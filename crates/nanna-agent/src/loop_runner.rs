@@ -1322,8 +1322,9 @@ impl RepeatLedger {
 /// A [`RepeatLedger`] handle shared across the steps of one run.
 pub type SharedRepeatLedger = Arc<RepeatLedger>;
 
-/// Canonical repetition key for a tool call: name + canonicalized input JSON.
-/// Shared by both sibling breakers ([`RepeatCallState`]).
+/// Canonical repetition key for a tool call: name + canonicalized,
+/// whitespace-normalized input JSON. Shared by both sibling breakers
+/// ([`RepeatCallState`]).
 ///
 /// Object keys are sorted recursively because JSON object member order
 /// carries no meaning — `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same call
@@ -1331,8 +1332,61 @@ pub type SharedRepeatLedger = Arc<RepeatLedger>;
 /// meaningful. The unit separator (U+001F) joins name and input; it cannot
 /// appear in a tool name, so no (name, input) pair can collide with a
 /// differently-split one.
+///
+/// String values are whitespace-normalized ([`normalize_call_text`]) so that
+/// re-spelling an argument is not a fresh call shape — the byte-identity
+/// match was evaded live by ~20 trivial respellings of one shell command in
+/// five minutes, each opening a new ledger entry so no streak ever built. The
+/// one exemption is the artifact fields ([`is_artifact_field`]), whose
+/// whitespace is content rather than spelling.
+///
+/// Epoch semantics are untouched: this changes only WHICH calls share an
+/// entry, never when an entry may short-circuit — a successful
+/// side-effectful call still bumps the world epoch and frees every shape for
+/// one probe ([`RepeatCallState::last_execution_epoch`]).
 fn repeat_call_key(name: &str, input: &Value) -> String {
-    format!("{name}\u{1f}{}", canonical_json(input))
+    format!("{name}\u{1f}{}", canonical_json(input, true))
+}
+
+/// Whitespace-normalize one tool-input string for the repetition key.
+///
+/// Line structure is preserved (a newline IS a command separator in every
+/// shell), while runs of blanks collapse to one, each line is trimmed, and
+/// blank lines drop out. That is not a heuristic about model behavior: POSIX
+/// shells treat any run of blanks as a single token separator and an empty
+/// line as a no-op, so `ls   -la ` and `ls -la` are the same command to the
+/// thing that runs them — and therefore the same no-information action when
+/// repeated. Two genuinely different command lists still differ, because
+/// their line structure and tokens differ.
+fn normalize_call_text(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Input fields whose string value is FILE CONTENT rather than a spelling of
+/// a call — the one exemption from the repetition key's whitespace
+/// normalization.
+///
+/// `content` is the payload `write_file`/`file_buffer` land on disk;
+/// `old_string`/`new_string` (and their `_str` dialect spellings) are the
+/// exact text `edit_file` matches and substitutes. Whitespace there is
+/// meaning, not spelling: re-indenting a body writes a different file, and an
+/// edit needle with different leading spaces matches different text — in a
+/// whitespace-structured language, all of it. Merging those into one shape
+/// could let the breaker refuse a genuinely new world change, which is the
+/// one mistake this machinery must never make.
+///
+/// Keyed by field NAME, not by tool name, because the same field means the
+/// same thing wherever it appears (a memory body is content too) and because
+/// erring toward MORE distinct shapes only ever costs one extra execution.
+fn is_artifact_field(key: &str) -> bool {
+    matches!(
+        key,
+        "content" | "old_string" | "new_string" | "old_str" | "new_str"
+    )
 }
 
 /// Hash a tool result's content bytes for the zero-information breaker's
@@ -1355,7 +1409,13 @@ fn result_content_hash(content: &str) -> u64 {
 /// is a feature-flag accident — `preserve_order` flips it to insertion order.
 /// The breaker key must not change meaning if a transitive dependency enables
 /// that flag, so ordering is enforced here explicitly.
-fn canonical_json(v: &Value) -> String {
+///
+/// `normalize` whitespace-normalizes string scalars ([`normalize_call_text`])
+/// — the repetition key's form, so a respelled argument is the same shape —
+/// except under an artifact field ([`is_artifact_field`]), whose whole
+/// subtree is serialized verbatim because nothing inside an artifact is a
+/// spelling.
+fn canonical_json(v: &Value, normalize: bool) -> String {
     match v {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
@@ -1363,19 +1423,22 @@ fn canonical_json(v: &Value) -> String {
             let members: Vec<String> = keys
                 .into_iter()
                 .map(|k| {
-                    format!(
-                        "{}:{}",
-                        Value::String(k.clone()),
-                        canonical_json(&map[k.as_str()])
-                    )
+                    let member = &map[k.as_str()];
+                    let rendered =
+                        canonical_json(member, normalize && !is_artifact_field(k.as_str()));
+                    format!("{}:{}", Value::String(k.clone()), rendered)
                 })
                 .collect();
             format!("{{{}}}", members.join(","))
         }
         Value::Array(items) => {
-            let members: Vec<String> = items.iter().map(canonical_json).collect();
+            let members: Vec<String> = items
+                .iter()
+                .map(|item| canonical_json(item, normalize))
+                .collect();
             format!("[{}]", members.join(","))
         }
+        Value::String(s) if normalize => Value::String(normalize_call_text(s)).to_string(),
         other => other.to_string(),
     }
 }
@@ -1410,8 +1473,9 @@ fn repeat_failure_breaker_notice(
         last_error.to_string()
     };
     format!(
-        "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
-         arguments already failed {failures} times in a row in this run; the last error \
+        "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these \
+         arguments (re-spacing or re-indenting them is the same call, not a new one) \
+         already failed {failures} times in a row in this run; the last error \
          was: {replay}\n\
          Repeating the identical call cannot succeed while nothing has changed, so this \
          exact call is paused — it now fails instantly instead of re-running a known \
@@ -1461,8 +1525,9 @@ fn zero_info_breaker_notice(
         excerpt.to_string()
     };
     format!(
-        "{header}[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these exact \
-         arguments already succeeded {repeats} times in a row in this run with a \
+        "{header}[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these \
+         arguments (re-spacing or re-indenting them is the same call, not a new one) \
+         already succeeded {repeats} times in a row in this run with a \
          byte-identical result every time — repeating it yields zero new information. \
          The result is UNCHANGED; if you were polling for a change, this unchanged result \
          IS your answer, delivered without re-running the call. The result you already \
@@ -2592,6 +2657,50 @@ pub fn claim_nudge_message(task_anchor: Option<&str>) -> String {
          If the task's goal is met, STOP calling tools and reply now: state your \
          final answer and end with TASK COMPLETE on its own line. Only continue \
          with tools if something specific is missing — name it first. \
+         {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Width at which a tool call is NAMED back to the model inside a steering
+/// text — its command, path, or the first line of what it printed.
+///
+/// Not a new number: it is the width the run's own memory records already use
+/// for their `target` tag (the identification of what a call acted on), and
+/// it is applied here for the same reason. The excerpt IDENTIFIES the call;
+/// it does not reproduce it. The full input and the full output already
+/// reached the model when the call ran and are still in the transcript, so a
+/// wider excerpt would replay data the model has instead of pointing at the
+/// thing it must look at. Cut char-safely by [`preview_snippet`].
+const CALL_IDENTIFICATION_WIDTH: usize = 120;
+
+/// The evidence-anchored fork of [`claim_nudge_message`], rendered when the
+/// step's NEWEST side-effectful call reported failure.
+///
+/// Why the fork exists: the unconditional text opens "You have already
+/// executed successful write/exec work this step" — true of the step as a
+/// whole, and false of the last thing that actually happened. Handed to a
+/// model whose most recent command exited non-zero, it reads as permission
+/// to claim completion over a standing failure. The rung's JOB is unchanged
+/// (prompt a verdict so the abandon ladder stays reachable) and so is its
+/// cadence — only the premise is corrected, and it is never suppressed.
+///
+/// `subject` names the failing call and `verdict` is its exit status when one
+/// definitely parsed, else the first line of its output — both at
+/// [`CALL_IDENTIFICATION_WIDTH`]. Neither is decided by pattern-matching the
+/// output text: a verdict is read from the execution's own exit status, never
+/// grepped out of what the command printed (a run's own test output can say
+/// anything, and a fabricated verdict here would be worse than none).
+#[must_use]
+pub fn claim_nudge_failure_message(
+    task_anchor: Option<&str>,
+    subject: &str,
+    verdict: &str,
+) -> String {
+    format!(
+        "{}Your most recent side-effecting command reported failure: {subject} → {verdict}. \
+         Claim TASK COMPLETE only if that failure is now fixed AND a newer run re-verified \
+         it; otherwise name the specific remaining gap and address it. \
          {STEERING_CONTINUATION}",
         anchor_header(task_anchor)
     )
@@ -4940,10 +5049,16 @@ impl Agent {
     }
 
     /// Direct completion-claim rung — the rung above the tool-loop nudge on
-    /// the escalation ladder. Injects [`claim_nudge_message`] when ALL of:
+    /// the escalation ladder. Injects [`claim_nudge_message`] (or its
+    /// evidence-anchored fork, below) when ALL of:
     ///
-    /// - (a) this run holds at least one SUCCESSFUL side-effectful tool call
-    ///   ([`is_work_evidence_tool`]) — evidence the step's real work happened;
+    /// - (a) this step holds a VERDICT that real work landed
+    ///   ([`claim_evidence_armed`] — a successful write/edit, or an exec that
+    ///   flipped a definite non-zero exit to exit 0). Deliberately NOT the
+    ///   shared [`is_work_evidence_tool`] name test the rungs above use: a
+    ///   stream of successful `ls` calls is not evidence that anything was
+    ///   done, and prompting a completion claim on it teaches exactly the
+    ///   wrong lesson;
     /// - (b) the tool-loop nudge already fired this step and got its full
     ///   post-nudge attempt (call-site ordering guarantees the attempt);
     /// - (c) the model is still issuing tool calls (the call site is the
@@ -4975,13 +5090,9 @@ impl Agent {
         if crate::harness::step_claims_completion(&state.final_text) {
             return false;
         }
-        // (a) — no successful side-effectful work yet means the grind is not
-        // a claim failure; the loop nudge and breakers own that case.
-        if !state
-            .tool_records
-            .iter()
-            .any(|r| r.success && is_work_evidence_tool(&r.name))
-        {
+        // (a) — no verdict that work landed means the grind is not a claim
+        // failure; the loop nudge and breakers own that case.
+        if !claim_evidence_armed(&state.tool_records) {
             return false;
         }
         match state.claim_nudge_count {
@@ -4998,13 +5109,27 @@ impl Agent {
         }
         state.claim_nudge_count += 1;
         state.claim_nudge_iteration = state.iterations;
+        // Which instruction: the newest side-effectful record decides. When
+        // it FAILED, the unconditional "you have already executed successful
+        // work" opening is contrary to the last thing that happened, so the
+        // instruction carries that failure instead of talking over it. The
+        // rung fires either way — the fork rephrases, it never suppresses.
+        let latest_failure = newest_work_evidence_failure(&state.tool_records);
         warn!(
             iteration = state.iterations,
             claim_nudges = state.claim_nudge_count,
-            "🏁 Successful work but no completion claim — injecting claim instruction"
+            latest_side_effect_failed = latest_failure.is_some(),
+            "🏁 Work evidence but no completion claim — injecting claim instruction"
         );
-        let nudge =
-            AnthropicMessage::user_text(claim_nudge_message(state.task_anchor.as_deref()));
+        let text = match latest_failure {
+            Some((subject, verdict)) => claim_nudge_failure_message(
+                state.task_anchor.as_deref(),
+                &subject,
+                &verdict,
+            ),
+            None => claim_nudge_message(state.task_anchor.as_deref()),
+        };
+        let nudge = AnthropicMessage::user_text(text);
         let mut ctx = self.context.write().await;
         ctx.messages.push(nudge);
         true
@@ -6073,7 +6198,9 @@ impl Agent {
                         .or_else(|| input.get("command"))
                         .or_else(|| input.get("query"))
                         .and_then(|v| v.as_str())
-                        .map(|s| s.chars().take(120).collect::<String>());
+                        .map(|s| {
+                            s.chars().take(CALL_IDENTIFICATION_WIDTH).collect::<String>()
+                        });
                     let outcome = if response.result.success { "ok" } else { "FAILED" };
 
                     for (idx, chunk_content) in &chunks {
@@ -7974,18 +8101,156 @@ fn is_write_tool(name: &str) -> bool {
 /// succeed forever without changing anything outside the context window,
 /// so they are never claim evidence.
 ///
-/// Public because every rung of the stack asks the same question: the
-/// completion-claim gate here, the harness one rung up (a continuation round
-/// that made no work-evidence call changed nothing in the world), and the
-/// daemon's session-liveness ledger one rung above that ("when did this
-/// session last change the world?", the wedged-vs-working discriminator).
-/// One classification, three rungs — a second list would drift.
+/// Public because the rungs above ask a DIFFERENT question with the same
+/// classification: the harness one rung up (a continuation round that made no
+/// work-evidence call changed nothing in the world) and the daemon's
+/// session-liveness ledger above that ("when did this session last change the
+/// world?", the wedged-vs-working discriminator). Both are name-level
+/// questions about whether the session is capable of touching the world at
+/// all, and both are deliberately generous: their cheap mistake is believing
+/// a `ls` was work — a session that is merely reading is still alive, still
+/// worth waiting on, and nothing is claimed on its behalf.
+///
+/// The completion-claim rung in this file is the ASYMMETRIC case and no
+/// longer uses this predicate: see [`claim_evidence_armed`]. Its cheap
+/// mistake runs the other way — a read-only success there invites a
+/// completion claim over work that never happened — so it demands a verdict
+/// (a successful write/edit, or an exec that flipped a definite non-zero exit
+/// to exit 0), not a tool name. Same classification for the generous
+/// questions, a stricter one for the question that ends a step.
 pub fn is_work_evidence_tool(name: &str) -> bool {
     is_write_tool(name)
         || matches!(
             name,
             "edit_file" | "edit" | "Edit" | "exec" | "bash" | "Bash"
         )
+}
+
+/// The write family as the completion-claim rung counts it: every file-writing
+/// tool ([`is_write_tool`]) plus the in-place editor. A SUCCESSFUL call here
+/// is a verdict on its own — the tool reports success only after the bytes
+/// landed, and the skill-side ratchet/hiwater machinery has already judged
+/// the write — so no exit-status reasoning is needed for this arm.
+fn is_claim_write_family(name: &str) -> bool {
+    is_write_tool(name) || matches!(name, "edit_file" | "edit" | "Edit")
+}
+
+/// The completion-claim rung's own evidence predicate: has this step produced
+/// a VERDICT that real work landed?
+///
+/// Armed by either:
+/// - a successful write/edit-family call ([`is_claim_write_family`]) — the
+///   world changed and the tool said so; or
+/// - an exec-family success whose command previously recorded a DEFINITE
+///   non-zero exit this step and now records exit 0 — the fail→pass flip.
+///   That flip IS the verdict: something that provably did not work provably
+///   works now.
+///
+/// A read-only exec success never arms it. `ls`, `cat`, `git status` and
+/// their kin exit 0 forever without changing anything, and the shared
+/// [`is_work_evidence_tool`] name test cannot tell them from a `chmod` — one
+/// observed window fired the claim instruction 40 times on a stream of
+/// successful listings, teaching a model to claim completion over work it had
+/// never done. The rare under-fire (a single side-effectful exec that
+/// succeeds first try, never having failed) is the cheap mistake here: the
+/// step still ends through the wrap-up and abandon ladders, which this rung
+/// only exists to reach FASTER.
+///
+/// Verdicts come from [`exec_verified_outcome`] — the execution's own exit
+/// status — never from pattern-matching output text. Shapes are keyed by
+/// (tool name, whitespace-normalized command) so that re-spelling the command
+/// between the failing and passing run still reads as one flip, the same
+/// normalization the repetition breakers key on ([`normalize_call_text`]).
+///
+/// Per-step by construction: `state.tool_records` is the step's own record
+/// list, so a failure from an earlier step cannot arm a later one.
+fn claim_evidence_armed(records: &[ToolCallRecord]) -> bool {
+    let mut failed_shapes: HashSet<String> = HashSet::new();
+    for record in records {
+        if record.success && is_claim_write_family(&record.name) {
+            return true;
+        }
+        // Records hold the result CONTENT, not the error field, so only the
+        // content-prefixed exit status parses here — the conservative half of
+        // the existing definite-exit-status rule, which under-fires rather
+        // than inventing a verdict.
+        let Some((command, verdict)) = exec_verified_outcome(
+            &record.name,
+            &record.input,
+            record.success,
+            &record.output,
+            None,
+        ) else {
+            continue;
+        };
+        let shape = format!("{}\u{1f}{}", record.name, normalize_call_text(&command));
+        if record.success {
+            if failed_shapes.remove(&shape) {
+                return true;
+            }
+        } else if verdict != "exit 0" {
+            failed_shapes.insert(shape);
+        }
+    }
+    false
+}
+
+/// The newest side-effectful record when it FAILED, rendered as (subject,
+/// verdict) for [`claim_nudge_failure_message`] — `None` when the newest one
+/// succeeded (the unconditional instruction stands) or when the step has no
+/// side-effectful record at all.
+///
+/// Classification is the shared name test ([`is_work_evidence_tool`]) plus
+/// the record's own success flag: this decides only how the instruction is
+/// WORDED, so the generous name set is the right one — an `ls` that failed is
+/// still the newest contrary evidence worth naming. Whether the rung fires at
+/// all is [`claim_evidence_armed`]'s stricter question.
+///
+/// The subject is the call's own identification field (command, then the
+/// path fields), first line only, at [`CALL_IDENTIFICATION_WIDTH`]; the
+/// verdict is the parsed exit status when one is definite, else the first
+/// non-blank line of the output. No output-text pattern matching decides
+/// anything — the text is quoted, never interpreted.
+fn newest_work_evidence_failure(records: &[ToolCallRecord]) -> Option<(String, String)> {
+    let newest = records
+        .iter()
+        .rev()
+        .find(|r| is_work_evidence_tool(&r.name))?;
+    if newest.success {
+        return None;
+    }
+    let subject = newest
+        .input
+        .get("command")
+        .or_else(|| newest.input.get("file_path"))
+        .or_else(|| newest.input.get("path"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+        .map_or_else(
+            || format!("`{}`", newest.name),
+            |line| preview_snippet(line.trim(), CALL_IDENTIFICATION_WIDTH),
+        );
+    let verdict = exec_verified_outcome(
+        &newest.name,
+        &newest.input,
+        newest.success,
+        &newest.output,
+        None,
+    )
+    .map_or_else(
+        || {
+            newest
+                .output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map_or_else(
+                    || "reported failure with no output".to_string(),
+                    |line| preview_snippet(line.trim(), CALL_IDENTIFICATION_WIDTH),
+                )
+        },
+        |(_, verdict)| verdict,
+    );
+    Some((subject, verdict))
 }
 
 /// Extract the (command, verdict) pair a completed exec-family call proved,
@@ -8912,7 +9177,10 @@ mod repeat_failure_breaker_tests {
         let v = serde_json::json!({"b": [2, 1], "a": {"z": true, "y": null}});
         // Objects sort recursively (member order carries no meaning); arrays
         // keep their order (it does).
-        assert_eq!(canonical_json(&v), r#"{"a":{"y":null,"z":true},"b":[2,1]}"#);
+        assert_eq!(
+            canonical_json(&v, false),
+            r#"{"a":{"y":null,"z":true},"b":[2,1]}"#
+        );
         // The key carries the tool name, unambiguously separated.
         assert_eq!(
             repeat_call_key("explore", &serde_json::json!({})),
@@ -8922,6 +9190,113 @@ mod repeat_failure_breaker_tests {
             repeat_call_key("explore", &serde_json::json!({"path": "a"})),
             repeat_call_key("explore", &serde_json::json!({"path": "b"})),
             "different arguments are different keys"
+        );
+    }
+
+    /// The zero-information breaker matched inputs by BYTE identity, and a
+    /// live run evaded it for five minutes with ~20 trivially varied
+    /// spellings of one command — every respelling opened a fresh ledger
+    /// entry, so no streak ever built while the run learned nothing. Spelling
+    /// is not identity: the shell collapses blank runs itself.
+    #[test]
+    fn respelling_a_command_is_the_same_call_shape() {
+        let plain = repeat_call_key("exec", &serde_json::json!({"command": "ls -la src"}));
+        for respelling in [
+            "ls  -la   src",
+            "  ls -la src  ",
+            "ls -la src\n",
+            "\n\nls -la src\n\n",
+            "ls\t-la\tsrc",
+        ] {
+            assert_eq!(
+                repeat_call_key("exec", &serde_json::json!({"command": respelling})),
+                plain,
+                "{respelling:?} is the same command to the shell that runs it"
+            );
+        }
+
+        // A genuinely different command stays a different shape — the
+        // normalization collapses blanks, never tokens or line structure.
+        for different in [
+            "ls -la tests",
+            "ls -l src",
+            "ls -la src --color",
+            "ls -la\nsrc",
+        ] {
+            assert_ne!(
+                repeat_call_key("exec", &serde_json::json!({"command": different})),
+                plain,
+                "{different:?} is a different action and must keep its own entry"
+            );
+        }
+
+        // Other fields normalize too (a respelled query is the same search),
+        // and the tool name still separates the shapes.
+        assert_eq!(
+            repeat_call_key("explore", &serde_json::json!({"query": "find  the  parser"})),
+            repeat_call_key("explore", &serde_json::json!({"query": "find the parser"}))
+        );
+        assert_ne!(
+            repeat_call_key("exec", &serde_json::json!({"command": "ls -la src"})),
+            repeat_call_key("bash", &serde_json::json!({"command": "ls -la src"}))
+        );
+    }
+
+    /// The one exemption: in an artifact field the string IS the content, so
+    /// its whitespace is meaning, not spelling — two writes that differ only
+    /// in indentation write two different files, and an edit needle with
+    /// different leading spaces matches different text. Merging those could
+    /// let the breaker refuse a genuinely new world change.
+    #[test]
+    fn artifact_field_whitespace_is_content_not_a_spelling() {
+        let tight = serde_json::json!({
+            "file_path": "src/main.rs",
+            "content": "fn main() {\nprintln!(\"hi\");\n}"
+        });
+        let indented = serde_json::json!({
+            "file_path": "src/main.rs",
+            "content": "fn main() {\n    println!(\"hi\");\n}"
+        });
+        assert_ne!(
+            repeat_call_key("write_file", &tight),
+            repeat_call_key("write_file", &indented),
+            "re-indenting a file is a different write, not a respelling"
+        );
+
+        // An edit's needle and replacement are content too — in a
+        // whitespace-structured language the indentation IS the match.
+        let flush_edit = serde_json::json!({
+            "file_path": "app.py",
+            "old_string": "return x",
+            "new_string": "return y"
+        });
+        let nested_edit = serde_json::json!({
+            "file_path": "app.py",
+            "old_string": "    return x",
+            "new_string": "    return y"
+        });
+        assert_ne!(
+            repeat_call_key("edit_file", &flush_edit),
+            repeat_call_key("edit_file", &nested_edit)
+        );
+
+        // The call's OTHER fields still normalize — the exemption is the
+        // artifact, not the whole call.
+        assert_eq!(
+            repeat_call_key(
+                "write_file",
+                &serde_json::json!({"file_path": " src/main.rs ", "content": "a b"})
+            ),
+            repeat_call_key(
+                "write_file",
+                &serde_json::json!({"file_path": "src/main.rs", "content": "a b"})
+            )
+        );
+        // The exemption is keyed by field name, not tool name: a memory body
+        // is content wherever it is written.
+        assert_ne!(
+            repeat_call_key("remember", &serde_json::json!({"content": "a  b"})),
+            repeat_call_key("remember", &serde_json::json!({"content": "a b"}))
         );
     }
 
@@ -10472,6 +10847,21 @@ mod claim_nudge_tests {
         }
     }
 
+    /// An exec-family record in the shape the loop actually stores: a
+    /// `ToolCallRecord` carries the result CONTENT, not the error field, so
+    /// the skill's "Command failed (exit code N)" prefix is the definite exit
+    /// status a record can prove.
+    fn exec_record(command: &str, output: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "command": command }),
+            output: output.to_string(),
+            success,
+            duration_ms: 1,
+        }
+    }
+
     /// A RunState in the observed live shape (gemma4:12b, 2026-08-02): the
     /// real work SUCCEEDED, the loop nudge already fired, and the latest
     /// text still has no claim — all of (a) + (b) + (c).
@@ -10746,6 +11136,202 @@ mod claim_nudge_tests {
             })
             .count();
         assert_eq!(injected, CLAIM_NUDGES_MAX);
+    }
+
+    /// Read-only churn is not work. The shared name test
+    /// ([`is_work_evidence_tool`]) cannot tell `ls` from `chmod` — it only
+    /// sees `exec` succeeding — and one observed window fired the claim
+    /// instruction 40 times over a stream of listings, teaching the model to
+    /// claim completion over work it had never done. Replayed against the
+    /// rung's own predicate, that window arms nothing.
+    #[tokio::test]
+    async fn read_only_exec_churn_never_arms_the_claim_rung() {
+        let churn = vec![
+            exec_record("ls -la", "src tests", true),
+            exec_record("cat README.md", "# nanna", true),
+            exec_record("git status", "nothing to commit", true),
+            // …including the respellings that evade a byte-identity match.
+            exec_record("ls  -la", "src tests", true),
+        ];
+        assert!(!claim_evidence_armed(&churn));
+
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = churn;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+        assert_eq!(state.claim_nudge_count, 0);
+    }
+
+    /// The exec arm's verdict is the fail→pass flip: a command that provably
+    /// did not work provably works now.
+    #[tokio::test]
+    async fn a_fail_then_pass_flip_arms_the_claim_rung() {
+        // Still failing: nothing has been shown to work.
+        let mut records = vec![exec_record(
+            "chmod +x scripts/run.sh",
+            "Command failed (exit code 1)\nchmod: cannot access 'scripts/run.sh'",
+            false,
+        )];
+        assert!(!claim_evidence_armed(&records));
+
+        // Read-only successes in between are still not evidence.
+        records.push(exec_record("ls scripts", "run.sh", true));
+        assert!(!claim_evidence_armed(&records));
+
+        // The same command passing IS the verdict — and a respelling of it is
+        // the same command, so the flip survives re-typing.
+        records.push(exec_record("chmod  +x   scripts/run.sh", "", true));
+        assert!(claim_evidence_armed(&records));
+
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = records;
+        assert!(a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // A DIFFERENT command exiting 0 is not the flip: what failed is still
+        // failing, so the rung stays out of it.
+        let unrelated = vec![
+            exec_record(
+                "chmod +x scripts/run.sh",
+                "Command failed (exit code 1)\ndenied",
+                false,
+            ),
+            exec_record("chmod +x scripts/other.sh", "", true),
+        ];
+        assert!(!claim_evidence_armed(&unrelated));
+    }
+
+    /// The write arm needs no exit-status reasoning: these tools report
+    /// success only once the bytes landed, and the skill-side ratchet has
+    /// already judged the write.
+    #[test]
+    fn a_successful_write_or_edit_is_a_verdict_on_its_own() {
+        for name in ["write_file", "file_buffer", "create_tool", "edit_file", "Edit"] {
+            assert!(claim_evidence_armed(&[record(name, true)]), "{name} armed");
+            assert!(
+                !claim_evidence_armed(&[record(name, false)]),
+                "{name} FAILED is not evidence"
+            );
+        }
+        // Reads never arm it, however many succeed.
+        assert!(!claim_evidence_armed(&[
+            record("read_file", true),
+            record("explore", true)
+        ]));
+    }
+
+    /// The instruction must not talk over the last thing that happened: when
+    /// the newest side-effecting call FAILED, the unconditional "you have
+    /// already executed successful work" opening reads as permission to claim
+    /// completion over a standing failure.
+    #[tokio::test]
+    async fn the_instruction_carries_the_newest_contrary_evidence() {
+        let a = agent();
+        let mut state = eligible_state();
+        // Work DID land this step (the write in `eligible_state`), and then
+        // the newest side-effecting command failed with a definite status.
+        state.tool_records.push(exec_record(
+            "sh tests/test_3.sh",
+            "Command failed (exit code 2)\n3 assertions failed",
+            false,
+        ));
+        assert!(a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+        // The fork rephrases the rung; it never suppresses it.
+        assert_eq!(state.claim_nudge_count, 1);
+
+        let ctx = a.context.read().await;
+        let last =
+            serde_json::to_string(ctx.messages.last().expect("injected message")).unwrap();
+        assert!(
+            last.contains("most recent side-effecting command reported failure"),
+            "got: {last}"
+        );
+        assert!(last.contains("sh tests/test_3.sh"), "names it: {last}");
+        assert!(last.contains("exit 2"), "carries the verdict: {last}");
+        assert!(
+            last.contains("Claim TASK COMPLETE only if that failure is now fixed"),
+            "got: {last}"
+        );
+    }
+
+    /// Classification is the exit status the execution itself reported, never
+    /// a scan of what the command printed — a passing run whose output
+    /// mentions failures must never be reported as a failure.
+    #[test]
+    fn the_evidence_anchor_never_greps_the_output_for_a_verdict() {
+        let definite = vec![exec_record(
+            "cargo test",
+            "Command failed (exit code 101)\ntest result: FAILED. 2 passed; 1 failed",
+            false,
+        )];
+        assert_eq!(
+            newest_work_evidence_failure(&definite),
+            Some(("cargo test".to_string(), "exit 101".to_string()))
+        );
+
+        // No definite status anywhere: the first non-blank output line is
+        // QUOTED, not interpreted.
+        let indefinite = vec![exec_record("cargo test", "\nkilled at the deadline", false)];
+        assert_eq!(
+            newest_work_evidence_failure(&indefinite),
+            Some(("cargo test".to_string(), "killed at the deadline".to_string()))
+        );
+
+        // A newest record that succeeded leaves the unconditional text alone…
+        let recovered = vec![
+            exec_record("cargo test", "Command failed (exit code 101)\nboom", false),
+            exec_record("cargo test", "ok", true),
+        ];
+        assert_eq!(newest_work_evidence_failure(&recovered), None);
+        // …and so does a step with no side-effectful record at all.
+        assert_eq!(
+            newest_work_evidence_failure(&[record("read_file", true)]),
+            None
+        );
+
+        // Non-exec side effects identify themselves by their path field, and
+        // their failure text is quoted the same way.
+        let write_failure = vec![ToolCallRecord {
+            id: "t".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"file_path": "src/main.rs", "content": "fn main() {}"}),
+            output: "read-only file system".to_string(),
+            success: false,
+            duration_ms: 1,
+        }];
+        assert_eq!(
+            newest_work_evidence_failure(&write_failure),
+            Some((
+                "src/main.rs".to_string(),
+                "read-only file system".to_string()
+            ))
+        );
+    }
+
+    /// The excerpt IDENTIFIES the failing call; it never reproduces it (the
+    /// full input and output are already in the transcript).
+    #[test]
+    fn the_evidence_excerpt_identifies_and_never_reproduces() {
+        let long = format!("sh {}.sh", "a".repeat(CALL_IDENTIFICATION_WIDTH * 2));
+        let records = vec![exec_record(
+            &long,
+            "Command failed (exit code 1)\nnope",
+            false,
+        )];
+        let (subject, verdict) = newest_work_evidence_failure(&records).expect("a failure");
+        assert!(
+            subject.len() <= CALL_IDENTIFICATION_WIDTH + 3,
+            "bounded, got {} bytes",
+            subject.len()
+        );
+        assert!(subject.ends_with("..."), "the cut announces itself: {subject}");
+        assert_eq!(verdict, "exit 1");
+
+        // Multi-byte text cuts on a char boundary — the 2026-08-10 wedge
+        // shape was a raw byte slice through model-written text.
+        let unicode = "é".repeat(CALL_IDENTIFICATION_WIDTH);
+        let records = vec![exec_record(&unicode, "", false)];
+        let _ = newest_work_evidence_failure(&records);
     }
 
     #[tokio::test]
@@ -11395,6 +11981,10 @@ mod anchored_steering_tests {
             ("repetition_nudge", repetition_nudge_message(anchor)),
             ("thinking_spiral_nudge", thinking_spiral_nudge_message(anchor)),
             ("claim_nudge", claim_nudge_message(anchor)),
+            (
+                "claim_nudge_failure",
+                claim_nudge_failure_message(anchor, "sh tests/test_3.sh", "exit 2"),
+            ),
             ("budget_warning", budget_warning_message(800, 1000, anchor)),
             (
                 "wrapup_gentle",

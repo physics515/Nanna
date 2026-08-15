@@ -1,6 +1,6 @@
 export default {
   name: "code_search",
-  version: "0.3.0",
+  version: "0.3.1",
   output: "memory",
   description: "Search for a pattern across files in a directory tree. Returns matching lines with context. Supports regex patterns, a filename glob filter, and a depth bound.",
   parameters: {
@@ -244,6 +244,18 @@ export default {
         entries = Nanna.listDir(cur.path, false, MAX_ENTRIES - visited + 1);
       } catch (e) {
         if (cur.depth === 1) {
+          // A FILE passed as `path` is the commonest cause, and its os error
+          // ("The directory name is invalid", ENOTDIR) teaches nothing — one
+          // stat, on an already-failed call, turns it into the correction.
+          // The stat has its own try so this error path can never throw.
+          if (pathIsFile(searchPath)) {
+            return {
+              content: "code_search: \"" + searchPath + "\" exists but is a FILE, not a " +
+                "directory — use search_file to search it (or read_file to see its contents). " +
+                "Nothing was searched.",
+              success: false
+            };
+          }
           return {
             content: "code_search failed: cannot list \"" + searchPath + "\": " + String(e) +
               ". Nothing was searched. Check that the path exists, is a directory, and is " +
@@ -546,6 +558,19 @@ function walkLines(content, regex, maxMatches, ctx, sliceChars, deadlineAt) {
   }
 
   return { lines: lines, matches: matches, timeCapped: timeCapped };
+}
+
+// Is this path a file? Asked only on a path that already failed as a
+// directory, so it costs one metadata call on a path the tool was going to
+// give up on anyway. The stat sits in its OWN try: an error path that throws
+// is worse than the error it was explaining.
+function pathIsFile(path) {
+  try {
+    var st = Nanna.stat(path);
+    return !!(st && st.is_file);
+  } catch (e) {
+    return false;
+  }
 }
 
 // Running total of the rendered sections, including the "\n\n" that joins

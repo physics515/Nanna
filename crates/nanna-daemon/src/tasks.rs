@@ -1850,6 +1850,73 @@ const NO_PROGRESS_NUDGE: &str = "\n\n[SYSTEM: your previous attempt at this step
      Either CALL A TOOL now (that is how work happens), or, if the step is genuinely already \
      satisfied, reply with one short sentence saying so.]";
 
+/// A short, constant-size label for the fault a retry is healing.
+///
+/// The classified KIND, never the raw message: an error body carries provider
+/// JSON, stream tails and byte counts, and pasting that into a prompt spends
+/// window on noise the model cannot act on. Every arm reuses a classifier the
+/// ladder already consults, so the label and the healing action can never
+/// disagree.
+pub(crate) fn transient_fault_kind(message: &str) -> &'static str {
+    if gpu_memory_error(message) {
+        "the model ran out of GPU memory"
+    } else if ollama_generation_parse_error(message).is_some() {
+        "the provider could not parse the tool call"
+    } else if message.contains("No NDJSON line was ever parsed") {
+        "the provider's stream died before any output"
+    } else if wedged_runner_error(message) {
+        "the provider's runner wedged mid-generation"
+    } else if message.contains("stream watchdog:") {
+        "the stream stalled and the watchdog cut it"
+    } else if message.contains("timed out") {
+        "the request timed out"
+    } else {
+        "a provider transport fault"
+    }
+}
+
+/// Appended to a step prompt when the SAME step is retried after a transient
+/// provider fault interrupted it mid-flight.
+///
+/// A retry re-enters the step with a FRESH context — that is the re-anchor,
+/// and it is what makes retries cheap. But the fresh context is also a lie by
+/// omission: the interrupted attempt may already have called tools, and those
+/// calls RAN. Their effects are on disk while the conversation the model can
+/// see shows none of them, so a model that reads its own context as ground
+/// truth concludes the file is untouched and rewrites it from scratch —
+/// destroying the work the interrupted attempt did. Observed as the
+/// abandonment/truncation chain: peak content early, a shrunken file at the
+/// end.
+///
+/// Replaying the partial transcript is not the fix and is not attempted:
+/// [`StepAttemptError`] is lossy by design (the ladder keeps the classified
+/// message and the wedge fingerprint, nothing else), and a half transcript
+/// re-fed as history is exactly the corrupted state the re-anchor exists to
+/// escape. Naming the situation costs a fixed handful of sentences instead.
+pub(crate) fn transient_retry_note(attempt: usize, fault: &str) -> String {
+    format!(
+        "\n\n[SYSTEM: this same step was interrupted mid-flight by a provider fault (attempt \
+         {attempt}; fault: {fault}) and is being retried. Tool calls the interrupted attempt had \
+         already made DID execute — their effects are on disk even though this conversation does \
+         not show them. Continue the step, do not restart it: re-read the working artifact before \
+         any whole-file write; a rewrite that drops existing functions is destruction, not \
+         progress.]"
+    )
+}
+
+/// One line naming the last side-effecting call the liveness ledger holds, so
+/// the re-anchor points at a specific artifact instead of a general warning.
+///
+/// Constant size by construction — one tool name and one age, from the P22
+/// Tier 4 [`crate::liveness::SessionLiveness`] record, which keeps exactly one
+/// such mark.
+pub(crate) fn last_side_effect_note(name: &str, secs_ago: u64) -> String {
+    format!(
+        "\n[SYSTEM: the last side-effecting tool call recorded in this turn was {name} \
+         ({secs_ago}s ago). Its effect landed — read the file it touched before writing over it.]"
+    )
+}
+
 /// The only tool definitions shipped with a step. Everything else is reached
 /// through `discover_tools`.
 ///
@@ -1968,13 +2035,111 @@ fn is_low_signal_memory(content: &str) -> bool {
 ///   cluster — accumulated aborts degrade the runner until no stream
 ///   finishes. A single one is often sampling luck (the plain retry stays
 ///   first); the reset arms only under the existing attempt>=2 repeat rule.
+/// - "No NDJSON line was ever parsed": the stream hit EOF having produced
+///   ZERO bytes of body and ZERO parsed lines, with nothing left in the
+///   residual buffer — the dead-stream shape, emitted by `nanna-llm` only in
+///   exactly that case. Observed 2026-08-15: 116 of 160 in-window step
+///   retries carried it while this classifier stayed silent, so the ladder
+///   re-asked a dead runner three times per step; the reset armed only when
+///   the sibling "aborted generation mid-response" shape finally arrived at
+///   11:48:43, after 9 blind retries, and healed it at once.
+///
+/// The bytes>0 variants of that same stream-end error ("Last line before the
+/// cut: …", "N unparsed bytes remained") deliberately stay OUT. A stream that
+/// produced output before dying is ambiguous with a generation-slot
+/// contention cancel (`agent_service` drops the loser's stream), and a reset
+/// there unloads a runner that was working on someone else's turn.
 fn wedged_runner_error(message: &str) -> bool {
     message.contains("empty completion")
         || message.contains("same token")
         || message.contains("aborted generation mid-response")
+        || message.contains("No NDJSON line was ever parsed")
         || (message.contains("invalid character ") && message.contains(" in string literal"))
         || message.contains(" in string escape code")
         || message.contains("after object key:value pair")
+}
+
+/// The character an Ollama tool-call parse abort names, when the body is one.
+///
+/// Same last-line-fingerprint style as `provider_unknown_tool_name`
+/// (nanna-agent's loop_runner): the provider's own error body is the signal,
+/// read out of whatever transport prefixes wrap it (`API error: 500 - {…}`).
+/// Ollama's Go JSON decoder rejects the model's generated tool call before it
+/// ever reaches the registry and names the offending byte — `invalid
+/// character '\t' in string literal`, `… in string escape code`, `… after
+/// object key:value pair`. The model emitted a RAW control character inside a
+/// tool-call string argument, which no JSON parser accepts; retrying the same
+/// request unchanged reproduces it, because the fault is in how the model
+/// encodes, not in the transport.
+///
+/// Deliberately narrow in both directions. It requires the `invalid character
+/// '<c>'` prefix AND one of the three parse sites, so an arbitrary 500 body
+/// cannot arm a correction. And it explicitly refuses the dead-stream /
+/// aborted-generation classes, whose bodies can quote the MODEL's own text
+/// back in a tail: those faults belong to the runner reset, and a correction
+/// aimed at the model would be advice about someone else's failure.
+fn ollama_generation_parse_error(message: &str) -> Option<String> {
+    if message.contains("Ollama stream ended without completion")
+        || message.contains("aborted generation mid-response")
+        || message.contains("empty completion")
+    {
+        return None;
+    }
+    let (_, rest) = message.split_once("invalid character '")?;
+    let (character, tail) = rest.split_once('\'')?;
+    if character.is_empty() {
+        return None;
+    }
+    let names_a_parse_site = tail.starts_with(" in string literal")
+        || tail.starts_with(" in string escape code")
+        || tail.starts_with(" after object key:value pair");
+    names_a_parse_site.then(|| character.to_string())
+}
+
+/// Appended to a step prompt after the provider refused to parse the model's
+/// tool call because of a raw control character in a string argument.
+///
+/// The transport wall this heals is invisible from the model's side: the call
+/// never reached the registry, so no tool result comes back to learn from,
+/// and the plain retry re-generates the same encoding. So the note says what
+/// was rejected, names the character the provider named, and gives the two
+/// routes that actually work — JSON escapes for the argument, or `exec` when
+/// the FILE genuinely needs literal control bytes. It rides the existing
+/// `STEP_LLM_RETRIES` ladder: no extra attempt is bought, the attempt that
+/// was already going to happen just carries the correction.
+fn control_char_transport_note(character: &str) -> String {
+    format!(
+        "\n\n[SYSTEM: the provider REJECTED the tool call you were generating — its JSON \
+         parser hit an invalid character ({character}) inside a string argument, so that call \
+         never reached the tools and nothing from it ran. A raw control character cannot \
+         travel inside a tool-call argument. Two legal routes: (1) ESCAPE it in the JSON — \
+         write \\t for a tab and \\n for a newline inside the string argument, and the tool \
+         receives the real character; or (2) when the file content genuinely needs literal \
+         control bytes, call exec and let the shell produce them (printf 'a\\tb' > file, or a \
+         quoted heredoc: cat <<'EOF' > file). Re-issue the call one of those two ways.]"
+    )
+}
+
+/// Record whether a control-character correction healed the attempt it rode
+/// on, so the correction rate is auditable from the log — the same
+/// accountability the unserved-tool heal keeps for its own retries.
+///
+/// `still_failing` carries the message when the attempt failed again, and is
+/// `None` when it succeeded.
+fn log_parse_heal_outcome(attempt: usize, character: &str, still_failing: Option<&str>) {
+    match still_failing {
+        None => tracing::info!(
+            attempt,
+            character,
+            "control-character encoding correction healed the step"
+        ),
+        Some(error) => tracing::warn!(
+            attempt,
+            character,
+            error,
+            "control-character encoding correction did not heal the step"
+        ),
+    }
 }
 
 /// What one repetition abort looked like, kept so the next one can be
@@ -2201,6 +2366,14 @@ impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
         let mut last_err = String::new();
         let mut nudge_pending = false;
+        // Set once a transient fault has interrupted THIS step, and holds the
+        // classified kind of the newest one. Every later attempt of the step
+        // carries the re-anchor: the effects of the interrupted attempt stay
+        // on disk for the rest of the step, so the warning stays true.
+        let mut transient_fault: Option<&'static str> = None;
+        // The character the provider named when it refused to parse a tool
+        // call, carried into the next attempt's prompt as a correction.
+        let mut parse_fault_char: Option<String> = None;
         // The wedge the last attempt aborted on, and the one the runner
         // produced before it — the pair `wedge_reset_due` judges.
         let mut cur_wedge: Option<WedgeFingerprint> = None;
@@ -2315,13 +2488,32 @@ impl StepRunner for AgentStepRunner {
             // there is no partial transcript worth salvaging. After a
             // no-progress attempt the prompt carries a nudge, so the retry is
             // never a verbatim repeat of the request that just stalled.
-            let attempt_request = if nudge_pending {
-                let mut nudged = request.clone();
-                nudged.prompt.push_str(NO_PROGRESS_NUDGE);
-                nudged
-            } else {
-                request.clone()
-            };
+            //
+            // The same site carries the other two corrections, for the same
+            // reason and at the same cost: a re-anchor when a provider fault
+            // interrupted this step mid-flight (its tool effects are on disk
+            // and the fresh context cannot show them), and the encoding
+            // correction when the provider refused to parse a tool call.
+            let mut attempt_request = request.clone();
+            if nudge_pending {
+                attempt_request.prompt.push_str(NO_PROGRESS_NUDGE);
+            }
+            if let Some(fault) = transient_fault {
+                attempt_request
+                    .prompt
+                    .push_str(&transient_retry_note(attempt + 1, fault));
+                if let Some(line) = self.last_side_effect_line() {
+                    attempt_request.prompt.push_str(&line);
+                }
+            }
+            // The correction riding on THIS attempt, so its outcome can be
+            // logged the way the unserved-tool heal logs its own.
+            let heal_in_flight = parse_fault_char.clone();
+            if let Some(character) = heal_in_flight.as_deref() {
+                attempt_request
+                    .prompt
+                    .push_str(&control_char_transport_note(character));
+            }
             // Each attempt is judged on its own: only a repetition abort
             // refills these, so an interleaved network blip cannot leave a
             // stale pair behind for the next wedge to match against.
@@ -2346,7 +2538,12 @@ impl StepRunner for AgentStepRunner {
                     last_err =
                         "no-progress step (reasoning only: no tool call, no answer)".to_string();
                 }
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    if let Some(character) = heal_in_flight.as_deref() {
+                        log_parse_heal_outcome(attempt, character, None);
+                    }
+                    return Ok(outcome);
+                }
                 Err(e) if is_transient_llm_error(&e.message) => {
                     // Remember this wedge so the NEXT one can be recognised
                     // as the same fault. `record_wedge` hands back what it
@@ -2356,9 +2553,34 @@ impl StepRunner for AgentStepRunner {
                         prev_wedge = record_wedge(&self.agent_config.model, wedge.clone());
                         cur_wedge = Some(wedge);
                     }
+                    // The step is being retried after a fault that may have
+                    // executed tool calls this attempt's context will never
+                    // show — the next attempt says so out loud.
+                    transient_fault = Some(transient_fault_kind(&e.message));
+                    // A named-character parse refusal is a fault in how the
+                    // model ENCODED the call, so the next attempt carries the
+                    // correction as well as the re-anchor.
+                    if let Some(character) = ollama_generation_parse_error(&e.message) {
+                        tracing::warn!(
+                            attempt,
+                            character = %character,
+                            error = %e.message,
+                            "provider refused to parse a tool call over a raw control \
+                             character — retrying with the encoding correction"
+                        );
+                        parse_fault_char = Some(character);
+                    }
                     last_err = e.message;
                 }
-                Err(e) => return Err(e.message),
+                Err(e) => {
+                    if let Some(character) = heal_in_flight.as_deref() {
+                        log_parse_heal_outcome(attempt, character, Some(&e.message));
+                    }
+                    return Err(e.message);
+                }
+            }
+            if let Some(character) = heal_in_flight.as_deref() {
+                log_parse_heal_outcome(attempt, character, Some(&last_err));
             }
         }
         Err(last_err)
@@ -2366,6 +2588,93 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// The re-anchor's one concrete line: the last side-effecting tool call
+    /// this turn, read from the P22 Tier 4 liveness ledger.
+    ///
+    /// Gated on `turn_side_effects` rather than on the mark's existence,
+    /// because the mark outlives the turn while the counter is reset by
+    /// `begin_turn`: with a zero count, any mark present belongs to an
+    /// EARLIER turn, and naming it would invent a history this step never
+    /// had. `None` on runs with no liveness handle (task-run manager, tests),
+    /// where the general re-anchor stands alone.
+    fn last_side_effect_line(&self) -> Option<String> {
+        let live = self.chat_sink.as_ref()?.liveness.as_ref()?;
+        let snapshot = live.snapshot();
+        if snapshot.turn_side_effects == 0 {
+            return None;
+        }
+        let mark = snapshot.last_side_effect?;
+        Some(last_side_effect_note(&mark.name, mark.secs_ago))
+    }
+
+    /// Seed the step's FRESH context with what this scope has already proven —
+    /// the do-not-regress digest, in the never-compressed slot.
+    ///
+    /// Why here and not only in the planner: verified state must reach the
+    /// model that EDITS. Each step gets a brand-new `AgentContext`, so
+    /// everything the previous step proved is gone by construction; and inside
+    /// a step, every summarization/distillation pass can collapse ordinary
+    /// history. `verified_outcomes` is the one slot proven to survive every
+    /// compression path (P22 Tier 2), so the digest is seeded there and carry
+    /// is session-scoped by PERSISTENCE — the store — rather than by keeping a
+    /// long-lived context alive.
+    ///
+    /// Source is the same store read the turn-start `established_work_context`
+    /// block uses (`established_rows`), which is newest-completion-first and
+    /// already bounded by that module's `ESTABLISHED_MAX` — so the bound is
+    /// reused, not re-declared. Collapse-to-×N and the monotone timestamp rule
+    /// are the slot's own (`record_verified_outcome_at`).
+    ///
+    /// Chat scope is (`session`, session_id), which is exactly the scope the
+    /// chat harness seeds and reads. Background task runs have no chat sink and
+    /// therefore no session to read — they keep today's behavior.
+    async fn seed_verified_outcomes(&self, context: &mut nanna_agent::AgentContext) {
+        let Some(sink) = &self.chat_sink else {
+            return;
+        };
+        let Some(storage) = &sink.storage else {
+            return;
+        };
+        let rows = crate::control::chat_harness::established_rows(
+            storage,
+            "session",
+            Some(&sink.session_id),
+        )
+        .await;
+        for row in &rows {
+            // Only VERIFIED completions are facts proven by execution; an
+            // unverified close is a claim, and the slot's whole contract is
+            // that everything in it was run.
+            let Some(verdict) = &row.verdict else {
+                continue;
+            };
+            // The subject a model can act on: the command the check runs when
+            // there is one, the item otherwise.
+            let subject = row
+                .acceptance
+                .as_ref()
+                .and_then(|value| {
+                    nanna_agent::harness::AcceptanceCheck::from_json(value).ok()
+                })
+                .and_then(|check| check.self_check_command().map(str::to_string))
+                .unwrap_or_else(|| format!("#{} {}", row.id, row.title));
+            // The store's own completion time, never "now": a fact verified in
+            // an earlier turn must not claim to have been verified this step.
+            let verified_at = chrono::DateTime::parse_from_rfc3339(&row.when)
+                .map(|t| t.timestamp())
+                .unwrap_or_default();
+            context.record_verified_outcome_at(subject, verdict.clone(), verified_at);
+        }
+        if !rows.is_empty() {
+            tracing::debug!(
+                seeded = context.verified_outcomes.len(),
+                rows = rows.len(),
+                "seeded the step context's never-compressed verified-outcome slot from \
+                 the scope's stored verdicts"
+            );
+        }
+    }
+
     /// Put the step's own output — its answer, and each reasoning block — into
     /// memory, in the same `[kind → subject]` shape the episodic tool writer
     /// uses, so answers, thoughts and actions all read alike on recall.
@@ -2525,6 +2834,7 @@ impl AgentStepRunner {
         if let Some(ws_ctx) = &self.workspace_context {
             context.workspace_context = Some(ws_ctx.clone());
         }
+        self.seed_verified_outcomes(&mut context).await;
 
         let mut config = self.agent_config.clone();
         // Execution/verification wants determinism (pass^k reliability on a
@@ -6203,6 +6513,55 @@ mod wedged_runner_tests {
         assert!(!wedged_runner_error("request timed out after 120s"));
     }
 
+    /// The dead-stream message as it actually arrives: EOF at 0 bytes and 0
+    /// NDJSON lines, nothing left in the residual buffer.
+    const DEAD_STREAM: &str = "step error: LLM error: API error: 502 - Ollama stream ended \
+         without completion (no done=true) after 0 bytes / 0 NDJSON lines — nothing was left \
+         unparsed (the stream simply stopped). No NDJSON line was ever parsed.";
+
+    /// REGRESSION (2026-08-15 leg): 116 of 160 in-window step retries died on
+    /// a stream that produced NOTHING, and the classifier stayed silent — so
+    /// the ladder re-asked a dead runner three times per step. The reset
+    /// armed only when the sibling "aborted generation mid-response" shape
+    /// finally arrived at 11:48:43, after 9 blind retries, and healed it at
+    /// once. A stream that never emitted a line is the runner's state, not
+    /// the request's luck.
+    #[test]
+    fn a_zero_byte_dead_stream_triggers_a_reset() {
+        assert!(wedged_runner_error(DEAD_STREAM));
+    }
+
+    /// The counter-case that keeps the reset honest. A stream that DID
+    /// produce output before dying is ambiguous with a generation-slot
+    /// contention cancel (`agent_service` drops the loser's stream), and
+    /// unloading the model there punishes a runner that was working fine.
+    /// Both bytes>0 variants of the same error must stay out.
+    #[test]
+    fn a_stream_that_produced_bytes_never_resets() {
+        assert!(!wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 2780 bytes / 14 NDJSON lines — nothing was left unparsed \
+             (the stream simply stopped). Last line before the cut: {\"message\":{\"content\":\"x\"}}"
+        ));
+        assert!(!wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 4096 bytes / 9 NDJSON lines — 412 unparsed bytes remained, \
+             ending: {\"message\":{\"content\":\"the"
+        ));
+    }
+
+    /// The dead stream carries no fingerprint, so it rides the existing
+    /// repeat rule exactly as "empty completion" does: the first retry stays
+    /// free, the reset arms from the second.
+    #[test]
+    fn the_dead_stream_rides_the_existing_repeat_ladder() {
+        assert_eq!(wedge_reset_due(1, DEAD_STREAM, None, None), None);
+        assert_eq!(
+            wedge_reset_due(2, DEAD_STREAM, None, None),
+            Some(WedgeReset::Repeated)
+        );
+    }
+
     use super::{wedge_reset_due, WedgeFingerprint, WedgeReset};
 
     /// The wedge message as it actually arrives, so the tests below exercise
@@ -6308,6 +6667,159 @@ mod wedged_runner_tests {
         ] {
             assert!(!wedged_runner_error(msg), "must not reset for: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_note_tests {
+    use super::{
+        control_char_transport_note, last_side_effect_note, ollama_generation_parse_error,
+        transient_fault_kind, transient_retry_note,
+    };
+
+    /// The three Go-JSON parse sites Ollama reports when the model emits a raw
+    /// control character inside a tool-call string argument, each wrapped in
+    /// the transport prefixes the message actually arrives with.
+    #[test]
+    fn each_parse_site_yields_the_offending_character() {
+        assert_eq!(
+            ollama_generation_parse_error(
+                "step error: LLM error: API error: 500 - {\"error\":\"invalid character \
+                 '\\t' in string literal\"}"
+            )
+            .as_deref(),
+            Some("\\t")
+        );
+        assert_eq!(
+            ollama_generation_parse_error(
+                "API error: 500 - {\"error\":\"invalid character '$' in string escape code\"}"
+            )
+            .as_deref(),
+            Some("$")
+        );
+        assert_eq!(
+            ollama_generation_parse_error(
+                "API error: 500 - {\"error\":\"invalid character '.' after object key:value \
+                 pair\"}"
+            )
+            .as_deref(),
+            Some(".")
+        );
+    }
+
+    /// The correction is aimed at the MODEL's encoding, so it must never fire
+    /// for the dead-stream / aborted-generation classes, which are the
+    /// runner's state and heal by reset. The last case is the one that needs
+    /// the explicit exclusion: a stream-end body can quote the model's own
+    /// text back in its tail.
+    #[test]
+    fn the_reset_owned_classes_never_arm_a_correction() {
+        for msg in [
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 0 bytes / 0 NDJSON lines — nothing was left unparsed (the \
+             stream simply stopped). No NDJSON line was ever parsed.",
+            "step error: LLM error: API error: 502 - Ollama aborted generation mid-response \
+             (done=false)",
+            "empty completion (no text, no tool calls, ~0 tokens) from provider",
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 900 bytes / 3 NDJSON lines — nothing was left unparsed (the \
+             stream simply stopped). Last line before the cut: invalid character '\\t' in \
+             string literal",
+        ] {
+            assert!(
+                ollama_generation_parse_error(msg).is_none(),
+                "must not arm an encoding correction for: {msg}"
+            );
+        }
+    }
+
+    /// A body that names no character, or names one at no parse site, is a
+    /// different fault — the correction would be advice about nothing.
+    #[test]
+    fn unrelated_errors_arm_nothing() {
+        assert!(ollama_generation_parse_error("API error: 500 - internal").is_none());
+        assert!(ollama_generation_parse_error("API error: 404 - model not found").is_none());
+        assert!(ollama_generation_parse_error(
+            "API error: 500 - {\"error\":\"invalid character 'x' looking for beginning of value\"}"
+        )
+        .is_none());
+    }
+
+    /// The correction has to be actionable: name what was rejected, the
+    /// character the provider named, and both legal routes.
+    #[test]
+    fn the_correction_names_the_character_and_both_routes() {
+        let note = control_char_transport_note("\\t");
+        assert!(note.contains("REJECTED"));
+        assert!(
+            note.contains("(\\t)"),
+            "the character the provider named must appear, not just the generic advice: {note}"
+        );
+        assert!(note.contains("ESCAPE"));
+        assert!(note.contains("printf"));
+        assert!(note.contains("heredoc"));
+    }
+
+    /// The re-anchor's whole job: say that the interrupted attempt's tool
+    /// effects are real and on disk, and forbid the rewrite-from-scratch that
+    /// a fresh context invites.
+    #[test]
+    fn the_re_anchor_states_the_effects_and_forbids_the_restart() {
+        let note = transient_retry_note(2, "the request timed out");
+        assert!(note.contains("attempt 2"));
+        assert!(note.contains("the request timed out"));
+        assert!(note.contains("DID execute"));
+        assert!(note.contains("on disk"));
+        assert!(note.contains("do not restart it"));
+        assert!(note.contains("re-read"));
+    }
+
+    /// Every fault label comes from a classifier the ladder already consults,
+    /// so the sentence the model reads and the action the ladder takes cannot
+    /// disagree.
+    #[test]
+    fn fault_kinds_come_from_the_ladders_own_classifiers() {
+        assert_eq!(
+            transient_fault_kind("CUDA error: an illegal memory access was encountered"),
+            "the model ran out of GPU memory"
+        );
+        assert_eq!(
+            transient_fault_kind(
+                "API error: 500 - {\"error\":\"invalid character '\\t' in string literal\"}"
+            ),
+            "the provider could not parse the tool call"
+        );
+        assert_eq!(
+            transient_fault_kind(
+                "API error: 502 - Ollama stream ended without completion (no done=true) after \
+                 0 bytes / 0 NDJSON lines — nothing was left unparsed (the stream simply \
+                 stopped). No NDJSON line was ever parsed."
+            ),
+            "the provider's stream died before any output"
+        );
+        assert_eq!(
+            transient_fault_kind("API error: 502 - Ollama aborted generation mid-response"),
+            "the provider's runner wedged mid-generation"
+        );
+        assert_eq!(
+            transient_fault_kind("stream watchdog: no event for 240s"),
+            "the stream stalled and the watchdog cut it"
+        );
+        assert_eq!(transient_fault_kind("request timed out"), "the request timed out");
+        assert_eq!(
+            transient_fault_kind("error sending request for url (http://127.0.0.1:11434)"),
+            "a provider transport fault"
+        );
+    }
+
+    /// The ledger line points the re-anchor at one artifact instead of a
+    /// general warning.
+    #[test]
+    fn the_ledger_line_names_the_call_and_its_age() {
+        let line = last_side_effect_note("write_file", 12);
+        assert!(line.contains("write_file"));
+        assert!(line.contains("12s ago"));
+        assert!(line.contains("read the file it touched"));
     }
 }
 
@@ -6428,7 +6940,7 @@ mod workspace_reference_tests {
             tool_scope: Vec::new(),
             notes_tail: Vec::new(),
         };
-        let user_message = build_step_prompt(goal, &step, None, "budget: fresh");
+        let user_message = build_step_prompt(goal, &step, None, None, "budget: fresh");
         let assembled = format!("{system}\n\n{user_message}");
         let reference_at = assembled
             .find("# Project Context (background reference)")

@@ -252,14 +252,25 @@
                       Browse
                     </UiGlassButton>
                   </div>
-                  <p v-if="createValidity && createValidity.exists && createValidity.is_valid" class="text-[11px] text-amber-300/60 mt-1.5">
-                    ⚠️ This folder already has workspace files. Missing files will be added.
+                  <p v-if="hasWorkspaceMarker" class="text-[11px] text-emerald-300/70 mt-1.5">
+                    ✓ Already a workspace — Nanna recognises it by {{ markerSummary }}. Nothing below is
+                    required; anything you tick is created as a convenience.
+                  </p>
+                  <p v-else-if="createValidity && createValidity.exists" class="text-[11px] text-amber-300/60 mt-1.5">
+                    ⚠️ Nothing here marks this folder as a project — no <code>.git</code>, no manifest
+                    (<code>Cargo.toml</code>, <code>package.json</code>, …), no README/AGENTS/ROADMAP. Pick at
+                    least one file below so the folder carries a workspace marker on disk.
                   </p>
                 </div>
 
-                <!-- File Selection -->
+                <!-- File Selection. The bar for "this is a workspace" is one
+                     marker on disk (see control/workspace.rs) — NOT a set of
+                     standard files. When a marker is already there this list
+                     is an unchecked offer; only a bare folder must gain one. -->
                 <div>
-                  <label class="text-xs font-medium text-white/50 mb-2 block">Files to create</label>
+                  <label class="text-xs font-medium text-white/50 mb-2 block">
+                    {{ requiresStandardFile ? 'Files to create (pick at least one)' : 'Files to create (optional)' }}
+                  </label>
                   <div class="space-y-1">
                     <label
                       v-for="file in availableFiles"
@@ -294,11 +305,11 @@
                   pill
                   size="xs"
                   color="accent"
-                  :disabled="!createPath || createFiles.length === 0"
+                  :disabled="!createPath || (requiresStandardFile && createFiles.length === 0)"
                   @click="createWorkspace"
                 >
                   <FolderPlus class="w-3.5 h-3.5" />
-                  Create
+                  {{ hasWorkspaceMarker && createFiles.length === 0 ? 'Open' : 'Create' }}
                 </UiGlassButton>
               </div>
             </div>
@@ -471,6 +482,12 @@ import { open } from '@tauri-apps/plugin-dialog'
 import {
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
 } from 'lucide-vue-next'
+import {
+  describeMarkers,
+  hasWorkspaceMarker as folderHasMarker,
+  requiresStandardFile as folderNeedsFile,
+  type WorkspaceValidity,
+} from '~/lib/workspaceMarkers'
 
 const { isOnline } = useBackend()
 const toast = useToast()
@@ -493,16 +510,8 @@ interface WorkspaceInfo {
   context_chars: number
 }
 
-interface WorkspaceValidity {
-  exists: boolean
-  is_valid: boolean
-  has_readme: boolean
-  has_agents: boolean
-  has_contributing: boolean
-  has_roadmap: boolean
-  has_git: boolean
-  has_manifest: boolean
-}
+// WorkspaceValidity and the marker rules live in ~/lib/workspaceMarkers — the
+// rule is "what the backend requires", so it is stated once and tested.
 
 const workspaces = ref<WorkspaceInfo[]>([])
 const isLoading = ref(false)
@@ -550,6 +559,12 @@ const fileReference = [
   { name: 'ROADMAP.md', desc: 'Planned work and project direction' },
 ]
 
+// The create dialog gates on the backend's own bar — one workspace marker on
+// disk — not on a set of standard files. See ~/lib/workspaceMarkers.
+const hasWorkspaceMarker = computed(() => folderHasMarker(createValidity.value))
+const requiresStandardFile = computed(() => folderNeedsFile(createValidity.value))
+const markerSummary = computed(() => describeMarkers(createValidity.value))
+
 const missingFilesForRepair = computed(() => {
   if (!repairTarget.value) return []
   return availableFiles.filter(f => {
@@ -572,6 +587,14 @@ watch(createPath, async (path) => {
         if (!file) return true
         return !createValidity.value![file.existsKey as keyof WorkspaceValidity]
       })
+      // A folder that already carries a marker needs nothing from us — start
+      // the checklist unchecked so "Create" does not silently write files into
+      // somebody's repository. A markerless folder keeps the one-file minimum.
+      if (hasWorkspaceMarker.value) {
+        createFiles.value = []
+      } else if (createFiles.value.length === 0) {
+        createFiles.value = ['AGENTS.md']
+      }
     } catch (e) {
       createValidity.value = null
     }
@@ -664,14 +687,21 @@ async function openWorkspace(path: string) {
 }
 
 async function createWorkspace() {
-  if (!createPath.value || createFiles.value.length === 0) return
+  if (!createPath.value) return
+  if (requiresStandardFile.value && createFiles.value.length === 0) return
 
   isLoading.value = true
   try {
-    await invoke('init_workspace', {
-      path: createPath.value,
-      files: createFiles.value
-    })
+    // `init_workspace` always writes AGENTS.md (its initialize_minimal step),
+    // so "no files requested" has to skip it entirely rather than pass an
+    // empty list — otherwise the offer would not be an offer. Opening a
+    // marked folder registers it exactly as it is on disk.
+    if (createFiles.value.length > 0) {
+      await invoke('init_workspace', {
+        path: createPath.value,
+        files: createFiles.value
+      })
+    }
     await openWorkspace(createPath.value)
     showCreateDialog.value = false
     createPath.value = ''

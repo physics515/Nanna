@@ -147,7 +147,11 @@ pub struct VerifiedOutcome {
     pub subject: String,
     /// The verdict the environment returned (e.g. "exit 0").
     pub outcome: String,
-    /// Unix seconds of the LATEST execution asserting this outcome.
+    /// Unix seconds of the LATEST execution asserting this outcome, or `0`
+    /// when the source that supplied the fact recorded no time (a verdict read
+    /// back from the store whose completion timestamp is missing). Rendered as
+    /// "time not recorded" rather than as the epoch — a slot whose whole
+    /// contract is exactness must not invent a moment.
     pub verified_at: i64,
     /// How many executions have asserted this exact (subject, outcome).
     pub times: u32,
@@ -499,13 +503,18 @@ impl AgentContext {
              re-do or rewrite work these lines already prove.\n",
         );
         for outcome in &self.verified_outcomes {
+            let when = if outcome.verified_at <= 0 {
+                "time not recorded".to_string()
+            } else {
+                chrono::DateTime::from_timestamp(outcome.verified_at, 0)
+                    .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339())
+            };
             block.push_str(&format!(
                 "- {} → {} (×{}, last verified {})\n",
                 verified_subject_preview(&outcome.subject),
                 outcome.outcome,
                 outcome.times,
-                chrono::DateTime::from_timestamp(outcome.verified_at, 0)
-                    .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339()),
+                when,
             ));
         }
         block.push_str("</verified_outcomes>");
@@ -523,21 +532,38 @@ impl AgentContext {
         subject: impl Into<String>,
         outcome: impl Into<String>,
     ) {
+        self.record_verified_outcome_at(subject, outcome, chrono_timestamp());
+    }
+
+    /// [`Self::record_verified_outcome`] for a fact whose verification time is
+    /// KNOWN and is not now — a verdict read back from the store when a fresh
+    /// per-step context is seeded (the do-not-regress digest).
+    ///
+    /// The collapse rule is identical, and the timestamp is monotone: a
+    /// re-assertion never moves a line's "last verified" backwards, so seeding
+    /// an older verdict beside a fresh execution of the same fact cannot make
+    /// the newer evidence look stale. `verified_at <= 0` means "time not
+    /// recorded" and renders as such — never as the epoch.
+    pub fn record_verified_outcome_at(
+        &mut self,
+        subject: impl Into<String>,
+        outcome: impl Into<String>,
+        verified_at: i64,
+    ) {
         let subject = subject.into();
         let outcome = outcome.into();
-        let now = chrono_timestamp();
         if let Some(existing) = self
             .verified_outcomes
             .iter_mut()
             .find(|o| o.subject == subject && o.outcome == outcome)
         {
             existing.times = existing.times.saturating_add(1);
-            existing.verified_at = now;
+            existing.verified_at = existing.verified_at.max(verified_at);
         } else {
             self.verified_outcomes.push(VerifiedOutcome {
                 subject,
                 outcome,
-                verified_at: now,
+                verified_at,
                 times: 1,
             });
         }
@@ -2527,6 +2553,36 @@ mod tests {
         assert_eq!(ctx.verified_outcomes.len(), 2);
         assert_eq!(ctx.verified_outcomes[0].outcome, "exit 0");
         assert_eq!(ctx.verified_outcomes[1].outcome, "exit 1");
+    }
+
+    /// Seeding a fresh per-step context from the store's stored verdicts (the
+    /// do-not-regress digest) must carry the verification time the STORE
+    /// recorded, never "now" — a fact proven three turns ago that claims to
+    /// have been proven this second is the same class of lie the slot exists to
+    /// prevent. And the timestamp is monotone, so seeding an older assertion
+    /// beside a fresh execution never ages the fresh evidence.
+    #[test]
+    fn seeded_outcomes_keep_the_stores_time_and_never_move_it_backwards() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.record_verified_outcome_at("sh tests/test_1.sh", "exit 0", 1_700_000_000);
+        assert_eq!(ctx.verified_outcomes[0].verified_at, 1_700_000_000);
+        // A newer execution of the same fact advances the line.
+        ctx.record_verified_outcome_at("sh tests/test_1.sh", "exit 0", 1_700_000_500);
+        assert_eq!(ctx.verified_outcomes.len(), 1);
+        assert_eq!(ctx.verified_outcomes[0].times, 2);
+        assert_eq!(ctx.verified_outcomes[0].verified_at, 1_700_000_500);
+        // An OLDER assertion collapses into it without aging it.
+        ctx.record_verified_outcome_at("sh tests/test_1.sh", "exit 0", 1_600_000_000);
+        assert_eq!(ctx.verified_outcomes[0].verified_at, 1_700_000_500);
+
+        // A verdict the store recorded no time for says so, rather than
+        // claiming the epoch.
+        ctx.record_verified_outcome_at("#4 add the parser", "verified", 0);
+        let block = ctx
+            .verified_outcomes_block()
+            .expect("the slot renders when non-empty");
+        assert!(block.contains("time not recorded"), "{block}");
+        assert!(!block.contains("1970-01-01"), "{block}");
     }
 
     /// The monotone guarantee: no compression path may drop a verified

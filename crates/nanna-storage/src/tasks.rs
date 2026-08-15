@@ -1479,6 +1479,385 @@ fn validate_acceptance(value: &serde_json::Value) -> Result<(), StorageError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Acceptance evidence + user-declared file invariants (P23)
+// ---------------------------------------------------------------------------
+
+/// Every workspace path a canonical acceptance check NAMES — the subject it
+/// observes plus anything its command reads.
+///
+/// Lives beside [`canonicalize_acceptance`] for the same reason the shapes do:
+/// the write boundary owns what an acceptance check *is*, so a reader that
+/// disagreed with it about which files a check names would be the exact drift
+/// that let a stringified check pass admission and then be rejected at run
+/// time. Callers hold a typed check; they serialize it back to the canonical
+/// object and ask here, so there is one extraction, not two.
+///
+/// Deliberately conservative: only tokens that LOOK like a path are returned
+/// (see [`looks_like_path`]). A caller resolves them against its workdir and
+/// keeps the ones that are really files — the acceptance text is the bound on
+/// the set, and a token that resolves to nothing costs one failed stat.
+#[must_use]
+pub fn acceptance_referenced_paths(acceptance: &serde_json::Value) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    // `path` is a path by contract (file_exists, path-flavored regex).
+    if let Some(path) = acceptance.get("path").and_then(serde_json::Value::as_str) {
+        push_path_token(&mut paths, path);
+    }
+    for evidence in acceptance_evidence_paths(acceptance) {
+        push_path_token(&mut paths, &evidence);
+    }
+    paths
+}
+
+/// The subset of [`acceptance_referenced_paths`] that is the check's
+/// INSTRUMENT rather than its subject: the files its command reads.
+///
+/// The distinction is load-bearing, and it is a distinction the check kinds
+/// already draw. `file_exists` and a path-flavored `regex` observe their
+/// subject DIRECTLY — the named file is the deliverable, and producing it is
+/// the work, so there is no separable evidence to tamper with. A command
+/// check runs a program: `sh tests/test_01.sh` renders its verdict THROUGH
+/// that script, and a session that rewrites the script has changed what the
+/// verdict means without changing the work at all.
+///
+/// Callers that must not confuse "the model built the artifact" with "the
+/// model edited the judge" ask for this list, never the full one.
+#[must_use]
+pub fn acceptance_evidence_paths(acceptance: &serde_json::Value) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let Some(command) = acceptance
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return paths;
+    };
+    // Split on shell word boundaries only — this is identification, not shell
+    // parsing.
+    for token in command.split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&')) {
+        push_path_token(&mut paths, token);
+    }
+    paths
+}
+
+/// Append `candidate` to `paths` when it is an unambiguous path referent and
+/// not already present.
+fn push_path_token(paths: &mut Vec<String>, candidate: &str) {
+    let cleaned = trim_path_token(candidate);
+    if !cleaned.is_empty() && looks_like_path(cleaned) && !paths.iter().any(|p| p == cleaned) {
+        paths.push(cleaned.to_string());
+    }
+}
+
+/// Strip the punctuation a path token is wrapped in when it appears inside
+/// prose or a shell line (quotes, backticks, brackets, a trailing comma or
+/// sentence period). A trailing directory slash is kept — it is what makes
+/// "tests/" a path referent at all.
+fn trim_path_token(token: &str) -> &str {
+    let trimmed = token.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':')
+            || c.is_whitespace()
+    });
+    // A sentence period must go; an extension's period must stay. Only a
+    // TRAILING period directly after another period-free tail is punctuation.
+    trimmed.strip_suffix('.').unwrap_or(trimmed)
+}
+
+/// Does this token name a file or directory *explicitly*?
+///
+/// Three unambiguous shapes, and nothing else: a trailing separator
+/// ("tests/"), a glob ("tests/**"), or a dotted extension of at least two
+/// characters containing a letter ("run.sh", "src/main.rs"). Everything
+/// looser was rejected on purpose — a bare word ("tests") is a topic, not a
+/// path, and "e.g." / "1.2.3" are not files. Over-matching here would let
+/// prose register a durable prohibition the user never stated.
+#[must_use]
+pub fn looks_like_path(token: &str) -> bool {
+    if token.is_empty() || token.contains("://") || token.starts_with('-') {
+        return false;
+    }
+    let normalized = token.replace('\\', "/");
+    if normalized.ends_with('/') {
+        return true;
+    }
+    if normalized.contains('*') {
+        return true;
+    }
+    let last = normalized.rsplit('/').next().unwrap_or("");
+    let Some((stem, ext)) = last.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && ext.len() >= 2
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && ext.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The workspace file every write tool reads user-declared file prohibitions
+/// from. Same directory as the write ratchet's ledger — one place holds the
+/// per-workspace state the tool layer consults before mutating.
+pub const DECLARED_INVARIANTS_FILE: &str = ".nanna/declared_invariants.json";
+
+/// Schema version of [`DECLARED_INVARIANTS_FILE`]. The tool side fails open on
+/// anything it cannot read, so the version is a compatibility marker, never a
+/// gate.
+pub const DECLARED_INVARIANTS_VERSION: u64 = 1;
+
+/// One durable file prohibition the USER stated in chat.
+///
+/// `source` is the user's own sentence, verbatim: a refusal that paraphrases
+/// the constraint reads as a tool malfunction and gets routed around, while
+/// one that quotes the user is recognizably the user's own instruction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredInvariant {
+    /// `read_only` | `no_delete` | `no_create_under`.
+    pub kind: String,
+    /// The path or glob, in the canonical spelling the write ratchet uses.
+    pub glob: String,
+    /// The user's verbatim sentence that declared it.
+    pub source: String,
+    /// The scope that declared it (a task scope id, or "session").
+    pub scope: String,
+}
+
+/// Words that make a sentence a PROHIBITION rather than a description.
+const INVARIANT_NEGATIONS: &[&str] = &[
+    "never",
+    "do not",
+    "don't",
+    "dont",
+    "must not",
+    "mustn't",
+    "cannot",
+    "can not",
+    "shall not",
+    "should not",
+    "shouldn't",
+    "hands off",
+];
+
+/// Standing declarations that ARE the prohibition (no verb needed).
+const INVARIANT_DECLARATIONS: &[&str] = &[
+    "read-only",
+    "readonly",
+    "is read only",
+    "are read only",
+    "as read only",
+    "off-limits",
+    "off limits",
+];
+
+/// Anything that makes the sentence conditional, hedged, or permissive. A
+/// durable constraint is unconditional by definition, so any of these means
+/// the sentence registers NOTHING.
+const INVARIANT_AMBIGUITY: &[&str] = &[
+    "if ",
+    "unless",
+    "except",
+    "when ",
+    "while ",
+    "maybe",
+    "might",
+    "probably",
+    "not sure",
+    "unsure",
+    "you can ",
+    "you may ",
+    "feel free",
+    "ok to ",
+    "okay to ",
+    "fine to ",
+    "allowed to",
+    "prefer not",
+    "try not",
+];
+
+/// Extract durable file prohibitions from the user's own text.
+///
+/// The contract is deliberately lopsided: the tool layer FAILS OPEN when the
+/// registry is absent, so a missed constraint costs exactly today's behavior
+/// while an invented one blocks work the user asked for. Everything below is
+/// therefore a reason to register nothing — only an imperative sentence with
+/// an explicit path referent and an unambiguous verb ever produces an entry.
+///
+/// Bound: the registry is what the user actually said. One entry per (kind,
+/// path) named in the text; no caps, because there is no growth term that is
+/// not the user typing.
+#[must_use]
+pub fn extract_declared_invariants(text: &str, scope: &str) -> Vec<DeclaredInvariant> {
+    let mut out: Vec<DeclaredInvariant> = Vec::new();
+    for sentence in split_sentences(text) {
+        let source = sentence.trim().trim_end_matches(['.', '!', ';']).trim();
+        if source.is_empty() {
+            continue;
+        }
+        let lower = source.to_lowercase();
+        // A question asks; it does not declare.
+        if sentence.trim_end().ends_with('?') || lower.contains(" or should ") {
+            continue;
+        }
+        if INVARIANT_AMBIGUITY.iter().any(|m| lower.contains(m)) {
+            continue;
+        }
+        let negated = INVARIANT_NEGATIONS.iter().any(|m| lower.contains(m));
+        let declared = INVARIANT_DECLARATIONS.iter().any(|m| lower.contains(m));
+        if !negated && !declared {
+            continue;
+        }
+        let kinds = prohibited_kinds(&lower, negated, declared);
+        if kinds.is_empty() {
+            continue;
+        }
+        for token in source.split_whitespace() {
+            let cleaned = trim_path_token(token);
+            if cleaned.is_empty() || !looks_like_path(cleaned) {
+                continue;
+            }
+            let glob = normalize_invariant_glob(cleaned);
+            if glob.is_empty() {
+                continue;
+            }
+            for kind in &kinds {
+                if out.iter().any(|e| e.kind == *kind && e.glob == glob) {
+                    continue;
+                }
+                out.push(DeclaredInvariant {
+                    kind: (*kind).to_string(),
+                    glob: glob.clone(),
+                    source: source.to_string(),
+                    scope: scope.to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Which prohibition kinds does this (already-negated or already-declarative)
+/// sentence state? A negation with no recognized verb states nothing — "never
+/// again with tests/run.sh" is not a file rule.
+fn prohibited_kinds(lower: &str, negated: bool, declared: bool) -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    let mut add = |kind: &'static str| {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    };
+    if declared {
+        add("read_only");
+    }
+    if negated {
+        const MODIFY: &[&str] = &[
+            "edit", "modify", "change", "rewrite", "overwrite", "alter", "update", "touch",
+            "write", "patch",
+        ];
+        // " rm " keeps its spaces on purpose: the bare substring lives inside
+        // "perform", and a prohibition invented out of "do not perform" is
+        // exactly the over-registration this extractor exists to avoid.
+        const DELETE: &[&str] = &["delete", "remove", "erase", "unlink", "wipe", " rm "];
+        const CREATE: &[&str] = &["create", "add ", "new file", "generate", "scaffold"];
+        if MODIFY.iter().any(|v| lower.contains(v)) {
+            add("read_only");
+        }
+        if DELETE.iter().any(|v| lower.contains(v)) {
+            add("no_delete");
+        }
+        if CREATE.iter().any(|v| lower.contains(v)) {
+            add("no_create_under");
+        }
+    }
+    kinds
+}
+
+/// Sentence split that a path can survive: only a terminator FOLLOWED BY
+/// whitespace (or end of text) ends a sentence, so "config.json" stays whole
+/// while "…config.json. Fix the code" splits. Newlines always split — a list
+/// of rules is a list of sentences.
+fn split_sentences(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in text.char_indices() {
+        let terminator = matches!(c, '.' | '!' | '?' | ';' | '\n');
+        if !terminator {
+            continue;
+        }
+        let next = bytes.get(i + c.len_utf8());
+        let ends_here = c == '\n'
+            || next.is_none()
+            || next.is_some_and(|b| b.is_ascii_whitespace());
+        if !ends_here {
+            continue;
+        }
+        let end = i + c.len_utf8();
+        out.push(&text[start..end]);
+        start = end;
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// The canonical spelling of a declared glob: the SAME normalization the write
+/// ratchet's ledger key uses (backslashes to slashes, lowercase, no `./`
+/// prefix, no doubled or trailing separators), so one file has one identity on
+/// both sides of the contract.
+#[must_use]
+pub fn normalize_invariant_glob(glob: &str) -> String {
+    let mut key = glob.replace('\\', "/").to_lowercase();
+    while let Some(rest) = key.strip_prefix("./") {
+        key = rest.to_string();
+    }
+    while key.contains("//") {
+        key = key.replace("//", "/");
+    }
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    key
+}
+
+/// Fold freshly-extracted invariants into the registry document already on
+/// disk, returning the new document — or `None` when nothing changed, so a
+/// turn that declares nothing new never rewrites the file.
+///
+/// Invariants ACCUMULATE: a constraint stated three turns ago is still the
+/// user's instruction this turn, and only the user lifts one. An unreadable or
+/// malformed existing document is treated as empty (the same fail-open rule
+/// the tool side applies), so a corrupted registry heals on the next
+/// declaration instead of wedging.
+#[must_use]
+pub fn merge_declared_invariants(
+    existing_json: &str,
+    fresh: &[DeclaredInvariant],
+) -> Option<String> {
+    let mut merged: Vec<DeclaredInvariant> = serde_json::from_str::<serde_json::Value>(existing_json)
+        .ok()
+        .and_then(|v| v.get("invariants").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<DeclaredInvariant>>(v).ok())
+        .unwrap_or_default();
+    let mut added = 0usize;
+    for invariant in fresh {
+        if merged
+            .iter()
+            .any(|e| e.kind == invariant.kind && e.glob == invariant.glob)
+        {
+            continue;
+        }
+        merged.push(invariant.clone());
+        added += 1;
+    }
+    if added == 0 {
+        return None;
+    }
+    serde_json::to_string_pretty(&serde_json::json!({
+        "version": DECLARED_INVARIANTS_VERSION,
+        "invariants": merged,
+    }))
+    .ok()
+}
+
 fn is_blocked(task: &Task, by_id: &HashMap<i64, &Task>) -> bool {
     task.depends_on.iter().any(|dep| {
         by_id
@@ -2465,5 +2844,137 @@ mod tests {
         repo.complete(a.id, None, None).await.unwrap();
         let (open, closed) = repo.counts("session", Some("s1")).await.unwrap();
         assert_eq!((open, closed), (1, 1));
+    }
+
+    // -----------------------------------------------------------------
+    // Acceptance evidence inputs (P23)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn referenced_paths_finds_the_files_a_check_names() {
+        let check = serde_json::json!({"kind": "command", "command": "sh tests/test_01.sh"});
+        assert_eq!(
+            acceptance_referenced_paths(&check),
+            vec!["tests/test_01.sh".to_string()]
+        );
+        let file = serde_json::json!({"kind": "file_exists", "path": "build/minidb.exe"});
+        assert_eq!(
+            acceptance_referenced_paths(&file),
+            vec!["build/minidb.exe".to_string()]
+        );
+        // Flags and bare words are not path referents — a false referent
+        // costs a stat, but a false PROHIBITION would block real work.
+        let noisy =
+            serde_json::json!({"kind": "command", "command": "cargo test --all -p nanna"});
+        assert!(acceptance_referenced_paths(&noisy).is_empty());
+    }
+
+    /// The instrument/subject split. A `file_exists` (or path-`regex`) check
+    /// observes its subject directly: the named file is the DELIVERABLE, and
+    /// producing it is the work — treating that as evidence tampering would
+    /// make every first completion suspicious. Only a command check has an
+    /// instrument that can be edited out from under the verdict.
+    #[test]
+    fn only_a_command_check_has_evidence_inputs() {
+        let file = serde_json::json!({"kind": "file_exists", "path": "artifact.txt"});
+        assert!(acceptance_evidence_paths(&file).is_empty());
+        let path_regex =
+            serde_json::json!({"kind": "regex", "pattern": "PASS", "path": "report.txt"});
+        assert!(acceptance_evidence_paths(&path_regex).is_empty());
+        assert_eq!(
+            acceptance_referenced_paths(&path_regex),
+            vec!["report.txt".to_string()],
+            "the subject still carries artifact identity onto the completion record"
+        );
+
+        let command = serde_json::json!({"kind": "command", "command": "sh tests/test_01.sh"});
+        assert_eq!(
+            acceptance_evidence_paths(&command),
+            vec!["tests/test_01.sh".to_string()]
+        );
+        let command_regex = serde_json::json!({
+            "kind": "regex", "pattern": "0 failed", "command": "sh tests/run_all.sh"
+        });
+        assert_eq!(
+            acceptance_evidence_paths(&command_regex),
+            vec!["tests/run_all.sh".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_referents_reject_prose_that_merely_contains_a_dot() {
+        assert!(!looks_like_path("e.g."));
+        assert!(!looks_like_path("1.2.3"));
+        assert!(!looks_like_path("tests"));
+        assert!(!looks_like_path("https://example.com/x.sh"));
+        assert!(looks_like_path("tests/"));
+        assert!(looks_like_path("tests/**"));
+        assert!(looks_like_path("src/main.rs"));
+    }
+
+    // -----------------------------------------------------------------
+    // User-declared file invariants (P23)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn declared_invariants_register_the_imperative_with_a_path() {
+        let found = extract_declared_invariants(
+            "Fix the failing behaviour in ./minidb. Never create, edit or delete \
+             anything under tests/.",
+            "session",
+        );
+        let kinds: Vec<&str> = found.iter().map(|i| i.kind.as_str()).collect();
+        assert!(kinds.contains(&"read_only"), "{found:?}");
+        assert!(kinds.contains(&"no_delete"), "{found:?}");
+        assert!(kinds.contains(&"no_create_under"), "{found:?}");
+        assert!(found.iter().all(|i| i.glob == "tests"), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|i| i.source == "Never create, edit or delete anything under tests/"),
+            "the user's own sentence must be quotable verbatim: {found:?}"
+        );
+        // The other sentence names a path but states no prohibition.
+        assert!(found.iter().all(|i| i.glob != "minidb"), "{found:?}");
+    }
+
+    #[test]
+    fn declared_invariants_register_nothing_when_the_phrasing_is_ambiguous() {
+        // Conditional, hedged, permissive, interrogative, and path-free —
+        // every one registers nothing, because the tool layer fails open and a
+        // missed constraint costs only today's behavior.
+        for text in [
+            "If the test is wrong, do not edit tests/run.sh",
+            "Try not to edit tests/run.sh",
+            "You can edit tests/run.sh, but do not delete it",
+            "Should I avoid editing tests/run.sh?",
+            "Never touch the tests",
+            "Never again with this task",
+        ] {
+            assert!(
+                extract_declared_invariants(text, "session").is_empty(),
+                "must register nothing: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_invariants_accumulate_and_stay_idempotent() {
+        let first = extract_declared_invariants("tests/ is read-only.", "session");
+        assert_eq!(first.len(), 1, "{first:?}");
+        let doc = merge_declared_invariants("", &first).expect("first declaration writes");
+        assert!(doc.contains("\"version\": 1"), "{doc}");
+        assert!(doc.contains("read_only"), "{doc}");
+        // Re-declaring the same constraint changes nothing — a turn that adds
+        // no new rule must not rewrite the registry.
+        assert!(merge_declared_invariants(&doc, &first).is_none());
+        // A NEW constraint folds in beside the old one; nothing is dropped.
+        let more = extract_declared_invariants("Never delete docs/plan.md.", "session");
+        let merged = merge_declared_invariants(&doc, &more).expect("a new rule writes");
+        assert!(merged.contains("tests"), "{merged}");
+        assert!(merged.contains("docs/plan.md"), "{merged}");
+        // A corrupted registry is treated as empty, never as a wedge.
+        let healed = merge_declared_invariants("{not json", &first).expect("heals");
+        assert!(healed.contains("read_only"), "{healed}");
     }
 }

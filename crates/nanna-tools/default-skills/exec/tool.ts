@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.5",
+  version: "0.1.6",
   output: "memory",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -333,6 +333,22 @@ export default {
       result = Nanna.exec(input.command, input.workdir, input.timeout);
     } catch (e) {
       var bridgeErr = String(e && e.message ? e.message : e);
+      // A deadline is not a spawn failure. The script engine's own ceiling
+      // (this skill's `timeout: 180`) can only fire AFTER the command has been
+      // running for that long, so "Nothing ran" is exactly backwards — and it
+      // is the sentence the model remembers when it decides whether to re-run
+      // a command that already did half its work. Matched on the full message,
+      // before the truncation below, so a long error can never hide it.
+      if (bridgeErr.indexOf("Timeout after") !== -1) {
+        return {
+          content: "exec hit its deadline (" + bridgeErr + ") and the command was killed. It " +
+            "RAN for that whole time — this is NOT a failure to start — and it may have left " +
+            "side effects; disk is truth, so check with ls/cat before re-running. Any output " +
+            "it had produced was lost with the kill. Re-run something narrower, or pass a " +
+            "larger `timeout`.",
+          success: false
+        };
+      }
       if (bridgeErr.length > 200) bridgeErr = bridgeErr.substring(0, 200);
       var hint = "";
       if (bridgeErr.indexOf("directory name is invalid") !== -1 || bridgeErr.indexOf("os error 267") !== -1) {
@@ -346,13 +362,38 @@ export default {
       };
     }
 
+    // A deadline-exceeded run comes back as a RESULT, not a throw: the bridge
+    // kills the tree and hands over what the command had already produced.
+    // Killing it does not un-run it, and the failure line the model remembers
+    // is what decides whether the next turn re-runs a command that already
+    // created half its files. A bridge that carries no `timed_out` field never
+    // enters this branch, so the behaviour there is exactly as before.
+    var timedOut = result.timed_out === true;
+
     var output = result.stdout;
     if (result.stderr) {
       output += output ? "\n" : "";
       output += "--- stderr ---\n" + result.stderr;
     }
 
-    if (!result.success) {
+    if (timedOut) {
+      var elapsedText = typeof result.elapsed_ms === "number" && isFinite(result.elapsed_ms)
+        ? "ran for " + (result.elapsed_ms / 1000).toFixed(1) + "s, killed at the "
+        : "was killed at the ";
+      // The deadline the caller ASKED for. When it was omitted the bridge
+      // auto-detects one from the command, so quote the rule rather than
+      // guessing a number this side cannot know.
+      var askedTimeout = parseInt(input.timeout, 10);
+      var deadlineText = isFinite(askedTimeout) && askedTimeout > 0
+        ? askedTimeout + "s deadline"
+        : "auto-detected deadline (30s, or 120s for git/cargo/npm/build tools)";
+      output = "TIMED OUT — " + elapsedText + deadlineText + " — the command executed and may " +
+        "have left side effects; disk is truth. Whatever it wrote, created or deleted before " +
+        "the kill is still there: check with ls/cat before re-running, then narrow the command " +
+        "or raise `timeout`." +
+        (output ? "\n\nOutput captured before the kill:\n" + output
+                : "\n\nIt had produced no output when the deadline fired.");
+    } else if (!result.success) {
       output = "Command failed (exit code " + result.code + ")\n" + output;
     }
 
@@ -504,6 +545,8 @@ export default {
       // The verdict is informational only — never affects the result.
     }
 
-    return { content: output || "(no output)", success: result.success };
+    // A killed command never succeeded, whatever the bridge recorded for a run
+    // that has no exit status of its own.
+    return { content: output || "(no output)", success: timedOut ? false : result.success };
   }
 }

@@ -1,6 +1,6 @@
 export default {
   name: "read_file",
-  version: "0.1.2",
+  version: "0.1.3",
   output: "memory",
   description: "Read a file from the filesystem. Returns the file contents with line numbers. Supports optional offset and limit for reading portions of large files.",
   parameters: {
@@ -30,6 +30,18 @@ export default {
     } catch (e) {
       return {
         content: "read_file: '" + filePath + "' does not exist (or is unreadable). Nothing was read. Check the path, or create the file first if you meant to write it.",
+        success: false
+      };
+    }
+    // The converse of the listing tools' file-for-directory case, and the
+    // stat that answers it is already in hand — zero extra syscalls. It also
+    // closes a latent uncaught throw: Nanna.readFile on a directory raises
+    // OUTSIDE any try here, so it escaped as an "Execution failed:" prefix,
+    // exactly what lines 17-19 above say must never happen.
+    if (stat.is_dir) {
+      return {
+        content: "read_file: '" + filePath + "' is a DIRECTORY, not a file — use list_dir to " +
+          "see its contents. Nothing was read.",
         success: false
       };
     }

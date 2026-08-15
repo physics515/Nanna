@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.8",
+  version: "0.1.9",
   output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. After each edit the cheapest structural check (sh -n / node --check / JSON.parse) runs on the result and its verdict is appended — including whether the file parsed before the edit. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -98,13 +98,19 @@ export default {
       var p = ".__prev__";
       return key.length >= p.length && key.lastIndexOf(p) === key.length - p.length;
     }
+    // The coverage high-water park write_file maintains — a recovery copy
+    // like .__prev__, rewritten wholesale, never judged by history.
+    function hiwaterIsBest(key) {
+      var b = ".__best__";
+      return key.length >= b.length && key.lastIndexOf(b) === key.length - b.length;
+    }
     function hiwaterIsState(key) {
       if (key === ".nanna/write_hiwater.json") return true;
       var tail = "/.nanna/write_hiwater.json";
       return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
     }
     function hiwaterExempt(key) {
-      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsState(key);
+      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsBest(key) || hiwaterIsState(key);
     }
     function hiwaterLoad() {
       try {
@@ -194,7 +200,7 @@ export default {
       }
     }
 
-    function hiwaterRecord(path, newSize, prevSize, verdict) {
+    function hiwaterRecord(path, newSize, prevSize, verdict, goodSyms) {
       try {
         var key = hiwaterKey(path);
         if (hiwaterExempt(key)) return;
@@ -206,13 +212,24 @@ export default {
         if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi) {
           hi = entry.hi;
         }
+        // Rebuilt from scratch, which is also how write_file's structural
+        // shrink hold clears its `heldGut` signature: any successful
+        // mutation drops it and the hold re-arms for the next removal event.
         var next = { hi: hi, last: newSize, at: Date.now() };
         if (entry) {
           if (hiwaterGood(entry) > 0) {
             next.good = entry.good;
             next.goodAt = entry.goodAt || 0;
+            if (Array.isArray(entry.goodSyms)) {
+              next.goodSyms = entry.goodSyms;
+            }
           }
           if (entry.chk === "ok" || entry.chk === "bad") next.chk = entry.chk;
+          // write_file's coverage high-water record survives in-band edits.
+          if (typeof entry.bestSyms === "number" && isFinite(entry.bestSyms)) {
+            next.bestSyms = entry.bestSyms;
+            next.bestAt = entry.bestAt || 0;
+          }
         }
         // A structural verdict updates the evidence: a pass records this
         // size as the new good anchor, either outcome records the state the
@@ -222,6 +239,16 @@ export default {
           if (verdict.ok) {
             next.good = newSize;
             next.goodAt = Date.now();
+            // The anchor's definition set rebases WITH its size (P23): the
+            // structural shrink hold in write_file measures removals against
+            // it, and a set left over from an older good version would name
+            // definitions this edit legitimately removed. Always replaced,
+            // never carried past a rebase.
+            if (Array.isArray(goodSyms)) {
+              next.goodSyms = goodSyms;
+            } else {
+              delete next.goodSyms;
+            }
           }
         }
         map[key] = next;
@@ -229,6 +256,174 @@ export default {
       } catch (e) {
         // Best-effort.
       }
+    }
+    // Top-level definition names of a version — the same single-regex pass
+    // write_file's rewrite-note uses (shell functions `name() {`, case arms
+    // `name)`, def/class/function declarations at line starts), reduced to
+    // sorted unique names because only membership matters here. One whole-
+    // string regex pass, no per-line split (the Boa split-cost lesson).
+    function symbolNames(text) {
+      var re = /^[ \t]*(?:([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(\)[ \t]*\{?[ \t]*$|(?:def|class|function)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)|([A-Za-z_][A-Za-z0-9_-]*)\)[ \t]*$)/gm;
+      var seen = {};
+      var names = [];
+      var m;
+      while ((m = re.exec(text)) !== null) {
+        var n = m[1] || m[2] || m[3];
+        if (n && seen[n] === undefined) {
+          seen[n] = 1;
+          names.push(n);
+        }
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+      names.sort();
+      return names;
+    }
+
+    // USER-DECLARED FILE INVARIANTS (P23), shared contract with write_file /
+    // file_buffer (full design comment in write_file). Durable prohibitions
+    // the USER stated in chat are registered at plan time and consulted
+    // before any mutation; the refusal quotes the user's own sentence back.
+    // Missing, unreadable or malformed registry => NO invariants (fail open,
+    // silently), and force does NOT bypass — only the user lifts a
+    // constraint, and ask_user is the wanted escape hatch.
+    var INVARIANT_STATE = ".nanna/declared_invariants.json";
+    function invariantsLoad() {
+      try {
+        var raw = Nanna.readFile(INVARIANT_STATE);
+        if (!raw) return [];
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return [];
+        var list = parsed.invariants;
+        if (!Array.isArray(list)) return [];
+        return list;
+      } catch (e) {
+        return [];
+      }
+    }
+    // `**` crosses directory separators, `*`/`?` stop at one; a wildcard-free
+    // glob matches the path itself or anything under it. Matching runs over
+    // the same canonical spelling the ratchet ledger uses. Fails open.
+    function invariantMatches(glob, canonPath, normPath) {
+      try {
+        // Canonical on BOTH sides: an absolute glob under the workspace
+        // root collapses to the relative form exactly as the path does.
+        var g = hiwaterKey(String(glob));
+        while (g.length > 1 && g.charAt(g.length - 1) === "/") g = g.substring(0, g.length - 1);
+        if (g === "") return false;
+        if (g.indexOf("*") === -1 && g.indexOf("?") === -1) {
+          return canonPath === g || normPath === g ||
+            canonPath.indexOf(g + "/") === 0 || normPath.indexOf(g + "/") === 0;
+        }
+        var re = "";
+        for (var i = 0; i < g.length; i++) {
+          var c = g.charAt(i);
+          if (c === "*") {
+            if (g.charAt(i + 1) === "*") {
+              re += "[\\s\\S]*";
+              i++;
+              if (g.charAt(i + 1) === "/") i++;
+            } else {
+              re += "[^/]*";
+            }
+          } else if (c === "?") {
+            re += "[^/]";
+          } else if ("\\^$.|+()[]{}".indexOf(c) !== -1) {
+            re += "\\" + c;
+          } else {
+            re += c;
+          }
+        }
+        var rx = new RegExp("^" + re + "$");
+        return rx.test(canonPath) || rx.test(normPath);
+      } catch (e) {
+        return false;
+      }
+    }
+    function invariantRefusal(path, verb) {
+      try {
+        var list = invariantsLoad();
+        if (list.length === 0) return "";
+        var canon = hiwaterKey(path);
+        var norm = hiwaterNormKey(path);
+        for (var i = 0; i < list.length; i++) {
+          var inv = list[i];
+          if (!inv || typeof inv !== "object") continue;
+          var kind = typeof inv.kind === "string" ? inv.kind : "";
+          // `no_delete` is about deletion and is enforced where deletions
+          // happen; an edit is neither a creation nor a deletion, so
+          // `no_create_under` cannot bite here either — edit_file only ever
+          // changes a file that already exists.
+          if (kind !== "read_only") continue;
+          if (typeof inv.glob !== "string") continue;
+          if (!invariantMatches(inv.glob, canon, norm)) continue;
+          var quoted = typeof inv.source === "string" && inv.source !== "" ? inv.source : "";
+          var scope = typeof inv.scope === "string" && inv.scope !== "" ? inv.scope : "session";
+          glog("edit_file guard: " + verb + " REFUSED (declared invariant " + kind + " on '" + inv.glob + "') " + path);
+          return verb + " REFUSED — " + path + " is under a path you declared off-limits" +
+            (quoted === "" ? " (" + kind + " on `" + inv.glob + "`)" : ": \"" + quoted + "\"") +
+            ". Nothing was changed and the file on disk is intact. That is YOUR instruction (declared for " +
+            scope + "), not a tool limitation, and it stays in force until you lift it in chat. " +
+            "The fix belongs in the artifact you are producing — if something that READS " + path +
+            " is failing, change the code it exercises, not " + path + ". If you believe this constraint " +
+            "genuinely blocks the goal, ask_user about it instead of working around it.";
+        }
+        return "";
+      } catch (e) {
+        return "";
+      }
+    }
+
+    // WRITE-FAILURE HONESTY (P23), shared with write_file / file_buffer (full
+    // design comment in write_file): classify BEFORE truncating, always keep
+    // the trailing cause, and only offer a retry for a plausibly transient
+    // fault. Parses both the current bridge format and one carrying the
+    // stable ErrorKind name, falling back to the locale-independent OS error
+    // number.
+    function writeErrorKind(msg) {
+      var m = /\(kind=([A-Za-z]+)\)/.exec(msg);
+      if (m) return m[1];
+      if (msg.indexOf("(os error 5)") !== -1 || msg.indexOf("(os error 13)") !== -1) return "PermissionDenied";
+      if (msg.indexOf("(os error 32)") !== -1 || msg.indexOf("(os error 33)") !== -1) return "SharingViolation";
+      if (msg.indexOf("(os error 4)") !== -1) return "Interrupted";
+      return "";
+    }
+    function writeErrorTransient(kind) {
+      return kind === "Interrupted" || kind === "TimedOut" || kind === "WouldBlock" ||
+        kind === "SharingViolation" || kind === "ResourceBusy";
+    }
+    // The same 120-char identification width as before, split so the trailing
+    // cause survives the cut.
+    function preserveCause(msg) {
+      if (msg.length <= 120) return msg;
+      return msg.substring(0, 80) + " … " + msg.substring(msg.length - 40);
+    }
+    function writeFailureNote(path, rawErr, retryAdvice) {
+      var kind = writeErrorKind(rawErr);
+      var shown = preserveCause(rawErr);
+      if (kind === "PermissionDenied") {
+        // FileStat carries no read-only bit, so the stat distinguishes what
+        // it CAN and the sentence claims only the denial the OS reported.
+        var what = " The filesystem refused the write, not this tool.";
+        try {
+          var st = Nanna.stat(path);
+          if (st && st.is_dir) {
+            what = " " + path + " is a DIRECTORY, not a file — writing to it can never work.";
+          } else if (st && st.is_file) {
+            what = " " + path + " exists and is write-protected on disk.";
+          }
+        } catch (eStat) {
+          what = " The path cannot even be stat'ed, so the protection is on the file or on the directory holding it.";
+        }
+        return "(" + shown + ")." + what +
+          " Retrying the identical call cannot succeed — nothing transient failed. " +
+          "Write protection is usually deliberate: it marks the file as INPUT. Unless the request is " +
+          "specifically to change THIS file, leave the protection in place and change the file you are producing instead.";
+      }
+      if (kind === "" || writeErrorTransient(kind)) {
+        return "(" + shown + "). " + retryAdvice;
+      }
+      return "(" + shown + "). That failure is not transient — retrying the identical call will fail the same way. " +
+        "Fix what the cause names (the path, the directory, the disk) and then write again.";
     }
 
     // Collapse whitespace runs in one line: leading/trailing dropped,
@@ -451,6 +646,41 @@ export default {
       return " STRUCTURE: " + path + " does NOT parse (" + verdict.tool + "): " + verdict.detail + "." + history +
         " This is information, not a block — the edit was applied exactly as sent. Fix that line with another edit_file.";
     }
+    // LITERAL-ESCAPE VERDICT (P23), shell-checked files only — shared with
+    // write_file (full design comment there). A physical line that is a
+    // COMMENT and carries two or more literal backslash-n sequences is a
+    // flattened block hiding behind a '#': sh gives comments no escape
+    // semantics, so the file parses cleanly and the hidden code silently
+    // never runs. A SENTENCE, never a gate and never a repair — converting on
+    // a heuristic would ACTIVATE code the author may not have meant to run.
+    // Comment scoping keeps printf/awk lines with legitimate literal \n out.
+    // Fails open.
+    function escapedCommentNote(kind, text) {
+      if (kind !== "sh" && kind !== "bash") return "";
+      try {
+        if (typeof text !== "string" || text.indexOf("\\n") === -1) return "";
+        var re = /^[ \t]*#[^\n]*$/gm;
+        var m;
+        var scanned = 0;
+        var lineNo = 1;
+        while ((m = re.exec(text)) !== null) {
+          while (scanned < m.index) {
+            if (text.charAt(scanned) === "\n") lineNo++;
+            scanned++;
+          }
+          var hits = m[0].split("\\n").length - 1;
+          if (hits >= 2) {
+            return " NOTE: line " + lineNo + " is a comment carrying " + hits +
+              " literal \\n sequences — flattened code may be hiding behind it;" +
+              " if you meant newlines, rewrite the file.";
+          }
+          if (m.index === re.lastIndex) re.lastIndex++;
+        }
+        return "";
+      } catch (e) {
+        return "";
+      }
+    }
 
     // Accept multiple parameter name variants from different models
     var filePath = input.file_path || input.filePath || input.path || input.file;
@@ -483,6 +713,12 @@ export default {
     if (oldStr === "") {
       return fail("edit_file failed: old_string is empty. Nothing was changed. edit_file replaces an existing snippet; to create a file or replace its entire content, use write_file with the complete text.");
     }
+
+    // The user's own declared prohibitions come FIRST — before the file is
+    // even read, and well before the syntax gate writes .__chk temp files
+    // beside the target.
+    var invBlock = invariantRefusal(filePath, "EDIT");
+    if (invBlock !== "") return fail(invBlock);
 
     var content;
     try {
@@ -688,9 +924,12 @@ export default {
     try {
       Nanna.writeFile(filePath, updated);
     } catch (e2) {
-      var writeErr = String(e2);
-      if (writeErr.length > 120) writeErr = writeErr.substring(0, 120) + "...";
-      return fail("edit_file failed writing " + filePath + " (" + writeErr + "). Retry the same edit_file call; if it fails again, read the file to verify its current state before editing.");
+      // Classify BEFORE truncating (P23): the cause is the tail, and the
+      // advice that follows it must match the cause — a permission denial is
+      // not something a retry can fix.
+      return fail("edit_file failed writing " + filePath + " " +
+        writeFailureNote(filePath, String(e2),
+          "Retry the same edit_file call; if it fails again, read the file to verify its current state before editing."));
     }
 
     // Structural verdict on the result (P22). The .py gate above already
@@ -717,10 +956,22 @@ export default {
     // guard armed across surgical edits — otherwise every edit looks
     // out-of-band and hands the next rewrite a fresh current-size floor (the
     // 2-call nibble+rewrite erosion loop from the verify round). Best-effort,
-    // fails open.
-    hiwaterRecord(filePath, updated.length, content.length, verdict);
+    // fails open. A passing verdict also rebases the structural anchor
+    // write_file's shrink hold measures against (P23) — computed only on the
+    // rebase, so ordinary failing/absent verdicts pay nothing.
+    var editGoodSyms = null;
+    if (verdict && verdict.ok) {
+      try {
+        editGoodSyms = symbolNames(updated);
+      } catch (eSyms) {
+        // No anchor is safer than a stale one — hiwaterRecord drops it.
+        editGoodSyms = null;
+      }
+    }
+    hiwaterRecord(filePath, updated.length, content.length, verdict, editGoodSyms);
 
-    var structNote = structSentence(filePath, verdict, prevChk);
+    var structNote = structSentence(filePath, verdict, prevChk) +
+      (input.force === true ? "" : escapedCommentNote(checkKind, updated));
     if (verdict && !verdict.ok) {
       glog("edit_file structure: " + filePath + " does NOT parse after edit (" + verdict.tool + "): " + verdict.detail + (prevChk === "ok" ? " [parsed before this edit]" : ""));
     } else if (verdict && verdict.ok && prevChk === "bad") {

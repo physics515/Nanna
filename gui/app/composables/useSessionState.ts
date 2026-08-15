@@ -55,6 +55,12 @@ export interface TimelineEntry {
   /** Tokens spent by the request that issued this call / run total then. */
   tokens?: number | null
   total_tokens?: number | null
+  /** P22 Tier 4 breaker replay: the harness answered this call itself and the
+   *  tool never ran. `success` is false because there is no tool result, but
+   *  nothing failed — steering, not an error. Live-stream only; the daemon's
+   *  own journal does not carry the marker, so a restored timeline renders
+   *  these as plain failures until it does. */
+  short_circuited?: boolean | null
 }
 
 interface SessionState {
@@ -278,7 +284,14 @@ export function useSessionState(sessionId: Ref<string | null>) {
    *  response), and matching a completed record would overwrite an earlier
    *  call's outcome. With no open match, a fresh item records the outcome
    *  so the call can never vanish from the journal. */
-  function timelineToolEnd(id: string, name: string, output: string, success: boolean, durationMs: number) {
+  function timelineToolEnd(
+    id: string,
+    name: string,
+    output: string,
+    success: boolean,
+    durationMs: number,
+    shortCircuited = false,
+  ) {
     if (!state.value) return
     const items = state.value.liveTimeline
     for (let i = items.length - 1; i >= 0; i--) {
@@ -287,6 +300,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
         item.output = output
         item.success = success
         item.duration_ms = durationMs
+        item.short_circuited = shortCircuited
         return
       }
     }
@@ -300,6 +314,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
       duration_ms: durationMs,
       tokens: null,
       total_tokens: null,
+      short_circuited: shortCircuited,
       at: new Date().toISOString(),
     })
   }

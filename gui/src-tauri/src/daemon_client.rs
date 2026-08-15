@@ -137,6 +137,9 @@ pub enum DaemonEvent {
     /// design: the workspace SET is shared, which one is active is this
     /// client's own view.
     WorkspacesChanged,
+    /// The daemon's config was mutated and committed. Payload-free by design:
+    /// each view re-fetches the slice it renders.
+    ConfigChanged,
 }
 
 /// Pending request waiting for response

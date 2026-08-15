@@ -88,7 +88,11 @@ function toToolCall(item: TimelineEntry) {
   }
 }
 
-function toolStatus(item: TimelineEntry): 'started' | 'completed' | 'error' {
+function toolStatus(item: TimelineEntry): 'started' | 'completed' | 'error' | 'steering' {
+  // Breaker replay: the harness answered the call itself and the tool never
+  // ran. `success` is false only because there is no tool result — nothing
+  // failed, so it must not wear the error styling.
+  if (item.short_circuited === true) return 'steering'
   if (item.success === null || item.success === undefined) {
     // Live: genuinely still running. Finalized history: the run ended
     // without this call completing (stop/crash/fault mid-call) — a

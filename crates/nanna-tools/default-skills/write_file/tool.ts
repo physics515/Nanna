@@ -1,8 +1,8 @@
 export default {
   name: "write_file",
-  version: "0.1.15",
+  version: "0.1.16",
   output: "memory",
-  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery.",
+  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); a shrinking rewrite that deletes more top-level sections than it keeps is held ONCE with the current content and the removed names — send the same content again to confirm the deletions; blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery and the richest earlier version at <file>.__best__.",
   parameters: {
     type: "object",
     properties: {
@@ -158,6 +158,12 @@ export default {
       var p = ".__prev__";
       return key.length >= p.length && key.lastIndexOf(p) === key.length - p.length;
     }
+    // The coverage high-water park (below) is a recovery copy like .__prev__:
+    // rewritten wholesale, never judged by cross-call history.
+    function hiwaterIsBest(key) {
+      var b = ".__best__";
+      return key.length >= b.length && key.lastIndexOf(b) === key.length - b.length;
+    }
     // Exact path only (root or any /.nanna/ dir), so a real work file with a
     // similar name keeps full ratchet protection.
     function hiwaterIsState(key) {
@@ -166,7 +172,7 @@ export default {
       return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
     }
     function hiwaterExempt(key) {
-      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsState(key);
+      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsBest(key) || hiwaterIsState(key);
     }
     function hiwaterLoad() {
       try {
@@ -233,6 +239,201 @@ export default {
         return merged;
       }
       return a;
+    }
+    // Sign an acknowledged removal set onto the ratchet entry (P23 structural
+    // shrink hold, below). A follow-up write whose removal set signs the same
+    // proceeds — the deletions were named and in view when it was re-sent —
+    // and every successful write rebuilds the entry from scratch, so the
+    // signature clears itself and the hold re-arms for the next removal
+    // event. Best-effort: an unrecorded signature costs one more hold, never
+    // a write.
+    function heldGutPut(path, sig) {
+      try {
+        var map = hiwaterLoad();
+        var key = hiwaterKey(path);
+        var entry = hiwaterEntryFor(map, path);
+        if (!entry) entry = { hi: 0, last: 0, at: Date.now() };
+        entry.heldGut = sig;
+        entry.at = Date.now();
+        map[key] = entry;
+        hiwaterSave(map);
+      } catch (e) {
+        // Best-effort.
+      }
+    }
+
+    // USER-DECLARED FILE INVARIANTS (P23). Durable prohibitions the USER
+    // stated in chat — "never create, edit or delete anything under tests/" —
+    // are registered at plan time as (kind, glob, the verbatim sentence,
+    // declaring scope) and consulted here, at the last point a mutation can
+    // still be stopped honestly. The refusal quotes the user's own sentence
+    // instead of paraphrasing it: a constraint the model cannot recognize as
+    // the user's reads as a tool malfunction and gets routed around.
+    //
+    // Missing, unreadable or malformed registry => NO invariants (fail open,
+    // silently) — this can never be the reason a write fails. force does NOT
+    // bypass: only the user lifts a constraint, and a model that believes the
+    // constraint blocks the mission has ask_user, the wanted escape hatch.
+    // `read_only` forbids any mutation of a matching path, `no_create_under`
+    // only the creation of a path that does not exist yet; `no_delete` is
+    // about deletion and is enforced where deletions happen (exec), not here.
+    var INVARIANT_STATE = ".nanna/declared_invariants.json";
+    function invariantsLoad() {
+      try {
+        var raw = Nanna.readFile(INVARIANT_STATE);
+        if (!raw) return [];
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return [];
+        var list = parsed.invariants;
+        if (!Array.isArray(list)) return [];
+        return list;
+      } catch (e) {
+        return [];
+      }
+    }
+    // Glob match over the SAME canonical spelling the ratchet ledger uses, so
+    // one file has one identity here too. `**` crosses directory separators,
+    // `*`/`?` stop at one; a wildcard-free glob matches the path itself or
+    // anything under it (a user who says "tests/" means the tree). Any regex
+    // failure yields NO match — fail open.
+    function invariantMatches(glob, canonPath, normPath) {
+      try {
+        // Canonical on BOTH sides: an absolute glob under the workspace
+        // root collapses to the relative form exactly as the path does.
+        var g = hiwaterKey(String(glob));
+        while (g.length > 1 && g.charAt(g.length - 1) === "/") g = g.substring(0, g.length - 1);
+        if (g === "") return false;
+        if (g.indexOf("*") === -1 && g.indexOf("?") === -1) {
+          return canonPath === g || normPath === g ||
+            canonPath.indexOf(g + "/") === 0 || normPath.indexOf(g + "/") === 0;
+        }
+        var re = "";
+        for (var i = 0; i < g.length; i++) {
+          var c = g.charAt(i);
+          if (c === "*") {
+            if (g.charAt(i + 1) === "*") {
+              re += "[\\s\\S]*";
+              i++;
+              if (g.charAt(i + 1) === "/") i++;
+            } else {
+              re += "[^/]*";
+            }
+          } else if (c === "?") {
+            re += "[^/]";
+          } else if ("\\^$.|+()[]{}".indexOf(c) !== -1) {
+            re += "\\" + c;
+          } else {
+            re += c;
+          }
+        }
+        var rx = new RegExp("^" + re + "$");
+        return rx.test(canonPath) || rx.test(normPath);
+      } catch (e) {
+        return false;
+      }
+    }
+    // The refusal text for a path a declared invariant forbids mutating, or
+    // "" when nothing applies. `verb` is the tool's own word for the action so
+    // the sentence reads as this tool's refusal, not a generic one.
+    function invariantRefusal(path, verb) {
+      try {
+        var list = invariantsLoad();
+        if (list.length === 0) return "";
+        var canon = hiwaterKey(path);
+        var norm = hiwaterNormKey(path);
+        for (var i = 0; i < list.length; i++) {
+          var inv = list[i];
+          if (!inv || typeof inv !== "object") continue;
+          var kind = typeof inv.kind === "string" ? inv.kind : "";
+          if (kind !== "read_only" && kind !== "no_create_under") continue;
+          if (typeof inv.glob !== "string") continue;
+          if (!invariantMatches(inv.glob, canon, norm)) continue;
+          if (kind === "no_create_under") {
+            // Only CREATION is forbidden: an existing file under the glob is
+            // not this constraint's business. One stat, only on a match.
+            var exists = false;
+            try { exists = !!Nanna.stat(path); } catch (eS) { exists = false; }
+            if (exists) continue;
+          }
+          var quoted = typeof inv.source === "string" && inv.source !== "" ? inv.source : "";
+          var scope = typeof inv.scope === "string" && inv.scope !== "" ? inv.scope : "session";
+          glog("write_file guard: " + verb + " REFUSED (declared invariant " + kind + " on '" + inv.glob + "') " + path);
+          return verb + " REFUSED — " + path + " is under a path you declared off-limits" +
+            (kind === "no_create_under" ? " for NEW files" : "") +
+            (quoted === "" ? " (" + kind + " on `" + inv.glob + "`)" : ": \"" + quoted + "\"") +
+            ". Nothing was written and the file on disk is unchanged. That is YOUR instruction (declared for " +
+            scope + "), not a tool limitation, and it stays in force until you lift it in chat. " +
+            "The fix belongs in the artifact you are producing — if something that READS " + path +
+            " is failing, change the code it exercises, not " + path + ". If you believe this constraint " +
+            "genuinely blocks the goal, ask_user about it instead of working around it.";
+        }
+        return "";
+      } catch (e) {
+        return "";
+      }
+    }
+
+    // WRITE-FAILURE HONESTY (P23). A failed write has a CAUSE and the cause
+    // lives at the TAIL of the OS message — exactly what a head truncation
+    // eats. Classify BEFORE truncating and keep the tail. "Retry the same
+    // call" is advice that only makes sense for a plausibly transient fault:
+    // on a permission denial it is a lie the model pays for in identical
+    // retries. Parses BOTH the current bridge format ("Failed to write
+    // '<path>': <os message>") and one carrying the stable ErrorKind name
+    // ("... (kind=PermissionDenied): <os message>"); with neither, it falls
+    // back to the OS error NUMBER, which is locale-independent (5 = Windows
+    // access denied, 13 = EACCES, 32/33 = sharing/lock violation,
+    // 4 = interrupted).
+    function writeErrorKind(msg) {
+      var m = /\(kind=([A-Za-z]+)\)/.exec(msg);
+      if (m) return m[1];
+      if (msg.indexOf("(os error 5)") !== -1 || msg.indexOf("(os error 13)") !== -1) return "PermissionDenied";
+      if (msg.indexOf("(os error 32)") !== -1 || msg.indexOf("(os error 33)") !== -1) return "SharingViolation";
+      if (msg.indexOf("(os error 4)") !== -1) return "Interrupted";
+      return "";
+    }
+    function writeErrorTransient(kind) {
+      return kind === "Interrupted" || kind === "TimedOut" || kind === "WouldBlock" ||
+        kind === "SharingViolation" || kind === "ResourceBusy";
+    }
+    // Same 120-char identification width as before, split so the trailing
+    // cause survives the cut instead of the head eating the whole budget.
+    function preserveCause(msg) {
+      if (msg.length <= 120) return msg;
+      return msg.substring(0, 80) + " … " + msg.substring(msg.length - 40);
+    }
+    // "(cause). <advice>" — cause first, then whether a retry can possibly
+    // help, then what the failure MEANS. Write protection is a deliberate
+    // signal, not an obstacle to route around.
+    function writeFailureNote(path, rawErr, retryAdvice) {
+      var kind = writeErrorKind(rawErr);
+      var shown = preserveCause(rawErr);
+      if (kind === "PermissionDenied") {
+        // FileStat carries no read-only bit, so the stat distinguishes what it
+        // CAN — a protected existing file from a directory from a path whose
+        // parent is protected — and the sentence claims only the denial the
+        // OS actually reported.
+        var what = " The filesystem refused the write, not this tool.";
+        try {
+          var st = Nanna.stat(path);
+          if (st && st.is_dir) {
+            what = " " + path + " is a DIRECTORY, not a file — writing to it can never work.";
+          } else if (st && st.is_file) {
+            what = " " + path + " exists and is write-protected on disk.";
+          }
+        } catch (eStat) {
+          what = " The path cannot even be stat'ed, so the protection is on the file or on the directory holding it.";
+        }
+        return "(" + shown + ")." + what +
+          " Retrying the identical call cannot succeed — nothing transient failed. " +
+          "Write protection is usually deliberate: it marks the file as INPUT. Unless the request is " +
+          "specifically to change THIS file, leave the protection in place and change the file you are producing instead.";
+      }
+      if (kind === "" || writeErrorTransient(kind)) {
+        return "(" + shown + "). " + retryAdvice;
+      }
+      return "(" + shown + "). That failure is not transient — retrying the identical call will fail the same way. " +
+        "Fix what the cause names (the path, the directory, the disk) and then write again.";
     }
 
     // Read-recency marks (P22 Tier 3): when did this session last SEE this
@@ -421,6 +622,43 @@ export default {
       return " STRUCTURE: " + path + " does NOT parse (" + verdict.tool + "): " + verdict.detail + "." + history +
         " This is information, not a block — the file holds exactly what you sent. Fix that line with edit_file.";
     }
+    // LITERAL-ESCAPE VERDICT (P23), shell-checked files only. The shipped
+    // repair above catches the whole-file flattening (>=2 literal \n and NO
+    // real newlines). The PARTIAL case survives it: the file has real line
+    // breaks, but one physical line carries a flattened block behind a '#'.
+    // sh gives comments no escape semantics, so the file parses cleanly and
+    // the hidden code silently never runs — the parse verdict says "ok" and
+    // means nothing. A SENTENCE, never a gate and never a repair: converting
+    // on a heuristic would ACTIVATE code the author may not have meant to
+    // run. Comment-scoped, so printf/awk lines with legitimate literal \n
+    // never trip it, and the >=2 bound is inherited from the repair (two
+    // literal \n describe three or more lines). Fails open.
+    function escapedCommentNote(kind, text) {
+      if (kind !== "sh" && kind !== "bash") return "";
+      try {
+        if (typeof text !== "string" || text.indexOf("\\n") === -1) return "";
+        var re = /^[ \t]*#[^\n]*$/gm;
+        var m;
+        var scanned = 0;
+        var lineNo = 1;
+        while ((m = re.exec(text)) !== null) {
+          while (scanned < m.index) {
+            if (text.charAt(scanned) === "\n") lineNo++;
+            scanned++;
+          }
+          var hits = m[0].split("\\n").length - 1;
+          if (hits >= 2) {
+            return " NOTE: line " + lineNo + " is a comment carrying " + hits +
+              " literal \\n sequences — flattened code may be hiding behind it;" +
+              " if you meant newlines, rewrite the file.";
+          }
+          if (m.index === re.lastIndex) re.lastIndex++;
+        }
+        return "";
+      } catch (e) {
+        return "";
+      }
+    }
 
     // Accept multiple parameter name variants from different models
     var filePath = input.file_path || input.filePath || input.path || input.file || input.filename;
@@ -450,6 +688,12 @@ export default {
     if (!input.force && hiwaterIsState(hiwaterKey(filePath))) {
       return fail("write_file skipped: " + filePath + " is write_file's internal bookkeeping. It maintains itself, is healthy, and never needs manual repair. Your own files are unaffected. Continue with your actual task.");
     }
+
+    // The user's own declared prohibitions come FIRST — before the syntax
+    // gate, which writes .__chk temp files beside the target, and before any
+    // parking or repair. Nothing has been touched at this point.
+    var invBlock = invariantRefusal(filePath, "WRITE");
+    if (invBlock !== "") return fail(invBlock);
 
     // Double-escaped content — REPAIRED, not refused. Observed live
     // (lfm2.5): the model emitted "#!/bin/sh\ncase $1 in" with the
@@ -487,6 +731,12 @@ export default {
 
     var bytes = fileContent.length;
 
+    // The pre-write definition pass. Computed once (when the structural hold
+    // below needs it) and reused by the rewrite-note after the write, so each
+    // side is parsed exactly once per call.
+    var preOldBodies = null;
+    var preNewBodies = null;
+
     // Safety checks BEFORE writing. Three invariants from the adversarial
     // verify round still hold: a write that does not shrink the CURRENT
     // disk file can never erode it, so it is never refused; a file that no
@@ -521,6 +771,17 @@ export default {
 
       var hwKeyGuard = hiwaterKey(filePath);
 
+      // Echo bound (ultrareview on PR #224), shared by BOTH holds below: the
+      // echo is MERGE MATERIAL, and merge material the model cannot hold is
+      // not material — 64 KiB is a small local model's entire 16k-token
+      // window, so anything bigger only burns the context these guards exist
+      // to respect. Under the bound the full content ships and counts as the
+      // read; over it, a head ships with a loud truncation notice (WHAT
+      // dropped, WHY, disk unaffected) and the mark is NOT recorded, so the
+      // next attempt bounces into an explicit ranged read_file rather than a
+      // merge against a partial view.
+      var ECHO_MAX = 65536;
+
       // P22 Tier 3: you cannot shrink what you have not seen. A shrinking
       // whole-file write over a file whose content CHANGED since the session
       // last read it is a rewrite from a stale context copy — the commonest
@@ -533,16 +794,6 @@ export default {
       // next attempt proceeds. One bounce, with the missing information.
       if (fileExists && !hiwaterExempt(hwKeyGuard) && bytes < existingSize &&
           typeof existing === "string" && !seenSinceLastChange(filePath)) {
-        // Echo bound (ultrareview on PR #224): the echo is MERGE MATERIAL,
-        // and merge material the model cannot hold is not material — 64 KiB
-        // is a small local model's entire 16k-token window, so anything
-        // bigger only burns the context this guard exists to respect. Under
-        // the bound the full content ships and counts as the read; over it,
-        // a head ships with a loud truncation notice (WHAT dropped, WHY,
-        // disk unaffected), the mark is NOT recorded, and the next attempt
-        // still bounces — into an explicit ranged read_file, never into a
-        // merge against a partial view.
-        var ECHO_MAX = 65536;
         if (existingSize <= ECHO_MAX) {
           readmarkPut(filePath);
           glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; file changed since last recorded read)");
@@ -610,6 +861,112 @@ export default {
             "(2) merge your change into the FULL text, (3) call write_file again with the complete content.",
           success: false
         };
+      }
+
+      // STRUCTURAL SHRINK HOLD (P23): bytes cannot see function removal.
+      //
+      // The byte floor answers "how much smaller?", which is the wrong
+      // question for the destructive shape actually observed: a rewrite that
+      // keeps the file's size respectable while dropping most of its
+      // top-level definitions clears 30% comfortably and still deletes the
+      // work. Two independent P23 analyses converged on the same guard — a
+      // SHRINKING rewrite that removes more pre-existing definitions than it
+      // keeps, or that drops definitions present in the last version that
+      // PASSED a structural check, is held ONCE with the stale-shrink echo
+      // treatment: the current content ships as merge material, the removed
+      // definitions are NAMED, the echo counts as the read, and the removal
+      // set is signed onto the ratchet entry. Send the same removal set again
+      // and it goes through — the deletions were in view when it was
+      // re-sent, which is the whole point of the bounce — and any successful
+      // write clears the signature, so the next removal event re-arms it.
+      //
+      // Invariants kept: a NON-shrinking write is never refused; force is
+      // never held; and the pass fails OPEN in every direction — either side
+      // yielding zero parsed definitions, or the computation throwing, leaves
+      // the write untouched. edit_file is exempt by design: an explicit
+      // old_string IS the statement of intent this hold asks for.
+      if (fileExists && !existsUnknown && !hiwaterExempt(hwKeyGuard) &&
+          bytes < existingSize && typeof existing === "string") {
+        var gutHold = null;
+        try {
+          preOldBodies = symbolBodies(existing);
+          preNewBodies = symbolBodies(fileContent);
+          var gutRemoved = [];
+          var gutKept = 0;
+          var gutOldCount = 0;
+          for (var gOld in preOldBodies) {
+            gutOldCount++;
+            if (preNewBodies[gOld] === undefined) gutRemoved.push(gOld);
+            else gutKept++;
+          }
+          var gutNewCount = 0;
+          for (var gNew in preNewBodies) gutNewCount++;
+          if (gutOldCount > 0 && gutNewCount > 0) {
+            var gutEntry = hiwaterEntryFor(hiwaterLoad(), filePath);
+            // The structural anchor: the definition set of the last version
+            // that passed a structural check, recorded when `good` rebases.
+            // Measured against the NEW content, not against disk — the point
+            // of the anchor is that the current disk copy may itself already
+            // have lost something the evidenced-good version had.
+            var goodNames = gutEntry && Array.isArray(gutEntry.goodSyms)
+              ? gutEntry.goodSyms : [];
+            var lostFromGood = [];
+            for (var gi = 0; gi < goodNames.length; gi++) {
+              var gn = goodNames[gi];
+              if (typeof gn !== "string") continue;
+              if (preNewBodies[gn] !== undefined) continue;
+              lostFromGood.push(gn);
+            }
+            if (gutRemoved.length > gutKept || lostFromGood.length > 0) {
+              // One removal SET, deduplicated: the two arms overlap whenever
+              // a definition is missing from both disk and the good anchor.
+              var gutSet = gutRemoved.slice(0);
+              for (var li = 0; li < lostFromGood.length; li++) {
+                if (gutSet.indexOf(lostFromGood[li]) === -1) gutSet.push(lostFromGood[li]);
+              }
+              gutSet.sort();
+              var gutSig = String(hashStr(gutSet.join("\n")));
+              var gutAckd = gutEntry && typeof gutEntry.heldGut === "string" ? gutEntry.heldGut : "";
+              if (gutAckd !== gutSig) {
+                gutHold = { names: gutSet, sig: gutSig, fromGood: lostFromGood, old: gutOldCount, kept: gutKept };
+              }
+            }
+          }
+        } catch (eGut) {
+          // No structural opinion — the write proceeds exactly as before.
+          gutHold = null;
+        }
+        if (gutHold) {
+          heldGutPut(filePath, gutHold.sig);
+          var gutWhy = "This rewrite of " + filePath + " (" + existingSize + " → " + bytes +
+            " bytes) REMOVES " + gutHold.names.length + " of the " + gutHold.old +
+            " top-level sections the file defines and keeps " + gutHold.kept + ": " + nameList(gutHold.names) + "." +
+            (gutHold.fromGood.length > 0
+              ? " " + nameList(gutHold.fromGood) + " were present in the last version of this file that PASSED a structural check."
+              : "") +
+            " Deleting more than you keep is usually a rewrite from a stale or partial copy rather than a deliberate removal, and byte counts cannot see it.";
+          var gutHow = "If those sections are genuinely obsolete, send this SAME content again and it will be written — " +
+            "this hold fires once per removal set, not once per attempt. Otherwise put the missing sections back and " +
+            "send the full merged file, or use edit_file to remove one named section at a time.";
+          glog("write_file guard: structural shrink hold for " + filePath + " (" + existingSize + "->" + bytes +
+            " bytes) removed=[" + gutHold.names.join(",") + "] kept=" + gutHold.kept + " sig=" + gutHold.sig);
+          if (existingSize <= ECHO_MAX) {
+            readmarkPut(filePath);
+            return fail(
+              "WRITE HELD — nothing was written and nothing is lost. " + gutWhy +
+              "\n\nHere is the CURRENT content of " + filePath + ":\n\n" + existing +
+              "\n\n" + gutHow + " This reply counts as your read."
+            );
+          }
+          return fail(
+            "WRITE HELD — nothing was written and nothing is lost. " + gutWhy +
+            "\n\nThe file is too large (" + existingSize + " bytes) to echo here; its first lines are:\n\n" +
+            existing.substring(0, 4096) +
+            "\n\n[TRUNCATED — only the first 4096 of " + existingSize + " bytes shown; the file on disk is complete and unaffected.] " +
+            "This truncated preview does NOT count as reading the file — call read_file(\"" + filePath +
+            "\") (with offset/limit for ranges) to see what those sections contain. " + gutHow
+          );
+        }
       }
     }
 
@@ -773,9 +1130,12 @@ export default {
     try {
       Nanna.writeFile(filePath, fileContent);
     } catch (e2) {
-      var writeErr = String(e2);
-      if (writeErr.length > 120) writeErr = writeErr.substring(0, 120) + "...";
-      return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
+      // Classify BEFORE truncating (P23): the cause is the tail, and the
+      // advice that follows it must match the cause — a permission denial is
+      // not something a retry can fix.
+      return fail("write_file failed writing " + filePath + " " +
+        writeFailureNote(filePath, String(e2),
+          "Retry the same call; if it fails again, read_file to verify the file state."));
     }
 
     // Structural verdict on what landed. The .py gate above already ran the
@@ -784,6 +1144,7 @@ export default {
     var hwKeyPost = hiwaterKey(filePath);
     var verdict = null;
     var prevChk = null;
+    var escNote = "";
     if (!hiwaterExempt(hwKeyPost)) {
       try {
         var peek = hiwaterEntryFor(hiwaterLoad(), filePath);
@@ -797,6 +1158,9 @@ export default {
       } else if (checkKind) {
         verdict = runStructuralCheck(checkKind, filePath, fileContent);
       }
+      // force writes bytes through untouched, so it inherits the escape
+      // repair's exemption here too.
+      if (!input.force) escNote = escapedCommentNote(checkKind, fileContent);
     }
     if (input.force || !fileExists) prevChk = null;
 
@@ -823,19 +1187,45 @@ export default {
             if (hwPrevHi > hwNext) hwNext = hwPrevHi;
           }
           if (input.force || !fileExists) hwNext = bytes;
+          // The entry is rebuilt from scratch every time, which is also how
+          // the structural hold's `heldGut` signature clears itself: any
+          // successful write drops it and the hold re-arms for the next
+          // removal event.
           var hwNew = { hi: hwNext, last: bytes, at: Date.now() };
           if (!input.force && fileExists && hwPrevEntry) {
             if (hiwaterGood(hwPrevEntry) > 0) {
               hwNew.good = hwPrevEntry.good;
               hwNew.goodAt = hwPrevEntry.goodAt || 0;
+              if (Array.isArray(hwPrevEntry.goodSyms)) {
+                hwNew.goodSyms = hwPrevEntry.goodSyms;
+              }
             }
             if (hwPrevEntry.chk === "ok" || hwPrevEntry.chk === "bad") hwNew.chk = hwPrevEntry.chk;
+            // Coverage high-water record travels with the ratchet: force and
+            // creation-over-missing reset it exactly as they reset `good`.
+            if (typeof hwPrevEntry.bestSyms === "number" && isFinite(hwPrevEntry.bestSyms)) {
+              hwNew.bestSyms = hwPrevEntry.bestSyms;
+              hwNew.bestAt = hwPrevEntry.bestAt || 0;
+            }
           }
           if (verdict) {
             hwNew.chk = verdict.ok ? "ok" : "bad";
             if (verdict.ok) {
               hwNew.good = bytes;
               hwNew.goodAt = Date.now();
+              // The structural anchor rebases WITH the good size: the symbol
+              // table for this content is already computed when the hold ran,
+              // so recording it costs at most one parse on the paths that
+              // never needed one (and the rewrite-note below then reuses it).
+              // A stale set would name definitions the good version no longer
+              // has, so it is always replaced — and DROPPED if the pass
+              // cannot run at all — never carried past a rebase.
+              try {
+                if (!preNewBodies) preNewBodies = symbolBodies(fileContent);
+                hwNew.goodSyms = symbolNames(fileContent, preNewBodies);
+              } catch (eSyms) {
+                delete hwNew.goodSyms;
+              }
             }
           }
           hwMap[hwKey] = hwNew;
@@ -850,7 +1240,7 @@ export default {
       if (!hiwaterExempt(hwKeyPost)) readmarkPut(filePath);
     }
 
-    var structNote = structSentence(filePath, verdict, prevChk);
+    var structNote = structSentence(filePath, verdict, prevChk) + escNote;
     if (verdict && !verdict.ok) {
       glog("write_file structure: " + filePath + " does NOT parse after write (" + verdict.tool + "): " + verdict.detail);
     } else if (verdict && verdict.ok && prevChk === "bad") {
@@ -952,21 +1342,73 @@ export default {
       }
       return map;
     }
+    // The sorted definition NAMES of a version, reusing an already-computed
+    // body map when the caller has one (the structural hold's pre-write pass
+    // is over exactly this content) so no side is parsed twice.
+    function symbolNames(text, cachedBodies) {
+      var bodies = cachedBodies || symbolBodies(text);
+      var names = [];
+      for (var n in bodies) names.push(n);
+      names.sort();
+      return names;
+    }
     function nameList(arr) {
       var shown = arr.slice(0, 10);
       var more = arr.length - shown.length;
       return "`" + shown.join("`, `") + "`" + (more > 0 ? " (+" + more + " more)" : "");
     }
     var lossNote = "";
+    var bestPath = filePath + ".__best__";
     if (fileExists && !input.force && typeof existing === "string" && existing !== fileContent) {
       try {
-        var oldBodies = symbolBodies(existing);
-        var newBodies = symbolBodies(fileContent);
+        var oldBodies = preOldBodies || symbolBodies(existing);
+        var newBodies = preNewBodies || symbolBodies(fileContent);
         var dropped = [];
         var changed = [];
         for (var sName in oldBodies) {
           if (newBodies[sName] === undefined) dropped.push(sName);
           else if (newBodies[sName] !== oldBodies[sName]) changed.push(sName);
+        }
+        // COVERAGE HIGH-WATER PARK (P23). .__prev__ holds exactly ONE
+        // generation, so a two-write spiral rotates the good version out: the
+        // second write parks the wreck the first one made and the peak is
+        // gone. .__best__ parks the outgoing version whenever it is the
+        // richest version this ledger has seen, measured by top-level
+        // definition COUNT — deliberately NOT a subset relation, because
+        // rewrite spirals RENAME symbols, so no mid-spiral wreck is ever a
+        // strict subset and the peak would rotate out on the second write
+        // anyway. Only writes that actually REMOVE sections qualify (an
+        // additive write has nothing to preserve), the first qualifying write
+        // parks unconditionally, and the record resets with the ratchet on
+        // force and creation. Best-effort; never blocks the write.
+        var bestNote = "";
+        if (dropped.length > 0 && !hiwaterExempt(hwKeyPost)) {
+          var outCount = 0;
+          for (var oName in oldBodies) outCount++;
+          try {
+            var bMap = hiwaterLoad();
+            var bEntry = hiwaterEntryFor(bMap, filePath);
+            var bHave = bEntry && typeof bEntry.bestSyms === "number" && isFinite(bEntry.bestSyms)
+              ? bEntry.bestSyms : 0;
+            if (outCount > bHave) {
+              Nanna.writeFile(bestPath, existing);
+              if (!bEntry) bEntry = { hi: existingSize, last: bytes, at: Date.now() };
+              bEntry.bestSyms = outCount;
+              bEntry.bestAt = Date.now();
+              bMap[hwKeyPost] = bEntry;
+              hiwaterSave(bMap);
+              glog("write_file parked coverage high-water for " + filePath + " at " + bestPath +
+                " (" + outCount + " sections, previous record " + bHave + ")");
+            } else if (bHave > 0) {
+              // Parked best differs from the version .__prev__ just took:
+              // name it, with the counts that make the difference concrete.
+              bestNote = " The fullest prior version (" + bHave + " sections, against " + outCount +
+                " in the version this write replaced) is parked at " + bestPath +
+                " — read_file it before rewriting again.";
+            }
+          } catch (eBest) {
+            // Recovery copies are best-effort.
+          }
         }
         // "More than doubled" = this rewrite added more new mass than the
         // entire previous file held — a from-scratch superset, the shape of
@@ -988,7 +1430,7 @@ export default {
           }
           lossNote = " NOTE: this whole-file rewrite replaced " + filePath + " (" + existingSize + " → " + bytes + " bytes)." + parts +
             " The write SUCCEEDED — the file holds exactly what you sent. If any of those sections were verified working, re-verify them now" +
-            (prevParked ? "; the previous version is preserved at " + prevPath + " (read_file it to recover anything)" : "") + ".";
+            (prevParked ? "; the previous version is preserved at " + prevPath + " (read_file it to recover anything)" : "") + "." + bestNote;
           glog("write_file rewrite-note for " + filePath + " (" + existingSize + "->" + bytes + " bytes): removed=[" + dropped.join(",") + "] changed=[" + changed.join(",") + "]" + (grewPastDouble ? " grew>2x" : ""));
         }
       } catch (eLoss) {

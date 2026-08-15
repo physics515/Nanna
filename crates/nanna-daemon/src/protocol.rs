@@ -761,6 +761,18 @@ pub enum Event {
     /// invisible to it until restart.
     WorkspacesChanged,
 
+    /// The daemon's configuration was mutated and committed (set / reset /
+    /// reload / import).
+    ///
+    /// Payload-free for the same reason as [`Event::WorkspacesChanged`]: the
+    /// config is shared state, and pushing a diff would make every client
+    /// re-implement the merge. Clients re-fetch whatever slice they render.
+    ///
+    /// One event per committed mutation — the model priority a client shows
+    /// otherwise stays whatever it read at mount, so a change made in another
+    /// window (or by the agent itself) was invisible until restart.
+    ConfigChanged,
+
     // Memory events
     MemoryCreated {
         id: String,

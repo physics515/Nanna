@@ -146,7 +146,7 @@
                 v-for="tool in msg.tool_calls"
                 :key="tool.id"
                 :tool-call="tool"
-                :status="tool.success ? 'completed' : 'error'"
+                :status="toolCardStatus(tool)"
               />
             </div>
           </div>
@@ -214,7 +214,7 @@
               v-for="tool in activeToolCalls"
               :key="tool.id"
               :tool-call="tool"
-              :status="tool.status"
+              :status="tool.status === 'started' ? 'started' : toolCardStatus(tool)"
             />
           </div>
         </div>
@@ -346,6 +346,9 @@ interface ToolCallInfo {
   success: boolean
   duration_ms: number
   status?: 'started' | 'completed' | 'error'
+  /** Structured outcome markers from the daemon. `short_circuited: true`
+   *  marks a breaker replay — harness steering, not a tool failure. */
+  data?: Record<string, any>
 }
 
 interface Message {
@@ -523,12 +526,22 @@ function truncateText(text: string, maxLen: number): string {
   return text.substring(0, maxLen) + '...'
 }
 
+// A breaker replay carries `short_circuited` in its structured data all the way
+// from loop_runner: the harness answered the call and the tool never ran. It
+// reports success=false because there is no tool result, but nothing failed —
+// so it gets its own status rather than the red error chip.
+function toolCardStatus(tool: ToolCallInfo): 'completed' | 'error' | 'steering' {
+  if (tool.data?.short_circuited === true) return 'steering'
+  return tool.success ? 'completed' : 'error'
+}
+
 let unlistenChunk: UnlistenFn | null = null
 let unlistenTool: UnlistenFn | null = null
 let unlistenThinking: UnlistenFn | null = null
 let unlistenModelStatus: UnlistenFn | null = null
 let unlistenDaemonError: UnlistenFn | null = null
 let unlistenContextUsage: UnlistenFn | null = null
+let unlistenConfigChanged: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -747,6 +760,10 @@ onMounted(async () => {
               output: t.output,
               success: t.success,
               duration_ms: t.duration_ms,
+              // Keeps `short_circuited` on the finalized message, so a replay
+              // stays a steering chip after the stream ends instead of
+              // reverting to a red failure.
+              data: t.data,
             })),
             reasoning: finalThinking,
             timeline: finalTimeline.length > 0 ? finalTimeline : undefined,
@@ -793,6 +810,12 @@ onMounted(async () => {
       const existingName = sessionState.activeToolCalls.value.find(t => t.id === tool_call.id)?.name
       const toolName = tool_call.name || existingName || 'unknown'
 
+      // A breaker replay: the harness answered the call itself instead of
+      // running the tool, and marked the result `short_circuited` end to end
+      // (loop_runner → ToolEnd.data → here). Nothing failed — the tool never
+      // ran — so it must not be rendered, counted, or announced as failure.
+      const isSteering = tool_call.data?.short_circuited === true
+
       // Update existing tool call
       sessionState.updateToolCall(tool_call.id, { ...tool_call, status })
       sessionState.timelineToolEnd(
@@ -801,10 +824,31 @@ onMounted(async () => {
         tool_call.output || '',
         tool_call.success ?? false,
         tool_call.duration_ms || 0,
+        isSteering,
       )
 
-      // Push tool errors to notification center
-      if (status === 'error' || tool_call.success === false) {
+      if (isSteering) {
+        // Inline steering notice: what happened, why, and that the call was
+        // answered rather than executed.
+        addNotification({
+          type: 'info',
+          title: `Steering: ${toolName}`,
+          summary: truncateText(
+            `The harness answered this repeated call instead of running it — ${tool_call.output || 'breaker replay'}`,
+            120,
+          ),
+          detail: tool_call.output
+            || 'The circuit breaker replayed a previous outcome for this identical call. The tool did not run, so nothing failed and nothing changed on disk.',
+          source: `tool:${toolName}`,
+          sessionId: eventSessionId,
+          metadata: {
+            callId: tool_call.id,
+            toolName: toolName,
+            shortCircuited: true,
+          },
+        })
+      } else if (status === 'error' || tool_call.success === false) {
+        // Push tool errors to notification center
         addNotification({
           type: 'error',
           title: `Tool Failed: ${toolName}`,
@@ -819,8 +863,9 @@ onMounted(async () => {
         })
       }
 
-      // Notify on tool completion if window not focused
-      if (document.hidden) {
+      // Notify on tool completion if window not focused. A replay is not a
+      // failed tool, so it never fires the "Tool Failed" desktop notification.
+      if (document.hidden && !isSteering) {
         notifyToolComplete(toolName, tool_call.success)
       }
     }
@@ -885,6 +930,19 @@ onMounted(async () => {
     })
   })
 
+  // Config is shared daemon state — the settings page, another window, or the
+  // agent itself can change it while this chat is open. Read once at mount, the
+  // header's tool count and the new-chat model/tool chip named whatever was
+  // true when the page loaded. Payload-free event → re-fetch the whole config,
+  // exactly like `workspaces-changed`. Event-driven only: no poll, no TTL.
+  unlistenConfigChanged = await listen('config-changed', async () => {
+    try {
+      config.value = await invoke<AppConfig>('get_config')
+    } catch (e) {
+      console.error('Failed to reload config:', e)
+    }
+  })
+
   // Load initial session (listeners are already active to capture any events)
   await loadSession()
 })
@@ -913,6 +971,7 @@ onUnmounted(() => {
   if (unlistenModelStatus) unlistenModelStatus()
   if (unlistenDaemonError) unlistenDaemonError()
   if (unlistenContextUsage) unlistenContextUsage()
+  if (unlistenConfigChanged) unlistenConfigChanged()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null
