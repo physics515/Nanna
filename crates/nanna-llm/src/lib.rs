@@ -14,7 +14,10 @@ pub mod oauth;
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
 pub mod heal;
-pub use heal::{count_balanced_top_level_objects, heal_json, heal_json_as, heal_tool_args};
+pub use heal::{
+    count_balanced_top_level_objects, escape_bare_controls_in_strings, heal_json, heal_json_as,
+    heal_tool_args,
+};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};

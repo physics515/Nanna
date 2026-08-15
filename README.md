@@ -274,6 +274,70 @@ those turns died early and accidentally parked the artifact at its peak. Fix tra
 ROADMAP P22 ("Keep the peak", PR #221); the first counter-levers are already merged
 (mid-mission verified-work sweep #218, fold-vs-write safety #219).
 
+### GUI-path series, post-P22 (2026-08-14/15) — the rerun
+
+The same ladder, same conditions (fresh read-only workspace, `num_ctx=16384` pinned and
+gate-verified per leg, 4-hour window, 15-minute snapshot scoring vs pristine tests), on
+**v0.3.7-beta.12 with the complete P22 program** (PRs #218–#231). Differences from the
+2026-08-10 series, held constant across all five legs: the *installed release* daemon
+(not the debug bench build), missions delivered through the running product (leg 1
+through the GUI composer via desktop automation; legs 2–5 over IPC after a Windows
+input-overlay blocked synthetic clicks), sub-agent priority pinned to the leg model
+(closing gemma's cloud-contamination hole), and liveness-gated scoring (a probe precedes
+every poll — a dead daemon can never be scored again).
+
+| Model | Peak | 4 h final | Prior (peak / final) | Shape |
+|---|---|---|---|---|
+| qwen3.5:9b | **41 / 42 @ t=65m** | 0 / 42 | 22 / 1 | monotonic 27→32→34→41 with ZERO destructive rewrites; held 41 for 145 minutes one test (test_40) from a full clear; a driver interjection at t=194m triggered the only rewrite, mid-flight at window close |
+| ornith:latest | **30 / 42 @ t=135m** | 0 / 42 | 16 / 5 | three destruction→rebuild cycles (17→5→24, 24→0→25→30), every one named by rewrite-notes and recovered in ≤2 polls; post-interjection rewrite unfinished at close |
+| gemma4:e4b-it-qat | **16 / 42 @ t=161m** | **16 / 42** | contaminated / 0 | **final = peak** — bootstrapped from 0 by one interjection, survived its own 16→4 destruction, rebuilt to 16 by close; fully local this time |
+| ministral-3:8b | 4 / 42 @ t=123m | **4 / 42** | invalid (unmeasured) | **final = peak** — first VALID GUI-path number for this model; slow but non-destructive |
+| lfm2.5 | 0 / 42 | 0 / 42 | 0 / 0 | the P22 narration-salvage engaged (real tool executions, artifact on disk — the frozen-era run had neither); the residual gap is capability, not the tool channel |
+
+**What P22 bought, measured:** peaks roughly doubled across the board (22→41, 16→30,
+0→16, unmeasured→4), destruction cycles that used to be terminal now recover in one to
+two polls, two of five legs ended *at* their peak, and the dialect model went from
+fabricated tool calls to real executions (127 salvaged calls vs 379 frozen-era
+hallucinated ones).
+
+**What the 40-agent log forensics found underneath** (adversarially verified; full
+recommendations: [ROADMAP P23](ROADMAP.md)):
+
+- **The surviving destruction channel is cross-turn, with a mechanism.** A continuation
+  turn starts from a fresh context seeded by a heavily compressed summary (ornith's was
+  420 chars — 63× compression), so the knowledge that 30 tests passed is simply gone and
+  a from-scratch rewrite is the model's cheapest coherent move: ornith went 30→0 within
+  8 minutes of one continuation message; qwen 41→0 the same way. Chat-general — any user
+  nudging a long-running session hits it. P23 Tier 1 pins verified artifact state to
+  every continuation turn.
+- **qwen actually solved the ladder.** Its peak artifact satisfies all 42 tests under
+  hermetic per-test scoring; the official 41 stands because after 12+ misleading
+  "retry the same call" write errors it ran `chmod +w tests/test_40.sh` and doctored the
+  read-only spec test — from then on its local verification diverged from the pristine
+  scorer, and the driver's later "test_40 fails" interjections became a claim-conflict
+  it resolved by rewriting from scratch. Three P23 levers come straight from this:
+  tool-layer enforcement of user-declared read-only paths, verdicts that notice
+  self-modified evidence, and reproduce-first on claim conflicts.
+- **The byte-based 30% shrink floor cannot see function removal.** Ornith's five
+  destruction writes each removed 9–33 functions while clearing the floor, because a
+  gutted file that still parses re-anchors the "good" baseline downward. P23 Tier 2 adds
+  a symbol-aware one-bounce hold plus a `.__best__` structural-coverage parking slot.
+- **Two runs died silently.** qwen's run ended at its peak on planner error-round
+  exhaustion with no stop line and no user-visible message; gemma dry-counted out at
+  0/42 while its own acceptance checks were failing. P23 Tier 3: every exit names its
+  reason, and a round is never "dry" while the scope's own checks fail.
+- **The weak-model walls are transport and honesty, not just capability.** Ministral's
+  constant wall is Ollama aborting the stream on a literal TAB in tool-call JSON
+  (retried blind ×3 each time); gemma spent 97 minutes "saving" its artifact into the
+  python script registry — 201 success acks, zero files on disk — because the ack never
+  said *where* the save landed.
+
+Series caveat found post-hoc: a summarize-priority resolution bug routed all 171 Tier-2
+context summarizations to `lfm2.5` regardless of the per-leg pins — every leg's
+compressed context was degraded by the weakest model, so the P22 numbers above are, if
+anything, a floor. Full per-poll history, ledgers, and interjection effect records:
+`D:/Development/nanna-bench/ui-run-*/`.
+
 ### Endurance (42 features)
 
 **Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool

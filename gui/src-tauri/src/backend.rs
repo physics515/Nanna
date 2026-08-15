@@ -516,9 +516,19 @@ daemon_proxies! {
     /// Get channel status
     channel_status(id: Option<&str>);
 
-    // --- Task store (read-only view for the chat's checklist) ---
+    // --- Task store operations ---
     /// List tasks in a scope
     task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
+    /// Create a new task
+    task_create(title: &str, scope: &str, session_id: Option<&str>, parent_id: Option<i64>, description: Option<&str>, priority: Option<i64>);
+    /// Update a task with a partial patch
+    task_update(id: i64, patch: Value);
+    /// Mark a task as done
+    task_done(id: i64, workdir: Option<&str>);
+    /// Delete a task and its subtree
+    task_delete(id: i64);
+    /// Reorder a task by updating its priority
+    task_reorder(id: i64, new_priority: i64);
 }
 
 impl Default for Backend {

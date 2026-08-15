@@ -50,6 +50,14 @@
       <!-- Toggles -->
       <div class="flex items-center justify-between">
         <div>
+          <div class="text-sm font-medium text-nanna-text">Auto-Remember Messages</div>
+          <div class="text-xs text-nanna-text-dim">Save conversations to memory automatically</div>
+        </div>
+        <UiSwitch :model-value="settings?.auto_remember_messages" label="Auto-remember enabled" @update:model-value="setAutoRememberMessages" />
+      </div>
+
+      <div class="flex items-center justify-between">
+        <div>
           <div class="text-sm font-medium text-nanna-text">Enable Dreaming</div>
           <div class="text-xs text-nanna-text-dim">Memory consolidation</div>
         </div>
@@ -135,6 +143,15 @@ async function setDreamingEnabled(enabled: boolean) {
     await loadSettings()
   } catch (e: any) {
     showToast(`Could not update dreaming: ${e.message || e}`, 'error')
+  }
+}
+
+async function setAutoRememberMessages(enabled: boolean) {
+  try {
+    await invoke('set_auto_remember_messages', { enabled })
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Could not update auto-remember: ${e.message || e}`, 'error')
   }
 }
 

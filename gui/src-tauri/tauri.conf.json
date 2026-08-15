@@ -69,7 +69,8 @@
     },
     "macOS": {
       "minimumSystemVersion": "10.15"
-    }
+    },
+    "linux": {}
   },
   "plugins": {
     "updater": {

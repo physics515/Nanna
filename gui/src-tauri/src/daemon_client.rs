@@ -1313,6 +1313,67 @@ impl DaemonClient {
             "include_closed": include_closed
         })).await
     }
+
+    /// Create a new task.
+    pub async fn task_create(
+        &self,
+        title: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        parent_id: Option<i64>,
+        description: Option<&str>,
+        priority: Option<i64>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "create",
+            "title": title,
+            "scope": scope,
+            "session_id": session_id,
+            "parent_id": parent_id,
+            "description": description,
+            "priority": priority
+        })).await
+    }
+
+    /// Update a task (partial patch).
+    pub async fn task_update(&self, id: i64, patch: Value) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "update",
+            "id": id,
+            "patch": patch
+        })).await
+    }
+
+    /// Mark a task as done (with optional acceptance check).
+    pub async fn task_done(&self, id: i64, workdir: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "done",
+            "id": id,
+            "workdir": workdir
+        })).await
+    }
+
+    /// Delete a task and its subtree.
+    pub async fn task_delete(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "delete",
+            "id": id
+        })).await
+    }
+
+    /// Reorder a task by updating its priority.
+    pub async fn task_reorder(&self, id: i64, new_priority: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "update",
+            "id": id,
+            "patch": { "priority": new_priority }
+        })).await
+    }
 }
 
 /// Connection status for frontend
