@@ -258,6 +258,37 @@ those turns died early and accidentally parked the artifact at its peak. Fix tra
 ROADMAP P22 ("Keep the peak", PR #221); the first counter-levers are already merged
 (mid-mission verified-work sweep #218, fold-vs-write safety #219).
 
+### GUI-path series, post-P22 (2026-08-14/15) — the rerun
+
+The same ladder, same conditions (fresh read-only workspace, `num_ctx=16384` pinned and
+gate-verified per leg, 4-hour window, 15-minute snapshot scoring vs pristine tests), on
+**v0.3.7-beta.12 with the complete P22 program** (PRs #218–#231). Differences from the
+2026-08-10 series, held constant across all five legs: the *installed release* daemon
+(not the debug bench build), missions delivered through the running product (leg 1
+through the GUI composer via desktop automation; legs 2–5 over IPC after a Windows
+input-overlay blocked synthetic clicks), sub-agent priority pinned to the leg model
+(closing gemma's cloud-contamination hole), and liveness-gated scoring (a probe precedes
+every poll — a dead daemon can never be scored again).
+
+| Model | Peak | 4 h final | Prior (peak / final) | Shape |
+|---|---|---|---|---|
+| qwen3.5:9b | **41 / 42 @ t=65m** | 0 / 42 | 22 / 1 | monotonic 27→32→34→41 with ZERO destructive rewrites; held 41 for 145 minutes one test (test_40) from a full clear; a driver interjection at t=194m triggered the only rewrite, mid-flight at window close |
+| ornith:latest | **30 / 42 @ t=135m** | 0 / 42 | 16 / 5 | three destruction→rebuild cycles (17→5→24, 24→0→25→30), every one named by rewrite-notes and recovered in ≤2 polls; post-interjection rewrite unfinished at close |
+| gemma4:e4b-it-qat | **16 / 42 @ t=161m** | **16 / 42** | contaminated / 0 | **final = peak** — bootstrapped from 0 by one interjection, survived its own 16→4 destruction, rebuilt to 16 by close; fully local this time |
+| ministral-3:8b | 4 / 42 @ t=123m | **4 / 42** | invalid (unmeasured) | **final = peak** — first VALID GUI-path number for this model; slow but non-destructive |
+| lfm2.5 | 0 / 42 | 0 / 42 | 0 / 0 | the P22 narration-salvage engaged (real tool executions, artifact on disk — the frozen-era run had neither); the residual gap is capability, not the tool channel |
+
+**What P22 bought, measured:** peaks roughly doubled across the board (22→41, 16→30,
+0→16, unmeasured→4), destruction cycles that used to be terminal now recover in one to
+two polls, two of five legs ended *at* their peak, and the dialect model went from
+fabricated tool calls to real executions. **What it exposed:** the remaining
+peak-destroyer is no longer the harness — both high scorers lost their final number to a
+rewrite triggered by a *driver continuation message* ("continue: … do not rewrite passing
+work") sent after the run went idle. Continuation prompts read as "start over" to strong
+models; that is the next lever, and it is a chat-general one (any user nudging a
+long-running session hits it). Full per-poll history, ledgers, and interjection effect
+records: `D:/Development/nanna-bench/ui-run-*/`.
+
 ### Endurance (42 features)
 
 **Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool
