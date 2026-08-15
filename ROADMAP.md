@@ -221,33 +221,16 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 ## Phases
 
 ### P0 - Public Preview Release
-- [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope.
-      *(2026-08-15)* `RELEASE_NOTES.md` shipped at repo root with feature summary and release checklist.
-- [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases.
-      *(2026-08-15)* `.github/workflows/release.yml` builds Windows/macOS/Linux with daemon sidecar and
-      publishes artifacts to GitHub Releases.
-- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar.
-      *(2026-08-15)* NSIS installer builds with bundled daemon sidecar (`externalBin`). **Code signing
-      not yet implemented** — SmartScreen warnings expected. See P0.3 for signing.
-- [~] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon).
-      *(2026-08-15)* DMG target configured in `tauri.conf.json`. **Notarization not yet implemented** —
-      Gatekeeper warnings expected. See P0.3 for notarization.
-- [x] Publish Linux AppImage and/or .deb/.rpm.
-      *(2026-08-15)* Both `appimage` and `deb` targets configured; release workflow creates both.
-- [x] App launches without terminal; daemon starts automatically.
-      *(2026-08-15)* Tauri app has `decorations: false` (no terminal); `DaemonManager` auto-spawns the
-      daemon sidecar on app launch with health-check readiness wait.
-- [x] Add Start Menu / tray / launch-at-login support.
-      *(2026-08-15)* Tray icon configured in `tauri.conf.json`. NSIS creates Start Menu shortcut
-      (`startMenuFolder: "Nanna"`). Launch-at-login deferred to P0.3 (requires tauri-plugin-autostart).
-- [x] WebView2 handling on Windows.
-      *(2026-08-15)* Configured `webviewInstallMode: downloadBootstrapper` with silent install — app
-      downloads and installs WebView2 runtime automatically if missing.
-- [x] Document uninstall process.
-      *(2026-08-15)* Uninstall documentation added to README.md Installation section.
-- [x] Add "check for updates" or auto-update mechanism
-      *(2026-08-15)* `tauri-plugin-updater` configured with GitHub-hosted endpoint. GUI shows update
-      notification; user-initiated install (passive mode).
+- [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope. *(2026-08-15)*
+- [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases. *(2026-08-15)*
+- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar. *(signing deferred to P0.3)*
+- [~] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon). *(notarization deferred to P0.3)*
+- [x] Publish Linux AppImage and/or .deb/.rpm. *(2026-08-15)*
+- [x] App launches without terminal; daemon starts automatically. *(2026-08-15)*
+- [x] Add Start Menu / tray / launch-at-login support. *(2026-08-15 — launch-at-login deferred to P0.3)*
+- [x] WebView2 handling on Windows. *(2026-08-15 — downloadBootstrapper with silent install)*
+- [x] Document uninstall process. *(2026-08-15 — README.md Installation section)*
+- [x] Add "check for updates" or auto-update mechanism. *(2026-08-15 — tauri-plugin-updater)*
 
 #### P0.1 - First Run UX
 - [ ] Create public facing website / Github Pages
