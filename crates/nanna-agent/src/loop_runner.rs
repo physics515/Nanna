@@ -1872,9 +1872,9 @@ fn collect_json_objects(
                 depth -= 1;
                 if depth == 0 {
                     let slice = &text[start..=i];
-                    match serde_json::from_str::<Value>(slice) {
-                        Ok(v @ Value::Object(_)) => out.push((base + start, base + i + 1, v)),
-                        _ => rescan.push((start + 1, i)),
+                    match parse_object_span_lenient(slice) {
+                        Some(v) => out.push((base + start, base + i + 1, v)),
+                        None => rescan.push((start + 1, i)),
                     }
                 }
             }
@@ -1890,6 +1890,26 @@ fn collect_json_objects(
         for (s, e) in rescan {
             collect_json_objects(&text[s..e], base + s, depth_budget - 1, out);
         }
+    }
+}
+
+/// Parse a candidate brace span as a JSON object: strict first, then — if the
+/// span carries bare control characters inside its string literals — one
+/// escaped retry ([`nanna_llm::escape_bare_controls_in_strings`]). Local
+/// models writing TSV content emit a literal 0x09 where the spec wants `\t`;
+/// the escape is lossless (the re-parsed string holds the exact original
+/// character), so the salvaged call is still what the model wrote. Span
+/// offsets always refer to the ORIGINAL text — only the parsed value comes
+/// from the escaped copy.
+fn parse_object_span_lenient(slice: &str) -> Option<Value> {
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(slice) {
+        return Some(v);
+    }
+    match nanna_llm::escape_bare_controls_in_strings(slice)
+        .and_then(|escaped| serde_json::from_str::<Value>(&escaped).ok())
+    {
+        Some(v @ Value::Object(_)) => Some(v),
+        _ => None,
     }
 }
 
@@ -1928,10 +1948,18 @@ fn prose_call_params(map: &serde_json::Map<String, Value>, name_key: &str) -> Op
             None => {}
             Some(Value::Object(args)) => return Some(Value::Object(args.clone())),
             // Stringified arguments (OpenAI dialect): only a string that
-            // parses back to a JSON object is usable.
+            // parses back to a JSON object is usable. Bare in-string control
+            // characters (a literal tab in TSV content, arriving here after
+            // one decode) get the same lossless escaped retry as the outer
+            // span — recovering the exact characters the model wrote is
+            // within the never-guess rule.
             Some(Value::String(s)) => {
-                return match serde_json::from_str::<Value>(s) {
-                    Ok(Value::Object(args)) => Some(Value::Object(args)),
+                let parsed = serde_json::from_str::<Value>(s).ok().or_else(|| {
+                    nanna_llm::escape_bare_controls_in_strings(s)
+                        .and_then(|escaped| serde_json::from_str::<Value>(&escaped).ok())
+                });
+                return match parsed {
+                    Some(Value::Object(args)) => Some(Value::Object(args)),
                     _ => None,
                 };
             }
@@ -8631,6 +8659,52 @@ mod tests {
     }
 
     #[test]
+    fn literal_tab_in_streamed_args_heals_to_real_tab() {
+        // A local model emitting TSV content writes a bare 0x09 inside the
+        // JSON string (spec-invalid). The lenient heal escapes it losslessly;
+        // the finalized input must hold the REAL tab, not the two chars `\t`.
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("write_file".into()));
+        asm.on_tool_delta(1, "{\"path\":\"db.tsv\",\"content\":\"key\tvalue\"}");
+        asm.on_block_stop(1);
+
+        assert!(asm.error_tool_results.is_empty(), "must heal, not error");
+        assert_eq!(asm.tool_uses.len(), 1);
+        assert_eq!(
+            asm.tool_uses[0].2,
+            serde_json::json!({"path":"db.tsv","content":"key\tvalue"})
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_tab_tool_call_reaches_disk_as_real_tab() {
+        // Pipeline end-to-end: streamed args with a bare tab → healed input →
+        // real write_file execution → the file holds a real 0x09.
+        use nanna_tools::Tool as _;
+
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("write_file".into()));
+        asm.on_tool_delta(1, "{\"path\":\"mini.tsv\",\"content\":\"key\tvalue\nk2\tv2\"}");
+        asm.on_block_stop(1);
+        let input = asm.tool_uses[0].2.clone();
+
+        let params: std::collections::HashMap<String, Value> = input
+            .as_object()
+            .expect("healed args are an object")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = nanna_tools::WriteFileTool::new()
+            .with_base_dir(dir.path().to_string_lossy().to_string());
+        tool.execute(params).await.expect("write_file succeeds");
+
+        let written = std::fs::read_to_string(dir.path().join("mini.tsv")).expect("file exists");
+        assert_eq!(written, "key\tvalue\nk2\tv2");
+        assert!(written.as_bytes().contains(&0x09), "a REAL tab byte, not `\\t`");
+    }
+
+    #[test]
     fn malformed_args_produce_synthetic_error_result() {
         let mut asm = StreamBlockAssembler::default();
         asm.on_block_start(1, "tool_use".into(), Some("call_x".into()), Some("foo".into()));
@@ -11180,6 +11254,46 @@ mod prose_dialect_tests {
         let found = calls(text);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].written_name, "list_files");
+    }
+
+    // ── bare control characters in call arguments ──
+    // Observed 2026-08-14 (ornith UI leg): the model reasoned "write_file
+    // doesn't support tab characters" and routed around it — the belief a
+    // model learns when its literal-0x09 JSON (spec-invalid) kills the call.
+
+    #[test]
+    fn literal_tab_in_a_string_value_still_salvages() {
+        let text =
+            "Writing now: {\"action\": \"write_file\", \"path\": \"db.tsv\", \"content\": \"key\tvalue\"}";
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "write_file");
+        assert_eq!(
+            found[0].params,
+            Some(serde_json::json!({ "path": "db.tsv", "content": "key\tvalue" })),
+            "the salvaged argument must hold the REAL tab the model wrote"
+        );
+    }
+
+    #[test]
+    fn literal_tab_in_stringified_arguments_still_salvages() {
+        // Both decode layers at once: a bare tab inside the OUTER envelope's
+        // string literal, which after the outer escape+parse lands as a bare
+        // tab inside the INNER stringified-arguments JSON.
+        let text =
+            "{\"function\": {\"name\": \"write_file\", \"arguments\": \"{\\\"content\\\": \\\"k\tv\\\"}\"}}";
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "write_file");
+        assert_eq!(found[0].params, Some(serde_json::json!({ "content": "k\tv" })));
+    }
+
+    #[test]
+    fn malformed_braces_with_tabs_are_still_not_invented() {
+        // Leniency covers exactly the control-character defect; a structurally
+        // broken call stays unsalvageable.
+        let text = "{\"action\": \"write_file\", \"content\": \"k\tv\"";
+        assert!(calls(text).is_empty());
     }
 
     // ── negative cases: prose ABOUT tools must not trip ──

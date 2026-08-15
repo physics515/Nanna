@@ -13,6 +13,11 @@ use serde_json::Value;
 /// 2. Strip ``` / ```json fences, retry
 /// 3. Extract the first balanced `{...}` or `[...]` span, retry
 /// 4. Apply cheap repairs (trailing commas, single quotes, bare keys), retry
+///
+/// Every attempt is lenient about bare control characters inside string
+/// literals (a literal tab in TSV content — see
+/// [`escape_bare_controls_in_strings`]): strict parse first, one escaped
+/// retry on failure.
 #[must_use]
 pub fn heal_json(input: &str) -> Option<Value> {
     let trimmed = input.trim();
@@ -20,29 +25,116 @@ pub fn heal_json(input: &str) -> Option<Value> {
         return None;
     }
 
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+    if let Some(v) = parse_lenient(trimmed) {
         return Some(v);
     }
 
     let unfenced = strip_code_fence(trimmed);
-    if unfenced != trimmed {
-        if let Ok(v) = serde_json::from_str::<Value>(unfenced) {
-            return Some(v);
-        }
+    if unfenced != trimmed
+        && let Some(v) = parse_lenient(unfenced)
+    {
+        return Some(v);
     }
 
     if let Some(span) = extract_json_span(unfenced) {
-        if let Ok(v) = serde_json::from_str::<Value>(span) {
+        if let Some(v) = parse_lenient(span) {
             return Some(v);
         }
         let repaired = repair_common(span);
-        if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+        if let Some(v) = parse_lenient(&repaired) {
             return Some(v);
         }
     }
 
     let repaired = repair_common(unfenced);
-    serde_json::from_str::<Value>(&repaired).ok()
+    parse_lenient(&repaired)
+}
+
+/// Strict parse, then — only if the input carries bare control characters
+/// inside string literals — one retry with those escaped. The escaped retry
+/// can only ever ACCEPT input the strict parse rejected for exactly that
+/// reason; structurally malformed input fails both.
+fn parse_lenient(s: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(s) {
+        return Some(v);
+    }
+    escape_bare_controls_in_strings(s)
+        .and_then(|escaped| serde_json::from_str::<Value>(&escaped).ok())
+}
+
+/// Escape bare ASCII control characters (U+0000..U+001F) found inside JSON
+/// string literals, so spec-strict parsers accept them.
+///
+/// Local models emitting TSV/multiline content write a literal tab or newline
+/// inside a JSON string instead of `\t`/`\n`. That is spec-invalid — serde
+/// rejects the whole call — but the intent is unambiguous: a bare control
+/// character in a non-escape position inside a string can only mean that
+/// character. The transform is:
+///
+/// - **bounded**: one pass; output ≤ 6× input bytes (each replaced character
+///   becomes at most a 6-byte `\u00XX` escape);
+/// - **lossless**: each replaced character becomes the JSON escape that
+///   decodes back to exactly that character, and every byte outside string
+///   literals is copied verbatim — provable by round-trip (parse the result,
+///   the decoded strings equal the raw originals);
+/// - **conservative**: a control character right after a backslash (an
+///   already-invalid escape like `\<TAB>`) is ambiguous and left alone, and
+///   `None` is returned when nothing was rewritten so callers skip the
+///   redundant re-parse.
+#[must_use]
+pub fn escape_bare_controls_in_strings(s: &str) -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut changed = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if !in_string {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                escaped = true;
+                out.push(c);
+            }
+            '"' => {
+                in_string = false;
+                out.push(c);
+            }
+            '\t' => {
+                changed = true;
+                out.push_str("\\t");
+            }
+            '\n' => {
+                changed = true;
+                out.push_str("\\n");
+            }
+            '\r' => {
+                changed = true;
+                out.push_str("\\r");
+            }
+            c if (c as u32) < 0x20 => {
+                changed = true;
+                // All remaining controls are < 0x20, so the escape is always
+                // `\u00XX` — two hex digits suffice.
+                let b = c as u32;
+                out.push_str("\\u00");
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+            c => out.push(c),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Like [`heal_json`], but typed.
@@ -348,5 +440,79 @@ mod tests {
     fn braces_inside_strings_ignored() {
         assert_eq!(count_balanced_top_level_objects(r#"{"a":"}{"}"#), 1);
         assert_eq!(count_balanced_top_level_objects(r#"{"a":"\""}"#), 1);
+    }
+
+    // ── bare control characters inside string literals ──
+    // Observed 2026-08-14 (ornith UI leg): a local model writing TSV content
+    // emits a literal 0x09 inside the JSON string instead of \t; strict serde
+    // rejects the whole tool call.
+
+    #[test]
+    fn strict_serde_rejects_bare_tab_premise() {
+        // The premise the lenient path exists for: spec-invalid, serde says no.
+        assert!(serde_json::from_str::<Value>("{\"a\":\"x\ty\"}").is_err());
+    }
+
+    #[test]
+    fn literal_tab_in_string_value_heals_to_real_tab() {
+        let v = heal_json("{\"path\":\"db.tsv\",\"content\":\"key\tvalue\"}").unwrap();
+        assert_eq!(v["content"], "key\tvalue");
+    }
+
+    #[test]
+    fn literal_newline_and_cr_heal() {
+        let v = heal_json("{\"content\":\"line1\nline2\rend\"}").unwrap();
+        assert_eq!(v["content"], "line1\nline2\rend");
+    }
+
+    #[test]
+    fn escaped_tab_is_untouched() {
+        // A proper \t escape decodes to a real tab and the escape pass never
+        // fires (nothing bare to rewrite).
+        let raw = r#"{"content":"key\tvalue"}"#;
+        assert_eq!(heal_json(raw).unwrap()["content"], "key\tvalue");
+        assert!(escape_bare_controls_in_strings(raw).is_none());
+    }
+
+    #[test]
+    fn controls_in_keys_and_short_escapeless_controls_heal() {
+        // A tab inside a KEY string, and 0x01 (no short escape; becomes \u0001).
+        let v = heal_json("{\"k\tey\":\"a\u{1}b\"}").unwrap();
+        assert_eq!(v["k\tey"], "a\u{1}b");
+    }
+
+    #[test]
+    fn fenced_json_with_literal_tab_heals() {
+        let raw = "```json\n{\"content\":\"a\tb\"}\n```";
+        assert_eq!(heal_json(raw).unwrap()["content"], "a\tb");
+    }
+
+    #[test]
+    fn tool_args_with_literal_tab_reach_the_object() {
+        let v = heal_tool_args("{\"path\":\"x\",\"content\":\"k\tv\"}");
+        assert_eq!(v["content"], "k\tv");
+    }
+
+    #[test]
+    fn escape_is_lossless_and_bounded() {
+        let raw = "{\"a\":\"w\tx\ny\rz\u{1}\"}";
+        let escaped = escape_bare_controls_in_strings(raw).unwrap();
+        // Round-trip: parsing the escaped text restores the exact original
+        // characters — the transform is lossless by construction.
+        let v: Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(v["a"], "w\tx\ny\rz\u{1}");
+        // Bounded: at most 6 output bytes per input byte.
+        assert!(escaped.len() <= raw.len() * 6);
+        // Controls OUTSIDE string literals are legal whitespace (or already
+        // broken JSON) — never rewritten, so valid input stays byte-identical.
+        assert!(escape_bare_controls_in_strings("{\t\"a\":\n1}").is_none());
+    }
+
+    #[test]
+    fn malformed_input_with_tabs_still_rejected() {
+        // Leniency covers exactly one defect class; garbage stays garbage.
+        assert!(heal_json("not json \t at all").is_none());
+        // `\<TAB>` is an invalid escape — ambiguous, left alone, still fails.
+        assert!(heal_json("{\"a\":\"x\\\t\"}").is_none());
     }
 }
