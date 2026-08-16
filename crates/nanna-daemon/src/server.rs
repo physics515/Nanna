@@ -41,16 +41,18 @@ const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
     tools: Arc<ToolRegistry>,
-    agent_config: nanna_agent::AgentConfig,
+    /// Read at spawn, never at construction: a sub-agent must run on the
+    /// model and summarization list the user has NOW, not the ones the daemon
+    /// booted with. `model_routing`/`routing_first_turn_primary` stay pinned
+    /// below because they are this spawner's own sub-agent policy, not user
+    /// config.
+    agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    sub_agent_routing: Vec<nanna_agent::ModelTier>,
     system_prompt: String,
     workspace_root: Option<PathBuf>,
     workspace_context: Option<String>,
     /// Shared model stats tracker (sub-agents contribute to the same stats)
     stats: Option<nanna_agent::ModelStatsTracker>,
-    /// Model fallback chain for sub-agents, in priority order — resolved via
-    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
-    /// sub-agent list already means "the main chat list". Never empty.
-    sub_agent_models: Vec<String>,
 }
 
 #[async_trait]
@@ -65,14 +67,25 @@ impl AgentSpawner for AgentSpawnerImpl {
 
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
+        // One live read for the whole spawn: the model list, the chat model
+        // it falls back to, and the summarization list the sub-agent inherits
+        // all come from the config as it stands right now.
+        let (base_config, sub_agent_models) = {
+            let live = self.agent_config_src.read().await;
+            (
+                crate::agent_service::agent_config_from(&live),
+                live.sub_agent_models.clone(),
+            )
+        };
+
         // Fallback chain: first working model wins. A candidate whose
         // provider is missing is skipped; a candidate whose run fails hands
         // the prompt to the next (a fresh agent — sub-agent runs are
         // idempotent by contract, the parent only consumes the final text).
-        let candidates = if self.sub_agent_models.is_empty() {
-            vec![self.agent_config.model.clone()]
+        let candidates = if sub_agent_models.is_empty() {
+            vec![base_config.model.clone()]
         } else {
-            self.sub_agent_models.clone()
+            sub_agent_models.clone()
         };
 
         let mut last_error = String::new();
@@ -99,7 +112,9 @@ impl AgentSpawner for AgentSpawnerImpl {
             }
 
             // Configure agent — sub-agents are full agents, no artificial iteration cap
-            let mut config = self.agent_config.clone();
+            let mut config = base_config.clone();
+            config.model_routing = self.sub_agent_routing.clone();
+            config.routing_first_turn_primary = true;
             config.max_iterations = max_iterations;
             let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
             // Strip provider prefix from model name for the actual API call
@@ -510,7 +525,13 @@ fn build_script_services(
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
     turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    summarizer: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    // Router plus the LIVE config the model list is resolved from at call
+    // time. A `Vec<String>` here would be a boot snapshot, and this service
+    // outlives every `config.set` (2026-08-15).
+    summarizer: Option<(
+        Arc<crate::llm_router::LlmRouter>,
+        Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    )>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -844,12 +865,12 @@ fn build_script_services(
     // summarization model chain. The `day_dream` tool is the model-facing
     // half: dreaming already does this on a schedule, and this lets the model
     // ask for it deliberately when it notices related fragments piling up.
-    if let Some((router, models)) = summarizer {
+    if let Some((router, summarizer_config)) = summarizer {
         services.insert(
             "memory.summarize".to_string(),
             Arc::new(move |params: Value| {
                 let router = router.clone();
-                let models = models.clone();
+                let summarizer_config = Arc::clone(&summarizer_config);
                 Box::pin(async move {
                     let texts: Vec<String> = params
                         .get("texts")
@@ -868,6 +889,15 @@ fn build_script_services(
 ---
 
 ");
+                    // Resolved per call: whichever summarization list the
+                    // user has set right now is the one that answers.
+                    let models = {
+                        let live = summarizer_config.read().await;
+                        crate::dream_summarizer::summarization_models(
+                            &live.summarization_priority,
+                            std::slice::from_ref(&live.model),
+                        )
+                    };
                     let summarize =
                         crate::dream_summarizer::summarize_with_failover(router, models);
                     let summary = summarize(joined).await?;
@@ -1952,20 +1982,20 @@ impl DaemonServer {
             // both thresholds), so there is no second copy of the policy here.
             let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
             let activity_for_tasks = activity_clock.clone();
-            // The user's full summarization priority list, not just its head:
-            // the scheduled dream cycle now fails over exactly like the IPC one,
-            // so a single unavailable model no longer kills the nightly cycle.
-            let summarization_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
+            // NOT captured here. The list is read from the live agent config at
+            // the top of each cycle instead: a boot clone survives every
+            // `config.set`, so a user who repointed summarization kept dreaming
+            // on the model they had at startup — the whole class the P23
+            // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
+            // summarizations in the benchmark series ran on the wrong model).
+            // A dream cycle runs minutes-to-hours apart, so one lock read per
+            // cycle costs nothing measurable.
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
                 let dreaming = dreaming_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
-                let summarization_models = summarization_models.clone();
                 let chat_runs = chat_runs_for_tasks.clone();
                 let dream_in_flight = dream_in_flight_for_tasks.clone();
                 let scheduled_resume_parked = scheduled_resume_parked.clone();
@@ -1993,6 +2023,16 @@ impl DaemonServer {
                                         None,
                                     )
                                 } else {
+                                // Read the summarization list LIVE, once per
+                                // cycle: whatever the user last set is what
+                                // this dream summarizes on. Falls back to the
+                                // chat model exactly as the boot path did.
+                                let live_cfg = agent.agent_config().await;
+                                let summarization_models =
+                                    crate::dream_summarizer::summarization_models(
+                                        &live_cfg.summarization_priority,
+                                        std::slice::from_ref(&live_cfg.model),
+                                    );
                                 let outcome = {
                                 // The idle gate AND the full dream cycle (feedback
                                 // flush -> FSRS testing-effect flush -> consolidate)
@@ -3384,6 +3424,14 @@ impl DaemonServer {
             None
         };
 
+        // ONE config for every long-lived collaborator below. The sub-agent
+        // spawner and the script summarizer are constructed BEFORE the agent
+        // service, so the service adopts this same lock (`with_shared_config`)
+        // and a later `config.set` reaches all three at once — the boot-clone
+        // staleness that ran a whole benchmark series on the wrong summarizer
+        // (2026-08-15).
+        let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
+
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
@@ -3424,38 +3472,19 @@ impl DaemonServer {
                 Some(Arc::new(AgentSpawnerImpl {
                     router: router.clone(),
                     tools: tools.clone(),
-                    agent_config: nanna_agent::AgentConfig {
-                        model: self.config.agent.model.clone(),
-                        max_tokens: self.config.agent.max_tokens,
-                        temperature: self.config.agent.temperature,
-                        max_iterations: None, // Unlimited — model stops when done
-                        thinking_mode: self.config.agent.thinking_mode,
-                        summarization_priority: self.config.agent.summarization_priority.clone(),
-                        summarization_ollama_url: self
-                            .config
-                            .agent
-                            .summarization_ollama_url
-                            .clone(),
-                        model_routing: sub_agent_routing,
-                        routing_first_turn_primary: true,
-                        openrouter_api_key: self.config.agent.openrouter_api_key.clone(),
-                        openai_api_key: self.config.agent.openai_api_key.clone(),
-                        ..Default::default()
-                    },
+                    // The live config, not a snapshot of it — see
+                    // `AgentSpawnerImpl::agent_config_src`.
+                    agent_config_src: Arc::clone(&shared_agent_config),
+                    sub_agent_routing,
                     system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
-                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
                 }))
             } else {
                 None
             };
 
-            let summarizer_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
             let services = build_script_services(
                 &memory,
                 spawner_arc,
@@ -3463,7 +3492,7 @@ impl DaemonServer {
                 workspace_id_for_services.clone(),
                 self.storage.clone(),
                 turn_baselines.clone(),
-                Some((router.clone(), summarizer_models)),
+                Some((router.clone(), Arc::clone(&shared_agent_config))),
             );
 
             if let Some(ref dir) = tools_dir {
@@ -3550,7 +3579,10 @@ impl DaemonServer {
         )
         .with_session_history(session_history)
         .with_stats(model_stats.clone())
-        .with_degradations(degradations.clone());
+        .with_degradations(degradations.clone())
+        // Adopt the lock the spawner and the script summarizer already hold,
+        // so `config.set` moves all three at once instead of only this one.
+        .with_shared_config(Arc::clone(&shared_agent_config));
         if let Some(ref storage) = self.storage {
             agent_service = agent_service.with_storage(storage.clone());
         }

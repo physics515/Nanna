@@ -163,7 +163,7 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
 /// Free function so the whole resolution chain — `[llm]` snapshot →
 /// [`AgentServiceConfig`] → the `AgentConfig` the agent loop actually
 /// summarizes with — is unit-testable without a live service.
-fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
+pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
     AgentConfig {
         model: config.model.clone(),
         max_tokens: config.max_tokens,
@@ -593,7 +593,35 @@ impl AgentService {
         let config = self.config.read().await;
         agent_config_from(&config)
     }
-    
+
+    /// Adopt a config handle created before this service existed.
+    ///
+    /// The daemon builds the sub-agent spawner and the script services BEFORE
+    /// the agent service, and each of those needs the same live config the
+    /// service will mutate on `config.set`. Sharing one lock is what makes
+    /// "the user changed the model" true for all of them at once; cloning the
+    /// config into each is what made it false (2026-08-15).
+    #[must_use]
+    pub fn with_shared_config(mut self, config: Arc<RwLock<AgentServiceConfig>>) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The live config itself, for the long-lived collaborators the daemon
+    /// builds once at boot but that must keep answering to `config.set`.
+    ///
+    /// Handing out the `Arc<RwLock<..>>` rather than a snapshot is the point:
+    /// a boot-time clone silently outlives every later config change, which is
+    /// exactly how the scheduled dream cycle, the sub-agent spawner and the
+    /// script summarizer each kept using the model the daemon started with
+    /// (2026-08-15). Holders read it when they act, not when they are built.
+    /// It is the config only — never the service — so no holder can form a
+    /// reference cycle back to [`AgentService`].
+    #[must_use]
+    pub fn config_handle(&self) -> Arc<RwLock<AgentServiceConfig>> {
+        Arc::clone(&self.config)
+    }
+
     /// Get or create the per-session queue for serializing chat processing
     async fn get_or_create_queue(&self, session_id: &str) -> Arc<SessionQueue> {
         // Fast path: read lock
@@ -2021,6 +2049,46 @@ mod tests {
     /// with — because the hot-reload path pushed only `model`/`model_priority`
     /// onto the running service. The pin has to survive the whole chain, not
     /// just the on-disk write.
+    /// The sibling half of the pin: the daemon builds the sub-agent spawner
+    /// and the script summarizer BEFORE this service exists, so each was
+    /// handed a clone of the boot config and kept answering with it forever.
+    /// Sharing one lock is what makes a later change reach them; this asserts
+    /// the handle really is shared, not copied.
+    #[tokio::test]
+    async fn collaborators_sharing_the_config_handle_see_a_later_change() {
+        let boot = AgentServiceConfig {
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            ..Default::default()
+        };
+        // What the daemon hands to the spawner / script summarizer at boot.
+        let shared = Arc::new(RwLock::new(boot));
+        let collaborator = Arc::clone(&shared);
+        assert_eq!(
+            collaborator.read().await.summarization_priority,
+            vec!["ollama/lfm2.5".to_string()]
+        );
+
+        // The service adopts the SAME lock, then the user repoints summarization.
+        {
+            let mut live = shared.write().await;
+            apply_llm_settings(
+                &mut live,
+                &nanna_config::LlmConfig {
+                    summarization_priority: vec!["ollama/ornith:9b".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The collaborator resolves at USE time, so it sees the new list.
+        let resolved = agent_config_from(&*collaborator.read().await);
+        assert_eq!(
+            resolved.summarization_priority,
+            vec!["ollama/ornith:9b".to_string()],
+            "a collaborator holding the shared handle must summarize on the              model the user set, not the one the daemon booted with"
+        );
+    }
+
     #[test]
     fn a_changed_summarization_priority_reaches_the_next_agent_config() {
         let mut cfg = AgentServiceConfig {
