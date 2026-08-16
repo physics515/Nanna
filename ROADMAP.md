@@ -277,21 +277,31 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
       controls `auto_remember_messages` config, persisted and pushed to daemon.
 
 #### P0.2 - Documentation
-- [ ] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
-- [ ] Move architecture/performance content to the bottom of the readme
-- [ ] Add truthful capability matrix: Desktop GUI / CLI chat / Fully local inference / Ollama backend / Cloud providers / Channels — each with Status and Requires columns.
+- [x] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
+      *(2026-08-16)* README reorganized: user-focused top half with pitch, download links, system
+      requirements, and "First 5 Minutes" checklist. Architecture/performance moved to bottom.
+- [x] Move architecture/performance content to the bottom of the readme
+      *(2026-08-16)* Done as part of README reorganization.
+- [x] Add truthful capability matrix: Desktop GUI / CLI chat / Fully local inference / Ollama backend / Cloud providers / Channels — each with Status and Requires columns.
+      *(2026-08-16)* **Capability Matrix table added** to README with Status and Requires columns
+      for all major features.
 - [x] Add PRIVACY.md documenting: what's stored locally, what's sent to LLM providers, OpenAI embeddings, Brave Search, channels, websites; how to disable cloud calls; how to delete/export data.
       *(2026-07-24)* **`PRIVACY.md` shipped** at repo root (local storage, outbound sinks, opt-out,
       deletion). Cross-linked from the P1 privacy item.
-- [ ] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
-- [ ] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
-- [ ] Add per-OS installation docs.
+- [~] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
+      *(2026-08-16)* Placeholder references added to README; actual screenshots to be captured separately.
+- [x] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
+      *(2026-08-16)* **Troubleshooting section added** to README covering all common issues.
+- [x] Add per-OS installation docs.
+      *(2026-08-16)* **Per-OS installation instructions** added to README for Windows, macOS, and Linux.
 - [x] Commit LICENSE file (MIT) — appears absent despite README reference.
       *(2026-07-23)* Added. Both `Cargo.toml` manifests already declared `license = "MIT"` and the
       README claimed MIT, but the file itself was missing — so every published crate asserted a licence
       with no text behind it. Copyright line reads `2026 physics515` (the repo owner); change it if you
       want a legal name there.
-- [ ] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
+- [x] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
+      *(2026-08-16)* **Both files shipped** — CONTRIBUTING.md with development setup, code style,
+      and PR guidelines; CODE_OF_CONDUCT.md with Contributor Covenant v2.1.
 - [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
       *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
 - [ ] Add GitHub repo description and topics.
