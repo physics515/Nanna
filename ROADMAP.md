@@ -315,18 +315,28 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 #### P0.3 - Stronger Public Release (can follow 0.1)
 - [ ] Local Ollama setup assistant in GUI.
 - [ ] Model/backend status dashboard.
-- [ ] Cost tracking for cloud models.
+- [~] Cost tracking for cloud models.
+      *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,
+      `ModelStatsTracker::cost_report()` surfaced on IPC. Remaining: GUI surface, per-session/day aggregation.
 - [ ] Backup/export/delete data UI.
 - [ ] Per-channel session isolation (critical if any channel is marketed).
-- [ ] Channel-native response formatting.
-- [ ] Log rotation + crash diagnostics export.
-- [ ] Windows service install/uninstall/start/stop actually working.
+- [~] Channel-native response formatting.
+      *(See P8)* First slice shipped — `ChannelFeatures::MARKDOWN` + `format_for_channel` + length-aware
+      splitting + tables→text conversion. Remaining: Discord embeds, Slack Block Kit.
+- [x] Log rotation + crash diagnostics export.
+      *(Done in P6, 2026-07-09)* `tracing-appender` daily rotation, max 7 files, `--log-dir` + `--no-file-log`
+      flags. Crash diagnostics: logs capture panics via the tracing layer.
+- [x] Windows service install/uninstall/start/stop actually working.
+      *(Done in P11, 2026-07-17)* Windows service install/uninstall/start/stop via the SCM with platform-aware
+      default args.
 - [ ] Code signing / notarization in CI.
 - [ ] Accessibility pass (screen reader, keyboard navigation, ARIA, color contrast).
 - [ ] Internationalization/localization framework (currently English-only).
 - [ ] Burn local runner (P12) → re-market true offline.
-- [ ] Dreaming overhaul (P13)
-- [ ] Self-update via GitHub Releases.
+- [ ] Dreaming overhaul (P13).
+- [~] Self-update via GitHub Releases.
+      *(P8 GUI half landed 2026-07-24, v0.2.1)* tauri-plugin-updater with signed NSIS artifacts, status-bar
+      "Update to vX" chip, user-initiated apply. Remaining: headless-daemon self-update.
 - [ ] Resource cleanup verification on uninstall (daemon, config, memory DB, credentials fully removed).
 
 #### P0.3 - Code Quality & CI
