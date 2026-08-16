@@ -3414,6 +3414,61 @@ Full evidence: the 40-agent forensic analysis (per-leg + cross-cutting, adversar
 verified) in the 2026-08-15 session; per-leg ledgers and per-poll history under
 `D:/Development/nanna-bench/ui-run-*/`.
 
+**P23 verification series (2026-08-15/16, v0.3.8-beta.13).** Five legs on the same
+ladder; results and per-leg trajectories in [bench/BASELINE.md](bench/BASELINE.md).
+P23's core claim held for the top two models: ornith 40 peak / **36 final** and qwen
+**26 = peak = final**, both with **zero interjections**, against post-P22 finals of 0 and
+0. Three legs ran destruction-free end-to-end untouched. Levers observed firing:
+MissionEnd honesty, repeat-done escalation, structural shrink holds, byte-floor refusals,
+truthful tool acks (zero phantom registry saves, against 201 previously), exit-reason
+file. The series produced one crash bug and five carry-forward items below.
+
+### P24 — Close what the P23 series exposed 🌱 (new — 2026-08-16, series-driven)
+
+Every item below was observed live and verified against the code or a cross-model
+control before being written down. All are chat-general per the owner rule: each one
+describes a session that edits a file, not a benchmark.
+
+- [ ] **Fix the em-dash slice panic — crash, ships in v0.3.8-beta.13.**
+      `crates/nanna-agent/src/context.rs:1838` builds a dropped-message preview with
+      `&content[..80]`, a raw byte slice that panics on a multi-byte boundary;
+      `:1827` has the same defect at `..100`. It killed the whole daemon mid-run when
+      byte 80 landed inside an em dash **in nanna's own `edit_file` error text**. Same
+      class as the 2026-08-10 `&text[..200]` distillation panic. Fix with a
+      char-boundary-safe truncation helper and **sweep for every other `[..N]` on a
+      user- or model-derived string** — the codebase writes em dashes into tool errors
+      freely, so this input is ordinary. Ministral's leg is INVALID because of it.
+- [ ] **Detect the no-shrink structural break.** Every collapse this series was an
+      in-place splice that left the file the same size or **larger** (ministral
+      2542→3389 bytes while breaking; gemma 1877→1882). The byte floor guards shrinkage
+      and cannot see this class at all. A parse/structure check on a write that did not
+      shrink is the missing guard.
+- [ ] **Park by verified score, not by recency.** `.__prev__` holds the previous write,
+      so after a bad write it holds whatever preceded it. Observed four times as
+      worthless recovery material: a *broken* file (ministral, fails `sh -n`), a *stale*
+      9-point file while the peak was 11 (gemma), the copied spec, and a 0-byte file.
+      Park the best *verified* version instead.
+- [ ] **Name the parked copy in the structural verdict.** When the current file fails to
+      parse, the verdict names the broken line but never says a known-good copy exists or
+      where. All three of gemma's repairs were from-scratch rewrites — strictly more
+      expensive than restoring and re-climbing.
+- [ ] **Arm the reseed off the environment's verdicts, not only task `unmet`.**
+      `chat_harness.rs:1166` guards the fresh-context reseed with
+      `report.abandoned_unmet.is_empty()`. lfm2.5 ended dry having verified **0/42** with
+      35 items abandoned and `unmet=0`, so the guard correctly declined and the safety
+      net never armed in exactly the case it exists for. The failing verdicts are already
+      re-read each turn for the ARTIFACT STATE block — the signal is present and free.
+- [ ] **Replace `is_running` with artifact-staleness as the stuck-run signal.** Ministral
+      ran 38 minutes with steps completing normally and the artifact untouched: after the
+      splice desynced its context from disk, every `edit_file` was *rejected*
+      ("old_string not found … the file's real content differs from your memory"). The
+      process was genuinely alive the whole time. "Artifact unchanged across two polls
+      while steps still complete" is the observable.
+- [ ] **Refuse (or challenge) a write whose content copies a read-only file.** lfm2.5
+      wrote a near-verbatim copy of `tests/test_01.sh` into `minidb`, making the artifact
+      invoke itself. The ratchet protects the spec *from* the artifact but not the
+      artifact *from* the spec, and the content is right there at write time.
+
 ---
 
 ---
