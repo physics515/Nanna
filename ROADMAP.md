@@ -3384,7 +3384,11 @@ the 40-agent series analysis (2026-08-15 session).
 **Landed 2026-08-15 (v0.3.8-beta.13).** All 27 verified levers are in; 1046 tests
 green. Known remainders, deliberately scoped rather than silently dropped:
 
-- [ ] **Summarization priority is live per turn but still boot-frozen in three
+- [x] **Summarization priority is live everywhere** *(2026-08-15)* — the daemon now
+      builds ONE `Arc<RwLock<AgentServiceConfig>>` before the spawner and the script
+      services and hands the same lock to the agent service (`with_shared_config`), so
+      `config.set` reaches all three; the scheduled dream cycle re-reads the list at the
+      top of each cycle. Previously boot-frozen in three
       long-lived consumers** (`server.rs`: the scheduled dream-cycle summarizer list,
       the sub-agent `AgentConfig`, and script-services summarizer models each clone the
       list once at boot). The per-turn chat/harness path — the one that degraded the
