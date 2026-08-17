@@ -4,9 +4,11 @@
 //! The buffer is the answer to a 9B model's hardest constraint: one huge,
 //! perfect tool argument per file. Chunks are appended across calls (each
 //! response echoes the tail so the model continues in the right place) and
-//! the real file changes only on commit. In this harness `Nanna.exec` is
-//! unavailable, so the commit-time Python gate fails OPEN and cleanup falls
-//! back to truncating the buffer — both by design.
+//! the real file changes only on commit. Both shrink branches of the commit
+//! guard are pinned, in the order it applies them: the stale-copy hold that
+//! echoes the current content, then the size floor behind it. In this harness
+//! `Nanna.exec` is unavailable, so the commit-time Python gate fails OPEN and
+//! cleanup falls back to truncating the buffer — both by design.
 //!
 //! Tolerant by design (same as `default_skills_params.rs`): if the sibling
 //! `nanna-tools/default-skills` tree isn't present, the tests no-op.
@@ -22,12 +24,19 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/file_buffer/tool.ts")
 }
 
+/// The commit guards are stateful: read-recency marks and the anti-erosion
+/// ratchet live at `.nanna/*.json`, a RELATIVE path the bridge resolves against
+/// the working directory. Pinning the workdir to the temp dir keeps that state
+/// inside the test — without it the paths resolve against the real home
+/// directory, where the permission set denies them and every guard sees the same
+/// blank state, so the branches that differ only by what the state says cannot
+/// be told apart.
 async fn run_buffer(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read file_buffer tool.ts")
         .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]));
     ScriptEngine::new()
-        .execute(&tool, input, None, None)
+        .execute_with_workdir(&tool, input, None, None, Some(dir.to_path_buf()))
         .await
         .map(|r| r.value)
         .map_err(|e| e.to_string())
@@ -202,8 +211,13 @@ async fn second_clear_requires_force() {
     assert!(forced.contains("discarded"), "got: {forced}");
 }
 
+/// FIRST of the two shrink branches, in the order the guard applies them (same
+/// order write_file carries): a shrinking commit over a file whose content this
+/// session has never seen is the STALE-COPY hold. It is not a refusal — the
+/// reply hands back the file's CURRENT content as merge material and counts
+/// itself as the read, so the size floor below is what the *next* attempt meets.
 #[tokio::test]
-async fn shrink_guard_keeps_buffer_and_file() {
+async fn stale_shrink_hold_echoes_the_current_file() {
     if skill_missing() {
         return;
     }
@@ -218,12 +232,64 @@ async fn shrink_guard_keeps_buffer_and_file() {
         dir.path(),
     )
     .await;
+    let held = run_fail(
+        json!({ "action": "commit", "file_path": target }),
+        dir.path(),
+    )
+    .await;
+    assert!(held.contains("COMMIT HELD"), "got: {held}");
+    assert!(held.contains("KEPT"), "got: {held}");
+    assert!(held.contains("from 1000 to 4 bytes"), "got: {held}");
+    assert!(held.contains("CHANGED since you last read it"), "got: {held}");
+    // The echo IS the merge material — a hold without the content is useless.
+    assert!(
+        held.contains(&original),
+        "the hold must carry the file's current content"
+    );
+    assert!(held.contains("counts as your read"), "got: {held}");
+    assert!(!held.contains("force"), "must not advertise force: {held}");
+    // Real file untouched, buffer still there for continued appending.
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+    let buf = std::fs::read_to_string(dir.path().join("e.txt.__buffer__")).unwrap();
+    assert_eq!(buf, "tiny");
+}
+
+/// SECOND branch: the size floor. Once the stale-copy hold above has handed the
+/// current content over and recorded the read, the floor is what stands between
+/// a 4-char fragment and a 1000-byte file — and its answer is "keep appending",
+/// which is only possible because the buffer is KEPT.
+#[tokio::test]
+async fn shrink_floor_refuses_a_fragment_of_a_seen_file() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("e.txt");
+    let original = "x".repeat(1_000);
+    std::fs::write(&real, &original).unwrap();
+    let target = real.to_string_lossy().into_owned();
+
+    run_ok(
+        json!({ "action": "append", "file_path": target, "content": "tiny" }),
+        dir.path(),
+    )
+    .await;
+    // Burn the stale-copy hold: it fires once and records the read.
+    let held = run_fail(
+        json!({ "action": "commit", "file_path": target }),
+        dir.path(),
+    )
+    .await;
+    assert!(held.contains("COMMIT HELD"), "first commit is the hold: {held}");
+
     let err = run_fail(
         json!({ "action": "commit", "file_path": target }),
         dir.path(),
     )
     .await;
     assert!(err.contains("COMMIT REFUSED"), "got: {err}");
+    assert!(err.contains("only 4 chars"), "got: {err}");
+    assert!(err.contains("currently holds 1000"), "got: {err}");
     assert!(err.contains("KEPT"), "got: {err}");
     assert!(err.contains("appending"), "got: {err}");
     assert!(!err.contains("force"), "must not advertise force: {err}");

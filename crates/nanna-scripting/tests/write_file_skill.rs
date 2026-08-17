@@ -1,8 +1,10 @@
 //! Behavioral tests for the `write_file` default skill (v0.1.4), executed
 //! for real through the Boa engine. Covers the structured guidance
-//! failures, the versioned-copy-name refusal, and the shrink guard. The
-//! Python syntax gate needs `Nanna.exec`, which this harness does not
-//! grant — that path fails OPEN here by design and is exercised live.
+//! failures, the versioned-copy-name refusal, and BOTH shrink branches in
+//! the order the guard applies them: the stale-copy hold that echoes the
+//! current content, then the size floor behind it. The Python syntax gate
+//! needs `Nanna.exec`, which this harness does not grant — that path fails
+//! OPEN here by design and is exercised live.
 //!
 //! Tolerant by design: if the sibling default-skills tree isn't present,
 //! the tests no-op.
@@ -18,12 +20,19 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/write_file/tool.ts")
 }
 
+/// The write guards are stateful: read-recency marks and the anti-erosion
+/// ratchet live at `.nanna/*.json`, a RELATIVE path the bridge resolves against
+/// the working directory. Pinning the workdir to the temp dir keeps that state
+/// inside the test — without it the paths resolve against the real home
+/// directory, where the permission set denies them and every guard sees the same
+/// blank state, so the branches that differ only by what the state says cannot
+/// be told apart.
 async fn run_write(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read write_file tool.ts")
         .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]));
     ScriptEngine::new()
-        .execute(&tool, input, None, None)
+        .execute_with_workdir(&tool, input, None, None, Some(dir.to_path_buf()))
         .await
         .map(|r| r.value)
         .map_err(|e| e.to_string())
@@ -147,6 +156,44 @@ async fn valid_rewrite_over_a_parked_draft_is_accepted() {
     );
 }
 
+/// FIRST of the two shrink branches, in the order the guard applies them (the
+/// same order file_buffer's commit carries): a shrinking write over a file whose
+/// content this session has never seen is the STALE-COPY hold. It is not a
+/// refusal — the reply hands back the file's CURRENT content to merge against
+/// and counts itself as the read, so the size floor below is what the *next*
+/// attempt meets.
+#[tokio::test]
+async fn stale_shrink_hold_echoes_the_current_file() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("big.txt");
+    let original = "y".repeat(1_000);
+    std::fs::write(&real, &original).unwrap();
+    let target = real.to_string_lossy().into_owned();
+
+    let held = run_fail(
+        json!({ "file_path": target, "content": "fragment" }),
+        dir.path(),
+    )
+    .await;
+    assert!(held.contains("WRITE HELD"), "got: {held}");
+    assert!(held.contains("nothing is lost"), "got: {held}");
+    assert!(held.contains("from 1000 to 8 bytes"), "got: {held}");
+    assert!(held.contains("CHANGED since you last read it"), "got: {held}");
+    // The echo IS the merge material — a hold without the content is useless.
+    assert!(
+        held.contains(&original),
+        "the hold must carry the file's current content"
+    );
+    assert!(held.contains("counts as your read"), "got: {held}");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+}
+
+/// SECOND branch: the size floor. Once the stale-copy hold above has handed the
+/// current content over and recorded the read, the floor is what still refuses
+/// an 8-byte fragment sent over a 1000-byte file.
 #[tokio::test]
 async fn shrink_guard_still_refuses_fragments() {
     if skill_missing() {
@@ -157,6 +204,14 @@ async fn shrink_guard_still_refuses_fragments() {
     std::fs::write(&real, "y".repeat(1_000)).unwrap();
     let target = real.to_string_lossy().into_owned();
 
+    // Burn the stale-copy hold: it fires once and records the read.
+    let held = run_fail(
+        json!({ "file_path": target, "content": "fragment" }),
+        dir.path(),
+    )
+    .await;
+    assert!(held.contains("WRITE HELD"), "first write is the hold: {held}");
+
     let err = run_fail(
         json!({ "file_path": target, "content": "fragment" }),
         dir.path(),
@@ -164,6 +219,8 @@ async fn shrink_guard_still_refuses_fragments() {
     .await;
     assert!(err.contains("WRITE REFUSED"), "got: {err}");
     assert!(err.contains("NOT modified"), "got: {err}");
+    assert!(err.contains("only 8 bytes"), "got: {err}");
+    assert!(err.contains("currently holds 1000 bytes"), "got: {err}");
     assert_eq!(std::fs::read_to_string(&real).unwrap().len(), 1_000);
 }
 
