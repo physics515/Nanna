@@ -261,16 +261,19 @@ export default {
         // Best-effort.
       }
     }
-    function seenSinceLastChange(path) {
+    // "seen" / "stale" / "never" — same three verdicts as write_file (full
+    // design comment there): the hold below is identical for "stale" and
+    // "never", the sentence it prints is not. Unknown → "seen" (fail open).
+    function readSeenVerdict(path) {
       try {
         var st = Nanna.stat(path);
-        if (!st || typeof st.modified !== "number" || !isFinite(st.modified)) return true;
+        if (!st || typeof st.modified !== "number" || !isFinite(st.modified)) return "seen";
         var entry = readmarkLoad()[hiwaterKey(path)];
         var at = entry && typeof entry.at === "number" && isFinite(entry.at) ? entry.at : 0;
-        if (at === 0) return false;
-        return at >= st.modified * 1000;
+        if (at === 0) return "never";
+        return at >= st.modified * 1000 ? "seen" : "stale";
       } catch (e) {
-        return true;
+        return "seen";
       }
     }
 
@@ -771,25 +774,33 @@ export default {
         // mark is NOT recorded, and the next commit bounces into an explicit
         // ranged read_file rather than a merge against a partial view.
         var ECHO_MAX = 65536;
-        if (fileExists && !hiwaterExempt(hwKeyC) && buffered.length < existingLen &&
-            typeof existing === "string" && !seenSinceLastChange(filePath)) {
+        // Evaluated only once the cheap conditions hold, so an ordinary
+        // commit still costs no stat and no state read.
+        var seenVerdict = (fileExists && !hiwaterExempt(hwKeyC) && buffered.length < existingLen &&
+            typeof existing === "string") ? readSeenVerdict(filePath) : "seen";
+        if (seenVerdict !== "seen") {
+          // The reason clause, and ONLY the reason clause, differs between
+          // the two verdicts — the way forward below is the same either way.
+          var staleWhy = seenVerdict === "never"
+            ? "but you have NEVER read this file in this session — your buffer was built without ever seeing what the file holds, "
+            : "but the file has CHANGED since you last read it — your buffer was built from a stale copy, ";
           if (existingLen <= ECHO_MAX) {
             readmarkPut(filePath);
-            glog("file_buffer guard: stale-shrink echo for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; file changed since last recorded read)");
+            glog("file_buffer guard: stale-shrink echo for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; read-mark verdict: " + seenVerdict + ")");
             return fail(
               "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. Committing would shrink " + filePath +
-              " from " + existingLen + " to " + buffered.length + " bytes, but the file has CHANGED since you last read it — " +
-              "your buffer was built from a stale copy, so parts of the current file would be silently destroyed. " +
+              " from " + existingLen + " to " + buffered.length + " bytes, " + staleWhy +
+              "so parts of the current file would be silently destroyed. " +
               "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
               "\n\nCompare it with your buffer (file_buffer action=\"show\"), fold anything missing into the buffer with " +
               "edit_file(file_path=\"" + bufPath + "\", ...), then commit again. This reply counts as your read — the commit will not be held for this reason again."
             );
           }
-          glog("file_buffer guard: stale-shrink hold (truncated echo) for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes)");
+          glog("file_buffer guard: stale-shrink hold (truncated echo) for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; read-mark verdict: " + seenVerdict + ")");
           return fail(
             "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. Committing would shrink " + filePath +
-            " from " + existingLen + " to " + buffered.length + " bytes, but the file has CHANGED since you last read it — " +
-            "your buffer was built from a stale copy, so parts of the current file would be silently destroyed. " +
+            " from " + existingLen + " to " + buffered.length + " bytes, " + staleWhy +
+            "so parts of the current file would be silently destroyed. " +
             "The file is too large (" + existingLen + " bytes) to echo here; its first lines are:\n\n" + existing.substring(0, 4096) +
             "\n\n[TRUNCATED — only the first 4096 of " + existingLen + " bytes shown; the file on disk is complete and unaffected.] " +
             "This truncated preview does NOT count as reading the file. Call read_file(\"" + filePath + "\") " +
