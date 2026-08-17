@@ -324,7 +324,7 @@ impl Session {
     /// Get display name (name or truncated ID)
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
-            format!("Session {}", &self.id[..8])
+            format!("Session {}", &self.id[..floor_boundary(&self.id, 8)])
         })
     }
     
@@ -1114,6 +1114,24 @@ impl SessionManager {
     }
 }
 
+/// Largest byte index at or below `max` that `s` may be sliced at.
+///
+/// A `SessionId` is a plain `String`, not a validated UUID: `with_id`,
+/// restored legacy sessions and rows read back from the database all carry
+/// whatever text their source held. Slicing one at a fixed byte index panics
+/// when the id is shorter than the limit or when the index lands inside a
+/// multi-byte character, and a panic here would take the whole daemon down.
+fn floor_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1185,28 @@ mod tests {
 
         assert!(s.take_last_user_turn().is_none());
         assert_eq!(s.messages.len(), before, "session left unchanged");
+    }
+
+    /// REGRESSION: the display name previews the first 8 bytes of the id, and
+    /// an id is any string a caller hands us. When byte 8 falls inside a
+    /// multi-byte character the raw slice panics — the same defect that killed
+    /// the daemon mid-run from a preview elsewhere.
+    #[test]
+    fn display_name_clamps_multibyte_id_to_char_boundary() {
+        // "session" is 7 bytes and the em dash occupies bytes 7..10, so the
+        // 8-byte limit lands inside it.
+        let s = Session::with_id("session\u{2014}id", None);
+
+        assert_eq!(s.display_name(), "Session session");
+    }
+
+    /// REGRESSION: legacy sessions restored from disk carry short ids like
+    /// "main", which the fixed-index slice ran off the end of.
+    #[test]
+    fn display_name_survives_id_shorter_than_the_preview() {
+        let s = Session::with_id("main", None);
+
+        assert_eq!(s.display_name(), "Session main");
     }
 
     /// REGRESSION (P19): a run's tool calls are first-class citizens of the

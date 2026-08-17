@@ -98,6 +98,29 @@ fn classify_windows_command(trimmed: &str) -> WinShell {
     }
 }
 
+/// Strip the outer quotes off a `python -c` payload when it has a matching pair.
+///
+/// `rest` is whatever followed `-c`, already trimmed. The length guard is the
+/// whole point: a lone quote — `python -c "`, the unterminated one-liner a model
+/// emits routinely — satisfies BOTH `starts_with` and `ends_with` on the SAME
+/// character, so the bare `&rest[1..rest.len() - 1]` was the inverted range
+/// `[1..0]`, and that panic unwound out of the daemon instead of letting python
+/// answer for a malformed command. Below two characters there is no pair to
+/// strip, so the payload passes through as written.
+#[cfg(windows)]
+fn strip_outer_quotes(rest: &str) -> &str {
+    let quoted = rest.len() >= 2
+        && ((rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('\'') && rest.ends_with('\'')));
+    if quoted {
+        // Both bounds land on the ASCII quotes themselves, so they stay char
+        // boundaries however multi-byte the code between them is.
+        &rest[1..rest.len() - 1]
+    } else {
+        rest
+    }
+}
+
 /// Translate `X:\a\b` drive paths into the `/x/a/b` form Git Bash understands.
 ///
 /// In bash a backslash is an ESCAPE, so `cat > D:\Development\ws\minidb.sh`
@@ -685,13 +708,7 @@ impl NannaBridge {
                     ("python", trimmed.strip_prefix("python -c").unwrap_or("").trim())
                 };
                 // Strip outer quotes if present
-                let code = if (rest.starts_with('"') && rest.ends_with('"'))
-                    || (rest.starts_with('\'') && rest.ends_with('\''))
-                {
-                    &rest[1..rest.len() - 1]
-                } else {
-                    rest
-                };
+                let code = strip_outer_quotes(rest);
                 let mut c = tokio::process::Command::new(exe);
                 c.args(["-c", code]);
                 c
@@ -1657,6 +1674,30 @@ mod tests {
                 WinShell::PowerShell,
                 "should route to powershell: {cmd}"
             );
+        }
+    }
+
+    /// REGRESSION (`python -c "`): an unterminated one-liner leaves `rest` as a
+    /// single quote character, which satisfies BOTH halves of the outer-quote
+    /// test — so the strip evaluated `&rest[1..0]`, an inverted range, and the
+    /// panic took the whole daemon down over one malformed command. A payload
+    /// with no real pair to strip must pass through and let python report it.
+    #[cfg(windows)]
+    #[test]
+    fn lone_quote_python_payload_survives_the_outer_quote_strip() {
+        for (input, want) in [
+            ("\"", "\""),                      // the crash shape: one char, both ends
+            ("'", "'"),
+            ("", ""),
+            ("\"\"", ""),                      // an empty but genuine pair still unwraps
+            ("\"print(1)\"", "print(1)"),
+            ("'print(1)'", "print(1)"),
+            ("print(1)", "print(1)"),          // unquoted payloads are untouched
+            ("\"—\"", "—"),                    // em dash: 3 bytes, right against both bounds
+            ("\"print('—')\"", "print('—')"),
+            ("\"mismatched'", "\"mismatched'"), // no pair, so nothing is stripped
+        ] {
+            assert_eq!(strip_outer_quotes(input), want, "input: {input}");
         }
     }
 
