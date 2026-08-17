@@ -3428,8 +3428,295 @@ Full evidence: the 40-agent forensic analysis (per-leg + cross-cutting, adversar
 verified) in the 2026-08-15 session; per-leg ledgers and per-poll history under
 `D:/Development/nanna-bench/ui-run-*/`.
 
+**P23 verification series (2026-08-15/16, v0.3.8-beta.13).** Five legs on the same
+ladder; results and per-leg trajectories in [bench/BASELINE.md](bench/BASELINE.md).
+P23's core claim held for the top two models: ornith 40 peak / **36 final** and qwen
+**26 = peak = final**, both with **zero interjections**, against post-P22 finals of 0 and
+0. Three legs ran destruction-free end-to-end untouched. Levers observed firing:
+MissionEnd honesty, repeat-done escalation, structural shrink holds, byte-floor refusals,
+truthful tool acks (zero phantom registry saves, against 201 previously), exit-reason
+file. The series produced one crash bug and five carry-forward items below.
+
+### P24 — Sessions that keep their work, and tell the truth about it 🌱 (new — 2026-08-17, review-driven)
+
+Successor to P23. Produced by a systematic review of five long autonomous sessions on
+v0.3.8-beta.13: 93 candidate findings, each put through two independent adversarial
+refutation passes (one checking every log quote and code anchor against the tree, one
+checking the owner rules and whether the proposal is already implemented). 41 were killed
+and are listed at the end so they are not re-derived. What follows is the 52 that survived,
+merged into 21 items and ranked by expected effect on an ordinary user session.
+
+
+#### What is already working — do not re-litigate
+
+The review turned up more working machinery than broken machinery. Recording it so nobody "fixes" it:
+
+- **The write-side structural shrink hold works.** It fired 13 times across the review window, always on the shape it was designed for — a large file losing most of its definitions — e.g. `write_file guard: structural shrink hold for <path> (15473->10425 bytes) removed=[append,backup,clear,...] kept=18`. In the strongest session it blocked four destructive whole-file rewrites and the file never lost its definition set.
+- **The stale-shrink hold covers the post-retry blind rewrite.** After a provider abort re-anchored a step, three destructive whole-file rewrites were attempted in the fresh context and all three were held. The read-mark ledger lives on disk and survives the context discard, which is why it worked.
+- **The structural sentence is enough for capable models.** A break introduced by an edit was self-repaired in 6 s and 15 s on two models with no prompting, and 9 of 10 times on a weak one. Do not convert the sentence into a hard gate on that evidence alone (see P24.5).
+- **The repeat-failure and zero-information breakers fire and bound loops** (21 / 32 / 16 firings in three sessions). The world-epoch gate correctly re-arms a read after an edit — the edit→re-read→edit path is not being blocked.
+- **The transport retry ladder is not the bottleneck.** One session absorbed 44 aborted generations and 26 runner unloads and still finished with its work intact; the session that lost work took one abort and one reset. Total retry-transport cost was ~4% of that session. No transport lever should be justified by the difference between them.
+- **Context demotion never fired and the stream watchdog never fired.** Both are correct and idle.
+- **The user-declared invariant refusal held** in all three write tools, 17 times, e.g. `edit_file guard: EDIT REFUSED (declared invariant read_only on '<dir>') <dir>/<file>`.
+- **Every truncation that announces itself, announced itself correctly** — the memory stub, the compression loss notice, the write-held echo. The failures below are all cases where nothing announces, not cases where the announcement is wrong.
+- **The daemon's liveness surface already knows when a turn is wedged.** It emitted `quiet_s=5700 phase="step_pending" awaiting=LLM request in flight ...: 5700s, no output yet this step` on a 30-second beat for 96 minutes. The gap is entirely in what consumes it (P24.17).
+
 ---
 
+#### Tier 0 — Crash
+
+#### P24.1 — Char-boundary slice sweep **[COVERED — land the open PR]**
+**Broken.** Four raw byte slices in the compression paths (`&text[..100]`, `&content[..80]`, `&content[..200]`, `&thinking[..200]`) abort the process when a multi-byte character straddles the cut. With `panic = "abort"` this kills the daemon, not the turn — every concurrent session's work goes with it.
+**Evidence.** `PANIC: end byte index 80 is not a char boundary; it is inside '—' (bytes 79..82 of string) location=crates\nanna-agent\src\context.rs:1838:54`, followed by a 15-minute silence and `Removing stale PID file`.
+**Change.** Route all four through `floor_char_boundary`, which the same file already uses at :1165, :1181, :1414, :1617. **PR #242 is open and already does exactly this** (plus two further sites: memory paging offsets in `server.rs`, and a `&rest[1..rest.len()-1]` that inverts on a lone quote). Merge it.
+**Where.** `crates/nanna-agent/src/context.rs:1827, 1838, 2011, 2020`.
+**Correction to the earlier write-up:** the panic hook cannot name the offending string — std's message drops it and the hook only receives the formatted payload. Drop that half; once the slices are safe there is no panic to name.
+
+---
+
+#### Tier 1 — Destroys or misplaces the user's work
+
+#### P24.2 — Two chats on two projects share one mutable working directory **[NEW]**
+**Broken.** The tool registry keeps a single process-wide working directory. A second chat turn's setup overwrites it — and because the per-session override is keyed on whichever session currently owns the shared id, the incoming turn files its root under the *outgoing* session's key and never clears it. A turn already running then resolves its relative paths into the other project, writes there, and reports success.
+**Evidence.** `chat.rs:391` calls `set_default_workdir` **before** `chat.rs:396` calls `set_session_id`, while `registry.rs:90-98` keys the per-session insert on the current shared id; observed live as a running turn's edits landing in an unrelated checkout, which still shows ` M src/setup.rs`, ` M gui/app/components/ChatInput.vue` and `?? tests/` in `git status` while the turn's own file stopped changing at the moment of the override.
+**Change.** Pin the root to the turn, don't narrate the drift. (a) Scope a chat turn with `ToolRegistry::with_run_session`, the mechanism already used for scheduled runs (`server.rs:1339`) and never wired to interactive chat. (b) Swap the ordering so the session id is set first, and key the per-session insert on the session being prepared rather than the shared slot. (c) Clear the entry on the `None` path (`registry.rs:131` already has `clear_session_workdir` and nothing calls it on teardown), or a session that loses its workspace keeps a stale entry that now *wins* over the default. (d) Add the missing test: two turns in flight, different roots, each reads its own. Only after that, as a backstop for roots that move for reasons the daemon does not own, emit one announce-once line naming both absolute paths.
+**Where.** `crates/nanna-tools/src/registry.rs:90-131, 141`; `crates/nanna-daemon/src/control/chat.rs:237, 391, 396`; sub-agent path `control/session.rs:376-383` uses the same weak `set_session_id` patch and should migrate with it.
+
+---
+
+#### P24.3 — Memory ingestion is unbounded, synchronous, and uncancellable **[NEW — merges five observations]**
+Merges: the inline `on_memory` await, the unbounded chunk count, the degenerate-repetition blow-up, the uncapped exec capture, and the uncapped log write. They are one event seen from five layers.
+
+**Broken.** Every tool result is chunked with no bound on chunk *count*, and each chunk costs an embedding round-trip plus a vector search plus an insert, awaited inline on the turn's critical path against the same local model server that serves generation. A command that fails or is killed carries its entire captured output inside its error string, so the failure path is the dominant one.
+**Evidence.** `loop_runner.rs:6212` chunks with no cap and `:6244` awaits `on_memory` per chunk; three tool results became 100,016 memory rows, the loop made zero model decisions for 189 of 246 minutes, and one of them was still writing 34 minutes after the user's stop had cancelled its session.
+**Change.** Four parts, in order:
+1. **Run-length-collapse identical consecutive lines before chunking**, storing the line plus its repeat count. This is lossless and reversible, so the "stored whole in memory, nothing was lost" promise and the `source_id` reassembly path (`server.rs:338-378`) both stay true. It is the only part with a genuinely derived bound — cost becomes proportional to information rather than bytes — and it alone would have prevented all 100,016 rows.
+2. **Add a cancellation check to the chunk loop** at `loop_runner.rs:6234`. Today a user pressing stop does not stop it.
+3. **Take the embedding off the critical path** — persist the row synchronously (the model is handed a `recall(...)` handle in the same turn and a deferred row makes that handle dead), queue only the vector. Do **not** reuse the background drain unmodified: it sits behind `chat_runs.wait_idle()` (`server.rs:1256`), so foreground-originated rows would never land during a live turn.
+4. **Bound the log write** at `crates/nanna-scripting/src/boa_impl.rs:365`, which prints full stdout and stderr with no cap and produced ~300 MB of one repeated line in a single day's log.
+**Also resolve while here:** the two memory sinks disagree. `agent_service.rs:1093` drops any tool result whose content merely `contains("Error")`; `tasks.rs:1991` filters only empty/control-char/heartbeat noise and has no such test. Either the first is silently discarding legitimate failed-tool evidence in ordinary chat, or the second is missing a filter. They cannot both be right.
+**Do not** derive the chunk cap from the retrieval top-k — chunks past top-k are reachable by handle dereference and by direct similarity hit, and dropping the middle would make the stub's promise a lie.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:6169-6255`; `crates/nanna-memory/src/service.rs:1019-1165`; `crates/nanna-tools/default-skills/exec/tool.ts:373-395`; `crates/nanna-scripting/src/boa_impl.rs:365`.
+
+---
+
+#### P24.4 — An in-place edit can delete named definitions, and the edit path parks no recovery copy **[SHARPENS "no-shrink structural break detection", "park by verified score not recency", "name the parked copy in the verdict"]**
+Merges: the anchor that is written but never compared, and the recovery copy that only the whole-file path writes.
+
+**Broken.** `edit_file` computes the file's top-level definition set, writes it into the shared anchor for the *other* tool's guard to measure against, never compares it itself — and on any parsing edit unconditionally **rebases** the anchor to the post-edit set, erasing the evidence the write-side hold depends on. Separately, `.__prev__` and `.__best__` are written only inside `write_file`, so in an edit-driven session the recovery copy is as old as the last whole-file rewrite that was *permitted*.
+**Evidence.** `edit_file/tool.ts:248` sets `next.goodSyms` on a passing verdict with no shrink guard while `goodSyms` is never compared anywhere in that file; the only recovery copy in one session was 2 h 56 min stale and 5,081 bytes short at the moment it was needed, because every later whole-file write had been correctly held (`WRITE REFUSED (shrink floor) ... floorBase=15473 anchor=good`) and a held write returns before the park at `write_file/tool.ts:1123`.
+**Change.**
+1. **Compare before writing.** Move the definition-set comparison to before `Nanna.writeFile` at `edit_file/tool.ts:925` (`updated` is complete by :822 and the ledger loaders are in scope; the pre-write Python gate at :836 is the existing precedent). Ship it first as the **removal note** `write_file` already emits at :1421 — informational, no extra round-trip, works on every file class the regex can see. Only consider the hold afterwards, and only with the bounce cost accepted.
+2. **Guard the anchor rebase.** A parsing edit that drops a name currently overwrites the anchor with the smaller set. Stop that; the write-side hold is built on it.
+3. **Park by last-verified-good, not recency** (already on the list): gate the existing `write_file` park on the ledger's `chk`, so a broken outgoing version never displaces a good parked one. Needs no new call site.
+4. **New:** give the *edit* path a durable copy, but as a **coverage ratchet, not a recency slot.** A one-slot per-edit recency park is useless — in the observed case six more parsing edits followed the destructive one within 2.5 minutes and would have rotated it out in ~13 seconds. `edit_file` already has the section regex at :265 and already calls `symbolNames(updated)` at :965; park to `.__best__` when the outgoing version's section count beats the record.
+5. **Drop `write_file`'s `dropped.length > 0` precondition at :1385**, which silenced the coverage park in four of five sessions, and fix the tool description at :5, which promises `.__best__` unconditionally.
+**Known residual, honestly stated.** None of this sees a *body-level* rewrite: a change that removes no definition name and grows the file is invisible to every name-set and every size-gated check. That is exactly the existing "no-shrink structural break detection" item and it is the harder half.
+**Where.** `crates/nanna-tools/default-skills/edit_file/tool.ts:241-251, 265-282, 822-925, 958-971`; `write_file/tool.ts:5, 886-887, 1118-1128, 1385-1401, 1421-1433`.
+
+---
+
+#### P24.5 — A mutation the tool has already measured as breaking the file is reported as plain success **[NEW — merges three observations]**
+Merges: the success flag, the downstream "ok" tags, and the fruitless-budget replenishment.
+
+**Broken.** `edit_file` runs the file's real parser after writing, learns whether it parsed before, narrates an accurate verdict — and returns `success: true` regardless. Four consumers read only the flag, so a break is recorded as landed work: the memory row tag, the step digest, the mission digest, and the work-evidence budget that decides whether an item is making progress.
+**Evidence.** `edit_file structure: <path> does NOT parse after edit (sh -n): line 14: syntax error near unexpected token 'fi'  [parsed before this edit]` followed 166 ms later by `Remembered (scoped, importance 1.5): [edit_file → <path> — ok] Edited <path>: repla...`; 120 such edits across the review, all tagged `ok`.
+**Change.** **Change the reported outcome, not the `success` flag.** `success` on the write family means "the bytes landed" and three separate mechanisms read it that way (`loop_runner.rs:6099` epoch bump, `:6108/:6140` failure counting, `:5974` error routing). Carry the structural verdict as structured data on the result — `ToolResult.data` already exists and `scripted.rs:263` already forwards it — add a field to `ToolCallRecord` and `StepToolCall`, and have the three digest/memory sites render a third outcome (`ok — DOES NOT PARSE`). Apply the same change to `write_file`, which has the identical hole.
+**Guardrails.** An absent, unrun, or fail-open verdict must never read as `bad` — `sh -n` is documented to cry wolf on valid bash where `/bin/sh` is dash, and a false `bad` would suppress completion and drain the item budget. Scope is only where a checker applies (`.sh`, `.bash`, `.json`, `.js`, `.py`, shebang'd extensionless): it is inert on `.rs`, `.ts`, `.md`, `.toml`.
+**Optional second rung, lower confidence.** A pre-write refusal for non-Python languages, on a temp copy the way `pythonSyntaxCheck` already does. Resolve the shebang before trusting an extension, apply it to **all three** in-place mutators or none (`edit_file`, `write_file`, `file_buffer`), keep `force=true`, and route repeats through `failEscalating` — a flat refusal at this volume is its own wedge. Note the observed counter-pressure: models answered write-side holds by escalating to *more* rewrites, so measure notice-vs-hold before committing.
+**Where.** `crates/nanna-tools/default-skills/edit_file/tool.ts:945-951, 981`; `write_file/tool.ts:1245`; `crates/nanna-agent/src/loop_runner.rs:1080, 2525, 6232`; `crates/nanna-agent/src/harness.rs:3159`.
+
+---
+
+#### P24.6 — The context tiers spend the window on a preamble they cannot shrink, and no path pins the user's request **[NEW — merges six observations]**
+Merges: the double-charged summary, the append-only preamble, the inverted tier gates, the four-way-inconsistent pin, the misreported gate quantity, and pair-unaware cuts. All six are the same accounting failure.
+
+**Broken.** Compression's only levers touch the message list, but the number that gates them also counts an injected preamble that only ever grows — and one copy of that preamble text is charged to the budget twice while never being sent at all.
+**Evidence.** `replace_with_summary` appends to `consolidated_summary` (`context.rs:1774`) *and* pushes the identical text into `self.summaries` (`:1777`); `estimate_tokens()` sums `summaries` (`:1083`) and `estimate_request_tokens()` adds `consolidated_summary` on top (`:718-734`), while the request itself carries only the former — measured: with one message left, `estimated_tokens=4767 hard_limit=12288`, of which ~4,200 is a vector no model ever sees.
+**Change, in dependency order:**
+1. **Stop charging never-sent text.** Delete `self.summaries` or reduce `ContextSummary` to metadata. Its only readers, `get_full_context()` and `create_isolated()`, have no production callers. This alone removes the observed forced truncations.
+2. **Make every tier gate on the quantity the request will actually carry**, with the preamble deducted from the threshold rather than added to the measurement: compare message tokens against `threshold − preamble`. `CT − P < HL − P` for all P, so the tiers become ordered by construction and the gentler rung stops being unreachable. Today they gate on *different* quantities and the aggressive one gates on the larger — 94 of 166 aggressive firings happened in states where the gentler rung's predicate was structurally false.
+3. **Give the preamble a reduction path**, or (2) merely relocates the problem: as it approaches the limit both derived thresholds collapse. Re-summarize `consolidated_summary` when the room left for messages falls below the tracker's already-measured `max_observed_growth` — below that the next iteration provably cannot fit, which is a measured-rate bound rather than a chosen fraction. Route refusal here, never through to message truncation. Observed ratchet: 1,182 → 21,209 chars in one 22-minute stretch, 54% of the window.
+4. **One pin rule.** `drop_oldest` and `compress` pin index 0; `truncate_to_limit`'s second loop, `replace_with_summary`'s `drain(0..)`, and `trim_if_needed` do not — and four comments assert the pin is universal. The message carrying the live request must survive every path. This needs a provenance marker set at `add_user_message_with_budget`, because index 0 and `role == user` both fail (the loop pushes synthetic user-role notices). Ship **after** (3), or refusing to drop the request just converts message-destruction into an over-limit request.
+5. **Report the quantity the predicate used.** All four sites print `estimate_tokens()` beside a limit tested with `estimate_request_tokens()`; 149 of 166 aggressive warnings announce a number *below* the limit they claim was exceeded. Print the request estimate plus its parts. Fix the logging, not the predicate.
+6. **Make the cuts pair-aware, by repair rather than by arithmetic.** Every cut removes a prefix, so the only reachable orphan is a leading `tool_result` with no matching `tool_use` — a one-message bound, not an open-ended snap. Tolerated by the local server; rejected by every other provider. Repair at assembly in the house style already used for eviction (`[superseded by later call — N chars removed]`), never a `debug_assert!` — a panic in a spawned turn is the documented silent-wedge signature.
+**Note.** These reset per turn (a fresh context is built per chat request), so this bites *inside* one long turn, not across a conversation. That is still the common shape for "go fix the failing tests".
+**Where.** `crates/nanna-agent/src/context.rs:718-734, 1080-1087, 1099-1111, 1119-1152, 1274-1286, 1728-1795, 1849-1870, 2107-2111`; `crates/nanna-agent/src/loop_runner.rs:2868-2967, 3667-3830, 5185`.
+
+---
+
+#### P24.7 — A provider fault mid-step re-enters blind, and its first move is a whole-file rewrite **[NEW]**
+**Broken.** A transient fault builds a fresh context per attempt, so the attempt's accumulated tool transcript is gone while its side effects remain on disk. The recovery is a prose warning plus, at most, one tool name.
+**Evidence.** A mean of 17 tool executions and 82 s of step time discarded per abort (max 104) across 44 aborts in one session; the note tells the model to "re-read the working artifact before any whole-file write" and cannot verify that it did.
+**Change.** The data is not lost — every result is already persisted as `[tool → target — outcome]` and is recallable. Surface it, don't reconstruct it: (a) carry only the attempt's **side-effecting** calls (reads must be re-done and the note already says so) by extending the liveness ledger's single `last_side_effect` mark to the side-effect list it already counts; (b) add the missing pointer telling the model the full outputs are recallable. Bound it by a measured share of the model's live `hard_limit`, not by "the attempt's own tool calls" — that is unbounded (104 observed).
+**Do not** put this in the never-compressed verified-outcome slot: it is an uncapped `Vec` rendered into a never-compressed block, 104 lines is ~13% of a small model's input budget, and its header ("do NOT re-do or rewrite work these lines already prove") directly contradicts the retry note's instruction to re-read.
+**Where.** `crates/nanna-daemon/src/tasks.rs:1880-1918, 2366, 2829`; `crates/nanna-daemon/src/liveness.rs:167, 353-354`; render with the existing bounded `step_activity_digest` (`loop_runner.rs:1066-1092`).
+
+---
+
+#### Tier 2 — Burns the user's turns
+
+#### P24.8 — The edit-rejection loop **[NEW — merges five observations]**
+Merges: the line-numbered read format, the closest-text hint, the unverified cause, the missing file echo, and the never-escalating message. One user-visible failure: "the assistant re-read the same file three times and got nowhere."
+
+**Broken.** Four separate defects compound into the product's most common wasted turn. (a) `read_file`'s only output format is `<padded line number><TAB><line>`, and `edit_file`'s miss message tells the model to copy that text back — so the text the product points at is never a valid `old_string`. (b) On a miss the tool hands back a 4-line, 240-char guess instead of the file it is already holding. (c) The guess anchors on the first non-empty line, keeps the earliest of equal-scoring matches with no report of ambiguity, and scans at most the first 500 lines. (d) The message asserts a *cause* — "the file's real content differs from your memory" — that the tool never checked, and never names the path it actually resolved. (e) All 294 rejections returned byte-identical guidance; `failEscalating` exists in the same file and is used once, on a different guard.
+**Evidence.** `edit_file failed: old_string not found in <path> — the file's real content differs from your memory. ... Call read_file, copy the exact current text, then retry edit_file.` (`edit_file/tool.ts:830`), against `numbered.push(lineNum + "\t" + lines[i])` as `read_file`'s sole return path (`read_file/tool.ts:117`); 26 of one model's 121 rejections carried the `NN<TAB>` prefix verbatim.
+**Change.**
+1. **Echo the file.** On a miss, inline the current content under the existing, already-derived `ECHO_MAX = 65536` (`write_file/tool.ts:783`), with `write_file`'s truncated-preview behaviour above it. Do **not** reuse `read_file`'s 10 MB cap — that is a filesystem sanity limit, not a context budget. Decide the read-mark question explicitly: recording a mark weakens the blind-rewrite guard, not recording one leaves the model held on its next write. Steer the wording back to a targeted edit, not a rewrite.
+2. **Strip a line-number block as a fallback only**, after the ordinary loose match already failed, and only on read_file's actual emit shape — every line prefixed, numbers consecutive, right-aligned to one common width. A bare per-line `^\s*\d+\t` is unsafe: tab-separated data files start that way.
+3. **Fix the hint** if it is kept as an over-cap fallback: anchor on the longest distinctive line, report how many candidates matched, and replace the 500-line cap (an underived constant; the split above it already runs unconditionally). Note it currently returns *nothing* when the anchor line normalizes below two characters.
+4. **Say only what was measured.** No mark recorded → "no read of `<path>` is recorded" (not "you have not read it" — the mark store is LRU-capped at 200 and its I/O is best-effort). Mark older than mtime → "changed after you last read it". Fresh mark → "your text does not appear in the N bytes currently at `<resolved path>`". `edit_file` must also *write* a mark on every successful edit, or consulting marks makes the message wrong more often than the old one. Correct the same over-claim in `write_file:801`, which asserts "the file has CHANGED since you last read it" even when no read was ever recorded.
+5. **Escalate.** Route repeated identical misses through `failEscalating` (do not reuse its shared `fork:` key prefix).
+**Where.** `crates/nanna-tools/default-skills/edit_file/tool.ts:57-61, 432-445, 470-493, 813-830`; `read_file/tool.ts:110-126`; `write_file/tool.ts:478-491, 774-819`.
+
+---
+
+#### P24.9 — A path the shell prints does not resolve to the same file when handed to a file tool **[NEW]**
+**Broken.** On Windows the shell emits MSYS paths (`/d/Development/...`). `Path::new("/d/...")` has a root but no drive prefix, so the resolver takes the relative branch and joins it onto the workspace root, producing `D:\d\Development\...`. Reads of existing files report "does not exist"; writes create a phantom tree and report success. No tool result ever names the path it actually opened.
+**Evidence.** Within one second: `code_search: "<path>" exists but is a FILE, not a directory` and `cat: <path>: No such file or directory` — the same string addressing two different filesystems depending on which tool receives it; a shadow tree at `D:\d\...` and `D:\tmp\...` has been accumulating for months.
+**Change.** (a) In `resolve_path_with_workdir`, before the relative test, recognize `^/([A-Za-z])/` and `^/([A-Za-z]):[\\/]`, guarded by the literal-first precedence `repair_redundant_prefix` already uses so a genuine single-letter directory stays addressable. Do **not** apply `normalize_drive_paths` to `workdir` — it runs native→MSYS, the wrong direction for `current_dir`. (b) Return the resolved path from the bridge and echo it in every file tool's result whenever it differs from the string given; reconstructing it in JS is wrong, because the resolver may repair the path. (c) Split `runStructuralCheck`'s exit-127 branch: "checker absent" and "the shell cannot see the file we just wrote" are different facts, and today the second is silently discarded.
+**Invariant to test.** For any path the shell prints, `read_file(P)` and `exec("cat P")` must address the same bytes.
+**Where.** `crates/nanna-scripting/src/bridge.rs:490-520, 543-577, 1219-1274`; `crates/nanna-tools/default-skills/write_file/tool.ts:593-611`.
+
+---
+
+#### P24.10 — Whole-file reads are silently head-tailed at a boot-frozen threshold **[NEW]**
+**Broken.** The tool-result stub threshold is documented as scaling with the model's context window. It is computed from `max_tokens` — the requested *output* budget — is never rebound when the window is demoted, and the value it reads is a hardcoded default that boot deliberately does not take from config. It is a constant 16,384 chars for every model. Above it, a read returns 600 head chars and 400 tail chars.
+**Evidence.** `loop_runner.rs:6185-6188` computes `(self.config.max_tokens as usize * 2).clamp(2000, 32000)` while the field's own doc at `:501` claims `0 = auto (scales with model context window)`; on the machine's configured 1M-window model the threshold is still 16,384 chars, ~0.4% of the window.
+**Change.** Derive it from the input window the runner already computes and logs, and rebind it on demotion (`window_scaled_output_reserve` at `:144` is the existing window-derived helper). Then exempt the two cases where a head-tail is unusable: the anti-destruction guard's echo, and a read the model issued to refresh a file it is editing — `write_file`'s own `ECHO_MAX` comment already reaches this conclusion ("64 KiB is a small local model's entire window") and that bound is dead above 16,384. Cheaper first step: the `inline: true` hatch already exists at `:6333-6367` and appears in no schema and no prompt.
+**Also.** Log the stub decision (tool, byte length, threshold) in the Memory arm, which currently logs nothing while the Context arm logs "Summarized tool output" — that absence is why this went unmeasured.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:144, 501, 6185-6189, 6333-6400, 8075-8096`; `crates/nanna-daemon/src/agent_service.rs:105, 133-135, 169`.
+
+---
+
+#### P24.11 — A failed tool's text never enters the loop's own record **[NEW — merges two observations]**
+**Broken.** `ToolResult::error` moves the message into `error` and leaves `content` empty; the record is built from `content`, and the struct has no error field. The model sees the text; the loop's own memory of what happened stores a name, an input, and an empty string.
+**Evidence.** `output: response.result.content.clone()` at `loop_runner.rs:6078`, with two production comments asserting the opposite as a design property; the user-visible consequence is `Your most recent side-effecting command reported failure: <cmd> → reported failure with no output` emitted 34 ms after the run logged the command's actual failure text.
+**Change.** Add `error: Option<String>` to `ToolCallRecord` and populate both fields at `:6078` — `output` with the raw failure text (unprefixed; the `Error: ` prefix defeats the exit-code parse) and `error` from `response.result.error`. Then have the verdict sites read `record.error` the way the sibling call at `:6157` already does. Rewrite the two test fixtures to construct records the way `:6078` does, so they fail unless the wiring is right, and delete the two comments asserting the false premise.
+**Two consequences reachable from ordinary chat, which is the justification:** `detect_tool_call_loop` compares `prev.output == last.output`, so a command that fails two *different* ways compares equal on `""` and the user is told "you got the identical result both times" when the world changed; and `iteration_produced_information` always hashes `""` in the branch written to hash the error's first line, so a *changing* error never counts as novel and the step-budget counter advances through exactly the debugging loop it was meant to fund.
+**Note when landing:** with real text present, the soft loop nudge stops firing on varying failures. Restate its derivation comment rather than leaving it stale. Fix the two blind length fields too — `output_len` on the slow-tool warning and `output_size` on the stats observation both measure `content` and therefore record every failure as zero-byte.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:842-849, 895-911, 1015-1026, 5938, 5965, 6078, 8195-8225, 8242-8281`; `cratests/nanna-tools/src/lib.rs:164-171`.
+
+---
+
+#### P24.12 — The outer deadline preempts the tool and discards its honest message **[NEW — merges two observations]**
+**Broken.** The registry wraps every call in a timeout built from the tool's *static manifest* ceiling, blind to the per-call deadline the script engine actually enforces. So a caller asking for a longer command deadline is killed early, and when the wrapper wins it replaces the tool's carefully built message — elapsed time, which deadline fired, "disk is truth", what to check before re-running — with four words and empty content.
+**Evidence.** `registry.rs:635-636` returns `ToolResult::error("Tool execution timed out")` while the engine's own `effective_timeout_ms` deliberately extends its deadline by a 10 s handoff margin "so the bridge (which can kill the child) always fires first"; observed as `Tool exec failed in 180004ms: Tool execution timed out`, with the tool's real answer arriving 1.03 s later to nobody.
+**Change.** Give the registry a params-aware timeout that applies the same existing `ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`, so the inner, better-informed message wins by construction — reuse of an existing derivation, no new constant. This also removes the silent truncation of legitimately long commands. Only then, as a genuine last resort, have the backstop state elapsed wall time and the side-effect warning.
+**Where.** `crates/nanna-tools/src/registry.rs:613-645`; `crates/nanna-tools/src/skills/scripted.rs:292-294`; `crates/nanna-scripting/src/engine.rs:327-346`.
+
+---
+
+#### P24.13 — Repetition guards key on argument bytes, so rewording defeats them **[NEW — merges two observations]**
+**Broken.** Every repetition guard keys on `(name, canonical arguments)`. A model that rewords a failing command — adding `2>&1`, a pipe, a `cd` prefix, a different timeout — opens a fresh ledger key each time, and an interleaved success bumps the world epoch and re-arms everything. Separately, N *different* edits that produce the byte-identical parse error are invisible to all three guards, because each call differs.
+**Evidence.** Fifteen successive attempts at one hanging script under nine distinct command strings returned no usable output and nothing noticed; and 25 consecutive successful edits produced the same failing verdict for 12m44s, each receiving the identical static sentence "Fix that line with another edit_file."
+**Change.** (a) Track the last structural verdict per canonical file path (normalize `<file>` vs `./<file>` — one break rendered two ways split a 22-long streak into 5 and 17), and after three consecutive mutations of that path yield the same normalized signature, escalate the sentence once: say that N different edits produced the same error and name a different strategy. Normalize by stripping the `path: line N:` prefix and keeping the token plus the echoed source line, or the common case (a line number drifting as edits add lines above) never matches. This streak must **not** inherit the epoch gate — the mutations that bump the epoch are the evidence it counts. (b) Extend the name-level, paraphrase-proof detection already built for discovery tools to any call shape whose repeats keep returning no information, keyed on the observed result rather than argument bytes.
+**Bound.** Reuse the existing three-in-a-row rung; the in-tree precedent (`ZERO_DELTA_DISCOVERY_BREAKER_AFTER`) is an outcome-streak guard added for exactly this reason.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:895-911, 933, 965, 1573, 5795-5834`; `crates/nanna-tools/default-skills/edit_file/tool.ts:238, 637-648`.
+
+---
+
+#### P24.14 — The decomposition rung is charged for and never changes its ask **[NEW]**
+**Broken.** When an item stalls, the harness asks the model to break it into subtasks. It correctly measures that the attempt produced nothing, withholds the budget reset — and then asks the identical question again, then abandons, describing the outcome as though decomposition had happened.
+**Evidence.** 84 firings, zero subtasks, split exactly 42 at the first attempt and 42 at the second, every one of the 42 items abandoned with `reason=abandoned after 5 fruitless steps and 2 replans`; the durable record carries `{"produced_work": false}` and nothing reads it.
+**Change.** On a dry attempt, do not repeat the ask: put the item's own last failing result in front of the model — the replan prompt is the only step prompt that never receives it — and ask for the single next concrete action. Make the abandonment reason say both attempts returned nothing. Note that the replan branch `continue`s ahead of every escalation the harness owns, so a zero-tool replan step never increments the narration counter and never receives steering; and the abandonment gate still kills the item one iteration after the escalated ask, so the escalated rung must count as an execute step or replenish on a tool call, or it is decorative.
+**Scope honestly.** The rung has decomposed successfully on record (~2% of instrumented attempts); this is escalation, not removal. It only reaches sessions already grinding, and the defaults that govern it (5 steps, 2 replans) govern ordinary chat turns too.
+**Where.** `crates/nanna-agent/src/harness.rs:1301-1302, 1562-1583, 2054, 2263-2275, 2304-2310, 2412-2440`.
+
+---
+
+#### P24.15 — Structured text is sentence-scored, and both fallbacks damage it **[NEW]**
+**Broken.** The context compressor asks the summarization model for one score per sentence and treats `\n` as a sentence terminator, so a file listing's "sentences" are its lines. The scorer is capped at 256 output tokens, so any input past roughly 128 lines can never return a matching score vector — for any model, however capable. When scoring does work, survivors are trimmed and joined with spaces, flattening the listing onto one line with the line-number prefixes still attached, under a banner calling it a summary. When it fails, the fallback silently deletes the middle 75% without naming which lines went.
+**Evidence.** `compressor.rs:100` caps the scorer at `max_output_tokens.min(256)`; every successful scoring observed was on ≤37 sentences, and 116 rewrites across four models burned a scoring round-trip (3.3-3.7 s each) before falling through.
+**Change.** Detect line-structured content before scoring — a high ratio of newline-terminated lines, leading line-number or indentation structure, diff or JSON framing — and route it to a shape-preserving reduction: whole lines, indentation intact, line numbers contiguous, elided ranges named in the banner. Reserve sentence scoring for prose; the wasted round-trip disappears as a side effect. Do **not** add a per-model failure counter — it is an arbitrary retry count and empirically wrong (one model succeeded, failed, then succeeded 25 more times). Also mark compressed slots so a later pass does not re-compress its own ~380-char banner.
+**Where.** `crates/nanna-agent/src/compressor.rs:100, 139-155, 295-348`; `crates/nanna-agent/src/context.rs:1909-1944`.
+
+---
+
+#### Tier 3 — The assistant tells the user something untrue
+
+#### P24.16 — What the assistant says when it stops **[PARTLY COVERED — merges four observations]**
+Merges: abandoned work with no check vanishing, the fused completion count, the ending that promises evidence and prints none, and the cancel that suppresses it.
+
+**Broken.** Four defects in the closing message, all the same shape: every *named* list on the report is check-bearing, so work without a machine-checkable done-condition is never named on either path.
+1. **Abandonment leaves a count, not a name.** An abandoned item is recorded for re-examination only if it carries a check; a second abandonment site records nothing at all even when one exists. Across the whole task store, 81% of items ever abandoned had no check — this is the majority path, not an edge case. In one observed session the item that vanished was the root goal itself.
+2. **"N items completed" fuses three different closures** — a check passing on work done, a check that already passed before the item started, and the model's own word — and the counter that would separate them is dropped by the multi-round merge, so a display fix alone would print a *new* false number.
+3. **The dry ending promises evidence and prints none.** `"re-planning found no new work, but the evidence below is still unmet. 0 items verified done, 0 checks still failing"` renders with no list, while the environment ledger on disk recorded that a file the turn wrote does not parse. **[The reseed half is COVERED by "arm the reseed off environment verdicts"; see the correction below.]**
+4. **A cancel suppresses the evidence with the banner.** The unmet list is never printed on a cancelled ending, and it is unrecoverable next turn — cancelled tasks are filtered out of every context path and the verdict lives only on the in-memory report.
+**Change.**
+- Record every abandonment, checked or not, as a first-class `abandoned_unverifiable` list carrying the item's last result; fix **both** abandonment sites. The detail field already exists and is live at the abandonment site.
+- Merge `items_completed_unverified` (and `false_success_claims`, `items_revived`, `replans`) at both round-merge sites **before** changing any display; `fold_reports` already does this correctly and is the model to follow. Then report composition rather than the sum, naming buckets by *which door* — closed after a passing check / closed on a check that already passed / closed on the model's word — and stay quiet when there is nothing to disclose.
+- Restrict the word "verified" to the first bucket only.
+- Split the unresolved-evidence rendering out of the banner into its own function and call it on the cancel path with the banner still suppressed — it cannot be "the same code one branch higher", because the banner carries a `why` string the cancel arm does not produce. Carry the measurement's age on that path; a cancel's verdict can be hours stale.
+- **Correction to the covered reseed item:** the ending half stands on its own; the *reseed* half is unproven and mechanically mismatched — the reseed's documented job is clearing a runner wedge, and a file that does not parse is no evidence of one. Before trusting a `chk` verdict, check its currency against the file's size on disk (`meta.len() == entry.last`); `chk` is the last verdict that *ran*, is sticky when no checker applies, and never refreshes after an out-of-band repair.
+- Also note: a dropped item is actively barred from returning — cancelled titles are treated as closed-this-turn and silently deduped out of any re-proposal.
+**Where.** `crates/nanna-agent/src/harness.rs:1363, 1694, 1907-1949, 2074-2077, 2360-2370`; `crates/nanna-daemon/src/control/chat_harness.rs:908-925, 1166, 1235-1251, 1532-1540, 1591-1606, 1688-1706, 2202-2272, 2800`; `crates/nanna-daemon/src/tasks.rs:3344-3358, 3490-3499`. One existing test asserts the cancel suppression and must be rewritten with the change.
+
+---
+
+#### P24.17 — The activity badge asserts an activity it has not observed, and the context meter is dead **[PARTLY COVERED — sharpens "artifact-staleness instead of is_running"]**
+**Broken.** Two honesty holes in the same surface. (a) The badge computes `Running X… → Streaming… → Thinking… → Working…` with no elapsed time and no quiet time, and `isStreaming` latches on the first text chunk and clears only at the end of the whole run — so a turn that streamed anything and then went silent pulses `Streaming...` for as long as the silence lasts. A stuck turn and a working turn are pixel-identical. (b) Chat lost its context gauge when chat moved off the old direct path: the only `ContextUsage` emitter lives in a closure the harness never sets, and the run handle does not expose the atomics, so the driver structurally cannot fill them.
+**Evidence.** All 59 captured run-state snapshots read `context_used=0, context_window=0, run_input_tokens=0, run_output_tokens=0`, 56 of them with `is_running: true` and tool calls accumulating, while the daemon computed the real figures continuously.
+**Change.** (a) The daemon already emits `LivenessBeat` with `elapsed_s`, `quiet_s`, `phase`, `awaiting` every ~30 s — the GUI's event enum has no such variant and no `#[serde(other)]`, so every beat currently fails deserialization into "Unknown message format". Add the variant, forward it, and render `awaiting` (or "…(Ns since last output)") on **all four** badge branches, not just the idle one. (b) Set `on_usage` in the harness `RunOptions` and plumb the four atomics onto the run handle the way accumulated text already is; also stop re-zeroing the meter from run-state on every session load.
+**Where.** `gui/app/components/SessionActivityBadge.vue`; `gui/app/composables/useSessionState.ts:334-363`; `gui/app/pages/index.vue:34, 649, 659-660, 786`; `gui/src-tauri/src/daemon_client.rs:120-142, 507`; `crates/nanna-daemon/src/tasks.rs:2929-2966`; `crates/nanna-daemon/src/agent_service.rs:366-374, 628-656, 1148`.
+
+---
+
+#### P24.18 — Memory tells the user its record is safe while discarding it **[NEW — merges two observations]**
+**Broken.** Three related dishonesties on the memory path. (a) When embedding fails, the capability notice tells the model "Memory and tool-result writes still SUCCEED and are stored in full … queued for embedding backfill" while the same error returns from the write path *before* any insert — nothing is stored and nothing is queued. **Both** branches that raise this notice are false, including the no-provider branch that a fresh install hits. (b) `recall` answers a bare "No memories found matching: X" when rows are bound to a model they have no vector for, and when the query vector's width does not match the store's binding at all — a total blackout reported as an empty result. (c) An oversized write is beheaded at 30,000 bytes with no marker in the row, on one write path but not the other, so whether a long note survives depends on whether a workspace happened to be active.
+**Evidence.** The notice text at `server.rs:3005` against `remember_scoped` returning at `service.rs:1029` before `store.add` at `:1165`; the store itself declares an empty active embedding legal ("it is the queued-for-backfill state"), so the notice can be made true rather than reworded.
+**Change.** (a) On embed failure, persist the row with an empty vector and no buckets — the exact state the backfill already drains — skipping the neighbour-dedup search, which needs a query vector. This makes both notices true as written and matches the file's own stated invariant: "The write always lands; losing a vector costs temporary searchability, losing the write cost the memory." (b) Compute the searchable/total split inside the search scan (`lib.rs:736` already evaluates the width predicate per row, so it is free and exact at answer time — do not reuse the rebind-time snapshot, which goes stale) and make the empty answer distinguish three states: nothing matched, N of M awaiting re-embedding, and the query width does not match the binding. (c) Delete the 30k truncation and rely on the chunker both paths already have; the cap's own justification is superseded. If any content is ever genuinely dropped, the marker must name its own row, because it will be embedded and can propagate into a neighbour.
+**Also.** A provider *switch* takes the healthy arm of the ledger and asserts "new writes are searchable normally" while most of the store is not. And `try_restore_primary` has no callers anywhere despite its doc saying "call this periodically", so a fallback that wins once holds the binding indefinitely.
+**Where.** `crates/nanna-memory/src/service.rs:305, 873-891, 1019-1034, 1155-1165, 2395-2412`; `crates/nanna-memory/src/lib.rs:617-633, 701-736`; `crates/nanna-daemon/src/server.rs:2999-3019, 3336-3378`; `crates/nanna-daemon/src/embedding_router.rs:342`; `crates/nanna-tools/default-skills/recall/tool.ts:60`; `crates/nanna-daemon/src/control/memory.rs:114`.
+
+---
+
+#### P24.19 — A refused write is recorded, and re-read, as one that succeeded **[NEW]**
+**Broken.** Two placeholder substitutions replace a write call's `content` with text asserting the bytes landed, neither gated on the outcome. One lands in the persisted record and the GUI's Input pane, so a card marked failed shows an Input claiming success. The other is worse: it is written into the assistant's own stored turn *before* the tool runs, so the model re-reads "all N bytes were written successfully and are intact on disk; read_file to see them" on every later turn, immediately beside a tool result reading "WRITE HELD — nothing was written and nothing is lost."
+**Evidence.** `loop_runner.rs:6056-6072` has no success guard while storing `success: false` fourteen lines later; ~42 occurrences across the review, all on legitimate shrink-guard holds.
+**Change.** Site 1: three-way — success / short-circuited-by-the-harness / genuine failure. Site 2 cannot be gated on an outcome that does not exist yet: make the wording outcome-neutral ("…the tool result below is the authoritative record of what happened on disk") or rewrite the stored block after execution.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:5648-5680, 6056-6079, 8112-8117`; `gui/app/components/ToolCallCard.vue:35`.
+
+---
+
+#### P24.20 — Diagnostics report a quantity the decision did not use **[NEW — merges three observations]**
+**Broken.** Three log-layer assertions mislead whoever is diagnosing a user's stuck session, which is how this product gets debugged. (a) The compression warnings print the message-side estimate beside a limit tested with the request estimate — covered as change (5) of P24.6, listed here because the same fix must reach `context.rs:1281-1286` and `:1141-1147`, and because the "compression complete" line reports success against a quantity the exit condition never tested. (b) `Script executed successfully` is logged with `tool = tool.name`, which is the source file stem and therefore the literal string `tool` for 6,677 of 6,726 lines — a structured field carrying zero information, on a line that immediately precedes 1,164 tool failures. (c) A compression pass that removed nothing still logs completion, because the truncation helper's loop condition is already false and it has no error return.
+**Change.** (a) Print the request estimate and its parts at all four sites plus the completion line. (b) Pass the declared manifest name into the scripted tool at load time, or drop the field; do not merge engine and tool outcomes into one line — the scripting crate sits below the tools crate and does not own tool-result semantics. (c) Report zero reduction as zero reduction. **Do not** repoint `summarized_len`: it is the offset of the last chunk actually read, a divergence detector, and the output length is already on the same line as `summary_len`.
+**Where.** `crates/nanna-agent/src/loop_runner.rs:3780-3830`; `crates/nanna-agent/src/context.rs:1141-1147, 1274-1286, 1353-1360`; `crates/nanna-scripting/src/engine.rs:214`; `crates/nanna-scripting/src/tool.rs:44-49`.
+
+---
+
+#### P24.21 — Errors that prescribe an action the caller cannot perform **[NEW]**
+**Broken.** `web_search` fails with "BRAVE_API_KEY not set. Configure it in your environment or nanna config" — neither route is available to a tool call: a child shell cannot mutate the daemon's process environment, and the config path appears dead (the config field reaches a boot log line and no consumer). `exec`'s missing-argument error is the only bare `Error: Missing required parameter` among 42 skills: it names no tool, does not say nothing ran, and lists none of the five aliases it accepts.
+**Evidence.** 16 failures followed by 11 shell calls attempting `export BRAVE_API_KEY=…` inside subshells; `Nanna.getEnv` reads the daemon's live process env, so the advice can never be followed in-turn.
+**Change.** Reword both to name an action available in this session ("web_search is unavailable in this session: no key is set in the daemon's environment. Nothing was searched. Use web_fetch on a known URL, or ask the user to set it before starting."; same for the batch variant). Give `exec`'s argument error the house style used by every other file-touching skill. Add `requires:` to the two web skills — 20 default skills already use it, with the rationale in the loader: "An advertised tool that can only fail is worse than an absent one." Separately, verify whether config-only key placement is meant to work at all; if it is, that is a second bug.
+**Where.** `crates/nanna-tools/default-skills/web_search/tool.ts:19`; `web_search_batch/tool.ts:24`; `exec/tool.ts:28`; `crates/nanna-tools/src/registry.rs:737-753, 968-985`; `crates/nanna-config/src/lib.rs:704`; `crates/nanna-daemon/src/server.rs:3863-3868`.
+
+---
+
+#### Considered and rejected — do not re-raise
+
+Each of these was proposed, tested against the evidence, and killed. Where a real residual survives, it is folded into a numbered item above and named here so nobody re-derives it.
+
+- **Convert the structural sentence into a hard gate for every checkable language.** Refuted: the sentence already drives unaided recovery, valid→invalid-only gating was tried and abandoned in-tree, and `sh -n` cries wolf on valid bash where `/bin/sh` is dash. Residual folded into P24.5 as an optional, shebang-resolved second rung.
+- **Remove the "file got smaller" precondition from the write guards.** Refuted: those guards fired 13 times on exactly their target shape; the two events the change would newly catch destroyed nothing, and the change would bounce ordinary rename-heavy refactors. The real gap is body-level rewrites, which is the existing "no-shrink structural break detection" item.
+- **Pin the most recent read against compression.** Refuted: the summarizer's `keep_count = 2` already preserves the most recent tool round, and the dominant cause of a stale `old_string` is the model's own successful intervening edit. Compression correlated with *fewer* rejections.
+- **Cap memory rows by what a top-k recall could return.** Refuted: chunks past top-k are reachable by handle dereference and by direct similarity hit, and the design promises byte-for-byte reassembly. Corrected bound in P24.3.
+- **Bound the verified-outcome slot.** Refuted: it is per-step, reseeded from a capped source; the growth measured against it was the preamble (P24.6).
+- **Give the planner a longer first-call deadline / a rolling latency ceiling.** Refuted: the fallback plan is the designed path for ordinary conversation, the session that took the fallback did the best work, and timed-out calls are never sampled so the proposed statistic is unmeasurable. Small residual: the effective-window latch is populated at request-build time, after the budget is logged, so the first request of a process is budgeted against the model card. Self-heals in milliseconds; worth fixing only on principle, and it would bite a first turn that *does* carry a large workspace slice.
+- **Escalate a wedged runner to a full server restart.** Refuted: the unload demonstrably cured the fault every time (mean 23 tool executions in the following two minutes), and a third of the faults were model-output encoding errors no restart can fix. A shared-server restart would have hurt the strongest session.
+- **Set a repetition penalty / change sampling on wedged streams.** Refuted: the wedge fires at the first token, before any repetition history exists; the fault is runner state and the unload is the cure.
+- **Reject malformed tool calls at dispatch.** Refuted: the tools already check arguments before any I/O in 6-7 ms, the model round-trip is unavoidable, and a schema-level required check would break the alias sets the tools deliberately accept. Residual (the corrective message never escalates) folded into P24.8.
+- **Report escaped quotes / per-file "shape" signatures.** Refuted: the in-tree precedent chose *repair* over reporting for the sibling case, on the recorded grounds that a model cannot see its own serialization and resends byte-identical content when told.
+- **Report a delta when a repeated command returns a different result.** Refuted: the "repeated" commands were five different commands, and a neutral "it changed" notice would fire loudest on the healthy edit→retest loop.
+- **Hide or gate tools with no credential** beyond the existing `requires:` convention. Refuted: the mechanism already exists with this exact rationale in its comment. Residual folded into P24.21.
+- **Delegated-step model disclosure** (small, genuinely open): the spawn result carries the model that ran a delegated step and the tool drops it, so a transcript never names which model did that work. Worth one line if someone is in the file.
+
+---
+
+#### Sequencing note
+
+P24.6 items (1) and (2) must land before (4); P24.16's counter merge must land before its display change; P24.4's removal note should ship before its hold. P24.1 is an open PR and blocks nothing.
 ---
 
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
