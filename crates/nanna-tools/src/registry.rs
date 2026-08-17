@@ -44,9 +44,11 @@ pub struct ToolRegistry {
     alias_targets: RwLock<HashMap<String, String>>,
     /// Default working directory for tool execution (global fallback)
     default_workdir: RwLock<Option<std::path::PathBuf>>,
-    /// Per-session working directories (session_id → workdir).
-    /// Takes precedence over default_workdir when a session is active.
-    session_workdirs: RwLock<HashMap<String, std::path::PathBuf>>,
+    /// Per-session working directories (session_id → root).
+    /// `Some(root)` pins the session there; `None` records that the session
+    /// resolved to NO workspace, so it must not fall through to the global
+    /// default that another session's turn may own.
+    session_workdirs: RwLock<HashMap<String, Option<std::path::PathBuf>>>,
     /// Current session ID (set when agent session starts)
     session_id: RwLock<Option<String>>,
     /// Allow/deny policy over canonical tool names. Default permits everything.
@@ -87,20 +89,31 @@ impl ToolRegistry {
 
     /// Set the default working directory for tool execution.
     /// Called when the active workspace changes.
+    ///
+    /// CONTROL PLANE ONLY. A run binds its own root with
+    /// [`Self::bind_session_workdir`] and never comes here: this call writes
+    /// the process-wide slot, so a run that used it would re-root every other
+    /// session that has no binding of its own.
     pub async fn set_default_workdir(&self, workdir: Option<std::path::PathBuf>) {
-        // Also set for the current session if one is active. Deliberately the
-        // SHARED binding, not `current_session_id()`: this is a control-plane
-        // call (workspace activation, chat setup) made from outside any run, so
-        // a run scope is never in effect here, and pinning a workspace root to
-        // a transient `scheduled-<id>` would leave an entry nothing clears.
-        if let Some(ref sid) = *self.session_id.read().await {
-            if let Some(ref wd) = workdir {
-                self.session_workdirs
-                    .write()
-                    .await
-                    .insert(sid.clone(), wd.clone());
-            }
-        }
+        // ONLY the process-wide default, which is what a session without a
+        // binding of its own falls through to.
+        //
+        // This deliberately does NOT touch `session_workdirs`. It used to also
+        // file the root under whichever session owned the shared slot, and that
+        // is the re-root: activating a workspace is a control-plane call, so it
+        // carries no run scope, but the shared slot still names whichever chat
+        // most recently prepared a turn — including one that is streaming right
+        // now. The insert therefore rewrote a live turn's root, and its next
+        // tool call resolved into the newly-activated project. That is how a
+        // session's writes landed in an unrelated checkout.
+        //
+        // Nothing needs the convenience any more: a turn binds its own root in
+        // `prepare_chat_turn` with `bind_session_workdir`, keyed on the session
+        // NAMED there, and releases it on teardown.
+        debug_assert!(
+            RUN_SESSION_ID.try_with(|_| ()).is_err(),
+            "set_default_workdir is control-plane only — a run binds its own root"
+        );
         *self.default_workdir.write().await = workdir;
     }
 
@@ -109,10 +122,14 @@ impl ToolRegistry {
     pub async fn default_workdir(&self) -> Option<std::path::PathBuf> {
         // Per-session workdir takes priority — keyed on the session THIS run is
         // executing as, so a scheduled run does not inherit the workdir of
-        // whichever chat happens to own the shared binding.
+        // whichever chat happens to own the shared binding. A session bound to
+        // `None` answers `None`: it deliberately has no root, and falling
+        // through to the global default here is the same destruction by
+        // another door, because that default belongs to whoever activated a
+        // workspace last.
         if let Some(ref sid) = self.current_session_id().await {
-            if let Some(wd) = self.session_workdirs.read().await.get(sid) {
-                return Some(wd.clone());
+            if let Some(bound) = self.session_workdirs.read().await.get(sid) {
+                return bound.clone();
             }
         }
         self.default_workdir.read().await.clone()
@@ -120,6 +137,24 @@ impl ToolRegistry {
 
     /// Set the working directory for a specific session.
     pub async fn set_session_workdir(&self, session_id: &str, workdir: std::path::PathBuf) {
+        self.session_workdirs
+            .write()
+            .await
+            .insert(session_id.to_string(), Some(workdir));
+    }
+
+    /// Bind (or un-bind) a session's root, keyed on the session NAMED HERE —
+    /// never on whichever session happens to own the shared slot. This is the
+    /// call a turn makes for itself while another turn may be mid-flight.
+    ///
+    /// `None` is a binding too, not an absence: it records that this session
+    /// resolved to no workspace, which is what keeps it out of the global
+    /// default a concurrent turn's workspace activation owns.
+    pub async fn bind_session_workdir(
+        &self,
+        session_id: &str,
+        workdir: Option<std::path::PathBuf>,
+    ) {
         self.session_workdirs
             .write()
             .await
@@ -163,8 +198,14 @@ impl ToolRegistry {
     /// Run `future` with `session_id` as the session every tool call inside it
     /// scopes to, leaving the shared binding untouched.
     ///
-    /// Use this for a run that is not the session the daemon is bound to — a
-    /// scheduled task or a heartbeat, work that can overlap a live chat.
+    /// EVERY run wraps itself in this — an interactive chat turn just as much
+    /// as a scheduled task, a heartbeat or a sub-agent. Chat is not the
+    /// exception: two chat turns overlap whenever one is still streaming as the
+    /// next begins, and the incoming turn's workspace resolution used to re-key
+    /// the outgoing turn's root under the shared slot, so a running turn
+    /// resolved its relative paths against another project (that is how a
+    /// 3,718-line file was overwritten).
+    ///
     /// Session-scoped tools (`todo` above all) read their scope from
     /// `Nanna.sessionId()`, which is this value; the scheduler used to call
     /// `agent.chat(&session_id, ..)` without supplying it at all, so
@@ -177,6 +218,13 @@ impl ToolRegistry {
     /// [`Self::session_id`] resolves to `session_id` throughout the run, and a
     /// concurrently polled chat future in the same task still reads the shared
     /// binding.
+    ///
+    /// CONSTRAINT for whoever comes next: a task-local does NOT cross
+    /// `tokio::spawn`. Tool execution that is spawned off the run's own future
+    /// silently loses this scope and falls back to the shared slot —
+    /// reintroducing the bug with no compile error. Execution must stay inside
+    /// the future: `execute_parallel` uses `join_all`, the task tool awaits the
+    /// spawner inline, and nothing under this crate spawns a tool call.
     pub async fn with_run_session<F>(session_id: String, future: F) -> F::Output
     where
         F: std::future::Future,
@@ -1559,6 +1607,260 @@ mod tests {
             Some(std::path::PathBuf::from("/default")),
             "a scheduled run has no workdir of its own and must fall back to the \
              global default, not borrow an unrelated chat's"
+        );
+    }
+
+    /// "This session has no workspace" is a fact about the session, not an
+    /// absence of one. If it falls through to the global default, the session
+    /// writes into whatever directory another turn's workspace activation left
+    /// there — the original destruction, reached by a different door.
+    #[tokio::test]
+    async fn a_bound_session_with_no_root_does_not_borrow_the_global_default() {
+        let reg = ToolRegistry::new();
+        *reg.default_workdir.write().await = Some(std::path::PathBuf::from("/other"));
+        reg.bind_session_workdir("chat-a", None).await;
+
+        let seen =
+            ToolRegistry::with_run_session("chat-a".to_string(), reg.default_workdir()).await;
+        assert_eq!(
+            seen, None,
+            "a session bound to NO root must resolve to nothing, not to the \
+             global default another session owns"
+        );
+        assert_eq!(
+            reg.default_workdir.read().await.clone(),
+            Some(std::path::PathBuf::from("/other")),
+            "binding a session must not touch the global default"
+        );
+    }
+
+    /// How an incoming turn files the root it just resolved. This one choice
+    /// is the whole bug and the whole fix, so the interleaving below is run
+    /// under both.
+    #[derive(Clone, Copy)]
+    enum Filing {
+        /// Pre-fix: ask the registry which session it is "in" — the SHARED
+        /// slot — and key the insert on that, then write the process-wide
+        /// default too. Spelled out here rather than reached through
+        /// `set_default_workdir` so the counter-example keeps reproducing the
+        /// old ordering even if that call later changes.
+        OnTheSharedSlot,
+        /// Now: key the insert on the session the turn actually IS.
+        OnItsOwnSession,
+    }
+
+    /// Two chat turns overlapping over different projects. `chat-a` is
+    /// mid-stream: it owns the shared slot (it is the session the user is in)
+    /// and has already bound `/project-a`. `chat-b` arrives, resolves its
+    /// workspace, files `/project-b`, and only then does `chat-a` resolve its
+    /// next relative path — the interleaving that overwrote a 3,718-line file.
+    ///
+    /// Returns what each turn resolves against, streaming turn first.
+    async fn overlapping_turns(
+        filing: Filing,
+    ) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        let reg = Arc::new(ToolRegistry::new());
+        reg.set_session_id(Some("chat-a".to_string())).await;
+        reg.bind_session_workdir("chat-a", Some(std::path::PathBuf::from("/project-a")))
+            .await;
+
+        let filed = Arc::new(tokio::sync::Barrier::new(2));
+
+        let incoming = {
+            let (reg, filed) = (reg.clone(), filed.clone());
+            async move {
+                match filing {
+                    Filing::OnTheSharedSlot => {
+                        let key = reg
+                            .session_id
+                            .read()
+                            .await
+                            .clone()
+                            .expect("the outgoing session owns the shared slot");
+                        reg.session_workdirs
+                            .write()
+                            .await
+                            .insert(key, Some(std::path::PathBuf::from("/project-b")));
+                        *reg.default_workdir.write().await =
+                            Some(std::path::PathBuf::from("/project-b"));
+                    }
+                    Filing::OnItsOwnSession => {
+                        reg.bind_session_workdir(
+                            "chat-b",
+                            Some(std::path::PathBuf::from("/project-b")),
+                        )
+                        .await;
+                    }
+                }
+                filed.wait().await;
+                reg.default_workdir().await
+            }
+        };
+
+        let streaming = {
+            let (reg, filed) = (reg.clone(), filed.clone());
+            async move {
+                filed.wait().await;
+                reg.default_workdir().await
+            }
+        };
+
+        tokio::join!(
+            ToolRegistry::with_run_session("chat-a".to_string(), streaming),
+            ToolRegistry::with_run_session("chat-b".to_string(), incoming),
+        )
+    }
+
+    /// The regression, and the proof that the assertion discriminates: the
+    /// same interleaving under the old filing must still re-root the
+    /// streaming turn, and under the new one must not.
+    #[tokio::test]
+    async fn an_incoming_turn_cannot_file_its_root_under_the_running_turns_key() {
+        let (streaming, incoming) = overlapping_turns(Filing::OnTheSharedSlot).await;
+        assert_eq!(
+            streaming,
+            Some(std::path::PathBuf::from("/project-b")),
+            "counter-example: keying the newcomer's root on the shared slot \
+             must still re-root the streaming turn into the other project — \
+             if this stops holding, the check below proves nothing"
+        );
+        assert_eq!(
+            incoming,
+            Some(std::path::PathBuf::from("/project-b")),
+            "counter-example: and the newcomer reached its own project only \
+             through the process-wide default, which is why the damage went \
+             unnoticed — both turns 'worked', one of them in the wrong tree"
+        );
+
+        let (streaming, incoming) = overlapping_turns(Filing::OnItsOwnSession).await;
+        assert_eq!(
+            streaming,
+            Some(std::path::PathBuf::from("/project-a")),
+            "a turn already running must keep its own root when a newcomer \
+             files one, whoever owns the shared slot"
+        );
+        assert_eq!(
+            incoming,
+            Some(std::path::PathBuf::from("/project-b")),
+            "and the newcomer must reach its own project by its own binding, \
+             not by a default that happens to agree"
+        );
+    }
+
+    /// The registry-side invariant that keeps the counter-example above
+    /// unreachable. `set_default_workdir` writes the process-wide default and
+    /// nothing else, but it is still the wrong call to make from inside a run:
+    /// the default belongs to whoever activated a workspace last, and a run
+    /// that moved it would change the root of every session with no binding of
+    /// its own. So the separation is asserted rather than commented — a run
+    /// that reaches for this call dies here and in the debug daemon.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "control-plane only")]
+    async fn a_run_may_not_reach_for_the_control_plane_workdir_call() {
+        let reg = ToolRegistry::new();
+        reg.set_session_id(Some("chat-a".to_string())).await;
+
+        ToolRegistry::with_run_session(
+            "chat-b".to_string(),
+            reg.set_default_workdir(Some(std::path::PathBuf::from("/project-b"))),
+        )
+        .await;
+    }
+
+    /// The production path, not a re-spelling of it. The counter-example above
+    /// open-codes the old filing so it keeps reproducing even if the real call
+    /// changes; this one drives `set_default_workdir` ITSELF, because the way
+    /// this reached a user was a workspace activation over IPC — a genuine
+    /// control-plane call, carrying no run scope, made while a turn was
+    /// streaming. The shared slot still names that streaming chat, so the
+    /// convenience insert that used to live in this function rewrote its root
+    /// and its next tool call resolved into the newly-activated project.
+    #[tokio::test]
+    async fn activating_a_workspace_cannot_re_root_a_streaming_turn() {
+        let reg = ToolRegistry::new();
+
+        // A turn is live: it bound its own root and owns the shared slot,
+        // exactly as `prepare_chat_turn` leaves things.
+        reg.set_session_id(Some("streaming-chat".to_string())).await;
+        reg.bind_session_workdir("streaming-chat", Some(std::path::PathBuf::from("/project-a")))
+            .await;
+
+        // The user clicks another workspace in the sidebar mid-turn.
+        reg.set_default_workdir(Some(std::path::PathBuf::from("/project-b")))
+            .await;
+
+        let streaming = ToolRegistry::with_run_session(
+            "streaming-chat".to_string(),
+            reg.default_workdir(),
+        )
+        .await;
+        assert_eq!(
+            streaming,
+            Some(std::path::PathBuf::from("/project-a")),
+            "activating a workspace must not move a running turn's root — this \
+             is the interleaving that wrote one session's files into another \
+             project's checkout"
+        );
+
+        // The activation still did its job for everyone without a binding.
+        // Read it as such a session would — inside its own run scope — because
+        // reading it bare would fall through to the shared slot, which still
+        // names the streaming chat and would answer with ITS root.
+        let unbound = ToolRegistry::with_run_session(
+            "chat-with-no-binding".to_string(),
+            reg.default_workdir(),
+        )
+        .await;
+        assert_eq!(
+            unbound,
+            Some(std::path::PathBuf::from("/project-b")),
+            "and the new workspace must still become the default that a \
+             session with no binding of its own follows"
+        );
+    }
+
+    /// The same key choice at the other end of a turn. `chat-b` finishes and
+    /// tears its binding down while `chat-a` is still streaming: teardown is
+    /// keyed on the session that ENDED, so the running turn keeps its root.
+    /// Had it been keyed on the shared slot it would drop `chat-a`'s instead,
+    /// and the streaming turn would fall through to whatever workspace
+    /// activation last left in the global default — the same destruction, one
+    /// door further along. Only the session that ended returns to the default,
+    /// and it must return all the way: a stale entry left behind would now win
+    /// over the default it should be following.
+    #[tokio::test]
+    async fn a_turn_ending_clears_only_its_own_binding() {
+        let reg = ToolRegistry::new();
+        *reg.default_workdir.write().await =
+            Some(std::path::PathBuf::from("/last-activated-workspace"));
+        reg.set_session_id(Some("chat-a".to_string())).await;
+        reg.bind_session_workdir("chat-a", Some(std::path::PathBuf::from("/project-a")))
+            .await;
+        reg.bind_session_workdir("chat-b", Some(std::path::PathBuf::from("/project-b")))
+            .await;
+
+        ToolRegistry::with_run_session("chat-b".to_string(), async {
+            reg.clear_session_workdir("chat-b").await;
+        })
+        .await;
+
+        let streaming =
+            ToolRegistry::with_run_session("chat-a".to_string(), reg.default_workdir()).await;
+        assert_eq!(
+            streaming,
+            Some(std::path::PathBuf::from("/project-a")),
+            "a turn ending must not hand a still-running turn back to the \
+             global default"
+        );
+
+        let ended =
+            ToolRegistry::with_run_session("chat-b".to_string(), reg.default_workdir()).await;
+        assert_eq!(
+            ended,
+            Some(std::path::PathBuf::from("/last-activated-workspace")),
+            "teardown must remove the binding entirely, not leave a stale entry \
+             that now wins over the default"
         );
     }
 }

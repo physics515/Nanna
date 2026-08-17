@@ -56,7 +56,14 @@
             </svg>
             {{ daemonQueueCount }} queued
           </span>
-          <ModelStatusBadge />
+          <!-- Which model THIS chat replies with, then the provider's health.
+               A pin supersedes only the global badge's NAME — that name comes
+               from the daemon's process-wide ModelSwitch event and would
+               confidently name a model this chat is not using. Fallback state
+               and the rate-limited count are process-wide facts that hold for
+               a pinned chat too, so the badge keeps reporting them. -->
+          <SessionModelPicker v-if="currentSession" :session-id="currentSession.id" />
+          <ModelStatusBadge :model-name-superseded="!!chatModel" />
         </div>
       </div>
       <p class="text-xs text-nanna-text-dim mt-1">
@@ -378,6 +385,8 @@ interface SessionInfo {
   message_count: number
   workspace_id?: string
   workspace_name?: string
+  /** Model this chat is pinned to; absent/null = the global `[llm]` default. */
+  chat_model?: string | null
 }
 
 interface AppConfig {
@@ -445,6 +454,7 @@ const {
   liveTimeline,
   contextUsed,
   contextWindow,
+  chatModel,
   messageQueue,
   hasActiveWork,
   hasQueuedMessages,
@@ -617,6 +627,11 @@ async function loadSession() {
 
       if (currentSession.value) {
         const sid = currentSession.value.id
+
+        // The daemon's copy of the pin is authoritative — seed the header from
+        // it before anything renders, or a chat pinned in another window shows
+        // "Default" until the user touches the picker.
+        chatModel.value = currentSession.value.chat_model ?? null
 
         // Fetch history and run state in parallel.
         // Don't clear streaming state before fetching — listeners may already be

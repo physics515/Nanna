@@ -825,6 +825,16 @@ impl DaemonClient {
         })).await
     }
 
+    /// Set or clear the chat-model pin for a session
+    pub async fn session_set_model(&self, session_id: &str, model: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "set_model",
+            "id": session_id,
+            "model": model
+        })).await
+    }
+
     /// Get session history
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({

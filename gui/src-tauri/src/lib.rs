@@ -210,6 +210,7 @@ pub fn run() {
             commands::sessions::archive_and_delete_session,
             commands::sessions::rename_session,
             commands::sessions::set_session_workspace,
+            commands::sessions::set_session_model,
             commands::settings::get_config,
             commands::settings::set_model,
             commands::settings::set_api_key,

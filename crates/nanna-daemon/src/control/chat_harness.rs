@@ -44,8 +44,10 @@ use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
     closed_task_ids, demote_in_progress, seed_continuation, seed_plan,
 };
+use nanna_agent::AgentConfig;
 use nanna_agent::harness::{Interjector, LongHorizonConfig};
 use nanna_storage::Storage;
+use nanna_tools::ToolRegistry;
 use nanna_agent::planner::{PLAN_DESCRIPTION_MAX_BYTES, PLAN_GOAL_MAX_BYTES};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -540,6 +542,7 @@ impl ControlPlane {
         let watcher_session = session_id.to_string();
         let watcher_message_id = message_id.clone();
         let watcher_live = live.clone();
+        let watcher_tools = agent.tools().clone();
 
         // Handles for the liveness beat task below; `live` itself moves into
         // the turn task, which owns begin/finish.
@@ -547,7 +550,26 @@ impl ControlPlane {
         let beat_event_tx = event_tx.clone();
         let beat_session = session_id.to_string();
 
-        let turn = tokio::spawn(async move {
+        // The interactive turn is a run like any other, so it binds its own
+        // session for the whole future instead of leaning on the shared slot.
+        // Chat was the last holdout here and it is the case that actually
+        // overlaps: turn B's `prepare_chat_turn` re-points the shared binding
+        // the moment it is admitted, while turn A is still streaming and still
+        // resolving relative paths — so A's tools would start answering with
+        // B's root. `with_run_session` gives each turn its own copy, which no
+        // other turn can reach.
+        //
+        // Boxed for the reason the sub-agent and scheduled paths box: this
+        // future is large, and inlining it in the spawned task's state machine
+        // puts the whole of it on the stack at spawn time.
+        //
+        // CONSTRAINT the registry's own doc states: a task-local does not cross
+        // `tokio::spawn`. The scope therefore has to wrap the future INSIDE the
+        // spawn, as it does here, and any tool execution moved onto a task of
+        // its own would silently fall back to the shared slot with no compile
+        // error.
+        let scope_session_id = session_id.to_string();
+        let turn = tokio::spawn(ToolRegistry::with_run_session(scope_session_id, Box::pin(async move {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
@@ -580,6 +602,7 @@ impl ControlPlane {
                         conversation,
                         workspace_root,
                         workspace_context,
+                        chat_model,
                     } = prep;
 
                     // The active workspace scopes stored memories, so a run's
@@ -592,6 +615,36 @@ impl ControlPlane {
                         None => None,
                     };
 
+                    // THE one place a chat turn's model is decided. Hoisted
+                    // above the runner literal so both runners below are built
+                    // from the same resolved value: the planner takes
+                    // `step_runner.agent_config.clone()`, so planning and
+                    // stepping cannot end up on different models, and the
+                    // fail-fast further down checks the model that will
+                    // actually run.
+                    //
+                    // `agent_config()` hands back a fresh clone per call, and
+                    // that clone is the whole isolation mechanism — mutating it
+                    // here reaches this turn and nothing else. The pin must
+                    // never be written into the shared `AgentServiceConfig`,
+                    // which the sub-agent spawner and the dream summarizer read
+                    // live.
+                    let is_pinned = chat_model.is_some();
+                    let agent_config =
+                        turn_agent_config(agent.agent_config().await, chat_model);
+
+                    // SAY which model won, for the same reason the workspace
+                    // resolution above says which workspace won: an override
+                    // nobody can see is indistinguishable from a bug, and "the
+                    // pin is set but the turn ran on the global model" is
+                    // exactly the failure this wiring exists to end.
+                    tracing::info!(
+                        session_id = %session_id_owned,
+                        model = %agent_config.model,
+                        source = if is_pinned { "chat pin" } else { "global [llm] default" },
+                        "chat turn model resolved"
+                    );
+
                     let step_runner = AgentStepRunner {
                         discovered_tools: Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::new(),
@@ -603,7 +656,7 @@ impl ControlPlane {
                         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
                         router: router.clone(),
                         tools: tools.clone(),
-                        agent_config: agent.agent_config().await,
+                        agent_config,
                         system_prompt,
                         workspace_root: workspace_root.clone(),
                         workspace_context,
@@ -662,20 +715,45 @@ impl ControlPlane {
                     // (observed live 2026-07-31, priority set to bare
                     // "claude-fable-5" with only OpenRouter configured). Say
                     // why instead, and seed no task that is born dead.
+                    //
+                    // A pinned chat gets a DIFFERENT sentence, because the
+                    // Settings wording is a lie for it: the model is not the
+                    // one Settings names, so a user sent there finds a
+                    // perfectly-served global model and no explanation. Falling
+                    // back to that global model would be worse still — the chat
+                    // would answer on a model the user did not pick, with
+                    // nothing saying so, which is the silent-substitution class
+                    // this project has already been bitten by. So name the pin,
+                    // say it is THIS chat's, and say how to drop it.
                     let model = step_runner.agent_config.model.clone();
                     live.set_model(&model);
                     if step_runner.router.client_for_model(&model).is_none() {
                         turn_stop_kind = "no_provider".to_string();
                         tracing::warn!(
                             %model,
-                            "chat turn cannot run: no provider serves the configured model"
+                            pinned = is_pinned,
+                            "chat turn cannot run: no provider serves the model it must run on"
                         );
-                        final_sink.delta(&format!(
-                            "_could not run: no provider is configured for model '{model}'. \
-                             Add the provider's credential in Settings — it registers \
-                             live, no restart needed — or pick a model from an \
-                             available provider in Settings → Models._"
-                        ));
+                        final_sink.delta(&if is_pinned {
+                            format!(
+                                "_could not run: this chat is pinned to model \
+                                 '{model}', and no provider is configured for it. \
+                                 The pin is this conversation's own — it overrides \
+                                 the model in Settings, so changing Settings will \
+                                 not help. Either add that provider's credential \
+                                 (it registers live, no restart needed), pick \
+                                 another model for this chat, or clear the pin to \
+                                 fall back to the Settings default._"
+                            )
+                        } else {
+                            format!(
+                                "_could not run: no provider is configured for model \
+                                 '{model}'. Add the provider's credential in Settings \
+                                 — it registers live, no restart needed — or pick a \
+                                 model from an available provider in Settings → \
+                                 Models._"
+                            )
+                        });
                         None
                     } else {
                         Some((step_runner, planner, conversation, workspace_root))
@@ -1813,6 +1891,18 @@ impl ControlPlane {
                 content,
             });
 
+            // The turn's workdir binding is turn-scoped and dies with the turn.
+            // Kept, it would grow the map one permanent entry per session the
+            // daemon ever chats in, and — worse — a session whose workspace is
+            // later closed would keep a stale entry that now WINS over the
+            // global default, so tools would resolve against a directory the
+            // session no longer has. This mirrors what the sub-agent path
+            // already does at its own tail (`control/session.rs`). Before
+            // `registry.release`, so the next turn for this session cannot be
+            // admitted until the stale binding is gone; its own
+            // `prepare_chat_turn` binds a fresh one.
+            agent.tools().clear_session_workdir(&session_id_owned).await;
+
             // Every exit path releases all three registrations — a leaked
             // entry would make the session look busy forever, and a leaked
             // turn baseline would keep filtering titles into the next turn,
@@ -1822,7 +1912,7 @@ impl ControlPlane {
             if let Some(ref baselines) = turn_baselines {
                 baselines.close_turn(&scope, scope_id.as_deref()).await;
             }
-        });
+        })));
 
         // Death watcher: a turn that dies before its release tail must not
         // leak its registrations. The task above is fire-and-forget, releases
@@ -1858,6 +1948,11 @@ impl ControlPlane {
                 message_id: watcher_message_id,
                 content: String::new(),
             });
+            // The tail's workdir clear is exactly as unreachable on this path as
+            // the releases below, and leaving the binding behind is the worse
+            // half of the leak: the next thing to resolve a path as this
+            // session would silently use a dead turn's root.
+            watcher_tools.clear_session_workdir(&watcher_session).await;
             watcher_agent.unregister_external_run(&watcher_session).await;
             watcher_registry.release(&watcher_session).await;
             if let Some(baselines) = watcher_baselines {
@@ -1913,6 +2008,32 @@ impl ControlPlane {
 
         Ok(Some(message_id))
     }
+}
+
+/// The [`AgentConfig`] THIS chat turn runs on: the chat's own pin if it has
+/// one, otherwise the global `[llm]` default exactly as it arrived.
+///
+/// This is the single point where the precedence rule is executed. `base` is
+/// always a fresh per-turn clone from
+/// [`crate::agent_service::AgentService::agent_config`] — that freshness is the
+/// entire isolation mechanism, so this function may mutate what it is given and
+/// must never be handed shared state.
+///
+/// The unpinned path returns `base` untouched rather than reconstructing it, so
+/// a chat that never picked a model is byte-for-byte what it was before per-chat
+/// models existed. That is not a nicety: the global default carries a model
+/// routing tier table, provider keys and the whole nudge policy, and "unpinned
+/// behaves as before" is only checkable if nothing on that path is rebuilt.
+fn turn_agent_config(base: AgentConfig, chat_model: Option<String>) -> AgentConfig {
+    let Some(model) = chat_model else {
+        return base;
+    };
+    let mut config = base;
+    // The one helper that knows what a pin moves and — just as importantly —
+    // what it must clear (`model_routing`, or the loop re-picks a global model
+    // from iteration 2 onward). Never re-implemented here; see its doc.
+    crate::agent_service::apply_chat_model_override(&mut config, model);
+    config
 }
 
 /// Shape the chat handler returns when a message joined a live run.
@@ -3072,6 +3193,83 @@ mod tests {
         assert!(ack["accepted_at"].as_str().is_some_and(|t| !t.is_empty()));
         // Empty content: the transcript is driven by events, never by this ack.
         assert_eq!(ack["content"], "");
+    }
+
+    /// A prep for a chat with no pin, so the "unpinned is unchanged" assertion
+    /// below is written against the same shape the real turn destructures.
+    fn prep(chat_model: Option<&str>) -> super::super::chat::ChatTurnPrep {
+        super::super::chat::ChatTurnPrep {
+            system_prompt: "you are nanna".to_string(),
+            conversation: None,
+            workspace_root: None,
+            workspace_context: None,
+            chat_model: chat_model.map(str::to_string),
+        }
+    }
+
+    /// A realistic global default: a primary model, a populated routing tier
+    /// table, and the summarization/provider settings a pin must not touch.
+    fn global_default() -> AgentConfig {
+        crate::agent_service::agent_config_from(&crate::agent_service::AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            model_priority: vec!["claude-sonnet-4".to_string()],
+            model_routing: vec![
+                "claude-haiku-3-5:simple".to_string(),
+                "claude-sonnet-4:complex".to_string(),
+            ],
+            summarization_priority: vec!["ollama/lfm2.5:latest".to_string()],
+            ..Default::default()
+        })
+    }
+
+    /// THE wiring assertion. Before the turn read `chat_model` off the prep,
+    /// the pin was stored, shown in the GUI and shipped over IPC while every
+    /// turn still ran on the global model — the feature was inert. A prep
+    /// carrying a pin must produce a turn config pointed at that model.
+    #[test]
+    fn a_prep_carrying_a_pin_produces_a_turn_on_the_pinned_model() {
+        let config = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
+
+        assert_eq!(config.model, "ollama/qwen3:14b");
+        // The loop re-picks a model every iteration after the first while the
+        // tier table is populated, so a pin that left it in place would run
+        // steps 2..n on the global models anyway — the inert bug with extra
+        // steps.
+        assert!(
+            config.model_routing.is_empty(),
+            "a pinned chat must not be re-routed off its model mid-run"
+        );
+        // The pin names the CHAT model only.
+        assert_eq!(
+            config.summarization_priority,
+            vec!["ollama/lfm2.5:latest".to_string()]
+        );
+    }
+
+    /// The other half of the contract: a chat that never picked a model must
+    /// behave EXACTLY as it did before per-chat models existed. Compared
+    /// through `Debug` because `AgentConfig` is not `PartialEq` — the point is
+    /// that every field is identical, not just the two a pin moves, so a
+    /// whole-value comparison is what is wanted here.
+    #[test]
+    fn a_prep_with_no_pin_is_the_global_default_untouched() {
+        let before = format!("{:?}", global_default());
+        let after = format!("{:?}", turn_agent_config(global_default(), prep(None).chat_model));
+
+        assert_eq!(after, before, "an unpinned chat must not be reshaped at all");
+    }
+
+    /// The planner is built from `step_runner.agent_config.clone()`, so it
+    /// inherits the pin by construction. Asserted here because planning and
+    /// stepping disagreeing about the model is the failure that would make a
+    /// pinned chat plan on one model and work on another, invisibly.
+    #[test]
+    fn the_planner_inherits_the_pinned_model_from_the_step_runner() {
+        let step = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
+        let planner = step.clone();
+
+        assert_eq!(planner.model, step.model);
+        assert!(planner.model_routing.is_empty());
     }
 
     #[test]

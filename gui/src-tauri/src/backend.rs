@@ -408,6 +408,8 @@ daemon_proxies! {
     session_create_in_workspace(name: Option<&str>, workspace_id: Option<&str>);
     /// Set or clear the workspace for a session
     session_set_workspace(session_id: &str, workspace_id: Option<&str>);
+    /// Set or clear the chat-model pin for a session
+    session_set_model(session_id: &str, model: Option<&str>);
     /// Get session history
     session_history(session_id: &str, limit: Option<usize>);
     /// Delete a session
