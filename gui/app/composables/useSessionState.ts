@@ -76,6 +76,30 @@ interface SessionState {
   /** Live context usage: last request's prompt tokens / enforced window. */
   contextUsed: number
   contextWindow: number
+  /**
+   * The model THIS chat is pinned to (`null` = follow the global `[llm]`
+   * default). Seeded from the daemon's `SessionInfo.chat_model` when the
+   * session loads; the picker writes it so the header updates on selection
+   * instead of on the round-trip. Chat replies only — sub-agent,
+   * summarization and embedding models are global and live in Settings.
+   */
+  chatModel: string | null
+  /**
+   * Whether `chatModel` above has actually been ASSERTED — seeded from the
+   * daemon's `SessionInfo`, or written by the picker — rather than merely
+   * defaulted by creating this entry. A stream event for a chat this window
+   * never opened creates state for it, and that entry's `null` means "we have
+   * not looked", not "no pin"; a list row that trusted it would drop the pin
+   * of a chat that has one.
+   */
+  chatModelKnown: boolean
+  /**
+   * Whether the pin changed while a turn was already running. A turn resolves
+   * its model once, when it is prepared, so a change made mid-turn does NOT
+   * re-model the reply on screen — it lands on the next message. Cleared when
+   * that turn ends, because from then on the pin is simply what this chat uses.
+   */
+  chatModelPendingNextTurn: boolean
 }
 
 // Global state store - persists across component lifecycle
@@ -96,6 +120,9 @@ function getSessionState(sessionId: string): SessionState {
       daemonQueueCount: 0,
       contextUsed: 0,
       contextWindow: 0,
+      chatModel: null,
+      chatModelKnown: false,
+      chatModelPendingNextTurn: false,
     })
   }
   return sessionStates.get(sessionId)!
@@ -161,6 +188,25 @@ export function useSessionState(sessionId: Ref<string | null>) {
     get: () => state.value?.contextWindow ?? 0,
     set: (val: number) => {
       if (state.value) state.value.contextWindow = val
+    }
+  })
+
+  // Writing the pin is also what makes it KNOWN: both writers — the seed from
+  // the daemon's SessionInfo and the picker — are assertions about this chat.
+  const chatModel = computed({
+    get: () => state.value?.chatModel ?? null,
+    set: (val: string | null) => {
+      if (state.value) {
+        state.value.chatModel = val
+        state.value.chatModelKnown = true
+      }
+    }
+  })
+
+  const chatModelPendingNextTurn = computed({
+    get: () => state.value?.chatModelPendingNextTurn ?? false,
+    set: (val: boolean) => {
+      if (state.value) state.value.chatModelPendingNextTurn = val
     }
   })
 
@@ -339,10 +385,16 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.activeToolCalls = []
       state.value.liveTimeline = []
       state.value.isLoading = false
+      // The turn the pin could not reach is over, so the pin is no longer
+      // waiting on anything — the next message resolves against it.
+      state.value.chatModelPendingNextTurn = false
     }
   }
 
-  // Reset all state for session
+  // Reset all state for session.
+  // `chatModel` deliberately survives: it is the chat's durable pin, not run
+  // state, and clearing it here would make the header claim the session
+  // follows the global default while the daemon still runs it on the pin.
   function resetState() {
     if (state.value) {
       state.value.isLoading = false
@@ -354,6 +406,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.messageQueue = []
       state.value.lastError = null
       state.value.daemonQueueCount = 0
+      state.value.chatModelPendingNextTurn = false
     }
   }
 
@@ -383,6 +436,8 @@ export function useSessionState(sessionId: Ref<string | null>) {
     daemonQueueCount,
     contextUsed,
     contextWindow,
+    chatModel,
+    chatModelPendingNextTurn,
 
     // Computed
     hasActiveWork,
@@ -408,6 +463,35 @@ export function useSessionState(sessionId: Ref<string | null>) {
 // Export for checking state from outside (e.g., layout)
 export function getSessionStateMap() {
   return sessionStates
+}
+
+/**
+ * This window's own answer for a session's pin, or `undefined` when it has
+ * none. Session LISTS come from a snapshot the layout reloads only at mount,
+ * on `sessions-cleared`, and on a workspace-tab change — so a row that trusted
+ * the snapshot alone kept asserting a pin the user had already removed. Where
+ * this window knows the pin first-hand, that is the fresher of the two answers
+ * and the one a list row should render.
+ */
+export function knownChatModel(sessionId: string): string | null | undefined {
+  const state = sessionStates.get(sessionId)
+  return state?.chatModelKnown ? state.chatModel : undefined
+}
+
+/**
+ * Record the daemon's answer for a session's pin. A reloaded session list is
+ * daemon truth about every chat at once, so it re-seeds the store the rows
+ * read from; otherwise this window's own older answer would outlive a pin
+ * changed in another window, which is the same staleness the other way round.
+ */
+export function seedChatModel(sessionId: string, model: string | null) {
+  // With no pin and no state for this chat there is nothing to correct — the
+  // row already falls back to the list's own value — and creating an entry per
+  // listed session would grow the map for chats never opened here.
+  if (model === null && !sessionStates.has(sessionId)) return
+  const state = getSessionState(sessionId)
+  state.chatModel = model
+  state.chatModelKnown = true
 }
 
 // Check if any session has active work
