@@ -368,7 +368,27 @@ nanna/
 | qwen3.5:9b | 5/5 | 25/42 | 2.11 h |
 | gemma4:e4b-it-qat | 5/5 | 6/42 | 4.50 h |
 
-See [ROADMAP.md](ROADMAP.md) and [bench/BASELINE.md](bench/BASELINE.md) for methodology.
+**Long-horizon chat path (4 h per model, 42-test dependency ladder, v0.3.8-beta.13).**
+Missions run through the product's own chat path, not a bespoke harness. *Final* is the
+score at the 4-hour mark — the number that says whether work built early still exists at
+the end.
+
+| Model | Peak | 4 h final | Interjections | vs. previous series (final) |
+|-------|------|-----------|---------------|------------------------------|
+| ornith:latest | **40/42** | **36/42** | 0 | 0/42 → 36/42 |
+| qwen3.5:9b | 26/42 | **26/42** | 0 | 0/42 → 26/42 |
+| gemma4:e4b-it-qat | 11/42 | 5/42 | 0 | 16/42 → 5/42 |
+| lfm2.5 | 0/42 | 0/42 | 2 | 0/42 (capability floor) |
+
+The previous series' two strongest models peaked at 30 and 41 and both ended at **zero** —
+peaks were built, then rewritten away when the run continued past a context boundary.
+Holding the peak was the target of the P23 work, and the top two legs now end at or near
+their peak with no human intervention. ornith's 40 also beats its best headless run (37).
+A fifth leg (ministral-3:8b) is excluded: the daemon hit a genuine panic mid-run, and a
+dead daemon never gets a score.
+
+See [ROADMAP.md](ROADMAP.md) and [bench/BASELINE.md](bench/BASELINE.md) for methodology,
+per-leg trajectories, and the findings queued from this series.
 
 </details>
 

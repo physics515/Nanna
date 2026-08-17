@@ -102,6 +102,10 @@ pub struct SessionInfo {
     pub workspace_id: Option<String>,
     /// Workspace name for display
     pub workspace_name: Option<String>,
+    /// Model this chat is pinned to (None = follow the global `[llm]` default).
+    /// The pin is durable, so the header pill and the sidebar chip must read it
+    /// from the listing — after a reload nothing else remembers the pick.
+    pub chat_model: Option<String>,
 }
 
 /// Application config for frontend

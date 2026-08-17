@@ -14,6 +14,16 @@ pub(super) struct ChatTurnPrep {
     pub conversation: Option<String>,
     pub workspace_root: Option<PathBuf>,
     pub workspace_context: Option<String>,
+    /// This chat's pinned model, read off the session that was already loaded
+    /// to build the prompt above. `None` = follow the global `[llm]` default,
+    /// which is the whole of the precedence rule.
+    ///
+    /// It rides in the prep rather than being re-read at the point of use
+    /// because the turn resolves its model exactly ONCE, from this value, into
+    /// the per-turn `AgentConfig` clone — a second read is a second place the
+    /// answer could differ, and the planner and the step runner must never
+    /// disagree about which model this chat runs on.
+    pub chat_model: Option<String>,
 }
 
 impl ControlPlane {
@@ -227,16 +237,50 @@ impl ControlPlane {
             }
         };
 
-        // Whatever we resolved, the tool working directory must match
-        // it — including when it resolved to NOTHING. Leaving the
-        // previous workspace's workdir in place is what turned "this
-        // session has no workspace" into "this session writes into the
-        // last session's directory".
-        if effective_ws_id.is_none() {
-            if let Some(agent) = self.agent.as_ref() {
-                agent.tools().set_default_workdir(None).await;
-            }
-        }
+        // The shared slot must name the session being prepared before anything
+        // derived from it is written. Nothing in a run reads it any more — the
+        // turn carries its own binding (`ToolRegistry::with_run_session`) — but
+        // the control-plane callers of `set_default_workdir` still do.
+        agent.tools().set_session_id(Some(session_id.to_string())).await;
+
+        let workspace_root = if let Some(ref ws_id) = effective_ws_id {
+            let registry = self.workspaces.read().await;
+            registry.get(ws_id).map(|ws| ws.path.clone())
+        } else {
+            None
+        };
+
+        // Whatever we resolved — including NOTHING — is recorded against THIS
+        // session. Keyed here, not inferred from the shared slot, so an incoming
+        // turn cannot file its root under the outgoing session's key: that is
+        // what turned "this session has no workspace" into "this session writes
+        // into the last session's directory", and then into a turn already
+        // streaming resolving its relative paths inside another project.
+        //
+        // This binding is the ONLY workdir write a chat turn makes, and it is
+        // turn-scoped: `run_chat_turn`'s release tail clears it again. The two
+        // `set_default_workdir` calls that used to live here (one for the
+        // resolved root, one clearing it when nothing resolved) are deliberately
+        // gone, and must not come back:
+        //
+        //   - `set_default_workdir` writes the PROCESS-WIDE slot. Writing it per
+        //     chat turn made a global mean "the last chat turn's workspace",
+        //     which is the cross-session re-rooting this per-session map exists
+        //     to end.
+        //   - It is documented and asserted control-plane-only:
+        //     `debug_assert!(RUN_SESSION_ID is unset)`. `prepare_chat_turn` runs
+        //     inside the turn's `with_run_session` scope, so calling it here
+        //     would now trip that assert rather than merely being unwise.
+        //
+        // Nothing is left unmaintained by their removal. The global keeps the
+        // meaning its own doc gives it — the ACTIVE workspace — and keeps the
+        // writers that give it that meaning: `WorkspaceAction::SetActive` /
+        // `ClearActive`, and the boot seeding from the persisted active
+        // workspace. Readers that want THIS session's root read it under this
+        // session's scope and get the binding above; readers with no session in
+        // hand fall through to the active workspace, which is the honest answer
+        // when nobody knows who is asking.
+        agent.tools().bind_session_workdir(session_id, workspace_root.clone()).await;
 
         // SAY which one won. The precedence itself is right, but it was
         // silent, and a silent override is indistinguishable from a
@@ -384,17 +428,6 @@ impl ControlPlane {
             *ws_arc.write().await = effective_ws_id.clone();
         }
 
-        // Set tool working directory to workspace root
-        if let Some(ref ws_id) = effective_ws_id {
-            let registry = self.workspaces.read().await;
-            if let Some(ws) = registry.get(ws_id) {
-                agent.tools().set_default_workdir(Some(ws.path.clone())).await;
-            }
-        }
-
-        // Set session ID so tools can scope per-session state
-        agent.tools().set_session_id(Some(session_id.to_string())).await;
-
         // Each harness step re-anchors from the task store, so the
         // conversation must ride in the system prompt (the retired
         // direct path passed it as a message array). The same bounded
@@ -405,18 +438,16 @@ impl ControlPlane {
             system_prompt.push_str(conversation);
         }
 
-        let workspace_root = if let Some(ref ws_id) = effective_ws_id {
-            let registry = self.workspaces.read().await;
-            registry.get(ws_id).map(|ws| ws.path.clone())
-        } else {
-            None
-        };
-
         Ok(ChatTurnPrep {
             system_prompt,
             conversation,
             workspace_root,
             workspace_context,
+            // Read from the session snapshot taken at the top of this function,
+            // so the pin the turn honours is the one that was set when the
+            // message was accepted — not one a Settings click may land halfway
+            // through a run that has already started streaming.
+            chat_model: session.chat_model().map(str::to_string),
         })
     }
 }

@@ -212,6 +212,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, MoreHorizontal } from 'lucide-vue-next'
 import { statusBarLabel } from '~/lib/backendLabels'
+import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
@@ -249,6 +250,8 @@ interface SessionInfo {
   message_count: number
   workspace_id: string | null
   workspace_name: string | null
+  /** Model this chat is pinned to; absent/null = the global `[llm]` default. */
+  chat_model?: string | null
 }
 
 interface WorkspaceInfo {
@@ -656,6 +659,11 @@ async function loadSessions() {
     // Workspace = show only that workspace's sessions (workspaceId = id)
     const workspaceId = currentTab.value?.type === 'workspace' ? (currentTab.value.workspaceId ?? null) : null
     sessions.value = await invoke<SessionInfo[]>('list_sessions', { workspaceId })
+    // The rows render their pin from the session-state store, so that the chat
+    // header's picker reaches them the moment a pin changes. This reload is the
+    // daemon's own answer for every chat at once, and re-seeding it here is
+    // what keeps a pin set in another window from being outlived by ours.
+    for (const session of sessions.value) seedChatModel(session.id, session.chat_model ?? null)
     if (sessions.value[0] && !currentSessionId.value) currentSessionId.value = sessions.value[0].id
   } catch (e) { console.error('Failed to load sessions:', e) }
 }

@@ -372,7 +372,7 @@ impl Tool for WebFetchTool {
         let truncated = if text.len() > max_chars {
             format!(
                 "{}...\n\n[Truncated at {} chars]",
-                &text[..max_chars],
+                &text[..truncate_boundary(&text, max_chars)],
                 max_chars
             )
         } else {
@@ -391,6 +391,22 @@ impl Tool for WebFetchTool {
     fn timeout_secs(&self) -> Option<u64> {
         Some(self.timeout_secs)
     }
+}
+
+/// Largest byte index at or below `max_bytes` that does not split a character.
+///
+/// Fetched pages are full of multi-byte characters — em dashes, curly quotes,
+/// CJK — and slicing a string at a byte index inside one panics, taking the
+/// whole process down, so the cut walks back to the nearest boundary.
+fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Extract readable content from HTML using a readability-style algorithm.
@@ -562,4 +578,30 @@ fn strip_html_basic(html: &str) -> String {
         .collect();
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_backs_off_a_split_multibyte_character() {
+        // The shape that killed the daemon: an em dash is 3 bytes, so a cut at
+        // byte 80 lands one byte inside it and `&text[..80]` panics.
+        let text = format!("{}—tail", "a".repeat(79));
+        assert!(!text.is_char_boundary(80));
+
+        let end = truncate_boundary(&text, 80);
+        assert_eq!(end, 79);
+        assert_eq!(&text[..end], "a".repeat(79).as_str());
+    }
+
+    #[test]
+    fn truncation_keeps_the_limit_when_it_lands_on_a_boundary() {
+        let text = "a".repeat(200);
+        assert_eq!(truncate_boundary(&text, 80), 80);
+        assert_eq!(truncate_boundary(&text, 200), 200);
+        // Shorter than the limit means no cut at all.
+        assert_eq!(truncate_boundary("short", 80), 5);
+    }
 }

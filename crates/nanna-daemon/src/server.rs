@@ -392,6 +392,34 @@ async fn assemble_handle_content(
         .join("\n")
 }
 
+/// The byte range of `content` that one `memory.get` page covers.
+///
+/// Rust panics when a byte index splits a char, and what is stored behind a
+/// handle is tool and model output — an em dash in an `edit_file` error is
+/// what killed the daemon — so both ends walk forward to the next boundary.
+/// Forward, not back, because the walked `start` is handed to the caller as
+/// the page's `offset`: a follow-up read resumes at the byte this one really
+/// began at, and no char is dropped between two pages.
+///
+/// The range is only valid for the string it was computed from. Keeping that
+/// pairing in one function is the point: the offsets were once proven against
+/// the assembled text and then used to index a single chunk of it, which is
+/// both out of bounds and off-boundary.
+fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
+    let total = content.len();
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let mut s = start;
+    while s < total && !content.is_char_boundary(s) {
+        s += 1;
+    }
+    let mut e = end;
+    while e < total && !content.is_char_boundary(e) {
+        e += 1;
+    }
+    (s, e)
+}
+
 async fn resolve_memory_handle(
     memory: &Arc<MemoryService>,
     handle: &str,
@@ -763,13 +791,10 @@ fn build_script_services(
                     let content = assemble_handle_content(&mem, &entry).await;
 
                     let total = content.len();
-                    let start = offset.min(total);
-                    let end = start.saturating_add(limit).min(total);
-                    // Never split a UTF-8 char.
-                    let mut s = start;
-                    while s < total && !content.is_char_boundary(s) { s += 1; }
-                    let mut e = end;
-                    while e < total && !content.is_char_boundary(e) { e += 1; }
+                    // Never split a UTF-8 char, and index the same text the
+                    // range was measured against: every field below reports on
+                    // the assembled content, so that is what the page cuts.
+                    let (s, e) = handle_page_range(&content, offset, limit);
 
                     // If the handle forwarded, SAY SO. Silently returning a
                     // consolidated narration where raw output was asked for
@@ -780,7 +805,7 @@ fn build_script_services(
                         && entry.metadata.get("source_id").is_none_or(|s| s != &id);
                     let mut out = json!({
                         "id": entry.id,
-                        "content": &entry.content[s..e],
+                        "content": &content[s..e],
                         "offset": s,
                         "returned": e - s,
                         "total": total,
@@ -4324,6 +4349,50 @@ mod tests {
         assert!(webhook.discord_public_key.is_none());
         assert!(webhook.slack_signing_secret.is_none());
         assert!(webhook.whatsapp_app_secret.is_none());
+    }
+
+    /// The crash: a stored `edit_file` error whose em dash straddled the byte
+    /// at the default 4 000-byte cap. An em dash is three bytes, `&s[..4_000]`
+    /// landed in the middle of it, and the panic took the whole daemon down.
+    #[test]
+    fn a_page_never_splits_a_multi_byte_char_at_the_default_limit() {
+        let content = format!("{}—tail", "a".repeat(3_999));
+        assert!(!content.is_char_boundary(4_000), "the test string must straddle the cap");
+
+        let (s, e) = handle_page_range(&content, 0, 4_000);
+        let page = &content[s..e];
+
+        assert_eq!(s, 0);
+        assert_eq!(e, 4_002, "the em dash is carried whole rather than cut at 4 000");
+        assert!(page.ends_with('—'));
+    }
+
+    /// The range must be usable on the very string it was measured from, at
+    /// any caller-supplied offset and limit — those come straight off the wire
+    /// via `opt_count`. Slicing is the operation that panicked, so slice.
+    #[test]
+    fn a_page_range_indexes_the_string_it_was_measured_from() {
+        let content = "—".repeat(5);
+        for offset in 0..content.len() + 4 {
+            for limit in 0..content.len() + 4 {
+                let (s, e) = handle_page_range(&content, offset, limit);
+                assert!(s <= e && e <= content.len(), "offset {offset} limit {limit}");
+                let _ = &content[s..e];
+            }
+        }
+    }
+
+    /// Paging must not drop a char between reads: the second page starts where
+    /// the first ended, so walking both ends forward has to keep them joinable.
+    #[test]
+    fn consecutive_pages_reassemble_the_whole_content() {
+        let content = format!("{}—{}", "a".repeat(10), "b".repeat(10));
+        let (s1, e1) = handle_page_range(&content, 0, 11);
+        let (s2, e2) = handle_page_range(&content, e1, 100);
+
+        assert_eq!(s1, 0);
+        assert_eq!(s2, e1, "the next page resumes at the byte this one ended on");
+        assert_eq!(format!("{}{}", &content[s1..e1], &content[s2..e2]), content);
     }
 
     #[test]
