@@ -19,7 +19,11 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "build:daemon": "node scripts/build-daemon.js",
-    "build:daemon:debug": "node scripts/build-daemon.js --debug"
+    "build:daemon:debug": "node scripts/build-daemon.js --debug",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --check .",
+    "format:write": "prettier --write ."
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",

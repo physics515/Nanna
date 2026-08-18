@@ -143,3 +143,6 @@ opt-level = 3
 
 [profile.release.build-override]
 opt-level = 3
+
+[dev-dependencies]
+# tarpaulin removed until CI is stable
