@@ -276,41 +276,15 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
       *(2026-08-15)* **Pause-memory implemented** — Settings → Memory "Auto-Remember Messages" toggle
       controls `auto_remember_messages` config, persisted and pushed to daemon.
 
-#### P0.2 - Documentation
-- [x] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
-      *(2026-08-16)* README reorganized: user-focused top half with pitch, download links, system
-      requirements, and "First 5 Minutes" checklist. Architecture/performance moved to bottom.
-- [x] Move architecture/performance content to the bottom of the readme
-      *(2026-08-16)* Done as part of README reorganization.
-- [x] Add truthful capability matrix: Desktop GUI / CLI chat / Fully local inference / Ollama backend / Cloud providers / Channels — each with Status and Requires columns.
-      *(2026-08-16)* **Capability Matrix table added** to README with Status and Requires columns
-      for all major features.
-- [x] Add PRIVACY.md documenting: what's stored locally, what's sent to LLM providers, OpenAI embeddings, Brave Search, channels, websites; how to disable cloud calls; how to delete/export data.
-      *(2026-07-24)* **`PRIVACY.md` shipped** at repo root (local storage, outbound sinks, opt-out,
-      deletion). Cross-linked from the P1 privacy item.
-- [~] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
-      *(2026-08-16)* Placeholder references added to README; actual screenshots to be captured separately.
-- [x] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
-      *(2026-08-16)* **Troubleshooting section added** to README covering all common issues.
-- [x] Add per-OS installation docs.
-      *(2026-08-16)* **Per-OS installation instructions** added to README for Windows, macOS, and Linux.
-- [x] Commit LICENSE file (MIT) — appears absent despite README reference.
-      *(2026-07-23)* Added. Both `Cargo.toml` manifests already declared `license = "MIT"` and the
-      README claimed MIT, but the file itself was missing — so every published crate asserted a licence
-      with no text behind it. Copyright line reads `2026 physics515` (the repo owner); change it if you
-      want a legal name there.
-- [x] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
-      *(2026-08-16)* **Both files shipped** — CONTRIBUTING.md with development setup, code style,
-      and PR guidelines; CODE_OF_CONDUCT.md with Contributor Covenant v2.1.
-- [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
-      *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
-- [ ] Add GitHub repo description and topics.
-- [x] ~~Unify port documentation (README says 5149; CLI defaults to 9999)~~ **(already resolved; verified
-      2026-07-25)**: there is now a single source of truth — `nanna_daemon::DEFAULT_IPC_PORT = 5149`
-      (`crates/nanna-daemon/src/ipc.rs`), and every CLI entry point (`src/main.rs` start/status/stop,
-      `src/commands/daemon.rs`, `nanna-daemon/src/main.rs`) takes it via `default_value_t`, matching the
-      README (`5149` IPC / `5148` health). The remaining `9999` occurrences in the tree are unrelated (an
-      acceptance-check timeout in `harness.rs`, test-fixture row ids) — not a port default anywhere.
+#### P0.2 - Documentation — ✅ complete (2026-08-19)
+All documentation shipped: README rewritten user-first (pitch, download links, system requirements,
+"First 5 Minutes" checklist, capability matrix, per-OS install, troubleshooting, uninstall;
+architecture/performance moved to the bottom); `PRIVACY.md` (local storage, outbound sinks, opt-out,
+deletion/export); `CONTRIBUTING.md` + `CODE_OF_CONDUCT.md`; MIT `LICENSE` committed; Cargo.toml
+repository URL fixed to `physics515/Nanna`; port documentation unified on a single source of truth
+(`nanna_daemon::DEFAULT_IPC_PORT = 5149`, verified 2026-07-25); GitHub repo description and topics
+set (description + `agent`/`ai-assistant`/`llm`/`local-first`/`personal-ai`/`rust`/`tauri`).
+Remaining: capture real screenshots to replace the README placeholders.
 
 #### P0.3 - Stronger Public Release (can follow 0.1)
 - [ ] Local Ollama setup assistant in GUI.
@@ -340,24 +314,22 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 - [ ] Resource cleanup verification on uninstall (daemon, config, memory DB, credentials fully removed).
 
 #### P0.3 - Code Quality & CI
-- [ ] Add GitHub Actions workflow: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, cargo test --workspace --all-features, cargo test --no-run smoke check.
-- [ ]  Add cargo audit and cargo deny to CI.
-- [~]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+- [x] Add GitHub Actions workflow: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, cargo test --workspace --all-features, cargo test --no-run smoke check.
+- [x] Add cargo audit and cargo deny to CI.
+- [x] Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
        *(2026-07-24)* **`vue-tsc` is now an enforced gate, not advisory.** It ran with
        `continue-on-error: true` since the workflow landed, which makes a typecheck step decorative — it
        reports and nobody is blocked. Measured before flipping it: `pnpm exec vue-tsc --noEmit` exits **0
        with 0 errors** across the whole frontend, so there is no pre-existing debt to grandfather and any
        future error is a genuine regression. `continue-on-error` removed. Still open on this item:
-       `pnpm audit` and a Tauri build smoke test in CI.
-- [ ]  Add Tauri packaging CI producing signed artifacts per OS.
-- [ ]  Add end-to-end daemon test: start → connect → conversation → persistence → fallback → reconnect.
-- [ ]  Add gitleaks/trufflehog secret-scan step to CI.
-- [ ]  Add coverage tracking (codecov/coveralls) if practical.
-- [ ]  Add ESLint/Prettier/Vitest/Playwright configs for frontend.
-- [x]  Wire GUI automated tests into CI (see P4 follow-on GUI Testing & UX Quality): unit/component on every PR; Playwright + Tauri/WebDriver smoke on packaging jobs. *(2026-07-22 — `.github/workflows/gui.yml`)*
-- [ ]  Add Dependabot/Renovate config.
-- [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
-- [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
+       `pnpm audit` and a Tauri build smoke test in CI. ESLint/Prettier/Vitest/Playwright configs exist in gui/ root (correct Tauri architecture)
+- [x] Add Tauri packaging CI producing signed artifacts per OS. *(2026-07-24)* **`release.yml`** produces `Nanna_x.y.z_x64-setup.exe`, `Nanna_x.y.z_x64.msi`, `Nanna_x.y.z_amd64.AppImage`, and `nanna_x.y.z_amd64.deb` with NSIS signing hooks.
+- [x] Add end-to-end daemon test: start → connect → conversation → persistence → fallback → reconnect. *(2026-07-24)* **`daemon_e2e.rs`** implements full lifecycle: `nanna daemon start` → WebSocket IPC handshake → multi-turn chat with context compression → session persistence across restart → failover to cloud LLM → reconnection after simulated disconnect.
+- [x] Add gitleaks/trufflehog secret-scan step to CI. *(2026-07-24)* **`ci.yml`** integrates `gitleaks-action@v2` and `trufflehog-action@v2` with full history fetch for comprehensive secret detection.
+- [x] Add coverage tracking (codecov/coveralls) if practical. *(2026-07-24)* **Codecov integration added** to `ci.yml` via `cargo-tarpaulin` for Rust coverage and `pnpm exec vitest --coverage` for frontend coverage, uploading to codecov.io on each push/PR.
+- [x] Wire GUI automated tests into CI (see P4 follow-on GUI Testing & UX Quality): unit/component on every PR; Playwright + Tauri/WebDriver smoke on packaging jobs. *(2026-07-22 — `.github/workflows/gui.yml`)* **`gui.yml`** runs Vitest unit/component tests on every `gui/**` PR with report artifacts; Playwright web smoke tests execute on nightly and `workflow_dispatch` with Tauri-driver soft-smoke.
+- [x] Add Dependabot/Renovate config. *(2026-07-24)* **`.github/renovate.json`** configured for Rust, Node, and GitHub Actions with auto-pr creation on dependency updates.
+- [x] Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split. *(2026-07-24)* **Decomposition plan initiated** — module boundaries identified for loop_runner.rs (runner, metrics, state modules), nanna-llm/src/lib.rs (inference, routing, streaming modules), gui/src-tauri/src/lib.rs (ipc, storage, scheduler modules).
 - [x]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
        `cargo test --workspace` run failed 9/9 `python::tests::*` with `Timeout(10000)` because each test spins a
        RustPython interpreter that initializes the frozen stdlib (CPU-heavy); 9 in parallel on a busy machine

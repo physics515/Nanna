@@ -1,4 +1,4 @@
-# Nanna v0.2.1 — Public Preview Release
+# Nanna v0.3.8-beta.14 — Continuation Without Destruction
 
 ## What's New
 
@@ -11,6 +11,18 @@
 - **Tools & MCP** — 39 default skills via Boa/Deno engines, MCP server mode
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp
 - **Desktop GUI** — Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme)
+
+### P23 — Continuation Without Destruction (this release)
+- **Verified work survives turn boundaries** — continuation turns carry a pinned ARTIFACT STATE block re-read from disk at turn start
+- **Claim conflicts reproduce before rewrite** — when user input contradicts verified evidence, the harness runs a reproduction task before mutating
+- **Shrinking rewrites held with removals named** — whole-file writes that drop definitions are held once with the removed symbols listed
+- **Endings are loud and honest** — every turn ends with one stated reason; a round is never "dry" while its own checks still fail
+- **Error rounds charged against provider-health probes** — error rounds only consume budget when a minimal probe confirms the fault persists
+- **Transient outages park and resume** — instead of giving up, a transient error demotes to PARKED and resumes on provider recovery
+- **Tool results stopped lying** — python registry saves report where they landed; killed commands report partial output; directory tools teach instead of OS jargon
+- **Live summarization priority** — per-turn re-read of `llm.summarization_priority` (was boot-frozen in three consumers)
+- **GUI steering no longer reads as failure** — breaker replays render as inline steering, not red "Tool Failed" toasts
+- **Fixed invalid installer config keys** — two keys that blocked builds outright removed
 
 ### Performance
 - **SIMD vector ops** (AVX-512/AVX2/NEON) — 768-dim cosine similarity in ~0.1µs
