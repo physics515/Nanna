@@ -262,7 +262,6 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
       *(2026-08-15)* **Config exists** — `auto_remember_messages` in `[memory]` config (default true).
       *(2026-08-15)* **GUI toggle added** — Settings → Memory now has "Auto-Remember Messages" switch
       that persists to config and pushes to daemon. `PRIVACY.md` documents the feature.
-- [ ] Tool permission setup: ask before enabling shell/browser/file-write.
 - [x] Daemon/embedded backend auto-start.
       *(2026-08-15)* The daemon launches as a managed sidecar via `tauri-plugin-shell` on app start.
       `daemon_manager.rs` spawns `nanna-daemon` automatically; reconnection loop handles transient
