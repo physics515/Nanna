@@ -41,16 +41,18 @@ const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
     tools: Arc<ToolRegistry>,
-    agent_config: nanna_agent::AgentConfig,
+    /// Read at spawn, never at construction: a sub-agent must run on the
+    /// model and summarization list the user has NOW, not the ones the daemon
+    /// booted with. `model_routing`/`routing_first_turn_primary` stay pinned
+    /// below because they are this spawner's own sub-agent policy, not user
+    /// config.
+    agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    sub_agent_routing: Vec<nanna_agent::ModelTier>,
     system_prompt: String,
     workspace_root: Option<PathBuf>,
     workspace_context: Option<String>,
     /// Shared model stats tracker (sub-agents contribute to the same stats)
     stats: Option<nanna_agent::ModelStatsTracker>,
-    /// Model fallback chain for sub-agents, in priority order — resolved via
-    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
-    /// sub-agent list already means "the main chat list". Never empty.
-    sub_agent_models: Vec<String>,
 }
 
 #[async_trait]
@@ -65,14 +67,25 @@ impl AgentSpawner for AgentSpawnerImpl {
 
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
+        // One live read for the whole spawn: the model list, the chat model
+        // it falls back to, and the summarization list the sub-agent inherits
+        // all come from the config as it stands right now.
+        let (base_config, sub_agent_models) = {
+            let live = self.agent_config_src.read().await;
+            (
+                crate::agent_service::agent_config_from(&live),
+                live.sub_agent_models.clone(),
+            )
+        };
+
         // Fallback chain: first working model wins. A candidate whose
         // provider is missing is skipped; a candidate whose run fails hands
         // the prompt to the next (a fresh agent — sub-agent runs are
         // idempotent by contract, the parent only consumes the final text).
-        let candidates = if self.sub_agent_models.is_empty() {
-            vec![self.agent_config.model.clone()]
+        let candidates = if sub_agent_models.is_empty() {
+            vec![base_config.model.clone()]
         } else {
-            self.sub_agent_models.clone()
+            sub_agent_models.clone()
         };
 
         let mut last_error = String::new();
@@ -99,7 +112,9 @@ impl AgentSpawner for AgentSpawnerImpl {
             }
 
             // Configure agent — sub-agents are full agents, no artificial iteration cap
-            let mut config = self.agent_config.clone();
+            let mut config = base_config.clone();
+            config.model_routing = self.sub_agent_routing.clone();
+            config.routing_first_turn_primary = true;
             config.max_iterations = max_iterations;
             let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
             // Strip provider prefix from model name for the actual API call
@@ -377,6 +392,34 @@ async fn assemble_handle_content(
         .join("\n")
 }
 
+/// The byte range of `content` that one `memory.get` page covers.
+///
+/// Rust panics when a byte index splits a char, and what is stored behind a
+/// handle is tool and model output — an em dash in an `edit_file` error is
+/// what killed the daemon — so both ends walk forward to the next boundary.
+/// Forward, not back, because the walked `start` is handed to the caller as
+/// the page's `offset`: a follow-up read resumes at the byte this one really
+/// began at, and no char is dropped between two pages.
+///
+/// The range is only valid for the string it was computed from. Keeping that
+/// pairing in one function is the point: the offsets were once proven against
+/// the assembled text and then used to index a single chunk of it, which is
+/// both out of bounds and off-boundary.
+fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
+    let total = content.len();
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let mut s = start;
+    while s < total && !content.is_char_boundary(s) {
+        s += 1;
+    }
+    let mut e = end;
+    while e < total && !content.is_char_boundary(e) {
+        e += 1;
+    }
+    (s, e)
+}
+
 async fn resolve_memory_handle(
     memory: &Arc<MemoryService>,
     handle: &str,
@@ -510,7 +553,13 @@ fn build_script_services(
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
     turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    summarizer: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    // Router plus the LIVE config the model list is resolved from at call
+    // time. A `Vec<String>` here would be a boot snapshot, and this service
+    // outlives every `config.set` (2026-08-15).
+    summarizer: Option<(
+        Arc<crate::llm_router::LlmRouter>,
+        Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    )>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -742,13 +791,10 @@ fn build_script_services(
                     let content = assemble_handle_content(&mem, &entry).await;
 
                     let total = content.len();
-                    let start = offset.min(total);
-                    let end = start.saturating_add(limit).min(total);
-                    // Never split a UTF-8 char.
-                    let mut s = start;
-                    while s < total && !content.is_char_boundary(s) { s += 1; }
-                    let mut e = end;
-                    while e < total && !content.is_char_boundary(e) { e += 1; }
+                    // Never split a UTF-8 char, and index the same text the
+                    // range was measured against: every field below reports on
+                    // the assembled content, so that is what the page cuts.
+                    let (s, e) = handle_page_range(&content, offset, limit);
 
                     // If the handle forwarded, SAY SO. Silently returning a
                     // consolidated narration where raw output was asked for
@@ -759,7 +805,7 @@ fn build_script_services(
                         && entry.metadata.get("source_id").is_none_or(|s| s != &id);
                     let mut out = json!({
                         "id": entry.id,
-                        "content": &entry.content[s..e],
+                        "content": &content[s..e],
                         "offset": s,
                         "returned": e - s,
                         "total": total,
@@ -844,12 +890,12 @@ fn build_script_services(
     // summarization model chain. The `day_dream` tool is the model-facing
     // half: dreaming already does this on a schedule, and this lets the model
     // ask for it deliberately when it notices related fragments piling up.
-    if let Some((router, models)) = summarizer {
+    if let Some((router, summarizer_config)) = summarizer {
         services.insert(
             "memory.summarize".to_string(),
             Arc::new(move |params: Value| {
                 let router = router.clone();
-                let models = models.clone();
+                let summarizer_config = Arc::clone(&summarizer_config);
                 Box::pin(async move {
                     let texts: Vec<String> = params
                         .get("texts")
@@ -868,6 +914,15 @@ fn build_script_services(
 ---
 
 ");
+                    // Resolved per call: whichever summarization list the
+                    // user has set right now is the one that answers.
+                    let models = {
+                        let live = summarizer_config.read().await;
+                        crate::dream_summarizer::summarization_models(
+                            &live.summarization_priority,
+                            std::slice::from_ref(&live.model),
+                        )
+                    };
                     let summarize =
                         crate::dream_summarizer::summarize_with_failover(router, models);
                     let summary = summarize(joined).await?;
@@ -1952,20 +2007,20 @@ impl DaemonServer {
             // both thresholds), so there is no second copy of the policy here.
             let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
             let activity_for_tasks = activity_clock.clone();
-            // The user's full summarization priority list, not just its head:
-            // the scheduled dream cycle now fails over exactly like the IPC one,
-            // so a single unavailable model no longer kills the nightly cycle.
-            let summarization_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
+            // NOT captured here. The list is read from the live agent config at
+            // the top of each cycle instead: a boot clone survives every
+            // `config.set`, so a user who repointed summarization kept dreaming
+            // on the model they had at startup — the whole class the P23
+            // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
+            // summarizations in the benchmark series ran on the wrong model).
+            // A dream cycle runs minutes-to-hours apart, so one lock read per
+            // cycle costs nothing measurable.
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
                 let dreaming = dreaming_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
-                let summarization_models = summarization_models.clone();
                 let chat_runs = chat_runs_for_tasks.clone();
                 let dream_in_flight = dream_in_flight_for_tasks.clone();
                 let scheduled_resume_parked = scheduled_resume_parked.clone();
@@ -1993,6 +2048,16 @@ impl DaemonServer {
                                         None,
                                     )
                                 } else {
+                                // Read the summarization list LIVE, once per
+                                // cycle: whatever the user last set is what
+                                // this dream summarizes on. Falls back to the
+                                // chat model exactly as the boot path did.
+                                let live_cfg = agent.agent_config().await;
+                                let summarization_models =
+                                    crate::dream_summarizer::summarization_models(
+                                        &live_cfg.summarization_priority,
+                                        std::slice::from_ref(&live_cfg.model),
+                                    );
                                 let outcome = {
                                 // The idle gate AND the full dream cycle (feedback
                                 // flush -> FSRS testing-effect flush -> consolidate)
@@ -3384,6 +3449,14 @@ impl DaemonServer {
             None
         };
 
+        // ONE config for every long-lived collaborator below. The sub-agent
+        // spawner and the script summarizer are constructed BEFORE the agent
+        // service, so the service adopts this same lock (`with_shared_config`)
+        // and a later `config.set` reaches all three at once — the boot-clone
+        // staleness that ran a whole benchmark series on the wrong summarizer
+        // (2026-08-15).
+        let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
+
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
@@ -3424,38 +3497,19 @@ impl DaemonServer {
                 Some(Arc::new(AgentSpawnerImpl {
                     router: router.clone(),
                     tools: tools.clone(),
-                    agent_config: nanna_agent::AgentConfig {
-                        model: self.config.agent.model.clone(),
-                        max_tokens: self.config.agent.max_tokens,
-                        temperature: self.config.agent.temperature,
-                        max_iterations: None, // Unlimited — model stops when done
-                        thinking_mode: self.config.agent.thinking_mode,
-                        summarization_priority: self.config.agent.summarization_priority.clone(),
-                        summarization_ollama_url: self
-                            .config
-                            .agent
-                            .summarization_ollama_url
-                            .clone(),
-                        model_routing: sub_agent_routing,
-                        routing_first_turn_primary: true,
-                        openrouter_api_key: self.config.agent.openrouter_api_key.clone(),
-                        openai_api_key: self.config.agent.openai_api_key.clone(),
-                        ..Default::default()
-                    },
+                    // The live config, not a snapshot of it — see
+                    // `AgentSpawnerImpl::agent_config_src`.
+                    agent_config_src: Arc::clone(&shared_agent_config),
+                    sub_agent_routing,
                     system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
-                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
                 }))
             } else {
                 None
             };
 
-            let summarizer_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
             let services = build_script_services(
                 &memory,
                 spawner_arc,
@@ -3463,7 +3517,7 @@ impl DaemonServer {
                 workspace_id_for_services.clone(),
                 self.storage.clone(),
                 turn_baselines.clone(),
-                Some((router.clone(), summarizer_models)),
+                Some((router.clone(), Arc::clone(&shared_agent_config))),
             );
 
             if let Some(ref dir) = tools_dir {
@@ -3550,7 +3604,10 @@ impl DaemonServer {
         )
         .with_session_history(session_history)
         .with_stats(model_stats.clone())
-        .with_degradations(degradations.clone());
+        .with_degradations(degradations.clone())
+        // Adopt the lock the spawner and the script summarizer already hold,
+        // so `config.set` moves all three at once instead of only this one.
+        .with_shared_config(Arc::clone(&shared_agent_config));
         if let Some(ref storage) = self.storage {
             agent_service = agent_service.with_storage(storage.clone());
         }
@@ -4292,6 +4349,50 @@ mod tests {
         assert!(webhook.discord_public_key.is_none());
         assert!(webhook.slack_signing_secret.is_none());
         assert!(webhook.whatsapp_app_secret.is_none());
+    }
+
+    /// The crash: a stored `edit_file` error whose em dash straddled the byte
+    /// at the default 4 000-byte cap. An em dash is three bytes, `&s[..4_000]`
+    /// landed in the middle of it, and the panic took the whole daemon down.
+    #[test]
+    fn a_page_never_splits_a_multi_byte_char_at_the_default_limit() {
+        let content = format!("{}—tail", "a".repeat(3_999));
+        assert!(!content.is_char_boundary(4_000), "the test string must straddle the cap");
+
+        let (s, e) = handle_page_range(&content, 0, 4_000);
+        let page = &content[s..e];
+
+        assert_eq!(s, 0);
+        assert_eq!(e, 4_002, "the em dash is carried whole rather than cut at 4 000");
+        assert!(page.ends_with('—'));
+    }
+
+    /// The range must be usable on the very string it was measured from, at
+    /// any caller-supplied offset and limit — those come straight off the wire
+    /// via `opt_count`. Slicing is the operation that panicked, so slice.
+    #[test]
+    fn a_page_range_indexes_the_string_it_was_measured_from() {
+        let content = "—".repeat(5);
+        for offset in 0..content.len() + 4 {
+            for limit in 0..content.len() + 4 {
+                let (s, e) = handle_page_range(&content, offset, limit);
+                assert!(s <= e && e <= content.len(), "offset {offset} limit {limit}");
+                let _ = &content[s..e];
+            }
+        }
+    }
+
+    /// Paging must not drop a char between reads: the second page starts where
+    /// the first ended, so walking both ends forward has to keep them joinable.
+    #[test]
+    fn consecutive_pages_reassemble_the_whole_content() {
+        let content = format!("{}—{}", "a".repeat(10), "b".repeat(10));
+        let (s1, e1) = handle_page_range(&content, 0, 11);
+        let (s2, e2) = handle_page_range(&content, e1, 100);
+
+        assert_eq!(s1, 0);
+        assert_eq!(s2, e1, "the next page resumes at the byte this one ended on");
+        assert_eq!(format!("{}{}", &content[s1..e1], &content[s2..e2]), content);
     }
 
     #[test]

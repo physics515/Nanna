@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { modelDisplayName } from '~/lib/modelSpecs'
 import { useGroundGlass } from '~/composables/useGroundGlass'
 
 interface ModelStatus {
@@ -9,6 +10,18 @@ interface ModelStatus {
   fallback_reason: string | null
   rate_limited_models: string[]
 }
+
+/**
+ * `modelNameSuperseded` says something else on screen already names the model
+ * in play — today, a chat pinned to its own model. This badge is fed by the
+ * daemon's process-wide ModelSwitch event, so its NAME would be wrong there.
+ * Everything else it reports is process-wide too and stays right: whether the
+ * router is on a fallback, why, and how many models are rate limited. Hiding
+ * the whole badge to hide one wrong word took the provider's health with it.
+ */
+const props = withDefaults(defineProps<{ modelNameSuperseded?: boolean }>(), {
+  modelNameSuperseded: false,
+})
 
 const status = ref<ModelStatus | null>(null)
 const isLoading = ref(true)
@@ -33,24 +46,36 @@ function handleLeave() {
   if (ready.value) onLeave()
 }
 
-const displayModel = computed(() => {
-  if (!status.value) return 'Loading...'
-  const model = status.value.active_model
-  const name = model.includes('/') ? (model.split('/')[1] ?? model) : model
-  return formatModelName(name)
-})
-
+// Loose null check on purpose: before the first fetch lands there is no
+// status at all, and `undefined !== null` had the pill wearing the fallback
+// warning on every mount.
 const isUsingFallback = computed(() => {
-  return status.value?.fallback_reason !== null
+  return status.value?.fallback_reason != null
 })
 
 const rateLimitedCount = computed(() => {
   return status.value?.rate_limited_models?.length ?? 0
 })
 
+/**
+ * The pill's text. Naming the model is the badge's job only while it is the
+ * model in play; when it has been superseded the pill reports the one thing
+ * that is still true of it either way — the router's health.
+ */
+const displayModel = computed(() => {
+  if (!status.value) return props.modelNameSuperseded ? 'Provider status unavailable' : 'Loading...'
+  if (props.modelNameSuperseded) return isUsingFallback.value ? 'Provider fallback' : 'Provider ready'
+  return modelDisplayName(status.value.active_model)
+})
+
 const statusTitle = computed(() => {
   if (!status.value) return 'Loading model status...'
-  let title = `Active: ${status.value.active_model}`
+  let title = props.modelNameSuperseded
+    // The active model is still worth naming — it is what every chat WITHOUT
+    // a pin replies with — but the sentence has to say that it is not this
+    // chat's model, or the tooltip re-tells the lie the pill just avoided.
+    ? `Provider health for all chats.\nThis chat is pinned to its own model; the global active model (${status.value.active_model}) does not apply here.`
+    : `Active: ${status.value.active_model}`
   if (status.value.fallback_reason) {
     title += `\nFallback reason: ${status.value.fallback_reason}`
   }
@@ -59,20 +84,6 @@ const statusTitle = computed(() => {
   }
   return title
 })
-
-function formatModelName(model: string): string {
-  const replacements: Record<string, string> = {
-    'claude-opus-4-5-20251101': 'Opus 4.5',
-    'claude-opus-4-20250514': 'Opus 4',
-    'claude-sonnet-4-20250514': 'Sonnet 4',
-    'claude-3-5-sonnet-20241022': 'Sonnet 3.5',
-    'claude-3-5-haiku-20241022': 'Haiku 3.5',
-    'gpt-4o': 'GPT-4o',
-    'gpt-4o-mini': 'GPT-4o Mini',
-    'gpt-4-turbo': 'GPT-4 Turbo',
-  }
-  return replacements[model] || model
-}
 
 async function loadStatus() {
   try {

@@ -321,13 +321,33 @@ impl Storage {
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("Session {}", &session.session_id[..8]))
+            .unwrap_or_else(|| {
+                let end = truncate_boundary(&session.session_id, 8);
+                format!("Session {}", &session.session_id[..end])
+            })
     }
 
     /// Update session's workspace
     pub async fn set_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
         self.sessions().update_workspace(session_id, workspace_id).await
     }
+}
+
+/// Byte offset at or below `max_bytes` that a slice can end on.
+///
+/// A session id is whatever the caller stored: `nanna chat --session <ID>` and
+/// `upsert_daemon_session` both take the string verbatim, so a fixed byte index
+/// can land past the end of a short id or inside a multi-byte character, and
+/// `str` indexing panics on either.
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -386,6 +406,45 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    fn sample_session(session_id: &str) -> Session {
+        Session {
+            id: 1,
+            session_id: session_id.into(),
+            channel: "cli".into(),
+            user_id: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            metadata: None,
+            workspace_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn get_session_name_survives_multibyte_session_id() {
+        // `nanna chat --session <ID>` stores the flag verbatim and writes
+        // neither a name nor metadata, so the generated fallback is the only
+        // reachable branch for such a session. Byte 8 of this id lands inside
+        // the em dash (bytes 6..9) — the same cut that killed the daemon.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abcdef—ghij")),
+            "Session abcdef"
+        );
+
+        // The same defect from the other side: an id shorter than the limit
+        // puts the index out of range before boundaries even matter.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abc")),
+            "Session abc"
+        );
+
+        // An ASCII id still keeps exactly the eight bytes it always did.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("0123456789abcdef")),
+            "Session 01234567"
+        );
     }
 
     fn sample_new_memory(id: &str, content: &str) -> NewMemory {

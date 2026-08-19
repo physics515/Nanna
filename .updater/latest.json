@@ -1,11 +1,11 @@
 {
-  "version": "0.3.8-beta.14",
-  "notes": "Public Beta 14 - P23 'Continuation without destruction': verified work now survives the turn boundary. A continuation turn carries a pinned ARTIFACT STATE block re-read from disk, a user claim that contradicts verified evidence gets reproduced before anything is rewritten, and shrinking rewrites that drop definitions are held once with the removals named. Endings are loud and honest: every turn ends with one stated reason, a round is never 'dry' while its own checks still fail, error rounds are charged only against a provider-health probe, and a transient outage parks and resumes instead of giving up. Tool results stopped lying: python registry saves say where they landed, a killed command reports what it did before the deadline, and directory tools teach instead of emitting OS jargon. Plus live (no longer boot-frozen) summarization-priority, GUI steering that no longer reads as failure, and two invalid installer-config keys that blocked builds outright.",
-  "pub_date": "2026-08-18T19:27:14.000Z",
+  "version": "0.3.9",
+  "notes": "Public Beta 14 — P24 per-chat model pin and chat-scoped tool roots, UTF-8 char-boundary slice safety, stale-shrink hold names the true reason, live summarization priority, and P0.2/P0.3 documentation.",
+  "pub_date": "2026-08-17T21:01:33.160Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXUxQWh6SHprMG5tMXRjVWlQU05tRDUzUTdiN1JUSjZ4cmpBVmFmWnJIVmxsT0k1UW10ZXFac0hOWFNFc1phZWh3QUQwMzRReVB2TElSWW1LK2dldmcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODI5MjA3CWZpbGU6TmFubmFfMC4zLjhfeDY0LXNldHVwLmV4ZQpKMGUyM2FhdjMvUmcxanNBdVFNR2k3M2IrMm5vVmRNMDJXcUpLRHBWT1pQR1gzN0JwekUxWmxlR3l5bVZxQ0ozKzMrcGxCR3o3cEdsMy9WZ0ErUVRBUT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.8-beta.14/Nanna_0.3.8-beta.14_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWkxR3Bzem5HTzhqUTdQeU1DVTNkUlV1N1Z3dzV0M05lc3czMWwwbDNOKzAybWUvNE1NU2VFMHNWREhkdUpUNndYSCs4YjVNd1ArVWROSlhsK0I2MkFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3MDAwNDc4CWZpbGU6TmFubmFfMC4zLjlfeDY0LXNldHVwLmV4ZQpJYkRVMDBsTDNpRXZqN08ybUlpUDdXMjExZXhmS1Y0OHRPTDcvdmEyU3dqelhyVkczKzY2Q1RoVlFJOHJ6QnJvYmlyc0V4aFJybytOSlI3RHFoQW5EUT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.9-beta.14/Nanna_0.3.9_x64-setup.exe"
     }
   }
 }

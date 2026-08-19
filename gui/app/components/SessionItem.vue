@@ -17,7 +17,17 @@
             <SessionActivityBadge :session-id="session.id" compact />
           </div>
         </div>
-        <div class="session-date">{{ formatDate(session.updated_at) }}</div>
+        <div class="session-meta">
+          <span class="session-date">{{ formatDate(session.updated_at) }}</span>
+          <!-- The sidebar is where a user notices that one chat runs on a
+               different model. Read-only: the pin is changed in the chat
+               header, and it covers chat replies only. -->
+          <span
+            v-if="pinnedModel"
+            class="session-model"
+            :title="`This chat is pinned to ${pinnedModel}`"
+          >{{ modelDisplayName(pinnedModel) }}</span>
+        </div>
       </div>
     </button>
     <button
@@ -74,8 +84,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, watch } from 'vue'
+import { ref, computed, nextTick, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { modelDisplayName } from '~/lib/modelSpecs'
+import { knownChatModel } from '~/composables/useSessionState'
 import { useConfirm } from '~/composables/useConfirm'
 import { useSplatter } from '~/composables/useSplatter'
 
@@ -89,6 +101,8 @@ interface SessionInfo {
   message_count: number
   workspace_id: string | null
   workspace_name: string | null
+  /** Model this chat is pinned to; absent/null = the global `[llm]` default. */
+  chat_model?: string | null
 }
 
 const props = defineProps<{
@@ -101,6 +115,17 @@ const emit = defineEmits<{
   (e: 'deleted', sessionId: string): void
   (e: 'renamed', session: SessionInfo): void
 }>()
+
+/**
+ * The pin to show. `session` comes from the layout's list, which is only
+ * reloaded at mount, on `sessions-cleared`, and on a workspace-tab change — so
+ * on its own it goes on claiming a pin the header has since removed. Where
+ * this window has its own answer for the chat, that one is newer and wins.
+ */
+const pinnedModel = computed(() => {
+  const known = knownChatModel(props.session.id)
+  return known === undefined ? (props.session.chat_model ?? null) : known
+})
 
 // Splatter for active state — violet/indigo palette
 const { splatterBg, onEnter: meshEnter, onLeave: meshLeave } = useSplatter({
@@ -288,13 +313,33 @@ const vClickOutside = {
   color: #e2e8f0;
 }
 
+.session-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
 .session-date {
   font-size: 0.65rem;
   color: #64748b;
-  margin-top: 2px;
+  flex-shrink: 0;
 }
 .session-btn.active .session-date {
   color: rgba(139, 92, 246, 0.6);
+}
+
+.session-model {
+  font-size: 0.6rem;
+  color: rgba(167, 139, 250, 0.85);
+  background: rgba(139, 92, 246, 0.12);
+  border-radius: 9999px;
+  padding: 1px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 /* Context menu */

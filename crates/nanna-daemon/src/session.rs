@@ -169,6 +169,14 @@ pub struct AttachmentRecord {
     pub url: Option<String>,
 }
 
+/// Metadata key holding a session's chat-model override.
+///
+/// Named `chat_model` rather than `model` because it names the ONE thing the
+/// override covers: the absence of `sub_agent_model` / `summarization_model` /
+/// `embedding_model` keys reads as deliberate rather than forgotten. Those stay
+/// global — see `[llm]` and `[embedding]` in the config.
+const CHAT_MODEL_KEY: &str = "chat_model";
+
 /// A conversation session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -229,6 +237,18 @@ impl Session {
         self
     }
     
+    /// This session's chat-model override, if the user picked one.
+    ///
+    /// `None` means "use the global default" — the absence of the key is the
+    /// unset state, so a session that never picked behaves exactly as it did
+    /// before overrides existed. The spec is stored verbatim in router form
+    /// (`ollama/qwen3:14b`, `openrouter/…`, bare `claude-…`), the same shape
+    /// `llm.model_priority` holds, so a caller can hand it straight to
+    /// `LlmRouter::client_for_model`.
+    pub fn chat_model(&self) -> Option<&str> {
+        self.metadata.get(CHAT_MODEL_KEY).and_then(serde_json::Value::as_str)
+    }
+
     /// Add a message to the session (in-memory only — use SessionManager for persistence)
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
@@ -324,7 +344,7 @@ impl Session {
     /// Get display name (name or truncated ID)
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
-            format!("Session {}", &self.id[..8])
+            format!("Session {}", &self.id[..floor_boundary(&self.id, 8)])
         })
     }
     
@@ -346,6 +366,10 @@ pub struct SessionSummary {
     pub owner: Option<ChannelId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Chat-model override, mirrored out of `metadata` so a client that lists
+    /// sessions can render the pin without a `session.get` per row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
 }
 
 impl From<&Session> for SessionSummary {
@@ -359,6 +383,7 @@ impl From<&Session> for SessionSummary {
             subscriber_count: session.subscribers.len(),
             owner: session.owner.clone(),
             workspace_id: session.workspace_id.clone(),
+            chat_model: session.chat_model().map(str::to_string),
         }
     }
 }
@@ -493,6 +518,35 @@ fn db_message_to_session_message(
     }
 }
 
+/// The `sessions` row a persist writes, lifted out from under the map's guard.
+///
+/// A write-through has to survive the guard being dropped, because the database
+/// round trip must not happen while the map is locked. Carrying the whole
+/// [`Session`] across that await would copy its entire message history — the
+/// largest thing a session owns — for what is often a one-key metadata change,
+/// so only the columns the upsert actually binds come along.
+struct SessionRow {
+    id: SessionId,
+    name: Option<String>,
+    workspace_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    metadata: HashMap<String, serde_json::Value>,
+}
+
+impl From<&Session> for SessionRow {
+    fn from(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            workspace_id: session.workspace_id.clone(),
+            created_at: session.created_at.to_rfc3339(),
+            updated_at: session.updated_at.to_rfc3339(),
+            metadata: session.metadata.clone(),
+        }
+    }
+}
+
 /// Manages all sessions with write-through to Turso.
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
@@ -620,27 +674,40 @@ impl SessionManager {
 
     /// Persist session metadata to DB (fire-and-forget on errors)
     async fn persist_session(&self, session: &Session) {
+        self.persist_row(&SessionRow::from(session)).await;
+    }
+
+    /// Write one `sessions` row, metadata included (fire-and-forget on errors).
+    ///
+    /// The metadata blob always travels, even when the map is empty. The SQL is
+    /// `metadata = COALESCE(?6, metadata)`, so a NULL means "keep whatever is on
+    /// disk" — and sending NULL for an empty map made a key the user just
+    /// REMOVED survive the write, with `load_from_db` resurrecting it on the
+    /// next daemon start. Un-pinning a chat's model would have looked like it
+    /// worked right up until a restart put the pin back. The literal `{}` is
+    /// what makes a removal land.
+    async fn persist_row(&self, row: &SessionRow) {
         let Some(ref storage) = self.storage else {
-            warn!("persist_session called but no storage backend — session {} will not be persisted", session.id);
+            warn!("persist_session called but no storage backend — session {} will not be persisted", row.id);
             return;
         };
-        let created = session.created_at.to_rfc3339();
-        let updated = session.updated_at.to_rfc3339();
-        let metadata = if session.metadata.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&session.metadata).ok()
+        let metadata = match serde_json::to_string(&row.metadata) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Failed to serialize metadata for session {}: {}", row.id, e);
+                return;
+            }
         };
         match storage.upsert_daemon_session(
-            &session.id,
-            session.name.as_deref(),
-            session.workspace_id.as_deref(),
-            &created,
-            &updated,
-            metadata.as_deref(),
+            &row.id,
+            row.name.as_deref(),
+            row.workspace_id.as_deref(),
+            &row.created_at,
+            &row.updated_at,
+            Some(&metadata),
         ).await {
-            Ok(()) => info!("Persisted session {} to database", session.id),
-            Err(e) => warn!("Failed to persist session {} to database: {}", session.id, e),
+            Ok(()) => info!("Persisted session {} to database", row.id),
+            Err(e) => warn!("Failed to persist session {} to database: {}", row.id, e),
         }
     }
 
@@ -709,6 +776,54 @@ impl SessionManager {
         }
     }
 
+    /// Set or clear this session's chat model (`None` = follow the global
+    /// `[llm]` default).
+    ///
+    /// Chat only. Sub-agent, summarization and embedding models stay global on
+    /// purpose — this writes one key and touches nothing else.
+    pub async fn set_chat_model(&self, session_id: &str, model: Option<String>) -> bool {
+        let Some(row) = self.apply_chat_model(session_id, model).await else {
+            return false;
+        };
+        // The database round trip runs with the map unlocked — see
+        // `apply_chat_model` for why that split exists.
+        self.persist_row(&row).await;
+        true
+    }
+
+    /// Apply a chat-model pick to the cached session and hand back the row that
+    /// still has to be written; `None` when there is no such session.
+    ///
+    /// The two halves are separate because the `sessions` WRITE guard must not
+    /// be held across the storage await. It once was, and every concurrent
+    /// `get`/`list` then queued behind a full database round trip — including
+    /// the read an in-flight turn does in `prepare_chat_turn` to resolve this
+    /// very pin. The guard dies with this function; only the row crosses into
+    /// the write.
+    async fn apply_chat_model(&self, session_id: &str, model: Option<String>) -> Option<SessionRow> {
+        // Normalize at the boundary so every reader sees a single shape for
+        // "no override". A blank pick from a client is a CLEAR, not a pin on
+        // the empty string — which no provider serves, so it would only ever
+        // reach the turn's fail-fast.
+        let model = model.filter(|spec| !spec.trim().is_empty());
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_id)?;
+        match model {
+            Some(spec) => {
+                session
+                    .metadata
+                    .insert(CHAT_MODEL_KEY.to_string(), serde_json::Value::String(spec));
+            }
+            None => {
+                session.metadata.remove(CHAT_MODEL_KEY);
+            }
+        }
+        session.updated_at = Utc::now();
+        info!("Session {} chat model set to {:?}", session_id, session.chat_model());
+        Some(SessionRow::from(&*session))
+    }
+
     /// Get a session by ID
     pub async fn get(&self, id: &str) -> Option<Session> {
         let sessions = self.sessions.read().await;
@@ -739,11 +854,38 @@ impl SessionManager {
         sessions.values().map(SessionSummary::from).collect()
     }
     
-    /// Update a session
-    pub async fn update(&self, session: Session) {
-        self.persist_session(&session).await;
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(session.id.clone(), session);
+    /// Update a session from a caller-held snapshot.
+    ///
+    /// The snapshot is not authoritative about the chat-model pin. Callers read
+    /// a session, mutate their copy, and write it back — `ChatAction::Regenerate`
+    /// does exactly that — so a `session.setModel` landing inside that window
+    /// would be undone by the write: a stale snapshot resurrects a pin the user
+    /// just cleared, or drops one they just set, and the chat then runs on a
+    /// model the picker says it is not using. [`Self::set_chat_model`] is the
+    /// single writer of that key and the live map is where its write landed, so
+    /// the live value wins and `update` stays pin-neutral — it can neither set
+    /// nor clear a pin. A session the map has never seen has no live value to
+    /// reconcile against, so its snapshot carries through as-is.
+    pub async fn update(&self, mut session: Session) {
+        let row = {
+            let mut sessions = self.sessions.write().await;
+            if let Some(live) = sessions.get(&session.id) {
+                match live.metadata.get(CHAT_MODEL_KEY) {
+                    Some(pin) => {
+                        session
+                            .metadata
+                            .insert(CHAT_MODEL_KEY.to_string(), pin.clone());
+                    }
+                    None => {
+                        session.metadata.remove(CHAT_MODEL_KEY);
+                    }
+                }
+            }
+            let row = SessionRow::from(&session);
+            sessions.insert(session.id.clone(), session);
+            row
+        };
+        self.persist_row(&row).await;
     }
     
     /// Delete a session
@@ -1114,6 +1256,24 @@ impl SessionManager {
     }
 }
 
+/// Largest byte index at or below `max` that `s` may be sliced at.
+///
+/// A `SessionId` is a plain `String`, not a validated UUID: `with_id`,
+/// restored legacy sessions and rows read back from the database all carry
+/// whatever text their source held. Slicing one at a fixed byte index panics
+/// when the id is shorter than the limit or when the index lands inside a
+/// multi-byte character, and a panic here would take the whole daemon down.
+fn floor_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1327,28 @@ mod tests {
 
         assert!(s.take_last_user_turn().is_none());
         assert_eq!(s.messages.len(), before, "session left unchanged");
+    }
+
+    /// REGRESSION: the display name previews the first 8 bytes of the id, and
+    /// an id is any string a caller hands us. When byte 8 falls inside a
+    /// multi-byte character the raw slice panics — the same defect that killed
+    /// the daemon mid-run from a preview elsewhere.
+    #[test]
+    fn display_name_clamps_multibyte_id_to_char_boundary() {
+        // "session" is 7 bytes and the em dash occupies bytes 7..10, so the
+        // 8-byte limit lands inside it.
+        let s = Session::with_id("session\u{2014}id", None);
+
+        assert_eq!(s.display_name(), "Session session");
+    }
+
+    /// REGRESSION: legacy sessions restored from disk carry short ids like
+    /// "main", which the fixed-index slice ran off the end of.
+    #[test]
+    fn display_name_survives_id_shorter_than_the_preview() {
+        let s = Session::with_id("main", None);
+
+        assert_eq!(s.display_name(), "Session main");
     }
 
     /// REGRESSION (P19): a run's tool calls are first-class citizens of the
@@ -1239,6 +1421,277 @@ mod tests {
                 ..
             } if call_id == "c1" && input["cmd"] == "ls" && output == "file.txt"
         ));
+    }
+
+    /// A session that never picked a model must be indistinguishable from one
+    /// that existed before per-chat models did: no key, no override, and a
+    /// listing that says nothing about a model.
+    #[tokio::test]
+    async fn an_unpicked_session_reports_no_chat_model() {
+        let manager = SessionManager::new();
+        let session = manager.create(None).await;
+
+        assert_eq!(session.chat_model(), None);
+        assert!(session.metadata.is_empty(), "no key is the unset state");
+        assert_eq!(SessionSummary::from(&session).chat_model, None);
+    }
+
+    #[tokio::test]
+    async fn a_chat_model_pick_shows_up_on_the_session_and_in_the_listing() {
+        let manager = SessionManager::new();
+        let session = manager.create(None).await;
+
+        assert!(
+            manager
+                .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+                .await
+        );
+
+        // Stored verbatim in router form, so the turn can hand it straight to
+        // the router without re-deriving a provider prefix.
+        let picked = manager.get(&session.id).await.expect("session");
+        assert_eq!(picked.chat_model(), Some("ollama/qwen3:14b"));
+
+        // `session.list` is what a client hydrates from; without this it would
+        // need a `session.get` per row just to render the pin.
+        let listed = manager.list().await;
+        let summary = listed
+            .iter()
+            .find(|s| s.id == session.id)
+            .expect("session is listed");
+        assert_eq!(summary.chat_model.as_deref(), Some("ollama/qwen3:14b"));
+    }
+
+    /// A blank pick is a CLEAR, normalized here so every reader downstream sees
+    /// one shape for "no override". Pinning the empty string would instead
+    /// produce a chat no provider serves.
+    #[tokio::test]
+    async fn a_blank_chat_model_pick_clears_the_pin() {
+        let manager = SessionManager::new();
+        let session = manager.create(None).await;
+
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+        manager.set_chat_model(&session.id, Some("   ".to_string())).await;
+
+        let cleared = manager.get(&session.id).await.expect("session");
+        assert_eq!(cleared.chat_model(), None);
+        assert!(!cleared.metadata.contains_key(CHAT_MODEL_KEY), "the key is removed, not blanked");
+    }
+
+    #[tokio::test]
+    async fn setting_a_chat_model_on_an_unknown_session_reports_failure() {
+        let manager = SessionManager::new();
+
+        assert!(
+            !manager
+                .set_chat_model("no-such-session", Some("ollama/qwen3:14b".to_string()))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_model_pick_survives_a_daemon_restart() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("pinned".to_string())).await;
+
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+
+        let reborn = SessionManager::with_storage(storage);
+        assert!(reborn.load_from_db().await >= 1, "session loads from Turso");
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+
+        assert_eq!(restored.chat_model(), Some("ollama/qwen3:14b"));
+    }
+
+    /// REGRESSION (the COALESCE trap): `upsert_daemon_session` writes
+    /// `metadata = COALESCE(?6, metadata)`, so persisting an empty map as NULL
+    /// leaves the old blob on disk and `load_from_db` resurrects it. Un-pinning
+    /// a chat would then appear to work right up until the next daemon start
+    /// put the pin back — a silent lie about which model the chat runs on.
+    #[tokio::test]
+    async fn clearing_a_chat_model_pick_survives_a_daemon_restart() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("un-pinned".to_string())).await;
+
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+        manager.set_chat_model(&session.id, None).await;
+
+        let reborn = SessionManager::with_storage(storage);
+        assert!(reborn.load_from_db().await >= 1, "session loads from Turso");
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+
+        assert_eq!(
+            restored.chat_model(),
+            None,
+            "the clear must land on disk, not just in the hot cache"
+        );
+    }
+
+    /// The metadata blob is shared with whatever else a session records, so the
+    /// replacing write has to carry the siblings through — both when the key is
+    /// added and when it is removed.
+    #[tokio::test]
+    async fn a_chat_model_pick_leaves_the_rest_of_the_metadata_alone() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let mut session = manager.create(None).await;
+        session
+            .metadata
+            .insert("source".to_string(), serde_json::Value::String("telegram".to_string()));
+        manager.update(session.clone()).await;
+
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+        manager.set_chat_model(&session.id, None).await;
+
+        let reborn = SessionManager::with_storage(storage);
+        reborn.load_from_db().await;
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+
+        assert_eq!(restored.chat_model(), None);
+        assert_eq!(
+            restored.metadata.get("source").and_then(serde_json::Value::as_str),
+            Some("telegram"),
+            "removing the pin must not take the neighbours with it"
+        );
+    }
+
+    /// The chat-model pin as the DATABASE holds it, read past the hot cache —
+    /// the only way to tell "written" from "merely remembered".
+    async fn pinned_model_on_disk(
+        storage: &nanna_storage::Storage,
+        session_id: &str,
+    ) -> Option<String> {
+        storage
+            .list_daemon_sessions()
+            .await
+            .expect("sessions load")
+            .into_iter()
+            .find(|row| row.session_id == session_id)
+            .and_then(|row| row.metadata)
+            .and_then(|meta| {
+                meta.get(CHAT_MODEL_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+    }
+
+    /// REGRESSION: a model pick used to hold the `sessions` WRITE guard across
+    /// its database round trip, parking every concurrent `get`/`list` behind a
+    /// disk write — the turn resolving this very pin among them. The pick and
+    /// the write are now separate steps: `apply_chat_model` takes the guard,
+    /// mutates, and gives it back, so by the time the row exists the map is
+    /// readable, writable, and already telling the truth — with the database
+    /// still untouched.
+    #[tokio::test]
+    async fn a_chat_model_pick_lands_in_memory_before_the_database_write() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(None).await;
+
+        let row = manager
+            .apply_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await
+            .expect("session exists");
+
+        assert!(
+            manager.sessions_map().try_write().is_ok(),
+            "the guard is released before the write, not after it"
+        );
+        assert_eq!(
+            manager.get(&session.id).await.expect("session").chat_model(),
+            Some("ollama/qwen3:14b"),
+            "readers see the pick without waiting on storage"
+        );
+        assert_eq!(
+            pinned_model_on_disk(&storage, &session.id).await,
+            None,
+            "and all of that happened before the database was touched"
+        );
+
+        manager.persist_row(&row).await;
+        assert_eq!(
+            pinned_model_on_disk(&storage, &session.id).await.as_deref(),
+            Some("ollama/qwen3:14b"),
+            "the row the mutation handed back is what makes the pick durable"
+        );
+    }
+
+    /// REGRESSION: `ChatAction::Regenerate` reads a session, peels the last turn
+    /// off its copy, and writes that copy back. A `session.setModel` landing
+    /// inside that window used to be undone — the snapshot still carried the old
+    /// pin and put it straight back, so the chat kept running on a model the
+    /// picker said it had stopped using.
+    #[tokio::test]
+    async fn update_cannot_resurrect_a_pin_cleared_after_its_snapshot() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("regenerating".to_string())).await;
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+
+        // The snapshot a regenerate is holding, taken while the pin was set.
+        let mut snapshot = manager.get(&session.id).await.expect("session");
+        assert_eq!(snapshot.chat_model(), Some("ollama/qwen3:14b"));
+
+        // The user un-pins while the regenerate is still assembling.
+        manager.set_chat_model(&session.id, None).await;
+
+        // ...and the regenerate writes its snapshot back.
+        snapshot.add_message(MessageRole::User, "again");
+        manager.update(snapshot).await;
+
+        let live = manager.get(&session.id).await.expect("session");
+        assert_eq!(live.chat_model(), None, "the clear survives the write-back");
+        assert_eq!(live.messages.len(), 1, "the caller's own edit still lands");
+
+        let reborn = SessionManager::with_storage(storage);
+        reborn.load_from_db().await;
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+        assert_eq!(
+            restored.chat_model(),
+            None,
+            "and a restart does not bring the resurrected pin back"
+        );
+    }
+
+    /// The mirror of the resurrection case: a pin set after the snapshot was
+    /// taken must not be dropped by the write-back either. `update` is
+    /// pin-neutral — [`SessionManager::set_chat_model`] is the only writer of
+    /// that key.
+    #[tokio::test]
+    async fn update_cannot_drop_a_pin_set_after_its_snapshot() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("regenerating".to_string())).await;
+
+        let mut snapshot = manager.get(&session.id).await.expect("session");
+        assert_eq!(snapshot.chat_model(), None);
+
+        manager
+            .set_chat_model(&session.id, Some("ollama/qwen3:14b".to_string()))
+            .await;
+
+        snapshot.add_message(MessageRole::User, "again");
+        manager.update(snapshot).await;
+
+        let live = manager.get(&session.id).await.expect("session");
+        assert_eq!(live.chat_model(), Some("ollama/qwen3:14b"));
+
+        let reborn = SessionManager::with_storage(storage);
+        reborn.load_from_db().await;
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+        assert_eq!(restored.chat_model(), Some("ollama/qwen3:14b"));
     }
 
     #[tokio::test]

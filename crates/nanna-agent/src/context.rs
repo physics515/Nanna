@@ -1824,7 +1824,7 @@ impl AgentContext {
                 match block {
                     ContentBlock::Text { text } => {
                         let preview = if text.len() > 100 {
-                            format!("{}...", &text[..100])
+                            format!("{}...", &text[..text.floor_char_boundary(100)])
                         } else {
                             text.clone()
                         };
@@ -1835,7 +1835,7 @@ impl AgentContext {
                     }
                     ContentBlock::ToolResult { content, .. } => {
                         let preview = if content.len() > 80 {
-                            format!("{}...", &content[..80])
+                            format!("{}...", &content[..content.floor_char_boundary(80)])
                         } else {
                             content.clone()
                         };
@@ -2008,7 +2008,7 @@ impl AgentContext {
                     ContentBlock::ToolResult { content, .. } => {
                         // Truncate long tool results in summary
                         let truncated = if content.len() > 200 {
-                            format!("{}...", &content[..200])
+                            format!("{}...", &content[..content.floor_char_boundary(200)])
                         } else {
                             content.clone()
                         };
@@ -2017,7 +2017,7 @@ impl AgentContext {
                     ContentBlock::Thinking { thinking, .. } => {
                         // Include reasoning in summary, truncated
                         let truncated = if thinking.len() > 200 {
-                            format!("{}...", &thinking[..200])
+                            format!("{}...", &thinking[..thinking.floor_char_boundary(200)])
                         } else {
                             thinking.clone()
                         };
@@ -2744,6 +2744,45 @@ mod tests {
         assert!(
             ctx.take_pending_loss_notices().is_empty(),
             "announcing zero loss would be noise"
+        );
+    }
+
+    /// The production panic: these previews sliced by raw byte index, so a
+    /// multi-byte char straddling the limit killed the whole daemon process
+    /// rather than the turn. Nanna's own `edit_file` error message did it, with
+    /// an em dash at bytes 79..82 of an 80-byte tool-result preview.
+    #[test]
+    fn dropped_message_previews_survive_a_multibyte_char_on_the_limit() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages
+            .push(AnthropicMessage::user_text("the original request"));
+
+        // Byte 100, the text preview's limit, lands inside this em dash.
+        let text = format!("{}—and more text", "t".repeat(99));
+        assert!(!text.is_char_boundary(100));
+        ctx.messages.push(AnthropicMessage::user_text(text));
+
+        // Byte 80 lands inside this one, exactly as it did in the crash.
+        let content = format!("{}—and more output", "c".repeat(79));
+        assert!(!content.is_char_boundary(80));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("t1", content, true));
+
+        ctx.messages.push(AnthropicMessage::user_text("recent"));
+
+        assert_eq!(ctx.drop_oldest(1), 2);
+        let summary = ctx.consolidated_summary.expect("a drop note is recorded");
+        assert!(
+            summary.contains(&format!("{}...", "t".repeat(99))),
+            "the text preview clamps to the boundary below 100"
+        );
+        assert!(
+            summary.contains(&format!("{}...", "c".repeat(79))),
+            "the tool-result preview clamps to the boundary below 80"
+        );
+        assert!(
+            !summary.contains('—'),
+            "a char the limit splits is dropped, never half-copied"
         );
     }
 }

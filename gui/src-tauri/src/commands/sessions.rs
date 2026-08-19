@@ -40,6 +40,9 @@ pub async fn create_session(
             .map(String::from)
             .or(workspace_id),
         workspace_name: None,
+        // A session created this instant cannot carry a pin: `set_model` is the
+        // only thing that writes one, and it needs the id this call returns.
+        chat_model: None,
     })
 }
 
@@ -74,6 +77,9 @@ pub async fn list_sessions(
                         message_count: s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                         workspace_id: s.get("workspace_id").and_then(|v| v.as_str()).map(String::from),
                         workspace_name: s.get("workspace_name").and_then(|v| v.as_str()).map(String::from),
+                        // Absent (not null) on an unpinned session — the daemon's
+                        // `SessionSummary` skips the key when there is no pin.
+                        chat_model: s.get("chat_model").and_then(|v| v.as_str()).map(String::from),
                     })
                 })
                 .collect()
@@ -207,6 +213,32 @@ pub async fn set_session_workspace(
         .backend
         .session_set_workspace(&session_id, workspace_id.as_deref())
         .await?;
+    if result.get("error").is_some() {
+        return Err(result["message"].as_str().unwrap_or("Unknown error").to_string());
+    }
+    Ok(())
+}
+
+/// Set or clear the chat-model pin for a session.
+///
+/// `model = None` clears the pin and the chat follows the global `[llm]`
+/// default again. The pin covers chat replies only — the sub-agent,
+/// summarization and embedding models stay global.
+#[tauri::command]
+pub async fn set_session_model(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    model: Option<String>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let result = state_guard
+        .backend
+        .session_set_model(&session_id, model.as_deref())
+        .await?;
+    // A refused pin — unknown session, or a model no live provider serves —
+    // comes back in the body, not as a transport error. Swallowing it here
+    // would leave the picker showing a model that cannot answer a single turn,
+    // so it is raised as an `Err` for the caller to surface and revert.
     if result.get("error").is_some() {
         return Err(result["message"].as_str().unwrap_or("Unknown error").to_string());
     }

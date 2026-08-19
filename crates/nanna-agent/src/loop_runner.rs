@@ -7604,9 +7604,14 @@ impl Agent {
                         memories.extend(filter_extracted_memories(parsed));
                     }
                     None => {
+                        // This branch is reached precisely when the model wrote prose
+                        // instead of JSON, so the preview is arbitrary model-written
+                        // text: `.min(200)` clamps the length but not the boundary, and
+                        // a raw slice there panics on the first em-dash the model emits.
+                        let end = truncate_boundary(json_str, 200);
                         warn!(
                             "Memory extraction JSON parse failed after healing — raw response: {}",
-                            &json_str[..json_str.len().min(200)]
+                            &json_str[..end]
                         );
                     }
                 }
@@ -9085,6 +9090,48 @@ mod preview_snippet_tests {
             let cut = preview_snippet(&text, max);
             let kept = cut.strip_suffix("...").unwrap_or(&cut);
             assert!(text.starts_with(kept));
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncate_boundary_tests {
+    use super::truncate_boundary;
+
+    #[test]
+    fn text_shorter_than_the_bound_is_kept_whole() {
+        assert_eq!(truncate_boundary("hello", 200), 5);
+        // Exactly at the bound is not "over" — there is nothing to walk back over.
+        let exact = "x".repeat(200);
+        assert_eq!(truncate_boundary(&exact, 200), 200);
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_cut_does_not_panic() {
+        // The production crash shape: a preview of model-written text cut at a
+        // fixed 200 bytes, where byte 200 lands inside an em-dash (199..202).
+        // `.min(200)` clamped the LENGTH but not the boundary, so the raw slice
+        // panicked — and because this runs on the daemon's path, it killed the
+        // whole process rather than just the turn.
+        let raw = format!("{}—and the rest of the model's prose", "a".repeat(199));
+        let end = truncate_boundary(&raw, 200);
+        assert_eq!(end, 199, "the cut walks back over the straddled char");
+        assert_eq!(
+            &raw[..end],
+            "a".repeat(199),
+            "the preview stays a valid prefix"
+        );
+    }
+
+    #[test]
+    fn every_cut_point_in_multibyte_dense_text_is_a_valid_boundary() {
+        // 4-byte emoji make every misaligned offset an invalid boundary, so
+        // sweeping the whole range covers the class instead of one instance.
+        let text = "🌀🧬🏁🔂".repeat(20);
+        for max in 0..text.len() + 2 {
+            let end = truncate_boundary(&text, max);
+            assert!(text.is_char_boundary(end), "cut at {max} must be a boundary");
+            assert!(end <= max.min(text.len()), "the cut never exceeds the bound");
         }
     }
 }

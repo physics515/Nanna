@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.8-beta.14",
+  "version": "0.3.9",
   "type": "module",
   "private": true,
   "scripts": {
@@ -19,11 +19,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "build:daemon": "node scripts/build-daemon.js",
-    "build:daemon:debug": "node scripts/build-daemon.js --debug",
-    "lint": "eslint . --max-warnings=0",
-    "lint:fix": "eslint . --fix",
-    "format": "prettier --check .",
-    "format:write": "prettier --write ."
+    "build:daemon:debug": "node scripts/build-daemon.js --debug"
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
@@ -62,13 +58,13 @@
     "vuedraggable": "^4.1.0"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.12.1",
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/test-utils": "^2.4.11",
-    "happy-dom": "^20.11.1",
+    "happy-dom": "^20.11.2",
     "postcss": "^8.5.26",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",

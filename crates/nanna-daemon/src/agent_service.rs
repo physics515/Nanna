@@ -163,7 +163,7 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
 /// Free function so the whole resolution chain — `[llm]` snapshot →
 /// [`AgentServiceConfig`] → the `AgentConfig` the agent loop actually
 /// summarizes with — is unit-testable without a live service.
-fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
+pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
     AgentConfig {
         model: config.model.clone(),
         max_tokens: config.max_tokens,
@@ -180,6 +180,34 @@ fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
         routing_first_turn_primary: config.routing_first_turn_primary,
         ..Default::default()
     }
+}
+
+/// Point one chat turn's [`AgentConfig`] at the model that chat picked.
+///
+/// Precedence, in full: a session's own pick outranks the global `[llm]`
+/// default; with no pick, nothing here runs and the turn behaves exactly as it
+/// did before per-chat models existed.
+///
+/// Clearing `model_routing` is load-bearing, not tidiness. `route_model`
+/// re-picks a model on every iteration after the first whenever the tier table
+/// is non-empty, and a chat turn runs many iterations — leaving it populated
+/// would run the user's pinned chat on globally-configured models from step 2
+/// onward, silently.
+///
+/// Nothing else moves. `summarization_priority`, `summarization_ollama_url`,
+/// `sub_agent_model`, the provider keys and the whole iteration/nudge policy
+/// stay as [`agent_config_from`] produced them, because the pin names the CHAT
+/// model only. Embedding settings are not reachable from here at all — they
+/// live in `[embedding]` and nothing on the chat-turn path reads them.
+///
+/// Takes the per-turn clone by `&mut`, never the shared [`AgentServiceConfig`]:
+/// that struct is handed out live by [`AgentService::config_handle`] to the
+/// sub-agent spawner and the dream summarizer, so writing a per-chat pick into
+/// it would re-model every sub-agent, every summarization and every other
+/// session at once.
+pub fn apply_chat_model_override(config: &mut AgentConfig, model: impl Into<String>) {
+    config.model_routing.clear();
+    config.model = model.into();
 }
 
 /// Active chat request state
@@ -589,11 +617,44 @@ impl AgentService {
     
     /// Create agent config from service config (pub: the long-horizon
     /// step runner builds fresh per-step agents from the same config)
+    ///
+    /// Every call returns a fresh clone, which is what makes a per-turn model
+    /// pick safe: a caller may mutate the value it gets back (see
+    /// [`apply_chat_model_override`]) without touching the shared config any
+    /// other session, sub-agent or summarization reads from.
     pub async fn agent_config(&self) -> AgentConfig {
         let config = self.config.read().await;
         agent_config_from(&config)
     }
-    
+
+    /// Adopt a config handle created before this service existed.
+    ///
+    /// The daemon builds the sub-agent spawner and the script services BEFORE
+    /// the agent service, and each of those needs the same live config the
+    /// service will mutate on `config.set`. Sharing one lock is what makes
+    /// "the user changed the model" true for all of them at once; cloning the
+    /// config into each is what made it false (2026-08-15).
+    #[must_use]
+    pub fn with_shared_config(mut self, config: Arc<RwLock<AgentServiceConfig>>) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The live config itself, for the long-lived collaborators the daemon
+    /// builds once at boot but that must keep answering to `config.set`.
+    ///
+    /// Handing out the `Arc<RwLock<..>>` rather than a snapshot is the point:
+    /// a boot-time clone silently outlives every later config change, which is
+    /// exactly how the scheduled dream cycle, the sub-agent spawner and the
+    /// script summarizer each kept using the model the daemon started with
+    /// (2026-08-15). Holders read it when they act, not when they are built.
+    /// It is the config only — never the service — so no holder can form a
+    /// reference cycle back to [`AgentService`].
+    #[must_use]
+    pub fn config_handle(&self) -> Arc<RwLock<AgentServiceConfig>> {
+        Arc::clone(&self.config)
+    }
+
     /// Get or create the per-session queue for serializing chat processing
     async fn get_or_create_queue(&self, session_id: &str) -> Arc<SessionQueue> {
         // Fast path: read lock
@@ -2021,6 +2082,46 @@ mod tests {
     /// with — because the hot-reload path pushed only `model`/`model_priority`
     /// onto the running service. The pin has to survive the whole chain, not
     /// just the on-disk write.
+    /// The sibling half of the pin: the daemon builds the sub-agent spawner
+    /// and the script summarizer BEFORE this service exists, so each was
+    /// handed a clone of the boot config and kept answering with it forever.
+    /// Sharing one lock is what makes a later change reach them; this asserts
+    /// the handle really is shared, not copied.
+    #[tokio::test]
+    async fn collaborators_sharing_the_config_handle_see_a_later_change() {
+        let boot = AgentServiceConfig {
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            ..Default::default()
+        };
+        // What the daemon hands to the spawner / script summarizer at boot.
+        let shared = Arc::new(RwLock::new(boot));
+        let collaborator = Arc::clone(&shared);
+        assert_eq!(
+            collaborator.read().await.summarization_priority,
+            vec!["ollama/lfm2.5".to_string()]
+        );
+
+        // The service adopts the SAME lock, then the user repoints summarization.
+        {
+            let mut live = shared.write().await;
+            apply_llm_settings(
+                &mut live,
+                &nanna_config::LlmConfig {
+                    summarization_priority: vec!["ollama/ornith:9b".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The collaborator resolves at USE time, so it sees the new list.
+        let resolved = agent_config_from(&*collaborator.read().await);
+        assert_eq!(
+            resolved.summarization_priority,
+            vec!["ollama/ornith:9b".to_string()],
+            "a collaborator holding the shared handle must summarize on the              model the user set, not the one the daemon booted with"
+        );
+    }
+
     #[test]
     fn a_changed_summarization_priority_reaches_the_next_agent_config() {
         let mut cfg = AgentServiceConfig {
@@ -2111,6 +2212,155 @@ mod tests {
         assert_eq!(cfg.nudge_after_iterations, 7);
         assert_eq!(cfg.nudge_interval_iterations, 3);
         assert_eq!(cfg.max_iterations, Some(9));
+    }
+
+    /// A chat's own model pick governs THAT chat's turn and nothing else.
+    /// The failure this guards is the mirror image of the one
+    /// `with_shared_config` exists to fix: the sub-agent spawner and the dream
+    /// summarizer read the shared [`AgentServiceConfig`] live, so a pin written
+    /// into shared state would re-model every sub-agent, every summarization
+    /// and every other session at once.
+    #[test]
+    fn a_chats_model_pick_governs_only_that_chats_turn() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            model_priority: vec!["claude-sonnet-4".to_string()],
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            summarization_ollama_url: Some("http://127.0.0.1:11434".to_string()),
+            sub_agent_models: vec!["ollama/qwen3:4b".to_string()],
+            model_routing: vec!["cheap:simple".to_string()],
+            ..Default::default()
+        };
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "ollama/qwen3:14b");
+
+        // The chat runs on the pin.
+        assert_eq!(turn.model, "ollama/qwen3:14b");
+        // Summarization stays global — the pin names the CHAT model only.
+        assert_eq!(turn.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
+        assert_eq!(
+            turn.summarization_ollama_url.as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(turn.sub_agent_model, None, "sub-agents are not re-pointed by a chat pin");
+
+        // The shared config every other consumer reads is untouched, so the
+        // next sub-agent still gets the global chain and the next
+        // summarization the global summarizer.
+        assert_eq!(cfg.model, "claude-sonnet-4");
+        assert_eq!(cfg.model_priority, vec!["claude-sonnet-4".to_string()]);
+        assert_eq!(cfg.sub_agent_models, vec!["ollama/qwen3:4b".to_string()]);
+        assert_eq!(cfg.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
+        assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
+
+        // And a second chat built from the same config never sees the first
+        // chat's pin.
+        assert_eq!(agent_config_from(&cfg).model, "claude-sonnet-4");
+    }
+
+    /// Embedding models are not reachable from the chat-turn path at all: they
+    /// live in `[embedding]` and are resolved by the embedding router, and no
+    /// field of [`AgentServiceConfig`] or `AgentConfig` names one. This asserts
+    /// the field set a pin can even touch, so "helpfully" widening it later
+    /// fails here first.
+    #[test]
+    fn a_chat_model_pick_moves_exactly_two_fields() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 4242,
+            temperature: 0.13,
+            max_iterations: Some(9),
+            nudge_after_iterations: 7,
+            nudge_interval_iterations: 3,
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            openrouter_api_key: Some("or-key".to_string()),
+            openai_api_key: Some("oa-key".to_string()),
+            routing_first_turn_primary: false,
+            ..Default::default()
+        };
+        let before = agent_config_from(&cfg);
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "ollama/qwen3:14b");
+
+        assert_eq!(turn.max_tokens, before.max_tokens);
+        assert!((turn.temperature - before.temperature).abs() < f32::EPSILON);
+        assert_eq!(turn.max_iterations, before.max_iterations);
+        assert_eq!(turn.nudge_after_iterations, before.nudge_after_iterations);
+        assert_eq!(turn.nudge_interval_iterations, before.nudge_interval_iterations);
+        assert_eq!(turn.thinking_mode, before.thinking_mode);
+        assert_eq!(turn.summarization_priority, before.summarization_priority);
+        assert_eq!(turn.summarization_ollama_url, before.summarization_ollama_url);
+        assert_eq!(turn.openrouter_api_key, before.openrouter_api_key);
+        assert_eq!(turn.openai_api_key, before.openai_api_key);
+        assert_eq!(turn.context_result_threshold, before.context_result_threshold);
+        assert_eq!(turn.distillation_interval, before.distillation_interval);
+        assert_eq!(turn.routing_first_turn_primary, before.routing_first_turn_primary);
+        assert_eq!(turn.sub_agent_model, before.sub_agent_model);
+    }
+
+    /// `route_model` re-picks a model on every iteration after the first
+    /// whenever the tier table is populated, and a chat turn runs many
+    /// iterations. Leaving it in place would run the user's pinned chat on
+    /// globally-configured models from step 2 onward with nothing saying so —
+    /// so clearing it is part of honouring the pin, not tidiness.
+    #[test]
+    fn a_pin_clears_the_tier_table_but_an_unpinned_chat_keeps_it() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            model_routing: vec![
+                "claude-haiku-3-5:simple".to_string(),
+                "claude-sonnet-4:complex".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        // Unset override: the helper never runs, so the turn is byte-for-byte
+        // what the global default has always produced — tier table and all.
+        let unpinned = agent_config_from(&cfg);
+        assert_eq!(unpinned.model, "claude-sonnet-4");
+        assert_eq!(unpinned.model_routing.len(), 2);
+        assert_eq!(unpinned.model_routing[0].model, "claude-haiku-3-5");
+
+        let mut pinned = agent_config_from(&cfg);
+        apply_chat_model_override(&mut pinned, "ollama/qwen3:14b");
+        assert!(
+            pinned.model_routing.is_empty(),
+            "a pinned chat must not be re-routed off its model at iteration 2"
+        );
+    }
+
+    /// A pin naming a model no provider serves has to die loudly, naming the
+    /// model — never fall back to the global default. The helper's job in that
+    /// story is to leave `model` holding the USER'S spec, so the serve check
+    /// runs against what was actually asked for and the refusal can say so.
+    /// (Silently swapping in the global model is the bare-model-name
+    /// silent-cancel class this project has already been bitten by.)
+    #[test]
+    fn a_pin_no_provider_serves_stays_nameable_instead_of_reverting() {
+        // Only Anthropic is authenticated on this daemon.
+        let router = LlmRouter::new().with_anthropic("test-key");
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            ..Default::default()
+        };
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "openrouter/qwen/qwen3-14b");
+
+        assert_eq!(
+            turn.model, "openrouter/qwen/qwen3-14b",
+            "the turn still carries the pin, so the refusal can name it"
+        );
+        assert!(
+            router.client_for_model(&turn.model).is_none(),
+            "no provider serves the pin — the turn must refuse, not proceed"
+        );
+        // The global default WOULD have run. Quietly using it instead is the
+        // failure mode: the user would watch a chat they pinned answer on
+        // another model.
+        assert!(router.client_for_model(&cfg.model).is_some());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "nanna"
-version = "0.3.8-beta.14"
+version = "0.3.9"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
 repository = "https://github.com/physics515/Nanna"
@@ -62,7 +62,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.8-beta.14"
+version = "0.3.9"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -143,6 +143,3 @@ opt-level = 3
 
 [profile.release.build-override]
 opt-level = 3
-
-[dev-dependencies]
-# tarpaulin removed until CI is stable
