@@ -141,6 +141,14 @@ const MIN_OUTPUT_RESERVE_TOKENS: usize = (nanna_memory::MEMORY_CHUNK_MAX_CHARS *
 /// Callers feed the result through
 /// [`nanna_llm::ModelInfo::effective_output_budget`], which additionally caps
 /// at the provider's `max_output_tokens` and half the window.
+/// The characters-per-token ratio this codebase estimates with, used wherever a
+/// token budget has to be compared against a byte or character length.
+///
+/// Not a tuning knob — it is the same 4:1 the context estimator uses, named
+/// here so a budget expressed in tokens and a length expressed in characters
+/// are converted in one place instead of by a literal at each site.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
 fn window_scaled_output_reserve(window: usize, requested_max_tokens: usize) -> usize {
     // lo ≤ hi holds by construction: min(MIN, requested) ≤ requested. A
     // caller asking for less than the derived minimum gets what it asked for
@@ -6266,11 +6274,28 @@ impl Agent {
             };
 
             let output_target = response.output_target;
-            // Dynamic threshold: 0 = auto-scale based on max_tokens (proxy for model size)
-            // ~4 chars per token, use 2x max_tokens as threshold (generous for large models)
-            // Floor: 2000 chars, Cap: 32000 chars
+            // Auto (0) scales with the model's INPUT budget, which is what a
+            // tool result competes for.
+            //
+            // It used to scale with `max_tokens` — the requested OUTPUT budget
+            // — and `max_tokens` carries a hardcoded default that boot
+            // deliberately does not take from config, so the "dynamic"
+            // threshold was the constant 16,384 chars for every model. On a
+            // 1M-window model that is 0.4% of the window, and a whole-file read
+            // above it came back as 600 head chars and 400 tail chars.
+            //
+            // `hard_limit` is the live enforced input bound, so this also
+            // rebinds when the window is demoted on a GPU fault — the old
+            // value never moved.
+            //
+            // The fraction is the one already in the tree: the output reserve
+            // takes a quarter of the window (`window_scaled_output_reserve`),
+            // and one tool result should not claim more of the input than that.
+            // A quarter of N tokens is N chars at the ~4 chars/token this
+            // codebase estimates with.
             let threshold = if self.config.context_result_threshold == 0 {
-                (self.config.max_tokens as usize * 2).clamp(2000, 32000)
+                let input_budget_tokens = { self.context.read().await.hard_limit };
+                (input_budget_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
             } else {
                 self.config.context_result_threshold
             };
@@ -6475,6 +6500,18 @@ impl Agent {
                     } else if options.on_memory.is_some() && result_content.len() > threshold {
                         let chunk_count =
                             (result_content.len() / nanna_memory::MEMORY_CHUNK_MAX_CHARS).max(1);
+                        // Say that a result was stubbed and against what bound.
+                        // The Context arm logs its compression; this arm logged
+                        // nothing at all, which is why a threshold frozen at a
+                        // constant for every model went unmeasured for months.
+                        info!(
+                            tool = name,
+                            original_len = result_content.len(),
+                            threshold,
+                            "🗃️ Stubbed tool output to a memory handle ({} chars > {} threshold)",
+                            result_content.len(),
+                            threshold
+                        );
                         let digest = extractive_summary(&result_content);
                         // The stub is a HANDLE, not a hint. It names the id
                         // that `recall` resolves, so retrieval is addressed

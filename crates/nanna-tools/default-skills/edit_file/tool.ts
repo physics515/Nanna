@@ -54,6 +54,39 @@ export default {
         return 0;
       }
     }
+    // read_file's ONLY output format is "<right-aligned line number><TAB><line>",
+    // and the miss message below tells the model to copy that text back as
+    // old_string — so the product points at text that can never match. Undo the
+    // format, but only on read_file's exact shape: EVERY non-empty line
+    // prefixed, numbers consecutive, all right-aligned to one common width.
+    // A bare per-line number+tab test is unsafe because tab-separated data
+    // files start that way, and stripping their first column would silently
+    // edit the wrong text.
+    function stripLineNumberBlock(text) {
+      var lines = text.split("\r\n").join("\n").split("\n");
+      var width = -1;
+      var prev = -1;
+      var out = [];
+      var seen = 0;
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i] === "") { out.push(""); continue; }
+        var tab = lines[i].indexOf("\t");
+        if (tab < 1) return null;
+        var numField = lines[i].substring(0, tab);
+        if (!/^ *\d+$/.test(numField)) return null;
+        if (width === -1) width = numField.length;
+        else if (numField.length !== width) return null;
+        var n = parseInt(numField, 10);
+        if (prev !== -1 && n !== prev + 1) return null;
+        prev = n;
+        seen++;
+        out.push(lines[i].substring(tab + 1));
+      }
+      // One numbered line is a coincidence; a block is a paste.
+      if (seen < 2) return null;
+      return out.join("\n");
+    }
+
     function failEscalating(pathKey, normal, blunt) {
       var n = refusalBump("fork:" + pathKey);
       glog("edit_file guard refused (fork, attempt " + n + "): " + pathKey);
@@ -242,10 +275,29 @@ export default {
             // The anchor's definition set rebases WITH its size (P23): the
             // structural shrink hold in write_file measures removals against
             // it, and a set left over from an older good version would name
-            // definitions this edit legitimately removed. Always replaced,
-            // never carried past a rebase.
+            // definitions this edit legitimately removed.
+            //
+            // But it must not rebase DOWNWARD on a shrinking set. A parsing
+            // edit that drops names used to overwrite the anchor with the
+            // smaller set, erasing the very evidence the write-side hold is
+            // built on — so an edit could delete definitions and then a later
+            // whole-file rewrite measured itself against the already-reduced
+            // anchor and passed. Names the anchor still holds are kept; new
+            // ones are added.
             if (Array.isArray(goodSyms)) {
-              next.goodSyms = goodSyms;
+              var priorSyms = Array.isArray(next.goodSyms) ? next.goodSyms : [];
+              var merged = goodSyms.slice();
+              var lost = [];
+              for (var gi = 0; gi < priorSyms.length; gi++) {
+                if (goodSyms.indexOf(priorSyms[gi]) === -1) {
+                  merged.push(priorSyms[gi]);
+                  lost.push(priorSyms[gi]);
+                }
+              }
+              if (lost.length > 0) {
+                glog("edit_file anchor: keeping " + lost.length + " definition(s) the edit removed in the shrink anchor for " + path + ": [" + lost.join(",") + "]");
+              }
+              next.goodSyms = merged;
             } else {
               delete next.goodSyms;
             }
@@ -824,10 +876,56 @@ export default {
       } else if (spans.length > 1) {
         return fail("edit_file failed: " + spans.length + " places in " + filePath + " match old_string once indentation differences are ignored. The file is UNCHANGED. Include 1-2 more surrounding lines in old_string to make it unique.");
       } else {
-        var head = oldStr.split("\r\n").join("\n").split("\n").slice(0, 3).join("\n");
-        if (head.length > 120) head = head.substring(0, 120) + "...";
-        var near = closestSnippet(content, oldStr);
-        return fail("edit_file failed: old_string not found in " + filePath + " — the file's real content differs from your memory. The file is UNCHANGED and intact. You searched for:\n" + head + (near === "" ? "" : "\nClosest ACTUAL text in the file:\n" + near) + "\nCall read_file, copy the exact current text, then retry edit_file.");
+        // Before giving up: the model may have pasted read_file's own output
+        // back. That is not a mistake it can see — read_file has no unnumbered
+        // format — so the product has to undo its own formatting. Tried only
+        // AFTER the ordinary and loose matches have failed, so a genuine
+        // tab-separated file is never reinterpreted.
+        var unnumbered = stripLineNumberBlock(oldStr);
+        if (unnumbered !== null && unnumbered !== oldStr && content.indexOf(unnumbered) !== -1) {
+          var occurrences = content.split(unnumbered).length - 1;
+          if (occurrences === 1) {
+            glog("edit_file: matched after stripping read_file line numbers from old_string: " + filePath);
+            updated = content.split(unnumbered).join(newStr);
+            replaced = 1;
+          }
+        }
+        if (replaced === 0) {
+          var head = oldStr.split("\r\n").join("\n").split("\n").slice(0, 3).join("\n");
+          if (head.length > 120) head = head.substring(0, 120) + "...";
+
+          // Hand back the file, not a guess about it. The tool is already
+          // holding the content; a 240-char "closest text" hint costs the
+          // model another read_file round-trip and points at the wrong
+          // occurrence when several lines score alike. ECHO_MAX is
+          // write_file's existing derived bound for exactly this — a small
+          // local model's whole window — and read_file's 10 MB cap is a
+          // filesystem sanity limit, not a context budget.
+          var ECHO_MAX_MISS = 65536;
+          var echo;
+          if (content.length <= ECHO_MAX_MISS) {
+            echo = "\nHere is what is ACTUALLY in the file now:\n" + content;
+          } else {
+            var near = closestSnippet(content, oldStr);
+            echo = "\nThe file is " + content.length + " bytes, too large to echo here." +
+              (near === "" ? "" : "\nClosest ACTUAL text in the file:\n" + near);
+          }
+
+          // Say only what was measured. The old text asserted a CAUSE — "the
+          // file's real content differs from your memory" — that nothing had
+          // checked, and never named the path it actually resolved.
+          return failEscalating(
+            "miss:" + filePath,
+            "edit_file failed: your old_string does not appear in the " + content.length +
+              " bytes currently at " + filePath + ". The file is UNCHANGED and intact. You searched for:\n" +
+              head + echo +
+              "\nCopy the exact text above into old_string — keep the edit targeted, do not rewrite the file.",
+            "edit_file failed AGAIN on " + filePath + ": old_string still does not appear in the " +
+              content.length + " bytes on disk. Repeating the same search will not start matching. " +
+              "The text above IS the file — copy a distinctive line from it verbatim, or edit a " +
+              "different part of the file."
+          );
+        }
       }
     }
 
@@ -970,6 +1068,37 @@ export default {
     }
     hiwaterRecord(filePath, updated.length, content.length, verdict, editGoodSyms);
 
+    // A surgical edit that quietly deletes a top-level definition is the shape
+    // that destroys work, and until now only the whole-file path said anything
+    // about it — edit_file computed the definition set purely for write_file's
+    // guard to measure against, and never looked at it itself.
+    //
+    // Informational, not a hold: it costs no extra round-trip, it works on
+    // every file class the regex can see, and a refusal here has a bounce cost
+    // the evidence does not yet justify (models answer write-side holds by
+    // escalating to MORE rewriting, not less).
+    var removalNote = "";
+    try {
+      var beforeSyms = symbolNames(content);
+      var afterSyms = symbolNames(updated);
+      if (beforeSyms.length > 0) {
+        var goneNames = [];
+        for (var bi = 0; bi < beforeSyms.length; bi++) {
+          if (afterSyms.indexOf(beforeSyms[bi]) === -1) goneNames.push(beforeSyms[bi]);
+        }
+        if (goneNames.length > 0) {
+          removalNote = " NOTE: this edit removed " + goneNames.length + " top-level definition(s): [" +
+            goneNames.slice(0, 8).join(", ") + (goneNames.length > 8 ? ", …" : "") +
+            "]. The write SUCCEEDED and is on disk. If that was deliberate, nothing to do; if not, " +
+            "restore them with another targeted edit rather than rewriting the file.";
+          glog("edit_file removal-note for " + filePath + ": removed=[" + goneNames.join(",") + "] kept=" + afterSyms.length);
+        }
+      }
+    } catch (eRemoval) {
+      // The regex cannot see this file class — no note, no failure.
+      removalNote = "";
+    }
+
     var structNote = structSentence(filePath, verdict, prevChk) +
       (input.force === true ? "" : escapedCommentNote(checkKind, updated));
     if (verdict && !verdict.ok) {
@@ -989,7 +1118,7 @@ export default {
     // absent, unrun or fail-open verdict leaves this off entirely, because a
     // false "broken" would suppress completion and drain the item's budget —
     // `sh -n` is documented to cry wolf on valid bash where /bin/sh is dash.
-    var result = { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote, success: true };
+    var result = { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote + removalNote, success: true };
     if (verdict) {
       result.data = { structure: { parses: verdict.ok === true, tool: verdict.tool, detail: verdict.detail } };
     }
