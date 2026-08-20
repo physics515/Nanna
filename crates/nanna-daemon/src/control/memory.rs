@@ -54,13 +54,16 @@ impl ControlPlane {
             }
             MemoryAction::Search { query, limit, scope } => {
                 // Use scoped recall: None = all, Some("global") = global only, Some(ws_id) = global + workspace
-                let result = match &scope {
-                    Some(ws_id) if ws_id != "global" => memory.recall_scoped(&query, Some(ws_id.as_str())).await,
-                    Some(_) => memory.recall_scoped(&query, None).await, // "global" or None → all
-                    None => memory.recall(&query).await,
+                let scope_filter = match &scope {
+                    Some(ws_id) if ws_id != "global" => Some(ws_id.as_str()),
+                    // "global" or None → all
+                    _ => None,
                 };
+                let result = memory
+                    .recall_scoped_with_coverage(&query, scope_filter)
+                    .await;
                 match result {
-                    Ok(results) => {
+                    Ok((results, coverage)) => {
                         let memories: Vec<_> = results.into_iter()
                             .take(limit.unwrap_or(10))
                             .map(|r| json!({
@@ -70,7 +73,39 @@ impl ControlPlane {
                                 "weight": r.weight,
                             }))
                             .collect();
-                        json!({ "memories": memories, "query": query })
+                        // An empty answer from a scan that could not read the
+                        // whole store is NOT "nothing matched". Saying which of
+                        // the three states produced it is the difference
+                        // between a miss the caller can act on and a blackout
+                        // reported as a clean result.
+                        let note = if !memories.is_empty() {
+                            None
+                        } else if !coverage.query_width_matches {
+                            Some(format!(
+                                "No memories were searched: this query's embedding does not \
+                                 match the store's current binding, so all {} memories are \
+                                 unreachable until the store is re-bound or backfilled.",
+                                coverage.total
+                            ))
+                        } else if coverage.unsearchable() > 0 {
+                            Some(format!(
+                                "Nothing matched among the {} of {} memories that could be \
+                                 searched; the other {} are awaiting re-embedding and were not \
+                                 consulted.",
+                                coverage.comparable,
+                                coverage.total,
+                                coverage.unsearchable()
+                            ))
+                        } else {
+                            None
+                        };
+                        json!({
+                            "memories": memories,
+                            "query": query,
+                            "searched": coverage.comparable,
+                            "total": coverage.total,
+                            "note": note,
+                        })
                     }
                     Err(e) => json!({ "error": "search_failed", "message": e.to_string() })
                 }

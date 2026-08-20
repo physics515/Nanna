@@ -663,6 +663,13 @@ async function loadSessions() {
     // header's picker reaches them the moment a pin changes. This reload is the
     // daemon's own answer for every chat at once, and re-seeding it here is
     // what keeps a pin set in another window from being outlived by ours.
+    //
+    // "The daemon's own answer" holds only for changes the daemon has already
+    // answered. This list was fetched at some instant, and a `set_session_model`
+    // still in flight is by definition not in it — seeding from it would put the
+    // superseded model back on screen and mark it KNOWN, so the row and the
+    // header would both assert a pin the user had just replaced. `seedChatModel`
+    // stands off for exactly those chats; their own request writes the truth.
     for (const session of sessions.value) seedChatModel(session.id, session.chat_model ?? null)
     if (sessions.value[0] && !currentSessionId.value) currentSessionId.value = sessions.value[0].id
   } catch (e) { console.error('Failed to load sessions:', e) }

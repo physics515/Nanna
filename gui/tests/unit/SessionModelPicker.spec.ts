@@ -1,6 +1,6 @@
 import { mount } from '@vue/test-utils'
 import SessionModelPicker from '~/components/SessionModelPicker.vue'
-import { getSessionStateMap } from '~/composables/useSessionState'
+import { getSessionStateMap, seedChatModel } from '~/composables/useSessionState'
 
 /**
  * The pin is per CHAT, so the two failures worth guarding are both about
@@ -168,6 +168,57 @@ describe('SessionModelPicker', () => {
 
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledTimes(1))
     expect(selectEl(wrapper).value).toBe('')
+  })
+
+  /**
+   * The mirror of the case above, and the half the ticket guard never covered:
+   * an ACCEPTED change is a fact about the daemon, so a refusal that arrives
+   * afterwards must not revert past it. The daemon applies requests in the
+   * order they were sent and a refusal changes nothing there, so what it holds
+   * after the burst is the newest request that succeeded — not whichever
+   * request happened to settle last.
+   */
+  it('keeps a pin the daemon accepted when a later change is refused', async () => {
+    const wrapper = await mountPicker('session-accepted')
+    let accept: () => void = () => {}
+    invoke.mockImplementationOnce(() => new Promise<void>((resolve) => { accept = () => resolve() }))
+    invoke.mockRejectedValueOnce(new Error('session_not_found'))
+
+    await wrapper.get('select').setValue('ollama/qwen3:14b')
+    await wrapper.get('select').setValue('claude-opus-4-5-20251101')
+    await vi.waitFor(() => expect(toastError).toHaveBeenCalledTimes(1))
+
+    accept()
+
+    await vi.waitFor(() => expect(selectEl(wrapper).value).toBe('ollama/qwen3:14b'))
+  })
+
+  /**
+   * A session LIST is the daemon's answer as of when it was fetched. The
+   * layout reloads it on workspace-tab changes and on `sessions-cleared`, and
+   * a reload that overlaps an unanswered pin change cannot carry that change —
+   * seeding from it put the superseded model back on screen AND marked it
+   * known, so both the row and the header asserted a pin the user had just
+   * replaced.
+   */
+  it('ignores a session list that predates an unanswered pin change', async () => {
+    const wrapper = await mountPicker('session-seed')
+    let accept: () => void = () => {}
+    invoke.mockImplementationOnce(() => new Promise<void>((resolve) => { accept = () => resolve() }))
+
+    await wrapper.get('select').setValue('ollama/qwen3:14b')
+    // The layout's `loadSessions()` lands mid-flight with the pre-change list.
+    seedChatModel('session-seed', null)
+    await wrapper.vm.$nextTick()
+
+    expect(selectEl(wrapper).value).toBe('ollama/qwen3:14b')
+
+    // Once the request is answered the list is fair game again.
+    accept()
+    await vi.waitFor(() => expect(selectEl(wrapper).value).toBe('ollama/qwen3:14b'))
+    seedChatModel('session-seed', 'claude-opus-4-5-20251101')
+    await wrapper.vm.$nextTick()
+    expect(selectEl(wrapper).value).toBe('claude-opus-4-5-20251101')
   })
 
   describe('a pin changed while a turn is running', () => {

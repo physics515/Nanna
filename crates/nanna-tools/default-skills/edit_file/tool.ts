@@ -881,6 +881,7 @@ export default {
         // format — so the product has to undo its own formatting. Tried only
         // AFTER the ordinary and loose matches have failed, so a genuine
         // tab-separated file is never reinterpreted.
+        var recovered = false;
         var unnumbered = stripLineNumberBlock(oldStr);
         if (unnumbered !== null && unnumbered !== oldStr && content.indexOf(unnumbered) !== -1) {
           var occurrences = content.split(unnumbered).length - 1;
@@ -888,28 +889,35 @@ export default {
             glog("edit_file: matched after stripping read_file line numbers from old_string: " + filePath);
             updated = content.split(unnumbered).join(newStr);
             replaced = 1;
+            recovered = true;
           }
         }
-        if (replaced === 0) {
+        // An explicit flag, not `replaced === 0`: `replaced` is declared
+        // without an initializer, so it is undefined on this path and the
+        // comparison silently fell through — leaving `updated` unset for the
+        // code below instead of returning the failure.
+        if (!recovered) {
           var head = oldStr.split("\r\n").join("\n").split("\n").slice(0, 3).join("\n");
           if (head.length > 120) head = head.substring(0, 120) + "...";
 
-          // Hand back the file, not a guess about it. The tool is already
-          // holding the content; a 240-char "closest text" hint costs the
-          // model another read_file round-trip and points at the wrong
-          // occurrence when several lines score alike. ECHO_MAX is
-          // write_file's existing derived bound for exactly this — a small
-          // local model's whole window — and read_file's 10 MB cap is a
-          // filesystem sanity limit, not a context budget.
-          var ECHO_MAX_MISS = 65536;
-          var echo;
-          if (content.length <= ECHO_MAX_MISS) {
-            echo = "\nHere is what is ACTUALLY in the file now:\n" + content;
-          } else {
-            var near = closestSnippet(content, oldStr);
-            echo = "\nThe file is " + content.length + " bytes, too large to echo here." +
-              (near === "" ? "" : "\nClosest ACTUAL text in the file:\n" + near);
-          }
+          // NO file echo here, deliberately.
+          //
+          // The review asked for the current content to be inlined on a miss,
+          // to save the model a read_file round-trip. Two standing invariants
+          // in this tool's own tests say otherwise: a failure message must
+          // stay small enough for a 32k-window model to absorb, and it must
+          // not dump file content at all. Both are tested and both predate
+          // this change, so the recommendation is declined rather than
+          // silently overturned — dumping a file into an error is the same
+          // "one result claims the whole window" harm the read-stub threshold
+          // exists to prevent.
+          //
+          // The valuable half of that finding is upstream anyway: the reason
+          // the model kept missing was that it was pasting read_file's own
+          // line-numbered output back, which is now stripped and retried
+          // before this point.
+          var near = closestSnippet(content, oldStr);
+          var echo = near === "" ? "" : "\nClosest ACTUAL text in the file:\n" + near;
 
           // Say only what was measured. The old text asserted a CAUSE — "the
           // file's real content differs from your memory" — that nothing had
@@ -919,10 +927,10 @@ export default {
             "edit_file failed: your old_string does not appear in the " + content.length +
               " bytes currently at " + filePath + ". The file is UNCHANGED and intact. You searched for:\n" +
               head + echo +
-              "\nCopy the exact text above into old_string — keep the edit targeted, do not rewrite the file.",
+              "\nCall read_file, copy a distinctive line from it verbatim into old_string, and keep the edit targeted — do not rewrite the file.",
             "edit_file failed AGAIN on " + filePath + ": old_string still does not appear in the " +
               content.length + " bytes on disk. Repeating the same search will not start matching. " +
-              "The text above IS the file — copy a distinctive line from it verbatim, or edit a " +
+              "Read the file with read_file and copy a distinctive line from it verbatim, or edit a " +
               "different part of the file."
           );
         }

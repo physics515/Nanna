@@ -597,13 +597,28 @@ impl ControlPlane {
                     None
                 }
                 Ok(prep) => {
-                    let super::chat::ChatTurnPrep {
+                    // THE one place a chat turn's model is decided, and the
+                    // only reader of the prep's pin — see [`resolve_turn`].
+                    // Resolved before the runner literals so both are built
+                    // from the same value: planning and stepping cannot end
+                    // up on different models, and the fail-fast further down
+                    // checks the model that will actually run.
+                    //
+                    // `agent_config()` hands back a fresh clone per call, and
+                    // that clone is the whole isolation mechanism — reshaping
+                    // it here reaches this turn and nothing else. The pin must
+                    // never be written into the shared `AgentServiceConfig`,
+                    // which the sub-agent spawner and the dream summarizer read
+                    // live.
+                    let ResolvedTurn {
+                        step_config,
+                        planner_config,
+                        pinned: is_pinned,
                         system_prompt,
                         conversation,
                         workspace_root,
                         workspace_context,
-                        chat_model,
-                    } = prep;
+                    } = resolve_turn(prep, agent.agent_config().await);
 
                     // The active workspace scopes stored memories, so a run's
                     // observations belong to the workspace they happened in.
@@ -615,24 +630,6 @@ impl ControlPlane {
                         None => None,
                     };
 
-                    // THE one place a chat turn's model is decided. Hoisted
-                    // above the runner literal so both runners below are built
-                    // from the same resolved value: the planner takes
-                    // `step_runner.agent_config.clone()`, so planning and
-                    // stepping cannot end up on different models, and the
-                    // fail-fast further down checks the model that will
-                    // actually run.
-                    //
-                    // `agent_config()` hands back a fresh clone per call, and
-                    // that clone is the whole isolation mechanism — mutating it
-                    // here reaches this turn and nothing else. The pin must
-                    // never be written into the shared `AgentServiceConfig`,
-                    // which the sub-agent spawner and the dream summarizer read
-                    // live.
-                    let is_pinned = chat_model.is_some();
-                    let agent_config =
-                        turn_agent_config(agent.agent_config().await, chat_model);
-
                     // SAY which model won, for the same reason the workspace
                     // resolution above says which workspace won: an override
                     // nobody can see is indistinguishable from a bug, and "the
@@ -640,7 +637,7 @@ impl ControlPlane {
                     // exactly the failure this wiring exists to end.
                     tracing::info!(
                         session_id = %session_id_owned,
-                        model = %agent_config.model,
+                        model = %step_config.model,
                         source = if is_pinned { "chat pin" } else { "global [llm] default" },
                         "chat turn model resolved"
                     );
@@ -656,7 +653,7 @@ impl ControlPlane {
                         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
                         router: router.clone(),
                         tools: tools.clone(),
-                        agent_config,
+                        agent_config: step_config,
                         system_prompt,
                         workspace_root: workspace_root.clone(),
                         workspace_context,
@@ -680,7 +677,7 @@ impl ControlPlane {
                         chat_sink: None,
                         router: step_runner.router.clone(),
                         tools: step_runner.tools.clone(),
-                        agent_config: step_runner.agent_config.clone(),
+                        agent_config: planner_config,
                         system_prompt: step_runner.system_prompt.clone(),
                         workspace_root: step_runner.workspace_root.clone(),
                         // The planner sees the same bounded reference: acting
@@ -991,6 +988,19 @@ impl ControlPlane {
                             report.items_already_satisfied += extra.items_already_satisfied;
                             report.items_abandoned += extra.items_abandoned;
                             report.interjected_items += admitted + extra.interjected_items;
+                            // Union by id, like the knowledge half below: a
+                            // drain segment's dropped work must survive to the
+                            // closing message, which NAMES abandonments rather
+                            // than counting them. The harness only ever
+                            // appends to this list — no sweep revives an item
+                            // that had no check — so a segment can add to it
+                            // and never correct it.
+                            for a in &extra.abandoned_unverifiable {
+                                report.abandoned_unverifiable.retain(|p| p.id != a.id);
+                            }
+                            report
+                                .abandoned_unverifiable
+                                .extend(extra.abandoned_unverifiable.clone());
                             for v in &extra.verified_outcomes {
                                 report.verified_outcomes.retain(|p| p.id != v.id);
                             }
@@ -1625,6 +1635,19 @@ impl ControlPlane {
                                 report.abandoned_unmet.retain(|p| p.id != u.id);
                             }
                             report.abandoned_unmet.extend(more.abandoned_unmet.clone());
+                            // Same union for the UNCHECKED half of the same
+                            // story — the majority of abandonments. It is
+                            // append-only in the harness (no sweep can revive
+                            // an item that had no check), so a later round can
+                            // only add to it, and dropping it here would leave
+                            // the closing message able to count round two's
+                            // dropped work but never name it.
+                            for a in &more.abandoned_unverifiable {
+                                report.abandoned_unverifiable.retain(|p| p.id != a.id);
+                            }
+                            report
+                                .abandoned_unverifiable
+                                .extend(more.abandoned_unverifiable.clone());
                             // Same union for the knowledge half: newest
                             // verdict per id wins, earlier rounds' facts
                             // persist so the planner context accumulates.
@@ -1750,9 +1773,18 @@ impl ControlPlane {
                         // stop, so the planner-starvation give-up — whose
                         // `report.stop` still reads `AllTasksDone` — used to
                         // surface nothing at all: the run simply stopped.
-                        if let Some(notice) =
-                            mission_end_notice(&report, &mission_end, last_probe.as_ref())
-                        {
+                        //
+                        // A CANCEL still says nothing about HOW it ended —
+                        // it was asked for — but it surfaces the failing
+                        // checks it walked away from, dated with the turn's
+                        // own age because nothing re-measured them at the
+                        // stop. That evidence is unrecoverable next turn.
+                        if let Some(notice) = mission_end_notice(
+                            &report,
+                            &mission_end,
+                            last_probe.as_ref(),
+                            live.snapshot().elapsed_s,
+                        ) {
                             final_sink.delta(&notice);
                         }
 
@@ -2007,6 +2039,57 @@ impl ControlPlane {
         });
 
         Ok(Some(message_id))
+    }
+}
+
+/// A prepared turn, resolved onto the model it will actually run on.
+///
+/// Both runner configs come out of one value on purpose: the planner and the
+/// step runner disagreeing about the model is invisible in the transcript and
+/// shows up only as a pinned chat that behaves like an unpinned one.
+struct ResolvedTurn {
+    /// The config the STEP runner is built from.
+    step_config: AgentConfig,
+    /// The planner's — the step config verbatim, by construction.
+    planner_config: AgentConfig,
+    /// Whether the chat's own pin won, for the "which model won" log line and
+    /// for the no-provider sentence, whose Settings wording is a lie for a
+    /// pinned chat.
+    pinned: bool,
+    system_prompt: String,
+    conversation: Option<String>,
+    workspace_root: Option<PathBuf>,
+    workspace_context: Option<String>,
+}
+
+/// Resolve a prep into the turn that will run it.
+///
+/// The prep is CONSUMED here, which makes this the only reader of
+/// [`super::chat::ChatTurnPrep`]'s `chat_model`: the turn body destructures
+/// this value, never the prep, so a pin can no longer be dropped by a
+/// destructure that forgets a field. That is precisely how the feature once
+/// shipped inert — the pin was stored, shown in the GUI and sent over IPC
+/// while every turn still ran on the global model — and it is the reason this
+/// step is a function rather than four lines inside the spawned turn: a test
+/// can reach a function, and nothing can reach the inside of that task.
+fn resolve_turn(prep: super::chat::ChatTurnPrep, base: AgentConfig) -> ResolvedTurn {
+    let super::chat::ChatTurnPrep {
+        system_prompt,
+        conversation,
+        workspace_root,
+        workspace_context,
+        chat_model,
+    } = prep;
+    let pinned = chat_model.is_some();
+    let step_config = turn_agent_config(base, chat_model);
+    ResolvedTurn {
+        planner_config: step_config.clone(),
+        step_config,
+        pinned,
+        system_prompt,
+        conversation,
+        workspace_root,
+        workspace_context,
     }
 }
 
@@ -2300,6 +2383,91 @@ async fn reopen_top_unmet(
 /// with the environment's own verdict.
 const UNMET_SHOWN_MAX: usize = 5;
 
+/// The unresolved evidence a stopped turn is still holding — the standing
+/// walls and the environment's own verdict on each — with no "stopping —"
+/// banner around it.
+///
+/// Split out of [`mission_end_notice`] because the CANCEL path needs exactly
+/// this and none of the banner. A cancel was asked for and must never be
+/// dressed up as a fault, so the sentence stays suppressed; but suppressing
+/// the sentence used to suppress the evidence with it, and that evidence is
+/// unrecoverable next turn — cancelled items are filtered out of every
+/// context path, and these verdicts live only on the in-memory report. The
+/// banner cannot simply be reused one branch higher: it is built around a
+/// `why` string the cancel arm has no honest way to produce.
+///
+/// `stale_for_secs` dates the verdicts on the endings that did NOT re-measure
+/// them. Every entry here was recorded by a drain sweep at some round's plan
+/// exhaustion; an ending that drained ran its sweep AT the stop, so its
+/// verdicts are current and carry no date. A cancel stops mid-plan with no
+/// sweep at all, so the newest verdict on the report is at most as old as the
+/// turn — which the liveness ledger already measures (`snapshot().elapsed_s`).
+fn unresolved_evidence(
+    report: &nanna_agent::harness::LongHorizonReport,
+    stale_for_secs: Option<u64>,
+) -> Option<String> {
+    if report.abandoned_unmet.is_empty() && report.abandoned_unverifiable.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    if !report.abandoned_unmet.is_empty() {
+        out.push_str("\n\n_Still unmet:_");
+        for item in report.abandoned_unmet.iter().take(UNMET_SHOWN_MAX) {
+            out.push_str(&format!("\n_· #{} {}: {}_", item.id, item.title, item.detail));
+        }
+        if report.abandoned_unmet.len() > UNMET_SHOWN_MAX {
+            out.push_str(&format!(
+                "\n_· …and {} more_",
+                report.abandoned_unmet.len() - UNMET_SHOWN_MAX
+            ));
+        }
+        // Only the CHECKED half is a measurement, so only it can go stale.
+        // The unchecked half below records what happened at the moment of
+        // abandonment, which no later minute changes.
+        if let Some(secs) = stale_for_secs {
+            let ago = if secs >= 60 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{secs}s")
+            };
+            out.push_str(&format!(
+                "\n_· last measured up to {ago} ago — the stop re-checked nothing._"
+            ));
+        }
+    }
+    // The other half of what a stopped turn walked away from: items with no
+    // done-condition to run at all. Disjoint from the list above by
+    // construction, and the MAJORITY of abandonments — these used to leave a
+    // count and no name, and in one observed session the item that vanished
+    // that way was the root goal itself.
+    if !report.abandoned_unverifiable.is_empty() {
+        out.push_str("\n\n_Dropped, with no check to run:_");
+        for item in report.abandoned_unverifiable.iter().take(UNMET_SHOWN_MAX) {
+            // With no check, the item's last step result is the only evidence
+            // that exists for why the harness stopped trying — clamped at the
+            // width this file already uses for a stored verdict (see
+            // `established_rows`), because it arrives at the harness's own
+            // step-result bound and this is a chat message, not a log.
+            let last = item
+                .last_result
+                .as_deref()
+                .map(|r| format!(" — last said: {}", clamp_display(r, 200)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n_· #{} {}: {}{}_",
+                item.id, item.title, item.reason, last
+            ));
+        }
+        if report.abandoned_unverifiable.len() > UNMET_SHOWN_MAX {
+            out.push_str(&format!(
+                "\n_· …and {} more_",
+                report.abandoned_unverifiable.len() - UNMET_SHOWN_MAX
+            ));
+        }
+    }
+    Some(out)
+}
+
 /// One sentence saying HOW a mission ended and on what evidence — the
 /// user-visible sibling of [`failure_notice`].
 ///
@@ -2310,15 +2478,22 @@ const UNMET_SHOWN_MAX: usize = 5;
 /// a run that stops and does not say why.
 ///
 /// Deliberately quiet for the two endings that need no sentence:
-/// - a CANCEL was asked for;
+/// - a CANCEL was asked for — but its unresolved evidence is still printed,
+///   bannerless, by [`unresolved_evidence`]: the sentence is what the cancel
+///   makes dishonest, not the failing checks it walked away from;
 /// - a mission that converged with nothing failing, nothing unknown and
 ///   nothing abandoned has an honest ending already (the run-stats line), and
 ///   a "stopping:" banner on every ordinary chat turn that happened to read a
 ///   file would be noise, not honesty.
+///
+/// `turn_elapsed_s` is the liveness ledger's own measure of how long this turn
+/// has been running, used only to date the cancel path's evidence — see
+/// [`unresolved_evidence`].
 fn mission_end_notice(
     report: &nanna_agent::harness::LongHorizonReport,
     end: &MissionEnd,
     probe: Option<&ProviderProbe>,
+    turn_elapsed_s: u64,
 ) -> Option<String> {
     let unresolved = !report.abandoned_unmet.is_empty()
         || report.acceptance_unknown > 0
@@ -2331,9 +2506,26 @@ fn mission_end_notice(
         return None;
     }
     let why = match end {
-        MissionEnd::SingleRun | MissionEnd::Cancelled => return None,
-        MissionEnd::DryRoundsExhausted => {
+        MissionEnd::SingleRun => return None,
+        // The evidence WITHOUT the sentence: see [`unresolved_evidence`].
+        MissionEnd::Cancelled => return unresolved_evidence(report, Some(turn_elapsed_s)),
+        MissionEnd::DryRoundsExhausted if !report.abandoned_unmet.is_empty() => {
             "re-planning found no new work, but the evidence below is still unmet".to_string()
+        }
+        MissionEnd::DryRoundsExhausted if !report.abandoned_unverifiable.is_empty() => {
+            "re-planning found no new work, and the work below was dropped with nothing to \
+             check it against"
+                .to_string()
+        }
+        MissionEnd::DryRoundsExhausted => {
+            // Same ending with no list to point at — the remaining way to end
+            // dry-but-unresolved is a check that never returned a verdict,
+            // which the count below names. Promising "the evidence below" and
+            // then printing nothing is the shape observed live: a dry ending
+            // that read "0 items verified done, 0 checks still failing" under
+            // a sentence that had just announced evidence.
+            "re-planning found no new work, and nothing it left behind proves the goal met"
+                .to_string()
         }
         MissionEnd::RoundsMaxExhausted => format!(
             "the mission ran its full budget of {CONTINUATION_ROUNDS_MAX} planning rounds"
@@ -2376,20 +2568,36 @@ fn mission_end_notice(
             if report.acceptance_unknown == 1 { "" } else { "s" },
         ));
     }
+    // The count is the LAST resort, and only when nothing below names the
+    // work: both abandonment lists together cover every abandonment this
+    // harness records, so this fires for a report that carries a count with
+    // no names — an older run's report, whose list fields default to empty on
+    // deserialize. Gated on both lists so it can never be read as a second
+    // count of items already named below.
+    if report.abandoned_unmet.is_empty()
+        && report.abandoned_unverifiable.is_empty()
+        && report.items_abandoned > 0
+    {
+        // Says only that they are not named HERE, never that they had no
+        // check. Both lists are populated exclusively inside the drain sweep,
+        // which runs on one stop reason — so a run that abandons a CHECKED
+        // item and then stops on repeated runner errors, wall clock, token
+        // budget or a source error arrives here with both lists empty and a
+        // check that simply never ran. Asserting "no check" there would be the
+        // same unverified claim this whole pass exists to remove.
+        out.push_str(&format!(
+            ", {} item{} abandoned, not named here",
+            report.items_abandoned,
+            if report.items_abandoned == 1 { "" } else { "s" },
+        ));
+    }
     // Verified work is on disk and stays there — say so, so a stopped
     // mission is never mistaken for a rolled-back one.
     out.push_str(". The work already verified stands — disk is truth._");
-    if !report.abandoned_unmet.is_empty() {
-        out.push_str("\n\n_Still unmet:_");
-        for item in report.abandoned_unmet.iter().take(UNMET_SHOWN_MAX) {
-            out.push_str(&format!("\n_· #{} {}: {}_", item.id, item.title, item.detail));
-        }
-        if report.abandoned_unmet.len() > UNMET_SHOWN_MAX {
-            out.push_str(&format!(
-                "\n_· …and {} more_",
-                report.abandoned_unmet.len() - UNMET_SHOWN_MAX
-            ));
-        }
+    // The endings that reach here drained their plan, so the sweep that
+    // produced these verdicts ran at the stop: current, and undated.
+    if let Some(evidence) = unresolved_evidence(report, None) {
+        out.push_str(&evidence);
     }
     Some(out)
 }
@@ -3226,10 +3434,17 @@ mod tests {
     /// the pin was stored, shown in the GUI and shipped over IPC while every
     /// turn still ran on the global model — the feature was inert. A prep
     /// carrying a pin must produce a turn config pointed at that model.
+    ///
+    /// Driven through [`resolve_turn`] — the step the turn body actually
+    /// performs — and not through `turn_agent_config` directly: a test that
+    /// applies the pin itself stays green when the turn stops applying it,
+    /// which is the whole failure being guarded against.
     #[test]
     fn a_prep_carrying_a_pin_produces_a_turn_on_the_pinned_model() {
-        let config = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
+        let resolved = resolve_turn(prep(Some("ollama/qwen3:14b")), global_default());
+        let config = resolved.step_config;
 
+        assert!(resolved.pinned, "the turn must know the pin won");
         assert_eq!(config.model, "ollama/qwen3:14b");
         // The loop re-picks a model every iteration after the first while the
         // tier table is populated, so a pin that left it in place would run
@@ -3254,22 +3469,26 @@ mod tests {
     #[test]
     fn a_prep_with_no_pin_is_the_global_default_untouched() {
         let before = format!("{:?}", global_default());
-        let after = format!("{:?}", turn_agent_config(global_default(), prep(None).chat_model));
+        let resolved = resolve_turn(prep(None), global_default());
+        let after = format!("{:?}", resolved.step_config);
 
+        assert!(!resolved.pinned);
         assert_eq!(after, before, "an unpinned chat must not be reshaped at all");
     }
 
-    /// The planner is built from `step_runner.agent_config.clone()`, so it
-    /// inherits the pin by construction. Asserted here because planning and
-    /// stepping disagreeing about the model is the failure that would make a
-    /// pinned chat plan on one model and work on another, invisibly.
+    /// Both runners come out of the same resolve, so the planner inherits the
+    /// pin by construction. Asserted on what [`resolve_turn`] hands back
+    /// rather than on a clone the test makes itself — planning and stepping
+    /// disagreeing about the model is the failure that would make a pinned
+    /// chat plan on one model and work on another, invisibly, and a test that
+    /// clones the config for them cannot see it.
     #[test]
     fn the_planner_inherits_the_pinned_model_from_the_step_runner() {
-        let step = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
-        let planner = step.clone();
+        let resolved = resolve_turn(prep(Some("ollama/qwen3:14b")), global_default());
 
-        assert_eq!(planner.model, step.model);
-        assert!(planner.model_routing.is_empty());
+        assert_eq!(resolved.planner_config.model, "ollama/qwen3:14b");
+        assert_eq!(resolved.planner_config.model, resolved.step_config.model);
+        assert!(resolved.planner_config.model_routing.is_empty());
     }
 
     #[test]
@@ -3331,6 +3550,7 @@ mod tests {
             items_completed_unverified: 0,
             items_revived: 0,
             abandoned_unmet: Vec::new(),
+            abandoned_unverifiable: Vec::new(),
             items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: abandoned,
@@ -3350,6 +3570,15 @@ mod tests {
             id,
             title: format!("feature {id}"),
             detail: detail.to_string(),
+        }
+    }
+
+    fn dropped(id: i64, reason: &str, last: Option<&str>) -> nanna_agent::harness::AbandonedUnverifiable {
+        nanna_agent::harness::AbandonedUnverifiable {
+            id,
+            title: format!("feature {id}"),
+            reason: reason.to_string(),
+            last_result: last.map(str::to_string),
         }
     }
 
@@ -3394,7 +3623,7 @@ mod tests {
             failure_notice(&r).is_none(),
             "this is exactly the ending the failure notice cannot see"
         );
-        let notice = mission_end_notice(&r, &MissionEnd::PlannerStarvation, None)
+        let notice = mission_end_notice(&r, &MissionEnd::PlannerStarvation, None, 0)
             .expect("a starved mission must say so");
         assert!(notice.contains("planning starved"), "{notice}");
         assert!(notice.contains("NOT verified complete"), "{notice}");
@@ -3411,18 +3640,106 @@ mod tests {
     #[test]
     fn a_clean_ending_stays_a_plain_reply() {
         let clean = report(StopReason::AllTasksDone, 2, 1, 0, None);
-        assert!(mission_end_notice(&clean, &MissionEnd::SingleRun, None).is_none());
-        assert!(mission_end_notice(&clean, &MissionEnd::DryRoundsExhausted, None).is_none());
-        // A cancel was asked for — never dressed up as a fault.
-        let mut cancelled = report(StopReason::Cancelled, 3, 0, 1, None);
-        cancelled.abandoned_unmet = vec![unmet(1, "exit 1")];
-        assert!(mission_end_notice(&cancelled, &MissionEnd::Cancelled, None).is_none());
+        assert!(mission_end_notice(&clean, &MissionEnd::SingleRun, None, 0).is_none());
+        assert!(mission_end_notice(&clean, &MissionEnd::DryRoundsExhausted, None, 0).is_none());
+        // A cancel was asked for — never dressed up as a fault, and a cancel
+        // with nothing unresolved to show says nothing at all.
+        let cancelled = report(StopReason::Cancelled, 3, 0, 1, None);
+        assert!(mission_end_notice(&cancelled, &MissionEnd::Cancelled, None, 0).is_none());
         // …but a dry ending that walked away from a failing check speaks up.
         let mut dry = report(StopReason::AllTasksDone, 5, 2, 1, None);
         dry.abandoned_unmet = vec![unmet(3, "`cargo test` exited 101")];
-        let notice = mission_end_notice(&dry, &MissionEnd::DryRoundsExhausted, None)
+        let notice = mission_end_notice(&dry, &MissionEnd::DryRoundsExhausted, None, 0)
             .expect("failing checks make an ending loud");
         assert!(notice.contains("still unmet") || notice.contains("still failing"), "{notice}");
+    }
+
+    /// A cancel suppresses the SENTENCE, not the evidence. The failing checks
+    /// a stopped turn walked away from live only on the in-memory report —
+    /// cancelled items are filtered out of every context path, so anything
+    /// not printed here is gone. It carries the turn's age, because a cancel
+    /// stops mid-plan and re-measures nothing.
+    #[test]
+    fn a_cancel_prints_its_unmet_evidence_without_a_banner() {
+        let mut cancelled = report(StopReason::Cancelled, 3, 0, 1, None);
+        cancelled.abandoned_unmet = vec![unmet(1, "`cargo test` exited 101")];
+        let notice = mission_end_notice(&cancelled, &MissionEnd::Cancelled, None, 4_500)
+            .expect("a cancel that walked away from a failing check must still show it");
+        assert!(
+            !notice.contains("stopping —"),
+            "a cancel was asked for and is never dressed up as a fault: {notice}"
+        );
+        assert!(notice.contains("#1 feature 1: `cargo test` exited 101"), "{notice}");
+        assert!(notice.contains("75m ago"), "a cancel's verdict is dated: {notice}");
+        assert!(notice.contains("re-checked nothing"), "{notice}");
+
+        // …and a cancel that only dropped unchecked work still names it: the
+        // record is what happened at the abandonment, so it is not dated.
+        let mut cancelled = report(StopReason::Cancelled, 3, 0, 1, None);
+        cancelled.abandoned_unverifiable = vec![dropped(6, "the user stopped the run", None)];
+        let notice = mission_end_notice(&cancelled, &MissionEnd::Cancelled, None, 4_500)
+            .expect("dropped work is named on a cancel too");
+        assert!(!notice.contains("stopping —"), "{notice}");
+        assert!(notice.contains("#6 feature 6: the user stopped the run"), "{notice}");
+        assert!(!notice.contains("ago"), "an abandonment record is not a measurement: {notice}");
+
+        // The endings that drained ran their sweep AT the stop, so their
+        // evidence is current and must NOT be dated.
+        let mut drained = report(StopReason::AllTasksDone, 9, 1, 1, None);
+        drained.abandoned_unmet = vec![unmet(1, "`cargo test` exited 101")];
+        let notice = mission_end_notice(&drained, &MissionEnd::PlannerStarvation, None, 4_500)
+            .expect("a starved mission announces itself");
+        assert!(!notice.contains("ago"), "a fresh sweep needs no date: {notice}");
+    }
+
+    /// The dry ending must never promise evidence it has none of. Observed
+    /// live: "re-planning found no new work, but the evidence below is still
+    /// unmet. 0 items verified done, 0 checks still failing" — rendered with
+    /// no list under it, because the work it walked away from carried no
+    /// machine-checkable done-condition at all.
+    #[test]
+    fn a_dry_ending_with_no_list_promises_none_and_names_what_it_dropped() {
+        // The majority path: abandoned work with no done-condition. It is
+        // NAMED, and the sentence points at the list that actually prints.
+        let mut unchecked = report(StopReason::AllTasksDone, 4, 0, 2, None);
+        unchecked.abandoned_unverifiable = vec![
+            dropped(11, "no progress after 3 steps", Some("still trying to open the file")),
+            dropped(12, "the run ended first", None),
+        ];
+        let notice = mission_end_notice(&unchecked, &MissionEnd::DryRoundsExhausted, None, 0)
+            .expect("work abandoned without a check still ends the turn unresolved");
+        assert!(
+            !notice.contains("evidence below"),
+            "there is no unmet check below — that promise is the defect: {notice}"
+        );
+        assert!(notice.contains("nothing to check it against"), "{notice}");
+        assert!(notice.contains("#11 feature 11: no progress after 3 steps"), "{notice}");
+        assert!(notice.contains("last said: still trying to open the file"), "{notice}");
+        assert!(notice.contains("#12 feature 12: the run ended first"), "{notice}");
+        assert!(!notice.contains("Still unmet"), "{notice}");
+        // Named, so never re-reported as a bare count.
+        assert!(!notice.contains("abandoned, not named here"), "{notice}");
+
+        // The bare-count fallback: a report that carries the count and no
+        // names at all (an older run's, whose list fields default empty).
+        let counted = report(StopReason::AllTasksDone, 4, 0, 2, None);
+        assert!(counted.abandoned_unmet.is_empty());
+        let notice = mission_end_notice(&counted, &MissionEnd::DryRoundsExhausted, None, 0)
+            .expect("a count with no names is still unresolved");
+        assert!(!notice.contains("evidence below"), "{notice}");
+        assert!(notice.contains("nothing it left behind proves the goal met"), "{notice}");
+        assert!(notice.contains("2 items abandoned, not named here"), "{notice}");
+        assert!(!notice.contains("Still unmet"), "{notice}");
+
+        // …and the dry ending that DOES have a list keeps its promise.
+        let mut listed = report(StopReason::AllTasksDone, 4, 0, 1, None);
+        listed.abandoned_unmet = vec![unmet(2, "`sh check.sh` exited 1")];
+        let notice = mission_end_notice(&listed, &MissionEnd::DryRoundsExhausted, None, 0)
+            .expect("a failing check makes the ending loud");
+        assert!(notice.contains("evidence below is still unmet"), "{notice}");
+        assert!(notice.contains("#2 feature 2: `sh check.sh` exited 1"), "{notice}");
+        // One count, not two: the listed item is not re-counted as unnamed.
+        assert!(!notice.contains("abandoned with no check"), "{notice}");
     }
 
     /// "The provider is unreachable" and "the run keeps failing" are different
@@ -3442,13 +3759,13 @@ mod tests {
             elapsed_secs: 120,
             error: Some("no answer".to_string()),
         };
-        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&down))
+        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&down), 0)
             .expect("an exhausted error budget announces itself");
         assert!(notice.contains("provider stopped answering"), "{notice}");
         assert!(notice.contains("ollama/qwen3.5:9b"), "{notice}");
 
         let up = ProviderProbe { answered: true, ..down.clone() };
-        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&up))
+        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&up), 0)
             .expect("still announces itself");
         assert!(notice.contains("while the provider was answering"), "{notice}");
     }
@@ -3466,7 +3783,7 @@ mod tests {
         );
         let end = giveup_end(&transient, None, MissionEnd::ErrorRoundsExhausted);
         assert!(matches!(end, MissionEnd::ParkedTransient(_)), "{end:?}");
-        let notice = mission_end_notice(&transient, &end, None).expect("a park announces itself");
+        let notice = mission_end_notice(&transient, &end, None, 0).expect("a park announces itself");
         assert!(notice.contains("PARKED, not abandoned"), "{notice}");
         assert!(notice.contains("resumes when that provider answers"), "{notice}");
 

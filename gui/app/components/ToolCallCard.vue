@@ -32,7 +32,7 @@
         <!-- Input -->
         <div class="tool-section">
           <div class="tool-section-label">📥 Input</div>
-          <pre class="tool-code">{{ formatJson(toolCall.input) }}</pre>
+          <pre class="tool-code">{{ formatJson(displayInput) }}</pre>
         </div>
         <!-- Output -->
         <div v-if="toolCall.output || status === 'started'" class="tool-section">
@@ -44,8 +44,10 @@
           <pre v-if="toolCall.output" class="tool-code" :class="{ 'tool-code--error': status === 'error' }">{{ truncateOutput(toolCall.output) }}</pre>
           <div v-else class="tool-code tool-code--waiting">Waiting for result...</div>
         </div>
-        <!-- Written content (for write_file) -->
-        <div v-if="writtenContent" class="tool-section">
+        <!-- Written content (for write_file). Only on a call that SUCCEEDED:
+             this pane's whole claim is that these bytes are on disk, and a
+             held or refused write did not put them there. -->
+        <div v-if="writtenContent && status === 'completed'" class="tool-section">
           <div class="tool-section-label">📝 Written Content</div>
           <pre class="tool-code tool-code--written">{{ writtenContent }}</pre>
         </div>
@@ -137,6 +139,44 @@ const inputSummary = computed(() => {
     return s.length > 60 ? '…' + s.slice(-55) : s
   }
   return ''
+})
+
+/**
+ * The write-content placeholder the daemon substitutes for a write call's
+ * bytes, in the two shapes that ASSERT the bytes landed: the one written
+ * today, and the one every record persisted before P24.19 carries
+ * ("…bytes were written successfully to disk"). Neither was gated on the
+ * outcome, so a card marked failed showed an Input claiming success beside an
+ * Output reading "WRITE HELD — nothing was written and nothing is lost".
+ *
+ * Anchored and whole-string: it may only ever match the placeholder itself,
+ * never a file whose real content happens to describe a write.
+ */
+const LANDED_WRITE_PLACEHOLDER =
+  /^\[content omitted from context — (\d+) bytes were written(?: successfully)? to disk\]$/
+
+/**
+ * The Input as it can honestly be shown. The daemon's own record is fixed at
+ * the source now, but records already on disk are permanent and this card is
+ * what re-reads them — so where the stored placeholder asserts a write that
+ * this card is simultaneously marking as not-completed, the assertion is
+ * replaced by the fact that survives (the byte count) plus a pointer to the
+ * Output, which is the authoritative record. Wording matches the daemon's own
+ * outcome-neutral placeholder so the two surfaces say the same thing.
+ */
+const displayInput = computed(() => {
+  const input = props.toolCall.input
+  if (props.status === 'completed') return input
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input
+  const content = (input as Record<string, unknown>).content
+  if (typeof content !== 'string') return input
+  const claim = LANDED_WRITE_PLACEHOLDER.exec(content)
+  if (!claim) return input
+  return {
+    ...input,
+    content: `[content omitted from context — ${claim[1]} bytes were sent to this tool; `
+      + 'the Output below is the authoritative record of what happened on disk]',
+  }
 })
 
 // Written content from write_file tool (available via data.written)

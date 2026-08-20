@@ -4,7 +4,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ChevronDown } from 'lucide-vue-next'
 import { modelDisplayName } from '~/lib/modelSpecs'
-import { useSessionState } from '~/composables/useSessionState'
+import {
+  beginChatModelChange,
+  endChatModelChange,
+  useSessionState,
+} from '~/composables/useSessionState'
 import { useToast } from '~/composables/useToast'
 
 const props = defineProps<{ sessionId: string }>()
@@ -81,22 +85,35 @@ const pillTitle = computed(() => {
 })
 
 /**
- * The change still out for a chat. `ticket` is the newest one, and only the
- * newest may write the pill: a slow refusal that revert-wrote unconditionally
- * would undo a NEWER pick that had already succeeded, leaving the header
- * naming a model the chat is not using. `revertTo` is what the daemon last
- * agreed to, captured before the first request went out — with a second pick
- * made while the first is still in flight, the value on screen is itself a
- * guess, and reverting to it would name a model no request ever landed.
+ * A burst of pin changes for one chat — every request the user set off before
+ * the previous ones were answered.
+ *
+ * The daemon is the authority on what this chat is pinned to, and its state is
+ * derivable: requests reach it in the order they were sent, a refusal changes
+ * nothing there, so after a burst the daemon holds the value of the
+ * HIGHEST-numbered request that succeeded, or the pre-burst pin if none did.
+ * `agreed`/`agreedTicket` track exactly that, and the pill lands on it once
+ * the burst is over. Deciding from the last request to SETTLE instead is what
+ * went wrong: a refusal is a non-event at the daemon, but it was allowed to
+ * revert the pill past a success that had already been accepted — the header
+ * then named a model the chat was demonstrably not using.
+ *
+ * `outstanding` is what says the burst is over; `newest` is what says whose
+ * refusal the user is owed a toast for (a pick they have already replaced is
+ * not news). `baseline` is the pin the running turn resolved with, so a burst
+ * that ends where it started leaves nothing waiting on that turn.
  *
  * Keyed by session because the picker outlives the chat it is showing: the
  * user can switch chats mid-request, and each chat's pin is its own.
  */
-interface PendingPin {
-  ticket: number
-  revertTo: string | null
+interface PinBurst {
+  newest: number
+  outstanding: number
+  agreed: string | null
+  agreedTicket: number
+  baseline: string | null
 }
-const pending = new Map<string, PendingPin>()
+const bursts = new Map<string, PinBurst>()
 let nextTicket = 0
 
 async function onSelect(event: Event) {
@@ -112,9 +129,25 @@ async function onSelect(event: Event) {
   const pin = state.chatModel
 
   const ticket = ++nextTicket
-  const outstanding = pending.get(target)
-  const revertTo = outstanding ? outstanding.revertTo : pin.value
-  pending.set(target, { ticket, revertTo })
+  const open = bursts.get(target)
+  if (open) {
+    open.newest = ticket
+    open.outstanding += 1
+  } else {
+    // Ticket 0 for the pre-burst value: any real request outranks it.
+    bursts.set(target, {
+      newest: ticket,
+      outstanding: 1,
+      agreed: pin.value,
+      agreedTicket: 0,
+      baseline: pin.value,
+    })
+  }
+
+  // While this is unanswered, a reloaded session list is older news than the
+  // click — see `seedChatModel`, which stands off rather than seeding the pin
+  // back to the model the daemon has not been asked about yet.
+  beginChatModelChange(target)
 
   // Optimistic: the pill answers the click, and the daemon's rejection is what
   // puts the old value back — a picker that waits for the round-trip reads as
@@ -123,20 +156,50 @@ async function onSelect(event: Event) {
   // A turn already running resolved its model before this pick existed, so the
   // pill has to admit the change lands on the next message instead.
   state.chatModelPendingNextTurn.value = state.hasActiveWork.value
+
+  let accepted = false
+  let refusal: unknown = null
   try {
     await invoke('set_session_model', { sessionId: target, model: next })
+    accepted = true
   } catch (e) {
-    // Superseded: a newer pick owns the pill now, and its own outcome is what
-    // gets to write there. Reverting on top of it is the clobber this guards.
-    if (pending.get(target)?.ticket !== ticket) return
-    pin.value = revertTo
-    // Back on the value the running turn resolved with, so nothing is waiting.
-    state.chatModelPendingNextTurn.value = false
-    toast.error('Could not change this chat\'s model', e instanceof Error ? e.message : String(e))
-  } finally {
-    // Only the newest request clears the slot; an older one settling later
-    // finds a ticket that is not its own and leaves the newer state alone.
-    if (pending.get(target)?.ticket === ticket) pending.delete(target)
+    refusal = e
+  }
+
+  const burst = bursts.get(target)
+  endChatModelChange(target)
+  // The burst can only be missing if something cleared the map underneath us;
+  // there is then no record to decide from, so leave the pill alone.
+  if (!burst) return
+
+  // An acceptance moves what the daemon agrees to — that is the half the old
+  // guard never recorded. Later requests outrank earlier ones because the
+  // daemon applied them in that order.
+  if (accepted && ticket > burst.agreedTicket) {
+    burst.agreed = next
+    burst.agreedTicket = ticket
+  }
+  // Only the user's latest intent is worth interrupting them about; a refusal
+  // of a pick they have already replaced is not news.
+  const worthTelling = !accepted && ticket === burst.newest
+
+  burst.outstanding -= 1
+  if (burst.outstanding === 0) {
+    bursts.delete(target)
+    // Nothing is guessed any more: the pill takes the daemon's own state.
+    // A burst that was fully accepted lands on what the user last picked, so
+    // this is a no-op there and a correction everywhere else.
+    pin.value = burst.agreed
+    // Ending where it started means the running turn's model is still this
+    // chat's model, so nothing is waiting on that turn.
+    if (burst.agreed === burst.baseline) state.chatModelPendingNextTurn.value = false
+  }
+
+  if (worthTelling) {
+    toast.error(
+      'Could not change this chat\'s model',
+      refusal instanceof Error ? refusal.message : String(refusal),
+    )
   }
 }
 

@@ -213,6 +213,33 @@ pub struct AbandonedUnmet {
     pub detail: String,
 }
 
+/// An item this run walked away from that NO machine check can speak for —
+/// it carried no acceptance condition, so neither sweep can ever revive it
+/// or refute it.
+///
+/// [`AbandonedUnmet`] is the checked half of the same story ("we gave up and
+/// the environment says it is still undone"); this is the unchecked half,
+/// and it is the majority: across the task store 81% of items ever abandoned
+/// carried no check at all. Without this list those abandonments left a
+/// COUNT and no name — the closing message could say "1 item abandoned" but
+/// never which one, and in one observed session the item that vanished that
+/// way was the root goal itself.
+///
+/// It carries the item's own last step result because that is the only
+/// evidence that exists: with no check, what the model last reported is the
+/// whole record of why the harness stopped trying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbandonedUnverifiable {
+    pub id: i64,
+    pub title: String,
+    /// The abandonment reason the harness recorded on the store.
+    pub reason: String,
+    /// The item's last step result at the moment it was abandoned (already
+    /// bounded by [`STEP_RESULT_TAIL_MAX_BYTES`] where it was captured).
+    /// None when the item was abandoned before any step of it produced one.
+    pub last_result: Option<String>,
+}
+
 /// An item this run closed on the environment's own evidence — the check
 /// passed, whether after a step or before any ran.
 ///
@@ -1394,6 +1421,16 @@ pub struct LongHorizonReport {
     /// the evidence existed and was discarded).
     #[serde(default)]
     pub abandoned_unmet: Vec<AbandonedUnmet>,
+    /// Every item this run abandoned that carried NO acceptance check, with
+    /// the reason and its last step result (see [`AbandonedUnverifiable`]).
+    ///
+    /// Disjoint from `abandoned_unmet` by construction: an abandoned item
+    /// either has a check — in which case a sweep decides whether it is
+    /// unmet or revivable — or it does not, and lands here. Together the two
+    /// lists name EVERY abandonment, which is what the closing message needs
+    /// to stop reporting walked-away work as a bare count.
+    #[serde(default)]
+    pub abandoned_unverifiable: Vec<AbandonedUnverifiable>,
     /// Every item this run closed on a PASSING check (post-step or
     /// pre-check), with the verdict that closed it. The knowledge half of the
     /// report: `abandoned_unmet` says where the goal is provably unmet, this
@@ -1685,11 +1722,52 @@ pub const ITEM_RUNNER_ERRORS_MAX: usize = 2;
 /// cannot proceed here and charge normally so abandonment still converges.
 pub const NARRATION_LADDER_STEPS: usize = 3;
 
+/// File EVERY abandonment on the list that can speak for it, so no item the
+/// harness walked away from survives only as a count.
+///
+/// The two lists are disjoint and exhaustive: an item with a check goes to
+/// the sweep set, where a later run of that check decides whether it is
+/// revivable or provably unmet; an item without one can never be re-judged,
+/// so its name, the reason, and its own last result ARE the record. Both
+/// abandonment sites call this — the earlier omission at the runner-error
+/// site is exactly how a checked item could be abandoned and then reach no
+/// sweep at all.
+fn record_abandonment(
+    step: &TaskStep,
+    reason: &str,
+    last_result: Option<String>,
+    sweep_set: &mut Vec<(i64, String, AcceptanceCheck)>,
+    unverifiable: &mut Vec<AbandonedUnverifiable>,
+) {
+    match &step.acceptance {
+        Some(check) => sweep_set.push((step.id, step.title.clone(), check.clone())),
+        None => unverifiable.push(AbandonedUnverifiable {
+            id: step.id,
+            title: step.title.clone(),
+            reason: reason.to_string(),
+            last_result,
+        }),
+    }
+}
+
 /// Per-item progress bookkeeping.
 #[derive(Debug, Default, Clone)]
 struct ItemProgress {
     steps_without_progress: usize,
     replans: usize,
+    /// Replan steps on this item that added no subtasks at all.
+    ///
+    /// Non-zero means the decomposition ask has already come back empty
+    /// here, so the harness stops asking it: the next stall rung on this
+    /// item escalates instead of repeating the identical question (see
+    /// [`stalled_escalation_text`]). Also what lets the abandonment reason
+    /// say the ask returned nothing rather than describing the outcome as
+    /// though a plan had been made.
+    dry_replans: usize,
+    /// Escalated next-action asks this item has taken (the rung that
+    /// replaces a repeated decomposition ask). Reporting only — it is what
+    /// lets the abandonment reason name the rung that actually ran.
+    escalated_asks: usize,
     tokens_spent: u64,
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
@@ -1793,6 +1871,10 @@ impl LongHorizonRunner {
         // Rebuilt at every drain sweep; the FINAL sweep's state ships on the
         // report — an item revived later must not linger as "unmet".
         let mut abandoned_unmet: Vec<AbandonedUnmet> = Vec::new();
+        // Append-only, and never rebuilt: an item with no check cannot be
+        // revived by any sweep, so what is recorded here at the moment of
+        // abandonment stays true for the rest of the run.
+        let mut abandoned_unverifiable: Vec<AbandonedUnverifiable> = Vec::new();
         // Each item may be reopened at most once per run — the bound that
         // makes BOTH sweeps (mid-run and drain) a fixpoint instead of a loop.
         let mut reopened_once: HashSet<i64> = HashSet::new();
@@ -2053,9 +2135,39 @@ impl LongHorizonRunner {
 
             if is_replan && item_replans >= cfg.max_replans_per_item {
                 // Grinding AND replanning failed — close the item and move on.
+                let (dry_replans, escalated_asks, last_result) = progress
+                    .get(&step.id)
+                    .map_or((0, 0, None), |item| {
+                        (
+                            item.dry_replans,
+                            item.escalated_asks,
+                            item.last_result.clone(),
+                        )
+                    });
                 let mut reason = format!(
                     "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
                 );
+                // Say what the replan rungs actually returned. The old
+                // sentence described the outcome as though decomposition had
+                // happened: 84 instrumented firings produced ZERO subtasks,
+                // and every one of the 42 items abandoned behind them read
+                // "…and 2 replans" as if two plans had been made.
+                if dry_replans > 0 {
+                    reason.push_str(&format!(
+                        "; the decomposition ask came back with no subtasks {dry_replans} \
+                         time(s)"
+                    ));
+                    if escalated_asks > 0 {
+                        // Provably true wherever this gate fires: an item
+                        // whose check ever passed would have completed and
+                        // left `progress`, so it cannot reach abandonment.
+                        reason.push_str(
+                            ", and the escalated next-action ask that followed never got it \
+                             past its done-condition — both attempts to unstick it returned \
+                             nothing",
+                        );
+                    }
+                }
                 if hang_timeouts > 0 {
                     reason.push_str(&format!(
                         "; its acceptance check hung {hang_timeouts} consecutive time(s) with \
@@ -2072,9 +2184,13 @@ impl LongHorizonRunner {
                     break StopReason::SourceError { message };
                 }
                 items_abandoned += 1;
-                if let Some(check) = &step.acceptance {
-                    abandoned_this_run.push((step.id, step.title.clone(), check.clone()));
-                }
+                record_abandonment(
+                    &step,
+                    &reason,
+                    last_result,
+                    &mut abandoned_this_run,
+                    &mut abandoned_unverifiable,
+                );
                 progress.remove(&step.id);
                 continue;
             }
@@ -2256,7 +2372,28 @@ impl LongHorizonRunner {
 
             let item = progress.entry(step.id).or_default();
 
-            let (prompt, step_kind) = if is_replan {
+            // ESCALATION, not a second identical ask. The decomposition rung
+            // already came back empty on this item, and re-asking the same
+            // question produced the same nothing: 84 instrumented firings,
+            // zero subtasks, split exactly half at the first attempt and half
+            // at the second. So the next rung changes the question — it puts
+            // the item's own last failing result in front of the model (the
+            // replan prompt is the only step prompt that never receives it)
+            // and asks for the single next concrete action instead of a plan.
+            //
+            // It runs as an EXECUTE step deliberately. The replan branch
+            // `continue`s ahead of every escalation the harness owns, so a
+            // zero-tool replan never rode the narration ladder and never got
+            // steered; and the abandonment gate fires one iteration later
+            // regardless, so a rung that could not replenish would be
+            // decorative. As an execute step it earns its budget back the
+            // ordinary way — a novel successful tool call or a check that
+            // flips resets the fruitless counter — while still spending one
+            // replan allowance below, so abandonment converges on exactly
+            // the schedule the decompose-only ladder had.
+            let escalate = is_replan && item.dry_replans > 0;
+
+            let (prompt, step_kind) = if is_replan && !escalate {
                 // A replan reached with the check currently hanging must aim
                 // the decomposition at the hang first — it is the standing
                 // reason no verdict can arrive.
@@ -2297,6 +2434,25 @@ impl LongHorizonRunner {
                     (None, Some(notice)) => Some(notice),
                     (prev, None) => prev.map(str::to_string),
                 };
+                // The escalation rides in the same band as the regression
+                // notice, and for the same reason: it is what the model must
+                // hear LAST, right after the result it is being asked to act
+                // on. Everything else about the prompt stays the ordinary
+                // execute prompt — the done-condition, the self-check line,
+                // the notes and the digest all still apply, because this rung
+                // is asking for work, not for a plan.
+                let last_result = if escalate {
+                    let escalation = stalled_escalation_text(
+                        item.steps_without_progress,
+                        item.consecutive_check_timeouts,
+                    );
+                    Some(match last_result {
+                        Some(prev) => format!("{prev}\n\n{escalation}"),
+                        None => escalation,
+                    })
+                } else {
+                    last_result
+                };
                 // The do-not-regress digest: verified state must reach the
                 // model that EDITS, not only the planner that plans.
                 let digest = verified_digest(&verified_outcomes);
@@ -2314,9 +2470,9 @@ impl LongHorizonRunner {
 
             // Open-children count BEFORE a replan runs, so "did this replan
             // actually decompose anything?" is answerable afterwards. Only
-            // taken for replan steps — an execute step has no such contract,
-            // and this is a store round-trip.
-            let subtasks_before = if is_replan {
+            // taken for replan steps — an execute step has no such contract
+            // (the escalated rung included), and this is a store round-trip.
+            let subtasks_before = if is_replan && !escalate {
                 source.open_subtasks(step.id).await.unwrap_or(None)
             } else {
                 None
@@ -2360,12 +2516,26 @@ impl LongHorizonRunner {
                     // death still trips the run-level breaker below, whose
                     // counter spans items.
                     if item.runner_errors >= ITEM_RUNNER_ERRORS_MAX {
+                        let last_result = item.last_result.clone();
                         let reason =
                             format!("abandoned after persistent runner errors: {message}");
                         if let Err(message) = source.abandon(step.id, &reason).await {
                             break StopReason::SourceError { message };
                         }
                         items_abandoned += 1;
+                        // This site used to record NOTHING — not even for a
+                        // checked item, which then never reached either sweep
+                        // and so could be neither revived nor named as unmet.
+                        // A poisoned prompt says nothing about the world: if
+                        // later work satisfies this item's condition the sweep
+                        // must still be able to find it.
+                        record_abandonment(
+                            &step,
+                            &reason,
+                            last_result,
+                            &mut abandoned_this_run,
+                            &mut abandoned_unverifiable,
+                        );
                         progress.remove(&step.id);
                         continue;
                     }
@@ -2392,7 +2562,33 @@ impl LongHorizonRunner {
                 item.narration_steps = 0;
             }
 
-            if is_replan {
+            if escalate {
+                // The escalated rung spends one replan allowance even though
+                // it ran as an execute step. Without that the item would
+                // escalate forever: `is_replan` is derived from the fruitless
+                // counter, which an unproductive escalated step does not
+                // reset, and only `replans` moves the abandonment gate. With
+                // it, the ladder is decompose → escalate → abandon on the
+                // default `max_replans_per_item: 2` — the same length it had
+                // when both rungs asked the same question.
+                item.replans += 1;
+                item.escalated_asks += 1;
+                replans += 1;
+                let _ = source
+                    .log(
+                        step.id,
+                        "replan_escalated",
+                        serde_json::json!({
+                            "replans": item.replans,
+                            "dry_replans": item.dry_replans,
+                            "asked": "next concrete action",
+                        }),
+                    )
+                    .await;
+                // Falls through: the verdict, the fruitless accounting and
+                // the narration ladder below all apply, which is the whole
+                // point of running this rung as a step.
+            } else if is_replan {
                 // The replan step adds subtasks through the store; the next
                 // next() will surface them. A replan that actually decomposed
                 // resets the grind counter so the new work gets a fresh
@@ -2419,10 +2615,15 @@ impl LongHorizonRunner {
                     item.last_result = None;
                     item.last_tool_calls.clear();
                 } else {
+                    // Recorded, not just logged: the next stall rung on this
+                    // item reads it and changes the question rather than
+                    // asking this one again.
+                    item.dry_replans += 1;
                     tracing::info!(
                         item = step.id,
                         replans = item.replans,
-                        "replan added no subtasks — not resetting the grind counter"
+                        "replan added no subtasks — not resetting the grind counter; the \
+                         next stall rung escalates instead of re-asking"
                     );
                 }
                 replans += 1;
@@ -3052,6 +3253,7 @@ impl LongHorizonRunner {
             items_revived,
             items_regressed_reopened,
             abandoned_unmet,
+            abandoned_unverifiable,
             verified_outcomes,
             acceptance_unknown,
             items_already_satisfied,
@@ -3224,6 +3426,43 @@ fn narration_steering_text(level: usize) -> String {
               command with exec and act on its output."
             .to_string(),
     }
+}
+
+/// The escalated stall rung, appended to the LAST RESULT block of an
+/// ordinary execute prompt after a decomposition ask returned nothing.
+///
+/// The decomposition ask is a fair first question — it has decomposed
+/// successfully on record, in about 2% of instrumented attempts — but asking
+/// it twice measured 84 firings and zero subtasks. So the second rung asks a
+/// different question, and the change is not just wording: this prompt shows
+/// the model the failing result it is stuck on, which the replan prompt (a
+/// stable prefix plus a one-line stall summary) never did.
+///
+/// Voiced as one concrete action rather than a plan because "smallest thing
+/// that changes the result" is answerable from the verdict above it, while
+/// "break this into 2-5 subtasks" asks the model to invent structure for
+/// work it has just proven it cannot start.
+fn stalled_escalation_text(fruitless_steps: usize, check_timeouts: usize) -> String {
+    let mut text = format!(
+        "STALLED — READ THIS BEFORE ACTING. {fruitless_steps} steps on this task have gone \
+         by without its done-condition flipping, and the plan-it-into-smaller-pieces step \
+         that followed produced no new tasks. You are not being asked to plan again.\n\
+         Take ONE concrete action this step, chosen from the result above: the smallest \
+         thing that would make that verdict come out differently. Name it in one sentence, \
+         do it with a tool, then re-run the check."
+    );
+    if check_timeouts > 0 {
+        text.push_str(&format!(
+            "\nThe check has also hung {check_timeouts} consecutive time(s) with no verdict, \
+             so the one action to take is finding what it blocks on — reproduce it under a \
+             short timeout first."
+        ));
+    }
+    text.push_str(
+        "\nIf the task truly cannot be advanced here, say exactly what blocks it and what \
+         you tried — that is a useful answer; another description of the plan is not.",
+    );
+    text
 }
 
 fn failed_acceptance_result(
@@ -5581,6 +5820,158 @@ mod tests {
         assert_eq!(report.steps_taken, 5, "unreported children ⇒ productive");
     }
 
+    /// REGRESSION (instrumented, 84 firings): the decomposition rung asked
+    /// the SAME question twice — 42 first attempts and 42 second attempts,
+    /// zero subtasks between them — and then abandoned every one of those
+    /// items with a sentence describing the outcome as though decomposition
+    /// had happened. After a dry attempt the harness must change the
+    /// question: one EXECUTE step carrying the item's own failing result,
+    /// which the replan prompt is the only step prompt never to receive.
+    #[tokio::test]
+    async fn a_dry_replan_escalates_instead_of_repeating_the_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, runner) = replan_fixture(0);
+        source
+            .push(step(
+                1,
+                "stubborn item",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        // The default replan allowance, where the second rung exists at all.
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 2,
+            ..LongHorizonConfig::default()
+        };
+
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.items_abandoned, 1, "{report:?}");
+        // 2 execute + 1 decomposition ask + 1 escalated ask, then
+        // abandonment: the ladder is exactly as long as before, one rung of
+        // it asks something different.
+        assert_eq!(report.steps_taken, 4, "{report:?}");
+        assert_eq!(
+            report.replans, 2,
+            "the escalated rung still spends one replan allowance, or the \
+             abandonment gate never converges: {report:?}"
+        );
+
+        let requests = runner.inner.requests.lock().await;
+        let plans: Vec<_> = requests
+            .iter()
+            .filter(|r| r.step_kind == StepKind::Plan)
+            .collect();
+        assert_eq!(plans.len(), 1, "the decomposition ask is never repeated");
+
+        let escalated = requests.last().expect("four steps ran");
+        assert_eq!(escalated.step_kind, StepKind::Execute);
+        assert!(
+            escalated.prompt.contains("STALLED — READ THIS BEFORE ACTING"),
+            "{}",
+            escalated.prompt
+        );
+        assert!(
+            !escalated.prompt.contains("== REPLAN REQUIRED =="),
+            "the escalated rung must not re-ask for a plan: {}",
+            escalated.prompt
+        );
+        assert!(
+            escalated.prompt.contains("Done-condition NOT met"),
+            "the escalated rung must show the failing result it is stuck on: {}",
+            escalated.prompt
+        );
+        drop(requests);
+
+        let reasons = source.abandon_reasons.lock().await;
+        let (_, reason) = reasons.first().expect("the item was abandoned");
+        assert!(
+            reason.contains("came back with no subtasks")
+                && reason.contains("escalated next-action ask"),
+            "the reason must say BOTH attempts came back empty: {reason}"
+        );
+    }
+
+    /// REGRESSION: an abandoned item reached the report by NAME only if it
+    /// carried a check, and 81% of everything the store has ever abandoned
+    /// carries none — so the majority path left a count and nothing to read.
+    /// In one observed session the item that vanished that way was the root
+    /// goal itself.
+    #[tokio::test]
+    async fn an_unchecked_abandonment_is_named_not_just_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, runner) = replan_fixture(0);
+        source.push(step(1, "answer the question", None)).await;
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.items_abandoned, 1, "{report:?}");
+        assert!(
+            report.abandoned_unmet.is_empty(),
+            "with no check nothing can be called provably unmet: {report:?}"
+        );
+        assert_eq!(report.abandoned_unverifiable.len(), 1, "{report:?}");
+        let walked_away = &report.abandoned_unverifiable[0];
+        assert_eq!(walked_away.id, 1);
+        assert_eq!(walked_away.title, "answer the question");
+        assert!(
+            walked_away.reason.contains("abandoned after"),
+            "{}",
+            walked_away.reason
+        );
+        // With no check, what the model last said IS the whole record.
+        assert_eq!(walked_away.last_result.as_deref(), Some("try 1"));
+    }
+
+    /// REGRESSION: the SECOND abandonment site recorded nothing at all — not
+    /// even for an item that carries a check — so a poisoned item could
+    /// never be revived by either sweep. A prompt the model chokes on says
+    /// nothing about the world, and the world is what the check reads.
+    #[tokio::test]
+    async fn a_poisoned_item_with_a_check_still_reaches_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        // The condition is already true — the artifact is there, only the
+        // model's prompt is broken.
+        std::fs::write(dir.path().join("done.txt"), b"there").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "poisoned but satisfied",
+                Some(AcceptanceCheck::FileExists {
+                    path: "done.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![
+            Err("empty completion".to_string()),
+            Err("empty completion".to_string()),
+        ]);
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
+        assert_eq!(
+            report.items_revived, 1,
+            "the drain sweep must be able to see a poisoned item: {report:?}"
+        );
+        assert_eq!(report.items_abandoned, 0, "{report:?}");
+        assert_eq!(report.items_completed, 1, "{report:?}");
+        assert!(
+            report.abandoned_unverifiable.is_empty(),
+            "it had a check, so the sweep speaks for it: {report:?}"
+        );
+    }
+
     #[tokio::test]
     async fn repeated_tool_signatures_accelerate_the_stall_counter() {
         let dir = tempfile::tempdir().unwrap();
@@ -6231,10 +6622,22 @@ TASK COMPLETE"))]);
         // kept replenishing under the silent check; the item only died when
         // the script ran dry (runner-error containment), not as fruitless.
         assert_eq!(report.steps_taken, 3, "{report:?}");
-        // 3 post-step timeouts; a runner-error abandonment carries no check
-        // to the drain sweep, so nothing re-runs there.
-        assert_eq!(report.acceptance_unknown, 3);
+        // 3 post-step timeouts plus one at the drain sweep. A runner-error
+        // abandonment used to carry NO check onward, so the environment
+        // never got a last word on an item whose steps had all succeeded;
+        // it does now, and here it stays silent, so the verdict is still
+        // unknown rather than a failure.
+        assert_eq!(report.acceptance_unknown, 4, "{report:?}");
         assert_eq!(report.items_abandoned, 1);
+        assert_eq!(
+            report.abandoned_unmet.len(),
+            1,
+            "the walked-away item is NAMED, with the hang as its evidence: {report:?}"
+        );
+        assert!(
+            report.abandoned_unverifiable.is_empty(),
+            "it has a check, so the sweep speaks for it: {report:?}"
+        );
         let reasons = source.abandon_reasons.lock().await;
         assert!(
             reasons.iter().all(|(_, r)| r.contains("runner errors")),
