@@ -848,6 +848,20 @@ pub struct ToolCallRecord {
     pub duration_ms: u64,
 }
 
+/// The text a [`ToolCallRecord`] should carry for a finished call.
+///
+/// `ToolResult::error` moves a failure's message out of `content`, so reading
+/// `content` alone records that a call failed and nothing about HOW. Two guards
+/// read this text — the repeat detector and the novelty check — and both were
+/// comparing empty strings for every failure.
+fn record_output(result: &nanna_tools::ToolResult) -> String {
+    if result.content.is_empty() {
+        result.error.clone().unwrap_or_default()
+    } else {
+        result.content.clone()
+    }
+}
+
 /// Internal result from LLM call
 #[derive(Default)]
 struct LlmResult {
@@ -6102,7 +6116,21 @@ impl Agent {
                 id: id.clone(),
                 name: name.clone(),
                 input: stored_input,
-                output: response.result.content.clone(),
+                // A failing tool puts its message in `error` and leaves
+                // `content` empty, so building the record from `content` alone
+                // stored the NAME of what happened and none of the substance.
+                // The model saw the text; the loop's own memory of the turn did
+                // not, and two guards read this field:
+                //   - the repeat detector compares consecutive outputs, so a
+                //     command that failed two DIFFERENT ways compared equal on
+                //     "" and the user was told the result was identical;
+                //   - the novelty check hashes a failure's first line, so it
+                //     always hashed "" and a CHANGING error never counted as
+                //     progress — draining the step budget through exactly the
+                //     debugging loop the budget exists to fund.
+                // Unprefixed on purpose: an `Error: ` prefix defeats the
+                // exit-code parse downstream.
+                output: record_output(&response.result),
                 success: response.result.success,
                 duration_ms,
             });
@@ -8372,6 +8400,68 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wiring: a failing tool's message must reach the record. This is the
+    /// half that was broken — the consumer below always worked, it was just
+    /// being handed "" every time.
+    #[test]
+    fn a_failed_tools_message_reaches_the_record() {
+        let failed = nanna_tools::ToolResult {
+            success: false,
+            content: String::new(),
+            error: Some("error: unresolved import `foo`".to_string()),
+            data: None,
+        };
+        assert_eq!(
+            record_output(&failed),
+            "error: unresolved import `foo`",
+            "a failure's text lives in `error`; reading `content` alone records              that something failed and nothing about what"
+        );
+        assert!(
+            !record_output(&failed).starts_with("Error: "),
+            "unprefixed — an added prefix defeats the exit-code parse downstream"
+        );
+
+        let ok = nanna_tools::ToolResult {
+            success: true,
+            content: "built in 3s".to_string(),
+            error: None,
+            data: None,
+        };
+        assert_eq!(record_output(&ok), "built in 3s", "success is unchanged");
+    }
+
+    /// Two DIFFERENT failures must read as two different results. A failing
+    /// tool's message lives in `error`, not `content`, so a record built from
+    /// `content` alone made every failure hash and compare as the empty string
+    /// — the novelty check then scored a changing error as "no new
+    /// information" and spent the step budget on the debugging loop it exists
+    /// to fund.
+    #[test]
+    fn a_changing_failure_counts_as_new_information() {
+        let failing = |msg: &str| ToolCallRecord {
+            id: "t".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "command": "cargo build" }),
+            output: msg.to_string(),
+            success: false,
+            duration_ms: 1,
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            iteration_produced_information(&mut seen, &[failing("error: missing semicolon")], ""),
+            "the first failure is new"
+        );
+        assert!(
+            iteration_produced_information(&mut seen, &[failing("error: unresolved import")], ""),
+            "a DIFFERENT error is new information — the world changed"
+        );
+        assert!(
+            !iteration_produced_information(&mut seen, &[failing("error: unresolved import")], ""),
+            "the SAME error twice is not"
+        );
+    }
 
     /// The request the model made is not evidence the write landed. This block
     /// is stored in the assistant's own turn and re-read on every later turn,
