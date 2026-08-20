@@ -978,6 +978,21 @@ export default {
       glog("edit_file structure: " + filePath + " parses again after edit (" + verdict.tool + ")");
     }
 
-    return { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote, success: true };
+    // `success` stays true: on the write family it means "the bytes landed",
+    // and three separate mechanisms downstream read it that way (the world
+    // epoch bump, failure counting, and error routing). What was missing is
+    // the OUTCOME — this tool has already run the file's real parser and knows
+    // the edit broke it, and every consumer that only saw the flag recorded a
+    // break as landed work.
+    //
+    // Only ever set when a checker actually ran and returned a verdict. An
+    // absent, unrun or fail-open verdict leaves this off entirely, because a
+    // false "broken" would suppress completion and drain the item's budget —
+    // `sh -n` is documented to cry wolf on valid bash where /bin/sh is dash.
+    var result = { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote, success: true };
+    if (verdict) {
+      result.data = { structure: { parses: verdict.ok === true, tool: verdict.tool, detail: verdict.detail } };
+    }
+    return result;
   }
 }

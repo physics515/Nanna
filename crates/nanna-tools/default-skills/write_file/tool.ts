@@ -1453,6 +1453,15 @@ export default {
         " they were converted to real newlines before writing. The write SUCCEEDED and the file is correct —" +
         " nothing to redo. Send real line breaks next time and this note goes away.";
     }
-    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + structNote + repairNote + lossNote };
+    // Carry the structural OUTCOME, the same way edit_file does and for the
+    // same reason: this tool has already run the file's real parser, and a
+    // consumer reading only "the bytes landed" records a break as landed work.
+    // Set only when a checker actually ran — an absent or fail-open verdict
+    // must never read as broken.
+    var result = { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + structNote + repairNote + lossNote };
+    if (verdict) {
+      result.data = { structure: { parses: verdict.ok === true, tool: verdict.tool, detail: verdict.detail } };
+    }
+    return result;
   }
 }

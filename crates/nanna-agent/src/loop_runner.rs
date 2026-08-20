@@ -846,6 +846,9 @@ pub struct ToolCallRecord {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    /// The bytes landed but the file no longer parses. Separate from `success`
+    /// on purpose — see [`structure_broken`].
+    pub structure_broken: bool,
 }
 
 /// The text a [`ToolCallRecord`] should carry for a finished call.
@@ -860,6 +863,27 @@ fn record_output(result: &nanna_tools::ToolResult) -> String {
     } else {
         result.content.clone()
     }
+}
+
+/// True only when a write tool actually RAN the file's parser and it failed.
+///
+/// The write family reports `success` as "the bytes landed", which is what the
+/// world-epoch bump and the failure counters need it to mean. But a write that
+/// lands and breaks the file is not landed WORK, and every consumer reading
+/// only the flag recorded it as such.
+///
+/// Absent, unrun and fail-open verdicts deliberately answer false. `sh -n`
+/// cries wolf on valid bash where `/bin/sh` is dash, and a false "broken" would
+/// suppress completion and drain the item's budget — strictly worse than the
+/// silence it replaces.
+fn structure_broken(result: &nanna_tools::ToolResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|d| d.get("structure"))
+        .and_then(|s| s.get("parses"))
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|parses| !parses)
 }
 
 /// Internal result from LLM call
@@ -1091,7 +1115,11 @@ pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
         let line = format!(
             "- {} {} ({})",
             record.name,
-            if record.success { "ok" } else { "FAILED" },
+            match (record.success, record.structure_broken) {
+                (false, _) => "FAILED",
+                (true, true) => "ok — DOES NOT PARSE",
+                (true, false) => "ok",
+            },
             preview_snippet(&flat, 80),
         );
         if used + line.len() + 1 > budget {
@@ -6112,6 +6140,9 @@ impl Agent {
                 input.clone()
             };
 
+            // Read before anything moves out of the result: the memory tag
+            // below needs the same fact.
+            let struct_broken = structure_broken(&response.result);
             state.tool_records.push(ToolCallRecord {
                 id: id.clone(),
                 name: name.clone(),
@@ -6133,6 +6164,7 @@ impl Agent {
                 output: record_output(&response.result),
                 success: response.result.success,
                 duration_ms,
+                structure_broken: struct_broken,
             });
 
             // Sibling-breaker bookkeeping. A short-circuited call never ran,
@@ -6284,7 +6316,17 @@ impl Agent {
                         .map(|s| {
                             s.chars().take(CALL_IDENTIFICATION_WIDTH).collect::<String>()
                         });
-                    let outcome = if response.result.success { "ok" } else { "FAILED" };
+                    // A third outcome, because there are three. An edit that
+                    // lands and breaks the file used to be tagged "ok", so the
+                    // session's own record of the destroying event said it
+                    // succeeded.
+                    let outcome = if !response.result.success {
+                        "FAILED"
+                    } else if struct_broken {
+                        "ok — DOES NOT PARSE"
+                    } else {
+                        "ok"
+                    };
 
                     for (idx, chunk_content) in &chunks {
                         let mut tags = HashMap::new();
@@ -8401,6 +8443,41 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// A write that lands and breaks the file is not landed work. The guardrail
+    /// matters as much as the finding: only a verdict that actually RAN and
+    /// failed counts, because a false "broken" would suppress completion and
+    /// drain the item's budget.
+    #[test]
+    fn only_a_real_failing_verdict_reads_as_broken() {
+        let with = |data: Option<serde_json::Value>| nanna_tools::ToolResult {
+            success: true,
+            content: "Edited ./x".to_string(),
+            error: None,
+            data,
+        };
+
+        assert!(
+            structure_broken(&with(Some(
+                serde_json::json!({ "structure": { "parses": false, "tool": "sh -n" } })
+            ))),
+            "a checker ran and the file does not parse"
+        );
+        assert!(
+            !structure_broken(&with(Some(
+                serde_json::json!({ "structure": { "parses": true, "tool": "sh -n" } })
+            ))),
+            "a checker ran and the file parses"
+        );
+        assert!(
+            !structure_broken(&with(None)),
+            "no checker applies to this file type — silence is not a break"
+        );
+        assert!(
+            !structure_broken(&with(Some(serde_json::json!({ "other": 1 })))),
+            "an unrun or fail-open verdict must never read as broken"
+        );
+    }
+
     /// The wiring: a failing tool's message must reach the record. This is the
     /// half that was broken — the consumer below always worked, it was just
     /// being handed "" every time.
@@ -8446,6 +8523,7 @@ mod tests {
             output: msg.to_string(),
             success: false,
             duration_ms: 1,
+            structure_broken: false,
         };
 
         let mut seen = std::collections::HashSet::new();
@@ -8696,6 +8774,7 @@ mod tests {
                 },
                 success: i != 9,
                 duration_ms: 1,
+                structure_broken: false,
             });
         }
         let digest = mission_tool_digest(&records);
@@ -8781,6 +8860,7 @@ mod tests {
             output: output.to_string(),
             success: true,
             duration_ms: 1,
+            structure_broken: false,
         }
     }
 
@@ -11114,6 +11194,7 @@ mod claim_nudge_tests {
             output: "ok".to_string(),
             success,
             duration_ms: 1,
+            structure_broken: false,
         }
     }
 
@@ -11129,6 +11210,7 @@ mod claim_nudge_tests {
             output: output.to_string(),
             success,
             duration_ms: 1,
+            structure_broken: false,
         }
     }
 
@@ -11568,6 +11650,7 @@ mod claim_nudge_tests {
             output: "read-only file system".to_string(),
             success: false,
             duration_ms: 1,
+            structure_broken: false,
         }];
         assert_eq!(
             newest_work_evidence_failure(&write_failure),
@@ -12842,6 +12925,7 @@ mod step_exhaustion_tests {
             output: output.to_string(),
             success,
             duration_ms: 1,
+            structure_broken: false,
         }
     }
 
