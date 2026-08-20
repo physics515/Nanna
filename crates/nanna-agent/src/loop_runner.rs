@@ -5655,6 +5655,15 @@ impl Agent {
     ///
     /// The LLM already generated the content, so keeping it in stored context is pure waste.
     /// Replaces the `content` field with a size placeholder.
+    ///
+    /// The placeholder is deliberately OUTCOME-NEUTRAL. This runs while the
+    /// call is still only a request — the tool has not executed — so it cannot
+    /// know whether the bytes landed. It used to assert they had, and that
+    /// text is stored in the assistant's own turn, so on every later turn the
+    /// model re-read "all N bytes were written successfully and are intact on
+    /// disk" immediately beside a tool result reading "WRITE HELD — nothing
+    /// was written". The result is the record of what happened; this is only
+    /// the record of what was asked for, and it now says so.
     fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
         blocks.iter().map(|block| {
             match block {
@@ -5668,7 +5677,7 @@ impl Agent {
                             );
                             obj.insert(
                                 "content".to_string(),
-                                Value::String(format!("[content omitted here ONLY because your context window is limited — all {size} bytes were written successfully and are intact on disk; read_file to see them]")),
+                                Value::String(format!("[content omitted here ONLY because your context window is limited — {size} bytes were sent to this tool; the tool result below is the authoritative record of what happened on disk]")),
                             );
                         }
                     }
@@ -6052,7 +6061,14 @@ impl Agent {
                 state.zero_delta_discovery_streak = 0;
             }
 
-            // Strip write content from stored tool call record (same as context blocks)
+            // Strip write content from stored tool call record (same as context
+            // blocks), but report the outcome the call ACTUALLY had.
+            //
+            // This placeholder is what the persisted record and the GUI's Input
+            // pane show. It used to assert the bytes had landed whatever
+            // happened, so a card marked failed displayed an Input claiming
+            // success — and the write guards refuse writes routinely, which is
+            // the whole point of them. A refusal is not a write.
             let stored_input = if is_write_tool(&name) {
                 let mut input = input.clone();
                 if let Some(obj) = input.as_object_mut() {
@@ -6060,9 +6076,20 @@ impl Agent {
                         let size = content_val
                             .as_str()
                             .map_or_else(|| content_val.to_string().len(), str::len);
+                        let fate = if response.result.success {
+                            format!("{size} bytes were written to disk")
+                        } else {
+                            // Covers both a guard refusing the write and a
+                            // breaker short-circuiting it before dispatch: in
+                            // neither case did the bytes land, and the result
+                            // itself says which.
+                            format!(
+                                "{size} bytes were NOT written — the tool result below says why"
+                            )
+                        };
                         obj.insert(
                             "content".to_string(),
-                            Value::String(format!("[content omitted from context — {size} bytes were written successfully to disk]")),
+                            Value::String(format!("[content omitted from context — {fate}]")),
                         );
                     }
                 }
@@ -8345,6 +8372,38 @@ fn parse_exit_code_prefix(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request the model made is not evidence the write landed. This block
+    /// is stored in the assistant's own turn and re-read on every later turn,
+    /// so asserting success here contradicted the tool result sitting beside
+    /// it whenever a guard refused the write.
+    #[test]
+    fn a_stored_write_request_does_not_claim_the_bytes_landed() {
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({ "file_path": "./x", "content": "hello" }),
+        }];
+
+        let stripped = Agent::strip_write_content_from_blocks(&blocks);
+        let ContentBlock::ToolUse { input, .. } = &stripped[0] else {
+            panic!("the block must stay a tool_use");
+        };
+        let placeholder = input["content"].as_str().expect("content is replaced");
+
+        assert!(
+            placeholder.contains("5 bytes were sent to this tool"),
+            "it should say what was ASKED for: {placeholder}"
+        );
+        assert!(
+            !placeholder.contains("written successfully"),
+            "nothing has executed yet, so it must not claim a write: {placeholder}"
+        );
+        assert!(
+            !placeholder.contains("intact on disk"),
+            "and it must not send the model to read bytes that may never have              landed: {placeholder}"
+        );
+    }
 
     #[test]
     fn mission_complete_is_line_anchored() {
