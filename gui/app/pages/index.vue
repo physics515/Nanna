@@ -551,6 +551,7 @@ let unlistenThinking: UnlistenFn | null = null
 let unlistenModelStatus: UnlistenFn | null = null
 let unlistenDaemonError: UnlistenFn | null = null
 let unlistenContextUsage: UnlistenFn | null = null
+let unlistenLivenessBeat: UnlistenFn | null = null
 let unlistenConfigChanged: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -670,9 +671,16 @@ async function loadSession() {
           // burst of the run, not just the current healing attempt's.
           setLiveTimeline(runState.timeline ?? [])
 
-          // Seed the live context-usage badge from the daemon's snapshot
-          contextUsed.value = runState.context_used ?? 0
-          contextWindow.value = runState.context_window ?? 0
+          // Seed the live context-usage badge from the daemon's snapshot —
+          // but only where the snapshot HAS one. A zero window is the
+          // daemon saying "no request in this run has reported usage yet",
+          // not "the context is empty", and assigning it blanked a meter the
+          // `context-usage` events had already filled. Every session load
+          // paid that price, so the header read 0 for whole runs.
+          if (runState.context_window) {
+            contextUsed.value = runState.context_used ?? 0
+            contextWindow.value = runState.context_window
+          }
 
           // Replace tool calls with daemon's authoritative list
           activeToolCalls.value = []
@@ -897,6 +905,30 @@ onMounted(async () => {
     sessionState.contextWindow.value = event.payload.window
   })
 
+  // The daemon's liveness beat (~30s while a turn is in flight). This is the
+  // only OBSERVED statement about a running turn the GUI gets — the activity
+  // flags are latched inferences — so it is stored per session and the badge
+  // qualifies every branch with it.
+  unlistenLivenessBeat = await listen<{
+    session_id: string
+    elapsed_s: number
+    phase: string
+    awaiting: string
+    quiet_s: number | null
+    beat: number
+  }>('liveness-beat', (event) => {
+    const p = event.payload
+    const sessionState = useSessionState(ref(p.session_id))
+    sessionState.liveness.value = {
+      elapsedS: p.elapsed_s,
+      // Absent means "nothing observed to time from yet", which is not zero.
+      quietS: p.quiet_s ?? null,
+      phase: p.phase,
+      awaiting: p.awaiting,
+      beat: p.beat,
+    }
+  })
+
   // Listen for thinking/reasoning chunks
   unlistenThinking = await listen<{ session_id: string; delta: string }>('thinking-chunk', (event) => {
     const eventSessionId = event.payload.session_id
@@ -986,6 +1018,7 @@ onUnmounted(() => {
   if (unlistenModelStatus) unlistenModelStatus()
   if (unlistenDaemonError) unlistenDaemonError()
   if (unlistenContextUsage) unlistenContextUsage()
+  if (unlistenLivenessBeat) unlistenLivenessBeat()
   if (unlistenConfigChanged) unlistenConfigChanged()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)

@@ -165,6 +165,23 @@ struct LivenessState {
     tool_in_flight: Option<ToolMark>,
     last_tool: Option<ToolMark>,
     last_side_effect: Option<ToolMark>,
+    /// The side-effecting calls made since the current STEP ATTEMPT began,
+    /// oldest first — the same calls `turn_side_effects` counts, kept as the
+    /// list instead of only as a tally.
+    ///
+    /// Attempt-scoped, not turn-scoped, because that is the span a provider
+    /// fault throws away: the step runner re-enters `try_run_step` for every
+    /// retry and each entry stamps [`Self::on_step`], so this holds exactly
+    /// the calls the interrupted attempt made — calls that RAN, whose effects
+    /// are on disk, and which the retry's fresh context cannot show.
+    /// `last_side_effect` stays turn-scoped beside it because the stop
+    /// readout and the repeat-completion escalation ask a different question.
+    ///
+    /// Bounded by construction: cleared at every step boundary and at
+    /// [`Self::begin_turn`], so it holds at most what ONE attempt did, and an
+    /// attempt is already bounded by its own iteration, token and wall-clock
+    /// budgets.
+    attempt_side_effects: Vec<ToolMark>,
     turn_side_effects: u64,
     turn_stream_chars: u64,
     beats: u64,
@@ -191,6 +208,7 @@ impl LivenessState {
             tool_in_flight: None,
             last_tool: None,
             last_side_effect: None,
+            attempt_side_effects: Vec::new(),
             turn_side_effects: 0,
             turn_stream_chars: 0,
             beats: 0,
@@ -288,6 +306,7 @@ impl SessionLiveness {
         s.step_kind = None;
         s.step_label = None;
         s.tool_in_flight = None;
+        s.attempt_side_effects.clear();
         s.turn_side_effects = 0;
         s.turn_stream_chars = 0;
         s.beats = 0;
@@ -308,6 +327,12 @@ impl SessionLiveness {
     }
 
     /// A harness step started (fires for quiet conversation-shaped items too).
+    ///
+    /// Fires once per ATTEMPT, not once per step: the retry ladder re-enters
+    /// the step runner for every attempt. That makes this the attempt
+    /// boundary, so the attempt-scoped side-effect list starts empty here —
+    /// a retry must never be told that the calls of the attempt BEFORE the
+    /// one it is replacing are its own.
     pub fn on_step(&self, step_index: usize, kind: &str, label: &str) {
         let mut s = self.lock();
         s.phase = Phase::StepPending;
@@ -316,6 +341,7 @@ impl SessionLiveness {
         s.step_kind = Some(kind.to_string());
         s.step_label = Some(label.to_string());
         s.tool_in_flight = None;
+        s.attempt_side_effects.clear();
     }
 
     /// Assistant text streamed.
@@ -350,7 +376,9 @@ impl SessionLiveness {
         // Back to "request in flight" until the next delta says otherwise.
         s.phase = Phase::StepPending;
         if success && nanna_agent::is_work_evidence_tool(name) {
-            s.last_side_effect = Some(ToolMark::now(name));
+            let mark = ToolMark::now(name);
+            s.attempt_side_effects.push(mark.clone());
+            s.last_side_effect = Some(mark);
             s.turn_side_effects += 1;
         }
     }
@@ -404,6 +432,26 @@ impl SessionLiveness {
             content_fingerprint: s.turn_fingerprint,
         });
         repeat
+    }
+
+    /// The side-effecting calls of the CURRENT step attempt, NEWEST FIRST.
+    ///
+    /// Newest first because every consumer is working under a budget and
+    /// truncates the tail: the most recent call is the one whose effect the
+    /// caller is most likely about to write over.
+    ///
+    /// Deliberately not a [`LivenessSnapshot`] field. The snapshot is the
+    /// `session.liveness` wire body and the beat's payload source, both of
+    /// which are fixed-size by design; this list is proportional to what the
+    /// attempt did, so it is served only to the caller that asked for it.
+    #[must_use]
+    pub fn attempt_side_effects(&self) -> Vec<ToolMarkSnapshot> {
+        let s = self.lock();
+        s.attempt_side_effects
+            .iter()
+            .rev()
+            .map(tool_mark_snapshot)
+            .collect()
     }
 
     /// Count a beat and return the snapshot it should carry, or `None` when
@@ -629,6 +677,57 @@ mod tests {
         let snap = live.snapshot();
         assert!(!snap.running);
         assert_eq!(snap.last_stop.as_ref().map(|s| s.reason.as_str()), Some("all_tasks_done"));
+    }
+
+    /// The list a retry is rebuilt from: the calls THIS attempt made, newest
+    /// first, and nothing else. A retry that inherited the previous attempt's
+    /// list would be told its predecessor's work was its own, which is the
+    /// same lie by omission the carried list exists to remove.
+    #[test]
+    fn the_side_effect_list_is_scoped_to_the_current_attempt() {
+        let live = SessionLiveness::new();
+        live.begin_turn(None, content_fingerprint("build the thing"));
+        live.on_step(0, "working", "Build the thing");
+
+        for (tool, ok) in [
+            ("write_file", true),
+            ("read_file", true),
+            ("exec", true),
+            ("edit_file", false),
+        ] {
+            live.on_tool_start(tool);
+            live.on_tool_end(tool, ok);
+        }
+
+        let names: Vec<String> = live
+            .attempt_side_effects()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["exec".to_string(), "write_file".to_string()],
+            "newest first, side-effecting only, successful only"
+        );
+
+        // The retry: a fresh attempt starts with an empty list, while the
+        // TURN-scoped facts the escalation and the stop readout depend on
+        // survive untouched.
+        live.on_step(0, "working", "Build the thing");
+        assert!(live.attempt_side_effects().is_empty());
+        let snap = live.snapshot();
+        assert_eq!(snap.turn_side_effects, 2);
+        assert_eq!(
+            snap.last_side_effect.as_ref().map(|m| m.name.as_str()),
+            Some("exec")
+        );
+
+        // And a new turn clears it even without an intervening step.
+        live.on_tool_start("write_file");
+        live.on_tool_end("write_file", true);
+        assert_eq!(live.attempt_side_effects().len(), 1);
+        live.begin_turn(None, content_fingerprint("something else"));
+        assert!(live.attempt_side_effects().is_empty());
     }
 
     /// A mission that GAVE UP still stops on the last round's `all_tasks_done`,

@@ -136,7 +136,14 @@ async fn not_found_fails_and_leaves_file_unchanged() {
     .await;
 
     assert_eq!(read(&path), original, "file must be untouched");
-    assert!(err.contains("not found"), "got: {err}");
+    // The miss is named without asserting a CAUSE. It used to claim "the
+    // file's real content differs from your memory", which the tool never
+    // checked.
+    assert!(err.contains("does not appear in"), "got: {err}");
+    assert!(
+        !err.contains("differs from your memory"),
+        "the message must not assert a cause it did not establish: {err}"
+    );
     assert!(err.contains("UNCHANGED"), "got: {err}");
     // Re-anchoring guidance: shows what it looked for and tells the model
     // to call read_file first — without dumping the whole file.
@@ -420,7 +427,14 @@ async fn not_found_error_quotes_closest_real_text() {
     )
     .await;
     assert!(err.contains("UNCHANGED"), "got: {err}");
-    assert!(err.contains("Closest ACTUAL text"), "got: {err}");
+    // Real text from the file, either echoed whole (small files, the common
+    // case) or as the closest snippet when the file is too large to fit a
+    // failure message. What matters is that the model is shown actual content
+    // instead of being sent on another read_file round-trip.
+    assert!(
+        err.contains("ACTUALLY in the file") || err.contains("Closest ACTUAL text"),
+        "got: {err}"
+    );
     assert!(err.contains("def load_notes():"), "got: {err}");
 }
 

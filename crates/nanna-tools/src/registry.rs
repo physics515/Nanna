@@ -666,22 +666,40 @@ impl ToolRegistry {
         // removing the originals so either convention works.
         let parameters = normalize_param_keys(call.parameters.clone());
 
-        // Execute with timeout if specified
+        // Execute under the backstop timer when the tool declares a ceiling.
+        // That ceiling is a floor for this timer, not the timer itself — see
+        // `backstop_timeout` for why the backstop has to outlive whatever the
+        // tool enforces for itself.
         let result = if let Some(timeout_secs) = tool.timeout_secs() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                tool.execute(parameters.clone()),
-            )
-            .await
-            {
+            // Only a tool that DECLARES a timeout parameter may have its
+            // caller extend the outer net. Passing the raw arguments for every
+            // tool let a stray `timeout` key stretch the backstop past the
+            // ceiling of a tool that cannot honour it — the safety net is the
+            // declared ceiling for those, not whatever the caller typed.
+            let declares_timeout = tool
+                .definition()
+                .parameters
+                .iter()
+                .any(|p| p.name == "timeout");
+            let backstop = if declares_timeout {
+                backstop_timeout(timeout_secs, &parameters)
+            } else {
+                backstop_timeout(timeout_secs, &HashMap::new())
+            };
+            match tokio::time::timeout(backstop, tool.execute(parameters.clone())).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => {
                     warn!("Tool {} execution error: {}", call.name, e);
                     ToolResult::error(e.to_string())
                 }
                 Err(_) => {
-                    warn!("Tool {} timed out after {}s", call.name, timeout_secs);
-                    ToolResult::error("Tool execution timed out")
+                    let elapsed_ms = start.elapsed().as_millis();
+                    let limit_ms = backstop.as_millis();
+                    warn!(
+                        "Tool {} hit the registry backstop after {}ms (limit {}ms, ceiling {}s)",
+                        call.name, elapsed_ms, limit_ms, timeout_secs
+                    );
+                    ToolResult::error(backstop_message(&call.name, elapsed_ms, limit_ms))
                 }
             }
         } else {
@@ -968,6 +986,58 @@ fn normalize_param_keys(
         params.insert(key, val);
     }
     params
+}
+
+/// Wall-clock ceiling for the registry's backstop timer on one call.
+///
+/// `timeout_secs` is what the tool declares for itself, out of a static
+/// manifest that has never seen this call. A scripted tool's engine knows more:
+/// it derives its deadline from this call's `timeout` input and deliberately
+/// extends past it so the shell bridge — the layer that can actually kill the
+/// child — fires first, and it answers with elapsed time, which deadline fired,
+/// and what is on disk. A backstop pinned to the declared ceiling preempts that
+/// answer. It also loses when the two are nominally equal, because the inner
+/// handoff still costs something: observed as the backstop firing at 180_004 ms
+/// with the tool's own account arriving 1.03 s later, to nobody.
+///
+/// So derive the backstop from the deadline the engine will really enforce plus
+/// one more handoff margin — the same slack the engine already stacks above the
+/// bridge — and the inner message wins by construction. A caller who asks for a
+/// longer command deadline stops being cut short as a side effect.
+#[cfg(feature = "scripting")]
+fn backstop_timeout(timeout_secs: u64, parameters: &HashMap<String, Value>) -> std::time::Duration {
+    std::time::Duration::from_millis(nanna_scripting::ScriptEngine::supervising_timeout_ms(
+        timeout_secs.saturating_mul(1000),
+        parameters.get("timeout"),
+    ))
+}
+
+/// Without the scripting engine there is no inner deadline to outlive: this
+/// timer is the only one, so it fires exactly at the declared ceiling.
+#[cfg(not(feature = "scripting"))]
+fn backstop_timeout(
+    timeout_secs: u64,
+    _parameters: &HashMap<String, Value>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs)
+}
+
+/// What the backstop says when it has to abandon a call.
+///
+/// This is the last resort, reached only when the tool's own deadline did not
+/// report first, so it has nothing to relay about the work. Say that plainly:
+/// how long we actually waited, that this was the outer net rather than the
+/// tool's own limit, and that a tool killed mid-flight may already have written
+/// part of its work — disk is the truth, not this message.
+fn backstop_message(tool_name: &str, elapsed_ms: u128, limit_ms: u128) -> String {
+    format!(
+        "Tool '{tool_name}' was still running {elapsed_ms}ms after it was called and hit \
+         the registry's {limit_ms}ms backstop. That is the outer safety net, not the \
+         tool's own deadline, so the tool never reported what it managed to do. Anything \
+         it finished before this point is on disk; disk is truth, so check the current \
+         state before re-running. If the work genuinely needs longer and this tool \
+         accepts a `timeout` (seconds), raise it."
+    )
 }
 
 fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
@@ -1862,5 +1932,97 @@ mod tests {
             "teardown must remove the binding entirely, not leave a stale entry \
              that now wins over the default"
         );
+    }
+
+    // --- backstop timer (the registry is the outer net, not the authority) ---
+
+    /// A tool that outlives its declared ceiling and then answers for itself,
+    /// the way a shell command running under a longer command deadline does.
+    #[cfg(feature = "scripting")]
+    struct SlowTool;
+
+    #[cfg(feature = "scripting")]
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "slow".to_string(),
+                description: "Runs past its declared ceiling".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, crate::ToolError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            Ok(ToolResult::success("answer from the tool itself"))
+        }
+
+        fn timeout_secs(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    /// The bug this guards: a caller asking for a longer command deadline was
+    /// killed at the static manifest ceiling, and the account the tool had
+    /// built of what happened arrived a second later, to nobody.
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn backstop_does_not_preempt_a_call_that_asked_for_longer() {
+        let reg = ToolRegistry::new();
+        reg.register(SlowTool).await;
+
+        let response = reg
+            .execute(ToolCall {
+                id: "slow-1".to_string(),
+                name: "slow".to_string(),
+                parameters: [("timeout".to_string(), Value::from(3))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await;
+
+        assert!(
+            response.result.success,
+            "the tool answered within the deadline it was given, so the \
+             backstop must not have fired first: {:?}",
+            response.result
+        );
+        assert_eq!(response.result.content, "answer from the tool itself");
+    }
+
+    /// The derivation itself: the backstop must sit strictly above the deadline
+    /// the script engine will enforce, both when the call requests a longer
+    /// command deadline and when it requests nothing at all.
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn backstop_outlives_every_inner_deadline() {
+        let requested: HashMap<String, Value> = [("timeout".to_string(), Value::from(600))]
+            .into_iter()
+            .collect();
+        assert!(
+            backstop_timeout(180, &requested) > std::time::Duration::from_secs(600),
+            "a 600s command deadline must not be cut short by a 180s ceiling"
+        );
+        assert!(
+            backstop_timeout(180, &HashMap::new()) > std::time::Duration::from_secs(180),
+            "even with nothing requested the backstop must outlive the \
+             ceiling, or the two race and the outer one wins"
+        );
+    }
+
+    /// When the backstop really is the last resort it has no tool report to
+    /// relay, so it must say how long it waited and warn that the abandoned
+    /// tool may already have written part of its work.
+    #[test]
+    fn backstop_message_states_elapsed_time_and_side_effects() {
+        let msg = backstop_message("exec", 180_004, 190_000);
+        assert!(msg.contains("exec"));
+        assert!(msg.contains("180004ms"), "must state elapsed wall time: {msg}");
+        assert!(msg.contains("190000ms"), "must state the limit that fired: {msg}");
+        assert!(msg.contains("on disk"), "must warn about side effects: {msg}");
     }
 }

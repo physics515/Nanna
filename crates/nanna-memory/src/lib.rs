@@ -112,6 +112,49 @@ pub struct MemoryStoreHealth {
     pub expected: usize,
 }
 
+/// What a search could actually COMPARE, measured during the scan it describes.
+///
+/// An empty result set has three causes and they are not interchangeable:
+/// nothing matched, the rows exist but carry no vector the query can be scored
+/// against, or the query itself is the wrong width for the store's binding and
+/// nothing was scanned at all. Reported as "No memories found" they are
+/// indistinguishable — a total blackout reads as an honest miss, and the reader
+/// stops looking.
+///
+/// Measured in the scan rather than read from a rebind-time counter, because a
+/// snapshot taken when the binding changed goes stale the moment the backfill
+/// starts draining. The width predicate is already evaluated per row by the
+/// store's `cosine_or_stale`, so counting it costs nothing and is exact at
+/// answer time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchCoverage {
+    /// Entries in the store when the scan ran.
+    pub total: usize,
+    /// Entries whose stored vector had the query's width — the only ones a
+    /// cosine can score. The remainder are queued for backfill (empty vector)
+    /// or still bound to a superseded model's width.
+    pub comparable: usize,
+    /// False when the QUERY's width disagrees with the store's binding, in
+    /// which case no row was scanned: every memory is unreachable, not absent.
+    pub query_width_matches: bool,
+}
+
+impl SearchCoverage {
+    /// Entries the scan could not score. Never a "no match" — a row that was
+    /// not compared was not consulted.
+    #[must_use]
+    pub fn unsearchable(&self) -> usize {
+        self.total.saturating_sub(self.comparable)
+    }
+
+    /// Whether every entry in the store was actually scored, so an empty
+    /// result really does mean "nothing matched".
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.query_width_matches && self.unsearchable() == 0
+    }
+}
+
 #[async_trait]
 pub trait MemoryPersistence: Send + Sync {
     /// Persist (insert or update) a single entry.
@@ -703,8 +746,32 @@ impl VectorStore {
     }
 
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
+        self.search_with_coverage(query_embedding, top_k).await.0
+    }
+
+    /// [`search`](Self::search), plus what the scan could actually compare.
+    ///
+    /// Same ranking, same results — the extra return is measured inside the
+    /// scan that produced them, so a caller can tell an empty answer that means
+    /// "nothing matched" from one that means "nothing was searchable". See
+    /// [`SearchCoverage`].
+    pub async fn search_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
         if query_embedding.len() != self.config.get_dimension() {
-            return Vec::new();
+            // Nothing was scanned. The store is not empty of matches, it is
+            // unreachable at this width — say which.
+            let total = self.entries.read().await.len();
+            return (
+                Vec::new(),
+                SearchCoverage {
+                    total,
+                    comparable: 0,
+                    query_width_matches: false,
+                },
+            );
         }
 
         // Normalize query
@@ -715,8 +782,28 @@ impl VectorStore {
         let entry_count = entries.len();
 
         if entry_count == 0 {
-            return Vec::new();
+            return (
+                Vec::new(),
+                SearchCoverage {
+                    total: 0,
+                    comparable: 0,
+                    query_width_matches: true,
+                },
+            );
         }
+
+        // Exact at answer time: the same width predicate `cosine_or_stale`
+        // applies row by row, counted once here rather than inferred from a
+        // rebind-time snapshot that the backfill invalidates as it drains.
+        let comparable = entries
+            .iter()
+            .filter(|e| e.embedding.len() == query.len())
+            .count();
+        let coverage = SearchCoverage {
+            total: entry_count,
+            comparable,
+            query_width_matches: true,
+        };
 
         // Benchmark-calibrated threshold: GPU only wins with persistent buffers or
         // very large vector counts. With per-search buffer upload, the ~750us fixed
@@ -786,7 +873,7 @@ impl VectorStore {
             .map(|(idx, sim)| (entries[idx].clone(), sim))
             .collect();
         drop(entries);
-        scored
+        (scored, coverage)
     }
 
     /// Search for similar memories with workspace scope filtering.
@@ -800,8 +887,26 @@ impl VectorStore {
         top_k: usize,
         workspace_id: Option<&str>,
     ) -> Vec<(MemoryEntry, f32)> {
-        let all_results = self.search(query_embedding, top_k * 3).await; // Get more to filter
-        
+        self.search_scoped_with_coverage(query_embedding, top_k, workspace_id)
+            .await
+            .0
+    }
+
+    /// [`search_scoped`](Self::search_scoped), plus what the scan could compare.
+    ///
+    /// The coverage describes the SCAN, which is unscoped — a memory the
+    /// workspace filter then drops was still searched. That is the number the
+    /// caller needs: it separates "your query matched nothing" from "most of
+    /// the store could not be consulted".
+    pub async fn search_scoped_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        workspace_id: Option<&str>,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        // Get more to filter
+        let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
+
         let filtered: Vec<(MemoryEntry, f32)> = match workspace_id {
             // Workspace scope: global + this workspace only
             Some(ws_id) => all_results
@@ -814,8 +919,8 @@ impl VectorStore {
             // Global scope: all memories
             None => all_results.into_iter().take(top_k).collect(),
         };
-        
-        filtered
+
+        (filtered, coverage)
     }
 
     /// Get entry by ID
@@ -2314,6 +2419,66 @@ mod tests {
             results[1].1 <= -1.0 + f32::EPSILON,
             "the queued row scores at the stale floor, below any min_score"
         );
+    }
+
+    /// An empty answer must be able to say WHY. The three states are not
+    /// interchangeable: nothing matched, N of M rows carry no vector this query
+    /// can be scored against, and the query width does not match the binding at
+    /// all — the last one is a total blackout, and reported as "no memories
+    /// found" it reads as an honest miss.
+    ///
+    /// Measured in the scan, not from a rebind-time snapshot: the backfill
+    /// drains continuously, so any counter taken when the binding changed is
+    /// stale by the time a question is asked.
+    #[tokio::test]
+    async fn search_reports_what_it_could_actually_compare() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        let good = MemoryEntry {
+            embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..entry_dim8("good")
+        };
+        store.add(good).await.unwrap();
+        let mut queued = entry_dim8("queued");
+        queued.embedding = Vec::new();
+        store.add(queued).await.unwrap();
+        let mut stale = entry_dim8("stale");
+        stale.embedding = Vec::new();
+        store.add(stale).await.unwrap();
+
+        let (_, coverage) = store
+            .search_with_coverage(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .await;
+        assert_eq!(coverage.total, 3);
+        assert_eq!(coverage.comparable, 1, "only the embedded row was scored");
+        assert_eq!(coverage.unsearchable(), 2);
+        assert!(coverage.query_width_matches);
+        assert!(
+            !coverage.is_complete(),
+            "an empty answer from this scan would not mean 'nothing matched'"
+        );
+
+        // The blackout: the query is the wrong width for the binding, so the
+        // scan never ran. Every memory is unreachable, not absent.
+        let (results, coverage) = store.search_with_coverage(&[1.0, 0.0], 10).await;
+        assert!(results.is_empty());
+        assert!(!coverage.query_width_matches);
+        assert_eq!(coverage.total, 3, "the store is not empty — it is unreachable");
+        assert_eq!(coverage.comparable, 0);
+
+        // And a store that could be read whole says so, so a genuine miss is
+        // still reportable as a genuine miss.
+        let searchable = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        searchable.add(entry_dim8("only")).await.unwrap();
+        let (_, coverage) = searchable.search_with_coverage(&[0.0; 8], 10).await;
+        assert!(coverage.is_complete());
     }
 
     /// Rewriting content invalidates every previously computed vector, so the

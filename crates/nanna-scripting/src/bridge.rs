@@ -523,6 +523,21 @@ impl NannaBridge {
             }
         }
         
+        // An MSYS drive path the shell itself printed (`/d/Development/x`).
+        //
+        // On Windows such a path HAS a root but no drive prefix, so it reports
+        // `is_relative()` and the branch below joins it onto the workspace —
+        // turning `/d/Development/x` into `<drive-of-workdir>\d\Development\x`.
+        // Reads of a real file then answer "does not exist" while writes create
+        // a phantom tree and report success, so the same string addresses two
+        // different filesystems depending on which tool receives it. Git Bash
+        // is the shell here, so every path `exec` prints comes back in this
+        // shape and is routinely handed straight to a file tool.
+        #[cfg(windows)]
+        if let Some(native) = Self::msys_drive_path(path) {
+            return native;
+        }
+
         let p = Path::new(path);
         if p.is_relative() && !path.is_empty() {
             // Resolve relative to the active workspace working directory. The
@@ -540,6 +555,43 @@ impl NannaBridge {
             }
         }
         p.to_path_buf()
+    }
+
+    /// Translate an MSYS drive path (`/d/Development/x`, or `/d:/Development/x`)
+    /// into the native `D:\Development\x` form.
+    ///
+    /// Literal-first, the same precedence [`Self::repair_redundant_prefix`]
+    /// uses: a genuine single-letter directory at the root of the current drive
+    /// stays addressable, so this only rewrites when the literal path does not
+    /// exist and the native one does. `/d` alone is left alone — a drive path
+    /// needs something after the drive to name.
+    #[cfg(windows)]
+    fn msys_drive_path(path: &str) -> Option<PathBuf> {
+        let rest = path.strip_prefix('/')?;
+        let mut chars = rest.chars();
+        let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+        // Accept both `/d/...` and the `/d:/...` form some tools emit.
+        let tail = match chars.next()? {
+            ':' => rest.get(3..)?,
+            '/' => rest.get(2..)?,
+            _ => return None,
+        };
+        if tail.is_empty() {
+            return None;
+        }
+
+        // A real `/d/...` on this filesystem wins, exactly as a real nested
+        // directory wins over prefix repair.
+        if Path::new(path).exists() {
+            return None;
+        }
+
+        let native = PathBuf::from(format!(
+            "{}:\\{}",
+            drive.to_ascii_uppercase(),
+            tail.replace('/', "\\")
+        ));
+        native.exists().then_some(native)
     }
 
     /// Repair a relative path that redundantly repeats the tail of the working
@@ -1365,6 +1417,34 @@ fn strip_ansi_escapes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: a path the SHELL prints must name the same file when it
+    /// is handed back to a file tool. Git Bash prints `/d/...`, and that used
+    /// to be treated as relative and joined onto the workspace, so a read of a
+    /// real file answered "does not exist" while a write conjured a shadow tree
+    /// under `<workdir>\d\...` and reported success.
+    #[cfg(windows)]
+    #[test]
+    fn an_msys_drive_path_from_the_shell_resolves_to_the_real_file() {
+        let dir = std::env::temp_dir().join("nanna-msys-path-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("real.txt");
+        std::fs::write(&file, b"x").expect("write probe file");
+
+        // Exactly what `pwd`/`realpath` hand back for this file.
+        let native = file.to_string_lossy().replace('\\', "/");
+        let msys = format!("/{}{}", &native[..1].to_lowercase(), &native[2..]);
+
+        let workdir = std::path::PathBuf::from("D:/Development/some-workspace");
+        let resolved = NannaBridge::resolve_path_with_workdir(&msys, Some(&workdir));
+
+        assert_eq!(
+            resolved, file,
+            "the shell-printed path {msys} must resolve back to the file it names,              not be joined onto the workspace"
+        );
+
+        std::fs::remove_file(&file).ok();
+    }
 
     // ---------------------------------------------------------------------
     // Tree-kill: the timeout path must reap the shell AND its grandchildren.

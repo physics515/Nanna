@@ -25,7 +25,13 @@ export default {
       input.command = input.cmd || input.script || input.shell || input.bash_command || input.shell_command;
     }
     if (!input.command) {
-      return { content: "Error: Missing required parameter: command", success: false };
+      // Every other file-touching skill names itself, says nothing ran, and
+      // lists what it accepts. This one did none of those, so a model that
+      // passed the wrong key learned nothing about which keys work.
+      return {
+        content: "exec: no command given, so nothing ran. Pass the command as `command` (also accepted: cmd, script, shell, bash_command, shell_command), e.g. exec({command: \"ls -la\"}).",
+        success: false
+      };
     }
 
     // Guard events are logged at INFO so they can be audited from the

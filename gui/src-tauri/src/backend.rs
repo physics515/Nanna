@@ -304,6 +304,25 @@ impl Backend {
                             "window": window,
                         }));
                     }
+                    DaemonEvent::LivenessBeat {
+                        session_id, elapsed_s, phase, awaiting, quiet_s, step_index, last_tool, beat,
+                    } => {
+                        // Forwarded whole rather than reduced to a spinner
+                        // flag: the badge's job is to say what the turn is
+                        // waiting on, and every field here is part of that
+                        // sentence. Nulls stay null — "not reported" and
+                        // "zero seconds" are different claims.
+                        let _ = app.emit("liveness-beat", serde_json::json!({
+                            "session_id": session_id,
+                            "elapsed_s": elapsed_s,
+                            "phase": phase,
+                            "awaiting": awaiting,
+                            "quiet_s": quiet_s,
+                            "step_index": step_index,
+                            "last_tool": last_tool,
+                            "beat": beat,
+                        }));
+                    }
                     DaemonEvent::TaskRunStarted { scope, scope_id, goal } => {
                         let _ = app.emit("task-event", serde_json::json!({
                             "kind": "run_started",

@@ -640,24 +640,113 @@ impl MemoryService {
         }
     }
 
+    /// Persist `content` with NO vector — the queued-for-backfill state.
+    ///
+    /// Taken when no vector can be produced at all: no embedding provider is
+    /// configured (a fresh install), or every configured provider failed. The
+    /// alternative was to return the error BEFORE any insert, which made the
+    /// daemon's own capability notice a lie — it tells the model "memory and
+    /// tool-result writes still SUCCEED and are stored in full … queued for
+    /// embedding backfill" at the exact moment nothing was stored and nothing
+    /// was queued. Losing a vector costs temporary searchability; losing the
+    /// write cost the memory. That is already this file's stated rule for a
+    /// width race (`resolve_entry_vectors`) and the store already declares
+    /// an empty active embedding legal — "it is the queued-for-backfill
+    /// state" — so this reaches the same state by the same door the backfill
+    /// already drains.
+    ///
+    /// The neighbour-dedup search is SKIPPED, not approximated: it is a vector
+    /// search and there is no query vector. So a burst of near-identical
+    /// writes during an outage lands as its own rows rather than folding.
+    /// That is the correct trade here and it is not permanent — squeezing the
+    /// store is dreaming's job, done later with the whole corpus in view.
+    ///
+    /// The id carries the `source_id` handle whenever one was stamped, exactly
+    /// as [`Self::remember_scoped`] does — and it matters MORE here, because a
+    /// row with no vector cannot be reached by similarity at all, so the
+    /// handle is its only address until the backfill embeds it.
+    async fn store_unembedded(
+        &self,
+        content: &str,
+        metadata: HashMap<String, String>,
+        fsrs: FsrsState,
+        workspace_id: Option<String>,
+        reason: &str,
+    ) -> Result<(String, IngestAction), MemoryError> {
+        let id = match metadata.get("source_id") {
+            Some(source_id) => format!("{source_id}-{}", uuid::Uuid::new_v4()),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        let entry = MemoryEntry {
+            id: id.clone(),
+            content: content.to_string(),
+            // No model stamp and no bucket: nothing produced this text's
+            // vector, so claiming a model would bind the row to a space it was
+            // never in. This is the same triple `resolve_entry_vectors`
+            // returns when it discards a raced vector.
+            embedding_model: None,
+            embeddings: HashMap::new(),
+            embedding: Vec::new(),
+            metadata,
+            timestamp: chrono_timestamp(),
+            fsrs,
+            workspace_id,
+        };
+
+        self.store.add(entry).await?;
+        // The row is durable and honest, but nothing drains it until the next
+        // BINDING event: the daemon's unconditional drain runs when a model is
+        // bound (daemon start, provider switch, width reprobe), and a switch
+        // handler drains after a switch. A row parked here by a TRANSIENT
+        // provider failure therefore stays unsearchable for the rest of the
+        // session, because no switch happened. It is recovered, not lost —
+        // but the latency is a session, not a moment, and closing that needs
+        // a drain trigger the memory crate does not own.
+        warn!(
+            "Stored without a vector ({}) — the write landed and is queued for embedding \
+             backfill: {} (id: {})",
+            reason,
+            truncate(content, 50),
+            id
+        );
+        Ok((id, IngestAction::Create))
+    }
+
     /// Smart ingest - handles duplicates via prediction error gating.
     ///
     /// Returns (id, action) where action is Reinforce/Update/Create.
     ///
     /// # Errors
     ///
-    /// Returns `MemoryError` if embedding or storage fails.
+    /// Returns `MemoryError` if storage fails. A missing or failing embedding
+    /// provider is NOT an error: the row is stored unembedded and queued for
+    /// backfill (see `store_unembedded`).
     pub async fn smart_ingest(
         &self,
         content: &str,
         metadata: HashMap<String, String>,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+        let Some(embed_fn) = self.embed_fn.as_ref() else {
+            return self
+                .store_unembedded(
+                    content,
+                    metadata,
+                    FsrsState::new(),
+                    None,
+                    "no embedding provider is configured",
+                )
+                .await;
+        };
 
         // Generate embedding
-        let embedding = (embed_fn)(content)
-            .await
-            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        let embedding = match (embed_fn)(content).await {
+            Ok(embedding) => embedding,
+            Err(reason) => {
+                return self
+                    .store_unembedded(content, metadata, FsrsState::new(), None, &reason)
+                    .await;
+            }
+        };
 
         // Check for similar existing memories
         let results = self.store.search(&embedding, 1).await;
@@ -846,7 +935,9 @@ impl MemoryService {
     ///
     /// # Errors
     ///
-    /// Returns `MemoryError` if no embedding function is configured or storage fails.
+    /// Returns `MemoryError` if storage fails. A missing or failing embedding
+    /// provider is NOT an error: the row is stored unembedded and queued for
+    /// backfill (see `store_unembedded`).
     pub async fn remember(
         &self,
         content: &str,
@@ -863,37 +954,53 @@ impl MemoryService {
     ///
     /// # Errors
     ///
-    /// Returns `MemoryError` if no embedding function is configured or storage fails.
+    /// Returns `MemoryError` if storage fails. A missing or failing embedding
+    /// provider is NOT an error: the row is stored unembedded and queued for
+    /// backfill (see `store_unembedded`).
     pub async fn remember_with_importance(
         &self,
         content: &str,
         metadata: HashMap<String, String>,
         importance: f32,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
-
-        // Truncate oversized content to avoid embedding model context overflow
-        // Most embedding models have 8192 token context; ~4 chars/token ≈ 30k chars safe limit
-        let content = if content.len() > 30_000 {
-            warn!("Truncating oversized memory content ({} chars) to 30000", content.len());
-            // `&content[..30_000]` panics unless 30_000 lands on a char boundary,
-            // and `len()` is BYTES while the message says "chars". Any memory
-            // whose 30_000th byte falls inside a multi-byte sequence took the
-            // process down — one box-drawing character in `tree` output, one
-            // emoji in a log line, one accented word. Walk back to a boundary.
-            let mut end = 30_000;
-            while end > 0 && !content.is_char_boundary(end) {
-                end -= 1;
-            }
-            &content[..end]
-        } else {
-            content
+        // Content is NOT truncated here. There used to be a 30,000-byte
+        // behead-and-store, justified as "avoid embedding model context
+        // overflow" — and it was wrong three ways. It silently destroyed the
+        // tail of a long note with no marker in the stored row, so the reader
+        // could not tell a whole memory from a beheaded one. It existed on
+        // this path only, never on `remember_scoped`, so whether a long note
+        // survived depended on whether a workspace happened to be active. And
+        // its justification is superseded: the embedder's window is handled
+        // where it actually applies — `EmbeddingClient::embed_one` shrinks and
+        // retries an over-long input, and the store chunks every entry's
+        // content at the ACTIVE model's derived window (`write_chunks`), so a
+        // long memory is retrievable by the chunk that answers the query even
+        // when its whole-row vector describes only a prefix.
+        let Some(embed_fn) = self.embed_fn.as_ref() else {
+            let mut fsrs = FsrsState::new();
+            fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+            return self
+                .store_unembedded(
+                    content,
+                    metadata,
+                    fsrs,
+                    None,
+                    "no embedding provider is configured",
+                )
+                .await;
         };
 
         // Generate embedding
-        let embedding = (embed_fn)(content)
-            .await
-            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        let embedding = match (embed_fn)(content).await {
+            Ok(embedding) => embedding,
+            Err(reason) => {
+                let mut fsrs = FsrsState::new();
+                fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+                return self
+                    .store_unembedded(content, metadata, fsrs, None, &reason)
+                    .await;
+            }
+        };
 
         // Check for similar existing memories (duplicate detection)
         let results = self.store.search(&embedding, 1).await;
@@ -1015,7 +1122,9 @@ impl MemoryService {
     ///
     /// # Errors
     ///
-    /// Returns `MemoryError` if no embedding function is configured or storage fails.
+    /// Returns `MemoryError` if storage fails. A missing or failing embedding
+    /// provider is NOT an error: the row is stored unembedded and queued for
+    /// backfill (see `store_unembedded`).
     pub async fn remember_scoped(
         &self,
         content: &str,
@@ -1023,12 +1132,31 @@ impl MemoryService {
         importance: f32,
         workspace_id: Option<String>,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+        let Some(embed_fn) = self.embed_fn.as_ref() else {
+            let mut fsrs = FsrsState::new();
+            fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+            return self
+                .store_unembedded(
+                    content,
+                    metadata,
+                    fsrs,
+                    workspace_id,
+                    "no embedding provider is configured",
+                )
+                .await;
+        };
 
         // Generate embedding
-        let embedding = (embed_fn)(content)
-            .await
-            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        let embedding = match (embed_fn)(content).await {
+            Ok(embedding) => embedding,
+            Err(reason) => {
+                let mut fsrs = FsrsState::new();
+                fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+                return self
+                    .store_unembedded(content, metadata, fsrs, workspace_id, &reason)
+                    .await;
+            }
+        };
 
         // Check for similar existing memories (within same scope)
         let results = self.store.search_scoped(&embedding, 1, workspace_id.as_deref()).await;
@@ -1204,6 +1332,27 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<Vec<RecallResult>, MemoryError> {
+        Ok(self.recall_scoped_with_coverage(query, workspace_id).await?.0)
+    }
+
+    /// [`recall_scoped`](Self::recall_scoped), plus what the scan could compare.
+    ///
+    /// An empty result set has three causes and only one of them is "nothing
+    /// matched": rows can exist that carry no vector this query can be scored
+    /// against (queued for backfill, or bound to a superseded model), and the
+    /// query itself can be the wrong width for the store's binding, in which
+    /// case no row was consulted at all. Reporting all three as an empty
+    /// answer tells the reader the store is empty of matches when it is
+    /// actually unreachable. See [`crate::SearchCoverage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured.
+    pub async fn recall_scoped_with_coverage(
+        &self,
+        query: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(Vec<RecallResult>, crate::SearchCoverage), MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let store_count = self.store.len().await;
@@ -1217,7 +1366,14 @@ impl MemoryService {
         info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
 
         // Scoped search
-        let results = self.store.search_scoped(&query_embedding, self.config.max_results * 2, workspace_id).await;
+        let (results, coverage) = self
+            .store
+            .search_scoped_with_coverage(
+                &query_embedding,
+                self.config.max_results * 2,
+                workspace_id,
+            )
+            .await;
         let min_score = self.get_min_score();
 
         // Chunk-level hits, collapsed to one per parent. A long memory whose
@@ -1315,7 +1471,20 @@ impl MemoryService {
         }
 
         debug!("Recall (scoped) '{}' found {} results", truncate(query, 30), filtered.len());
-        Ok(filtered)
+        // An answer of nothing, given from a scan that could not read most of
+        // the store, is worth a WARN even when the caller discards the
+        // coverage: it is the shape of the blackout, not of a miss.
+        if filtered.is_empty() && !coverage.is_complete() {
+            warn!(
+                "Recall '{}' answered empty from an incomplete scan: {} of {} memories \
+                 were comparable (query width matches binding: {})",
+                truncate(query, 30),
+                coverage.comparable,
+                coverage.total,
+                coverage.query_width_matches
+            );
+        }
+        Ok((filtered, coverage))
     }
 
     /// How many FSRS testing-effect reviews are queued and not yet applied.
@@ -2455,13 +2624,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A fresh install has no embedding provider, and the daemon tells the
+    /// model its writes "still SUCCEED and are stored in full — queued for
+    /// embedding backfill". That has to be TRUE: the write lands, unembedded.
+    /// It used to return before any insert, so the notice was a lie and the
+    /// content was gone.
     #[tokio::test]
-    async fn test_memory_service_no_embed() {
+    async fn a_write_without_an_embedding_provider_still_lands() {
         let service = MemoryService::new(MemoryServiceConfig::default());
 
-        // Should fail without embed function
-        let result = service.remember("test", HashMap::new()).await;
-        assert!(result.is_err());
+        let id = service
+            .remember("the kitchen tap drips", HashMap::new())
+            .await
+            .expect("a missing provider costs searchability, never the write");
+
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert_eq!(stored.content, "the kitchen tap drips");
+        assert!(
+            stored.embedding.is_empty() && stored.embeddings.is_empty(),
+            "no vector was produced, so none may be claimed — this is the \
+             queued-for-backfill state"
+        );
+        assert!(
+            stored.embedding_model.is_none(),
+            "an unembedded row must not be stamped with a model it was never embedded by"
+        );
     }
 
     /// The user-reported bug: with no embedding provider, `recall` failed with
@@ -2497,22 +2684,149 @@ mod tests {
         );
     }
 
-    /// Every embed-dependent entry point should report the same actionable
-    /// condition, not just `recall` — the reporter hit it through `recall`, but
-    /// `remember` is the same latent trap.
+    /// `recall` and `remember` are NOT symmetric, and conflating them is what
+    /// lost writes. A recall genuinely cannot run without a provider — there
+    /// is no query vector, so it must name the condition. A remember can
+    /// always run: the content is the thing worth keeping, and the vector is
+    /// an index over it that the backfill can rebuild.
     #[tokio::test]
-    async fn remember_without_an_embedding_provider_uses_the_same_variant() {
+    async fn a_missing_provider_stops_recall_but_never_a_write() {
         let service = MemoryService::new(MemoryServiceConfig::default());
 
         let err = service
-            .remember("test", HashMap::new())
+            .recall("anything")
             .await
-            .expect_err("remember cannot run without an embedding provider");
-
+            .expect_err("recall cannot run without an embedding provider");
         assert!(
             matches!(err, MemoryError::NoEmbeddingProvider),
             "expected the dedicated variant, got: {err:?}"
         );
+
+        service
+            .remember("test", HashMap::new())
+            .await
+            .expect("the write path has no such excuse");
+    }
+
+    /// The other half of the same lie: a provider IS configured, and every one
+    /// of them fails. The daemon raises the identical "stored in full — queued
+    /// for embedding backfill" notice, so the row has to be there afterwards.
+    ///
+    /// The scoped path is the one the daemon's `memory.store` service and the
+    /// tool-result capture both use, and it is the path that issues handles.
+    #[tokio::test]
+    async fn a_failed_embedding_stores_the_row_and_keeps_its_handle() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Err("every provider is down".to_string()) })
+        });
+        let service = MemoryService::new(MemoryServiceConfig::default()).with_embed_fn(embed);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("source_id".to_string(), "deadbeef".to_string());
+        let (id, action) = service
+            .remember_scoped("the whole tool result", metadata, 3.0, Some("ws".into()))
+            .await
+            .expect("a dead provider costs searchability, never the write");
+
+        assert_eq!(action, IngestAction::Create);
+        assert!(
+            id.starts_with("deadbeef-"),
+            "a row with no vector is unreachable by similarity, so the handle \
+             is its only address: {id}"
+        );
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert_eq!(stored.content, "the whole tool result");
+        assert_eq!(stored.workspace_id.as_deref(), Some("ws"));
+        assert!(
+            stored.embedding.is_empty() && stored.embeddings.is_empty(),
+            "queued for backfill: no vector claimed under any model"
+        );
+    }
+
+    /// The two halves meet. A write that lost its vector is kept and queued —
+    /// and the recall that cannot yet see it must say so, because "no memories
+    /// found matching X" is the same sentence a genuine miss uses, and a
+    /// reader who believes it stops looking.
+    #[tokio::test]
+    async fn a_queued_write_is_reported_as_unsearchable_not_as_a_miss() {
+        use std::sync::Arc;
+
+        // One embedder, two eras: down while the memory is written, back up by
+        // the time it is searched for.
+        let down = Arc::new(AtomicUsize::new(1));
+        let flag = down.clone();
+        let embed: EmbedFn = Arc::new(move |_text: &str| {
+            let is_down = flag.load(Ordering::SeqCst) == 1;
+            Box::pin(async move {
+                if is_down {
+                    Err("every provider is down".to_string())
+                } else {
+                    Ok(vec![1.0_f32, 0.0, 0.0])
+                }
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        service
+            .remember("the kitchen tap drips", HashMap::new())
+            .await
+            .expect("the write lands even with no vector");
+
+        down.store(0, Ordering::SeqCst);
+        let (results, coverage) = service
+            .recall_scoped_with_coverage("anything at all", None)
+            .await
+            .expect("recall runs once a provider answers");
+
+        assert!(results.is_empty(), "the queued row cannot be scored yet");
+        assert_eq!(coverage.total, 1);
+        assert_eq!(coverage.comparable, 0, "nothing in the store was consulted");
+        assert!(coverage.query_width_matches);
+        assert!(
+            !coverage.is_complete(),
+            "so this empty answer is a blackout, not a miss — and must not be \
+             reported with the same words"
+        );
+    }
+
+    /// Oversized content is stored WHOLE. It used to be beheaded at 30,000
+    /// bytes on this path and only this one, with no marker in the row, so a
+    /// long note's survival depended on whether a workspace happened to be
+    /// active. The embedder's window is handled by chunking and by the client's
+    /// own shrink-and-retry, not by destroying the memory.
+    #[tokio::test]
+    async fn an_oversized_memory_is_stored_whole() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        // A tail that only exists past the old cut, so a beheaded row cannot
+        // fake this by accident.
+        let content = format!("{}TAIL", "x".repeat(40_000));
+        let (id, _) = service
+            .remember_with_importance(&content, HashMap::new(), 3.0)
+            .await
+            .expect("storing a long memory is not a failure");
+
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert_eq!(
+            stored.content.len(),
+            content.len(),
+            "every byte handed in is a byte stored"
+        );
+        assert!(stored.content.ends_with("TAIL"), "the tail survived");
     }
 
     #[test]
