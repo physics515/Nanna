@@ -407,6 +407,84 @@ resolution bug in the bucket router) — every leg's compressed context was degr
 the weakest model, making these numbers a floor. 27 improvement levers survived
 adversarial review; all are chat-general per the owner rule. See ROADMAP P23.
 
+**GUI-path series, post-P23 rerun (2026-08-15/16).** The same ladder on
+v0.3.8-beta.13 carrying the complete P23 program (PR #237, 27 levers). Same protocol as
+the post-P22 series — installed release daemon, fresh read-only workspace per leg, all
+four model priorities IPC-pinned and read back, `num_ctx=16384` verified from the
+daemon's latch line, quiesce + prior-model unload between legs, liveness-gated 15-minute
+polls — with two changes. **(1) Scoring is hermetic per-test** (each test in its own temp
+dir), closing the order-coupled residue that hid qwen's doctored spec last series.
+**(2) The interjection policy was tightened**: no interjection on first idle, only when
+the run is idle *and* flat across two consecutive polls *and* `m<220`, and **every one is
+recorded as a P23 miss** — because P23's reseed lever is supposed to internalise exactly
+what an interjection supplies.
+
+| Model | post-P22 peak / final | P23 peak | P23 final | Interj. | Δ peak / Δ final |
+|---|---|---|---|---|---|
+| ornith:latest | 30 @135m / 0 | **40/42 @ 212m** | **36/42** | 0 | **+10 / +36** |
+| qwen3.5:9b | 41 @65m / 0 | 26/42 @ 49m | **26/42** | 0 | −15 / **+26** |
+| gemma4:e4b-it-qat | 16 @161m / 16 | 11/42 @ 102m | 5/42 | 0 | −5 / −11 |
+| ministral-3:8b | 4 @123m / 4 | *INVALID (daemon panic @116m)* | — | 0 | — |
+| lfm2.5 | 0 / 0 | 0/42 | 0/42 | 2 (both MISSES) | none (floor) |
+
+**The headline is the final column, which is what P23 targeted.** Post-P22 the two
+strongest models peaked high and ended at **zero** — the peak was built and then
+rewritten away across the continuation boundary. Post-P23 ornith holds 36 of its 40 and
+qwen ends *exactly at* its peak, both with **zero interjections**. ornith's 40 also beats
+its all-time headless record (37) on the chat path. Three legs ran destruction-free
+end-to-end without a human touching them, which is the behaviour the 27 levers were
+built to produce.
+
+Two honest negatives. **qwen's peak is 15 lower** — not a regression: last series' 41 was
+inflated by the model `chmod +w`-ing and doctoring `test_40.sh`, which the pristine
+hermetic scorer no longer credits, and this leg wrote nothing to `tests/` at all.
+**gemma regressed on both axes** (16/16 → 11/5): it broke its own script three times, each
+time repairing *unaided* (0→10, 1→11, 0→9 — last series the equivalent hole needed a
+human nudge), then lost ground to a fourth, different failure at m=231.
+
+**Findings this series (all chat-general; queued, not implemented mid-series).**
+(a) **The dominant destruction channel is not shrinkage.** Every collapse across gemma
+and ministral arrived as an *in-place splice* leaving the file the same size or **larger**
+(ministral 2542→3389 bytes while breaking). The byte floor guards shrinkage and is
+structurally blind to this; it refused every gutting attempt it *could* see.
+(b) **Park by verified score, not by recency.** `.__prev__` holds the previous write, so
+after a bad write it holds whatever came just before — observed as a *broken* file
+(ministral), a *stale* 9-point file (gemma), the copied spec, and a 0-byte file.
+Four instances, zero recovery value. Naming the parked copy in the structural verdict
+would also help: all three of gemma's repairs were from-scratch rewrites.
+(c) **`is_running` is the wrong staleness signal.** Ministral ran 38 minutes with steps
+completing normally and the artifact untouched, because every `edit_file` was *rejected*
+("old_string not found … the file's real content differs from your memory") after a
+splice desynced the model's context from disk. "Artifact unchanged across two polls while
+steps still complete" is the observable worth acting on.
+(d) **The reseed is wired to a signal that reads empty in its own trigger case.**
+lfm2.5 ended dry having verified 0/42 with 35 items abandoned — yet `unmet=0`, so
+`chat_harness.rs:1166`'s `abandoned_unmet.is_empty()` guard correctly declined to arm.
+`unmet` derives from task done-conditions, not the environment's verdicts. Arming it off
+the failing verdicts (already re-read each turn for the ARTIFACT STATE block) closes it.
+(e) **New class — spec-into-artifact copy.** lfm2.5 wrote a near-verbatim copy of
+`tests/test_01.sh` into `minidb`, making the artifact self-recursive. The read-only guard
+protects the spec *from* the artifact but not the artifact *from* the spec; the content
+is available at write time.
+
+**One crash, and it is a real bug.** The ministral leg is INVALID because the daemon
+**panicked and exited** at m=116: `context.rs:1838` byte-slices a dropped tool result with
+`&content[..80]`, and byte 80 landed inside an em dash **in nanna's own `edit_file` error
+text**. Self-inflicted; `context.rs:1827` carries the same defect at `..100`. Same class as
+the 2026-08-10 `&text[..200]` distillation panic, recurring in a new file — and the
+codebase uses em dashes freely in tool errors, so the input is not exotic. The P22 Tier 4
+**exit-reason file named the cause instantly**, which is the only reason this is a
+one-line diagnosis instead of an unexplained disappearance.
+
+Levers observed working: MissionEnd (one cumulative line, honest counts —
+`items_completed=0 items_abandoned=35`, no pretence of success); repeat-done escalation
+(fired on both lfm2.5 repeats, counter 1 then 2, each stated in the transcript);
+structural shrink holds and byte-floor refusals (4 blocked destructive writes on ornith
+alone); truthful tool acks (**zero** phantom python-registry saves all series, against 201
+in the post-P22 gemma leg); read-only ladder held in every leg.
+
+Ledgers, per-poll history, per-leg summaries: `D:/Development/nanna-bench/p23-run-*/`.
+
 ---
 
 ## Suite 1 — Inference (not yet baselined)

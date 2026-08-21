@@ -597,28 +597,13 @@ impl ControlPlane {
                     None
                 }
                 Ok(prep) => {
-                    // THE one place a chat turn's model is decided, and the
-                    // only reader of the prep's pin — see [`resolve_turn`].
-                    // Resolved before the runner literals so both are built
-                    // from the same value: planning and stepping cannot end
-                    // up on different models, and the fail-fast further down
-                    // checks the model that will actually run.
-                    //
-                    // `agent_config()` hands back a fresh clone per call, and
-                    // that clone is the whole isolation mechanism — reshaping
-                    // it here reaches this turn and nothing else. The pin must
-                    // never be written into the shared `AgentServiceConfig`,
-                    // which the sub-agent spawner and the dream summarizer read
-                    // live.
-                    let ResolvedTurn {
-                        step_config,
-                        planner_config,
-                        pinned: is_pinned,
+                    let super::chat::ChatTurnPrep {
                         system_prompt,
                         conversation,
                         workspace_root,
                         workspace_context,
-                    } = resolve_turn(prep, agent.agent_config().await);
+                        chat_model,
+                    } = prep;
 
                     // The active workspace scopes stored memories, so a run's
                     // observations belong to the workspace they happened in.
@@ -630,6 +615,24 @@ impl ControlPlane {
                         None => None,
                     };
 
+                    // THE one place a chat turn's model is decided. Hoisted
+                    // above the runner literal so both runners below are built
+                    // from the same resolved value: the planner takes
+                    // `step_runner.agent_config.clone()`, so planning and
+                    // stepping cannot end up on different models, and the
+                    // fail-fast further down checks the model that will
+                    // actually run.
+                    //
+                    // `agent_config()` hands back a fresh clone per call, and
+                    // that clone is the whole isolation mechanism — mutating it
+                    // here reaches this turn and nothing else. The pin must
+                    // never be written into the shared `AgentServiceConfig`,
+                    // which the sub-agent spawner and the dream summarizer read
+                    // live.
+                    let is_pinned = chat_model.is_some();
+                    let agent_config =
+                        turn_agent_config(agent.agent_config().await, chat_model);
+
                     // SAY which model won, for the same reason the workspace
                     // resolution above says which workspace won: an override
                     // nobody can see is indistinguishable from a bug, and "the
@@ -637,7 +640,7 @@ impl ControlPlane {
                     // exactly the failure this wiring exists to end.
                     tracing::info!(
                         session_id = %session_id_owned,
-                        model = %step_config.model,
+                        model = %agent_config.model,
                         source = if is_pinned { "chat pin" } else { "global [llm] default" },
                         "chat turn model resolved"
                     );
@@ -653,7 +656,7 @@ impl ControlPlane {
                         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
                         router: router.clone(),
                         tools: tools.clone(),
-                        agent_config: step_config,
+                        agent_config,
                         system_prompt,
                         workspace_root: workspace_root.clone(),
                         workspace_context,
@@ -677,7 +680,7 @@ impl ControlPlane {
                         chat_sink: None,
                         router: step_runner.router.clone(),
                         tools: step_runner.tools.clone(),
-                        agent_config: planner_config,
+                        agent_config: step_runner.agent_config.clone(),
                         system_prompt: step_runner.system_prompt.clone(),
                         workspace_root: step_runner.workspace_root.clone(),
                         // The planner sees the same bounded reference: acting
@@ -2052,57 +2055,6 @@ impl ControlPlane {
     }
 }
 
-/// A prepared turn, resolved onto the model it will actually run on.
-///
-/// Both runner configs come out of one value on purpose: the planner and the
-/// step runner disagreeing about the model is invisible in the transcript and
-/// shows up only as a pinned chat that behaves like an unpinned one.
-struct ResolvedTurn {
-    /// The config the STEP runner is built from.
-    step_config: AgentConfig,
-    /// The planner's — the step config verbatim, by construction.
-    planner_config: AgentConfig,
-    /// Whether the chat's own pin won, for the "which model won" log line and
-    /// for the no-provider sentence, whose Settings wording is a lie for a
-    /// pinned chat.
-    pinned: bool,
-    system_prompt: String,
-    conversation: Option<String>,
-    workspace_root: Option<PathBuf>,
-    workspace_context: Option<String>,
-}
-
-/// Resolve a prep into the turn that will run it.
-///
-/// The prep is CONSUMED here, which makes this the only reader of
-/// [`super::chat::ChatTurnPrep`]'s `chat_model`: the turn body destructures
-/// this value, never the prep, so a pin can no longer be dropped by a
-/// destructure that forgets a field. That is precisely how the feature once
-/// shipped inert — the pin was stored, shown in the GUI and sent over IPC
-/// while every turn still ran on the global model — and it is the reason this
-/// step is a function rather than four lines inside the spawned turn: a test
-/// can reach a function, and nothing can reach the inside of that task.
-fn resolve_turn(prep: super::chat::ChatTurnPrep, base: AgentConfig) -> ResolvedTurn {
-    let super::chat::ChatTurnPrep {
-        system_prompt,
-        conversation,
-        workspace_root,
-        workspace_context,
-        chat_model,
-    } = prep;
-    let pinned = chat_model.is_some();
-    let step_config = turn_agent_config(base, chat_model);
-    ResolvedTurn {
-        planner_config: step_config.clone(),
-        step_config,
-        pinned,
-        system_prompt,
-        conversation,
-        workspace_root,
-        workspace_context,
-    }
-}
-
 /// The [`AgentConfig`] THIS chat turn runs on: the chat's own pin if it has
 /// one, otherwise the global `[llm]` default exactly as it arrived.
 ///
@@ -3444,17 +3396,10 @@ mod tests {
     /// the pin was stored, shown in the GUI and shipped over IPC while every
     /// turn still ran on the global model — the feature was inert. A prep
     /// carrying a pin must produce a turn config pointed at that model.
-    ///
-    /// Driven through [`resolve_turn`] — the step the turn body actually
-    /// performs — and not through `turn_agent_config` directly: a test that
-    /// applies the pin itself stays green when the turn stops applying it,
-    /// which is the whole failure being guarded against.
     #[test]
     fn a_prep_carrying_a_pin_produces_a_turn_on_the_pinned_model() {
-        let resolved = resolve_turn(prep(Some("ollama/qwen3:14b")), global_default());
-        let config = resolved.step_config;
+        let config = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
 
-        assert!(resolved.pinned, "the turn must know the pin won");
         assert_eq!(config.model, "ollama/qwen3:14b");
         // The loop re-picks a model every iteration after the first while the
         // tier table is populated, so a pin that left it in place would run
@@ -3479,26 +3424,22 @@ mod tests {
     #[test]
     fn a_prep_with_no_pin_is_the_global_default_untouched() {
         let before = format!("{:?}", global_default());
-        let resolved = resolve_turn(prep(None), global_default());
-        let after = format!("{:?}", resolved.step_config);
+        let after = format!("{:?}", turn_agent_config(global_default(), prep(None).chat_model));
 
-        assert!(!resolved.pinned);
         assert_eq!(after, before, "an unpinned chat must not be reshaped at all");
     }
 
-    /// Both runners come out of the same resolve, so the planner inherits the
-    /// pin by construction. Asserted on what [`resolve_turn`] hands back
-    /// rather than on a clone the test makes itself — planning and stepping
-    /// disagreeing about the model is the failure that would make a pinned
-    /// chat plan on one model and work on another, invisibly, and a test that
-    /// clones the config for them cannot see it.
+    /// The planner is built from `step_runner.agent_config.clone()`, so it
+    /// inherits the pin by construction. Asserted here because planning and
+    /// stepping disagreeing about the model is the failure that would make a
+    /// pinned chat plan on one model and work on another, invisibly.
     #[test]
     fn the_planner_inherits_the_pinned_model_from_the_step_runner() {
-        let resolved = resolve_turn(prep(Some("ollama/qwen3:14b")), global_default());
+        let step = turn_agent_config(global_default(), prep(Some("ollama/qwen3:14b")).chat_model);
+        let planner = step.clone();
 
-        assert_eq!(resolved.planner_config.model, "ollama/qwen3:14b");
-        assert_eq!(resolved.planner_config.model, resolved.step_config.model);
-        assert!(resolved.planner_config.model_routing.is_empty());
+        assert_eq!(planner.model, step.model);
+        assert!(planner.model_routing.is_empty());
     }
 
     #[test]

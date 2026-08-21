@@ -474,20 +474,30 @@ export default {
         // Best-effort.
       }
     }
-    // True when the file's content has NOT changed since the session last
-    // saw it. Unknown → true (fail open). stat.modified is whole seconds
-    // and truncates, which biases sub-second races toward "seen" — the open
-    // direction.
-    function seenSinceLastChange(path) {
+    // Has the session seen this file's CURRENT content? Three verdicts,
+    // because the shrink hold below fires for two DIFFERENT reasons and a
+    // reply that states the wrong one is a lie the model then reasons from:
+    //   "seen"  — a mark exists and is at least as new as the file's mtime.
+    //             Unknown → "seen" (fail open).
+    //   "stale" — a mark exists but predates the mtime: the file really did
+    //             change since the session last read it.
+    //   "never" — no mark at all: the session has never read this file.
+    // The hold is identical for both non-"seen" verdicts (you cannot shrink
+    // what you have not seen) and so is the way forward, but telling a model
+    // its copy went stale when it never had one sends it hunting for a change
+    // that never happened — and these replies are read literally by 9B-class
+    // local models. stat.modified is whole seconds and truncates, which
+    // biases sub-second races toward "seen" — the open direction.
+    function readSeenVerdict(path) {
       try {
         var st = Nanna.stat(path);
-        if (!st || typeof st.modified !== "number" || !isFinite(st.modified)) return true;
+        if (!st || typeof st.modified !== "number" || !isFinite(st.modified)) return "seen";
         var entry = readmarkLoad()[hiwaterKey(path)];
         var at = entry && typeof entry.at === "number" && isFinite(entry.at) ? entry.at : 0;
-        if (at === 0) return false; // never recorded as seen
-        return at >= st.modified * 1000;
+        if (at === 0) return "never";
+        return at >= st.modified * 1000 ? "seen" : "stale";
       } catch (e) {
-        return true;
+        return "seen";
       }
     }
 
@@ -783,34 +793,43 @@ export default {
       var ECHO_MAX = 65536;
 
       // P22 Tier 3: you cannot shrink what you have not seen. A shrinking
-      // whole-file write over a file whose content CHANGED since the session
-      // last read it is a rewrite from a stale context copy — the commonest
-      // way an assistant destroys a file: it saw the file twenty messages
-      // ago, the history got compacted, and it confidently rewrites from
-      // memory (2026-08-10 qwen: a fresh step wrote 2449 bytes over a
-      // 5598-byte artifact with 22 checks passing, zero reads in the step;
-      // the score fell to 1/42). Not a refusal: the reply carries the file's
-      // CURRENT content to merge against, counts itself as the read, and the
-      // next attempt proceeds. One bounce, with the missing information.
-      if (fileExists && !hiwaterExempt(hwKeyGuard) && bytes < existingSize &&
-          typeof existing === "string" && !seenSinceLastChange(filePath)) {
+      // whole-file write over a file the session has never read, or whose
+      // content CHANGED since it last read it, is a rewrite from a copy that
+      // does not match the disk — the commonest way an assistant destroys a
+      // file: it saw the file twenty messages ago, the history got compacted,
+      // and it confidently rewrites from memory (2026-08-10 qwen: a fresh
+      // step wrote 2449 bytes over a 5598-byte artifact with 22 checks
+      // passing, zero reads in the step; the score fell to 1/42). Not a
+      // refusal: the reply carries the file's CURRENT content to merge
+      // against, counts itself as the read, and the next attempt proceeds.
+      // One bounce, with the missing information.
+      // Evaluated only once the cheap conditions hold, so an ordinary write
+      // still costs no stat and no state read.
+      var seenVerdict = (fileExists && !hiwaterExempt(hwKeyGuard) && bytes < existingSize &&
+          typeof existing === "string") ? readSeenVerdict(filePath) : "seen";
+      if (seenVerdict !== "seen") {
+        // The reason clause, and ONLY the reason clause, differs between the
+        // two verdicts — the way forward below is the same either way.
+        var staleWhy = seenVerdict === "never"
+          ? "but you have NEVER read this file in this session — you are rewriting it from a copy you never saw, "
+          : "but the file has CHANGED since you last read it — your context copy is stale, ";
         if (existingSize <= ECHO_MAX) {
           readmarkPut(filePath);
-          glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; file changed since last recorded read)");
+          glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; read-mark verdict: " + seenVerdict + ")");
           return fail(
             "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
-            " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
-            "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
+            " from " + existingSize + " to " + bytes + " bytes, " + staleWhy +
+            "so this rewrite would silently destroy parts of the current file. " +
             "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
             "\n\nMerge your change INTO this current text and call write_file again with the full merged content " +
             "(or use edit_file for a targeted change). This reply counts as your read — the file will not be held for this reason again."
           );
         }
-        glog("write_file guard: stale-shrink hold (truncated echo) for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes)");
+        glog("write_file guard: stale-shrink hold (truncated echo) for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; read-mark verdict: " + seenVerdict + ")");
         return fail(
           "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
-          " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
-          "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
+          " from " + existingSize + " to " + bytes + " bytes, " + staleWhy +
+          "so this rewrite would silently destroy parts of the current file. " +
           "The file is too large (" + existingSize + " bytes) to echo here; its first lines are:\n\n" + existing.substring(0, 4096) +
           "\n\n[TRUNCATED — only the first 4096 of " + existingSize + " bytes shown; the file on disk is complete and unaffected.] " +
           "This truncated preview does NOT count as reading the file. Call read_file(\"" + filePath + "\") " +

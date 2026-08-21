@@ -90,6 +90,8 @@ interface SessionState {
   streamingThinking: string
   activeToolCalls: (ToolCallInfo & { status: 'started' | 'completed' | 'error' })[]
   liveTimeline: TimelineEntry[]
+  /** Last liveness beat for the turn in flight; `null` = none seen. */
+  liveness: LivenessBeat | null
   messageQueue: QueuedMessage[]
   lastError: string | null
   daemonQueueCount: number
@@ -120,17 +122,6 @@ interface SessionState {
    * that turn ends, because from then on the pin is simply what this chat uses.
    */
   chatModelPendingNextTurn: boolean
-  /**
-   * How many `set_session_model` requests this window still has out for this
-   * chat. A session LIST is the daemon's answer as of when it was fetched, so
-   * while a pin change is unanswered that list cannot know about it — seeding
-   * from it would put the old model back on screen and mark it KNOWN. Zero
-   * means nothing of ours is in flight and the daemon's answer is the newer
-   * of the two.
-   */
-  chatModelInFlight: number
-  /** Last liveness beat for the turn in flight; `null` = none seen. */
-  liveness: LivenessBeat | null
 }
 
 // Global state store - persists across component lifecycle
@@ -146,6 +137,7 @@ function getSessionState(sessionId: string): SessionState {
       streamingThinking: '',
       activeToolCalls: [],
       liveTimeline: [],
+      liveness: null,
       messageQueue: [],
       lastError: null,
       daemonQueueCount: 0,
@@ -154,8 +146,6 @@ function getSessionState(sessionId: string): SessionState {
       chatModel: null,
       chatModelKnown: false,
       chatModelPendingNextTurn: false,
-      chatModelInFlight: 0,
-      liveness: null,
     })
   }
   return sessionStates.get(sessionId)!
@@ -424,14 +414,13 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.liveTimeline = []
+      // A beat is an observation about the turn in flight; quoting it after
+      // the turn ends asserts activity nothing is performing.
+      state.value.liveness = null
       state.value.isLoading = false
       // The turn the pin could not reach is over, so the pin is no longer
       // waiting on anything — the next message resolves against it.
       state.value.chatModelPendingNextTurn = false
-      // Beats belong to the turn that produced them. Keeping the last one
-      // would have the badge go on reporting what a finished turn was
-      // waiting on.
-      state.value.liveness = null
     }
   }
 
@@ -447,11 +436,11 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.liveTimeline = []
+      state.value.liveness = null
       state.value.messageQueue = []
       state.value.lastError = null
       state.value.daemonQueueCount = 0
       state.value.chatModelPendingNextTurn = false
-      state.value.liveness = null
     }
   }
 
@@ -476,6 +465,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
     streamingThinking,
     activeToolCalls,
     liveTimeline,
+    liveness,
     messageQueue,
     lastError,
     daemonQueueCount,
@@ -483,7 +473,6 @@ export function useSessionState(sessionId: Ref<string | null>) {
     contextWindow,
     chatModel,
     chatModelPendingNextTurn,
-    liveness,
 
     // Computed
     hasActiveWork,
@@ -531,12 +520,6 @@ export function knownChatModel(sessionId: string): string | null | undefined {
  * changed in another window, which is the same staleness the other way round.
  */
 export function seedChatModel(sessionId: string, model: string | null) {
-  // ...EXCEPT while this window has a pin change of its own unanswered. The
-  // list was fetched at some point before the daemon replied, so it cannot
-  // carry a change the daemon has not confirmed yet; taking it would put the
-  // old model back on screen AND mark it known, which is worse than either
-  // half. The request's own outcome writes the truth when it lands.
-  if (chatModelChangesInFlight(sessionId) > 0) return
   // With no pin and no state for this chat there is nothing to correct — the
   // row already falls back to the list's own value — and creating an entry per
   // listed session would grow the map for chats never opened here.
@@ -544,27 +527,6 @@ export function seedChatModel(sessionId: string, model: string | null) {
   const state = getSessionState(sessionId)
   state.chatModel = model
   state.chatModelKnown = true
-}
-
-/** How many pin changes this window still has out for `sessionId`. */
-export function chatModelChangesInFlight(sessionId: string): number {
-  return sessionStates.get(sessionId)?.chatModelInFlight ?? 0
-}
-
-/**
- * Mark a `set_session_model` request as out for this chat. Counted rather than
- * flagged because a user can pick twice before the first answer arrives, and
- * the daemon's list only stops being stale once the LAST of them has settled.
- */
-export function beginChatModelChange(sessionId: string) {
-  getSessionState(sessionId).chatModelInFlight += 1
-}
-
-/** Mark one such request as settled — succeeded or refused, both are answers. */
-export function endChatModelChange(sessionId: string) {
-  const state = sessionStates.get(sessionId)
-  if (!state) return
-  state.chatModelInFlight = Math.max(0, state.chatModelInFlight - 1)
 }
 
 // Check if any session has active work

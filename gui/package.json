@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "type": "module",
   "private": true,
   "scripts": {
@@ -58,13 +58,13 @@
     "vuedraggable": "^4.1.0"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.12.1",
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/test-utils": "^2.4.11",
-    "happy-dom": "^20.11.1",
+    "happy-dom": "^20.11.2",
     "postcss": "^8.5.26",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
