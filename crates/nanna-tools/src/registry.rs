@@ -671,7 +671,21 @@ impl ToolRegistry {
         // `backstop_timeout` for why the backstop has to outlive whatever the
         // tool enforces for itself.
         let result = if let Some(timeout_secs) = tool.timeout_secs() {
-            let backstop = backstop_timeout(timeout_secs, &parameters);
+            // Only a tool that DECLARES a timeout parameter may have its
+            // caller extend the outer net. Passing the raw arguments for every
+            // tool let a stray `timeout` key stretch the backstop past the
+            // ceiling of a tool that cannot honour it — the safety net is the
+            // declared ceiling for those, not whatever the caller typed.
+            let declares_timeout = tool
+                .definition()
+                .parameters
+                .iter()
+                .any(|p| p.name == "timeout");
+            let backstop = if declares_timeout {
+                backstop_timeout(timeout_secs, &parameters)
+            } else {
+                backstop_timeout(timeout_secs, &HashMap::new())
+            };
             match tokio::time::timeout(backstop, tool.execute(parameters.clone())).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => {

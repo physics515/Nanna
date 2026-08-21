@@ -922,8 +922,19 @@ impl AgentContext {
     /// which is the same statement with no interval budget to spend.
     #[must_use]
     pub fn preamble_room_target(&self) -> usize {
-        self.hard_limit
-            .saturating_sub(self.step_frame_tokens() + self.growth.max_observed_growth)
+        // The system prompt is charged by `estimate_tokens`, so it has to be
+        // deducted here too or the target does not satisfy the predicate it
+        // exists to satisfy. Omitting it left the request at roughly
+        // `hard_limit + system - growth` after a "successful" elision, so
+        // whenever the system prompt outweighs measured growth — routine here,
+        // where it carries workspace context and tool guidance — the caller
+        // fell straight through to deleting messages anyway, which is the
+        // outcome eliding the preamble exists to avoid.
+        self.hard_limit.saturating_sub(
+            estimate_tokens(&self.system_prompt)
+                + self.step_frame_tokens()
+                + self.growth.max_observed_growth,
+        )
     }
 
     /// Whether the preamble has ratcheted past the room the messages need.
@@ -995,8 +1006,17 @@ impl AgentContext {
              itself needs. Everything it described already happened and SUCCEEDED — \
              files on disk are the ground truth.]\n"
         );
-        self.consolidated_summary =
-            Some(format!("{notice}{head}{ELISION_MARKER}{tail}"));
+        let replacement = format!("{notice}{head}{ELISION_MARKER}{tail}");
+        // Never report an elision that made the preamble BIGGER. When the room
+        // left is smaller than the notice itself, head and tail both collapse
+        // to nothing and the "elided" summary is just the notice — which can
+        // be longer than the summary it replaced. `elide_by_lines` guards
+        // exactly this; this path had no equivalent and would return true
+        // while growing the thing it was asked to shrink.
+        if replacement.len() >= summary.len() {
+            return false;
+        }
+        self.consolidated_summary = Some(replacement);
         info!(
             original_chars = summary.len(),
             elided_chars = elided,

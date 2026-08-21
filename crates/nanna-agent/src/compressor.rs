@@ -583,6 +583,43 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    /// The GATE, not the helper it delegates to. Every other test here calls
+    /// `is_line_structured` / `elide_by_lines` directly, so removing the
+    /// short-circuit from `compress_with_priority` left them all green while
+    /// the wasted round-trip came back — and that round-trip (3.3-3.7 s a
+    /// time, burned on four of five models) is the entire point of the item.
+    ///
+    /// The client factory panics: reaching it at all means the gate is gone.
+    #[tokio::test]
+    async fn line_structured_content_never_reaches_a_model() {
+        let listing = (1..=200)
+            .map(|n| format!("{n:>4}	src/module_{n}.rs"))
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(
+            is_line_structured(&listing),
+            "fixture must be the shape the gate is for"
+        );
+
+        let out = compress_with_priority(&listing, 4, &["ollama/whatever".to_string()], |_| {
+            panic!("line-structured content must be reduced without a scoring round-trip")
+        })
+        .await;
+
+        let out = out.expect("the line reducer answers");
+        assert!(
+            out.len() < listing.len(),
+            "it must actually reduce: {} -> {}",
+            listing.len(),
+            out.len()
+        );
+        assert!(
+            out.contains('\n'),
+            "and reduce by whole LINES, not flatten the listing onto one"
+        );
+    }
+
     #[test]
     fn test_split_sentences() {
         let text = "This is a sentence. This is another sentence! And a third one? Yes.";

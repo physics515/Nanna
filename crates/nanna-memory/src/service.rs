@@ -694,6 +694,14 @@ impl MemoryService {
         };
 
         self.store.add(entry).await?;
+        // The row is durable and honest, but nothing drains it until the next
+        // BINDING event: the daemon's unconditional drain runs when a model is
+        // bound (daemon start, provider switch, width reprobe), and a switch
+        // handler drains after a switch. A row parked here by a TRANSIENT
+        // provider failure therefore stays unsearchable for the rest of the
+        // session, because no switch happened. It is recovered, not lost —
+        // but the latency is a session, not a moment, and closing that needs
+        // a drain trigger the memory crate does not own.
         warn!(
             "Stored without a vector ({}) — the write landed and is queued for embedding \
              backfill: {} (id: {})",

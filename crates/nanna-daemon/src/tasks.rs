@@ -4194,6 +4194,17 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
     folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
     folded.acceptance_unknown = segments.iter().map(|r| r.acceptance_unknown).sum();
+    // The naming lists concat too, or a run that abandoned work in an earlier
+    // segment reports a count with nothing behind it — the same "a number with
+    // no names" gap this list was added to close.
+    folded.abandoned_unmet = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unmet.iter().cloned())
+        .collect();
+    folded.abandoned_unverifiable = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unverifiable.iter().cloned())
+        .collect();
     // Union by id, newest verdict wins — same rule as the chat harness fold.
     folded.verified_outcomes = Vec::new();
     for segment in segments {

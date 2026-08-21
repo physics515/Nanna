@@ -987,6 +987,11 @@ impl ControlPlane {
                             report.items_completed += extra.items_completed;
                             report.items_already_satisfied += extra.items_already_satisfied;
                             report.items_abandoned += extra.items_abandoned;
+                            report.items_completed_unverified +=
+                                extra.items_completed_unverified;
+                            report.items_revived += extra.items_revived;
+                            report.replans += extra.replans;
+                            report.false_success_claims += extra.false_success_claims;
                             report.interjected_items += admitted + extra.interjected_items;
                             // Union by id, like the knowledge half below: a
                             // drain segment's dropped work must survive to the
@@ -1623,6 +1628,11 @@ impl ControlPlane {
                             report.items_completed += more.items_completed;
                             report.items_already_satisfied += more.items_already_satisfied;
                             report.items_abandoned += more.items_abandoned;
+                            report.items_completed_unverified +=
+                                more.items_completed_unverified;
+                            report.items_revived += more.items_revived;
+                            report.replans += more.replans;
+                            report.false_success_claims += more.false_success_claims;
                             report.interjected_items += more.interjected_items;
                             // Union by id: a round's sweep only re-checks the
                             // items THAT round abandoned, so earlier rounds'
