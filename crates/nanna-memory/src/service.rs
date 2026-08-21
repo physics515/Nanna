@@ -2413,8 +2413,7 @@ impl MemoryService {
         Fut: Future<Output = Result<String, String>> + Send,
     {
         let prompt = format!(
-            "{}\n\nOriginal memory:\n{}\n\nEnriched memory:",
-            CompressionLevel::Expand.summarization_prompt(),
+            "{SINGLE_MEMORY_ENRICHMENT_PROMPT}\n\nOriginal memory:\n{}\n\nEnriched memory:",
             memory.content
         );
 
@@ -2422,40 +2421,76 @@ impl MemoryService {
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
-        // Only update if expansion added meaningful content
-        if expanded.len() > memory.content.len() {
-            // Re-embed the enriched content so the vector matches it. Updating
-            // content alone (the old `update_content` path) left the embedding
-            // pointing at the pre-expansion text, so recall matched the stale
-            // vector and the enrichment made the memory *harder* to find — the
-            // opposite of expansion's intent. Mirror the merge path, which
-            // re-embeds via `update_content_and_embedding` to keep content and
-            // embedding consistent. A failed re-embed returns before any write,
-            // so content and embedding never diverge.
-            let embed_fn = self
-                .embed_fn
-                .as_ref()
-                .ok_or(MemoryError::NoEmbeddingProvider)?;
-            let embedding = (embed_fn)(&expanded)
-                .await
-                .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-            // CAS on the snapshot content: the summarize call above takes
-            // seconds, and enrichment of a stale snapshot must not overwrite
-            // what a live write stored in the meantime. A declined swap just
-            // skips this expansion; the next cycle expands the fresh text.
-            if self
-                .rewrite_with_binding(&memory.id, &expanded, embedding, Some(&memory.content))
-                .await?
-                .is_none()
-            {
-                debug!(
-                    "Expansion of {} skipped — the memory changed mid-expansion",
-                    memory.id
-                );
-                return Ok(());
-            }
-            debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
+        // Enrichment is ADDITIVE or it does not happen. Growth alone was the
+        // old test, and growth alone is not evidence: a model that drops a
+        // clause and pads the rest comes back longer while the memory is
+        // poorer, and this band holds the highest-weight memories in the
+        // store — exactly the ones least worth risking on a paraphrase.
+        //
+        // The guard is the same one the dedup fold uses to decide a merge is
+        // safe to commit (`merged.contains(incoming)`): the result must still
+        // contain what was there. Trimmed on the original only, because the
+        // model may legitimately add before or after it.
+        let original = memory.content.trim();
+        let is_additive = expanded.len() > memory.content.len() && expanded.contains(original);
+        if !is_additive {
+            debug!(
+                "Enrichment of {} declined — the result did not contain the original \
+                 ({} -> {} chars); the memory is unchanged",
+                memory.id,
+                memory.content.len(),
+                expanded.len()
+            );
+            return Ok(());
         }
+
+        // Re-embed the enriched content so the vector matches it. Updating
+        // content alone (the old `update_content` path) left the embedding
+        // pointing at the pre-expansion text, so recall matched the stale
+        // vector and the enrichment made the memory *harder* to find — the
+        // opposite of expansion's intent. Mirror the merge path, which
+        // re-embeds via `update_content_and_embedding` to keep content and
+        // embedding consistent. A failed re-embed returns before any write,
+        // so content and embedding never diverge.
+        let embed_fn = self
+            .embed_fn
+            .as_ref()
+            .ok_or(MemoryError::NoEmbeddingProvider)?;
+        let embedding = (embed_fn)(&expanded)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        // CAS on the snapshot content: the summarize call above takes
+        // seconds, and enrichment of a stale snapshot must not overwrite
+        // what a live write stored in the meantime. A declined swap just
+        // skips this expansion; the next cycle expands the fresh text.
+        if self
+            .rewrite_with_binding(&memory.id, &expanded, embedding, Some(&memory.content))
+            .await?
+            .is_none()
+        {
+            debug!(
+                "Expansion of {} skipped — the memory changed mid-expansion",
+                memory.id
+            );
+            return Ok(());
+        }
+
+        // The appended half is model-authored, so the entry now carries
+        // generated text and must never be fed to the summarizer — the same
+        // rule that keeps a summary from being re-summarized. `generation`
+        // is what records that, so enrichment raises it.
+        self.store
+            .update_fsrs(&memory.id, |fsrs| {
+                fsrs.generation = fsrs.generation.saturating_add(1);
+            })
+            .await?;
+
+        debug!(
+            "Enriched memory {}: {} -> {} chars (original preserved)",
+            memory.id,
+            memory.content.len(),
+            expanded.len()
+        );
 
         Ok(())
     }
@@ -2718,6 +2753,32 @@ fn resolve_entry_vectors(
     }
     (model, embedding, buckets)
 }
+
+/// The prompt for enriching ONE high-weight memory, as distinct from
+/// consolidating a cluster into one.
+///
+/// `expand_memory` used to reuse [`CompressionLevel::Expand`]'s
+/// `summarization_prompt`, and the two disagreed in a way that made the feature
+/// misfire. That text is written for a CLUSTER — "no longer than the material
+/// it replaces", where the material is several memories — while
+/// `expand_memory`'s acceptance test is `expanded.len() > original.len()`. So
+/// the instruction asked the model not to grow, and the code committed the
+/// result only when it HAD grown: the only enrichments that ever landed were
+/// the ones that disobeyed the prompt.
+///
+/// This asks for the shape the caller can actually verify, and the only shape
+/// that cannot lose anything: **reproduce the memory, then add beneath it**.
+/// Enrichment is then provably additive — `expand_memory` commits only when the
+/// result still contains the original — so a model that rewrites instead of
+/// appending is declined rather than allowed to replace a high-weight memory
+/// with a paraphrase of it.
+const SINGLE_MEMORY_ENRICHMENT_PROMPT: &str = "\
+This memory matters. Reproduce it EXACTLY as given, word for word, and then \
+below it add what it connects to: what caused it, what it resembles, what it \
+predicts, what is still unresolved. Do not reword, shorten, correct or \
+re-order the original text — it must appear in your answer unchanged, or your \
+answer will be discarded. Mark anything speculative as speculation. Never \
+invent facts.";
 
 fn is_episodic_memory(entry: &MemoryEntry) -> bool {
     entry.metadata.contains_key("source_id") || entry.metadata.contains_key("kind")
@@ -3067,6 +3128,117 @@ mod tests {
         );
         assert!(service.get("a").await.is_some(), "source a survives");
         assert!(service.get("b").await.is_some(), "source b survives");
+    }
+
+
+    /// A fixture for the enrichment path: `(service, seeded entry)` with a
+    /// constant embedder, so the tests below differ only in what the
+    /// summarizer returns.
+    async fn enrichment_fixture(content: &str) -> (MemoryService, MemoryEntry) {
+        let embed: EmbedFn = Arc::new(|_t: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+        let entry = dedup_entry("m", content, vec![1.0, 0.0, 0.0], None);
+        service.add_entry(entry.clone()).await.expect("seed");
+        (service, entry)
+    }
+
+    /// Growth alone was the old acceptance test, and growth alone is not
+    /// evidence: a model that drops a clause and pads the rest comes back
+    /// LONGER while the memory is poorer. This band holds the highest-weight
+    /// memories in the store, so a paraphrase is the worst thing to accept
+    /// there.
+    #[tokio::test]
+    async fn an_enrichment_that_rewrites_instead_of_adding_is_declined() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password, vault Ops";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+
+        // Strictly longer, and it has dropped "vault Ops".
+        let rewrite = "the deploy key is stored in a password manager somewhere in the \
+                       organisation, and the team knows where to find it when needed";
+        assert!(rewrite.len() > ORIGINAL.len(), "the fixture must clear the old test");
+
+        service
+            .expand_memory(&entry, &move |_p: String| async move {
+                Ok::<_, String>(rewrite.to_string())
+            })
+            .await
+            .expect("a declined enrichment is not an error");
+
+        let stored = service.get("m").await.expect("the memory is still there");
+        assert_eq!(stored.content, ORIGINAL, "the memory must be untouched");
+    }
+
+    /// The additive case commits — and raises `generation`, because the
+    /// appended half is model-authored. That is what keeps the enriched entry
+    /// out of the summarizer on a later cycle, the same rule that stops a
+    /// summary being re-summarized.
+    #[tokio::test]
+    async fn an_additive_enrichment_commits_and_marks_the_entry_model_authored() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password, vault Ops";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+        assert_eq!(entry.fsrs.generation, 0, "the fixture starts as raw material");
+
+        let enriched = format!("{ORIGINAL}\n\nConnects to: the rotation runbook, unresolved.");
+        service
+            .expand_memory(&entry, &move |_p: String| {
+                let enriched = enriched.clone();
+                async move { Ok::<_, String>(enriched) }
+            })
+            .await
+            .expect("expansion must succeed");
+
+        let stored = service.get("m").await.expect("the memory is still there");
+        assert!(stored.content.contains(ORIGINAL), "the original survives verbatim");
+        assert!(stored.content.len() > ORIGINAL.len(), "and something was added");
+        let row = service.store.get("m").await.expect("the row is in the store");
+        assert!(
+            row.fsrs.generation >= 1,
+            "an entry carrying model-authored text must not read as raw material"
+        );
+    }
+
+    /// The prompt and the acceptance test have to agree, and they did not: the
+    /// cluster prompt this path used to borrow says the result "should be no
+    /// longer than the material it replaces", while the code committed only
+    /// when it HAD grown — so the only enrichments that ever landed were the
+    /// ones that disobeyed the instruction.
+    #[tokio::test]
+    async fn the_enrichment_prompt_asks_for_what_the_guard_accepts() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+        let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+        let captured = Arc::clone(&seen);
+        service
+            .expand_memory(&entry, &move |p: String| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().await = p;
+                    Ok::<_, String>(String::new())
+                }
+            })
+            .await
+            .expect("an empty answer is declined, not an error");
+
+        let prompt = seen.lock().await.clone();
+        assert!(prompt.contains(ORIGINAL), "the memory is in the prompt");
+        assert!(
+            prompt.contains("Reproduce it EXACTLY"),
+            "the instruction must ask for the additive shape the guard accepts: {prompt}"
+        );
+        assert!(
+            !prompt.contains("no longer than the material it replaces"),
+            "the cluster instruction must not be borrowed here: {prompt}"
+        );
+        assert_eq!(
+            service.get("m").await.expect("still there").content,
+            ORIGINAL,
+            "an empty answer changes nothing"
+        );
     }
 
     #[tokio::test]

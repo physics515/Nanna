@@ -2061,6 +2061,29 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             is recoverable rather than merely un-re-compressed.
       Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
       [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [x] *(2026-08-21)* **The `Expand` band's instruction and its acceptance test contradicted each
+      other, so the only enrichments that ever landed were the ones that disobeyed the prompt.**
+      `expand_memory` borrowed `CompressionLevel::Expand`'s `summarization_prompt`, which is written
+      for a **cluster** and says the result "should be no longer than the material it replaces" —
+      while the code committed the result only when `expanded.len() > original.len()`. A model that
+      followed the instruction was always rejected; a model that ignored it was always accepted.
+      Fixed by giving the single-memory path its own prompt whose shape the caller can actually
+      verify, and the only shape that cannot lose anything: **reproduce the memory verbatim, then
+      add beneath it**. The guard is now `contains(original) && longer`, the same losslessness test
+      the dedup fold already uses to decide a merge is safe to commit — so a model that rewrites
+      instead of appending is declined and the memory is left untouched, rather than a high-weight
+      memory being replaced by a paraphrase of itself on length evidence alone.
+      Enrichment also raises `generation`, because the appended half is model-authored: the entry
+      now carries generated text and must not be fed to the summarizer later, by the same rule that
+      stops a summary being re-summarized.
+      **The trade, stated plainly:** enrichment will fire less often than before, because it now has
+      to be additive. That is the intended direction — the previous behaviour's acceptance criterion
+      was "the model disobeyed", which is not evidence of anything — but if the firing rate turns out
+      to matter, the predicate is one line and the prompt is one constant.
+      3 new tests: the rewriting case is declined and the memory is unchanged, the additive case
+      commits and marks the entry model-authored, and the prompt asks for exactly what the guard
+      accepts (asserted against the borrowed cluster wording, so the two cannot silently diverge
+      again).
 - [x] *(2026-08-21)* **The `remember` tool could not produce a pinnable memory — the drift pin's
       biggest blind spot, found by following the feature to its other caller.** The extraction path
       writes `fact_type` from `MemoryProvenance`, but the `memory.store` service behind the
