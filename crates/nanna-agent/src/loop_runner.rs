@@ -2816,10 +2816,10 @@ pub fn mission_convergence_message(round: usize, repeats: usize, digest: &str) -
         "[MISSION CONTROL round {round} — LOOP DETECTED] You have repeated the same action \
          {repeats} rounds in a row with IDENTICAL results. Its result will not change; do \
          NOT run it again.{anchor}\
-         Instead, go through the mission's numbered acceptance items one by one against \
-         your CURRENT files. In ONE short line name the FIRST item that is not truly done, \
-         then immediately do that item with a tool call (for a test suite: one test per \
-         feature — a suite that prints a single PASS line does not cover 12 features). \
+         Instead, go through what this mission actually asked for, part by part, against \
+         your CURRENT files. In ONE short line name the FIRST part that is not truly done, \
+         then immediately do that part with a tool call. One check per part — a single \
+         summary line is not evidence that several parts work. \
          If and ONLY if every item is verified done, finish by outputting this marker on \
          its own line with NOTHING else on that line:\nMISSION COMPLETE"
     )

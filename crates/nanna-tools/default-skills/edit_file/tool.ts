@@ -980,7 +980,7 @@ export default {
           "EDIT REFUSED — '" + filePath + "' is '" + forkStem + "' with an extension " +
             "added, and '" + forkStem + "' already exists (" + (forkStat.size || 0) + " bytes). " +
             "Nothing was edited. Improving this copy cannot help: whatever reads '" + forkStem +
-            "' — the tests, the callers — will never see it, so the work scores zero no matter " +
+            "' goes on reading it, so this edit never reaches anyone, no matter " +
             "how good it is.\nMake the change in '" + forkStemPath + "' itself.",
           "STOP — '" + filePath + "' WILL NEVER BE ACCEPTED. You have tried it repeatedly. " +
             "The only file that counts is '" + forkStemPath + "'. Send this exact call instead:\n" +
