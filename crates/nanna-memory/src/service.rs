@@ -1819,7 +1819,9 @@ impl MemoryService {
                 continue;
             }
 
-            // Phase (c): a user-STATED fact is never handed to the summarizer.
+            // Drift mitigation (c): a user-STATED fact is never handed to the
+            // summarizer. (Not to be confused with dream *phase* (b) below —
+            // the (a)/(b)/(c) here are the drift-research item's mitigations.)
             //
             // Repeated summarization erases low-frequency detail — the clause
             // that appears once in a band is exactly the one a gist drops, and
@@ -1883,7 +1885,7 @@ impl MemoryService {
                 continue;
             }
 
-            // Phase (b): compress a session, never re-compress a summary.
+            // Drift mitigation (b): compress a session, never re-compress a summary.
             //
             // The complementary half of the pin above, and the one bound in
             // this area that needs no number chosen for it. Asking "how many
