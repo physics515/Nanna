@@ -1882,7 +1882,40 @@ impl MemoryService {
             if removal_budget == 0 {
                 continue;
             }
-            let memories = unpinned;
+
+            // Phase (b): compress a session, never re-compress a summary.
+            //
+            // The complementary half of the pin above, and the one bound in
+            // this area that needs no number chosen for it. Asking "how many
+            // summarization passes are safe?" has no derivable answer — our own
+            // drift fixture loses a rare clause in ONE — so the rule forbids the
+            // CLASS instead: raw episodes may be summarized, a summary of a
+            // summary is never formed. `FsrsState::generation` already records
+            // exactly this (`max(sources) + 1` at every consolidation), so the
+            // predicate is `generation > 0` and there is nothing to tune.
+            //
+            // Gists are exempted from the CLUSTERER, not from the cycle. They
+            // went through the lossless dedup fold above like everything else,
+            // so two gists that restate each other still collapse to one row and
+            // the store keeps compressing; what is refused is paraphrasing a
+            // paraphrase. The `Expand` band is covered by the same exemption,
+            // deliberately: re-expanding a gist would invent the detail it lost.
+            let unpinned_count = unpinned.len();
+            let (gists, fresh): (Vec<_>, Vec<_>) = unpinned
+                .into_iter()
+                .partition(|entry: &MemoryEntry| entry.fsrs.generation > 0);
+            debug_assert_eq!(
+                gists.len() + fresh.len(),
+                unpinned_count,
+                "the generation partition must not drop a memory"
+            );
+            debug_assert!(
+                fresh.iter().all(|entry| entry.fsrs.generation == 0),
+                "only raw episodes may reach the summarizing clusterer"
+            );
+            result.memories_processed += gists.len();
+
+            let memories = fresh;
             if memories.is_empty() {
                 continue;
             }
@@ -2138,6 +2171,16 @@ impl MemoryService {
                         .importance
                         .max(candidate.fsrs.importance);
                     survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
+                    // Generation is monotone across a fold, for the same reason
+                    // importance is: an entry that absorbed a consolidation
+                    // product still CONTAINS a consolidation product. Without
+                    // this a generation-1 gist folding into a generation-0 row
+                    // would launder itself back into the summarizer's input and
+                    // defeat the never-re-summarize rule below.
+                    survivors[target_index].fsrs.generation = survivors[target_index]
+                        .fsrs
+                        .generation
+                        .max(candidate.fsrs.generation);
                     folded_sources.push((candidate.id.clone(), candidate.content.clone()));
                     folded_count += 1;
                     result.memories_deduped += 1;
@@ -2273,10 +2316,15 @@ impl MemoryService {
 
         let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
         let inherited_access = source.fsrs.access_count;
+        // See the in-memory mirror in `fold_near_duplicates`: absorbing a gist
+        // makes the survivor a gist-carrier, and the stored row has to say so
+        // or the next cycle reads a stale generation off disk.
+        let inherited_generation = survivor.fsrs.generation.max(source.fsrs.generation);
         self.store
             .update_fsrs(&survivor.id, |fsrs| {
                 fsrs.importance = inherited_importance;
                 fsrs.access_count += inherited_access;
+                fsrs.generation = fsrs.generation.max(inherited_generation);
             })
             .await?;
 
@@ -4345,6 +4393,64 @@ mod tests {
         assert!(
             service.get("candidate").await.is_some(),
             "the source must not be removed when its fold declined"
+        );
+    }
+
+    /// Generation is monotone across a dedup fold, in the store as well as in
+    /// the in-memory survivor.
+    ///
+    /// The fold merges a source INTO a survivor and the survivor keeps its own
+    /// FSRS row, so a generation-1 gist folding into a generation-0 episode
+    /// would hand back a row that CONTAINS a summary while still reading as raw
+    /// material — and the "never re-summarize a summary" partition, which runs
+    /// after the fold, would then feed it straight back to the summarizer.
+    #[tokio::test]
+    async fn a_fold_that_absorbs_a_gist_marks_the_survivor_as_one() {
+        let embed: EmbedFn = Arc::new(|_text: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        // Identical vectors => the pair clears the Reinforce line and folds.
+        // Both weights sit inside ONE band (0.8..=1.0, `Detailed`) — the fold
+        // is per-band — and the gist is the lighter of the two, so the fold's
+        // descending-weight order makes it the source, not the survivor.
+        let mut episode = dedup_entry("episode", "the build passes", vec![1.0, 0.0, 0.0], None);
+        episode.fsrs.importance = 0.95;
+        let mut gist = dedup_entry(
+            "gist",
+            "the build passes, consistently, across the week",
+            vec![1.0, 0.0, 0.0],
+            None,
+        );
+        gist.fsrs.importance = 0.85;
+        gist.fsrs.generation = 1;
+
+        service.add_entry(episode).await.expect("seed");
+        service.add_entry(gist).await.expect("seed");
+
+        // Dedup-only cycle: an unreachable cluster size disables the clusterer.
+        let config = ConsolidationConfig {
+            min_cluster_size: usize::MAX,
+            min_remaining_memories: 1,
+            ..ConsolidationConfig::default()
+        };
+        let result = service
+            .consolidate(&config, |_p: String| async { Ok(String::new()) })
+            .await
+            .expect("consolidate");
+        assert_eq!(result.memories_deduped, 1, "the pair must fold: {result:?}");
+
+        let survivor = service
+            .store
+            .get("episode")
+            .await
+            .expect("the stronger memory survives the fold");
+        assert!(
+            survivor.fsrs.generation >= 1,
+            "a row that absorbed a generation-1 gist must not read as raw material"
         );
     }
 

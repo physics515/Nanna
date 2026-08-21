@@ -835,6 +835,104 @@ mod tests {
         }
     }
 
+
+    /// Mark a whole band as consolidation products — what a second dream cycle
+    /// actually sees after a first one has already summarized this material.
+    fn as_gists(mut band: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        for entry in &mut band {
+            entry.fsrs.generation = 1;
+        }
+        band
+    }
+
+    /// Mitigation (b), shipped 2026-08-21: compress a session, never
+    /// re-compress a summary.
+    ///
+    /// The controlled pair for this rule is the baseline arm above: identical
+    /// corpus, spread, summarizer and config — the *only* difference is that
+    /// these rows are already consolidation products. The baseline arm forms
+    /// clusters and destroys the clause; this one forms none and keeps it.
+    ///
+    /// This is the bound that needed no number chosen for it. "How many
+    /// summarization passes are safe?" has no derivable answer — the baseline
+    /// arm loses a rare clause in ONE — so the class is forbidden instead, and
+    /// `generation` already records membership of that class exactly.
+    #[tokio::test]
+    async fn a_summary_is_never_summarized_again() {
+        let dim = 16;
+        let service = drift_service(dim);
+        let band = as_gists(drift_band(8, dim, 0.45));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+        let before_count = service.count().await;
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert_eq!(
+            result.clusters_formed, 0,
+            "a summary must never be handed back to the summarizer: {result:?}"
+        );
+        assert_eq!(
+            result.memories_merged, 0,
+            "and nothing may be merged away by one: {result:?}"
+        );
+        assert_eq!(
+            result.memories_processed, before_count,
+            "every gist is still accounted for, not silently skipped: {result:?}"
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "the clause the baseline arm loses in one cycle survives here"
+        );
+    }
+
+    /// The exemption is from the CLUSTERER, not from the cycle: two gists that
+    /// restate each other must still collapse losslessly, or refusing to
+    /// re-summarize would just let summaries pile up.
+    ///
+    /// A regression guard for that, not a second proof of the rule — at this
+    /// spread the fold consumes the band, so `clusters_formed == 0` would hold
+    /// either way. The rule itself is proven by the arm above, which fails when
+    /// the generation split is removed.
+    #[tokio::test]
+    async fn gists_that_restate_each_other_still_fold() {
+        let dim = 16;
+        let service = drift_service(dim);
+        // Near-identical vectors => every pair clears the Reinforce line.
+        let band = as_gists(drift_band(8, dim, 0.01));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+        let before_count = service.count().await;
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.memories_deduped > 0,
+            "the lossless fold still applies to gists: {result:?}"
+        );
+        assert_eq!(
+            result.clusters_formed, 0,
+            "but the summarizer is still never paid: {result:?}"
+        );
+        assert!(
+            service.count().await < before_count,
+            "the store still compresses: {before_count} -> {}",
+            service.count().await
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "and a deterministic fold never paraphrases"
+        );
+    }
+
     #[test]
     fn corpus_generation_is_deterministic() {
         let params = CorpusParams::default();

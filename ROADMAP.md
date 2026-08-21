@@ -1963,7 +1963,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the original item referenced something never built. If worth doing: key on a content hash of the
       cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
       re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
-- [~] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
+- [x] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
       guard it before it costs us a safety-critical memory.** The 2026 agent-memory survey warns that repeated
       compression cycles make **low-frequency details vanish** — precisely the ones most likely to matter; its
       worked example is that after ~3 summary passes over a week, a rarely-mentioned instruction like
@@ -2023,10 +2023,28 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       space, its negative space, and partition losslessness. 145 nanna-memory tests green, **0 net new
       clippy warnings** (166 = 166 vs the pre-change baseline for the crate), two `bench/BASELINE.md`
       rows added.
-      Remaining from this item: **(b) the generation ceiling** — still worth doing, and it is the
-      complementary half: pinning protects what the user *said*, a ceiling bounds how many times an
-      agent-observed memory can become a gist of a gist.
-- [ ] *(research 2026-08-21 — confirms the drift model and names the principled form of mitigation (b))*
+      *(2026-08-21, same run)* **Mitigation (b) shipped as well — and the research fold below is what
+      made it derivable.** The item offered "a generation ceiling" and the obvious objection was that no
+      ceiling is derivable: our own fixture loses a rare clause in ONE pass, so any N would be a chosen
+      number. The 2026 consolidation literature answers it by forbidding the **class** instead of
+      counting passes — compress a session, never re-compress a summary — which needs no number at all
+      and maps exactly onto `FsrsState::generation` (already `max(sources) + 1` at every consolidation).
+      An entry with `generation > 0` is partitioned out of the summarizing clusterer in every band,
+      including `Expand` (re-expanding a gist would invent the detail it lost).
+      **Exempt from the clusterer, not from the cycle:** gists still go through the lossless dedup fold,
+      so two gists that restate each other still collapse and the store keeps compressing. `generation`
+      is now monotone across a fold as well — absorbing a gist makes the survivor a gist-carrier — or a
+      generation-1 row folding into a generation-0 one would launder itself back into the summarizer's
+      input; that single line is proven load-bearing by removing it.
+      3 new fixtures (the never-re-summarize arm, the still-folds guard, the fold-monotonicity test),
+      the first and third non-vacuous by construction-removal; one `bench/BASELINE.md` row. 150
+      nanna-memory tests green, 0 net new clippy warnings.
+      **This item's remaining work is now (a)'s follow-through, not (b) or (c)**: the drift *instrument*
+      only measures a rare clause. A drift budget over many cycles — how much of a corpus survives N
+      dreams — would let the footprint cost of these two exemptions be stated as a number rather than
+      as the reasoned trade it is today.
+- [x] *(research 2026-08-21 — confirms the drift model and names the principled form of mitigation (b);
+      IMPLEMENTED the same run, see the item above)*
       **"Compress a session, never re-compress a compressed summary" is the depth limit worth having.**
       The 2026 consolidation literature converges on three mitigations for summarization drift, and the
       third is the one that dissolves the "what number should the generation ceiling be?" problem: don't
@@ -2037,8 +2055,10 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       only a cluster *seed* whose sources are raw). The other two: **extraction over summarization**
       (structured facts distort less than prose — our deterministic dedup fold is already this), and
       **keep the original episodic record in non-lossy cold storage** so a drifted gist is always
-      recoverable. Gate on the existing `retention::clause_survives` fixtures, which will show the
-      generation rule the way they showed the pin.
+      recoverable — those two are what remain here:
+      - [ ] **Extraction over summarization** for the clusterer's output, not just the fold's.
+      - [ ] **Non-lossy cold storage of the pre-consolidation episodes**, so a gist that drifted anyway
+            is recoverable rather than merely un-re-compressed.
       Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
       [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
 - [ ] *(research 2026-08-21 — sharpens the provenance work landed this run)* **Provenance-role collapse:
