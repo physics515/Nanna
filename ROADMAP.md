@@ -2061,6 +2061,25 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             is recoverable rather than merely un-re-compressed.
       Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
       [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [x] *(2026-08-21)* **A consolidated memory could impersonate one of its sources, and corrupt a handle
+      reassembly doing it.** Found by reading while landing the drift mitigations, not by a report.
+      `create_consolidated_entry` merged the cluster's metadata **first-writer-wins**, so a summary
+      inherited whichever source sorted first — including `source_id` and `chunk` (`"3/17"`). Those two
+      are exactly what `assemble_handle_content` (`server.rs`) uses to rebuild the whole text behind a
+      memory handle: it gathers every row sharing a `source_id` and orders them by `chunk`. A
+      consolidated entry carrying both was therefore **spliced into the middle of a tool result the
+      model was promised was stored verbatim** — and the rows it replaced are gone, so nothing else
+      filled that slot. It also let a gist of five different tools' output claim `tool=exec`,
+      `outcome=ok`, `target=./build.sh`.
+      Two rules replace the merge, neither with a threshold in it: a **source locator** (`source_id`,
+      `chunk`) is never inherited however unanimous the cluster — a summary has no position in anyone's
+      byte stream — and every other key is inherited only when **every source that carries it agrees**,
+      because unanimity is exactly the condition under which the claim survives the merge.
+      Paired with the honesty half in `assemble_handle_content`: a reassembly that comes back short of
+      the `i/N` the stub promised now says how many rows are missing, that a dream cycle most likely
+      folded them, and that the artifact on disk is unaffected. Silence there was the same failure the
+      function was written to end. 3 + 3 unit tests, including the negative space (a complete
+      reassembly announces nothing; unmarked rows never claim a shortfall).
 - [ ] *(research 2026-08-21 — sharpens the provenance work landed this run)* **Provenance-role collapse:
       a two-valued `fact_type` is the cheap version of what the literature calls typed memory.**
       *Mitigating Provenance-Role Collapse in Long-Term Agent Memory* (arXiv:2605.25869) reports that

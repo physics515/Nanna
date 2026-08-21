@@ -367,17 +367,21 @@ async fn assemble_handle_content(
     let Some(source_id) = entry.metadata.get("source_id") else {
         return entry.content.clone();
     };
+    // `chunk` is `"i/N"`: the position, and the count the stub promised.
+    let mut expected_count = 0_usize;
     let mut chunks: Vec<(usize, String)> = memory
         .list_all()
         .await
         .into_iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
         .map(|e| {
-            let idx = e
-                .metadata
-                .get("chunk")
+            let mark = e.metadata.get("chunk");
+            let idx = mark
                 .and_then(|c| c.split('/').next()?.parse::<usize>().ok())
                 .unwrap_or(1);
+            if let Some(total) = mark.and_then(|c| c.split('/').nth(1)?.parse::<usize>().ok()) {
+                expected_count = expected_count.max(total);
+            }
             (idx, e.content)
         })
         .collect();
@@ -385,11 +389,31 @@ async fn assemble_handle_content(
         return entry.content.clone();
     }
     chunks.sort_by_key(|(idx, _)| *idx);
-    chunks
+    let found_count = chunks.len();
+    let assembled = chunks
         .into_iter()
         .map(|(_, content)| content)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // Say so when fewer rows came back than the stub promised. Dreaming
+    // REPLACES clusters, so a result whose chunks have been partly
+    // consolidated away reassembles short — and returning that silently is the
+    // exact failure this function was written to end: a model reading a
+    // fraction of a run and being told nothing was missing reports on what it
+    // saw. `expected_count` is 0 when no row carried an `i/N` mark, which is
+    // not evidence of loss, so that case says nothing.
+    if expected_count > found_count {
+        let missing_count = expected_count - found_count;
+        return format!(
+            "{assembled}\n\n[SYSTEM: {found_count} of {expected_count} stored chunks were \
+             reassembled — {missing_count} are no longer in the store as separate rows, most \
+             likely folded into a consolidated memory by a dream cycle. What is above is \
+             complete for the chunks that remain, and the artifact itself is unaffected: read \
+             it back off disk if you need the whole thing.]"
+        );
+    }
+    assembled
 }
 
 /// The byte range of `content` that one `memory.get` page covers.
@@ -4157,6 +4181,101 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Seed one tool result's chunk rows: `stored_count` of a promised
+    /// `promised_count`, all sharing a `source_id`.
+    async fn seeded_chunk_store(
+        stored_count: usize,
+        promised_count: usize,
+    ) -> Arc<nanna_memory::MemoryService> {
+        let service = Arc::new(nanna_memory::MemoryService::new(
+            nanna_memory::MemoryServiceConfig {
+                dimension: 4,
+                ..Default::default()
+            },
+        ));
+        for idx in 1..=stored_count {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("source_id".to_string(), "abc123".to_string());
+            metadata.insert("chunk".to_string(), format!("{idx}/{promised_count}"));
+            service
+                .add_entry(nanna_memory::MemoryEntry {
+                    id: format!("chunk-{idx}"),
+                    content: format!("part {idx}"),
+                    // A distinct unit vector per chunk: the store asserts a
+                    // non-empty embedding on add, and reassembly is keyed on
+                    // metadata, so the direction is irrelevant here.
+                    embedding: vec![1.0, 0.0, 0.0, 0.0],
+                    embedding_model: None,
+                    embeddings: std::collections::HashMap::new(),
+                    metadata,
+                    timestamp: 0,
+                    fsrs: nanna_memory::FsrsState::new(),
+                    workspace_id: None,
+                })
+                .await
+                .expect("seed");
+        }
+        service
+    }
+
+    async fn first_entry(
+        service: &Arc<nanna_memory::MemoryService>,
+    ) -> nanna_memory::MemoryListEntry {
+        service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    /// The whole result is present: the reassembly is exactly the chunks, in
+    /// order, and says nothing extra. An announcement on a complete read would
+    /// be noise, and worse, would teach the model to ignore the real one.
+    #[tokio::test]
+    async fn a_complete_reassembly_announces_nothing() {
+        let service = seeded_chunk_store(3, 3).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert_eq!(assembled, "part 1\npart 2\npart 3");
+        assert!(!assembled.contains("[SYSTEM:"));
+    }
+
+    /// Dreaming REPLACES clusters, so a result whose chunks were partly
+    /// consolidated away reassembles short. Returning that silently is the
+    /// failure this function exists to end: the stub promised the result "was
+    /// stored whole in memory as N chunk(s)", and a model reading a fraction
+    /// while being told nothing is missing reports on what it saw.
+    #[tokio::test]
+    async fn a_short_reassembly_says_how_much_is_missing() {
+        let service = seeded_chunk_store(2, 17).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert!(assembled.starts_with("part 1\npart 2"), "content still comes first");
+        assert!(assembled.contains("2 of 17 stored chunks"), "{assembled}");
+        assert!(assembled.contains("15 are no longer in the store"), "{assembled}");
+        assert!(
+            assembled.contains("read it back off disk"),
+            "the announcement must point at the thing that IS intact: {assembled}"
+        );
+    }
+
+    /// Negative space: rows with no `i/N` mark carry no promise about a total,
+    /// so there is nothing to be short of. Absence of evidence must not become
+    /// an announcement of loss.
+    #[tokio::test]
+    async fn unmarked_chunks_never_claim_a_shortfall() {
+        let service = seeded_chunk_store(2, 2).await;
+        let mut entry = first_entry(&service).await;
+        entry.metadata.remove("chunk");
+        for stored in service.list_all().await {
+            assert!(stored.metadata.contains_key("source_id"));
+        }
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+        assert!(!assembled.contains("[SYSTEM:"), "{assembled}");
+    }
 
     /// The entry that motivated this: provider `openrouter`, model
     /// `nvidia/nemotron-3-embed-1b:free`. Splitting on the LAST slash would
