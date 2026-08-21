@@ -2132,6 +2132,35 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
             This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
             (tool descriptions currently need literal keywords because there is no lexical search at all).
+      - [ ] *(research 2026-08-21 — settles HOW to fuse, which was the unstated hard part)* **Use
+            Reciprocal Rank Fusion, not a weighted sum of scores.** RRF has the two properties this
+            problem needs and a weighted sum does not: it is **score-independent** (only ranks enter the
+            fusion, never raw scores) and **additive across stores** (an item's fused score is the sum of
+            its per-list contributions, `Σ 1/(k + rank_i)`). That matters here more than in a typical RAG
+            stack, because Nanna's two legs produce genuinely incomparable numbers — an in-RAM cosine in
+            [-1, 1] and a BM25 term weight computed over an FTS candidate set — and normalising them
+            against each other would be inventing a scale. RRF needs neither normalisation nor a tuned
+            α, so the fusion introduces no magic number; only `k` (conventionally 60), and `k`'s effect
+            is a documented rank-discount curve rather than a per-corpus fit.
+            Reported effect where it has been measured: a tuned hybrid reaches 0.7497 NDCG on WANDS
+            against 0.6983 for BM25 alone and 0.6953 for pure vector — i.e. **the lift comes from the
+            fusion, not from either leg being better**, which is the argument for adding the leg at all.
+            Sources:
+            [Hybrid BM25 retrieval](https://www.emergentmind.com/topics/hybrid-bm25-retrieval),
+            [Hybrid search & reranking in production RAG 2026](https://appscale.blog/en/blog/hybrid-search-and-reranking-production-rag-bm25-dense-cross-encoder-2026).
+      - [ ] *(research 2026-08-21)* **Condition the channel weights on the QUERY TYPE, and get the
+            temporal win the +29.6 figure is actually about.** The 2026 systems that report the large
+            temporal gain classify each query as `single_hop | multi_hop | temporal | aggregation` and
+            apply a per-type multiplier before fusing — a temporal query boosts the time channel and
+            damps the others; a multi-hop query boosts the entity/graph channel. Nanna can afford the
+            cheap half of this today: the classifier is a handful of lexical cues ("when", "last week",
+            "before X", a date), it needs no model, and the recall gate already inspects the message
+            (>5 words OR `?` OR >80 chars). The temporal channel itself is `nanna-timeline`, so this is
+            the item that makes P13's timeline work *pay* at recall time rather than only at
+            compression time — worth sequencing right after it. Do NOT ship the classifier before there
+            is a temporal channel for it to boost: a multiplier over one channel is a no-op with a
+            maintenance cost. Source:
+            [AgentIR — workload-adaptive cascade retrieval (arXiv:2605.25092)](https://arxiv.org/pdf/2605.25092).
 - [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
       The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
       different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems
@@ -3154,20 +3183,34 @@ from evidence, budgets stay budgets):
       notice, drained AFTER the ladder so compression cannot eat its own announcement.)*
 
 **Tier 3 — write-path honesty (`nanna-tools/default-skills/*`)**
-- [ ] A shrinking whole-file write over a file the model has NOT read since its last
+*(2026-08-21, audited against the tree at `f3fe0352`: four of these five landed in PR #224/#237 and
+were never ticked. Anchors named per item so the next audit is a grep, not a re-read.)*
+- [x] A shrinking whole-file write over a file the model has NOT read since its last
       mutation returns the file's current content in the tool result (not a refusal).
-- [ ] Rewrite-loss note goes **bidirectional** (expansion rewrites that change existing
+      *(`write_file/tool.ts` — the stale-shrink echo: `glog("write_file guard: stale-shrink echo …
+      read-mark verdict: …")` followed by `"Here is the CURRENT content of …"`.)*
+- [x] Rewrite-loss note goes **bidirectional** (expansion rewrites that change existing
       symbol bodies) and is **logged at INFO** so guards are auditable. (Both destructive
       ornith writes GREW the file; the note never fired, and never logs.)
-- [ ] **Post-mutation structural check** appended as a sentence, never a gate: `sh -n`,
+      *(`write_file/tool.ts` — `lossNote` carries both `removed=[…]` and `changed=[…]`, and
+      `glog("write_file rewrite-note for …")` logs both plus a `grew>2x` marker.)*
+- [x] **Post-mutation structural check** appended as a sentence, never a gate: `sh -n`,
       `node --check`, `json.loads` on the result of any mutation, incl. append-redirects.
-      (Evidence: gemma corrupted its file with a partial-overlap edit — dangling `else` —
-      and edited the wreck for 30 minutes.)
-- [ ] Ratchet anchor = **last evidenced-good version**, not largest-ever byte count;
+      *(`write_file/tool.ts::structuralCheckKind` dispatching `sh -n` / `bash -n` /
+      `node --check` / `JSON.parse`; `exec/tool.ts` runs the same check on redirect targets.)*
+- [x] Ratchet anchor = **last evidenced-good version**, not largest-ever byte count;
       canonicalize the ledger key (one file, one entry — relative/absolute split observed);
       keep displaced content recoverable; give `file_buffer` commit the same guards.
+      *(`write_file/tool.ts` — `floorAnchor = hwGoodBase > 0 ? "good" : "hi"`, the canonical +
+      legacy spelling merge at :212, `.__prev__`/`.__best__` parking, and `file_buffer/tool.ts`
+      carrying the same guards.)*
 - [ ] When a check that previously passed now fails, the next step's context names the
       mutations that landed in between (regression attribution, the #218 sweep's voice).
+      **Still open** *(2026-08-21)*: `loop_runner::StructuralVerdictLedger` tracks the *streak* of a
+      repeated failing signature per path and escalates on repeats, but nothing records the
+      pass→fail EDGE or what landed across it. The interesting case is precisely when the span is
+      more than one call — a fail-open or unrun verdict in between leaves a gap the streak counter
+      cannot see.
 
 **Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
 - [x] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
