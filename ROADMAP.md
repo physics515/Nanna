@@ -3492,11 +3492,12 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
 **Read this before picking P24 work:** treat each item as landed unless you have checked its
 "Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
 
-- [ ] **P24.3's chunk-count bound is still missing.** The run-length collapse before chunking and
-      the mid-ingest cancellation check both landed (`loop_runner.rs:6728-6790`), but
-      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is still bounded only by
-      bytes, and each chunk is still awaited inline on the turn's critical path. The cap must not
-      be derived from the retrieval top-k (see the item's own note).
+- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
+      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
+      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
+      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
+      from the retrieval top-k (see the item's own note).
 - [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.
@@ -3551,6 +3552,22 @@ Merges: the inline `on_memory` await, the unbounded chunk count, the degenerate-
 4. **Bound the log write** at `crates/nanna-scripting/src/boa_impl.rs:365`, which prints full stdout and stderr with no cap and produced ~300 MB of one repeated line in a single day's log.
 **Also resolve while here:** the two memory sinks disagree. `agent_service.rs:1093` drops any tool result whose content merely `contains("Error")`; `tasks.rs:1991` filters only empty/control-char/heartbeat noise and has no such test. Either the first is silently discarding legitimate failed-tool evidence in ordinary chat, or the second is missing a filter. They cannot both be right.
 **Do not** derive the chunk cap from the retrieval top-k — chunks past top-k are reachable by handle dereference and by direct similarity hit, and dropping the middle would make the stub's promise a lie.
+      *(2026-08-21)* **"The two memory sinks disagree" is resolved — chat now uses the harness's
+      filter.** The tree answered its own question: `tasks.rs::is_low_signal_memory` already carried a
+      long doc comment explaining why the substring failure tests were removed (they discarded **704 of
+      704 failed tool calls** in one 2-hour run, and also ate successful calls whose output merely
+      quoted an error — `cat ./minidb` stored nothing, twice). `agent_service.rs` — the path an ordinary
+      user chats through — still ran the older filter that comment describes as the bug, plus a
+      `content.len() < 20` floor, a dead `[Tool:` prefix test, and a "dominated by non-ASCII" test that
+      classified `tree` output and every non-Latin script as binary. So the documented loss was still
+      live in interactive chat. Both sinks now call one `memory_adapter::is_low_signal_memory` and one
+      `memory_adapter::episodic_importance` (the importance table was the *second* privately-duplicated
+      policy — how the two drifted in the first place). 6 unit tests, previously zero, pin the shapes
+      that must stay writable (failed tool result, error-quoting success, box-drawing, non-Latin, a
+      19-byte "ok") and the shapes that must not (empty, whitespace, heartbeat, C0 control bytes, U+FFFD).
+      Parts 1, 2 and 4 of this item had already landed (`collapse_repeated_lines`, the mid-ingest
+      cancellation check, and `log_excerpt`/`EXEC_LOG_EXCERPT_BYTES`); **part 3 — the chunk-count bound
+      and taking the embedding off the critical path — is what remains open here.**
 **Where.** `crates/nanna-agent/src/loop_runner.rs:6169-6255`; `crates/nanna-memory/src/service.rs:1019-1165`; `crates/nanna-tools/default-skills/exec/tool.ts:373-395`; `crates/nanna-scripting/src/boa_impl.rs:365`.
 
 ---
