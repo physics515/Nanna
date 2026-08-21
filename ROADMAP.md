@@ -3204,13 +3204,23 @@ were never ticked. Anchors named per item so the next audit is a grep, not a re-
       *(`write_file/tool.ts` — `floorAnchor = hwGoodBase > 0 ? "good" : "hi"`, the canonical +
       legacy spelling merge at :212, `.__prev__`/`.__best__` parking, and `file_buffer/tool.ts`
       carrying the same guards.)*
-- [ ] When a check that previously passed now fails, the next step's context names the
+- [x] When a check that previously passed now fails, the next step's context names the
       mutations that landed in between (regression attribution, the #218 sweep's voice).
-      **Still open** *(2026-08-21)*: `loop_runner::StructuralVerdictLedger` tracks the *streak* of a
-      repeated failing signature per path and escalates on repeats, but nothing records the
-      pass→fail EDGE or what landed across it. The interesting case is precisely when the span is
-      more than one call — a fail-open or unrun verdict in between leaves a gap the streak counter
-      cannot see.
+      *(2026-08-21)* The streak counter could not do this: it counts repeats of one failing
+      signature and never records the pass→fail EDGE, and the interesting span is exactly the one
+      it cannot see — a mutation whose checker did not apply, or whose check was not run, leaves a
+      gap. So **every** write-family mutation of a path is now recorded (`RepeatLedger::
+      record_mutation`), verdict or not, and the ledger returns a `StructuralVerdictOutcome`
+      carrying two independent findings: the repeat streak (*your fix is not working*) and the
+      regression span (*this used to work; here is what changed*). The regression sentence comes
+      first, because what changed is the question that precedes the other one.
+      Bounds and negative space, both tested: a file that has **never** parsed is never called a
+      regression (accusing the model of breaking a file it is still writing would be false); the
+      sentence is said **once per edge** and re-arms only after a pass; and the name list is
+      bounded by a byte budget while the COUNT never is, so a 200-mutation span reports 200 and
+      says how many it did not list. 4 new tests; the two existing streak tests moved to the new
+      return type. Net **zero** new clippy warnings, and the call-site extraction into
+      `structural_notices_for_call` shrank the enclosing function 644 → 631 lines.
 
 **Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
 - [x] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
