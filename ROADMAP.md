@@ -1963,7 +1963,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the original item referenced something never built. If worth doing: key on a content hash of the
       cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
       re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
-- [ ] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
+- [~] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
       guard it before it costs us a safety-critical memory.** The 2026 agent-memory survey warns that repeated
       compression cycles make **low-frequency details vanish** — precisely the ones most likely to matter; its
       worked example is that after ~3 summary passes over a week, a rarely-mentioned instruction like
@@ -1998,6 +1998,64 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       regress, while the summarized arm is a **baseline to beat** — it asserts the clause *is* lost, so
       whichever mitigation lands next (generation ceiling / verbatim-pinning STATED memories) will make
       that test fail loudly, and its message says to flip it. Remaining: implement (b) or (c) above.
+      *(2026-08-21)* **Mitigation (c) shipped — user-STATED memories are pinned verbatim, and the
+      dedup fold no longer launders provenance.** New pure `consolidation::is_verbatim_pinned(metadata)`:
+      a memory whose `fact_type` says `stated` (the provenance the extraction path already writes from
+      `MemoryProvenance::as_str`) is never handed to a summarizer. Provenance is the gate, deliberately
+      **not** an importance threshold — categorical, no magic number, and conservative in the same
+      direction `MemoryProvenance` itself is (missing/empty/unknown → not pinned, so an unlabeled memory
+      cannot pin itself out of consolidation).
+      **The split runs BEFORE the dedup fold, and that ordering is the actual bug fix.** A fold merges a
+      source INTO a survivor and keeps the **survivor's** metadata, so a stated row folding into an
+      observed one came back marked `observed` — a user assertion laundered into agent-observed content,
+      which the next cycle was then free to paraphrase away. Two folds over disjoint partitions cannot do
+      that, and cost strictly less than one fold over their union (|A|² + |B|² ≤ (|A|+|B|)²). Pinned rows
+      still deduplicate *among themselves*, so a stated fact repeated across three sessions still
+      collapses to one row and pinning cannot make the store grow without bound.
+      Band-loop budget arithmetic extracted into `fold_and_charge` so the two partitions' folds cannot
+      drift apart, with the losslessness postcondition asserted per partition.
+      **Measured, not asserted:** 2 new fixtures in `retention`, both proven non-vacuous by re-running
+      them with the split removed — the mitigation arm loses the clause, and the laundering arm names the
+      row that stole it (`drift-1`, `fact_type: None`). The mitigation arm is the *same* corpus, spread
+      and summarizer as the losing baseline arm; only the provenance differs. The baseline arm
+      deliberately **stays at NO**: drift is real and unfixed for agent-*observed* content, and deleting
+      the measurement that says so would be dishonest. 3 more unit tests cover the predicate's positive
+      space, its negative space, and partition losslessness. 145 nanna-memory tests green, **0 net new
+      clippy warnings** (166 = 166 vs the pre-change baseline for the crate), two `bench/BASELINE.md`
+      rows added.
+      Remaining from this item: **(b) the generation ceiling** — still worth doing, and it is the
+      complementary half: pinning protects what the user *said*, a ceiling bounds how many times an
+      agent-observed memory can become a gist of a gist.
+- [ ] *(research 2026-08-21 — confirms the drift model and names the principled form of mitigation (b))*
+      **"Compress a session, never re-compress a compressed summary" is the depth limit worth having.**
+      The 2026 consolidation literature converges on three mitigations for summarization drift, and the
+      third is the one that dissolves the "what number should the generation ceiling be?" problem: don't
+      pick a ceiling, forbid the *class* — a summary may compress raw episodes, but a summary of a
+      summary is never formed. That is a categorical rule with no magic number, the same shape as the
+      provenance pin landed 2026-08-21, and it maps onto the `FsrsState::generation` field the store
+      already carries (`generation == 0` may consolidate; `generation > 0` may not be a cluster member,
+      only a cluster *seed* whose sources are raw). The other two: **extraction over summarization**
+      (structured facts distort less than prose — our deterministic dedup fold is already this), and
+      **keep the original episodic record in non-lossy cold storage** so a drifted gist is always
+      recoverable. Gate on the existing `retention::clause_survives` fixtures, which will show the
+      generation rule the way they showed the pin.
+      Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
+      [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [ ] *(research 2026-08-21 — sharpens the provenance work landed this run)* **Provenance-role collapse:
+      a two-valued `fact_type` is the cheap version of what the literature calls typed memory.**
+      *Mitigating Provenance-Role Collapse in Long-Term Agent Memory* (arXiv:2605.25869) reports that
+      long-horizon stores conflate **who originally asserted something** with **what role that entity
+      holds now**, and that the fix is to type the three dimensions separately at encode *and* retrieve
+      time: provenance, current role, and the temporal marker of the transition. Nanna now has the first
+      dimension only (`fact_type` = stated/observed, and it is finally load-bearing — it decides what a
+      dream cycle may paraphrase). ~~(a) make `fact_type` survive every merge path~~ **done in the same
+      run**: `create_consolidated_entry` merged metadata first-writer-wins, so a merged entry's
+      provenance was whichever source happened to be ordered first — a rule that depends on iteration
+      order is not a rule; it is now monotone (any stated source ⇒ stated result). Remaining rungs:
+      (b) stamp the transition time so "the user said X, then later said not-X" is orderable
+      rather than a pair of equally-true rows; (c) expose provenance as a **recall filter** so a caller
+      can ask for user-stated facts only. Source:
+      [arXiv:2605.25869](https://arxiv.org/pdf/2605.25869).
 - [ ] *(research 2026-07-23)* **Dual-buffer / probation consolidation ("hot" buffer before long-term).** The
       same survey's recommended write path: a new memory lands in a **hot buffer** and is promoted to long-term
       storage only after a probation period and quality checks — **re-verification, deduplication, importance
@@ -3417,6 +3475,32 @@ checking the owner rules and whether the proposal is already implemented). 41 we
 and are listed at the end so they are not re-derived. What follows is the 52 that survived,
 merged into 21 items and ranked by expected effect on an ordinary user session.
 
+**Status (2026-08-21, added by the nightly routine): most of P24 has LANDED — the write-ups
+below are the original defect reports, not a list of open work.** PR #255
+(`p24/session-scoped-and-review-fixes`, merged as `9fd4ba0d`) carries
+`62cc4465` (P24.9/19/21), `4a3f3103` (P24.11), `7114a27a` (P24.5), `8f7a8662` (P24.8/10/4),
+`91b58405` ("the remaining P24 items") and `de58d49d` (review findings). Verified present in the
+tree at `f3fe0352` by anchor: `floor_char_boundary` in `context.rs`/`compressor.rs`/`loop_runner.rs`
+(P24.1); `bind_session_workdir` + the `RUN_SESSION_ID` control-plane assertion in `registry.rs`
+with `chat.rs` binding per turn (P24.2); `.__best__` parking in all three write tools and
+`failEscalating` in `edit_file`/`write_file` (P24.4/P24.8); `record_structural_verdict` +
+`"ok — DOES NOT PARSE"` in `loop_runner.rs` (P24.5); `self.summaries` gone, so the
+double-charged preamble vector no longer exists and `estimate_request_tokens` is
+`preamble_tokens() + estimate_tokens()` (P24.6, first bullet); whitespace-normalized repeat keys
+(P24.13); `WRITE REFUSED — the file was NOT modified` (P24.19).
+
+**Read this before picking P24 work:** treat each item as landed unless you have checked its
+"Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
+
+- [ ] **P24.3's chunk-count bound is still missing.** The run-length collapse before chunking and
+      the mid-ingest cancellation check both landed (`loop_runner.rs:6728-6790`), but
+      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is still bounded only by
+      bytes, and each chunk is still awaited inline on the turn's critical path. The cap must not
+      be derived from the retrieval top-k (see the item's own note).
+- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+      listed above and deliberately did not claim the rest; a per-item pass would let this whole
+      section collapse to a few lines of history.
+
 
 #### What is already working — do not re-litigate
 
@@ -3925,6 +4009,33 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      is already at latest-safe, no GUI changes this run. *Reconfirmed the fmt gotcha: `cargo fmt -p <crate>`
      reformats the whole crate, not the touched file — `origin/master` isn't fmt-clean, so it churned 4
      unrelated files; reverted, kept only the surgical `.await` diff.*
+   - *(2026-08-21 sweep)* `cargo update` → **~150 compatible bumps** (the biggest sweep in a while:
+     `tokio-macros 2.7.2`, `ureq 3.4.0`, `uuid 1.24.1`, `wasm-bindgen 0.2.127`, `zbus 5.19.0`,
+     `zvariant 5.15.0`, `zerocopy 0.8.56`, `zlib-rs 0.6.7`, `xml 1.4.0`, …). `cargo upgrade
+     --incompatible` → four candidates, **one applied green, two reverted, one rejected**:
+     - **`wide 1.5 → 1.6`** (workspace, consumed by `nanna-simd`) — applied, compiled unchanged.
+     - **`playwright-rs 0.15 → 0.16`** (`nanna-browser`) — applied, compiled unchanged.
+     - **`rten 0.24 → 0.25`** (`nanna-tools`) — **reverted.** `ocrs 0.12.2` still requires `rten 0.24`,
+       so bumping our direct req puts **two `rten` versions in one graph** and `ocr.rs:309` fails with
+       `expected rten::model::Model, found Model`. Not our migration to do:
+       - [ ] Re-try `rten 0.25` once **`ocrs`** ships a release built against it (watch
+             `ocrs`/`rten-imageproc`); the bump is a one-line req change plus a rebuild once the
+             transitive pin moves.
+     - **`criterion 0.8 → "0.7"`** — **rejected as a downgrade.** `cargo-upgrade` reports `latest 0.7.0`
+       for criterion while the lock happily resolves `0.8.2`; taking its suggestion would walk the
+       benches *backwards*. Never apply a `cargo-upgrade` row whose "latest" is below the current req.
+     **A `cargo update` landmine worth remembering:** the sweep moved `malachite-bigint` to **0.10.0**
+     for `pymath` while `rustpython-{codegen,compiler,derive}` stay on **0.9.2** — two versions of the
+     same crate in one graph, and `rustpython-stdlib` then fails to compile with 17 `E0277`/`E0308`
+     errors about `malachite_bigint::BigUint`/`BigInt` ("there are multiple different versions of crate
+     `malachite_bigint`"). Pinned back with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`.
+     - [ ] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+     **Verification:** workspace (excl. `nanna-gui`) builds green, **1555 tests pass / 0 failures**,
+     `cargo clippy -p nanna-memory --all-targets` **0 errors**, and — closing the gate hole logged
+     below — a **`cargo build --release -p nanna-daemon` was run and is green** on the pinned
+     `nightly-2026-08-03`, so this sweep is verified against the profile the shippable artifact
+     actually uses.
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
@@ -3942,10 +4053,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      the GUI build inherit it. The file carries the full ICE text and its removal condition.
      - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
            every dependency-freshness pass, and report the ICE upstream if it survives.
-     - [ ] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
+     - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
            least `cargo check --profile release`) to the freshness increment's verification.
+           *(2026-08-21)* Closed where it is actually enforced: the `daily-dev` skill's **step 4 —
+           Verify** now requires `cargo build --release -p nanna-daemon` for any dependency, toolchain
+           or `Cargo.lock` change, naming both release-only failures this repo has already hit (the
+           `tokio` codegen ICE and the `turso_core` const-eval depth overflow) so a future run knows
+           what the gate is for. Run and green on this run's sweep.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at

@@ -468,6 +468,46 @@ pub(crate) fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     a.workspace_id == b.workspace_id
 }
 
+/// The metadata key carrying a memory's provenance.
+///
+/// Written at extraction time from `nanna_agent::MemoryProvenance::as_str` —
+/// `"stated"` when the user asserted the fact, `"observed"` when the agent
+/// inferred it.
+pub const FACT_TYPE_METADATA_KEY: &str = "fact_type";
+
+/// The one `fact_type` value that pins a memory verbatim.
+const STATED_FACT_TYPE: &str = "stated";
+
+/// Is the memory carrying this metadata pinned verbatim — i.e. must a dream
+/// cycle never paraphrase it?
+///
+/// Repeated summarization erases low-frequency detail: the clause that appears
+/// once in a band is exactly the one a gist drops. `crate::retention`'s drift
+/// fixture reproduces that against this pipeline — a rare safety-critical clause
+/// is gone after a single summarizing cycle while the topic stays perfectly
+/// recallable, so recall metrics cannot see the loss.
+///
+/// A fact the **user asserted** is the case where that loss is least acceptable
+/// and least excusable: it was not inferred from anything, it was said, and it
+/// is stored in the words it was said in. So provenance is the gate, not a tuned
+/// importance threshold — a categorical rule with no magic number in it.
+///
+/// Conservative by construction, mirroring `MemoryProvenance`'s own default: a
+/// missing, empty or unrecognised `fact_type` is **not** pinned. Absence of a
+/// provenance signal is not evidence that the user stated something, so an
+/// unlabeled memory can never pin itself out of consolidation.
+/// Takes the metadata map rather than a whole entry so the one policy answers
+/// for every shape a memory is read back in (`MemoryEntry` while consolidating,
+/// `MemoryListEntry` when listing), with no second copy to drift.
+#[must_use]
+pub fn is_verbatim_pinned<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+) -> bool {
+    metadata
+        .get(FACT_TYPE_METADATA_KEY)
+        .is_some_and(|fact_type| fact_type.trim().eq_ignore_ascii_case(STATED_FACT_TYPE))
+}
+
 /// Cluster memories using the composite score (not just cosine similarity).
 ///
 /// Uses greedy clustering: for each unassigned memory, find all unassigned memories
@@ -600,6 +640,21 @@ pub fn create_consolidated_entry(
         }
     }
     
+    // Provenance is MONOTONE across a merge: if any source was a user
+    // assertion, the entry that replaces it still contains a user assertion and
+    // must still read as one. The metadata merge above is first-writer-wins, so
+    // without this the result's `fact_type` would be whichever source happened
+    // to be ordered first — a rule that depends on iteration order is not a
+    // rule. The verbatim pin makes this unreachable today (a stated memory is
+    // partitioned out before it can join a cluster), so this is the invariant
+    // stated explicitly rather than left to hold by reachability.
+    if cluster.memories.iter().any(|m| is_verbatim_pinned(&m.metadata)) {
+        metadata.insert(
+            FACT_TYPE_METADATA_KEY.to_string(),
+            STATED_FACT_TYPE.to_string(),
+        );
+    }
+
     // Track consolidation
     let source_ids: Vec<_> = cluster.memories.iter().map(|m| m.id.clone()).collect();
     metadata.insert("consolidated_from".to_string(), source_ids.join(","));
@@ -890,6 +945,126 @@ mod tests {
             fsrs: FsrsState { importance: 2.0, access_count: 5, ..FsrsState::default() },
             workspace_id: None,
         }
+    }
+
+
+    fn entry_with_fact_type(fact_type: Option<&str>) -> MemoryEntry {
+        let mut entry = similar_entry("pin", "the deploy key lives in 1Password");
+        if let Some(fact_type) = fact_type {
+            entry
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), fact_type.to_string());
+        }
+        entry
+    }
+
+    /// Positive space: only an explicit `stated` provenance pins a memory, in
+    /// whatever casing/padding the extraction path happened to write.
+    #[test]
+    fn stated_provenance_pins_a_memory_verbatim() {
+        for label in ["stated", "STATED", "  Stated  "] {
+            assert!(
+                is_verbatim_pinned(&entry_with_fact_type(Some(label)).metadata),
+                "{label:?} names a user assertion"
+            );
+        }
+    }
+
+    /// Negative space, and the load-bearing half: absence of a provenance signal
+    /// is NOT evidence the user stated something, so an unlabeled memory must
+    /// never be able to pin itself out of consolidation. Mirrors
+    /// `MemoryProvenance`'s own `Observed` default.
+    #[test]
+    fn everything_that_is_not_stated_stays_consolidatable() {
+        for label in [None, Some(""), Some("observed"), Some("statedly"), Some("user-said")] {
+            assert!(
+                !is_verbatim_pinned(&entry_with_fact_type(label).metadata),
+                "{label:?} is not an explicit user assertion"
+            );
+        }
+    }
+
+    /// The partition the band loop performs must be lossless and exact: every
+    /// memory lands on exactly one side, and neither side holds one of the
+    /// other's.
+    #[test]
+    fn the_provenance_partition_is_lossless() {
+        let band = vec![
+            entry_with_fact_type(Some("stated")),
+            entry_with_fact_type(None),
+            entry_with_fact_type(Some("observed")),
+            entry_with_fact_type(Some("STATED")),
+        ];
+        let band_count = band.len();
+
+        let (pinned, unpinned): (Vec<_>, Vec<_>) = band
+            .into_iter()
+            .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
+
+        assert_eq!(pinned.len() + unpinned.len(), band_count);
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.iter().all(|e| is_verbatim_pinned(&e.metadata)));
+        assert!(!unpinned.iter().any(|e| is_verbatim_pinned(&e.metadata)));
+    }
+
+
+    /// Provenance must be monotone across a merge: an entry that replaces a
+    /// user assertion still contains one, so it must still read as one. The
+    /// metadata merge is first-writer-wins, so before this the answer depended
+    /// on cluster order — hence both orders are asserted here.
+    #[test]
+    fn a_consolidated_entry_inherits_stated_provenance_from_any_source() {
+        for stated_first in [true, false] {
+            let mut stated = similar_entry("stated", "the deploy key lives in 1Password");
+            stated
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), "stated".to_string());
+            let mut observed = similar_entry("observed", "the deploy job read a key from somewhere");
+            observed
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), "observed".to_string());
+
+            let memories = if stated_first {
+                vec![stated, observed]
+            } else {
+                vec![observed, stated]
+            };
+            let cluster = MemoryCluster::new(
+                memories,
+                CompressionLevel::Standard,
+                &FsrsParameters::default(),
+            );
+
+            let consolidated =
+                create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+            assert!(
+                is_verbatim_pinned(&consolidated.metadata),
+                "stated_first={stated_first}: a merge containing a user assertion stays stated"
+            );
+        }
+    }
+
+    /// Negative space: a cluster of purely agent-observed memories must NOT
+    /// come back pinned, or every consolidated entry would pin itself and
+    /// consolidation would stop after one pass.
+    #[test]
+    fn a_consolidated_entry_of_observed_sources_stays_consolidatable() {
+        let cluster = MemoryCluster::new(
+            vec![
+                similar_entry("a", "the build took 40 seconds"),
+                similar_entry("b", "the build took 41 seconds"),
+            ],
+            CompressionLevel::Standard,
+            &FsrsParameters::default(),
+        );
+
+        let consolidated = create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+        assert!(
+            !is_verbatim_pinned(&consolidated.metadata),
+            "nothing here was ever asserted by the user"
+        );
     }
 
     #[test]

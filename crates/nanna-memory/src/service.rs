@@ -6,7 +6,7 @@ use crate::{
     MemoryEntry, MemoryError, VectorStore, VectorStoreConfig,
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
-    MemoryCluster, cluster_memories, create_consolidated_entry,
+    MemoryCluster, cluster_memories, create_consolidated_entry, is_verbatim_pinned,
 };
 use crate::chunking::{derive_chunk_params, ChunkParams};
 use std::collections::HashMap;
@@ -1819,6 +1819,38 @@ impl MemoryService {
                 continue;
             }
 
+            // Phase (c): a user-STATED fact is never handed to the summarizer.
+            //
+            // Repeated summarization erases low-frequency detail — the clause
+            // that appears once in a band is exactly the one a gist drops, and
+            // `retention`'s drift fixture reproduces that against this pipeline
+            // (a rare safety-critical clause gone in ONE cycle, while the topic
+            // stayed perfectly recallable, so recall could not see the loss).
+            // What the user asserted is where that loss is least acceptable, so
+            // provenance — not a tuned importance threshold — takes those
+            // memories out of the paraphrasing path entirely.
+            //
+            // The split happens BEFORE the dedup fold, not after, and that
+            // ordering is load-bearing: the fold merges a source INTO a
+            // survivor and keeps the survivor's metadata, so a stated memory
+            // folding into an observed one would come back out marked
+            // `observed` — laundering the provenance and un-pinning itself. Two
+            // folds over disjoint partitions can't do that, and cost strictly
+            // less than one fold over their union (|A|² + |B|² <= (|A|+|B|)²).
+            let band_count = memories.len();
+            let (pinned, unpinned): (Vec<_>, Vec<_>) = memories
+                .into_iter()
+                .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
+            debug_assert_eq!(
+                pinned.len() + unpinned.len(),
+                band_count,
+                "the provenance partition must not drop a memory"
+            );
+            debug_assert!(
+                pinned.iter().all(|entry| is_verbatim_pinned(&entry.metadata)),
+                "the pinned partition must hold only pinned memories"
+            );
+
             // Phase (b): fold true duplicates deterministically FIRST, so the
             // summarizer is only ever paid for genuinely distinct content.
             //
@@ -1830,14 +1862,28 @@ impl MemoryService {
             // no reason to let exact restatements of your most important facts
             // accumulate forever. It also removes the most valuable memories
             // from the drift-exposed path entirely.
-            let deduped_before = result.memories_deduped;
-            let memories = self
-                .fold_near_duplicates(memories, removal_budget, &mut result)
+            //
+            // It runs over the pinned partition too, for the same reason: a
+            // stated fact repeated across three sessions should still collapse
+            // to one row, so pinning cannot make the store grow without bound.
+            let (unpinned, budget_left) = self
+                .fold_and_charge(unpinned, removal_budget, &mut result)
                 .await;
-            let folded_here = result.memories_deduped - deduped_before;
-            removal_budget = removal_budget.saturating_sub(folded_here);
-            result.memories_processed += folded_here;
+            removal_budget = budget_left;
+            let (pinned, budget_left) = self
+                .fold_and_charge(pinned, removal_budget, &mut result)
+                .await;
+            removal_budget = budget_left;
+
+            // Pinned survivors are finished for this cycle — deduplicated if they
+            // had restatements, and never offered to the summarizer.
+            result.memories_processed += pinned.len();
+
             if removal_budget == 0 {
+                continue;
+            }
+            let memories = unpinned;
+            if memories.is_empty() {
                 continue;
             }
 
@@ -1946,6 +1992,40 @@ impl MemoryService {
         }
 
         Ok(result)
+    }
+
+    /// Run the deterministic dedup fold over one partition of a band, charging
+    /// whatever it folded to the cycle's removal budget and to `result`.
+    ///
+    /// Returns the survivors and the budget that is left. Split out because the
+    /// band loop now folds two disjoint partitions (verbatim-pinned and not),
+    /// and the budget arithmetic between them must not drift apart.
+    async fn fold_and_charge(
+        &self,
+        memories: Vec<MemoryEntry>,
+        removal_budget_count: usize,
+        result: &mut ConsolidationResult,
+    ) -> (Vec<MemoryEntry>, usize) {
+        let memories_count_before = memories.len();
+        let deduped_before = result.memories_deduped;
+
+        let survivors = self
+            .fold_near_duplicates(memories, removal_budget_count, result)
+            .await;
+
+        let folded_count = result.memories_deduped - deduped_before;
+        debug_assert!(
+            folded_count <= removal_budget_count,
+            "a fold charged more than the budget it was given"
+        );
+        debug_assert_eq!(
+            survivors.len() + folded_count,
+            memories_count_before,
+            "every memory must either survive or be folded — none may vanish"
+        );
+
+        result.memories_processed += folded_count;
+        (survivors, removal_budget_count.saturating_sub(folded_count))
     }
 
     /// Dream phase (b): fold near-duplicate memories together **deterministically,
