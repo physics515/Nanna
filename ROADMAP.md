@@ -2061,6 +2061,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             is recoverable rather than merely un-re-compressed.
       Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
       [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [x] *(2026-08-21)* **The `remember` tool could not produce a pinnable memory — the drift pin's
+      biggest blind spot, found by following the feature to its other caller.** The extraction path
+      writes `fact_type` from `MemoryProvenance`, but the `memory.store` service behind the
+      `remember` TOOL wrote only the caller's `tags`, so a memory the user explicitly asked to keep
+      carried no provenance at all and could never be pinned. `memory.store` and its `memory.embed`
+      alias now stamp `fact_type` through `tags_with_provenance`, and `remember` gained a
+      `provenance` parameter whose description says what claiming it costs.
+      Deliberately **classified, not copied**: the value goes through
+      `MemoryProvenance::from_label` — the same rule, one implementation — so only an explicit,
+      case-insensitive `"stated"` pins, and an absent, empty or misspelt declaration degrades to
+      `observed`. A `fact_type` already present in `tags` is honoured as the declaration but
+      re-classified rather than trusted, so `tags: {fact_type: "STATED-ish"}` cannot smuggle a pin;
+      an explicit `provenance` field wins over an inherited tag. 4 unit tests, half of them negative
+      space.
 - [x] *(2026-08-21)* **A consolidated memory could impersonate one of its sources, and corrupt a handle
       reassembly doing it.** Found by reading while landing the drift mitigations, not by a report.
       `create_consolidated_entry` merged the cluster's metadata **first-writer-wins**, so a summary

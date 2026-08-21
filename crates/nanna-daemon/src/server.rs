@@ -328,6 +328,41 @@ use std::time::Duration;
 /// This allows the `session.history` service to return messages for the current session.
 pub type SharedSessionHistory = Arc<tokio::sync::RwLock<Vec<crate::session::SessionMessage>>>;
 
+/// Stamp a `memory.store` call's declared provenance onto its tags.
+///
+/// Until now the service wrote only the caller's `tags`, so a memory saved
+/// through the `remember` TOOL carried no `fact_type` at all — and the drift
+/// pin (`nanna_memory::is_verbatim_pinned`) can only protect what it can
+/// identify, so the memories a user most explicitly asked to keep were the ones
+/// it could never protect. This closes that, without letting the tool
+/// over-claim: the classification is `MemoryProvenance::from_label`, the SAME
+/// rule the extraction path uses, so only an explicit case-insensitive
+/// `"stated"` yields `stated` and everything else — absent, empty, misspelt —
+/// is `observed`.
+///
+/// A caller-supplied `fact_type` in `tags` is respected as the declaration if
+/// no explicit `provenance` field is given, so a script that already stamps the
+/// key keeps working; either way the value is re-classified rather than
+/// trusted verbatim, so `tags: {fact_type: "STATED-ish"}` cannot smuggle a pin.
+fn tags_with_provenance(
+    mut tags: HashMap<String, String>,
+    params: &serde_json::Value,
+) -> HashMap<String, String> {
+    let declared = params
+        .get("provenance")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| tags.get("fact_type").cloned())
+        .unwrap_or_default();
+    let provenance = nanna_agent::MemoryProvenance::from_label(&declared);
+    tags.insert("fact_type".to_string(), provenance.as_str().to_string());
+    debug_assert!(
+        tags.get("fact_type").is_some_and(|f| f == "stated" || f == "observed"),
+        "fact_type is a closed set"
+    );
+    tags
+}
+
 /// Resolve a memory handle — including one whose memory has since been
 /// consolidated away by dreaming.
 ///
@@ -627,6 +662,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -740,6 +780,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -4182,6 +4227,74 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 mod tests {
     use super::*;
 
+
+
+    /// A memory saved through the `remember` TOOL used to carry no `fact_type`
+    /// at all, so the drift pin — which can only protect what it can identify —
+    /// could never protect the memories a user most explicitly asked to keep.
+    #[test]
+    fn a_stated_declaration_pins_the_memory() {
+        let tags = tags_with_provenance(
+            HashMap::new(),
+            &serde_json::json!({"provenance": "stated"}),
+        );
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("stated"));
+        assert!(nanna_memory::is_verbatim_pinned(&tags));
+    }
+
+    /// The conservative default, and the whole reason this is classified rather
+    /// than copied: absence of a declaration is not evidence the user said
+    /// something. Only an explicit, case-insensitive "stated" pins.
+    #[test]
+    fn anything_that_is_not_stated_is_observed() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"provenance": ""}),
+            serde_json::json!({"provenance": "observed"}),
+            serde_json::json!({"provenance": "statedly"}),
+            serde_json::json!({"provenance": "user-said"}),
+        ] {
+            let tags = tags_with_provenance(HashMap::new(), &params);
+            assert_eq!(
+                tags.get("fact_type").map(String::as_str),
+                Some("observed"),
+                "{params}"
+            );
+            assert!(!nanna_memory::is_verbatim_pinned(&tags));
+        }
+    }
+
+    /// A caller that already stamps `fact_type` in its tags keeps working — but
+    /// the value is re-classified, never trusted verbatim, so a near-miss
+    /// spelling cannot smuggle a pin past the rule.
+    #[test]
+    fn a_fact_type_tag_is_reclassified_not_trusted() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "  StAtEd ".to_string());
+        let pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(pinned.get("fact_type").map(String::as_str), Some("stated"));
+
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "STATED-ish".to_string());
+        let not_pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(not_pinned.get("fact_type").map(String::as_str), Some("observed"));
+    }
+
+    /// An explicit `provenance` field wins over a `fact_type` tag: the field is
+    /// the declaration this call is making, the tag may be inherited metadata.
+    #[test]
+    fn the_explicit_field_wins_over_an_inherited_tag() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "stated".to_string());
+        tags.insert("topic".to_string(), "deploys".to_string());
+        let tags = tags_with_provenance(tags, &serde_json::json!({"provenance": "observed"}));
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("observed"));
+        assert_eq!(
+            tags.get("topic").map(String::as_str),
+            Some("deploys"),
+            "unrelated tags are untouched"
+        );
+    }
 
     /// Seed one tool result's chunk rows: `stored_count` of a promised
     /// `promised_count`, all sharing a `source_id`.
