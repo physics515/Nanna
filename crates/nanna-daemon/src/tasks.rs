@@ -2077,52 +2077,6 @@ pub(crate) fn carried_side_effect_note(
 /// the prompt, not to widen this list.
 const CORE_TOOLS: &[&str] = &["discover_tools"];
 
-/// Content not worth a memory: machine noise rather than an observation.
-///
-/// Deliberately narrow, and narrower than it used to be. This filter also
-/// matched six "failure shapes" — `"Error:"`, `"Command failed"` and friends —
-/// with `content.contains(s)` across the WHOLE body, not just the prefix.
-/// Upstream, `loop_runner` rewrites every unsuccessful tool result to
-/// `format!("Error: {…}")`, so the combination discarded **100% of failed tool
-/// calls**: 704 of them in one 2-hour run, with not a single ingest line in the
-/// whole day's log containing `FAILED`.
-///
-/// That is backwards. What went wrong is exactly what an agent must remember —
-/// an agent that cannot recall its own failures repeats them, which is what a
-/// long-horizon run looks like when it stalls. The substring form also ate
-/// SUCCESSFUL calls whose output merely mentioned an error: `cat ./minidb`
-/// stored nothing, twice, because the script contains its own error strings.
-/// The agent could not remember reading its own source.
-///
-/// Failure is now carried structurally instead — the episodic writer stamps
-/// `[tool → target — FAILED]` into the content and an `outcome` tag beside it —
-/// so it can be filtered at RECALL time by anyone who wants only successes,
-/// without being unwritable in the first place.
-fn is_low_signal_memory(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.is_empty() {
-        return true;
-    }
-    // Binary/garbled output. Judged by CONTROL characters and decode failures,
-    // not by "not ASCII" — the old test counted every non-ASCII char as noise,
-    // so 40 box-drawing characters in `tree` output, or any text in a
-    // non-Latin script, was classified as binary and deleted. It also flagged
-    // this very writer's own `[exec → cmd — ok]` header punctuation.
-    //
-    // Real binary shows up as C0 control bytes and U+FFFD replacement
-    // characters after a lossy decode; legitimate text does not.
-    let noise = trimmed
-        .chars()
-        .take(200)
-        .filter(|c| (c.is_control() && !c.is_whitespace()) || *c == '\u{FFFD}')
-        .count();
-    if noise > 40 {
-        return true;
-    }
-    // Heartbeat chatter is the machinery talking to itself — not an observation.
-    trimmed.starts_with("HEARTBEAT_OK")
-}
-
 /// Faults that mean the local runner's STATE is bad, not that the request
 /// was unlucky. These are healed by unloading/reloading the model; another
 /// identical request just re-hits the wedge.
@@ -2880,7 +2834,7 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if is_low_signal_memory(&memory.content) {
+                if crate::memory_adapter::is_low_signal_memory(&memory.content) {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
@@ -2901,12 +2855,7 @@ impl AgentStepRunner {
                 );
                 // A tool result is raw episodic material — worth keeping, but
                 // it must not outrank a stated preference when recall ranks.
-                let importance: f32 = match memory.category.as_str() {
-                    "tool_result" => 1.5,
-                    "preference" | "identity" => 4.0,
-                    "fact" | "insight" => 3.5,
-                    _ => 3.0,
-                };
+                let importance = crate::memory_adapter::episodic_importance(&memory.category);
                 let stored = match &workspace_id {
                     Some(ws) => {
                         service
