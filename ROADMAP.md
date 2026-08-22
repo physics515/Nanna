@@ -510,6 +510,36 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      - [x] *(2026-08-22)* **The whole inbound webhook surface now fails CLOSED, and the generic route
+            no longer aborts the daemon.** Every verifier in `nanna-daemon/src/webhook.rs` was correct and
+            every handler *skipped* it when nothing was configured — `if let Some(secret) = …` with no
+            `else` — so the **unconfigured case was the least protected one**, and each of those endpoints
+            hands its payload to the agent loop, which runs tools at the daemon's privilege. Telegram was
+            the worst: `apply_channel_webhook_secrets` never populated `telegram_secret` at all (its
+            comment claimed "Telegram authenticates via the bot token in the URL" — the route is the fixed
+            path `/webhook/telegram` with no token in it), so that endpoint had never verified anything.
+            Now: telegram/discord/slack/whatsapp-POST/generic each refuse with **503** + a log line naming
+            the one config key to set (503, not 401, so "never armed" reads differently from "wrong
+            proof"); `channels.telegram.webhook_secret` and `channels.signal.webhook_secret` are new config
+            fields (`TELEGRAM_WEBHOOK_SECRET` env override) and Telegram's `setWebhook` secret token is
+            wired through; a blank `Some("")` credential counts as **unconfigured** (comparing an empty
+            secret to an absent header is `"" == ""`, which would have authenticated everyone); the generic
+            hook's `==` secret compare became constant-time with both header forms evaluated unconditionally
+            (a short-circuiting `||` leaks which header was right); and **Discord gained the replay window
+            Slack already had** — Discord signs a timestamp but publishes no tolerance, so a captured POST
+            verified forever (test: a day-old capture still passes Ed25519 and is refused only by the
+            window). Separately and worse: `.route("/webhook/:id", …)` is **axum 0.7 syntax that axum 0.8
+            PANICS on** at router construction — inside a spawned task, under `panic = "abort"` — so
+            enabling any webhook server aborted the daemon at startup. Fixed to `{id}` with a
+            router-construction regression test (verified: reverting the route makes the test panic).
+            Evidence: 3 new end-to-end tests drive the real `WebhookServer` over a real socket with
+            `reqwest` (unconfigured→503 on all five routes, configured→401 without/with a wrong proof and
+            200 with it, blank→503); verified non-vacuous by re-introducing the fail-open and watching
+            `every_unconfigured_channel_refuses_with_503` report `got 200`. 6 new unit tests. The `run()`
+            log line that already promised "Only inbound requests carrying a valid provider signature are
+            accepted" is now true.
+            **Operator-visible change:** a channel that was relying on an unauthenticated webhook stops
+            serving until its secret is set; the 503 log names the key.
       - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
             match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
             (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had

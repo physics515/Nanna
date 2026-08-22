@@ -34,9 +34,110 @@ use tracing::{debug, error, info, warn};
 /// so the practical risk is small, but the daemon's HMAC/Ed25519 verifiers are
 /// all constant-time and this keeps the whole surface consistent. Length is not
 /// secret, so an early length check is fine.
+///
+/// An **empty** `expected` never matches. That is not a style choice: an empty
+/// configured secret compared against an absent header is `"" == ""`, which
+/// would authenticate every caller on earth. Callers should also route empty
+/// through [`configured`] so the refusal reads "not set up" rather than "wrong
+/// secret", but this function must be safe on its own.
 fn webhook_secret_matches(expected: &str, provided: Option<&str>) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
     let provided = provided.unwrap_or("");
+    debug_assert!(
+        !expected.is_empty(),
+        "the empty-secret guard above must have returned"
+    );
     expected.as_bytes().ct_eq(provided.as_bytes()).into()
+}
+
+/// Treat a credential as configured only when it is present AND non-blank.
+///
+/// `Some("")` is the shape a half-finished `config.toml` (or a keyring miss
+/// that wrote through as an empty string) leaves behind, and it is the
+/// dangerous shape: every verifier below reads "a secret exists" from
+/// `Option::is_some`, so a blank one would arm the endpoint with a credential
+/// nothing can fail to present.
+fn configured(value: Option<&String>) -> Option<&str> {
+    let present = value.map(String::as_str).filter(|v| !v.trim().is_empty());
+    debug_assert!(
+        present.is_none_or(|v| !v.trim().is_empty()),
+        "configured() must never yield a blank credential"
+    );
+    present
+}
+
+/// Widest age a provider-signed unix timestamp may have before it is treated as
+/// a replay, in seconds.
+///
+/// Derived, not magic. Slack documents a 5-minute tolerance on
+/// `X-Slack-Request-Timestamp` and rejects outside it, so accepting anything
+/// wider would be honouring a window the provider itself would not. Discord
+/// signs a timestamp too but publishes no tolerance, so it inherits this one —
+/// the alternative is an unbounded replay window on a signature that never
+/// expires, which is what shipped before. The bound has to cover ordinary
+/// provider↔host clock skew: 5 minutes is ~2 orders of magnitude above
+/// NTP-synced skew and still far below the time a captured POST stays useful.
+const MAX_SIGNED_TIMESTAMP_AGE_SECS: u64 = 300;
+
+/// Longest header value that can still be a unix-seconds timestamp.
+///
+/// 20 digits covers `u64::MAX` seconds (≈ 5.8e11 years). Anything longer is not
+/// a timestamp, and bounding it here keeps an attacker from handing the parser
+/// a megabyte of digits.
+const MAX_TIMESTAMP_HEADER_LEN: usize = 20;
+
+/// True when a provider-signed unix timestamp sits inside the replay window.
+///
+/// Returns `false` for every failure mode — unparseable, absurdly long, a host
+/// clock before the epoch. A replay guard that cannot establish an age must
+/// refuse, never wave through on an unknown one.
+fn signed_timestamp_is_fresh(timestamp: &str) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    debug_assert!(
+        MAX_SIGNED_TIMESTAMP_AGE_SECS > 0,
+        "a zero window would reject every request, including legitimate ones"
+    );
+    debug_assert!(
+        MAX_TIMESTAMP_HEADER_LEN >= u64::MAX.to_string().len(),
+        "the header bound must still admit every representable u64 second"
+    );
+
+    if timestamp.is_empty() || timestamp.len() > MAX_TIMESTAMP_HEADER_LEN {
+        return false;
+    }
+    let Ok(ts) = timestamp.parse::<u64>() else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        // The host clock is before the epoch, so no age can be computed and no
+        // replay can be bounded. Refuse rather than accept on an unknown age.
+        return false;
+    };
+    now.as_secs().abs_diff(ts) <= MAX_SIGNED_TIMESTAMP_AGE_SECS
+}
+
+/// Refuse a webhook for a channel whose credential is not configured.
+///
+/// **Fail closed.** Every endpoint below hands its payload to the agent loop,
+/// which runs tools with the daemon's privileges — an endpoint that cannot
+/// prove who called it is a remote command channel for anyone who learns the
+/// URL. Skipping verification "because nothing is configured" made the
+/// unconfigured case the *least* protected one, which is exactly backwards.
+///
+/// The status is 503 and not 401 deliberately: 401 says "your proof was
+/// wrong", 503 says "this host never armed this channel", and an operator
+/// reading a log has to be able to tell those apart. The message names the one
+/// config key that turns the endpoint on.
+fn refuse_unconfigured(channel: &str, config_key: &str) -> StatusCode {
+    warn!(
+        "{channel} webhook refused: no credential is configured, so the caller cannot be \
+         verified. Nothing was processed. Set `{config_key}` and restart the daemon to \
+         enable this endpoint."
+    );
+    StatusCode::SERVICE_UNAVAILABLE
 }
 
 /// Verify a Meta/WhatsApp `X-Hub-Signature-256` header against the raw body.
@@ -236,18 +337,23 @@ async fn telegram_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Verify secret token if configured (constant-time — see webhook_secret_matches).
-    if let Some(ref secret) = state.config.telegram_secret {
-        let header_secret = headers
-            .get("X-Telegram-Bot-Api-Secret-Token")
-            .and_then(|v| v.to_str().ok());
-
-        if !webhook_secret_matches(secret, header_secret) {
-            warn!("Telegram webhook: invalid secret token");
-            return StatusCode::UNAUTHORIZED;
-        }
+    // Telegram's only origin proof is the `secret_token` passed to `setWebhook`,
+    // which it echoes on every POST. The route is a fixed path with no token in
+    // it, so without this secret the endpoint accepts any body from anyone who
+    // can reach the port.
+    let Some(secret) = configured(state.config.telegram_secret.as_ref()) else {
+        return refuse_unconfigured("Telegram", "channels.telegram.webhook_secret");
+    };
+    let header_secret = headers
+        .get("X-Telegram-Bot-Api-Secret-Token")
+        .and_then(|v| v.to_str().ok());
+    // Constant-time — see webhook_secret_matches.
+    if !webhook_secret_matches(secret, header_secret) {
+        warn!("Telegram webhook: invalid secret token");
+        return StatusCode::UNAUTHORIZED;
     }
-    
+
+
     // Parse update
     let update: TelegramUpdate = match serde_json::from_slice(&body) {
         Ok(u) => u,
@@ -414,14 +520,32 @@ async fn discord_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     
-    // Verify signature if public key is configured
-    if let Some(ref public_key) = state.config.discord_public_key {
-        if !verify_discord_signature(public_key, signature, timestamp, &body) {
-            warn!("Discord webhook: invalid signature");
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid signature"}))).into_response();
-        }
+    // Fail closed: no public key means no way to tell Discord from anyone else.
+    let Some(public_key) = configured(state.config.discord_public_key.as_ref()) else {
+        return (
+            refuse_unconfigured("Discord", "channels.discord.public_key"),
+            Json(json!({"error": "webhook not configured"})),
+        )
+            .into_response();
+    };
+    // Discord signs the timestamp but publishes no tolerance, so a captured
+    // POST verifies forever unless we bound it ourselves. Check freshness
+    // BEFORE the Ed25519 verify: it is far cheaper and it is the cheap check
+    // that has to pass anyway.
+    if !signed_timestamp_is_fresh(timestamp) {
+        warn!("Discord webhook: signature timestamp outside the replay window");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "stale signature"})),
+        )
+            .into_response();
     }
-    
+    if !verify_discord_signature(public_key, signature, timestamp, &body) {
+        warn!("Discord webhook: invalid signature");
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid signature"}))).into_response();
+    }
+
+
     // Parse interaction
     let interaction: DiscordInteraction = match serde_json::from_slice(&body) {
         Ok(i) => i,
@@ -570,12 +694,17 @@ async fn slack_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     
-    // Verify signature if secret is configured
-    if let Some(ref signing_secret) = state.config.slack_signing_secret {
-        if !verify_slack_signature(signing_secret, signature, timestamp, &body) {
-            warn!("Slack webhook: invalid signature");
-            return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
-        }
+    // Fail closed: without the signing secret every POST is anonymous.
+    let Some(signing_secret) = configured(state.config.slack_signing_secret.as_ref()) else {
+        return (
+            refuse_unconfigured("Slack", "channels.slack.signing_secret"),
+            "webhook not configured",
+        )
+            .into_response();
+    };
+    if !verify_slack_signature(signing_secret, signature, timestamp, &body) {
+        warn!("Slack webhook: invalid signature");
+        return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
     }
     
     // Parse event
@@ -718,19 +847,17 @@ async fn whatsapp_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Verify the Meta X-Hub-Signature-256 when an app secret is configured. Skips
-    // (with a warning) when unset — same posture as the other providers — but an
-    // unset secret means the POST endpoint is unauthenticated, so configure one.
-    if let Some(ref app_secret) = state.config.whatsapp_app_secret {
-        let sig = headers
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok());
-        if !verify_meta_signature(app_secret, sig, &body) {
-            warn!("WhatsApp webhook: invalid X-Hub-Signature-256");
-            return StatusCode::UNAUTHORIZED;
-        }
-    } else {
-        warn!("WhatsApp app secret not configured - skipping POST signature verification");
+    // Fail closed: the Meta `X-Hub-Signature-256` is the only origin proof on
+    // this endpoint, and the GET handshake token does not cover POSTs.
+    let Some(app_secret) = configured(state.config.whatsapp_app_secret.as_ref()) else {
+        return refuse_unconfigured("WhatsApp", "channels.whatsapp.app_secret");
+    };
+    let sig = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok());
+    if !verify_meta_signature(app_secret, sig, &body) {
+        warn!("WhatsApp webhook: invalid X-Hub-Signature-256");
+        return StatusCode::UNAUTHORIZED;
     }
 
     // Parse webhook
@@ -808,27 +935,36 @@ async fn generic_webhook(
 ) -> impl IntoResponse {
     debug!("Generic webhook: received for id {}", webhook_id);
     
-    // Verify secret if configured for this webhook
-    if let Some(secret) = state.config.generic_secrets.get(&webhook_id) {
-        let auth_header = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        
-        // Check Bearer token or X-Webhook-Secret
-        let secret_header = headers
-            .get("X-Webhook-Secret")
-            .and_then(|v| v.to_str().ok());
-        
-        let is_valid = auth_header == format!("Bearer {}", secret)
-            || secret_header == Some(secret.as_str());
-        
-        if !is_valid {
-            warn!("Generic webhook {}: invalid secret", webhook_id);
-            return StatusCode::UNAUTHORIZED;
-        }
+    // Fail closed: an id with no registered secret used to be accepted, which
+    // made `/webhook/<anything>` an open command endpoint. An unregistered id
+    // and a registered-but-blank secret are the same answer — nothing here can
+    // authenticate a caller.
+    let Some(secret) = configured(state.config.generic_secrets.get(&webhook_id)) else {
+        return refuse_unconfigured("Generic", "server.webhook_secret (per webhook id)");
+    };
+
+    // Either `Authorization: Bearer <secret>` or `X-Webhook-Secret: <secret>`.
+    // Both compared in constant time, like every other verifier in this file —
+    // the previous `==` short-circuited on the first wrong byte.
+    let bearer = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let secret_header = headers
+        .get("X-Webhook-Secret")
+        .and_then(|v| v.to_str().ok());
+
+    // Evaluate both arms unconditionally: `||` would skip the second compare
+    // whenever the first matched, and the timing of that skip is itself a
+    // signal about which header was correct.
+    let bearer_ok = webhook_secret_matches(secret, bearer);
+    let header_ok = webhook_secret_matches(secret, secret_header);
+    if !(bearer_ok | header_ok) {
+        warn!("Generic webhook {}: invalid secret", webhook_id);
+        return StatusCode::UNAUTHORIZED;
     }
-    
+
+
     // Parse payload as JSON if possible
     let payload: Value = serde_json::from_slice(&body)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body).to_string() }));
@@ -935,8 +1071,15 @@ impl WebhookServer {
             .route("/webhook/discord", post(discord_webhook))
             .route("/webhook/slack", post(slack_webhook))
             .route("/webhook/whatsapp", get(whatsapp_verify).post(whatsapp_webhook))
-            // Generic webhook
-            .route("/webhook/:id", post(generic_webhook))
+            // Generic webhook.
+            //
+            // `{id}`, not `:id`: axum 0.8 removed the colon syntax and PANICS
+            // at router construction on a segment starting with `:`. The router
+            // is built inside `run()`, inside a spawned task, under
+            // `panic = "abort"` — so the stale form took the whole daemon down
+            // the moment a webhook server was enabled. `router_builds_*` below
+            // is the regression guard.
+            .route("/webhook/{id}", post(generic_webhook))
             // Health check (so load balancers can verify)
             .route("/", get(|| async { "Nanna Webhook Server" }))
             .layer(cors)
@@ -1007,6 +1150,103 @@ mod tests {
         assert!(!missing, "a missing token never matches");
         let empty = webhook_secret_matches("s3cr3t", Some(""));
         assert!(!empty, "an empty token never matches");
+    }
+
+    #[test]
+    fn an_empty_configured_secret_authenticates_nobody() {
+        // The dangerous shape: `"" == ""` would wave through every caller.
+        let both_empty = webhook_secret_matches("", None);
+        assert!(!both_empty, "an empty secret must not match an absent token");
+        let empty_vs_empty = webhook_secret_matches("", Some(""));
+        assert!(!empty_vs_empty, "an empty secret must not match an empty token");
+        let empty_vs_value = webhook_secret_matches("", Some("anything"));
+        assert!(!empty_vs_value, "an empty secret must not match any token");
+    }
+
+    #[test]
+    fn configured_rejects_absent_and_blank_credentials() {
+        assert_eq!(configured(None), None);
+        let blank = String::new();
+        assert_eq!(configured(Some(&blank)), None, "empty is not configured");
+        let spaces = "   ".to_string();
+        assert_eq!(configured(Some(&spaces)), None, "blank is not configured");
+        let real = "s3cr3t".to_string();
+        assert_eq!(configured(Some(&real)), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn signed_timestamp_window_accepts_now_and_rejects_replays() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("host clock is after the unix epoch")
+            .as_secs();
+
+        assert!(signed_timestamp_is_fresh(&now.to_string()), "now is fresh");
+        let edge = (now - MAX_SIGNED_TIMESTAMP_AGE_SECS + 5).to_string();
+        assert!(signed_timestamp_is_fresh(&edge), "just inside the window");
+
+        let stale = (now - MAX_SIGNED_TIMESTAMP_AGE_SECS - 60).to_string();
+        assert!(!signed_timestamp_is_fresh(&stale), "a replay is refused");
+        let future = (now + MAX_SIGNED_TIMESTAMP_AGE_SECS + 60).to_string();
+        assert!(
+            !signed_timestamp_is_fresh(&future),
+            "a far-future stamp is refused"
+        );
+
+        // Every unusable input refuses rather than passing on an unknown age.
+        assert!(!signed_timestamp_is_fresh(""), "absent");
+        assert!(!signed_timestamp_is_fresh("not-a-number"), "unparseable");
+        assert!(!signed_timestamp_is_fresh("-1"), "negative");
+        let overlong = "9".repeat(MAX_TIMESTAMP_HEADER_LEN + 1);
+        assert!(
+            !signed_timestamp_is_fresh(&overlong),
+            "bounded header length"
+        );
+    }
+
+    #[test]
+    fn discord_signature_alone_does_not_survive_the_replay_window() {
+        // The signature stays valid forever — Discord signs the timestamp but
+        // publishes no tolerance — so the window is the only thing separating a
+        // captured POST from a live one.
+        use ed25519_dalek::{Signer, SigningKey};
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let public_key = hex::encode(signing.verifying_key().to_bytes());
+        let body = br#"{"type":1}"#;
+
+        let stale_ts = (chrono::Utc::now().timestamp() - 86_400).to_string();
+        let mut message = stale_ts.as_bytes().to_vec();
+        message.extend_from_slice(body);
+        let sig = hex::encode(signing.sign(&message).to_bytes());
+
+        assert!(
+            verify_discord_signature(&public_key, &sig, &stale_ts, body),
+            "a day-old capture still verifies cryptographically"
+        );
+        assert!(
+            !signed_timestamp_is_fresh(&stale_ts),
+            "…and is exactly what the replay window has to reject"
+        );
+    }
+
+    #[test]
+    fn router_builds_with_the_axum_08_capture_syntax() {
+        // axum 0.8 removed `:id` and PANICS at router construction on it. The
+        // router is built inside a spawned task under `panic = "abort"`, so a
+        // stale capture takes the whole daemon down when a webhook server is
+        // enabled — and no other test constructs the router.
+        let (server, _rx) = WebhookServer::new(WebhookConfig::default());
+        let _router = server.router();
+    }
+
+    #[test]
+    fn refusing_an_unconfigured_channel_is_distinguishable_from_a_bad_secret() {
+        // 503 ("this host never armed the channel") must not be reported as
+        // 401 ("your proof was wrong") — an operator debugs from the difference.
+        let status = refuse_unconfigured("Telegram", "channels.telegram.webhook_secret");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
     }
 
     fn meta_signature(secret: &str, body: &[u8]) -> String {
