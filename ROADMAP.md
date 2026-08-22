@@ -3925,6 +3925,43 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      is already at latest-safe, no GUI changes this run. *Reconfirmed the fmt gotcha: `cargo fmt -p <crate>`
      reformats the whole crate, not the touched file — `origin/master` isn't fmt-clean, so it churned 4
      unrelated files; reverted, kept only the surgical `.await` diff.*
+   - *(2026-08-22 sweep)* `cargo update` → ~150 compatible bumps (`tokio-macros 2.7.2`, `ureq 3.4.0`,
+     `uuid 1.24.1`, `wasm-bindgen 0.2.127`, `wgpu 30.0.1`, `zbus 5.19.0`, `zvariant 5.15.0`,
+     `zerocopy 0.8.56`, `zlib-rs 0.6.7`, `xml 1.4.0`, `zerovec 0.11.8`, …).
+     `cargo upgrade --incompatible` offered four majors: **`wide 1.5 → 1.6`** (workspace/`nanna-simd`)
+     and **`playwright-rs 0.15 → 0.16`** (`nanna-browser`, verified under `--features playwright`)
+     both **applied**, compiled unchanged; **`rten 0.24 → 0.25`** **reverted** (see the blocked item
+     below); **`criterion 0.8 → "0.7"`** **rejected** — `cargo-upgrade` reports `latest 0.7.0` while the
+     lock resolves `criterion 0.8.2`, so taking the suggestion walks the bench harness *backwards*.
+     Landmine (same one the 2026-08-21 run hit — it is reproducible, not a one-off): the sweep moves
+     **`malachite-bigint` to 0.10.0** for `pymath` while `rustpython-{codegen,compiler,derive} 0.5.0`
+     stay on **0.9.2**, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308` errors about
+     `malachite_bigint::{BigUint,BigInt}`. Pinned back with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; **re-apply this pin after every
+     `cargo update` until `rustpython 0.5` unifies the req.**
+     Verified: workspace (excl. `nanna-gui`) builds `--all-targets` green, **1555 tests pass / 0 fail /
+     12 ignored**, clippy **0 errors** (2742 warnings = this run's baseline), and
+     `cargo build --release -p nanna-daemon` green.
+     Bench (`nanna-bench vector_search`, release, 4070 Ti SUPER / Zen 4, 768-dim): **42.0 µs @ 1k ·
+     1.31 ms @ 10k · 9.05 ms @ 50k** — every budget held (≤0.20 / ≤5.0 / ≤25 ms); no regression from
+     `wide 1.6`. Baseline p50s left unchanged (the 10k/50k improvement is not A/B-attributed).
+     Frontend: `happy-dom 20.11.6`, `vitest 4.1.11`, `vue-tsc 3.3.11` applied green (**159/159 vitest**);
+     `pnpm outdated` otherwise shows **only the documented deferred majors** (`@tiptap/* 2.27 → 3.30`,
+     `marked 17 → 18`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the
+     `lucide-vue-next 1.0.0` tombstone that must never be taken.
+     - [ ] **`rten 0.24 → 0.25` is blocked on `ocrs`.** `ocrs 0.12.2` (still the latest) requires
+           `rten ^0.24`, and `ocr.rs:299-312` hands an `rten::Model` straight into
+           `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
+           the two `Model` types stop being the same type. Re-check when `ocrs` ships a release that
+           tracks `rten 0.25`.
+     - [ ] **The `turso_core` release build is non-deterministic under the parallel rustc frontend.**
+           On the pinned `nightly-2026-08-03`, `cargo build --release -p nanna-daemon` failed once with
+           `error: queries overflow the depth limit!` in `turso_core 0.6.1` and then **succeeded on an
+           immediately-repeated identical invocation**. The user-global `~/.cargo/config.toml` sets
+           `rustflags = ["-Z", "threads=15"]`, so the depth/recursion accounting is thread-scheduling
+           dependent. Treat a single depth-limit failure as *flaky, retry once* rather than as a
+           toolchain incompatibility — but pin it down (repro under `-Z threads=1`, then report
+           upstream) before it eats a release cut.
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
