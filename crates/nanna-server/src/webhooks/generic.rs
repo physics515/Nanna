@@ -1,9 +1,10 @@
 //! Generic webhook handler for custom integrations
 
 use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use crate::webhooks::auth;
+use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Generic webhook request
@@ -35,10 +36,26 @@ pub struct GenericWebhookResponse {
 }
 
 /// Handle generic webhook
+///
+/// This endpoint takes an arbitrary `message` and runs it, so it is the most
+/// directly abusable of the five. `server.webhook_secret` was already parsed
+/// into `AppState` and then read by nobody; it is the credential now.
 pub async fn handle(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(webhook): Json<GenericWebhook>,
 ) -> Result<Json<GenericWebhookResponse>, StatusCode> {
+    let Some(secret) = auth::configured(state.webhook_secret.as_ref()) else {
+        return Err(auth::refuse_unconfigured(
+            "Generic",
+            "server.webhook_secret",
+        ));
+    };
+    if !auth::bearer_secret_ok(&headers, secret) {
+        warn!("Generic webhook: invalid shared secret");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let session_id = webhook
         .session_id
         .unwrap_or_else(|| format!("{}:{}:{}", webhook.channel, webhook.user_id, Uuid::new_v4()));

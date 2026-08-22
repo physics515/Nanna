@@ -540,6 +540,22 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             accepted" is now true.
             **Operator-visible change:** a channel that was relying on an unauthenticated webhook stops
             serving until its secret is set; the 503 log names the key.
+      - [x] *(2026-08-22)* **Same treatment for the `nanna serve` copy (`nanna-server`), which was worse.**
+            Telegram, Signal and the generic hook had **no authentication of any kind** — no header read,
+            no secret compared — and `nanna serve` also never handed the Slack signing secret to
+            `AppStateBuilder`, so its Slack verifier could not have run even in principle. The generic
+            endpoint (which takes an arbitrary `message` and runs it) had a `webhook_secret` field parsed
+            into `AppState` from `server.webhook_secret` and read by **nobody**. New
+            `webhooks/auth.rs` holds the shared primitives (`configured`, constant-time `secret_matches`,
+            `timestamp_is_fresh`, `refuse_unconfigured`, `bearer_secret_ok`), all five handlers fail closed
+            through it, Discord gained the replay window, and `serve.rs` now wires
+            slack/telegram/signal secrets. 6 unit tests. `nanna init` mints a 122-bit Telegram webhook
+            secret and prints the exact `setWebhook` call, so a fresh install is armed rather than broken.
+            - [ ] `nanna-server`'s handlers have **no end-to-end harness** (the daemon's do): building an
+                  `AppState` needs a live `Nanna` bot + Turso storage, so the fail-closed branches there
+                  are covered by the shared `auth` unit tests and compile-checked wiring only. Build a
+                  test-only `AppState` so the same three end-to-end assertions can run against
+                  `create_router`.
       - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
             match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
             (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had

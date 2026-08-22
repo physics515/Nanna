@@ -3,7 +3,8 @@
 //! Works with: https://github.com/bbernhard/signal-cli-rest-api
 
 use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use crate::webhooks::auth;
+use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
 use nanna_agent::RunOptions;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -146,8 +147,23 @@ pub struct SignalResponse {
 /// Handle incoming Signal webhook
 pub async fn handle(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(webhook): Json<SignalWebhook>,
 ) -> Result<Json<SignalResponse>, StatusCode> {
+    // signal-cli-rest-api does not sign its callbacks, so a shared secret is
+    // the strongest proof available on this path — and this payload drives the
+    // agent, which runs tools. Fail closed until one is configured.
+    let Some(secret) = auth::configured(state.signal_webhook_secret.as_ref()) else {
+        return Err(auth::refuse_unconfigured(
+            "Signal",
+            "channels.signal.webhook_secret",
+        ));
+    };
+    if !auth::bearer_secret_ok(&headers, secret) {
+        warn!("Signal webhook: invalid shared secret");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     debug!("Received Signal webhook from account: {}", webhook.account);
 
     let envelope = &webhook.envelope;

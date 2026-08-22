@@ -33,6 +33,9 @@ chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "3.0"
 hex = "0.4"
 
+# Constant-time secret comparison (shared-secret webhook auth)
+subtle = "2"
+
 # Slack signature verification
 hmac = "0.13"
 sha2 = "0.11"
