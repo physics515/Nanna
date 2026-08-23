@@ -125,7 +125,9 @@ export const SlashCommands = Extension.create({
               popup = tippy('body', {
                 getReferenceClientRect: props.clientRect,
                 appendTo: () => document.body,
-                content: component.element,
+                // `VueRenderer.element` is `Element | null`; tippy takes
+                // `Content | undefined`. Passing null would mount an empty popup.
+                content: component.element ?? undefined,
                 showOnCreate: true,
                 interactive: true,
                 trigger: 'manual',

@@ -1170,6 +1170,30 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             derive.
             **Verified non-vacuous**: a one-character change to the fence parser
             (`line.slice(3)` → `slice(4)`) trips 3 snapshots. 208 vitest green (was 159).
+            *(2026-08-23, same run)* **Second batch: 66 → 41, and it found a broken feature.**
+            `app/extensions/MonacoCodeBlock.ts`'s 16 errors were **one** root cause, not sixteen:
+            `Cannot find module '@tiptap/core'`. Three files import `@tiptap/core` directly
+            (`MonacoCodeBlock.ts`, `SlashCommands.ts`, `FloatingToolbar.vue`) but it was never a
+            declared dependency — only a transitive one, which pnpm's strict `node_modules` layout
+            correctly refuses to resolve by name. Every other error in those files was a downstream
+            implicit-`any`, because Tiptap's callback parameter types could not be inferred without it.
+            Declaring `"@tiptap/core": "2.27.2"` (pinned to the family) fixed **17 errors in one line**
+            and removed a real fragility: the code was relying on hoisting it never asked for.
+            Two genuine stragglers then fixed: `state.schema.nodes.paragraph` is optional and
+            `.create()` on an absent node type would throw **inside an input rule, mid-keystroke** (now
+            guarded — the code block still inserts, only the trailing paragraph is skipped); and
+            `VueRenderer.element` is `Element | null` while tippy takes `Content | undefined`, so a null
+            would mount an empty popup.
+            - [x] **`pages/memory.vue`: editing a memory was broken outright.** Its six errors were all
+                  one bug — the template bound `@click="startEditMemory(memory)"`,
+                  `saveEditMemory(memory)` and `cancelEditMemory`, none of which exist. The script
+                  defines `startEditing` / `saveEditing(id)` / `cancelEditing`. In Vue an undefined
+                  template handler throws on click, so **the Edit / Save / Cancel buttons on every
+                  memory card threw**, in both the semantic and episodic lists. Note the signature
+                  mismatch too: `saveEditing` takes an **id**, while the template was passing the whole
+                  memory object. Rewired all six call sites. This is the clearest possible argument for
+                  the gate: a shipped feature was dead, and a typecheck that actually ran would have
+                  said so the day it landed.
       - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
       - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
