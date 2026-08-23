@@ -92,7 +92,7 @@ A fully local run needs none.
 - **Cognitive memory** — FSRS-6 spaced repetition with semantic recall and consolidation ("dreaming")
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
 - **39 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools
-- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp
+- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
