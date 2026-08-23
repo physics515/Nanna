@@ -3995,6 +3995,41 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `pnpm outdated` otherwise shows **only the documented deferred majors** (`@tiptap/* 2.27 → 3.30`,
      `marked 17 → 18`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the
      `lucide-vue-next 1.0.0` tombstone that must never be taken.
+   - *(2026-08-23 sweep)* `cargo update` → 7 compatible bumps (`blocking 1.7.0`, `crc32fast 1.5.1`,
+     `log 0.4.34`, `uuid 1.25.0`). **The `malachite-bigint` landmine recurred exactly as documented** —
+     the sweep re-added 0.10.0 alongside `rustpython-{codegen,compiler,derive} 0.5.0`'s 0.9.2; pinned
+     back with `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`. Re-checked upstream: nothing
+     has moved, so **keep re-applying this pin after every `cargo update`**.
+     `cargo upgrade --incompatible` offered three, of which one was taken:
+     **`uuid 1.24 → 1.25`** (workspace + `nanna-server`) applied — hand-edited, not via `cargo-upgrade`,
+     to avoid its documented CRLF→LF whole-file churn. **`criterion 0.8 → "0.7"` rejected again** (the
+     lock resolves 0.8.2; taking the suggestion walks the bench harness backwards). **`rten 0.24 → 0.25`
+     still blocked** — re-verified against crates.io this run: `ocrs` is *still* 0.12.2 and still
+     requires `rten ^0.24`, so the two `Model` types would stop being the same type.
+     **The intentional `turso`/`aegis` pins were re-examined and both moved** — a pre-1.0 pin is a
+     "prove it before you take it" marker, not a permanent freeze, and the previous run had this bump
+     in flight but unverified when it ended. **`turso =0.6.1 → =0.7.2`** and
+     **`aegis =0.9.12 → =0.9.15`**: compiled with **zero source changes**, and **120 `nanna-storage`
+     tests pass** including the `rusqlite`/`libsql`/`sqlx` dep-guard and the corruption classifier
+     (`corruption_classifier_matches_turso_page_errors` still matches 0.7.2's page-error strings, so
+     the recovery path did not silently stop recognising them). Worth taking on its merits, not just
+     freshness: [Turso 0.7.0](https://turso.tech/blog/turso-0.7.0) makes the embeddable engine
+     **non-blocking** — the core no longer blocks the calling thread on I/O, no longer aborts the
+     process on OOM, and yields the CPU during long operations so one busy statement cannot starve
+     other connections sharing the runtime. That is the exact failure class this repo has been bitten
+     by (one shared connection under one mutex; an unfinished cursor swallowing later writes; a
+     `turso_core` panic taking the daemon down mid-load).
+     - [ ] **Exploit turso 0.7's non-blocking engine.** The single-shared-connection-under-a-mutex
+           design was shaped by an engine that blocked its caller. Re-measure whether the mutex can
+           narrow (or whether concurrent readers can be admitted) now that long operations yield —
+           and re-check whether the "drop cursors before writing" rule is still load-bearing. Do not
+           change the locking on inference alone; measure first.
+     Verified: workspace (excl. `nanna-gui`) builds `--all-targets` green, **1576 tests pass / 0 fail /
+     12 ignored** (1555 was the previous baseline; +6 from this run's new `nanna-server` suite, the
+     rest from turso 0.7.2's own test targets), clippy **0 errors**, and `cargo build --release -p
+     nanna-daemon` green — the release gate the roadmap asked for below, which debug + tests cannot see.
+     Toolchain: `rust-toolchain.toml` stays on `nightly-2026-08-03`; the release build above is the
+     evidence the pin still holds.
      - [ ] **`rten 0.24 → 0.25` is blocked on `ocrs`.** `ocrs 0.12.2` (still the latest) requires
            `rten ^0.24`, and `ocr.rs:299-312` hands an `rten::Model` straight into
            `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
@@ -4040,9 +4075,35 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
            tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
-   **Blocked here by design (checked 2026-07-23): `physics515/Mummu` is still an empty repo** — only
-   `.git`/`.claude`, no crates — so there is no runner surface for Nanna to consume. Items 3–5 stay
-   blocked until Mummu exposes one; runner code must NOT be written in this repo.
+   **UNBLOCKED (re-checked 2026-08-23): `physics515/Mummu` is no longer empty.** The earlier note
+   ("still an empty repo — only `.git`/`.claude`, no crates") is stale. The repo now carries a real
+   workspace — `crates/{mummu, mummu-serve, mummu-bench}`, `burn.toml`, `bench/BASELINE.md` — and its
+   README reports the surface Nanna's items 3–5 were waiting on: one binary compiling both `Wgpu`
+   (fusion + autotune, SPIR-V on Vulkan) and `burn-flex` CPU behind a cached runtime device probe;
+   checked safetensors / PyTorch / GGUF import with `config.json`-driven hyperparameters; HF
+   tokenizer + `tokenizer_config.json` import with byte-verified chat templates **including the
+   Hermes `# Tools` block**; per-layer KV cache, on-GPU argmax, sampling, **token streaming** and
+   cooperative cancellation; a validated **f16** path (Qwen2.5-1.5B ≈3.6 GiB runner VRAM, decode
+   36.8 tok/s, TTFT 24.9 ms on the reference 4070 Ti SUPER); a `warm_up` API; a from-scratch
+   MiniLM-class CPU sentence embedder; and `plan::pick_precision` for VRAM-aware dtype choice.
+   Runner code still must NOT be written in this repo — but the *consumer glue* is now the real work,
+   and it is no longer blocked:
+   - [ ] **Take Mummu as a dependency** — decide git-rev pin vs path dep, and land the `[infer]`
+         config surface (model id, device preference, precision override). A rev pin is the honest
+         default while Mummu is pre-release: it is the same reproducibility argument as the boa git
+         rev and the exact `turso`/`aegis` pins. Budget the build cost first — `burn` + `wgpu` +
+         CubeCL is a large cold compile, and `nanna-gui` already needs a sidecar and a built frontend.
+   - [ ] **Back the memory `embed_fn` with Mummu's MiniLM embedder** (P12 item 4) — this is the
+         lowest-risk first consumer: CPU-only, no VRAM budget to negotiate, and it removes the last
+         API dependency from the memory path. Mind the **embedding-dimension latch** (see the stale
+         embedding-binding work): switching embedders re-binds the vector width, so the backfill and
+         the dimension guard in `nanna-storage`'s SQL kNN both have to be exercised before this lands.
+   - [ ] **`Provider::Local` in the router** (P12 item 5) — dispatch completion/stream/tool-calls to
+         Mummu and make local the top-priority zero-cost tier. Note the router is **frozen at boot**
+         (see the bare-model-name work), so a local tier that appears after boot is invisible; wire it
+         into the boot-time provider map, not lazily.
+   - [ ] **Do not port the parity harness, the model zoo, or the quantization planner here.** Those
+         are Mummu's, with their own routine. If a bug is found through Nanna, file it there.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
 6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — the
