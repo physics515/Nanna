@@ -183,8 +183,8 @@ const MAX_PROBE_ANSWER_BYTES: usize = 4096;
 ///    an answer that hedges is not an acknowledgement.
 const AFFIRMATIVE_TOKENS: [&str; 5] = ["ok", "okay", "healthy", "operational", "alive"];
 const NEGATION_TOKENS: [&str; 12] = [
-    "not", "no", "never", "fail", "failed", "failing", "failure", "error", "unhealthy", "broken",
-    "cannot", "unable",
+    "not", "no", "never", "fail", "failed", "failing", "failure", "error", "unhealthy",
+    "broken", "cannot", "unable",
 ];
 
 fn probe_answer_is_affirmative(response: &str) -> bool {
@@ -859,7 +859,9 @@ mod tests {
 
     #[test]
     fn a_plain_acknowledgement_passes() {
-        for answer in ["OK", "ok", "Okay", "OK.", "**ok**", "ok!", "Healthy", "operational", "alive"] {
+        for answer in [
+            "OK", "ok", "Okay", "OK.", "**ok**", "ok!", "Healthy", "operational", "alive",
+        ] {
             assert!(
                 probe_answer_is_affirmative(answer),
                 "{answer:?} is an acknowledgement"
@@ -924,13 +926,19 @@ mod tests {
         // push a negation past the end of the scan.
         let huge = format!("ok {}", "a".repeat(super::MAX_PROBE_ANSWER_BYTES));
         assert!(huge.len() > super::MAX_PROBE_ANSWER_BYTES);
-        assert!(!probe_answer_is_affirmative(&huge), "over the cap is a fail");
+        assert!(
+            !probe_answer_is_affirmative(&huge),
+            "over the cap is a fail"
+        );
 
         // Just under the cap still works, so the bound is not so tight that it
         // rejects a merely verbose but healthy agent.
         let verbose = format!("{} ok", "a".repeat(super::MAX_PROBE_ANSWER_BYTES - 4));
         assert!(verbose.len() <= super::MAX_PROBE_ANSWER_BYTES);
-        assert!(probe_answer_is_affirmative(&verbose), "under the cap passes");
+        assert!(
+            probe_answer_is_affirmative(&verbose),
+            "under the cap passes"
+        );
     }
 
     #[test]
@@ -938,7 +946,13 @@ mod tests {
         // This repo has been bitten more than once by byte-slicing a string
         // with a multi-byte char in it (an em dash in an error message took the
         // daemon down). This path must never slice.
-        for answer in ["OK — operational", "d'accord, ok", "✅ ok", "не ok", "ok 🎉"] {
+        for answer in [
+            "OK — operational",
+            "d'accord, ok",
+            "✅ ok",
+            "не ok",
+            "ok 🎉",
+        ] {
             let _ = probe_answer_is_affirmative(answer);
         }
         assert!(probe_answer_is_affirmative("OK — operational"));

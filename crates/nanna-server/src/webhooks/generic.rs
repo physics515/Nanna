@@ -150,7 +150,10 @@ mod tests {
             "a caller that manages its own sessions is unaffected"
         );
         // Surrounding whitespace is not part of the identity.
-        assert_eq!(session_key(Some("  my-own-thread  "), "zapier", "alice"), "my-own-thread");
+        assert_eq!(
+            session_key(Some("  my-own-thread  "), "zapier", "alice"),
+            "my-own-thread"
+        );
     }
 
     #[test]
@@ -174,6 +177,10 @@ mod tests {
         // Telegram conversation.
         let key = session_key(None, "telegram", "12345");
         assert!(key.starts_with("generic:"), "got {key}");
-        assert_ne!(key, "telegram:12345", "must not alias a real Telegram session");
+        assert_ne!(
+            key,
+            "telegram:12345",
+            "must not alias a real Telegram session"
+        );
     }
 }
