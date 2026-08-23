@@ -218,9 +218,12 @@ fn probe_answer_is_affirmative(response: &str) -> bool {
         negated |= NEGATION_TOKENS.contains(&word);
     }
 
+    // The scan only ever runs on a bounded input: the early return above is the
+    // only thing standing between a runaway model and unbounded work on a check
+    // that fires on a timer forever, so pin that it happened.
     debug_assert!(
-        !negated || !(affirmed && !negated),
-        "a negated answer must never be reported as affirmative"
+        response.len() <= MAX_PROBE_ANSWER_BYTES,
+        "an over-cap answer must have been refused before the scan"
     );
     affirmed && !negated
 }

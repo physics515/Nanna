@@ -767,7 +767,14 @@ health checks). **Shipped**, except:
       6 tests (plain acknowledgement; the five substring traps; seven negated forms; empty/irrelevant;
       the cap in both directions; multi-byte answers incl. an em dash and emoji). **Verified
       non-vacuous**: restoring the substring check fails 4 of them. 389 `nanna-agent` lib tests green,
-      clippy 0 errors and 0 warnings from the new code.
+      clippy 0 errors.
+      *(Follow-up in the same run: the function's exit `debug_assert` was itself a tautology —
+      `!negated || !(affirmed && !negated)` simplifies to `true`, which clippy's `overly_complex_bool_expr`
+      caught on the workspace pass. A per-crate grep by function name had missed it, because clippy
+      anchors to lines, not names. Replaced with a real post-condition — the scan only ever runs on a
+      bounded input, so pin that the cap's early return happened — which is what the exit assertion
+      should have been saying. Worth remembering as a check-your-checks lesson: an assertion that
+      cannot fail is the same failure mode as the health probe it was guarding.)*
       - [ ] **Still open: give a supervised agent a real body.** `start_agent` must run the agent loop
             rather than parking on `shutdown_rx`. Until it does, the health probe measures the *LLM's*
             reachability, not the supervised agent's — which is worth knowing, but is not what the
