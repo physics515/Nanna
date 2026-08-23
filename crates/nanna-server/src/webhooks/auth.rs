@@ -12,6 +12,13 @@
 //! and the daemon is the surface P16 keeps; this copy exists because
 //! `nanna serve` still binds the same routes. Change one, change the other —
 //! the same note guards the Ed25519 and HMAC verifiers below them.
+//!
+//! One deliberate asymmetry, so it does not read as drift:
+//! `parse_authenticated_body` has **no twin**, and should not gain one. It
+//! exists because three handlers in this crate took `Json<T>`, which axum runs
+//! before the handler body and therefore before the credential check. Every
+//! daemon handler already takes `Bytes` and parses inline after verifying, so
+//! the daemon never had the ordering bug this helper fixes.
 
 use axum::http::{HeaderMap, StatusCode};
 use subtle::ConstantTimeEq;
