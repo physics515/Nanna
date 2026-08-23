@@ -4180,6 +4180,31 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `release.yml` builds, and it pulls in both crates the recorded failures lived in.
            Also corrected while here: `test-compile.yml`'s toolchain comment still claimed the
            workspace pinned `nightly-2026-07-13` while the step passed `nightly-2026-08-03`.
+   - [x] *(2026-08-23)* **`nanna-gui` was compiled by nothing in CI, and was found broken.**
+     `test-compile.yml` runs `--exclude nanna-gui`, and `gui.yml` runs only frontend jobs (Vitest,
+     `vue-tsc`, Playwright) *and only triggers on `gui/**` paths* — so a change under `crates/` that
+     broke `gui/src-tauri/src/**` reached **no** Rust coverage anywhere, on any trigger. The
+     `--exclude` was inherited by this routine's own verification too (`cargo build --all-targets
+     --workspace --exclude nanna-gui`), so nothing local caught it either.
+     Found the hard way: `cargo tauri build` failed with **two `E0063`s** —
+     `crates/nanna-config`'s new `webhook_secret` field on `TelegramConfig`/`SignalConfig` had been
+     added to three of its four construction sites, missing
+     `gui/src-tauri/src/commands/channels.rs`. Every gate was green while the shippable desktop app
+     did not compile.
+     Fixed both sites — and not with `None`, which would have compiled while shipping a GUI that
+     configures a permanently-503 channel, since the daemon now refuses to serve an unarmed webhook.
+     Telegram **mints** a 122-bit secret exactly as `nanna init` does (a supplied one wins, so
+     re-running never silently rotates a secret already registered via `setWebhook`); Signal only
+     **carries through** what the operator supplies, because that secret must also be configured on
+     the separate signal-cli-rest-api bridge — a value invented at this end would arm an endpoint the
+     bridge cannot satisfy, and a 503 naming the key is the honest outcome for "half configured".
+     New `check-gui` job in `test-compile.yml` closes the gap. The exclusion cited a real obstacle —
+     the crate's build needs the uncommitted sidecar and `gui/.output/public` — but **both can be
+     stubbed**, which is what makes the job cheap: measured locally, a 4-byte placeholder sidecar and
+     a one-line `index.html` are enough for `cargo check -p nanna-gui --locked` to run the real
+     typecheck in ~55s, with no `pnpm build` and no daemon build. Packaging stays `release.yml`'s job,
+     with the real artifacts. **Verified it catches the actual regression**: reverting the
+     `channels.rs` fix makes the job's exact command report both `E0063`s.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at

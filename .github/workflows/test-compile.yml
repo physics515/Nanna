@@ -61,3 +61,52 @@ jobs:
       # full pnpm + daemon build, which is a packaging job, not a smoke check.
       - name: Compile all test targets
         run: cargo test --no-run --workspace --exclude nanna-gui --locked
+
+  # `nanna-gui` is excluded above, so until this job existed **nothing in CI
+  # compiled it at all** — and `gui.yml` only triggers on `gui/**` paths, so a
+  # change under `crates/` that broke `gui/src-tauri/src/**` reached neither
+  # workflow's Rust coverage.
+  #
+  # That is not hypothetical. On 2026-08-23 `nanna-gui` was found broken on this
+  # branch: adding `webhook_secret` to `TelegramConfig`/`SignalConfig` in
+  # `nanna-config` updated three of the four construction sites, and the fourth
+  # (`gui/src-tauri/src/commands/channels.rs`) failed with two E0063s. Every
+  # existing gate was green, because every existing gate skips this crate.
+  #
+  # The exclusion above cites a real obstacle — `nanna-gui`'s build needs two
+  # artifacts the repo does not commit — but both can be **stubbed**, which is
+  # what makes this job cheap. Measured locally: a 4-byte placeholder sidecar
+  # and a one-line `index.html` are enough for `cargo check -p nanna-gui` to run
+  # the real typecheck. No `pnpm build`, no daemon build.
+  check-gui:
+    name: Typecheck nanna-gui
+    runs-on: windows-latest
+    # Measured at 55s for the check itself once the shared dependency graph is
+    # built; that graph dominates, so this matches the job above's bound for it.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-03
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-gui
+
+      # Stubs, deliberately: this job typechecks Rust, it does not package an
+      # app. The sidecar only has to exist for Tauri's externalBin resolution,
+      # and `frontendDist` only has to be a directory for `generate_context!`
+      # not to panic. Packaging is `release.yml`'s job, with the real artifacts.
+      - name: Stub the two uncommitted build artifacts
+        shell: bash
+        run: |
+          mkdir -p gui/src-tauri/binaries gui/.output/public
+          printf 'stub' > gui/src-tauri/binaries/nanna-daemon-x86_64-pc-windows-msvc.exe
+          printf '<!doctype html><title>stub</title>' > gui/.output/public/index.html
+
+      - name: Typecheck the GUI crate
+        run: cargo check --package nanna-gui --locked
