@@ -4171,6 +4171,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            dependent. Treat a single depth-limit failure as *flaky, retry once* rather than as a
            toolchain incompatibility — but pin it down (repro under `-Z threads=1`, then report
            upstream) before it eats a release cut.
+   - *(research 2026-08-23)* **Turso 0.7's non-blocking engine changes what this repo's storage
+     design was working around.** [Turso 0.7.0](https://turso.tech/blog/turso-0.7.0): the core no
+     longer blocks the calling thread on I/O, no longer aborts the process when it runs out of
+     memory, and yields the CPU during long operations so a busy statement cannot starve other
+     connections sharing a runtime. Also in 0.7: faster MVCC concurrent writes, leaner recovery,
+     lower per-row-version memory, index-resolved parameters (~2x faster prepare on a
+     thousand-parameter insert), runtime-registered custom storage backends via a global registry
+     resolved through `vfs=`, PostgreSQL-style sequences and ICU collations. Three of those bear
+     directly on decisions already made here — the single-shared-connection-under-one-mutex design,
+     the "drop cursors before writing" rule, and the fact that a `turso_core` panic used to take the
+     daemon down mid-load. Folded as a measurement to-do above, not a change: do not re-shape the
+     locking on inference.
+   - *(research 2026-08-23)* **`rustpython 0.5` still has not unified its `malachite-bigint` req**, so
+     the `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2` pin-back stays mandatory after
+     every sweep. Nothing upstream has moved; `rustpython-{codegen,compiler,derive} 0.5.0` remain on
+     0.9.2 while `pymath` pulls 0.10.0, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308`s
+     about `malachite_bigint::{BigUint,BigInt}`. Third consecutive run hitting it — it is a standing
+     step, not an incident.
+   - *(research 2026-08-23)* **`ocrs` is still 0.12.2, so `rten 0.24 → 0.25` remains blocked.**
+     Re-verified against crates.io this run rather than assumed. `ocrs` still requires `rten ^0.24`
+     and `ocr.rs` hands an `rten::Model` straight into `ocrs::OcrEngineParams`, so bumping the direct
+     req puts two `rten` versions in one graph and the two `Model` types stop being the same type.
+   - [ ] *(research 2026-08-23)* **Re-try the toolchain pin — not done this run.** `rust-toolchain.toml`
+     is on `nightly-2026-08-03`, and today's `cargo build --release -p nanna-daemon` proves it still
+     holds (exit 0, 15m29s, against a graph freshly invalidated by turso 0.7.2). A *newer* nightly was
+     **not** tried, deliberately: `rustup update` run concurrently with a `cargo build` fails and rolls
+     back on Windows (component files are locked), and a release build plus a Tauri build were in
+     flight for most of this run. Nothing was found upstream confirming the `rustc_codegen_ssa` tokio
+     ICE is fixed, so the pin's removal condition is still unverified. Sequence it first next run:
+     `rustup update` alone, then a full `cargo build --release -p nanna-daemon` — and note that
+     `.github/workflows/{test-compile,release-check}.yml` both hardcode the channel and must move in
+     lockstep with the toml.
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
