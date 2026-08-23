@@ -1194,6 +1194,20 @@ bugs and improvements here; do not bury them only in the backlog bullet.
                   memory object. Rewired all six call sites. This is the clearest possible argument for
                   the gate: a shipped feature was dead, and a typecheck that actually ran would have
                   said so the day it landed.
+            *(2026-08-23, same run)* **Third batch: 41 → 32.** `app/pages/workspaces.vue`'s nine errors
+            were one modelling gap: `contextFiles` / `detailFiles` / `availableFiles` declared their
+            `key` / `existsKey` as plain `string`, and the templates index workspace objects with them
+            (`ws[file.key]`, `createValidity[file.existsKey]`) — a `string` is not provably a member of
+            either shape, so every such read was an implicit `any`. Fixed at the source rather than at
+            the call sites: `app/lib/workspaceMarkers.ts` — the module that already owns
+            `WorkspaceValidity` — now exports a `ContextFileKey` literal union, and the three arrays are
+            annotated with it. The remaining one was a real (if small) template-typing bug:
+            `:disabled="createValidity && createValidity[key]"` yields `boolean | null` when
+            `createValidity` is null, which is not `Booleanish`; `createValidity?.[key] ?? false` keeps
+            the same truthiness and gives a plain boolean.
+            **Running total for the run: 96 → 32 errors**, with 208 vitest green and `pnpm build` green
+            throughout. Remaining backlog is now mostly `app/pages/{tool-stats,scheduler}.vue`,
+            `app/components/settings/*`, `app/layouts/default.vue` and the `ui/` primitives.
       - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
       - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
