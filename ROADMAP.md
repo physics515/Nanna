@@ -1150,7 +1150,26 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       Not switched on in the same run, deliberately — flipping the flag turns CI red on 96 pre-existing
       errors, and a green build achieved by leaving the gate blind is the thing being fixed here, so it
       should not be traded for a red one nobody can land against. Do it as its own increment(s):
-      - [ ] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+      - [~] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+            *(2026-08-23)* **First batch: `app/lib/tiptapMarkdown.ts` — 26 errors → 0, total 96 → 66.**
+            All of the `noUncheckedIndexedAccess` family (`lines[i]` types as `string | undefined`
+            even under an `i < lines.length` guard, and regex group reads likewise).
+            This file is the inbound composer path and its own header says it: "a corruption here is a
+            corruption of what the user actually said" — and it had **6 tests**, which is not cover to
+            refactor every branch behind. So a **characterization suite went in first and was run green
+            on the unmodified code**: `tests/unit/tiptapMarkdownGolden.spec.ts`, **47 snapshots / 49
+            tests** over every parser branch and the edges that decide whether an index read can run
+            out of range (unterminated fence, fence as last line, empty fence, one-line inputs, blank
+            input, multi-byte). Only then the fix — and **all 47 snapshots re-matched unchanged**, so
+            the change is proven behaviour-preserving rather than assumed to be.
+            Fixed with a total accessor (`const at = (n) => lines[n] ?? ''`) and `?? ''` on regex
+            groups, **not** `!`: a non-null assertion is erased at runtime, so it would leave a genuine
+            out-of-range read to stringify into the user's message as the literal "undefined" — which
+            two of the new tests assert against directly. Every call site is already under a bounds
+            guard, so `at()` never actually substitutes; it only supplies the proof the checker cannot
+            derive.
+            **Verified non-vacuous**: a one-character change to the fence parser
+            (`line.slice(3)` → `slice(4)`) trips 3 snapshots. 208 vitest green (was 159).
       - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
       - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
