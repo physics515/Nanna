@@ -1205,9 +1205,28 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `:disabled="createValidity && createValidity[key]"` yields `boolean | null` when
             `createValidity` is null, which is not `Booleanish`; `createValidity?.[key] ?? false` keeps
             the same truthiness and gives a plain boolean.
-            **Running total for the run: 96 → 32 errors**, with 208 vitest green and `pnpm build` green
-            throughout. Remaining backlog is now mostly `app/pages/{tool-stats,scheduler}.vue`,
-            `app/components/settings/*`, `app/layouts/default.vue` and the `ui/` primitives.
+            *(2026-08-23, same run)* **Fourth batch: 32 → 25, three more broken surfaces.**
+            - **`tool-stats.vue`: the latency-percentile chart never rendered.** All four of its errors
+              were one swapped pair. Vue's object `v-for` binds **value first, key second**, and the
+              template read `v-for="(label, val) in { P50: …, P95: …, P99: … }"` — so `label` held the
+              latency number and `val` held the string `"P50"`. Consequences: `val > 5000` compared a
+              string to a number (always false, so the red/amber bands never fired), and the bar height
+              computed `"P50" / n` → `NaN` → `height: NaNpx`, i.e. **no bars at all**; the caption
+              printed the number and the value printed a formatted string. One binding swap fixed all
+              four errors and the whole widget.
+            - **`scheduler.vue`: the timezone dropdown rendered empty.** `UiSelect` builds its list from
+              an `options: Option[]` prop, and it was being handed eight slotted `<option>` children,
+              which the component never reads. Moved to `:options="timezoneOptions"`.
+            - **`scheduler.vue`: the schedule-preset buttons had no styling.** `variant="outline"` is not
+              one of `UiButton`'s variants (`default | secondary | ghost | destructive | link | accent`),
+              so they silently fell through. Now `secondary`, the bordered one.
+            - `ui/card.vue` typed its `class` prop as `string` while rendering it through `cn` (clsx),
+              which accepts objects — so the legitimate `:class="{ 'opacity-50': … }"` form read as a
+              type error. Widened to `ClassValue`: the type was narrower than the runtime, not the
+              other way round.
+            **Running total for the run: 96 → 25 errors**, with 208 vitest green and `pnpm build` green
+            throughout. Remaining backlog: `app/components/settings/*`, `app/components/ToolCallCard.vue`,
+            `app/layouts/default.vue`, the `ui/` primitives, and a handful of one-error files.
       - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
       - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it

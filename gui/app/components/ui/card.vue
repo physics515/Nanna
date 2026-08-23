@@ -1,8 +1,16 @@
 <script setup lang="ts">
+import type { ClassValue } from 'clsx'
+
 import { cn } from '~/lib/utils'
 
 interface Props {
-  class?: string
+  /**
+   * Anything `cn` accepts, not just a string. Callers legitimately pass the
+   * object form (`:class="{ 'opacity-50': !enabled }"`), which clsx handles —
+   * the `string` type was narrower than the runtime, so correct usage read as
+   * a type error.
+   */
+  class?: ClassValue
 }
 
 const props = defineProps<Props>()
