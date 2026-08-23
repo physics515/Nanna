@@ -4064,6 +4064,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      nanna-daemon` green — the release gate the roadmap asked for below, which debug + tests cannot see.
      Toolchain: `rust-toolchain.toml` stays on `nightly-2026-08-03`; the release build above is the
      evidence the pin still holds.
+     Frontend: `package.json` needed **no change** — `pnpm outdated` shows *only* the documented
+     deferred majors (`@tiptap/* 2.27 → 3.30`, `marked 17 → 18`, `vue-router 4 → 5`,
+     `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the `lucide-vue-next 1.0.0` tombstone that must
+     never be taken. `pnpm update` moved the lockfile within ranges only (`vite 8.2.1 → 8.2.2`,
+     `rolldown 1.2.4 → 1.2.5`, `rollup 4.62.4 → 4.62.5`, `@oxc-project/types 0.144 → 0.146`), verified
+     by **159/159 vitest** and a green `pnpm build` (nitro + client, 4 routes prerendered).
      - [ ] **`rten 0.24 → 0.25` is blocked on `ocrs`.** `ocrs 0.12.2` (still the latest) requires
            `rten ^0.24`, and `ocr.rs:299-312` hands an `rten::Model` straight into
            `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
