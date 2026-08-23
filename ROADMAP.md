@@ -1338,8 +1338,40 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
-- [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
+- [~] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
+      *(2026-08-23)* **The headline was stale; the hole it hid was real and is now fixed.** Both live
+      paths have keyed sessions per channel/chat/sender for some time —
+      `ChannelManager::process_message` builds `{provider}:{channel.id}:{sender.id}` for everything the
+      daemon routes, and `nanna-server`'s handlers build `telegram:{chat_id}:{user_id}`,
+      `discord:{channel_id}:{user_id}`, `slack:{channel_id}:{user_id}`. So "all messages currently
+      share one context" has not been true generally.
+      **It was true for the generic webhook.** `extract_generic_message` never received the registered
+      hook id, so pattern 2 (`{text,user}`) and pattern 3 (`{content}`) hardcoded
+      `chat_id: "generic"` and pattern 1 fell back to `"unknown"` — and since the session key is
+      `{provider}:{chat_id}:{sender_id}`, a constant `chat_id` is a constant session. **Every
+      registered generic hook shared one conversation**, including hooks admitted by *different*
+      secrets; and pattern 3, which also hardcoded `sender_id: "unknown"`, put every anonymous caller
+      into that same context.
+      Fixed by threading the hook id through and using it as the identity fallback. The choice is
+      principled rather than convenient: each generic hook id carries **its own secret** in
+      `generic_secrets`, so the id is exactly the trust boundary the auth model already establishes —
+      two callers share an id precisely when they share a credential, which is when they belong in one
+      conversation. An explicitly supplied `channel`/`chat_id` still wins, so nothing that was already
+      isolating itself changes. For pattern 3, which names nobody, the credential is the only identity
+      there is, and using it for both fields is the honest reading; the old `"unknown"`/`"generic"`
+      pair claimed an identity the payload never supplied and merged everyone into it.
+      4 tests: the three pattern tests now assert the resulting `chat_id` (they previously asserted
+      only content/sender, which is why they never pinned this), plus a dedicated isolation test
+      asserting the four properties that matter — two hooks never collide, two hooks with the *same*
+      sender never collide, one hook + one sender is **stable** (isolation must not become a new
+      session per request), and two senders on one hook stay separate. **Verified non-vacuous**:
+      restoring the constants fails 3 of them. 298 `nanna-daemon` tests green, clippy 0 errors.
+      - [ ] Remaining: `nanna-server`'s generic hook has the same shape — it takes a `session_id` from
+            the request body and generates a UUID when absent, so two callers on one secret get a new
+            session per request rather than a stable conversation. That is the opposite failure
+            (fragmentation, not merging) and wants the same treatment; `nanna-server` has no
+            per-hook-id registry, so the boundary there is `server.webhook_secret` itself.
 - [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
       (strip markdown for Signal, tables→text for Telegram, embeds for Discord, Block Kit for Slack).
       Bitflags exist but every channel currently receives identical raw text.

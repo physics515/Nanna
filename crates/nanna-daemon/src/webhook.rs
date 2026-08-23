@@ -970,7 +970,7 @@ async fn generic_webhook(
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body).to_string() }));
     
     // Try to extract a message from common payload structures
-    let webhook_message = extract_generic_message(&payload);
+    let webhook_message = extract_generic_message(&payload, &webhook_id);
     
     let event = WebhookEvent {
         source: "generic".to_string(),
@@ -987,10 +987,27 @@ async fn generic_webhook(
     StatusCode::OK
 }
 
-/// Try to extract a message from common webhook payload structures
-fn extract_generic_message(payload: &Value) -> Option<WebhookMessage> {
+/// Try to extract a message from common webhook payload structures.
+///
+/// `webhook_id` is the registered generic-hook id from the route path. It is
+/// **the isolation boundary**, not decoration: each id carries its own secret in
+/// `generic_secrets`, so two callers share an id exactly when they share a
+/// credential — which is precisely when they belong in one conversation. Before
+/// it was threaded through here, patterns 2 and 3 hardcoded `chat_id:
+/// "generic"` and pattern 1 fell back to `"unknown"`, so **every registered hook
+/// collapsed into the same session** regardless of which secret admitted it, and
+/// pattern 3 (which supplies no sender either) put every anonymous caller on
+/// earth into one shared context. The downstream session key is
+/// `{provider}:{chat_id}:{sender_id}`, so a constant `chat_id` is a constant
+/// session.
+fn extract_generic_message(payload: &Value, webhook_id: &str) -> Option<WebhookMessage> {
+    debug_assert!(
+        !webhook_id.is_empty(),
+        "the hook id is the isolation boundary and must never be blank"
+    );
+
     // Try common patterns
-    
+
     // Pattern 1: { "message": "...", "from": "..." }
     if let (Some(message), Some(from)) = (
         payload.get("message").and_then(|v| v.as_str()),
@@ -998,17 +1015,22 @@ fn extract_generic_message(payload: &Value) -> Option<WebhookMessage> {
     ) {
         return Some(WebhookMessage {
             sender_id: from.to_string(),
-            sender_name: payload.get("from_name").and_then(|v| v.as_str()).map(String::from),
-            chat_id: payload.get("channel").or(payload.get("chat_id"))
+            sender_name: payload
+                .get("from_name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .map(String::from),
+            chat_id: payload
+                .get("channel")
+                .or(payload.get("chat_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(webhook_id)
                 .to_string(),
             content: message.to_string(),
             message_id: payload.get("id").and_then(|v| v.as_str()).map(String::from),
             is_command: false,
         });
     }
-    
+
     // Pattern 2: { "text": "...", "user": "..." }
     if let (Some(text), Some(user)) = (
         payload.get("text").and_then(|v| v.as_str()),
@@ -1017,28 +1039,33 @@ fn extract_generic_message(payload: &Value) -> Option<WebhookMessage> {
         return Some(WebhookMessage {
             sender_id: user.to_string(),
             sender_name: None,
-            chat_id: "generic".to_string(),
+            chat_id: webhook_id.to_string(),
             content: text.to_string(),
             message_id: None,
             is_command: false,
         });
     }
-    
+
     // Pattern 3: { "content": "..." }
+    //
+    // This shape names nobody, so the credential is the only identity there is.
+    // Using the hook id for *both* fields is the honest reading of that: callers
+    // holding one secret share one context, and callers holding different
+    // secrets do not. The old `"unknown"`/`"generic"` pair claimed an identity
+    // the payload never supplied and merged everyone into it.
     if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
         return Some(WebhookMessage {
-            sender_id: "unknown".to_string(),
+            sender_id: webhook_id.to_string(),
             sender_name: None,
-            chat_id: "generic".to_string(),
+            chat_id: webhook_id.to_string(),
             content: content.to_string(),
             message_id: None,
             is_command: false,
         });
     }
-    
+
     None
 }
-
 // =============================================================================
 // Webhook Server
 // =============================================================================
@@ -1300,34 +1327,87 @@ mod tests {
             "from_name": "John",
             "channel": "general"
         });
-        
-        let msg = extract_generic_message(&payload).unwrap();
+
+        let msg = extract_generic_message(&payload, "hooks").unwrap();
         assert_eq!(msg.content, "Hello world");
         assert_eq!(msg.sender_id, "user123");
         assert_eq!(msg.sender_name, Some("John".to_string()));
-        assert_eq!(msg.chat_id, "general");
+        assert_eq!(
+            msg.chat_id, "general",
+            "an explicit channel still wins over the hook id"
+        );
     }
-    
+
     #[test]
     fn test_extract_generic_message_pattern2() {
         let payload = json!({
             "text": "Test message",
             "user": "alice"
         });
-        
-        let msg = extract_generic_message(&payload).unwrap();
+
+        let msg = extract_generic_message(&payload, "hooks").unwrap();
         assert_eq!(msg.content, "Test message");
         assert_eq!(msg.sender_id, "alice");
+        assert_eq!(msg.chat_id, "hooks", "the hook id keys the conversation");
     }
-    
+
     #[test]
     fn test_extract_generic_message_pattern3() {
         let payload = json!({
             "content": "Simple content"
         });
 
-        let msg = extract_generic_message(&payload).unwrap();
+        let msg = extract_generic_message(&payload, "hooks").unwrap();
         assert_eq!(msg.content, "Simple content");
+        // This shape names nobody, so the credential is the only identity there
+        // is — and it is a real one, because each hook id carries its own
+        // secret.
+        assert_eq!(msg.sender_id, "hooks");
+        assert_eq!(msg.chat_id, "hooks");
+    }
+
+    #[test]
+    fn distinct_generic_hooks_do_not_share_a_session() {
+        // The downstream session key is `{provider}:{chat_id}:{sender_id}`
+        // (ChannelManager::process_message), so a constant chat_id is a constant
+        // session. Patterns 2 and 3 used to hardcode `"generic"` and pattern 1
+        // fell back to `"unknown"`, which merged *every registered hook* into one
+        // conversation — including hooks admitted by different secrets. Worse,
+        // pattern 3 also hardcoded `sender_id: "unknown"`, so every anonymous
+        // caller shared one context.
+        let session = |m: &WebhookMessage| format!("generic:{}:{}", m.chat_id, m.sender_id);
+
+        // Two hooks, two secrets, same anonymous payload: must not collide.
+        let anon = json!({ "content": "hi" });
+        let a = extract_generic_message(&anon, "team-a").unwrap();
+        let b = extract_generic_message(&anon, "team-b").unwrap();
+        assert_ne!(
+            session(&a),
+            session(&b),
+            "hooks with different secrets must not share a session"
+        );
+
+        // Same for the named-sender shape with no explicit channel.
+        let named = json!({ "text": "hi", "user": "alice" });
+        let a = extract_generic_message(&named, "team-a").unwrap();
+        let b = extract_generic_message(&named, "team-b").unwrap();
+        assert_ne!(session(&a), session(&b), "same sender, different hook");
+
+        // And the same hook with the same identity must still be stable —
+        // isolation must not become a new session per request.
+        let a1 = extract_generic_message(&named, "team-a").unwrap();
+        let a2 = extract_generic_message(&named, "team-a").unwrap();
+        assert_eq!(
+            session(&a1),
+            session(&a2),
+            "one hook + one sender is one conversation"
+        );
+
+        // Two senders on one hook are still two conversations.
+        let bob = json!({ "text": "hi", "user": "bob" });
+        let alice = extract_generic_message(&named, "team-a").unwrap();
+        let bob = extract_generic_message(&bob, "team-a").unwrap();
+        assert_ne!(session(&alice), session(&bob), "one hook, two senders");
     }
 
     #[test]
