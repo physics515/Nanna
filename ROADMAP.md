@@ -738,7 +738,40 @@ health checks). **Shipped**, except:
       (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
       store — (b) matches the "channels as control-plane clients" architecture and avoids a second
       process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
-- [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+- [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+      *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
+      `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
+      `timeout`, folded into the `apply_health_result` state machine — so "the health check is a
+      placeholder" has not been accurate for some time. What *is* still a placeholder is the
+      supervised agent's own body (`// TODO: Run actual agent loop here using _llm and _tools`);
+      `start_agent` spawns a task that only awaits its shutdown signal.
+      **The bug the stale label was hiding: the probe's pass condition was
+      `response.to_lowercase().contains("ok")`** — a substring test on two of the commonest letters
+      in English. Measured against real answers: **"I am broken", "not ok", "Out of tokens" and
+      "Something looks wrong" all PASSED**, while "Healthy", "operational" and "alive" all *failed*.
+      So it was simultaneously too loose and too tight, and — worse — an agent explicitly reporting
+      that it was broken was recorded as healthy, which means the `failure_threshold` /
+      `BecameUnhealthy` / restart machinery underneath it could never fire. A liveness probe that
+      cannot fail is worse than no probe: it manufactures confidence.
+      Replaced with a pure, testable `probe_answer_is_affirmative` beside the existing pure
+      `apply_health_result`: an affirmative token (`ok`/`okay`/`healthy`/`operational`/`alive`)
+      must appear at a **word boundary** (which is what stops `broken`/`tokens`/`looks`), **and** no
+      negation may appear anywhere (which is what stops "not ok" — it carries a perfectly good
+      boundary-`ok`, so the boundary rule alone is not enough). Bounded at
+      `MAX_PROBE_ANSWER_BYTES = 4096`, derived: ~3 orders of magnitude above the one-word answer the
+      probe asks for, while bounding the work a runaway model can impose on a check that runs on a
+      timer forever. Over the cap the verdict is **fail, not truncate-and-scan** — truncating would
+      make the cap a way to push a negation past the end of the scan. Splitting on
+      `!char::is_alphanumeric` is Unicode-aware and **never slices**, which matters here: byte-slicing
+      a string with a multi-byte char in it has taken this daemon down before.
+      6 tests (plain acknowledgement; the five substring traps; seven negated forms; empty/irrelevant;
+      the cap in both directions; multi-byte answers incl. an em dash and emoji). **Verified
+      non-vacuous**: restoring the substring check fails 4 of them. 389 `nanna-agent` lib tests green,
+      clippy 0 errors and 0 warnings from the new code.
+      - [ ] **Still open: give a supervised agent a real body.** `start_agent` must run the agent loop
+            rather than parking on `shutdown_rx`. Until it does, the health probe measures the *LLM's*
+            reachability, not the supervised agent's — which is worth knowing, but is not what the
+            name promises. Rename or re-scope the check when the body lands.
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not

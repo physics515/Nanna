@@ -153,6 +153,78 @@ pub struct AgentStats {
     pub consecutive_health_successes: u32,
 }
 
+/// Widest probe answer worth scanning, in bytes.
+///
+/// Derived, not magic. The probe asks the agent to answer with one word; a
+/// cooperative answer is a short sentence and a confused one is a paragraph.
+/// 4 KiB is ~3 orders of magnitude above a one-word reply yet bounds the work
+/// a runaway model can impose on a check that runs on a timer forever. Past
+/// the cap the verdict is *fail*, not "scan less": an agent that answers a
+/// liveness probe with kilobytes is not demonstrating liveness.
+const MAX_PROBE_ANSWER_BYTES: usize = 4096;
+
+/// True when a health-probe answer is an affirmative acknowledgement.
+///
+/// This used to be `response.to_lowercase().contains("ok")`, which is a
+/// substring test on the two most common letters in English. It passed on
+/// **"I am broken"**, **"not ok"**, **"Out of tokens"** and **"Something looks
+/// wrong"** — so an agent explicitly reporting that it was broken was recorded
+/// as healthy, and the whole failure_threshold state machine below it could
+/// never fire. A liveness probe that cannot fail is worse than no probe,
+/// because it manufactures confidence.
+///
+/// Two rules, both required:
+///
+/// 1. An affirmative token must appear at a **word boundary** — `ok`, `okay`,
+///    `healthy`, `operational`, `alive`. Boundary-checking is what stops
+///    `broken`/`tokens`/`looks` from counting.
+/// 2. **No negation may appear anywhere** in the answer. "not ok" contains a
+///    perfectly good `ok` at a word boundary, so rule 1 alone is not enough;
+///    an answer that hedges is not an acknowledgement.
+const AFFIRMATIVE_TOKENS: [&str; 5] = ["ok", "okay", "healthy", "operational", "alive"];
+const NEGATION_TOKENS: [&str; 12] = [
+    "not", "no", "never", "fail", "failed", "failing", "failure", "error", "unhealthy", "broken",
+    "cannot", "unable",
+];
+
+fn probe_answer_is_affirmative(response: &str) -> bool {
+    // The two sets must stay disjoint: a token in both would make the verdict
+    // depend on which loop arm ran last rather than on what the agent said.
+    debug_assert!(
+        !AFFIRMATIVE_TOKENS
+            .iter()
+            .any(|a| NEGATION_TOKENS.contains(a)),
+        "a token cannot be both an acknowledgement and a negation"
+    );
+
+    // Bound the work before doing any of it. Refusing (rather than truncating)
+    // keeps the cap from becoming a way to smuggle a negation past the scan.
+    if response.len() > MAX_PROBE_ANSWER_BYTES {
+        return false;
+    }
+
+    let lowered = response.to_lowercase();
+
+    // Split on anything that is not a letter or digit, so punctuation around a
+    // token ("OK.", "**ok**", "ok!") does not hide it. Unicode-aware, and it
+    // never slices — the char-boundary panic class has bitten this repo before.
+    let mut affirmed = false;
+    let mut negated = false;
+    for word in lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        affirmed |= AFFIRMATIVE_TOKENS.contains(&word);
+        negated |= NEGATION_TOKENS.contains(&word);
+    }
+
+    debug_assert!(
+        !negated || !(affirmed && !negated),
+        "a negated answer must never be reported as affirmative"
+    );
+    affirmed && !negated
+}
+
 /// Outcome of folding one health-check result into an agent's health state.
 ///
 /// Pure data — the async caller applies these to the live handle and emits the
@@ -623,7 +695,7 @@ impl Supervisor {
         ).await;
         
         let passed = match check_result {
-            Ok(Ok(response)) => response.text.to_lowercase().contains("ok"),
+            Ok(Ok(response)) => probe_answer_is_affirmative(&response.text),
             Ok(Err(e)) => {
                 warn!("Health check failed for {}: {:?}", agent_id, e);
                 false
@@ -780,6 +852,96 @@ fn chrono_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::probe_answer_is_affirmative;
+
+    #[test]
+    fn a_plain_acknowledgement_passes() {
+        for answer in ["OK", "ok", "Okay", "OK.", "**ok**", "ok!", "Healthy", "operational", "alive"] {
+            assert!(
+                probe_answer_is_affirmative(answer),
+                "{answer:?} is an acknowledgement"
+            );
+        }
+    }
+
+    #[test]
+    fn a_substring_of_ok_is_not_an_acknowledgement() {
+        // The whole reason this function exists. Each of these passed the old
+        // `.contains("ok")` check, so an agent reporting that it was broken was
+        // recorded healthy and the failure_threshold machine never fired.
+        for answer in [
+            "I am broken",
+            "Out of tokens",
+            "Something looks wrong",
+            "The socket is smoking",
+            "cookbook",
+        ] {
+            assert!(
+                !probe_answer_is_affirmative(answer),
+                "{answer:?} merely contains the letters o-k"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negated_acknowledgement_is_not_an_acknowledgement() {
+        // These carry a real word-boundary "ok", so the boundary rule alone
+        // would pass them. The negation rule is what refuses them.
+        for answer in [
+            "not ok",
+            "no, not ok",
+            "I am not okay",
+            "ok is what I cannot report",
+            "never ok",
+            "ok — but the tool call failed",
+            "unhealthy, though the process is alive",
+        ] {
+            assert!(
+                !probe_answer_is_affirmative(answer),
+                "{answer:?} is negated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_silent_or_irrelevant_answer_fails() {
+        for answer in ["", "   ", "42", "I have no idea what you are asking"] {
+            assert!(
+                !probe_answer_is_affirmative(answer),
+                "{answer:?} affirms nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbounded_answer_fails_rather_than_costing_unbounded_work() {
+        // Past the cap the verdict is fail, not "scan less": an agent that
+        // answers a liveness probe with kilobytes is not showing liveness. And
+        // refusing rather than truncating keeps the cap from being a way to
+        // push a negation past the end of the scan.
+        let huge = format!("ok {}", "a".repeat(super::MAX_PROBE_ANSWER_BYTES));
+        assert!(huge.len() > super::MAX_PROBE_ANSWER_BYTES);
+        assert!(!probe_answer_is_affirmative(&huge), "over the cap is a fail");
+
+        // Just under the cap still works, so the bound is not so tight that it
+        // rejects a merely verbose but healthy agent.
+        let verbose = format!("{} ok", "a".repeat(super::MAX_PROBE_ANSWER_BYTES - 4));
+        assert!(verbose.len() <= super::MAX_PROBE_ANSWER_BYTES);
+        assert!(probe_answer_is_affirmative(&verbose), "under the cap passes");
+    }
+
+    #[test]
+    fn a_multibyte_answer_does_not_panic() {
+        // This repo has been bitten more than once by byte-slicing a string
+        // with a multi-byte char in it (an em dash in an error message took the
+        // daemon down). This path must never slice.
+        for answer in ["OK — operational", "d'accord, ok", "✅ ok", "не ok", "ok 🎉"] {
+            let _ = probe_answer_is_affirmative(answer);
+        }
+        assert!(probe_answer_is_affirmative("OK — operational"));
+        assert!(!probe_answer_is_affirmative("не ok, broken —"));
+    }
+
     use super::*;
 
     #[test]
