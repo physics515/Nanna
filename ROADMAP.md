@@ -1111,16 +1111,50 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       (`expected 'sm' to be undefined`). Runtime-confirmed: `/tools`, `/logs`, `/tasks` now load with
       **zero** Vue warnings — both this one and the resolution one are gone.
       Verified: 65/65 vitest, 26/27 Playwright (the 27th is the pre-existing flake below).
-- [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
-      pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
-      the current branch it fails 1). Diagnosis from the trace: the step's locator
-      `getByRole('button', {name: /delete|confirm|yes/i})` is **ambiguous** — it matches both the context
-      menu's `Delete` item and the `ConfirmDialog`'s `Confirm` button, so after the menu detaches
-      Playwright re-resolves onto `Confirm` and then spins on
-      `confirm-overlay … intercepts pointer events` until the 60 s timeout. Fix is test-side: scope the
-      confirmation click to the dialog rather than the page, and wait for the overlay's transition to
-      settle. Deliberately **not** patched under time pressure in the run that found it — loosening an
-      assertion to get green is how a real regression gets hidden later.
+- [x] *(2026-07-23, fixed 2026-08-23)* **`critical-path.spec.ts` "session create / rename / delete / switch"
+      was flaky — and the flake was pointing at a real UI bug.** The 2026-07-23 diagnosis was exactly
+      right: the step's `getByRole('button', {name: /delete|confirm|yes/i})` matched **both** the context
+      menu's `Delete` item and the `ConfirmDialog`'s confirm button, so after the menu detached
+      Playwright re-resolved onto the dialog button and spun on
+      `confirm-overlay … intercepts pointer events` until the 60 s timeout.
+      Fixed test-side as planned, and **tightened rather than loosened**: the click is scoped to
+      `getByRole('alertdialog')` (the dialog's own role — unambiguous), the confirmation is now
+      **required** instead of `if (await confirm.isVisible())` (SessionItem's `confirmDelete()` always
+      awaits `confirm()`, so a missing dialog is a regression and must fail), and the fixed
+      `waitForTimeout(300)` became `await expect(dialog).toBeHidden()` — while the overlay is fading it
+      still intercepts pointer events, so a fixed sleep is either a stall or a race depending on the
+      machine. Verified: **6/6 `critical-path.spec.ts` pass**, including the previously-flaky one.
+      **But the regex was that loose for a reason**, and chasing it turned up a real bug: the dialog's
+      button did not say "Delete". `ConfirmOptions` declares `confirmLabel` / `danger`, while three
+      destructive call sites passed **`confirmText` / `destructive`** — keys that do not exist on the
+      type. Both fell through to their defaults, so **the three most destructive actions in the app**
+      (delete a session; Settings → Data "Delete All Sessions"; "Delete All Memories") rendered a
+      generic grey **"Confirm"** with no danger styling. All three corrected. A fourth site,
+      `pages/tools.vue`, called the composable's `confirm` as if it were `window.confirm` —
+      `if (hasChanges.value && !confirm('Discard unsaved changes?'))` — passing a string and never
+      awaiting, so `!Promise` was always `false`: **the unsaved-changes guard never prompted and never
+      blocked**, and edits were dropped silently on switching tools. Now a real awaited confirm.
+      The scoped test locator (`/^Delete$/i` *inside* the dialog) now also pins the label, so the UI bug
+      and its test cannot drift apart again.
+- [ ] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
+      it.** `gui.yml` runs `pnpm exec vue-tsc --noEmit`, and the roadmap records it as "Enforced as of
+      2026-07-24: the tree typechecks with 0 errors, so a new one is a regression". It does not. Nuxt 4
+      writes a **solution-style** `tsconfig.json` — `"files": []` plus four project `references` — and
+      plain `tsc`/`vue-tsc` on that compiles **zero files**; it does not follow references without
+      `--build`. Proven, not inferred: inserting `const definitelyBroken: number = 'this is a string'`
+      into `SessionItem.vue` still exits 0, as does a bogus extra key on a typed object literal.
+      `pnpm exec vue-tsc --build` reports **96 errors** across 12+ files — worst offenders
+      `app/lib/tiptapMarkdown.ts` (26), `app/extensions/MonacoCodeBlock.ts` (16),
+      `app/pages/workspaces.vue` (9), `app/pages/memory.vue` (6). Two of the four `confirm()` bugs fixed
+      above are in that list, which is the point: this gate would have caught them the day they landed.
+      Not switched on in the same run, deliberately — flipping the flag turns CI red on 96 pre-existing
+      errors, and a green build achieved by leaving the gate blind is the thing being fixed here, so it
+      should not be traded for a red one nobody can land against. Do it as its own increment(s):
+      - [ ] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+      - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
+            "0 errors" claim — this time with evidence that the command sees the files.
+      - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
+            reports zero *checked files*, the same way a coverage gate fails at 0%.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
@@ -4165,6 +4199,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            narrow (or whether concurrent readers can be admitted) now that long operations yield —
            and re-check whether the "drop cursors before writing" rule is still load-bearing. Do not
            change the locking on inference alone; measure first.
+     Bench (`nanna-bench vector_search`, release, 4070 Ti SUPER / Zen 4, 768-dim, fixed seed):
+     **43.2 µs @ 1k · 1.53 ms @ 10k · 9.16 ms @ 50k** — every budget held with margin
+     (≤0.20 / ≤5.0 / ≤25 ms), and 10k/50k came in **at or better than the recorded 2026-08-05
+     baseline p50s** (1.63 / 10.1 ms). Criterion's "+4%/+11%/+6%" is against the previous run *on this
+     machine*, not against the baseline table, and it is within the noise of a box that had just
+     finished a Tauri release build; nothing crossed a ceiling, so turso 0.7.2 shows no regression on
+     the search path. Baseline p50s left unchanged — these are not A/B-attributed improvements.
      Verified: workspace (excl. `nanna-gui`) builds `--all-targets` green, **1576 tests pass / 0 fail /
      12 ignored** (1555 was the previous baseline; +6 from this run's new `nanna-server` suite, the
      rest from turso 0.7.2's own test targets), clippy **0 errors**, and `cargo build --release -p
