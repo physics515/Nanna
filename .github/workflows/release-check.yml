@@ -1,0 +1,108 @@
+# Gate: the *release* profile must still build.
+#
+# The hole this closes: `test-compile.yml` builds every test target and
+# `cargo test` runs them, but both are the **debug** profile. Release codegen is
+# a different compiler path — `lto = "fat"`, `codegen-units = 1`,
+# `panic = "abort"` — and this workspace has been broken there twice while every
+# debug check stayed green:
+#
+#   * nightly 2026-07-23 ICEd in `rustc_codegen_ssa` compiling `tokio` under the
+#     release profile. The whole workspace built, 719 tests and clippy passed.
+#     It surfaced only when `pnpm build:daemon` failed preparing the Tauri
+#     sidecar — i.e. at packaging time.
+#   * nightly-2026-07-13 later failed release builds when a dependency bump
+#     dirtied `turso_core`: "queries overflow the depth limit". Latent while a
+#     cached rlib existed, so "the pin built fine yesterday" proved nothing.
+#
+# Release is exactly what `cargo tauri build`, `pnpm build:daemon` and every
+# benchmark number depend on, so a break there cannot be allowed to reach a
+# release cut undetected — and today the only release builds in CI live in
+# `release.yml` / `macos-dmg.yml`, which run at tag time, long after the change
+# merged.
+#
+# `cargo check --profile release` would NOT close this. Both failures above are
+# in codegen and const-eval; `check` stops before codegen and would report
+# green. The gate has to be a real `build`.
+name: release-check
+
+on:
+  # Deliberately NOT every push. A real fat-LTO release build is expensive, and
+  # release-codegen breaks come from the *toolchain* or the *dependency graph* —
+  # not from ordinary source edits, which the debug gates already cover. So the
+  # gate runs exactly when its failure mode is possible: when the inputs that
+  # can cause it change.
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "gui/src-tauri/Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/release-check.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - "gui/src-tauri/Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/release-check.yml"
+  # A latent break can also arrive with no diff at all (a yanked crate, a
+  # re-resolved git dep). Once a week catches that without paying per-push.
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    # Windows on purpose, matching `test-compile.yml`: this is the platform the
+    # workspace is developed and pinned against (MSVC, `aegis` on the pure-Rust
+    # path, the `windows-service` layer), and both recorded release failures
+    # were observed here.
+    runs-on: windows-latest
+    # The dev machine builds this cold in 15-18 minutes: 17m34s (2026-07-24),
+    # 15m06s (2026-08-14), and 15m29s measured on 2026-08-23 against a graph
+    # freshly invalidated by the turso 0.7.2 bump — i.e. the worst case this
+    # job actually sees, since a dependency change is what triggers it. A
+    # GitHub runner is materially slower than that machine, so 60 is roughly
+    # 2x headroom over a slow cold build, the same ratio `test-compile.yml`
+    # uses over its own measured 16m12s. Re-measure if the graph grows; do not
+    # raise it to paper over a hang.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `dtolnay/rust-toolchain` reads its `toolchain` input, not
+      # `rust-toolchain.toml`, so the pinned channel is passed explicitly. Keep
+      # this in lockstep with `rust-toolchain.toml` — that file carries the
+      # rationale and the condition for removing the pin.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-03
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Its own cache key: a release-profile artifact cache shares nothing
+          # useful with the debug one, and mixing them would evict both.
+          key: release-check
+
+      # `nanna-daemon` is the right target, not the whole workspace: it is what
+      # `pnpm build:daemon` ships as the Tauri sidecar and what `release.yml`
+      # builds, and it pulls in the crates both recorded failures lived in
+      # (`tokio` via the runtime, `turso_core` via `nanna-storage`). Building
+      # every crate here would multiply the cost without widening the graph
+      # that matters.
+      #
+      # `--locked` so the gate tests the committed lockfile rather than
+      # silently re-resolving to a graph nobody reviewed.
+      - name: Build the release profile
+        run: cargo build --release --package nanna-daemon --locked

@@ -480,7 +480,13 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             Source: [keyring-core docs](https://docs.rs/keyring-core).
 - [x] Set a restrictive Tauri CSP (not null).
       *(2026-07-24)* Done — see the CSP item above.
-- [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
+- [x] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
+      *(2026-08-23 — verified already shipped; the checkbox was stale.)* `gui/src-tauri/Cargo.toml`
+      has `default = ["custom-protocol"]` and `devtools = ["tauri/devtools"]` deliberately outside
+      it, with a comment recording why: the feature opens the webview inspector in *release* builds of
+      an app that renders model output and untrusted markdown. Tauri enables devtools automatically
+      under `debug_assertions`, so `tauri dev` is unaffected, and a release build gets the inspector
+      only by asking for `--features devtools`. No other reference to the feature exists in the crate.
 - [ ] Per-tool toggles visible in GUI; audit log for every tool call.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
@@ -4117,10 +4123,30 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      the GUI build inherit it. The file carries the full ICE text and its removal condition.
      - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
            every dependency-freshness pass, and report the ICE upstream if it survives.
-     - [ ] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
-           a release-only codegen break, so a toolchain or dependency bump can pass every green check
-           and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
-           least `cargo check --profile release`) to the freshness increment's verification.
+     - [x] *(2026-08-23)* **The verify-gate hole is closed in CI, not just in the routine's habits.**
+           `cargo build` (debug) + `cargo test` cannot see a release-only codegen break, so a
+           toolchain or dependency bump could pass every green check and still leave the shippable
+           artifact unbuildable — which is exactly what happened twice (the 2026-07-23 `tokio` ICE in
+           `rustc_codegen_ssa`, surfaced only when `pnpm build:daemon` prepared the sidecar; and
+           nightly-2026-07-13's `turso_core` "queries overflow the depth limit", latent while a
+           cached rlib existed). CI had **no release build on push or PR at all**: `test-compile.yml`
+           is `--no-run` debug, and the only `cargo build --release` lives in `release.yml` /
+           `macos-dmg.yml`, which run at tag time — long after the change merged.
+           New `.github/workflows/release-check.yml` runs `cargo build --release --package
+           nanna-daemon --locked` on windows-latest under the pinned nightly.
+           **`cargo check --profile release` was considered and rejected**: both recorded failures
+           are in codegen and const-eval, and `check` stops before codegen — it would have reported
+           green for both. The gate has to be a real `build`.
+           **Bounded to when the failure is possible, not to every push.** A fat-LTO
+           (`codegen-units = 1`) release build is expensive, and release-codegen breaks come from the
+           toolchain or the dependency graph, not from ordinary source edits the debug gates already
+           cover. So it triggers on changes to `Cargo.toml` / `Cargo.lock` / `crates/*/Cargo.toml` /
+           `gui/src-tauri/Cargo.toml` / `rust-toolchain.toml`, plus a weekly cron (a latent break can
+           arrive with no diff — a yank, a re-resolved git dep) and `workflow_dispatch`.
+           `nanna-daemon` is the target because it is what ships as the Tauri sidecar and what
+           `release.yml` builds, and it pulls in both crates the recorded failures lived in.
+           Also corrected while here: `test-compile.yml`'s toolchain comment still claimed the
+           workspace pinned `nightly-2026-07-13` while the step passed `nightly-2026-08-03`.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
