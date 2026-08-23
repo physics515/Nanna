@@ -1367,11 +1367,23 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       sender never collide, one hook + one sender is **stable** (isolation must not become a new
       session per request), and two senders on one hook stay separate. **Verified non-vacuous**:
       restoring the constants fails 3 of them. 298 `nanna-daemon` tests green, clippy 0 errors.
-      - [ ] Remaining: `nanna-server`'s generic hook has the same shape — it takes a `session_id` from
-            the request body and generates a UUID when absent, so two callers on one secret get a new
-            session per request rather than a stable conversation. That is the opposite failure
-            (fragmentation, not merging) and wants the same treatment; `nanna-server` has no
-            per-hook-id registry, so the boundary there is `server.webhook_secret` itself.
+      - [x] *(2026-08-23)* **`nanna-server`'s generic hook had the opposite failure, now fixed.** Its
+            fallback was `format!("{channel}:{user_id}:{}", Uuid::new_v4())` — a **fresh UUID per
+            request** — so a caller that does not thread `session_id` back itself started a brand-new
+            conversation on every message, and the agent remembered nothing across turns on this route
+            alone. Its four siblings all derive a stable key from the identity fields they are handed
+            (`telegram:{chat_id}:{user_id}`, `discord:{channel_id}:{user_id}`, …), and `channel` and
+            `user_id` are both **required** on this payload — so there was nothing to fall back to and
+            no randomness to add. Now `generic:{channel}:{user_id}`, extracted as a pure
+            `session_key(session_id, channel, user_id)` so it is testable without an LLM.
+            An explicit `session_id` still wins (a caller managing its own sessions is unaffected), and
+            a **blank** one does not count as supplied — `Some("")` is what a half-filled template
+            leaves behind, and honouring it would put every such caller into one conversation named
+            `""`. The key stays namespaced with `generic:` so it cannot alias a real Telegram or
+            Discord session in the shared session namespace.
+            5 tests: stability across identical requests, distinctness across users and across
+            channels, explicit-id precedence (incl. trimming), blank-id fallback, and the
+            cross-provider collision guard. 29 `nanna-server` tests green, clippy 0 errors.
 - [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
       (strip markdown for Signal, tables→text for Telegram, embeds for Discord, Block Kit for Slack).
       Bitflags exist but every channel currently receives identical raw text.
