@@ -578,18 +578,35 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
                   makes the suite report `/webhooks/telegram must refuse while unconfigured, got 200
                   OK` from two tests; reverted clean. 22 `nanna-server` tests green, clippy 0 errors
                   and 0 warnings from the new file. One dev-dependency added: `tower` with `util`.
-            - [ ] **Authentication runs *after* body deserialization on the three JSON-bodied routes.**
-                  Found while building the harness above. `telegram`, `signal` and `generic` take
-                  `Json<T>`, and axum runs extractors before the handler body — so an unauthenticated
-                  caller drives `serde_json` on those routes, and an **unconfigured** channel handed a
-                  malformed body answers **422, not the 503** whose whole purpose is to tell an
-                  operator "this host never armed this channel". `slack` and `discord` already take
-                  `Bytes` and parse after verifying, which is the shape that is correct. Fix by moving
-                  authentication ahead of parsing — either a `middleware::from_fn` layer over the
-                  webhook routes, or take `Bytes` and `serde_json::from_slice` after the auth branch
-                  (matching slack/discord). The harness above will need a malformed-body case added
-                  once it does. Not a fail-open (every route still refuses), so it is a correctness
-                  and operator-legibility bug rather than a security one.
+            - [x] *(2026-08-23)* **Authentication now runs *before* body deserialization on all five
+                  routes.** Found while building the harness above, then fixed. `telegram`, `signal`
+                  and `generic` took `Json<T>`, and axum runs extractors before the handler body — so
+                  an unauthenticated caller drove `serde_json` on those routes, and an
+                  **unconfigured** channel handed a malformed body answered the parser's **400
+                  instead of the 503** whose entire purpose is to tell an operator "this host never
+                  armed this channel". Measured, not assumed: a probe against the unconfigured router
+                  returned `telegram 400 · discord 503 · slack 503 · signal 400 · generic 400` — the
+                  split falls exactly on which extractor each handler used, because `slack` and
+                  `discord` already took `Bytes` and parsed after verifying. So did **every** handler
+                  in `nanna-daemon`, which is why only this copy was wrong.
+                  Fixed the way the two correct handlers already worked rather than by adding a
+                  middleware layer and its state plumbing: the three routes take `Bytes` and call the
+                  new shared `auth::parse_authenticated_body`, which parses after the credential
+                  branch and maps a failure to **400 — honest at that point, because by then the
+                  caller has proved who it is, so a bad body is a bad request and not an anonymous
+                  one**. Keeping the helper in `auth.rs` beside `configured`/`secret_matches` means
+                  the ordering rule is stated once, next to the rule it protects.
+                  1 new unit test (valid parses; malformed and wrong-shape are 400 and specifically
+                  *not* 401/503) and 1 new end-to-end test pinning all three states per route:
+                  unconfigured + malformed → 503, armed + wrong proof + malformed → 401, armed +
+                  right proof + malformed → 400. **Verified non-vacuous**: reverting `generic` to
+                  `Json<T>` makes it report "is unconfigured, so it must refuse before parsing, got
+                  400 Bad Request". 24 `nanna-server` tests green, clippy 0 errors.
+                  Not a fail-open — every route refused before and refuses now — so this was a
+                  correctness and operator-legibility fix, not a security one.
+                  *(Diff hygiene: `rustfmt` on `signal.rs`/`telegram.rs` re-indented ~40 unrelated
+                  pre-existing `#[serde(rename)]` attributes, burying a 4-line change. Reverted and
+                  the edits re-applied by hand — the same trap the 2026-07-25 sweep logged.)*
       - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
             match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
             (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had

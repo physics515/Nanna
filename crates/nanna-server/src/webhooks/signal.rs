@@ -4,7 +4,7 @@
 
 use crate::state::AppState;
 use crate::webhooks::auth;
-use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
+use axum::{Json, body::Bytes, extract::State, http::HeaderMap, http::StatusCode};
 use nanna_agent::RunOptions;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -148,7 +148,7 @@ pub struct SignalResponse {
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(webhook): Json<SignalWebhook>,
+    body: Bytes,
 ) -> Result<Json<SignalResponse>, StatusCode> {
     // signal-cli-rest-api does not sign its callbacks, so a shared secret is
     // the strongest proof available on this path — and this payload drives the
@@ -163,6 +163,10 @@ pub async fn handle(
         warn!("Signal webhook: invalid shared secret");
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // Parse only now. `Bytes` rather than `Json<T>` so the credential check
+    // above runs first — see `auth::parse_authenticated_body`.
+    let webhook: SignalWebhook = auth::parse_authenticated_body("Signal", &body)?;
 
     debug!("Received Signal webhook from account: {}", webhook.account);
 

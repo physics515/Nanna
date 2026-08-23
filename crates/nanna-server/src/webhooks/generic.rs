@@ -2,7 +2,7 @@
 
 use crate::state::AppState;
 use crate::webhooks::auth;
-use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
+use axum::{Json, body::Bytes, extract::State, http::HeaderMap, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -43,7 +43,7 @@ pub struct GenericWebhookResponse {
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(webhook): Json<GenericWebhook>,
+    body: Bytes,
 ) -> Result<Json<GenericWebhookResponse>, StatusCode> {
     let Some(secret) = auth::configured(state.webhook_secret.as_ref()) else {
         return Err(auth::refuse_unconfigured(
@@ -55,6 +55,12 @@ pub async fn handle(
         warn!("Generic webhook: invalid shared secret");
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // Parse only now. `Bytes` rather than `Json<T>` so the credential check
+    // above runs first — see `auth::parse_authenticated_body`. This route is
+    // the most abusable of the five (it runs whatever `message` it is handed),
+    // so it is the one that least deserves an anonymous deserializer.
+    let webhook: GenericWebhook = auth::parse_authenticated_body("Generic", &body)?;
 
     let session_id = webhook
         .session_id

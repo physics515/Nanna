@@ -445,3 +445,58 @@ async fn discord_admits_only_a_fresh_correctly_signed_request() {
         "the timestamp is signed, not asserted"
     );
 }
+
+#[tokio::test]
+async fn a_malformed_body_never_outranks_the_refusal() {
+    // Authentication must run before the body is parsed. When it did not, the
+    // three `Json<T>` routes answered the parser's **400** to an anonymous
+    // caller on an *unconfigured* channel — burying the 503 whose whole job is
+    // to tell an operator "this host never armed this channel", and letting an
+    // unauthenticated caller drive `serde_json` besides. Slack and Discord
+    // always took `Bytes` and always answered 503 here, which is what made the
+    // split visible.
+    const MALFORMED: &str = "{not json";
+
+    for (path, _) in routes() {
+        let status = post(unconfigured_state().await, path, MALFORMED, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} is unconfigured, so it must refuse before parsing, got {status}"
+        );
+    }
+
+    // Armed but unproven: still 401, not the parser's 400.
+    for (path, header) in [
+        ("/webhooks/telegram", "X-Telegram-Bot-Api-Secret-Token"),
+        ("/webhooks/signal", "X-Webhook-Secret"),
+        ("/webhooks/generic", "X-Webhook-Secret"),
+    ] {
+        let status = post(armed_state().await, path, MALFORMED, &[(header, "wrong")]).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} refuses a wrong proof before parsing, got {status}"
+        );
+    }
+
+    // Armed *and* proven: now the body is the caller's problem, and 400 is the
+    // honest answer — the caller is known, so this is a bad request and not an
+    // anonymous one.
+    for (path, header, secret) in [
+        (
+            "/webhooks/telegram",
+            "X-Telegram-Bot-Api-Secret-Token",
+            "tg-secret",
+        ),
+        ("/webhooks/signal", "X-Webhook-Secret", "sig-secret"),
+        ("/webhooks/generic", "X-Webhook-Secret", "gen-secret"),
+    ] {
+        let status = post(armed_state().await, path, MALFORMED, &[(header, secret)]).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path} parses only after the caller is known, got {status}"
+        );
+    }
+}

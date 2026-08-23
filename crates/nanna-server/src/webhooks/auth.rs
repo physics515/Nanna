@@ -131,6 +131,33 @@ pub fn bearer_secret_ok(headers: &HeaderMap, expected: &str) -> bool {
     bearer_ok | direct_ok
 }
 
+/// Deserialize a webhook body **after** its caller has been authenticated.
+///
+/// The `Json<T>` extractor cannot be used on these routes. Axum runs extractors
+/// before the handler body, so `Json<T>` would parse an unauthenticated
+/// caller's bytes before any credential is looked at — and, worse, an
+/// **unconfigured** channel handed a malformed body would answer the parser's
+/// `400` instead of the `503` whose entire job is to tell an operator "this
+/// host never armed this channel". Taking `Bytes` and calling this after the
+/// auth branch restores the intended order, and matches what the Slack and
+/// Discord handlers here (and every handler in `nanna-daemon`) already do.
+///
+/// A parse failure is `400`: by the time this runs the caller has proved who it
+/// is, so a bad body is a bad request and not an anonymous one.
+pub fn parse_authenticated_body<T: serde::de::DeserializeOwned>(
+    channel: &str,
+    body: &[u8],
+) -> Result<T, StatusCode> {
+    debug_assert!(
+        !channel.is_empty(),
+        "the log line must name the channel it refused"
+    );
+    serde_json::from_slice(body).map_err(|e| {
+        warn!("{channel} webhook: authenticated caller sent an unparseable payload: {e}");
+        StatusCode::BAD_REQUEST
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +215,30 @@ mod tests {
         let status = refuse_unconfigured("Telegram", "channels.telegram.webhook_secret");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn an_authenticated_body_parses_or_is_a_bad_request() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Payload {
+            id: u8,
+        }
+
+        let ok: Payload =
+            parse_authenticated_body("Test", br#"{"id":7}"#).expect("a valid body parses");
+        assert_eq!(ok, Payload { id: 7 });
+
+        // 400 and not 401/503: authentication already succeeded, so the caller
+        // is known and the *body* is what is wrong.
+        let err = parse_authenticated_body::<Payload>("Test", b"{not json")
+            .expect_err("a malformed body is refused");
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+        assert_ne!(err, StatusCode::UNAUTHORIZED);
+        assert_ne!(err, StatusCode::SERVICE_UNAVAILABLE);
+
+        let wrong_shape = parse_authenticated_body::<Payload>("Test", br#"{"id":"seven"}"#)
+            .expect_err("a well-formed body of the wrong shape is refused");
+        assert_eq!(wrong_shape, StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::state::AppState;
 use crate::webhooks::auth;
-use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
+use axum::{Json, body::Bytes, extract::State, http::HeaderMap, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -112,7 +112,7 @@ pub struct TelegramResponse {
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(update): Json<TelegramUpdate>,
+    body: Bytes,
 ) -> Result<Json<TelegramResponse>, StatusCode> {
     let Some(secret) = auth::configured(state.telegram_webhook_secret.as_ref()) else {
         return Err(auth::refuse_unconfigured(
@@ -127,6 +127,10 @@ pub async fn handle(
         warn!("Telegram webhook: invalid secret token");
         return Err(StatusCode::UNAUTHORIZED);
     }
+
+    // Parse only now. `Bytes` rather than `Json<T>` so the credential check
+    // above runs first — see `auth::parse_authenticated_body`.
+    let update: TelegramUpdate = auth::parse_authenticated_body("Telegram", &body)?;
 
     debug!("Received Telegram update: {:?}", update.update_id);
 
