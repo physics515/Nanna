@@ -40,3 +40,8 @@ subtle = "2"
 hmac = "0.13"
 sha2 = "0.11"
 serde_urlencoded = "0.7"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives `create_router()` directly, so the webhook
+# fail-closed suite exercises real axum routing without binding a socket.
+tower = { version = "0.5", features = ["util"] }

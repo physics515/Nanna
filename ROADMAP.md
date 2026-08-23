@@ -551,11 +551,45 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             through it, Discord gained the replay window, and `serve.rs` now wires
             slack/telegram/signal secrets. 6 unit tests. `nanna init` mints a 122-bit Telegram webhook
             secret and prints the exact `setWebhook` call, so a fresh install is armed rather than broken.
-            - [ ] `nanna-server`'s handlers have **no end-to-end harness** (the daemon's do): building an
-                  `AppState` needs a live `Nanna` bot + Turso storage, so the fail-closed branches there
-                  are covered by the shared `auth` unit tests and compile-checked wiring only. Build a
-                  test-only `AppState` so the same three end-to-end assertions can run against
-                  `create_router`.
+            - [x] *(2026-08-23)* **`nanna-server`'s handlers now have the end-to-end harness the daemon's
+                  had.** `crates/nanna-server/tests/webhook_fail_closed.rs` drives the real
+                  `create_router()` through `tower::ServiceExt::oneshot` — real axum routing, real
+                  extractors, real handler bodies — over a real `AppState`. The `AppState` turned out
+                  to need no test double at all: `Storage::in_memory()` opens a Turso store,
+                  `Nanna::new` touches no network, and `NannaConfig { enable_gpu: false }` plus
+                  `.dreaming(false).scheduler(false)` keeps the fixture to the path under test. **6
+                  tests, no network and no API key**, because every payload chosen for an "admitted"
+                  leg reaches a handler branch that returns *before* any agent work — Discord
+                  `PING`→`PONG`, Slack `url_verification`→challenge echo, a Telegram update with no
+                  message, a Signal envelope with no `dataMessage` — so passing authentication is all
+                  that passing authentication proves.
+                  Beyond the daemon suite's three properties (unconfigured→503, configured→401
+                  without/with a wrong proof, blank→503) this copy **signs its own fixtures**, which
+                  the daemon suite cannot: a genuinely HMAC-SHA256-signed Slack challenge is answered
+                  200 while a signature valid for a *different body* is refused, and a genuinely
+                  Ed25519-signed Discord `PING` is answered 200 while **a day-old capture of it is
+                  refused** — the one assertion that would fail if the replay window were deleted and
+                  the Ed25519 check kept, since Discord's signature never expires on its own. Also
+                  pinned: a *prefix* of a shared secret is refused (the constant-time compare exists
+                  precisely so a byte-by-byte one cannot be walked), and `Authorization: <secret>`
+                  without the `Bearer ` scheme is not the secret.
+                  **Verified non-vacuous**, the same way the daemon suite was: re-introducing the
+                  original fail-open in the Telegram handler (`else { return Err(StatusCode::OK) }`)
+                  makes the suite report `/webhooks/telegram must refuse while unconfigured, got 200
+                  OK` from two tests; reverted clean. 22 `nanna-server` tests green, clippy 0 errors
+                  and 0 warnings from the new file. One dev-dependency added: `tower` with `util`.
+            - [ ] **Authentication runs *after* body deserialization on the three JSON-bodied routes.**
+                  Found while building the harness above. `telegram`, `signal` and `generic` take
+                  `Json<T>`, and axum runs extractors before the handler body — so an unauthenticated
+                  caller drives `serde_json` on those routes, and an **unconfigured** channel handed a
+                  malformed body answers **422, not the 503** whose whole purpose is to tell an
+                  operator "this host never armed this channel". `slack` and `discord` already take
+                  `Bytes` and parse after verifying, which is the shape that is correct. Fix by moving
+                  authentication ahead of parsing — either a `middleware::from_fn` layer over the
+                  webhook routes, or take `Bytes` and `serde_json::from_slice` after the auth branch
+                  (matching slack/discord). The harness above will need a malformed-body case added
+                  once it does. Not a fail-open (every route still refuses), so it is a correctness
+                  and operator-legibility bug rather than a security one.
       - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
             match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
             (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had
