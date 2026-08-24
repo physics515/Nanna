@@ -275,11 +275,34 @@ impl Workspace {
         Ok(folder)
     }
 
-    /// Load standard project context files from the workspace root
+    /// Load the standard project context files from the workspace root.
+    ///
+    /// Files only — no subprocess. This is what the daemon's boot path calls,
+    /// once per persisted workspace, so its cost has to stay proportional to
+    /// reading four files. Use [`Self::load_context_with_git`] on the paths that
+    /// actually build a prompt.
     ///
     /// # Errors
     /// Returns `WorkspaceError::Io` if files cannot be read.
     pub async fn load_context(&mut self) -> Result<(), WorkspaceError> {
+        self.load_context_inner(false).await
+    }
+
+    /// Load the standard files *and* the git working-tree snapshot.
+    ///
+    /// Costs two `git` invocations (each bounded by
+    /// [`nanna_workspace::GIT_TIMEOUT`]), so call it for the **one** workspace a
+    /// turn is bound to — never in a loop over every registered workspace, where
+    /// the added cost would grow with the registry and land on daemon startup.
+    ///
+    /// # Errors
+    /// Returns `WorkspaceError::Io` if files cannot be read. A git failure is
+    /// never an error — it simply omits the snapshot.
+    pub async fn load_context_with_git(&mut self) -> Result<(), WorkspaceError> {
+        self.load_context_inner(true).await
+    }
+
+    async fn load_context_inner(&mut self, with_git: bool) -> Result<(), WorkspaceError> {
         let root = &self.path;
 
         self.context = WorkspaceContext {
@@ -290,7 +313,11 @@ impl Workspace {
             // Re-read every time this runs, which the chat path does per turn:
             // a stale tree snapshot is worse than none, and the whole point is
             // that it reflects what is on disk right now.
-            git: nanna_workspace::load_git_context(root).await,
+            git: if with_git {
+                nanna_workspace::load_git_context(root).await
+            } else {
+                None
+            },
         };
 
         // One-shot legacy import: if root AGENTS.md is missing but `.nanna/AGENTS.md`
@@ -646,6 +673,68 @@ mod tests {
         assert_eq!(ws.context.agents.as_deref(), Some("instructions"));
         assert_eq!(ws.context.readme.as_deref(), Some("hello"));
         assert!(ws.context.roadmap.is_none());
+    }
+
+    /// The daemon calls `load_context` in a loop over every persisted workspace
+    /// at boot, so its cost must stay proportional to reading four files. If the
+    /// git snapshot ever leaks back into it, startup would pay two subprocess
+    /// spawns per registered workspace — each with its own timeout — and the
+    /// added latency would grow with the registry.
+    #[tokio::test]
+    async fn load_context_stays_off_the_subprocess_path() {
+        // A directory that *is* a repository, so the only thing keeping git out
+        // is the call being the files-only one.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(README_FILE), "hello").unwrap();
+
+        let mut ws = Workspace::new(dir.path());
+        ws.load_context().await.unwrap();
+        assert_eq!(ws.context.readme.as_deref(), Some("hello"));
+        assert_eq!(
+            ws.context.git, None,
+            "the boot-path loader must not read git"
+        );
+    }
+
+    /// ...and the prompt-building path must.
+    #[tokio::test]
+    async fn load_context_with_git_reads_the_tree_when_there_is_one() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(README_FILE), "hello").unwrap();
+
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "--initial-branch=main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("skipping: git is not available on PATH");
+            return;
+        }
+
+        let mut ws = Workspace::new(dir.path());
+        ws.load_context_with_git().await.unwrap();
+        let branch = ws
+            .context
+            .git
+            .as_ref()
+            .expect("a real repository must yield a snapshot")
+            .branch
+            .clone();
+        assert!(
+            branch.as_deref().is_some_and(|b| b.contains("main")),
+            "{branch:?}"
+        );
+        assert!(
+            ws.context
+                .build_system_prompt_injection()
+                .contains("## Git state"),
+            "the snapshot must reach the injection"
+        );
     }
 
     #[tokio::test]

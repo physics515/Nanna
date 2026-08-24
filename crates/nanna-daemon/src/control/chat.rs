@@ -324,7 +324,11 @@ impl ControlPlane {
             {
                 let mut registry = self.workspaces.write().await;
                 if let Some(ws) = registry.get_mut(ws_id) {
-                    if let Err(e) = ws.load_context().await {
+                    // The git-aware variant, and only here: this is the one
+                    // workspace the turn is bound to, so the two `git` calls it
+                    // costs are paid once per turn rather than once per
+                    // registered workspace at boot.
+                    if let Err(e) = ws.load_context_with_git().await {
                         warn!("Failed to reload workspace context: {}", e);
                     }
                 }
