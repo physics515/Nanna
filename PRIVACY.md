@@ -18,6 +18,7 @@ to opt out, and how to delete your data.
 | Task store | Turso | Long-horizon mission plans and notes |
 | Tool scripts | Data dir `tools/` (+ any workspace `skills/`) | User-editable skills |
 | Logs | Data dir `logs/` (daily rotation, ≤7 files) | Diagnostics |
+| Tool audit trail | Data dir `logs/tool-audit.jsonl` (8 MB cap + one rollover) | One record per tool call: which tool, what it resolved to, the argument *key names*, duration, outcome. Argument **values** are excluded unless `[tools] audit_log_values = true`. Turn it off with `[tools] audit_log = false` |
 | Model info cache | OS cache dir | Capability metadata for routing |
 
 On Windows the canonical tree is under `%APPDATA%\nanna\nanna\` (config) and
@@ -44,7 +45,7 @@ Only when the corresponding feature is configured:
 
 | Destination | Trigger | What is sent |
 |-------------|---------|--------------|
-| **Cloud LLM providers** (Anthropic / OpenAI / OpenRouter) | You set a key and select a cloud model (or the router escalates) | Prompts, tool schemas, tool results, and returned completions. Embeddings go to OpenAI if `OPENAI_API_KEY` is set and the embedding provider is `openai`. |
+| **Cloud LLM providers** (Anthropic / OpenAI / OpenRouter) | You set a key and select a cloud model (or the router escalates) | Prompts, tool schemas, tool results, and returned completions. The prompt includes the workspace's `README.md` / `AGENTS.md` / `CONTRIBUTING.md` / `ROADMAP.md`, and — when the workspace is a git repository — the branch name, the paths of uncommitted changes, and recent commit subject lines. **File contents are never sent for the git snapshot, only paths.** Embeddings go to OpenAI if `OPENAI_API_KEY` is set and the embedding provider is `openai`. |
 | **Ollama / local runner** | Default local path | Stays on-machine (or on the host you pointed `ollama_host` at) |
 | **Brave Search** | `web_search` tool + `BRAVE_API_KEY` | The search query string |
 | **Channel platforms** (Telegram, Discord, Slack, Signal, WhatsApp) | Channel enabled + bot token | Outbound reply text/media; inbound messages are received from the platform |

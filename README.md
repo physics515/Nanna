@@ -93,6 +93,8 @@ A fully local run needs none.
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
 - **39 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp
+- **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
+- **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
