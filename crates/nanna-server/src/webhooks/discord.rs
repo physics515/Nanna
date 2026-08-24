@@ -181,8 +181,16 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<InteractionResponse>, StatusCode> {
-    // Verify Discord signature if public key is configured
-    if let Some(ref public_key) = state.discord_public_key {
+    // Fail closed: no public key means no way to tell Discord from anyone else,
+    // and this payload drives the agent.
+    let Some(public_key) = crate::webhooks::auth::configured(state.discord_public_key.as_ref())
+    else {
+        return Err(crate::webhooks::auth::refuse_unconfigured(
+            "Discord",
+            "channels.discord.public_key",
+        ));
+    };
+    {
         let signature = headers
             .get("X-Signature-Ed25519")
             .and_then(|v| v.to_str().ok())
@@ -199,14 +207,20 @@ pub async fn handle(
                 StatusCode::UNAUTHORIZED
             })?;
 
+        // Discord signs the timestamp but publishes no tolerance, so a captured
+        // POST verifies forever unless we bound it. Freshness first: it is far
+        // cheaper than Ed25519 and has to pass either way.
+        if !crate::webhooks::auth::timestamp_is_fresh(timestamp) {
+            warn!("Discord signature timestamp outside the replay window");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
         if !verify_discord_signature(public_key, signature, timestamp, &body) {
             warn!("Discord signature verification failed");
             return Err(StatusCode::UNAUTHORIZED);
         }
 
         debug!("Discord signature verified successfully");
-    } else {
-        warn!("Discord public key not configured - skipping signature verification");
     }
 
     let interaction: Interaction =

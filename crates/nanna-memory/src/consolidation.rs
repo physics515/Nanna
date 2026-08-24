@@ -468,6 +468,46 @@ pub(crate) fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     a.workspace_id == b.workspace_id
 }
 
+/// The metadata key carrying a memory's provenance.
+///
+/// Written at extraction time from `nanna_agent::MemoryProvenance::as_str` —
+/// `"stated"` when the user asserted the fact, `"observed"` when the agent
+/// inferred it.
+pub const FACT_TYPE_METADATA_KEY: &str = "fact_type";
+
+/// The one `fact_type` value that pins a memory verbatim.
+const STATED_FACT_TYPE: &str = "stated";
+
+/// Is the memory carrying this metadata pinned verbatim — i.e. must a dream
+/// cycle never paraphrase it?
+///
+/// Repeated summarization erases low-frequency detail: the clause that appears
+/// once in a band is exactly the one a gist drops. `crate::retention`'s drift
+/// fixture reproduces that against this pipeline — a rare safety-critical clause
+/// is gone after a single summarizing cycle while the topic stays perfectly
+/// recallable, so recall metrics cannot see the loss.
+///
+/// A fact the **user asserted** is the case where that loss is least acceptable
+/// and least excusable: it was not inferred from anything, it was said, and it
+/// is stored in the words it was said in. So provenance is the gate, not a tuned
+/// importance threshold — a categorical rule with no magic number in it.
+///
+/// Conservative by construction, mirroring `MemoryProvenance`'s own default: a
+/// missing, empty or unrecognised `fact_type` is **not** pinned. Absence of a
+/// provenance signal is not evidence that the user stated something, so an
+/// unlabeled memory can never pin itself out of consolidation.
+/// Takes the metadata map rather than a whole entry so the one policy answers
+/// for every shape a memory is read back in (`MemoryEntry` while consolidating,
+/// `MemoryListEntry` when listing), with no second copy to drift.
+#[must_use]
+pub fn is_verbatim_pinned<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+) -> bool {
+    metadata
+        .get(FACT_TYPE_METADATA_KEY)
+        .is_some_and(|fact_type| fact_type.trim().eq_ignore_ascii_case(STATED_FACT_TYPE))
+}
+
 /// Cluster memories using the composite score (not just cosine similarity).
 ///
 /// Uses greedy clustering: for each unassigned memory, find all unassigned memories
@@ -586,20 +626,94 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if sim.is_finite() { sim } else { 0.0 }
 }
 
+/// Metadata keys that locate ONE specific source record, and therefore can
+/// never be true of a summary that replaced several.
+///
+/// `source_id` groups the chunks of one tool result and `chunk` is a position
+/// (`"3/17"`) inside that group — together they are how `assemble_handle_content`
+/// reassembles the whole text behind a memory handle. A consolidated entry that
+/// inherited them would be pulled into that reassembly **at the inherited
+/// position**, splicing a paraphrase into the middle of a result the model was
+/// promised was stored verbatim. A summary has no position in anyone's byte
+/// stream; there is no value of these keys it could truthfully carry.
+const SOURCE_LOCATOR_METADATA_KEYS: [&str; 2] = ["source_id", "chunk"];
+
+/// Metadata for a consolidated entry: only what is true of the whole cluster.
+///
+/// The merge used to be first-writer-wins across the cluster, which asserts one
+/// arbitrary source's value about all of them — a gist of five different tools'
+/// output claiming `tool=exec, outcome=ok, target=./build.sh` because that
+/// source sorted first. Two rules replace it, and neither needs a threshold:
+///
+/// 1. A **source locator** ([`SOURCE_LOCATOR_METADATA_KEYS`]) is never
+///    inherited, however unanimous.
+/// 2. Every other key is inherited only when **every source that carries it
+///    agrees** on the value. Unanimity is the exact condition under which the
+///    claim survives the merge; disagreement means the merged entry has no
+///    truthful value to state, so it states none.
+///
+/// Pure, so the rule is testable without a store.
+#[must_use]
+fn consolidated_metadata(memories: &[MemoryEntry]) -> HashMap<String, String> {
+    debug_assert!(
+        !memories.is_empty(),
+        "a cluster with no members has no metadata to merge"
+    );
+
+    let mut merged: HashMap<String, String> = HashMap::new();
+    let mut contested: Vec<String> = Vec::new();
+
+    for memory in memories {
+        for (key, value) in &memory.metadata {
+            if SOURCE_LOCATOR_METADATA_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            match merged.get(key) {
+                None if !contested.iter().any(|k| k == key) => {
+                    merged.insert(key.clone(), value.clone());
+                }
+                Some(existing) if existing != value => {
+                    merged.remove(key);
+                    contested.push(key.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    debug_assert!(
+        merged
+            .keys()
+            .all(|k| !SOURCE_LOCATOR_METADATA_KEYS.contains(&k.as_str())),
+        "a source locator survived the merge"
+    );
+    merged
+}
+
 /// Create a consolidated memory entry from a cluster
 pub fn create_consolidated_entry(
     cluster: &MemoryCluster,
     consolidated_content: String,
     new_embedding: Vec<f32>,
 ) -> MemoryEntry {
-    // Merge metadata from all memories
-    let mut metadata: HashMap<String, String> = HashMap::new();
-    for memory in &cluster.memories {
-        for (k, v) in &memory.metadata {
-            metadata.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    }
+    // Only what is true of the whole cluster — see `consolidated_metadata`.
+    let mut metadata = consolidated_metadata(&cluster.memories);
     
+    // Provenance is MONOTONE across a merge: if any source was a user
+    // assertion, the entry that replaces it still contains a user assertion and
+    // must still read as one. The metadata merge above is first-writer-wins, so
+    // without this the result's `fact_type` would be whichever source happened
+    // to be ordered first — a rule that depends on iteration order is not a
+    // rule. The verbatim pin makes this unreachable today (a stated memory is
+    // partitioned out before it can join a cluster), so this is the invariant
+    // stated explicitly rather than left to hold by reachability.
+    if cluster.memories.iter().any(|m| is_verbatim_pinned(&m.metadata)) {
+        metadata.insert(
+            FACT_TYPE_METADATA_KEY.to_string(),
+            STATED_FACT_TYPE.to_string(),
+        );
+    }
+
     // Track consolidation
     let source_ids: Vec<_> = cluster.memories.iter().map(|m| m.id.clone()).collect();
     metadata.insert("consolidated_from".to_string(), source_ids.join(","));
@@ -890,6 +1004,233 @@ mod tests {
             fsrs: FsrsState { importance: 2.0, access_count: 5, ..FsrsState::default() },
             workspace_id: None,
         }
+    }
+
+
+    fn entry_with_fact_type(fact_type: Option<&str>) -> MemoryEntry {
+        let mut entry = similar_entry("pin", "the deploy key lives in 1Password");
+        if let Some(fact_type) = fact_type {
+            entry
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), fact_type.to_string());
+        }
+        entry
+    }
+
+    /// Positive space: only an explicit `stated` provenance pins a memory, in
+    /// whatever casing/padding the extraction path happened to write.
+    #[test]
+    fn stated_provenance_pins_a_memory_verbatim() {
+        for label in ["stated", "STATED", "  Stated  "] {
+            assert!(
+                is_verbatim_pinned(&entry_with_fact_type(Some(label)).metadata),
+                "{label:?} names a user assertion"
+            );
+        }
+    }
+
+    /// Negative space, and the load-bearing half: absence of a provenance signal
+    /// is NOT evidence the user stated something, so an unlabeled memory must
+    /// never be able to pin itself out of consolidation. Mirrors
+    /// `MemoryProvenance`'s own `Observed` default.
+    #[test]
+    fn everything_that_is_not_stated_stays_consolidatable() {
+        for label in [None, Some(""), Some("observed"), Some("statedly"), Some("user-said")] {
+            assert!(
+                !is_verbatim_pinned(&entry_with_fact_type(label).metadata),
+                "{label:?} is not an explicit user assertion"
+            );
+        }
+    }
+
+    /// The partition the band loop performs must be lossless and exact: every
+    /// memory lands on exactly one side, and neither side holds one of the
+    /// other's.
+    #[test]
+    fn the_provenance_partition_is_lossless() {
+        let band = vec![
+            entry_with_fact_type(Some("stated")),
+            entry_with_fact_type(None),
+            entry_with_fact_type(Some("observed")),
+            entry_with_fact_type(Some("STATED")),
+        ];
+        let band_count = band.len();
+
+        let (pinned, unpinned): (Vec<_>, Vec<_>) = band
+            .into_iter()
+            .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
+
+        assert_eq!(pinned.len() + unpinned.len(), band_count);
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.iter().all(|e| is_verbatim_pinned(&e.metadata)));
+        assert!(!unpinned.iter().any(|e| is_verbatim_pinned(&e.metadata)));
+    }
+
+
+
+    fn chunk_entry(id: &str, source_id: &str, chunk: &str, tool: &str, outcome: &str) -> MemoryEntry {
+        let mut entry = similar_entry(id, "some captured output");
+        entry.metadata.insert("source_id".to_string(), source_id.to_string());
+        entry.metadata.insert("chunk".to_string(), chunk.to_string());
+        entry.metadata.insert("tool".to_string(), tool.to_string());
+        entry.metadata.insert("outcome".to_string(), outcome.to_string());
+        entry.metadata.insert("category".to_string(), "tool_result".to_string());
+        entry
+    }
+
+    /// The bug this rule exists for. `assemble_handle_content` gathers every
+    /// memory sharing a `source_id` and orders them by their `chunk` position,
+    /// so a consolidated entry that inherited both would be spliced into the
+    /// middle of a tool result the model was promised was stored verbatim —
+    /// and the sources it replaced are gone, so nothing else fills that slot.
+    ///
+    /// A summary has no position in anyone's byte stream. It carries neither
+    /// key, however unanimous the cluster was about them.
+    #[test]
+    fn a_summary_never_inherits_a_source_locator() {
+        let cluster = MemoryCluster::new(
+            vec![
+                chunk_entry("c1", "abc123", "1/17", "exec", "ok"),
+                chunk_entry("c2", "abc123", "2/17", "exec", "ok"),
+            ],
+            CompressionLevel::Essence,
+            &FsrsParameters::default(),
+        );
+
+        let consolidated = create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+        assert!(
+            !consolidated.metadata.contains_key("source_id"),
+            "a summary is not a chunk of any one result"
+        );
+        assert!(
+            !consolidated.metadata.contains_key("chunk"),
+            "and it has no position inside one"
+        );
+    }
+
+    /// Every other key survives only when the whole cluster agrees. A gist of
+    /// two different tools' output must not claim to be from one of them.
+    #[test]
+    fn a_summary_inherits_only_what_every_source_agrees_on() {
+        let cluster = MemoryCluster::new(
+            vec![
+                chunk_entry("c1", "abc123", "1/2", "exec", "ok"),
+                chunk_entry("c2", "def456", "1/2", "read_file", "FAILED"),
+            ],
+            CompressionLevel::Essence,
+            &FsrsParameters::default(),
+        );
+
+        let consolidated = create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+        assert!(
+            !consolidated.metadata.contains_key("tool"),
+            "two tools disagree, so the merged entry names neither"
+        );
+        assert!(
+            !consolidated.metadata.contains_key("outcome"),
+            "one succeeded and one failed — the merge has no truthful verdict"
+        );
+        assert_eq!(
+            consolidated.metadata.get("category").map(String::as_str),
+            Some("tool_result"),
+            "a key the whole cluster agrees on is still true of the merge"
+        );
+    }
+
+    /// Negative space for the unanimity rule: a key present on only SOME
+    /// sources is still unanimous among those that carry it, and a key that is
+    /// dropped by disagreement must stay dropped even if a later source would
+    /// have re-introduced the first value.
+    #[test]
+    fn unanimity_survives_partial_presence_and_never_re_admits_a_contested_key() {
+        let mut only_one = similar_entry("a", "x");
+        only_one.metadata.insert("topic".to_string(), "deploys".to_string());
+        let bare = similar_entry("b", "y");
+        let mut disagrees = similar_entry("c", "z");
+        disagrees.metadata.insert("tool".to_string(), "exec".to_string());
+        let mut agrees_with_first = similar_entry("d", "w");
+        agrees_with_first.metadata.insert("tool".to_string(), "read_file".to_string());
+        let mut back_to_exec = similar_entry("e", "v");
+        back_to_exec.metadata.insert("tool".to_string(), "exec".to_string());
+
+        let cluster = MemoryCluster::new(
+            vec![only_one, bare, disagrees, agrees_with_first, back_to_exec],
+            CompressionLevel::Essence,
+            &FsrsParameters::default(),
+        );
+        let consolidated = create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+        assert_eq!(
+            consolidated.metadata.get("topic").map(String::as_str),
+            Some("deploys"),
+            "nothing contradicted it"
+        );
+        assert!(
+            !consolidated.metadata.contains_key("tool"),
+            "a contested key stays dropped — the third source agreeing with the \
+             first does not make the second one go away"
+        );
+    }
+
+    /// Provenance must be monotone across a merge: an entry that replaces a
+    /// user assertion still contains one, so it must still read as one. The
+    /// metadata merge is first-writer-wins, so before this the answer depended
+    /// on cluster order — hence both orders are asserted here.
+    #[test]
+    fn a_consolidated_entry_inherits_stated_provenance_from_any_source() {
+        for stated_first in [true, false] {
+            let mut stated = similar_entry("stated", "the deploy key lives in 1Password");
+            stated
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), "stated".to_string());
+            let mut observed = similar_entry("observed", "the deploy job read a key from somewhere");
+            observed
+                .metadata
+                .insert(FACT_TYPE_METADATA_KEY.to_string(), "observed".to_string());
+
+            let memories = if stated_first {
+                vec![stated, observed]
+            } else {
+                vec![observed, stated]
+            };
+            let cluster = MemoryCluster::new(
+                memories,
+                CompressionLevel::Standard,
+                &FsrsParameters::default(),
+            );
+
+            let consolidated =
+                create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+            assert!(
+                is_verbatim_pinned(&consolidated.metadata),
+                "stated_first={stated_first}: a merge containing a user assertion stays stated"
+            );
+        }
+    }
+
+    /// Negative space: a cluster of purely agent-observed memories must NOT
+    /// come back pinned, or every consolidated entry would pin itself and
+    /// consolidation would stop after one pass.
+    #[test]
+    fn a_consolidated_entry_of_observed_sources_stays_consolidatable() {
+        let cluster = MemoryCluster::new(
+            vec![
+                similar_entry("a", "the build took 40 seconds"),
+                similar_entry("b", "the build took 41 seconds"),
+            ],
+            CompressionLevel::Standard,
+            &FsrsParameters::default(),
+        );
+
+        let consolidated = create_consolidated_entry(&cluster, "a gist".to_string(), vec![0.0; 4]);
+
+        assert!(
+            !is_verbatim_pinned(&consolidated.metadata),
+            "nothing here was ever asserted by the user"
+        );
     }
 
     #[test]

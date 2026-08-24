@@ -78,6 +78,13 @@ cargo clippy --all-targets      # pedantic + nursery — clean, no new warnings
 cargo test                      # (or -p <crate> for the touched crate)
 cargo build                     # release if perf-relevant
 ```
+- **A dependency, toolchain or `Cargo.lock` change ALSO requires a release build** —
+  `cargo build --release -p nanna-daemon` (the crate the Tauri sidecar and every benchmark number
+  come from). Debug `build`/`test`/`clippy` cannot see a **release-only** codegen break, and both
+  toolchain failures this repo has hit were exactly that: a `rustc_codegen_ssa` ICE on `tokio`, and a
+  const-eval "queries overflow the depth limit" on `turso_core` that only appeared once a bump
+  dirtied its rlib. Either one passes the whole green gate above and still leaves the shippable
+  artifact unbuildable, so a freshness pass is not verified until release is green.
 - If perf-affecting: run the relevant bench (`cargo bench --bench <name> -p <crate>`), compare to
   `bench/BASELINE.md`, and **reject regressions past budget**. Update the baseline if it legitimately improved.
 - **GUI / runtime verification — drive the real app over WebDriver (grant-free, PRIMARY).** For any

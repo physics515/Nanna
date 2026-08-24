@@ -25,6 +25,7 @@ pub use consolidation::{
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
     create_consolidated_entry, composite_cluster_score,
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
+    is_verbatim_pinned, FACT_TYPE_METADATA_KEY,
 };
 pub use dreaming::{
     dream_trigger, DreamOutcome, DreamTrigger, DreamingConfig, DreamingService, DreamingStats,

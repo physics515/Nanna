@@ -131,8 +131,8 @@ async function confirmClearSessions() {
   const confirmed = await confirm({
     title: 'Delete All Sessions',
     message: 'Delete all chat sessions? This cannot be undone.',
-    confirmText: 'Delete All',
-    destructive: true
+    confirmLabel: 'Delete All',
+    danger: true
   })
 
   if (!confirmed) return
@@ -150,8 +150,8 @@ async function confirmClearMemories() {
   const confirmed = await confirm({
     title: 'Delete All Memories',
     message: 'Delete all memories? This cannot be undone.',
-    confirmText: 'Delete All',
-    destructive: true
+    confirmLabel: 'Delete All',
+    danger: true
   })
 
   if (!confirmed) return

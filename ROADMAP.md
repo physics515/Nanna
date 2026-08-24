@@ -480,6 +480,14 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             Source: [keyring-core docs](https://docs.rs/keyring-core).
 - [x] Set a restrictive Tauri CSP (not null).
       *(2026-07-24)* Done — see the CSP item above.
+- [x] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
+      *(2026-08-23 — verified already shipped; the checkbox was stale.)* `gui/src-tauri/Cargo.toml`
+      has `default = ["custom-protocol"]` and `devtools = ["tauri/devtools"]` deliberately outside
+      it, with a comment recording why: the feature opens the webview inspector in *release* builds of
+      an app that renders model output and untrusted markdown. Tauri enables devtools automatically
+      under `debug_assertions`, so `tauri dev` is unaffected, and a release build gets the inspector
+      only by asking for `--features devtools`. No other reference to the feature exists in the crate.
+- [ ] Per-tool toggles visible in GUI; audit log for every tool call.
 - [x] **Chat markdown was rendered unsanitized into `v-html` — the CSP was the only layer.**
       *(2026-08-24)* `MarkdownContent.vue` ran `marked.parse()` straight into `v-html`, and `marked`
       has not sanitized since v5 (the `sanitize` option was removed). Verified against the installed
@@ -604,6 +612,103 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      - [x] *(2026-08-22)* **The whole inbound webhook surface now fails CLOSED, and the generic route
+            no longer aborts the daemon.** Every verifier in `nanna-daemon/src/webhook.rs` was correct and
+            every handler *skipped* it when nothing was configured — `if let Some(secret) = …` with no
+            `else` — so the **unconfigured case was the least protected one**, and each of those endpoints
+            hands its payload to the agent loop, which runs tools at the daemon's privilege. Telegram was
+            the worst: `apply_channel_webhook_secrets` never populated `telegram_secret` at all (its
+            comment claimed "Telegram authenticates via the bot token in the URL" — the route is the fixed
+            path `/webhook/telegram` with no token in it), so that endpoint had never verified anything.
+            Now: telegram/discord/slack/whatsapp-POST/generic each refuse with **503** + a log line naming
+            the one config key to set (503, not 401, so "never armed" reads differently from "wrong
+            proof"); `channels.telegram.webhook_secret` and `channels.signal.webhook_secret` are new config
+            fields (`TELEGRAM_WEBHOOK_SECRET` env override) and Telegram's `setWebhook` secret token is
+            wired through; a blank `Some("")` credential counts as **unconfigured** (comparing an empty
+            secret to an absent header is `"" == ""`, which would have authenticated everyone); the generic
+            hook's `==` secret compare became constant-time with both header forms evaluated unconditionally
+            (a short-circuiting `||` leaks which header was right); and **Discord gained the replay window
+            Slack already had** — Discord signs a timestamp but publishes no tolerance, so a captured POST
+            verified forever (test: a day-old capture still passes Ed25519 and is refused only by the
+            window). Separately and worse: `.route("/webhook/:id", …)` is **axum 0.7 syntax that axum 0.8
+            PANICS on** at router construction — inside a spawned task, under `panic = "abort"` — so
+            enabling any webhook server aborted the daemon at startup. Fixed to `{id}` with a
+            router-construction regression test (verified: reverting the route makes the test panic).
+            Evidence: 3 new end-to-end tests drive the real `WebhookServer` over a real socket with
+            `reqwest` (unconfigured→503 on all five routes, configured→401 without/with a wrong proof and
+            200 with it, blank→503); verified non-vacuous by re-introducing the fail-open and watching
+            `every_unconfigured_channel_refuses_with_503` report `got 200`. 6 new unit tests. The `run()`
+            log line that already promised "Only inbound requests carrying a valid provider signature are
+            accepted" is now true.
+            **Operator-visible change:** a channel that was relying on an unauthenticated webhook stops
+            serving until its secret is set; the 503 log names the key.
+      - [x] *(2026-08-22)* **Same treatment for the `nanna serve` copy (`nanna-server`), which was worse.**
+            Telegram, Signal and the generic hook had **no authentication of any kind** — no header read,
+            no secret compared — and `nanna serve` also never handed the Slack signing secret to
+            `AppStateBuilder`, so its Slack verifier could not have run even in principle. The generic
+            endpoint (which takes an arbitrary `message` and runs it) had a `webhook_secret` field parsed
+            into `AppState` from `server.webhook_secret` and read by **nobody**. New
+            `webhooks/auth.rs` holds the shared primitives (`configured`, constant-time `secret_matches`,
+            `timestamp_is_fresh`, `refuse_unconfigured`, `bearer_secret_ok`), all five handlers fail closed
+            through it, Discord gained the replay window, and `serve.rs` now wires
+            slack/telegram/signal secrets. 6 unit tests. `nanna init` mints a 122-bit Telegram webhook
+            secret and prints the exact `setWebhook` call, so a fresh install is armed rather than broken.
+            - [x] *(2026-08-23)* **`nanna-server`'s handlers now have the end-to-end harness the daemon's
+                  had.** `crates/nanna-server/tests/webhook_fail_closed.rs` drives the real
+                  `create_router()` through `tower::ServiceExt::oneshot` — real axum routing, real
+                  extractors, real handler bodies — over a real `AppState`. The `AppState` turned out
+                  to need no test double at all: `Storage::in_memory()` opens a Turso store,
+                  `Nanna::new` touches no network, and `NannaConfig { enable_gpu: false }` plus
+                  `.dreaming(false).scheduler(false)` keeps the fixture to the path under test. **6
+                  tests, no network and no API key**, because every payload chosen for an "admitted"
+                  leg reaches a handler branch that returns *before* any agent work — Discord
+                  `PING`→`PONG`, Slack `url_verification`→challenge echo, a Telegram update with no
+                  message, a Signal envelope with no `dataMessage` — so passing authentication is all
+                  that passing authentication proves.
+                  Beyond the daemon suite's three properties (unconfigured→503, configured→401
+                  without/with a wrong proof, blank→503) this copy **signs its own fixtures**, which
+                  the daemon suite cannot: a genuinely HMAC-SHA256-signed Slack challenge is answered
+                  200 while a signature valid for a *different body* is refused, and a genuinely
+                  Ed25519-signed Discord `PING` is answered 200 while **a day-old capture of it is
+                  refused** — the one assertion that would fail if the replay window were deleted and
+                  the Ed25519 check kept, since Discord's signature never expires on its own. Also
+                  pinned: a *prefix* of a shared secret is refused (the constant-time compare exists
+                  precisely so a byte-by-byte one cannot be walked), and `Authorization: <secret>`
+                  without the `Bearer ` scheme is not the secret.
+                  **Verified non-vacuous**, the same way the daemon suite was: re-introducing the
+                  original fail-open in the Telegram handler (`else { return Err(StatusCode::OK) }`)
+                  makes the suite report `/webhooks/telegram must refuse while unconfigured, got 200
+                  OK` from two tests; reverted clean. 22 `nanna-server` tests green, clippy 0 errors
+                  and 0 warnings from the new file. One dev-dependency added: `tower` with `util`.
+            - [x] *(2026-08-23)* **Authentication now runs *before* body deserialization on all five
+                  routes.** Found while building the harness above, then fixed. `telegram`, `signal`
+                  and `generic` took `Json<T>`, and axum runs extractors before the handler body — so
+                  an unauthenticated caller drove `serde_json` on those routes, and an
+                  **unconfigured** channel handed a malformed body answered the parser's **400
+                  instead of the 503** whose entire purpose is to tell an operator "this host never
+                  armed this channel". Measured, not assumed: a probe against the unconfigured router
+                  returned `telegram 400 · discord 503 · slack 503 · signal 400 · generic 400` — the
+                  split falls exactly on which extractor each handler used, because `slack` and
+                  `discord` already took `Bytes` and parsed after verifying. So did **every** handler
+                  in `nanna-daemon`, which is why only this copy was wrong.
+                  Fixed the way the two correct handlers already worked rather than by adding a
+                  middleware layer and its state plumbing: the three routes take `Bytes` and call the
+                  new shared `auth::parse_authenticated_body`, which parses after the credential
+                  branch and maps a failure to **400 — honest at that point, because by then the
+                  caller has proved who it is, so a bad body is a bad request and not an anonymous
+                  one**. Keeping the helper in `auth.rs` beside `configured`/`secret_matches` means
+                  the ordering rule is stated once, next to the rule it protects.
+                  1 new unit test (valid parses; malformed and wrong-shape are 400 and specifically
+                  *not* 401/503) and 1 new end-to-end test pinning all three states per route:
+                  unconfigured + malformed → 503, armed + wrong proof + malformed → 401, armed +
+                  right proof + malformed → 400. **Verified non-vacuous**: reverting `generic` to
+                  `Json<T>` makes it report "is unconfigured, so it must refuse before parsing, got
+                  400 Bad Request". 24 `nanna-server` tests green, clippy 0 errors.
+                  Not a fail-open — every route refused before and refuses now — so this was a
+                  correctness and operator-legibility fix, not a security one.
+                  *(Diff hygiene: `rustfmt` on `signal.rs`/`telegram.rs` re-indented ~40 unrelated
+                  pre-existing `#[serde(rename)]` attributes, burying a 4-line change. Reverted and
+                  the edits re-applied by hand — the same trap the 2026-07-25 sweep logged.)*
       - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
             match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
             (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had
@@ -729,7 +834,47 @@ health checks). **Shipped**, except:
       (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
       store — (b) matches the "channels as control-plane clients" architecture and avoids a second
       process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
-- [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+- [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+      *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
+      `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
+      `timeout`, folded into the `apply_health_result` state machine — so "the health check is a
+      placeholder" has not been accurate for some time. What *is* still a placeholder is the
+      supervised agent's own body (`// TODO: Run actual agent loop here using _llm and _tools`);
+      `start_agent` spawns a task that only awaits its shutdown signal.
+      **The bug the stale label was hiding: the probe's pass condition was
+      `response.to_lowercase().contains("ok")`** — a substring test on two of the commonest letters
+      in English. Measured against real answers: **"I am broken", "not ok", "Out of tokens" and
+      "Something looks wrong" all PASSED**, while "Healthy", "operational" and "alive" all *failed*.
+      So it was simultaneously too loose and too tight, and — worse — an agent explicitly reporting
+      that it was broken was recorded as healthy, which means the `failure_threshold` /
+      `BecameUnhealthy` / restart machinery underneath it could never fire. A liveness probe that
+      cannot fail is worse than no probe: it manufactures confidence.
+      Replaced with a pure, testable `probe_answer_is_affirmative` beside the existing pure
+      `apply_health_result`: an affirmative token (`ok`/`okay`/`healthy`/`operational`/`alive`)
+      must appear at a **word boundary** (which is what stops `broken`/`tokens`/`looks`), **and** no
+      negation may appear anywhere (which is what stops "not ok" — it carries a perfectly good
+      boundary-`ok`, so the boundary rule alone is not enough). Bounded at
+      `MAX_PROBE_ANSWER_BYTES = 4096`, derived: ~3 orders of magnitude above the one-word answer the
+      probe asks for, while bounding the work a runaway model can impose on a check that runs on a
+      timer forever. Over the cap the verdict is **fail, not truncate-and-scan** — truncating would
+      make the cap a way to push a negation past the end of the scan. Splitting on
+      `!char::is_alphanumeric` is Unicode-aware and **never slices**, which matters here: byte-slicing
+      a string with a multi-byte char in it has taken this daemon down before.
+      6 tests (plain acknowledgement; the five substring traps; seven negated forms; empty/irrelevant;
+      the cap in both directions; multi-byte answers incl. an em dash and emoji). **Verified
+      non-vacuous**: restoring the substring check fails 4 of them. 389 `nanna-agent` lib tests green,
+      clippy 0 errors.
+      *(Follow-up in the same run: the function's exit `debug_assert` was itself a tautology —
+      `!negated || !(affirmed && !negated)` simplifies to `true`, which clippy's `overly_complex_bool_expr`
+      caught on the workspace pass. A per-crate grep by function name had missed it, because clippy
+      anchors to lines, not names. Replaced with a real post-condition — the scan only ever runs on a
+      bounded input, so pin that the cap's early return happened — which is what the exit assertion
+      should have been saying. Worth remembering as a check-your-checks lesson: an assertion that
+      cannot fail is the same failure mode as the health probe it was guarding.)*
+      - [ ] **Still open: give a supervised agent a real body.** `start_agent` must run the agent loop
+            rather than parking on `shutdown_rx`. Until it does, the health probe measures the *LLM's*
+            reachability, not the supervised agent's — which is worth knowing, but is not what the
+            name promises. Rename or re-scope the check when the body lands.
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
@@ -1076,17 +1221,127 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       (`expected 'sm' to be undefined`). Runtime-confirmed: `/tools`, `/logs`, `/tasks` now load with
       **zero** Vue warnings — both this one and the resolution one are gone.
       Verified: 65/65 vitest, 26/27 Playwright (the 27th is the pre-existing flake below).
-- [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
-      pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
-      the current branch it fails 1). Diagnosis from the trace: the step's locator
-      `getByRole('button', {name: /delete|confirm|yes/i})` is **ambiguous** — it matches both the context
-      menu's `Delete` item and the `ConfirmDialog`'s `Confirm` button, so after the menu detaches
-      Playwright re-resolves onto `Confirm` and then spins on
-      `confirm-overlay … intercepts pointer events` until the 60 s timeout. Fix is test-side: scope the
-      confirmation click to the dialog rather than the page, and wait for the overlay's transition to
-      settle. Deliberately **not** patched under time pressure in the run that found it — loosening an
-      assertion to get green is how a real regression gets hidden later.
-- [ ] *(2026-08-24)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
+- [x] *(2026-07-23, fixed 2026-08-23)* **`critical-path.spec.ts` "session create / rename / delete / switch"
+      was flaky — and the flake was pointing at a real UI bug.** The 2026-07-23 diagnosis was exactly
+      right: the step's `getByRole('button', {name: /delete|confirm|yes/i})` matched **both** the context
+      menu's `Delete` item and the `ConfirmDialog`'s confirm button, so after the menu detached
+      Playwright re-resolved onto the dialog button and spun on
+      `confirm-overlay … intercepts pointer events` until the 60 s timeout.
+      Fixed test-side as planned, and **tightened rather than loosened**: the click is scoped to
+      `getByRole('alertdialog')` (the dialog's own role — unambiguous), the confirmation is now
+      **required** instead of `if (await confirm.isVisible())` (SessionItem's `confirmDelete()` always
+      awaits `confirm()`, so a missing dialog is a regression and must fail), and the fixed
+      `waitForTimeout(300)` became `await expect(dialog).toBeHidden()` — while the overlay is fading it
+      still intercepts pointer events, so a fixed sleep is either a stall or a race depending on the
+      machine. Verified: **6/6 `critical-path.spec.ts` pass**, including the previously-flaky one.
+      **But the regex was that loose for a reason**, and chasing it turned up a real bug: the dialog's
+      button did not say "Delete". `ConfirmOptions` declares `confirmLabel` / `danger`, while three
+      destructive call sites passed **`confirmText` / `destructive`** — keys that do not exist on the
+      type. Both fell through to their defaults, so **the three most destructive actions in the app**
+      (delete a session; Settings → Data "Delete All Sessions"; "Delete All Memories") rendered a
+      generic grey **"Confirm"** with no danger styling. All three corrected. A fourth site,
+      `pages/tools.vue`, called the composable's `confirm` as if it were `window.confirm` —
+      `if (hasChanges.value && !confirm('Discard unsaved changes?'))` — passing a string and never
+      awaiting, so `!Promise` was always `false`: **the unsaved-changes guard never prompted and never
+      blocked**, and edits were dropped silently on switching tools. Now a real awaited confirm.
+      The scoped test locator (`/^Delete$/i` *inside* the dialog) now also pins the label, so the UI bug
+      and its test cannot drift apart again.
+- [ ] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
+      it.** `gui.yml` runs `pnpm exec vue-tsc --noEmit`, and the roadmap records it as "Enforced as of
+      2026-07-24: the tree typechecks with 0 errors, so a new one is a regression". It does not. Nuxt 4
+      writes a **solution-style** `tsconfig.json` — `"files": []` plus four project `references` — and
+      plain `tsc`/`vue-tsc` on that compiles **zero files**; it does not follow references without
+      `--build`. Proven, not inferred: inserting `const definitelyBroken: number = 'this is a string'`
+      into `SessionItem.vue` still exits 0, as does a bogus extra key on a typed object literal.
+      `pnpm exec vue-tsc --build` reports **96 errors** across 12+ files — worst offenders
+      `app/lib/tiptapMarkdown.ts` (26), `app/extensions/MonacoCodeBlock.ts` (16),
+      `app/pages/workspaces.vue` (9), `app/pages/memory.vue` (6). Two of the four `confirm()` bugs fixed
+      above are in that list, which is the point: this gate would have caught them the day they landed.
+      Not switched on in the same run, deliberately — flipping the flag turns CI red on 96 pre-existing
+      errors, and a green build achieved by leaving the gate blind is the thing being fixed here, so it
+      should not be traded for a red one nobody can land against. Do it as its own increment(s):
+      - [~] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+            *(2026-08-23)* **First batch: `app/lib/tiptapMarkdown.ts` — 26 errors → 0, total 96 → 66.**
+            All of the `noUncheckedIndexedAccess` family (`lines[i]` types as `string | undefined`
+            even under an `i < lines.length` guard, and regex group reads likewise).
+            This file is the inbound composer path and its own header says it: "a corruption here is a
+            corruption of what the user actually said" — and it had **6 tests**, which is not cover to
+            refactor every branch behind. So a **characterization suite went in first and was run green
+            on the unmodified code**: `tests/unit/tiptapMarkdownGolden.spec.ts`, **47 snapshots / 49
+            tests** over every parser branch and the edges that decide whether an index read can run
+            out of range (unterminated fence, fence as last line, empty fence, one-line inputs, blank
+            input, multi-byte). Only then the fix — and **all 47 snapshots re-matched unchanged**, so
+            the change is proven behaviour-preserving rather than assumed to be.
+            Fixed with a total accessor (`const at = (n) => lines[n] ?? ''`) and `?? ''` on regex
+            groups, **not** `!`: a non-null assertion is erased at runtime, so it would leave a genuine
+            out-of-range read to stringify into the user's message as the literal "undefined" — which
+            two of the new tests assert against directly. Every call site is already under a bounds
+            guard, so `at()` never actually substitutes; it only supplies the proof the checker cannot
+            derive.
+            **Verified non-vacuous**: a one-character change to the fence parser
+            (`line.slice(3)` → `slice(4)`) trips 3 snapshots. 208 vitest green (was 159).
+            *(2026-08-23, same run)* **Second batch: 66 → 41, and it found a broken feature.**
+            `app/extensions/MonacoCodeBlock.ts`'s 16 errors were **one** root cause, not sixteen:
+            `Cannot find module '@tiptap/core'`. Three files import `@tiptap/core` directly
+            (`MonacoCodeBlock.ts`, `SlashCommands.ts`, `FloatingToolbar.vue`) but it was never a
+            declared dependency — only a transitive one, which pnpm's strict `node_modules` layout
+            correctly refuses to resolve by name. Every other error in those files was a downstream
+            implicit-`any`, because Tiptap's callback parameter types could not be inferred without it.
+            Declaring `"@tiptap/core": "2.27.2"` (pinned to the family) fixed **17 errors in one line**
+            and removed a real fragility: the code was relying on hoisting it never asked for.
+            Two genuine stragglers then fixed: `state.schema.nodes.paragraph` is optional and
+            `.create()` on an absent node type would throw **inside an input rule, mid-keystroke** (now
+            guarded — the code block still inserts, only the trailing paragraph is skipped); and
+            `VueRenderer.element` is `Element | null` while tippy takes `Content | undefined`, so a null
+            would mount an empty popup.
+            - [x] **`pages/memory.vue`: editing a memory was broken outright.** Its six errors were all
+                  one bug — the template bound `@click="startEditMemory(memory)"`,
+                  `saveEditMemory(memory)` and `cancelEditMemory`, none of which exist. The script
+                  defines `startEditing` / `saveEditing(id)` / `cancelEditing`. In Vue an undefined
+                  template handler throws on click, so **the Edit / Save / Cancel buttons on every
+                  memory card threw**, in both the semantic and episodic lists. Note the signature
+                  mismatch too: `saveEditing` takes an **id**, while the template was passing the whole
+                  memory object. Rewired all six call sites. This is the clearest possible argument for
+                  the gate: a shipped feature was dead, and a typecheck that actually ran would have
+                  said so the day it landed.
+            *(2026-08-23, same run)* **Third batch: 41 → 32.** `app/pages/workspaces.vue`'s nine errors
+            were one modelling gap: `contextFiles` / `detailFiles` / `availableFiles` declared their
+            `key` / `existsKey` as plain `string`, and the templates index workspace objects with them
+            (`ws[file.key]`, `createValidity[file.existsKey]`) — a `string` is not provably a member of
+            either shape, so every such read was an implicit `any`. Fixed at the source rather than at
+            the call sites: `app/lib/workspaceMarkers.ts` — the module that already owns
+            `WorkspaceValidity` — now exports a `ContextFileKey` literal union, and the three arrays are
+            annotated with it. The remaining one was a real (if small) template-typing bug:
+            `:disabled="createValidity && createValidity[key]"` yields `boolean | null` when
+            `createValidity` is null, which is not `Booleanish`; `createValidity?.[key] ?? false` keeps
+            the same truthiness and gives a plain boolean.
+            *(2026-08-23, same run)* **Fourth batch: 32 → 25, three more broken surfaces.**
+            - **`tool-stats.vue`: the latency-percentile chart never rendered.** All four of its errors
+              were one swapped pair. Vue's object `v-for` binds **value first, key second**, and the
+              template read `v-for="(label, val) in { P50: …, P95: …, P99: … }"` — so `label` held the
+              latency number and `val` held the string `"P50"`. Consequences: `val > 5000` compared a
+              string to a number (always false, so the red/amber bands never fired), and the bar height
+              computed `"P50" / n` → `NaN` → `height: NaNpx`, i.e. **no bars at all**; the caption
+              printed the number and the value printed a formatted string. One binding swap fixed all
+              four errors and the whole widget.
+            - **`scheduler.vue`: the timezone dropdown rendered empty.** `UiSelect` builds its list from
+              an `options: Option[]` prop, and it was being handed eight slotted `<option>` children,
+              which the component never reads. Moved to `:options="timezoneOptions"`.
+            - **`scheduler.vue`: the schedule-preset buttons had no styling.** `variant="outline"` is not
+              one of `UiButton`'s variants (`default | secondary | ghost | destructive | link | accent`),
+              so they silently fell through. Now `secondary`, the bordered one.
+            - `ui/card.vue` typed its `class` prop as `string` while rendering it through `cn` (clsx),
+              which accepts objects — so the legitimate `:class="{ 'opacity-50': … }"` form read as a
+              type error. Widened to `ClassValue`: the type was narrower than the runtime, not the
+              other way round.
+            **Running total for the run: 96 → 25 errors**, with 208 vitest green and `pnpm build` green
+            throughout. Remaining backlog: `app/components/settings/*`, `app/components/ToolCallCard.vue`,
+            `app/layouts/default.vue`, the `ui/` primitives, and a handful of one-error files.
+      - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
+            "0 errors" claim — this time with evidence that the command sees the files.
+      - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
+            reports zero *checked files*, the same way a coverage gate fails at 0%.
+- [x] *(2026-08-24, fixed the same day)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
       deadline in a test, not a regression.** Six of its seventeen tests failed a full-workspace
       `cargo test` with `"Timeout after 30000ms"` while two cargo builds and sixteen other test binaries
       shared the box; the same file run alone passes **17/17 in 3.49 s** — a ~10× margin, so the failure
@@ -1105,6 +1360,14 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `cargo test -- --test-threads=4` (**1593 tests, 0 failures** this run), so the workable
       short-term answer is to bound test parallelism in CI; the durable one is to stop asserting
       wall-clock in tests that are not measuring latency.
+      *(2026-08-24, PR #264)* **Fixed, and the durable way round.** `e2e_daemon` now watches the
+      daemon task rather than the clock — a task that ends without binding fails at that moment with
+      its actual error, or resumes the original panic — with the clock demoted to a 120 s hang ceiling
+      whose assert says it is not a latency assertion. The eight scripting harnesses that were
+      inheriting `ScriptedTool`'s production 30 s default now take one shared
+      `tests/common::FIXTURE_TIMEOUT_MS`; `project_structure` keeps its 120 s because the skill
+      hardcodes `SCRIPT_DEADLINE_MS` and derives its work budget from it. Verified at **default**
+      parallelism — the exact condition that failed — 1555 passed / 0 failed.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
@@ -1329,8 +1592,52 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
-- [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
+- [~] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
+      *(2026-08-23)* **The headline was stale; the hole it hid was real and is now fixed.** Both live
+      paths have keyed sessions per channel/chat/sender for some time —
+      `ChannelManager::process_message` builds `{provider}:{channel.id}:{sender.id}` for everything the
+      daemon routes, and `nanna-server`'s handlers build `telegram:{chat_id}:{user_id}`,
+      `discord:{channel_id}:{user_id}`, `slack:{channel_id}:{user_id}`. So "all messages currently
+      share one context" has not been true generally.
+      **It was true for the generic webhook.** `extract_generic_message` never received the registered
+      hook id, so pattern 2 (`{text,user}`) and pattern 3 (`{content}`) hardcoded
+      `chat_id: "generic"` and pattern 1 fell back to `"unknown"` — and since the session key is
+      `{provider}:{chat_id}:{sender_id}`, a constant `chat_id` is a constant session. **Every
+      registered generic hook shared one conversation**, including hooks admitted by *different*
+      secrets; and pattern 3, which also hardcoded `sender_id: "unknown"`, put every anonymous caller
+      into that same context.
+      Fixed by threading the hook id through and using it as the identity fallback. The choice is
+      principled rather than convenient: each generic hook id carries **its own secret** in
+      `generic_secrets`, so the id is exactly the trust boundary the auth model already establishes —
+      two callers share an id precisely when they share a credential, which is when they belong in one
+      conversation. An explicitly supplied `channel`/`chat_id` still wins, so nothing that was already
+      isolating itself changes. For pattern 3, which names nobody, the credential is the only identity
+      there is, and using it for both fields is the honest reading; the old `"unknown"`/`"generic"`
+      pair claimed an identity the payload never supplied and merged everyone into it.
+      4 tests: the three pattern tests now assert the resulting `chat_id` (they previously asserted
+      only content/sender, which is why they never pinned this), plus a dedicated isolation test
+      asserting the four properties that matter — two hooks never collide, two hooks with the *same*
+      sender never collide, one hook + one sender is **stable** (isolation must not become a new
+      session per request), and two senders on one hook stay separate. **Verified non-vacuous**:
+      restoring the constants fails 3 of them. 298 `nanna-daemon` tests green, clippy 0 errors.
+      - [x] *(2026-08-23)* **`nanna-server`'s generic hook had the opposite failure, now fixed.** Its
+            fallback was `format!("{channel}:{user_id}:{}", Uuid::new_v4())` — a **fresh UUID per
+            request** — so a caller that does not thread `session_id` back itself started a brand-new
+            conversation on every message, and the agent remembered nothing across turns on this route
+            alone. Its four siblings all derive a stable key from the identity fields they are handed
+            (`telegram:{chat_id}:{user_id}`, `discord:{channel_id}:{user_id}`, …), and `channel` and
+            `user_id` are both **required** on this payload — so there was nothing to fall back to and
+            no randomness to add. Now `generic:{channel}:{user_id}`, extracted as a pure
+            `session_key(session_id, channel, user_id)` so it is testable without an LLM.
+            An explicit `session_id` still wins (a caller managing its own sessions is unaffected), and
+            a **blank** one does not count as supplied — `Some("")` is what a half-filled template
+            leaves behind, and honouring it would put every such caller into one conversation named
+            `""`. The key stays namespaced with `generic:` so it cannot alias a real Telegram or
+            Discord session in the shared session namespace.
+            5 tests: stability across identical requests, distinctness across users and across
+            channels, explicit-id precedence (incl. trimming), blank-id fallback, and the
+            cross-provider collision guard. 29 `nanna-server` tests green, clippy 0 errors.
 - [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
       (strip markdown for Signal, tables→text for Telegram, embeds for Discord, Block Kit for Slack).
       Bitflags exist but every channel currently receives identical raw text.
@@ -2094,7 +2401,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the original item referenced something never built. If worth doing: key on a content hash of the
       cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
       re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
-- [ ] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
+- [x] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
       guard it before it costs us a safety-critical memory.** The 2026 agent-memory survey warns that repeated
       compression cycles make **low-frequency details vanish** — precisely the ones most likely to matter; its
       worked example is that after ~3 summary passes over a week, a rarely-mentioned instruction like
@@ -2129,6 +2436,140 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       regress, while the summarized arm is a **baseline to beat** — it asserts the clause *is* lost, so
       whichever mitigation lands next (generation ceiling / verbatim-pinning STATED memories) will make
       that test fail loudly, and its message says to flip it. Remaining: implement (b) or (c) above.
+      *(2026-08-21)* **Mitigation (c) shipped — user-STATED memories are pinned verbatim, and the
+      dedup fold no longer launders provenance.** New pure `consolidation::is_verbatim_pinned(metadata)`:
+      a memory whose `fact_type` says `stated` (the provenance the extraction path already writes from
+      `MemoryProvenance::as_str`) is never handed to a summarizer. Provenance is the gate, deliberately
+      **not** an importance threshold — categorical, no magic number, and conservative in the same
+      direction `MemoryProvenance` itself is (missing/empty/unknown → not pinned, so an unlabeled memory
+      cannot pin itself out of consolidation).
+      **The split runs BEFORE the dedup fold, and that ordering is the actual bug fix.** A fold merges a
+      source INTO a survivor and keeps the **survivor's** metadata, so a stated row folding into an
+      observed one came back marked `observed` — a user assertion laundered into agent-observed content,
+      which the next cycle was then free to paraphrase away. Two folds over disjoint partitions cannot do
+      that, and cost strictly less than one fold over their union (|A|² + |B|² ≤ (|A|+|B|)²). Pinned rows
+      still deduplicate *among themselves*, so a stated fact repeated across three sessions still
+      collapses to one row and pinning cannot make the store grow without bound.
+      Band-loop budget arithmetic extracted into `fold_and_charge` so the two partitions' folds cannot
+      drift apart, with the losslessness postcondition asserted per partition.
+      **Measured, not asserted:** 2 new fixtures in `retention`, both proven non-vacuous by re-running
+      them with the split removed — the mitigation arm loses the clause, and the laundering arm names the
+      row that stole it (`drift-1`, `fact_type: None`). The mitigation arm is the *same* corpus, spread
+      and summarizer as the losing baseline arm; only the provenance differs. The baseline arm
+      deliberately **stays at NO**: drift is real and unfixed for agent-*observed* content, and deleting
+      the measurement that says so would be dishonest. 3 more unit tests cover the predicate's positive
+      space, its negative space, and partition losslessness. 145 nanna-memory tests green, **0 net new
+      clippy warnings** (166 = 166 vs the pre-change baseline for the crate), two `bench/BASELINE.md`
+      rows added.
+      *(2026-08-21, same run)* **Mitigation (b) shipped as well — and the research fold below is what
+      made it derivable.** The item offered "a generation ceiling" and the obvious objection was that no
+      ceiling is derivable: our own fixture loses a rare clause in ONE pass, so any N would be a chosen
+      number. The 2026 consolidation literature answers it by forbidding the **class** instead of
+      counting passes — compress a session, never re-compress a summary — which needs no number at all
+      and maps exactly onto `FsrsState::generation` (already `max(sources) + 1` at every consolidation).
+      An entry with `generation > 0` is partitioned out of the summarizing clusterer in every band,
+      including `Expand` (re-expanding a gist would invent the detail it lost).
+      **Exempt from the clusterer, not from the cycle:** gists still go through the lossless dedup fold,
+      so two gists that restate each other still collapse and the store keeps compressing. `generation`
+      is now monotone across a fold as well — absorbing a gist makes the survivor a gist-carrier — or a
+      generation-1 row folding into a generation-0 one would launder itself back into the summarizer's
+      input; that single line is proven load-bearing by removing it.
+      3 new fixtures (the never-re-summarize arm, the still-folds guard, the fold-monotonicity test),
+      the first and third non-vacuous by construction-removal; one `bench/BASELINE.md` row. 150
+      nanna-memory tests green, 0 net new clippy warnings.
+      **This item's remaining work is now (a)'s follow-through, not (b) or (c)**: the drift *instrument*
+      only measures a rare clause. A drift budget over many cycles — how much of a corpus survives N
+      dreams — would let the footprint cost of these two exemptions be stated as a number rather than
+      as the reasoned trade it is today.
+- [x] *(research 2026-08-21 — confirms the drift model and names the principled form of mitigation (b);
+      IMPLEMENTED the same run, see the item above)*
+      **"Compress a session, never re-compress a compressed summary" is the depth limit worth having.**
+      The 2026 consolidation literature converges on three mitigations for summarization drift, and the
+      third is the one that dissolves the "what number should the generation ceiling be?" problem: don't
+      pick a ceiling, forbid the *class* — a summary may compress raw episodes, but a summary of a
+      summary is never formed. That is a categorical rule with no magic number, the same shape as the
+      provenance pin landed 2026-08-21, and it maps onto the `FsrsState::generation` field the store
+      already carries (`generation == 0` may consolidate; `generation > 0` may not be a cluster member,
+      only a cluster *seed* whose sources are raw). The other two: **extraction over summarization**
+      (structured facts distort less than prose — our deterministic dedup fold is already this), and
+      **keep the original episodic record in non-lossy cold storage** so a drifted gist is always
+      recoverable — those two are what remain here:
+      - [ ] **Extraction over summarization** for the clusterer's output, not just the fold's.
+      - [ ] **Non-lossy cold storage of the pre-consolidation episodes**, so a gist that drifted anyway
+            is recoverable rather than merely un-re-compressed.
+      Sources: [Memory consolidation in long-running agents](https://zylos.ai/research/2026-04-20-memory-consolidation-ai-agents/),
+      [SSGM (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [x] *(2026-08-21)* **The `Expand` band's instruction and its acceptance test contradicted each
+      other, so the only enrichments that ever landed were the ones that disobeyed the prompt.**
+      `expand_memory` borrowed `CompressionLevel::Expand`'s `summarization_prompt`, which is written
+      for a **cluster** and says the result "should be no longer than the material it replaces" —
+      while the code committed the result only when `expanded.len() > original.len()`. A model that
+      followed the instruction was always rejected; a model that ignored it was always accepted.
+      Fixed by giving the single-memory path its own prompt whose shape the caller can actually
+      verify, and the only shape that cannot lose anything: **reproduce the memory verbatim, then
+      add beneath it**. The guard is now `contains(original) && longer`, the same losslessness test
+      the dedup fold already uses to decide a merge is safe to commit — so a model that rewrites
+      instead of appending is declined and the memory is left untouched, rather than a high-weight
+      memory being replaced by a paraphrase of itself on length evidence alone.
+      Enrichment also raises `generation`, because the appended half is model-authored: the entry
+      now carries generated text and must not be fed to the summarizer later, by the same rule that
+      stops a summary being re-summarized.
+      **The trade, stated plainly:** enrichment will fire less often than before, because it now has
+      to be additive. That is the intended direction — the previous behaviour's acceptance criterion
+      was "the model disobeyed", which is not evidence of anything — but if the firing rate turns out
+      to matter, the predicate is one line and the prompt is one constant.
+      3 new tests: the rewriting case is declined and the memory is unchanged, the additive case
+      commits and marks the entry model-authored, and the prompt asks for exactly what the guard
+      accepts (asserted against the borrowed cluster wording, so the two cannot silently diverge
+      again).
+- [x] *(2026-08-21)* **The `remember` tool could not produce a pinnable memory — the drift pin's
+      biggest blind spot, found by following the feature to its other caller.** The extraction path
+      writes `fact_type` from `MemoryProvenance`, but the `memory.store` service behind the
+      `remember` TOOL wrote only the caller's `tags`, so a memory the user explicitly asked to keep
+      carried no provenance at all and could never be pinned. `memory.store` and its `memory.embed`
+      alias now stamp `fact_type` through `tags_with_provenance`, and `remember` gained a
+      `provenance` parameter whose description says what claiming it costs.
+      Deliberately **classified, not copied**: the value goes through
+      `MemoryProvenance::from_label` — the same rule, one implementation — so only an explicit,
+      case-insensitive `"stated"` pins, and an absent, empty or misspelt declaration degrades to
+      `observed`. A `fact_type` already present in `tags` is honoured as the declaration but
+      re-classified rather than trusted, so `tags: {fact_type: "STATED-ish"}` cannot smuggle a pin;
+      an explicit `provenance` field wins over an inherited tag. 4 unit tests, half of them negative
+      space.
+- [x] *(2026-08-21)* **A consolidated memory could impersonate one of its sources, and corrupt a handle
+      reassembly doing it.** Found by reading while landing the drift mitigations, not by a report.
+      `create_consolidated_entry` merged the cluster's metadata **first-writer-wins**, so a summary
+      inherited whichever source sorted first — including `source_id` and `chunk` (`"3/17"`). Those two
+      are exactly what `assemble_handle_content` (`server.rs`) uses to rebuild the whole text behind a
+      memory handle: it gathers every row sharing a `source_id` and orders them by `chunk`. A
+      consolidated entry carrying both was therefore **spliced into the middle of a tool result the
+      model was promised was stored verbatim** — and the rows it replaced are gone, so nothing else
+      filled that slot. It also let a gist of five different tools' output claim `tool=exec`,
+      `outcome=ok`, `target=./build.sh`.
+      Two rules replace the merge, neither with a threshold in it: a **source locator** (`source_id`,
+      `chunk`) is never inherited however unanimous the cluster — a summary has no position in anyone's
+      byte stream — and every other key is inherited only when **every source that carries it agrees**,
+      because unanimity is exactly the condition under which the claim survives the merge.
+      Paired with the honesty half in `assemble_handle_content`: a reassembly that comes back short of
+      the `i/N` the stub promised now says how many rows are missing, that a dream cycle most likely
+      folded them, and that the artifact on disk is unaffected. Silence there was the same failure the
+      function was written to end. 3 + 3 unit tests, including the negative space (a complete
+      reassembly announces nothing; unmarked rows never claim a shortfall).
+- [ ] *(research 2026-08-21 — sharpens the provenance work landed this run)* **Provenance-role collapse:
+      a two-valued `fact_type` is the cheap version of what the literature calls typed memory.**
+      *Mitigating Provenance-Role Collapse in Long-Term Agent Memory* (arXiv:2605.25869) reports that
+      long-horizon stores conflate **who originally asserted something** with **what role that entity
+      holds now**, and that the fix is to type the three dimensions separately at encode *and* retrieve
+      time: provenance, current role, and the temporal marker of the transition. Nanna now has the first
+      dimension only (`fact_type` = stated/observed, and it is finally load-bearing — it decides what a
+      dream cycle may paraphrase). ~~(a) make `fact_type` survive every merge path~~ **done in the same
+      run**: `create_consolidated_entry` merged metadata first-writer-wins, so a merged entry's
+      provenance was whichever source happened to be ordered first — a rule that depends on iteration
+      order is not a rule; it is now monotone (any stated source ⇒ stated result). Remaining rungs:
+      (b) stamp the transition time so "the user said X, then later said not-X" is orderable
+      rather than a pair of equally-true rows; (c) expose provenance as a **recall filter** so a caller
+      can ask for user-stated facts only. Source:
+      [arXiv:2605.25869](https://arxiv.org/pdf/2605.25869).
 - [ ] *(research 2026-07-23)* **Dual-buffer / probation consolidation ("hot" buffer before long-term).** The
       same survey's recommended write path: a new memory lands in a **hot buffer** and is promoted to long-term
       storage only after a probation period and quality checks — **re-verification, deduplication, importance
@@ -2166,6 +2607,35 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
             This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
             (tool descriptions currently need literal keywords because there is no lexical search at all).
+      - [ ] *(research 2026-08-21 — settles HOW to fuse, which was the unstated hard part)* **Use
+            Reciprocal Rank Fusion, not a weighted sum of scores.** RRF has the two properties this
+            problem needs and a weighted sum does not: it is **score-independent** (only ranks enter the
+            fusion, never raw scores) and **additive across stores** (an item's fused score is the sum of
+            its per-list contributions, `Σ 1/(k + rank_i)`). That matters here more than in a typical RAG
+            stack, because Nanna's two legs produce genuinely incomparable numbers — an in-RAM cosine in
+            [-1, 1] and a BM25 term weight computed over an FTS candidate set — and normalising them
+            against each other would be inventing a scale. RRF needs neither normalisation nor a tuned
+            α, so the fusion introduces no magic number; only `k` (conventionally 60), and `k`'s effect
+            is a documented rank-discount curve rather than a per-corpus fit.
+            Reported effect where it has been measured: a tuned hybrid reaches 0.7497 NDCG on WANDS
+            against 0.6983 for BM25 alone and 0.6953 for pure vector — i.e. **the lift comes from the
+            fusion, not from either leg being better**, which is the argument for adding the leg at all.
+            Sources:
+            [Hybrid BM25 retrieval](https://www.emergentmind.com/topics/hybrid-bm25-retrieval),
+            [Hybrid search & reranking in production RAG 2026](https://appscale.blog/en/blog/hybrid-search-and-reranking-production-rag-bm25-dense-cross-encoder-2026).
+      - [ ] *(research 2026-08-21)* **Condition the channel weights on the QUERY TYPE, and get the
+            temporal win the +29.6 figure is actually about.** The 2026 systems that report the large
+            temporal gain classify each query as `single_hop | multi_hop | temporal | aggregation` and
+            apply a per-type multiplier before fusing — a temporal query boosts the time channel and
+            damps the others; a multi-hop query boosts the entity/graph channel. Nanna can afford the
+            cheap half of this today: the classifier is a handful of lexical cues ("when", "last week",
+            "before X", a date), it needs no model, and the recall gate already inspects the message
+            (>5 words OR `?` OR >80 chars). The temporal channel itself is `nanna-timeline`, so this is
+            the item that makes P13's timeline work *pay* at recall time rather than only at
+            compression time — worth sequencing right after it. Do NOT ship the classifier before there
+            is a temporal channel for it to boost: a multiplier over one channel is a no-op with a
+            maintenance cost. Source:
+            [AgentIR — workload-adaptive cascade retrieval (arXiv:2605.25092)](https://arxiv.org/pdf/2605.25092).
 - [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
       The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
       different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems
@@ -3262,20 +3732,44 @@ from evidence, budgets stay budgets):
       notice, drained AFTER the ladder so compression cannot eat its own announcement.)*
 
 **Tier 3 — write-path honesty (`nanna-tools/default-skills/*`)**
-- [ ] A shrinking whole-file write over a file the model has NOT read since its last
+*(2026-08-21, audited against the tree at `f3fe0352`: four of these five landed in PR #224/#237 and
+were never ticked. Anchors named per item so the next audit is a grep, not a re-read.)*
+- [x] A shrinking whole-file write over a file the model has NOT read since its last
       mutation returns the file's current content in the tool result (not a refusal).
-- [ ] Rewrite-loss note goes **bidirectional** (expansion rewrites that change existing
+      *(`write_file/tool.ts` — the stale-shrink echo: `glog("write_file guard: stale-shrink echo …
+      read-mark verdict: …")` followed by `"Here is the CURRENT content of …"`.)*
+- [x] Rewrite-loss note goes **bidirectional** (expansion rewrites that change existing
       symbol bodies) and is **logged at INFO** so guards are auditable. (Both destructive
       ornith writes GREW the file; the note never fired, and never logs.)
-- [ ] **Post-mutation structural check** appended as a sentence, never a gate: `sh -n`,
+      *(`write_file/tool.ts` — `lossNote` carries both `removed=[…]` and `changed=[…]`, and
+      `glog("write_file rewrite-note for …")` logs both plus a `grew>2x` marker.)*
+- [x] **Post-mutation structural check** appended as a sentence, never a gate: `sh -n`,
       `node --check`, `json.loads` on the result of any mutation, incl. append-redirects.
-      (Evidence: gemma corrupted its file with a partial-overlap edit — dangling `else` —
-      and edited the wreck for 30 minutes.)
-- [ ] Ratchet anchor = **last evidenced-good version**, not largest-ever byte count;
+      *(`write_file/tool.ts::structuralCheckKind` dispatching `sh -n` / `bash -n` /
+      `node --check` / `JSON.parse`; `exec/tool.ts` runs the same check on redirect targets.)*
+- [x] Ratchet anchor = **last evidenced-good version**, not largest-ever byte count;
       canonicalize the ledger key (one file, one entry — relative/absolute split observed);
       keep displaced content recoverable; give `file_buffer` commit the same guards.
-- [ ] When a check that previously passed now fails, the next step's context names the
+      *(`write_file/tool.ts` — `floorAnchor = hwGoodBase > 0 ? "good" : "hi"`, the canonical +
+      legacy spelling merge at :212, `.__prev__`/`.__best__` parking, and `file_buffer/tool.ts`
+      carrying the same guards.)*
+- [x] When a check that previously passed now fails, the next step's context names the
       mutations that landed in between (regression attribution, the #218 sweep's voice).
+      *(2026-08-21)* The streak counter could not do this: it counts repeats of one failing
+      signature and never records the pass→fail EDGE, and the interesting span is exactly the one
+      it cannot see — a mutation whose checker did not apply, or whose check was not run, leaves a
+      gap. So **every** write-family mutation of a path is now recorded (`RepeatLedger::
+      record_mutation`), verdict or not, and the ledger returns a `StructuralVerdictOutcome`
+      carrying two independent findings: the repeat streak (*your fix is not working*) and the
+      regression span (*this used to work; here is what changed*). The regression sentence comes
+      first, because what changed is the question that precedes the other one.
+      Bounds and negative space, both tested: a file that has **never** parsed is never called a
+      regression (accusing the model of breaking a file it is still writing would be false); the
+      sentence is said **once per edge** and re-arms only after a pass; and the name list is
+      bounded by a byte budget while the COUNT never is, so a 200-mutation span reports 200 and
+      says how many it did not list. 4 new tests; the two existing streak tests moved to the new
+      return type. Net **zero** new clippy warnings, and the call-site extraction into
+      `structural_notices_for_call` shrank the enclosing function 644 → 631 lines.
 
 **Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
 - [x] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
@@ -3622,6 +4116,33 @@ checking the owner rules and whether the proposal is already implemented). 41 we
 and are listed at the end so they are not re-derived. What follows is the 52 that survived,
 merged into 21 items and ranked by expected effect on an ordinary user session.
 
+**Status (2026-08-21, added by the nightly routine): most of P24 has LANDED — the write-ups
+below are the original defect reports, not a list of open work.** PR #255
+(`p24/session-scoped-and-review-fixes`, merged as `9fd4ba0d`) carries
+`62cc4465` (P24.9/19/21), `4a3f3103` (P24.11), `7114a27a` (P24.5), `8f7a8662` (P24.8/10/4),
+`91b58405` ("the remaining P24 items") and `de58d49d` (review findings). Verified present in the
+tree at `f3fe0352` by anchor: `floor_char_boundary` in `context.rs`/`compressor.rs`/`loop_runner.rs`
+(P24.1); `bind_session_workdir` + the `RUN_SESSION_ID` control-plane assertion in `registry.rs`
+with `chat.rs` binding per turn (P24.2); `.__best__` parking in all three write tools and
+`failEscalating` in `edit_file`/`write_file` (P24.4/P24.8); `record_structural_verdict` +
+`"ok — DOES NOT PARSE"` in `loop_runner.rs` (P24.5); `self.summaries` gone, so the
+double-charged preamble vector no longer exists and `estimate_request_tokens` is
+`preamble_tokens() + estimate_tokens()` (P24.6, first bullet); whitespace-normalized repeat keys
+(P24.13); `WRITE REFUSED — the file was NOT modified` (P24.19).
+
+**Read this before picking P24 work:** treat each item as landed unless you have checked its
+"Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
+
+- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
+      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
+      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
+      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
+      from the retrieval top-k (see the item's own note).
+- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+      listed above and deliberately did not claim the rest; a per-item pass would let this whole
+      section collapse to a few lines of history.
+
 
 #### What is already working — do not re-litigate
 
@@ -3672,6 +4193,22 @@ Merges: the inline `on_memory` await, the unbounded chunk count, the degenerate-
 4. **Bound the log write** at `crates/nanna-scripting/src/boa_impl.rs:365`, which prints full stdout and stderr with no cap and produced ~300 MB of one repeated line in a single day's log.
 **Also resolve while here:** the two memory sinks disagree. `agent_service.rs:1093` drops any tool result whose content merely `contains("Error")`; `tasks.rs:1991` filters only empty/control-char/heartbeat noise and has no such test. Either the first is silently discarding legitimate failed-tool evidence in ordinary chat, or the second is missing a filter. They cannot both be right.
 **Do not** derive the chunk cap from the retrieval top-k — chunks past top-k are reachable by handle dereference and by direct similarity hit, and dropping the middle would make the stub's promise a lie.
+      *(2026-08-21)* **"The two memory sinks disagree" is resolved — chat now uses the harness's
+      filter.** The tree answered its own question: `tasks.rs::is_low_signal_memory` already carried a
+      long doc comment explaining why the substring failure tests were removed (they discarded **704 of
+      704 failed tool calls** in one 2-hour run, and also ate successful calls whose output merely
+      quoted an error — `cat ./minidb` stored nothing, twice). `agent_service.rs` — the path an ordinary
+      user chats through — still ran the older filter that comment describes as the bug, plus a
+      `content.len() < 20` floor, a dead `[Tool:` prefix test, and a "dominated by non-ASCII" test that
+      classified `tree` output and every non-Latin script as binary. So the documented loss was still
+      live in interactive chat. Both sinks now call one `memory_adapter::is_low_signal_memory` and one
+      `memory_adapter::episodic_importance` (the importance table was the *second* privately-duplicated
+      policy — how the two drifted in the first place). 6 unit tests, previously zero, pin the shapes
+      that must stay writable (failed tool result, error-quoting success, box-drawing, non-Latin, a
+      19-byte "ok") and the shapes that must not (empty, whitespace, heartbeat, C0 control bytes, U+FFFD).
+      Parts 1, 2 and 4 of this item had already landed (`collapse_repeated_lines`, the mid-ingest
+      cancellation check, and `log_excerpt`/`EXEC_LOG_EXCERPT_BYTES`); **part 3 — the chunk-count bound
+      and taking the embedding off the critical path — is what remains open here.**
 **Where.** `crates/nanna-agent/src/loop_runner.rs:6169-6255`; `crates/nanna-memory/src/service.rs:1019-1165`; `crates/nanna-tools/default-skills/exec/tool.ts:373-395`; `crates/nanna-scripting/src/boa_impl.rs:365`.
 
 ---
@@ -4139,6 +4676,150 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      is already at latest-safe, no GUI changes this run. *Reconfirmed the fmt gotcha: `cargo fmt -p <crate>`
      reformats the whole crate, not the touched file — `origin/master` isn't fmt-clean, so it churned 4
      unrelated files; reverted, kept only the surgical `.await` diff.*
+   - *(2026-08-21 sweep)* `cargo update` → **~150 compatible bumps** (the biggest sweep in a while:
+     `tokio-macros 2.7.2`, `ureq 3.4.0`, `uuid 1.24.1`, `wasm-bindgen 0.2.127`, `zbus 5.19.0`,
+     `zvariant 5.15.0`, `zerocopy 0.8.56`, `zlib-rs 0.6.7`, `xml 1.4.0`, …). `cargo upgrade
+     --incompatible` → four candidates, **one applied green, two reverted, one rejected**:
+     - **`wide 1.5 → 1.6`** (workspace, consumed by `nanna-simd`) — applied, compiled unchanged.
+     - **`playwright-rs 0.15 → 0.16`** (`nanna-browser`) — applied, compiled unchanged.
+     - **`rten 0.24 → 0.25`** (`nanna-tools`) — **reverted.** `ocrs 0.12.2` still requires `rten 0.24`,
+       so bumping our direct req puts **two `rten` versions in one graph** and `ocr.rs:309` fails with
+       `expected rten::model::Model, found Model`. Not our migration to do:
+       - [ ] Re-try `rten 0.25` once **`ocrs`** ships a release built against it (watch
+             `ocrs`/`rten-imageproc`); the bump is a one-line req change plus a rebuild once the
+             transitive pin moves.
+     - **`criterion 0.8 → "0.7"`** — **rejected as a downgrade.** `cargo-upgrade` reports `latest 0.7.0`
+       for criterion while the lock happily resolves `0.8.2`; taking its suggestion would walk the
+       benches *backwards*. Never apply a `cargo-upgrade` row whose "latest" is below the current req.
+     **A `cargo update` landmine worth remembering:** the sweep moved `malachite-bigint` to **0.10.0**
+     for `pymath` while `rustpython-{codegen,compiler,derive}` stay on **0.9.2** — two versions of the
+     same crate in one graph, and `rustpython-stdlib` then fails to compile with 17 `E0277`/`E0308`
+     errors about `malachite_bigint::BigUint`/`BigInt` ("there are multiple different versions of crate
+     `malachite_bigint`"). Pinned back with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`.
+     - [ ] Drop that pin when `rustpython 0.6` (or any release that moves to malachite 0.10) lands.
+     **Verification:** workspace (excl. `nanna-gui`) builds green, **1555 tests pass / 0 failures**,
+     `cargo clippy -p nanna-memory --all-targets` **0 errors**, and — closing the gate hole logged
+     below — a **`cargo build --release -p nanna-daemon` was run and is green** on the pinned
+     `nightly-2026-08-03`, so this sweep is verified against the profile the shippable artifact
+     actually uses.
+   - *(2026-08-22 sweep)* `cargo update` → ~150 compatible bumps (`tokio-macros 2.7.2`, `ureq 3.4.0`,
+     `uuid 1.24.1`, `wasm-bindgen 0.2.127`, `wgpu 30.0.1`, `zbus 5.19.0`, `zvariant 5.15.0`,
+     `zerocopy 0.8.56`, `zlib-rs 0.6.7`, `xml 1.4.0`, `zerovec 0.11.8`, …).
+     `cargo upgrade --incompatible` offered four majors: **`wide 1.5 → 1.6`** (workspace/`nanna-simd`)
+     and **`playwright-rs 0.15 → 0.16`** (`nanna-browser`, verified under `--features playwright`)
+     both **applied**, compiled unchanged; **`rten 0.24 → 0.25`** **reverted** (see the blocked item
+     below); **`criterion 0.8 → "0.7"`** **rejected** — `cargo-upgrade` reports `latest 0.7.0` while the
+     lock resolves `criterion 0.8.2`, so taking the suggestion walks the bench harness *backwards*.
+     Landmine (same one the 2026-08-21 run hit — it is reproducible, not a one-off): the sweep moves
+     **`malachite-bigint` to 0.10.0** for `pymath` while `rustpython-{codegen,compiler,derive} 0.5.0`
+     stay on **0.9.2**, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308` errors about
+     `malachite_bigint::{BigUint,BigInt}`. Pinned back with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; **re-apply this pin after every
+     `cargo update` until `rustpython 0.5` unifies the req.**
+     Verified: workspace (excl. `nanna-gui`) builds `--all-targets` green, **1555 tests pass / 0 fail /
+     12 ignored**, clippy **0 errors** (2742 warnings = this run's baseline), and
+     `cargo build --release -p nanna-daemon` green.
+     Bench (`nanna-bench vector_search`, release, 4070 Ti SUPER / Zen 4, 768-dim): **42.0 µs @ 1k ·
+     1.31 ms @ 10k · 9.05 ms @ 50k** — every budget held (≤0.20 / ≤5.0 / ≤25 ms); no regression from
+     `wide 1.6`. Baseline p50s left unchanged (the 10k/50k improvement is not A/B-attributed).
+     Frontend: `happy-dom 20.11.6`, `vitest 4.1.11`, `vue-tsc 3.3.11` applied green (**159/159 vitest**);
+     `pnpm outdated` otherwise shows **only the documented deferred majors** (`@tiptap/* 2.27 → 3.30`,
+     `marked 17 → 18`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the
+     `lucide-vue-next 1.0.0` tombstone that must never be taken.
+   - *(2026-08-23 sweep)* `cargo update` → 7 compatible bumps (`blocking 1.7.0`, `crc32fast 1.5.1`,
+     `log 0.4.34`, `uuid 1.25.0`). **The `malachite-bigint` landmine recurred exactly as documented** —
+     the sweep re-added 0.10.0 alongside `rustpython-{codegen,compiler,derive} 0.5.0`'s 0.9.2; pinned
+     back with `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`. Re-checked upstream: nothing
+     has moved, so **keep re-applying this pin after every `cargo update`**.
+     `cargo upgrade --incompatible` offered three, of which one was taken:
+     **`uuid 1.24 → 1.25`** (workspace + `nanna-server`) applied — hand-edited, not via `cargo-upgrade`,
+     to avoid its documented CRLF→LF whole-file churn. **`criterion 0.8 → "0.7"` rejected again** (the
+     lock resolves 0.8.2; taking the suggestion walks the bench harness backwards). **`rten 0.24 → 0.25`
+     still blocked** — re-verified against crates.io this run: `ocrs` is *still* 0.12.2 and still
+     requires `rten ^0.24`, so the two `Model` types would stop being the same type.
+     **The intentional `turso`/`aegis` pins were re-examined and both moved** — a pre-1.0 pin is a
+     "prove it before you take it" marker, not a permanent freeze, and the previous run had this bump
+     in flight but unverified when it ended. **`turso =0.6.1 → =0.7.2`** and
+     **`aegis =0.9.12 → =0.9.15`**: compiled with **zero source changes**, and **120 `nanna-storage`
+     tests pass** including the `rusqlite`/`libsql`/`sqlx` dep-guard and the corruption classifier
+     (`corruption_classifier_matches_turso_page_errors` still matches 0.7.2's page-error strings, so
+     the recovery path did not silently stop recognising them). Worth taking on its merits, not just
+     freshness: [Turso 0.7.0](https://turso.tech/blog/turso-0.7.0) makes the embeddable engine
+     **non-blocking** — the core no longer blocks the calling thread on I/O, no longer aborts the
+     process on OOM, and yields the CPU during long operations so one busy statement cannot starve
+     other connections sharing the runtime. That is the exact failure class this repo has been bitten
+     by (one shared connection under one mutex; an unfinished cursor swallowing later writes; a
+     `turso_core` panic taking the daemon down mid-load).
+     - [ ] **Exploit turso 0.7's non-blocking engine.** The single-shared-connection-under-a-mutex
+           design was shaped by an engine that blocked its caller. Re-measure whether the mutex can
+           narrow (or whether concurrent readers can be admitted) now that long operations yield —
+           and re-check whether the "drop cursors before writing" rule is still load-bearing. Do not
+           change the locking on inference alone; measure first.
+     Bench (`nanna-bench vector_search`, release, 4070 Ti SUPER / Zen 4, 768-dim, fixed seed):
+     **43.2 µs @ 1k · 1.53 ms @ 10k · 9.16 ms @ 50k** — every budget held with margin
+     (≤0.20 / ≤5.0 / ≤25 ms), and 10k/50k came in **at or better than the recorded 2026-08-05
+     baseline p50s** (1.63 / 10.1 ms). Criterion's "+4%/+11%/+6%" is against the previous run *on this
+     machine*, not against the baseline table, and it is within the noise of a box that had just
+     finished a Tauri release build; nothing crossed a ceiling, so turso 0.7.2 shows no regression on
+     the search path. Baseline p50s left unchanged — these are not A/B-attributed improvements.
+     Verified: workspace (excl. `nanna-gui`) builds `--all-targets` green, **1576 tests pass / 0 fail /
+     12 ignored** (1555 was the previous baseline; +6 from this run's new `nanna-server` suite, the
+     rest from turso 0.7.2's own test targets), clippy **0 errors**, and `cargo build --release -p
+     nanna-daemon` green — the release gate the roadmap asked for below, which debug + tests cannot see.
+     Toolchain: `rust-toolchain.toml` stays on `nightly-2026-08-03`; the release build above is the
+     evidence the pin still holds.
+     Frontend: `package.json` needed **no change** — `pnpm outdated` shows *only* the documented
+     deferred majors (`@tiptap/* 2.27 → 3.30`, `marked 17 → 18`, `vue-router 4 → 5`,
+     `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the `lucide-vue-next 1.0.0` tombstone that must
+     never be taken. `pnpm update` moved the lockfile within ranges only (`vite 8.2.1 → 8.2.2`,
+     `rolldown 1.2.4 → 1.2.5`, `rollup 4.62.4 → 4.62.5`, `@oxc-project/types 0.144 → 0.146`), verified
+     by **159/159 vitest** and a green `pnpm build` (nitro + client, 4 routes prerendered).
+     - [ ] **`rten 0.24 → 0.25` is blocked on `ocrs`.** `ocrs 0.12.2` (still the latest) requires
+           `rten ^0.24`, and `ocr.rs:299-312` hands an `rten::Model` straight into
+           `ocrs::OcrEngineParams`, so bumping our direct req puts two `rten` versions in one graph and
+           the two `Model` types stop being the same type. Re-check when `ocrs` ships a release that
+           tracks `rten 0.25`.
+     - [ ] **The `turso_core` release build is non-deterministic under the parallel rustc frontend.**
+           On the pinned `nightly-2026-08-03`, `cargo build --release -p nanna-daemon` failed once with
+           `error: queries overflow the depth limit!` in `turso_core 0.6.1` and then **succeeded on an
+           immediately-repeated identical invocation**. The user-global `~/.cargo/config.toml` sets
+           `rustflags = ["-Z", "threads=15"]`, so the depth/recursion accounting is thread-scheduling
+           dependent. Treat a single depth-limit failure as *flaky, retry once* rather than as a
+           toolchain incompatibility — but pin it down (repro under `-Z threads=1`, then report
+           upstream) before it eats a release cut.
+   - *(research 2026-08-23)* **Turso 0.7's non-blocking engine changes what this repo's storage
+     design was working around.** [Turso 0.7.0](https://turso.tech/blog/turso-0.7.0): the core no
+     longer blocks the calling thread on I/O, no longer aborts the process when it runs out of
+     memory, and yields the CPU during long operations so a busy statement cannot starve other
+     connections sharing a runtime. Also in 0.7: faster MVCC concurrent writes, leaner recovery,
+     lower per-row-version memory, index-resolved parameters (~2x faster prepare on a
+     thousand-parameter insert), runtime-registered custom storage backends via a global registry
+     resolved through `vfs=`, PostgreSQL-style sequences and ICU collations. Three of those bear
+     directly on decisions already made here — the single-shared-connection-under-one-mutex design,
+     the "drop cursors before writing" rule, and the fact that a `turso_core` panic used to take the
+     daemon down mid-load. Folded as a measurement to-do above, not a change: do not re-shape the
+     locking on inference.
+   - *(research 2026-08-23)* **`rustpython 0.5` still has not unified its `malachite-bigint` req**, so
+     the `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2` pin-back stays mandatory after
+     every sweep. Nothing upstream has moved; `rustpython-{codegen,compiler,derive} 0.5.0` remain on
+     0.9.2 while `pymath` pulls 0.10.0, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308`s
+     about `malachite_bigint::{BigUint,BigInt}`. Third consecutive run hitting it — it is a standing
+     step, not an incident.
+   - *(research 2026-08-23)* **`ocrs` is still 0.12.2, so `rten 0.24 → 0.25` remains blocked.**
+     Re-verified against crates.io this run rather than assumed. `ocrs` still requires `rten ^0.24`
+     and `ocr.rs` hands an `rten::Model` straight into `ocrs::OcrEngineParams`, so bumping the direct
+     req puts two `rten` versions in one graph and the two `Model` types stop being the same type.
+   - [ ] *(research 2026-08-23)* **Re-try the toolchain pin — not done this run.** `rust-toolchain.toml`
+     is on `nightly-2026-08-03`, and today's `cargo build --release -p nanna-daemon` proves it still
+     holds (exit 0, 15m29s, against a graph freshly invalidated by turso 0.7.2). A *newer* nightly was
+     **not** tried, deliberately: `rustup update` run concurrently with a `cargo build` fails and rolls
+     back on Windows (component files are locked), and a release build plus a Tauri build were in
+     flight for most of this run. Nothing was found upstream confirming the `rustc_codegen_ssa` tokio
+     ICE is fixed, so the pin's removal condition is still unverified. Sequence it first next run:
+     `rustup update` alone, then a full `cargo build --release -p nanna-daemon` — and note that
+     `.github/workflows/{test-compile,release-check}.yml` both hardcode the channel and must move in
+     lockstep with the toml.
    - *(2026-08-24 sweep)* `cargo update` → 60+ compatible bumps. `cargo upgrade --incompatible` → three
      majors **applied green** — `wide 1.5 → 1.6` (`nanna-simd`, compiled unchanged), `uuid 1.24 → 1.25`
      (workspace + `nanna-server`), `playwright-rs 0.15 → 0.16` (`nanna-browser`, compiled unchanged under
@@ -4209,6 +4890,60 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
            least `cargo check --profile release`) to the freshness increment's verification.
+           *(2026-08-21)* Closed where it is actually enforced: the `daily-dev` skill's **step 4 —
+           Verify** now requires `cargo build --release -p nanna-daemon` for any dependency, toolchain
+           or `Cargo.lock` change, naming both release-only failures this repo has already hit (the
+           `tokio` codegen ICE and the `turso_core` const-eval depth overflow) so a future run knows
+           what the gate is for. Run and green on this run's sweep.
+     - [x] *(2026-08-23)* **The verify-gate hole is closed in CI, not just in the routine's habits.**
+           `cargo build` (debug) + `cargo test` cannot see a release-only codegen break, so a
+           toolchain or dependency bump could pass every green check and still leave the shippable
+           artifact unbuildable — which is exactly what happened twice (the 2026-07-23 `tokio` ICE in
+           `rustc_codegen_ssa`, surfaced only when `pnpm build:daemon` prepared the sidecar; and
+           nightly-2026-07-13's `turso_core` "queries overflow the depth limit", latent while a
+           cached rlib existed). CI had **no release build on push or PR at all**: `test-compile.yml`
+           is `--no-run` debug, and the only `cargo build --release` lives in `release.yml` /
+           `macos-dmg.yml`, which run at tag time — long after the change merged.
+           New `.github/workflows/release-check.yml` runs `cargo build --release --package
+           nanna-daemon --locked` on windows-latest under the pinned nightly.
+           **`cargo check --profile release` was considered and rejected**: both recorded failures
+           are in codegen and const-eval, and `check` stops before codegen — it would have reported
+           green for both. The gate has to be a real `build`.
+           **Bounded to when the failure is possible, not to every push.** A fat-LTO
+           (`codegen-units = 1`) release build is expensive, and release-codegen breaks come from the
+           toolchain or the dependency graph, not from ordinary source edits the debug gates already
+           cover. So it triggers on changes to `Cargo.toml` / `Cargo.lock` / `crates/*/Cargo.toml` /
+           `gui/src-tauri/Cargo.toml` / `rust-toolchain.toml`, plus a weekly cron (a latent break can
+           arrive with no diff — a yank, a re-resolved git dep) and `workflow_dispatch`.
+           `nanna-daemon` is the target because it is what ships as the Tauri sidecar and what
+           `release.yml` builds, and it pulls in both crates the recorded failures lived in.
+           Also corrected while here: `test-compile.yml`'s toolchain comment still claimed the
+           workspace pinned `nightly-2026-07-13` while the step passed `nightly-2026-08-03`.
+   - [x] *(2026-08-23)* **`nanna-gui` was compiled by nothing in CI, and was found broken.**
+     `test-compile.yml` runs `--exclude nanna-gui`, and `gui.yml` runs only frontend jobs (Vitest,
+     `vue-tsc`, Playwright) *and only triggers on `gui/**` paths* — so a change under `crates/` that
+     broke `gui/src-tauri/src/**` reached **no** Rust coverage anywhere, on any trigger. The
+     `--exclude` was inherited by this routine's own verification too (`cargo build --all-targets
+     --workspace --exclude nanna-gui`), so nothing local caught it either.
+     Found the hard way: `cargo tauri build` failed with **two `E0063`s** —
+     `crates/nanna-config`'s new `webhook_secret` field on `TelegramConfig`/`SignalConfig` had been
+     added to three of its four construction sites, missing
+     `gui/src-tauri/src/commands/channels.rs`. Every gate was green while the shippable desktop app
+     did not compile.
+     Fixed both sites — and not with `None`, which would have compiled while shipping a GUI that
+     configures a permanently-503 channel, since the daemon now refuses to serve an unarmed webhook.
+     Telegram **mints** a 122-bit secret exactly as `nanna init` does (a supplied one wins, so
+     re-running never silently rotates a secret already registered via `setWebhook`); Signal only
+     **carries through** what the operator supplies, because that secret must also be configured on
+     the separate signal-cli-rest-api bridge — a value invented at this end would arm an endpoint the
+     bridge cannot satisfy, and a 503 naming the key is the honest outcome for "half configured".
+     New `check-gui` job in `test-compile.yml` closes the gap. The exclusion cited a real obstacle —
+     the crate's build needs the uncommitted sidecar and `gui/.output/public` — but **both can be
+     stubbed**, which is what makes the job cheap: measured locally, a 4-byte placeholder sidecar and
+     a one-line `index.html` are enough for `cargo check -p nanna-gui --locked` to run the real
+     typecheck in ~55s, with no `pnpm build` and no daemon build. Packaging stays `release.yml`'s job,
+     with the real artifacts. **Verified it catches the actual regression**: reverting the
+     `channels.rs` fix makes the job's exact command report both `E0063`s.
            *(2026-08-24)* **Now part of every freshness increment** — the 2026-08-24 sweep ran
            `cargo build --release -p nanna-daemon` as a gate and it finished green in 21m54s. It is the
            `nanna-daemon` package specifically because that is the one the pin's two known failures
@@ -4225,9 +4960,35 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
            tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
-   **Blocked here by design (checked 2026-07-23): `physics515/Mummu` is still an empty repo** — only
-   `.git`/`.claude`, no crates — so there is no runner surface for Nanna to consume. Items 3–5 stay
-   blocked until Mummu exposes one; runner code must NOT be written in this repo.
+   **UNBLOCKED (re-checked 2026-08-23): `physics515/Mummu` is no longer empty.** The earlier note
+   ("still an empty repo — only `.git`/`.claude`, no crates") is stale. The repo now carries a real
+   workspace — `crates/{mummu, mummu-serve, mummu-bench}`, `burn.toml`, `bench/BASELINE.md` — and its
+   README reports the surface Nanna's items 3–5 were waiting on: one binary compiling both `Wgpu`
+   (fusion + autotune, SPIR-V on Vulkan) and `burn-flex` CPU behind a cached runtime device probe;
+   checked safetensors / PyTorch / GGUF import with `config.json`-driven hyperparameters; HF
+   tokenizer + `tokenizer_config.json` import with byte-verified chat templates **including the
+   Hermes `# Tools` block**; per-layer KV cache, on-GPU argmax, sampling, **token streaming** and
+   cooperative cancellation; a validated **f16** path (Qwen2.5-1.5B ≈3.6 GiB runner VRAM, decode
+   36.8 tok/s, TTFT 24.9 ms on the reference 4070 Ti SUPER); a `warm_up` API; a from-scratch
+   MiniLM-class CPU sentence embedder; and `plan::pick_precision` for VRAM-aware dtype choice.
+   Runner code still must NOT be written in this repo — but the *consumer glue* is now the real work,
+   and it is no longer blocked:
+   - [ ] **Take Mummu as a dependency** — decide git-rev pin vs path dep, and land the `[infer]`
+         config surface (model id, device preference, precision override). A rev pin is the honest
+         default while Mummu is pre-release: it is the same reproducibility argument as the boa git
+         rev and the exact `turso`/`aegis` pins. Budget the build cost first — `burn` + `wgpu` +
+         CubeCL is a large cold compile, and `nanna-gui` already needs a sidecar and a built frontend.
+   - [ ] **Back the memory `embed_fn` with Mummu's MiniLM embedder** (P12 item 4) — this is the
+         lowest-risk first consumer: CPU-only, no VRAM budget to negotiate, and it removes the last
+         API dependency from the memory path. Mind the **embedding-dimension latch** (see the stale
+         embedding-binding work): switching embedders re-binds the vector width, so the backfill and
+         the dimension guard in `nanna-storage`'s SQL kNN both have to be exercised before this lands.
+   - [ ] **`Provider::Local` in the router** (P12 item 5) — dispatch completion/stream/tool-calls to
+         Mummu and make local the top-priority zero-cost tier. Note the router is **frozen at boot**
+         (see the bare-model-name work), so a local tier that appears after boot is invisible; wire it
+         into the boot-time provider map, not lazily.
+   - [ ] **Do not port the parity harness, the model zoo, or the quantization planner here.** Those
+         are Mummu's, with their own routine. If a bug is found through Nanna, file it there.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
 6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — the

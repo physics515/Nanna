@@ -1123,36 +1123,25 @@ impl AgentService {
                                     memory.provenance.as_str().to_string(),
                                 );
                                 // Derive importance from category. Memories never
-                                // expire — all categories are permanent.
-                                let importance: f32 = match memory.category.as_str() {
-                                    "tool_result" => 1.5,
-                                    "preference" | "identity" => 4.0,
-                                    "fact" | "insight" => 3.5,
-                                    "context" => 3.0,
-                                    _ => 3.0,
-                                };
+                                // expire — all categories are permanent. ONE table,
+                                // shared with the harness sink (`tasks.rs`) — two
+                                // private copies is how the two sinks' policies
+                                // drifted apart in the first place.
+                                let importance = crate::memory_adapter::episodic_importance(
+                                    &memory.category,
+                                );
 
-                                // Skip low-signal content: errors, tiny results, or garbled output
-                                let dominated_by_non_ascii = memory.content.chars().take(200)
-                                    .filter(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace() && !c.is_ascii_punctuation())
-                                    .count() > 40;
-
-                                if memory.content.starts_with("Error:")
-                                    || memory.content.contains("HEARTBEAT_OK")
-                                    || memory.content.trim_start().starts_with("[Tool:")
-                                    || memory.content.starts_with("Execution failed:")
-                                    || memory.content.contains("Error: Execution failed")
-                                    || memory.content.contains("Command failed")
-                                    || memory.content.contains("Missing required parameter")
-                                    || memory.content.contains("cannot find the path specified")
-                                    || memory.content.contains("Parameter format not correct")
-                                    || memory.content.contains("not recognized as an internal")
-                                    || memory.content.contains("Bridge error:")
-                                    || memory.content.contains("JS execution failed")
-                                    || (memory.category == "tool_result" && memory.content.contains("Error"))
-                                    || memory.content.len() < 20
-                                    || dominated_by_non_ascii
-                                {
+                                // Machine noise, and ONLY machine noise. This used
+                                // to be a private, older filter that also matched
+                                // six failure substrings anywhere in the body — so
+                                // ordinary chat could not remember a single failed
+                                // tool call, nor a successful one whose output
+                                // merely quoted an error — plus a 20-byte floor and
+                                // a "not ASCII means binary" test that ate `tree`
+                                // output and every non-Latin script. The harness
+                                // path had already been fixed; chat had not. See
+                                // `memory_adapter::is_low_signal_memory`.
+                                if crate::memory_adapter::is_low_signal_memory(&memory.content) {
                                     info!("Skipping low-signal memory [{}]: {}", memory.category, truncate(&memory.content, 50));
                                     return;
                                 }

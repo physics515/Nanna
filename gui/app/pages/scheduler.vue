@@ -158,7 +158,7 @@
             <UiButton 
               v-for="preset in schedulePresets" 
               :key="preset.value"
-              variant="outline" 
+              variant="secondary"
               size="sm"
               @click="applyPreset(preset)"
             >
@@ -181,16 +181,7 @@
         <!-- Timezone -->
         <div>
           <label class="block text-sm font-medium text-nanna-text mb-1">Timezone</label>
-          <UiSelect v-model="form.timezone">
-            <option value="UTC">UTC</option>
-            <option value="America/New_York">America/New_York</option>
-            <option value="America/Chicago">America/Chicago</option>
-            <option value="America/Denver">America/Denver</option>
-            <option value="America/Los_Angeles">America/Los_Angeles</option>
-            <option value="Europe/London">Europe/London</option>
-            <option value="Europe/Paris">Europe/Paris</option>
-            <option value="Asia/Tokyo">Asia/Tokyo</option>
-          </UiSelect>
+          <UiSelect v-model="form.timezone" :options="timezoneOptions" />
         </div>
       </div>
 
@@ -312,6 +303,20 @@ const selectedJob = ref<CronJob | null>(null)
 
 const showDeleteModal = ref(false)
 const jobToDelete = ref<CronJob | null>(null)
+
+// UiSelect renders from this prop. It used to be given slotted <option>
+// children instead, which the component never reads — so the timezone
+// dropdown rendered empty.
+const timezoneOptions = [
+  { value: 'UTC', label: 'UTC' },
+  { value: 'America/New_York', label: 'America/New_York' },
+  { value: 'America/Chicago', label: 'America/Chicago' },
+  { value: 'America/Denver', label: 'America/Denver' },
+  { value: 'America/Los_Angeles', label: 'America/Los_Angeles' },
+  { value: 'Europe/London', label: 'Europe/London' },
+  { value: 'Europe/Paris', label: 'Europe/Paris' },
+  { value: 'Asia/Tokyo', label: 'Asia/Tokyo' },
+]
 
 const schedulePresets = [
   { label: 'Every 5 min', value: '*/5 * * * *' },

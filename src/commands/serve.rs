@@ -91,6 +91,30 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
         .tools_arc(tools.clone())
         .webhook_secret(config.server.webhook_secret.clone())
         .discord_public_key(discord_public_key)
+        // Slack's signing secret was parsed and then never handed to the
+        // server, so the `nanna serve` Slack webhook verified nothing. Now the
+        // handler fails closed without it, so the wiring is load-bearing.
+        .slack_signing_secret(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .map(|s| s.signing_secret.clone()),
+        )
+        .telegram_webhook_secret(
+            config
+                .channels
+                .telegram
+                .as_ref()
+                .and_then(|t| t.webhook_secret.clone()),
+        )
+        .signal_webhook_secret(
+            config
+                .channels
+                .signal
+                .as_ref()
+                .and_then(|s| s.webhook_secret.clone()),
+        )
         .default_model(config.llm.model.clone())
         .telegram_token(telegram_token)
         .discord_config(discord_bot_token, discord_app_id)

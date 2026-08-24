@@ -1,0 +1,95 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`inlineMd (characterization — pins current output) > is stable for: bold 1`] = `"<strong>b</strong>"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: bracket without paren 1`] = `"[text]"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: code 1`] = `"<code>c</code>"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: empty 1`] = `""`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: html-significant characters 1`] = `"&lt;script&gt;&amp;""`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: italic 1`] = `"<em>i</em>"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: link 1`] = `"<a href="u">t</a>"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: nested-looking 1`] = `"<strong>bold with <code>code</code></strong>"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: unclosed bold 1`] = `"**never closed"`;
+
+exports[`inlineMd (characterization — pins current output) > is stable for: unclosed code 1`] = `"\`never closed"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: angle bracket without space 1`] = `"<p>&gt;no space</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: blank lines 1`] = `"<p>text</p><p>more</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: blockquote 1`] = `"<blockquote><p>quoted</p></blockquote>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: blockquote is the last line 1`] = `"<p>text</p><blockquote><p>q</p></blockquote>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: blockquote, two lines 1`] = `"<blockquote><p>line one&lt;br&gt;line two</p></blockquote>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: bold 1`] = `"<p><strong>bold</strong></p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: bullet 1`] = `"<ul><li><p>bullet</p></li></ul>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: bullet list 1`] = `"<ul><li><p>a</p></li><li><p>b</p></li><li><p>c</p></li></ul>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: empty 1`] = `""`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: empty fence 1`] = `"<monaco-code-block language="" content=""></monaco-code-block>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: everything at once 1`] = `"<h1>H</h1><ul><li><p>a</p></li><li><p>b</p></li></ul><monaco-code-block language="py" content="x=1"></monaco-code-block><blockquote><p>q</p></blockquote>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: fence is the last line 1`] = `"<p>text</p><monaco-code-block language="" content=""></monaco-code-block>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: fence never closed 1`] = `"<monaco-code-block language="unclosed" content="still code"></monaco-code-block>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: fenced with language 1`] = `"<monaco-code-block language="js" content="const a = 1"></monaco-code-block>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: fenced, no language 1`] = `"<monaco-code-block language="" content="code"></monaco-code-block>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: h1 1`] = `"<h1>H1</h1>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: h2 1`] = `"<h2>H2</h2>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: h6 1`] = `"<h6>H6</h6>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: hash without space is not a heading 1`] = `"<p>#no-space</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: html-significant characters 1`] = `"<p>quote " and &amp; and &lt; &gt;</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: inline code 1`] = `"<p><code>code</code></p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: italic 1`] = `"<p><em>ital</em></p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: leading whitespace 1`] = `"<p>   leading</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: link 1`] = `"<p><a href="http://x">link</a></p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: mixed inline 1`] = `"<p><strong>bold</strong> and <code>code</code> and <a href="u">l</a></p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: multi-byte 1`] = `"<p>emoji 🎉 and em—dash and ünïcode</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: multiline plain 1`] = `"<p>a</p><p>b</p><p>c</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: only newlines 1`] = `""`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: ordered 1`] = `"<ol><li><p>one</p></li></ol>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: ordered list 1`] = `"<ol><li><p>one</p></li><li><p>two</p></li></ol>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: plain 1`] = `"<p>plain text</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: seven hashes is not a heading 1`] = `"<p>####### too many</p>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: single newline 1`] = `""`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: task checked 1`] = `"<ul data-type="taskList"><li data-type="taskItem" data-checked="true"><p>done</p></li></ul>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: task list 1`] = `"<ul data-type="taskList"><li data-type="taskItem"><p>a</p></li><li data-type="taskItem" data-checked="true"><p>b</p></li></ul>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: task unchecked 1`] = `"<ul data-type="taskList"><li data-type="taskItem"><p>todo</p></li></ul>"`;
+
+exports[`markdownToHtml (characterization — pins current output) > is stable for: trailing whitespace 1`] = `"<p>trailing spaces   </p>"`;
