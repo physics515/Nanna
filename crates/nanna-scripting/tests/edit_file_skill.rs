@@ -13,6 +13,8 @@
 
 #![cfg(feature = "boa")]
 
+mod common;
+
 use nanna_scripting::{ScriptEngine, ScriptedTool, ToolPermissions};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -27,7 +29,9 @@ fn skill_path() -> PathBuf {
 async fn run_edit(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read edit_file tool.ts")
-        .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]));
+        .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]))
+        // Scaffolding, not an assertion — see `common::FIXTURE_TIMEOUT_MS`.
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
     ScriptEngine::new()
         .execute(&tool, input, None, None)
         .await
