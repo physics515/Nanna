@@ -512,6 +512,13 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `marked 17 → 18` bump has to state what it changes. 185/185 vitest green.
       **Intentional behaviour change:** a message containing `<div>` now shows the literal characters
       instead of laying out a div. That is what a chat client should do with markup it did not author.
+      Frontend verified beyond the unit suite: `pnpm build` green (nitro + client, 4 routes prerendered)
+      and a non-CI `pnpm dev` boot serving a real **200** `__nuxt` shell on `:3000` with no errors in the
+      dev log — the check that catches a Nuxt boot-loop a built bundle would hide.
+      **Not done this run:** a `cargo tauri build` + WebDriver pass against the packaged app. The change
+      is a pure function whose 26 tests already assert against a real DOM, so the marginal value was low
+      next to a full release build of the whole workspace on a contended shared target dir. Worth doing
+      on a run that is building the GUI anyway.
 - [x] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
       *(2026-08-24 — verified, the roadmap was stale, not the code.)* `gui/src-tauri/Cargo.toml` already
       has `default = ["custom-protocol"]` with `devtools = ["tauri/devtools"]` kept **out** of it, and a
@@ -555,6 +562,19 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       concurrent calls cannot interleave a rename with a write) and `TracingAuditSink` for operators who
       already ship the daemon log elsewhere. 11 audit-module + 7 registry tests. Documented in
       `PRIVACY.md`'s local-storage table and README's feature list.
+      **Verified against the real binary, not just unit tests.** Booted the freshly built
+      `nanna-daemon` on an isolated `--data-dir` and drove four `tool.execute` calls over the live IPC
+      socket, one per outcome class. The trail it wrote:
+      ```
+      {"requested":"list_dir","resolved":"list_dir","param_keys":["path"],"duration_ms":48,"outcome":"succeeded"}
+      {"requested":"zzzz_no_such_tool_at_all","resolved":null,"param_keys":[],"duration_ms":0,"outcome":"not_found"}
+      {"requested":"Bash","resolved":"exec","param_keys":["command"],"duration_ms":62,"outcome":"succeeded"}
+      {"requested":"read_file","resolved":"read_file","param_keys":["file_path"],"outcome":"failed","error":"read_file: '…' does not exist …"}
+      ```
+      Four calls, four lines. Note row 3: `requested: "Bash"` → `resolved: "exec"` — the
+      alias-canonicalization fix, proven live rather than argued. And note what is *absent*: the `exec`
+      call carried `command: "echo hi"` and the `list_dir` call carried `path: "."`, and neither value
+      appears anywhere in the trail — only the key names, which is the default posture working.
       **Still open on this line:** the GUI per-tool toggles, and an audit *viewer* in the GUI.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
@@ -1066,6 +1086,25 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       confirmation click to the dialog rather than the page, and wait for the overlay's transition to
       settle. Deliberately **not** patched under time pressure in the run that found it — loosening an
       assertion to get green is how a real regression gets hidden later.
+- [ ] *(2026-08-24)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
+      deadline in a test, not a regression.** Six of its seventeen tests failed a full-workspace
+      `cargo test` with `"Timeout after 30000ms"` while two cargo builds and sixteen other test binaries
+      shared the box; the same file run alone passes **17/17 in 3.49 s** — a ~10× margin, so the failure
+      is scheduling, not logic. Confirmed off any changed path: `nanna-scripting`'s only in-tree
+      dependency is `nanna-proc`.
+      This is still a real test-quality bug, because a suite that goes red on a busy CI runner trains
+      people to re-run rather than read. The engine's deadline is wall-clock and absolute; under
+      contention the *script* never gets 30 s of CPU. Fix is test-side — raise the deadline for these
+      fixtures specifically (they measure edit semantics, not latency), or have the harness assert on
+      completion rather than on a wall-clock bound. Do **not** simply retry: a genuine hang and a
+      starved scheduler look identical from outside, and the distinction is what the deadline exists
+      to draw.
+      **Same class, different suite:** `nanna-client/tests/e2e_daemon.rs` failed all 4 on a second
+      loaded run ("daemon did not start listening on port … within 10s") and passes **4/4 in 1.54 s**
+      alone. Its wait is also an absolute 10 s. Both suites pass under
+      `cargo test -- --test-threads=4` (**1593 tests, 0 failures** this run), so the workable
+      short-term answer is to bound test parallelism in CI; the durable one is to stop asserting
+      wall-clock in tests that are not measuring latency.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
@@ -2655,6 +2694,14 @@ asks permission or restricts her.)*:
       turn, so the snapshot is re-read per turn, not frozen at boot.
       Also added `WorkspaceFiles::load_files_only` so a caller that only wants file contents does not pay
       for a subprocess — and so a test does not depend on whether its fixture happens to sit in a repo.
+      **A bound bug in the first cut, caught before it shipped.** `Workspace::load_context()` is called
+      by the daemon *in a loop over every persisted workspace at boot*. Loading git there made startup
+      cost **two subprocess spawns per registered workspace**, each with its own 5 s timeout — added
+      latency that grows with the registry, on the path where a slow start looks like a hang. Split into
+      `load_context()` (files only, what boot calls — cost stays proportional to reading four files) and
+      `load_context_with_git()`, used by the chat turn and the explicit user-driven workspace reload:
+      both act on the **one** workspace in question. A test pins the boot-path loader against a directory
+      that *is* a repository, so the only thing keeping git out is which function was called.
       16 tests: caps and their reported elision, char-boundary clipping of a multi-byte path, branch-line
       parsing (present / absent / clean tree), the snapshot framing itself, ordering below the file
       context, injection with no standard files at all, a `.git` file counting as a marker, a non-repo
@@ -4113,9 +4160,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
        malachite 0.10. **Recognise it by the symptom:** `BigInt: From<malachite_bigint::biguint::BigUint>
        is not satisfied` inside `rustpython-stdlib`.
      - [x] **The release-profile hole is now closed by the freshness gate itself** (the `[ ]` item two
-           bullets below): this sweep ran `cargo build --release -p nanna-daemon` and it finished green
-           in **21m54s** under the pinned `nightly-2026-08-03`. Debug build + **~600 workspace tests** +
-           clippy (**0 errors**, 2742 pre-existing warnings) also green.
+           bullets below): this sweep ran `cargo build --release -p nanna-daemon` green in **21m54s**
+           under the pinned `nightly-2026-08-03`, and the whole branch was re-gated the same way at the
+           end of the run (**22m14s**, green). Debug build, **1593 workspace tests / 0 failures**, and
+           clippy (**0 errors**, 2741 pre-existing warnings — one fewer than the 2742 baseline, from the
+           `execute_call` split) also green.
      - Frontend: `pnpm outdated` showed **only the documented deferred majors** plus three safe dev
        patches, applied green — `happy-dom 20.11.6`, `vitest 4.1.11`, `vue-tsc 3.3.11`
        (**159/159 vitest**, `pnpm build` clean, 4 routes prerendered). `pnpm update --latest` was **not**
@@ -4140,6 +4189,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      the GUI build inherit it. The file carries the full ICE text and its removal condition.
      - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
            every dependency-freshness pass, and report the ICE upstream if it survives.
+           *(2026-08-24 — deliberately NOT attempted, and worth saying why rather than leaving it
+           looking forgotten.)* The candidate is **`1.100.0-nightly (fb6531d55, 2026-08-23)`**, up from
+           the pinned `nightly-2026-08-03` (`1.99.0-nightly 11177f223`). The probe is not a cheap check:
+           it needs a from-scratch debug build, the full test suite, **and** a release build under the
+           new toolchain. This machine's `~/.cargo/config.toml` points every crate at one shared
+           `target-dir` (`D:\Development\Cargo Target`), and throughout this run a build from a
+           *different* project was holding that directory's lock — a toolchain switch would have evicted
+           the workspace's cached artifacts mid-run for a probe that could not then be finished and
+           verified. **Next run should do this first**, before any other cargo work, so the cache
+           eviction is paid once at the start rather than stranding an increment.
+           - [ ] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
+                 The shared target dir is a standing tax: two toolchains and several worktrees contend
+                 for one lock, so builds serialise behind unrelated projects (observed this run: a
+                 4-minute incremental build took 12, and a 22-minute release build was mostly waiting).
+                 It is also the hazard already recorded for benchmarks — a binary in the shared
+                 `release/` may have been produced by another worktree.
      - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
