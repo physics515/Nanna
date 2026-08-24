@@ -5659,6 +5659,7 @@ dependencies = [
  "nanna-memory",
  "nanna-simd",
  "nanna-storage",
+ "nanna-workspace",
  "serde",
  "serde_json",
  "tempfile",

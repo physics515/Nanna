@@ -487,7 +487,96 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       an app that renders model output and untrusted markdown. Tauri enables devtools automatically
       under `debug_assertions`, so `tauri dev` is unaffected, and a release build gets the inspector
       only by asking for `--features devtools`. No other reference to the feature exists in the crate.
-- [ ] Per-tool toggles visible in GUI; audit log for every tool call.
+- [x] **Chat markdown was rendered unsanitized into `v-html` — the CSP was the only layer.**
+      *(2026-08-24)* `MarkdownContent.vue` ran `marked.parse()` straight into `v-html`, and `marked`
+      has not sanitized since v5 (the `sanitize` option was removed). Verified against the installed
+      `marked@17.0.6`, not assumed:
+      `<img src=x onerror="alert(1)">` → `<img src=x onerror="alert(1)">`,
+      `<script>alert(1)</script>` → passed through verbatim,
+      `[click](javascript:alert(1))` → `<a href="javascript:alert(1)">`,
+      `![x](javascript:…)` → `<img src="javascript:…">`.
+      Everything that component renders is untrusted — assistant output, user input, and (via the
+      assistant quoting a tool result) any web page or file the agent touched. `innerHTML` will not run
+      a `<script>` tag, but it **will** fire an `<img onerror>`, so the only thing standing between
+      injected markup and script execution in a webview that holds `__TAURI_INTERNALS__.invoke` was the
+      Tauri CSP's `script-src 'self'` — one header, on one config file, with no second layer. A single
+      future `'unsafe-inline'` (a chart or highlight library is the usual reason) would have turned this
+      into a live local-command-execution path.
+      **Fix:** rendering moved out of the SFC into a pure `gui/app/lib/markdown.ts` that (1) escapes
+      author HTML instead of emitting it — the block *and* inline `html` renderers return escaped text,
+      so every tag in the output is one marked itself generated — and (2) scheme-checks link and image
+      URLs against an allowlist (`http:`/`https:`/`mailto:`; images narrow to `http:`/`https:`), keeping
+      the visible label but dropping the anchor when a URL is refused. An allowlist rather than a
+      `javascript:` denylist because the spellings are open-ended; the check parses with `URL` rather
+      than matching a prefix, which is what catches `java\tscript:` — the platform parser strips the
+      embedded control character before reading the scheme, a hand-rolled matcher does not. Built on a
+      private `new Marked({…})` instance, not the shared default export, so no unrelated
+      `marked.setOptions`/`marked.use` can silently replace the renderer a security property depends on.
+      26 tests, asserted against **what the browser actually builds** (`innerHTML` into a detached node,
+      then `querySelector`) rather than against substrings — including a sweep proving no element in the
+      output carries any `on*` attribute. The other 13 pin ordinary rendering (emphasis, headings, lists,
+      GFM tables/strikethrough/task lists, blockquotes, `breaks: true` soft line breaks) so the deferred
+      `marked 17 → 18` bump has to state what it changes. 185/185 vitest green.
+      **Intentional behaviour change:** a message containing `<div>` now shows the literal characters
+      instead of laying out a div. That is what a chat client should do with markup it did not author.
+      Frontend verified beyond the unit suite: `pnpm build` green (nitro + client, 4 routes prerendered)
+      and a non-CI `pnpm dev` boot serving a real **200** `__nuxt` shell on `:3000` with no errors in the
+      dev log — the check that catches a Nuxt boot-loop a built bundle would hide.
+      **Not done this run:** a `cargo tauri build` + WebDriver pass against the packaged app. The change
+      is a pure function whose 26 tests already assert against a real DOM, so the marginal value was low
+      next to a full release build of the whole workspace on a contended shared target dir. Worth doing
+      on a run that is building the GUI anyway.
+- [~] Per-tool toggles visible in GUI; audit log for every tool call.
+      *(2026-08-24)* **The audit half shipped.** New `nanna-tools::audit` records **one structured JSON
+      line per tool call** at the single chokepoint every caller funnels through — `ToolRegistry::execute`.
+      Two things were wrong before, and both are the reason this could not just be "add a log line":
+      **(1) The only per-call record was a `debug!` pair**, off at the default level and unstructured;
+      the aggregate counters that do exist (`nanna-agent::ToolStatsTracker`) are recorded from
+      `loop_runner`, so every call made outside the agent loop — chat harness, task tool, scheduled runs,
+      the `nanna mcp serve` bridge, scripted skills — left **no trace at all**. An audit that saw one
+      caller would be worse than none, because it would read as a complete account.
+      **(2) Three of `execute`'s four exits returned early.** A record appended at the end would have
+      missed *exactly* the events an audit exists for: a policy refusal and a not-found name. `execute`
+      is now a thin wrapper that times the call, delegates to `execute_call` (which returns
+      `(response, outcome, resolved)`), and records **once**, on every path. The invariant is enforced by
+      the shape of the code, not by remembering to log at four sites, and a test drives all four outcome
+      classes plus `execute_parallel` and asserts one record each.
+      **Values stay out by default.** Arguments carry secrets (an API key in a request, the body of a
+      file being written) and the trail is durable plaintext that outlives the run, so the record carries
+      the argument **key names** (sorted, deduped, bounded) and never the values unless the sink asks —
+      `[tools] audit_log_values`, off by default. The include-values decision sits on the `ToolAuditSink`
+      trait rather than in the registry, because only the sink knows where the trail lands; it defaults
+      to `false` so a sink written later inherits the value-free posture.
+      **A real bug fell out of writing the test.** `resolve_tool` returns the *registry key*, which for
+      an alias is the alias itself (`Bash`), not the tool it points at — `refuse_by_policy` was
+      canonicalizing privately, so nothing else in `execute` had the canonical name. The audit now
+      canonicalizes once, up front, and both the policy gate and the trail speak that one identity;
+      without it a denied aliased call would have been recorded as a decision about a tool named `Bash`.
+      **Bounds** (all Tiger-Style derived, none magic): ≤64 key names × ≤64 bytes each (a tool's
+      parameter list is its signature — the widest in-tree declares well under twenty, but the *map* is
+      caller-controlled), ≤512-byte value/error previews (a path, a URL, or the first clause of an error
+      — the identifying part of either), 8 MB file cap with one generation of rollover, so the trail
+      costs at most 16 MB on disk with no background reaper. Every truncation is char-boundary safe.
+      Wired end to end: `[tools] audit_log` (**on by default** — an unattended daemon with no answer to
+      "what did it do overnight" is the gap) → `DaemonConfig` → `{data_dir}/logs/tool-audit.jsonl`, plus
+      the legacy `nanna serve` path. Ships `JsonlAuditSink` (size-capped, rollover, mutex-gated so
+      concurrent calls cannot interleave a rename with a write) and `TracingAuditSink` for operators who
+      already ship the daemon log elsewhere. 11 audit-module + 7 registry tests. Documented in
+      `PRIVACY.md`'s local-storage table and README's feature list.
+      **Verified against the real binary, not just unit tests.** Booted the freshly built
+      `nanna-daemon` on an isolated `--data-dir` and drove four `tool.execute` calls over the live IPC
+      socket, one per outcome class. The trail it wrote:
+      ```
+      {"requested":"list_dir","resolved":"list_dir","param_keys":["path"],"duration_ms":48,"outcome":"succeeded"}
+      {"requested":"zzzz_no_such_tool_at_all","resolved":null,"param_keys":[],"duration_ms":0,"outcome":"not_found"}
+      {"requested":"Bash","resolved":"exec","param_keys":["command"],"duration_ms":62,"outcome":"succeeded"}
+      {"requested":"read_file","resolved":"read_file","param_keys":["file_path"],"outcome":"failed","error":"read_file: '…' does not exist …"}
+      ```
+      Four calls, four lines. Note row 3: `requested: "Bash"` → `resolved: "exec"` — the
+      alias-canonicalization fix, proven live rather than argued. And note what is *absent*: the `exec`
+      call carried `command: "echo hi"` and the `list_dir` call carried `path: "."`, and neither value
+      appears anywhere in the trail — only the key names, which is the default posture working.
+      **Still open on this line:** the GUI per-tool toggles, and an audit *viewer* in the GUI.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
@@ -859,6 +948,20 @@ health checks). **Shipped**, except:
       re-prompting on drift. Pairs with the "drop ACE grants on entering unattended mode" P6 item. Sources:
       [OWASP MCP Top 10 — Tool Poisoning](https://owasp.org/www-project-mcp-top-10/2025/MCP03-2025%E2%80%93Tool-Poisoning),
       [State of MCP Security 2026](https://pipelab.org/blog/state-of-mcp-security-2026/).
+      - *(research 2026-08-24)* **The threat kept growing and the defence converged — but sequence this
+        behind wiring the client, not in front of it.** Jan–Feb 2026 saw **30+ CVEs** filed against MCP
+        servers, clients and tooling, and the class is now catalogued as **ASI04 in the OWASP Agentic
+        Top 10**; the recommended controls are exactly the two already written above (hash-pin the tool
+        definition, allowlist approved servers) plus "treat every tool-returned string as hostile input".
+        **But this run confirmed `McpIntegration` is constructed nowhere in the tree and `nanna-config`
+        has no `[mcp]` section** — the MCP *client* is dead code today, so hardening it further buys
+        nothing until the "MCP client startup" item lands. Do that first, then pin. When pinning does
+        land it must be a **filter, not an approval prompt** (owner rule: no permission gates) — drift
+        drops the tool and says so, the same posture `schema_guard` already takes, with an explicit
+        out-of-band re-pin rather than an in-turn dialog. Sources:
+        [Speakeasy — tool poisoning threats and defenses](https://www.speakeasy.com/resources/mcp-tool-poisoning/),
+        [CSA Labs research note](https://labs.cloudsecurityalliance.org/research/csa-research-note-mcp-tool-poisoning-ai-agent-exfiltration-2/),
+        [Practical DevSecOps — attack chain & defense](https://www.practical-devsecops.com/mcp-tool-poisoning/).
 - [ ] *(research 2026-07-20)* **HalluSquatting guard on `discover_tools`/skill-install/fetch paths** — agents
       reach for fabricated names in up to 85% of repo requests / 100% of skill installs, and attackers
       pre-register them. Make name→source resolution mandatory before any clone/install/fetch, flag those
@@ -1231,6 +1334,33 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             "0 errors" claim — this time with evidence that the command sees the files.
       - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
             reports zero *checked files*, the same way a coverage gate fails at 0%.
+- [x] *(2026-08-24, fixed the same day)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
+      deadline in a test, not a regression.** Six of its seventeen tests failed a full-workspace
+      `cargo test` with `"Timeout after 30000ms"` while two cargo builds and sixteen other test binaries
+      shared the box; the same file run alone passes **17/17 in 3.49 s** — a ~10× margin, so the failure
+      is scheduling, not logic. Confirmed off any changed path: `nanna-scripting`'s only in-tree
+      dependency is `nanna-proc`.
+      This is still a real test-quality bug, because a suite that goes red on a busy CI runner trains
+      people to re-run rather than read. The engine's deadline is wall-clock and absolute; under
+      contention the *script* never gets 30 s of CPU. Fix is test-side — raise the deadline for these
+      fixtures specifically (they measure edit semantics, not latency), or have the harness assert on
+      completion rather than on a wall-clock bound. Do **not** simply retry: a genuine hang and a
+      starved scheduler look identical from outside, and the distinction is what the deadline exists
+      to draw.
+      **Same class, different suite:** `nanna-client/tests/e2e_daemon.rs` failed all 4 on a second
+      loaded run ("daemon did not start listening on port … within 10s") and passes **4/4 in 1.54 s**
+      alone. Its wait is also an absolute 10 s. Both suites pass under
+      `cargo test -- --test-threads=4` (**1593 tests, 0 failures** this run), so the workable
+      short-term answer is to bound test parallelism in CI; the durable one is to stop asserting
+      wall-clock in tests that are not measuring latency.
+      *(2026-08-24, PR #264)* **Fixed, and the durable way round.** `e2e_daemon` now watches the
+      daemon task rather than the clock — a task that ends without binding fails at that moment with
+      its actual error, or resumes the original panic — with the clock demoted to a 120 s hang ceiling
+      whose assert says it is not a latency assertion. The eight scripting harnesses that were
+      inheriting `ScriptedTool`'s production 30 s default now take one shared
+      `tests/common::FIXTURE_TIMEOUT_MS`; `project_structure` keeps its 120 s because the skill
+      hardcodes `SCRIPT_DEADLINE_MS` and derives its work budget from it. Verified at **default**
+      parallelism — the exact condition that failed — 1555 passed / 0 failed.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
@@ -1654,6 +1784,10 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 
 - [ ] **Crate `nanna-infer` on Burn** — `burn = { version = "0.21", default-features = false, features = ["std","ndarray","wgpu","fusion","autotune","store"] }`. Model code generic over `B: Backend`.
       - [ ] *(research 2026-07-07)* Burn 0.21 ships **`burn-dispatch`** (runtime backend selection via `DispatchDevice::Wgpu(WgpuDevice::DiscreteGpu(0))`, static-enum dispatch, no perf regression) and **`burn-flex`** (a lightweight *eager* CPU backend — no fusion/autotune — that replaces `burn-ndarray` for WASM/embedded/small-model inference). Evaluate `burn-dispatch` for the "one binary, dual backend, runtime probe" item (may replace the hand-rolled `wgpu::Instance::enumerate_adapters` probe) and `burn-flex` vs `ndarray` for the CPU-fallback tier and the local MiniLM embedder. Also: up to 8× lower framework overhead — meaningful for the small-model decode budget. Sources: [Burn 0.21.0 release](https://burn.dev/blog/release-0.21.0/), [cross-platform GPU backend](https://burn.dev/blog/cross-platform-gpu-backend/).
+      - *(research 2026-08-24)* **0.21 is still the latest — no 0.22 exists**, so the `burn = "0.21"`
+        pin above is current and needs no action this pass. Re-check on each freshness sweep. Remember
+        this is **Mummu's** dependency, not Nanna's: nothing here should pull `burn` into this tree.
+        Source: [tracel-ai/burn releases](https://github.com/tracel-ai/burn/releases).
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
@@ -2507,6 +2641,29 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       dreaming overhaul: **RecMem**, recurrence-based consolidation aimed specifically at long-running agents.
       Sources: [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1),
       [RecMem (arXiv:2605.16045)](https://arxiv.org/pdf/2605.16045).
+      - [ ] *(research 2026-08-24)* **The field has converged on the three-tier taxonomy we already
+            half-implement — and has named our exact risk.** 2026 surveys settle on
+            **episodic / semantic / procedural**, with promotion driven by recurrence: repeated episodes
+            distil into a durable fact while the specific event fades. Nanna has the semantic tier
+            (`MemEntry` + FSRS) and P13 plans the episodic one (`nanna-timeline`); **procedural is
+            entirely absent** — a "how I do this" tier is what the "Instruction skills + slash macros"
+            item is really asking for, so those two should be designed together rather than as separate
+            features.
+            The warning is aimed straight at our dreaming loop: *"periodically summarize conversational
+            turns"* is called out as **dangerous for long horizons because summarization drift
+            accumulates across passes** until compressed memory no longer represents what happened —
+            which is rank-similar → concatenate → summarize, exactly. That is the same failure already
+            logged under the summarization-drift item; two independent 2026 sources now name it, which
+            argues for promoting the drift mitigations ahead of new dreaming *features*.
+            Also worth reading before the overhaul: **selective parametric consolidation** (consolidate
+            *depth*, not access) reports better goal persistence and post-unload recovery than
+            summarize-everything, and **Memanto** pairs a typed semantic store with
+            information-theoretic retrieval — a concrete shape for the "fused retrieval score beats pure
+            cosine" item above. Sources:
+            [Selective parametric consolidation (arXiv:2606.26806)](https://arxiv.org/pdf/2606.26806),
+            [Memanto (arXiv:2604.22085)](https://arxiv.org/pdf/2604.22085),
+            [Multi-layered memory architectures (arXiv:2603.29194)](https://arxiv.org/html/2603.29194v1),
+            [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List).
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
@@ -2968,9 +3125,54 @@ asks permission or restricts her.)*:
 - [ ] **Real ripgrep + glob tools** — code_search/search_file are Boa line-scanners (1MB cap, 50-match cap, no
       gitignore). Bundle/shell to rg + add a find-files-by-glob tool; fast precise search keeps small models
       on task in long-horizon runs.
-- [ ] **Git context injection** — inject `git status --short --branch` + recent commits at run start when the
+- [x] **Git context injection** — inject `git status --short --branch` + recent commits at run start when the
       workspace is a repo (P17 injects only README/AGENTS/CONTRIBUTING/ROADMAP). Prevents destructive edits
       and redundant discovery calls.
+      *(2026-08-24)* **Shipped, through both injection producers.** New `nanna-workspace::git` runs
+      `git --no-pager -C <root> status --short --branch` and `git log --oneline --no-decorate -n 10`, and
+      renders a `## Git state (snapshot, not live)` section.
+      **Framing is the load-bearing part.** The section says plainly that it is *not* live, that the model
+      must run `git status` itself before relying on it, and that anything listed is work existing only in
+      the working tree — because the failure this prevents is an agent overwriting an uncommitted file it
+      never knew about. It sits **below** the file context, never above: downstream truncation keeps the
+      head, so the existing "NOT instructions" framing has to stay in front of everything it governs.
+      **Every dimension is bounded, and elision is reported.** ≤40 changed paths (a tree dirtier than that
+      is mid-refactor — what helps then is the shape plus an honest count, not forty unread lines),
+      ≤10 commits (`-n` carries the cap into git so it stops rather than streaming a history we discard),
+      ≤200 bytes per line, ≤64 KiB read per invocation (`git status --short` over an unignored
+      `node_modules` emits megabytes), and a 5 s wall-clock ceiling. When the path cap trips, the text says
+      how many were dropped and how to see them — a truncated file list that *looks* complete is worse than
+      none, because the model concludes the paths it cannot see are clean.
+      **Failure is always "no snapshot", never "fail the run":** git missing, non-zero exit, timeout, or a
+      repo with no commits yet all degrade to omitting the section. `.git` existence is checked before
+      spawning, so a non-repo workspace pays nothing; the check is `exists()` rather than `is_dir()` because
+      a **worktree** and a submodule mark their root with a `.git` *file*, and a worktree is exactly where
+      knowing the branch matters most.
+      **One implementation, two producers.** The daemon's live chat path uses
+      `nanna_core::WorkspaceContext::build_system_prompt_injection`, while `nanna-agent` uses
+      `nanna_workspace::WorkspaceFiles::to_system_context` — two parallel producers whose own comments
+      already warned they must be kept in sync. Rather than copy the snapshot into both, `nanna-core` now
+      depends on `nanna-workspace` and holds the *same* `GitContext`, which renders itself. Both fields are
+      `#[serde(default)]` (the types cross the daemon's IPC boundary). `load_context()` is called per chat
+      turn, so the snapshot is re-read per turn, not frozen at boot.
+      Also added `WorkspaceFiles::load_files_only` so a caller that only wants file contents does not pay
+      for a subprocess — and so a test does not depend on whether its fixture happens to sit in a repo.
+      **A bound bug in the first cut, caught before it shipped.** `Workspace::load_context()` is called
+      by the daemon *in a loop over every persisted workspace at boot*. Loading git there made startup
+      cost **two subprocess spawns per registered workspace**, each with its own 5 s timeout — added
+      latency that grows with the registry, on the path where a slow start looks like a hang. Split into
+      `load_context()` (files only, what boot calls — cost stays proportional to reading four files) and
+      `load_context_with_git()`, used by the chat turn and the explicit user-driven workspace reload:
+      both act on the **one** workspace in question. A test pins the boot-path loader against a directory
+      that *is* a repository, so the only thing keeping git out is which function was called.
+      16 tests: caps and their reported elision, char-boundary clipping of a multi-byte path, branch-line
+      parsing (present / absent / clean tree), the snapshot framing itself, ordering below the file
+      context, injection with no standard files at all, a `.git` file counting as a marker, a non-repo
+      yielding `None`, and old IPC payloads still deserializing — **plus one that really spawns `git`**
+      against a repository built on disk (init → commit → dirty it two ways) and asserts the branch, both
+      changed paths, the commit subject, and the rendered section. The parsers are pure and pinned, but
+      the subprocess flags and exit codes are the part most likely to be wrong; that test skips rather
+      than fails when `git` is not on PATH.
 - [ ] **@-file mentions + drag-drop injection** — chat attachments are image-only. Deterministic client-side
       file injection beats a read_file roundtrip the model may fumble; pairs with the P4 drag-drop item.
 - [ ] **"think hard" phrases** — map natural-language budget phrases onto the existing ThinkingMode ladder;
@@ -2980,9 +3182,15 @@ asks permission or restricts her.)*:
 - [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
       restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
       (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
-- [ ] **Cross-cutting tool-call hooks** — a scripted interceptor point in ToolRegistry::execute (audit-log
+- [~] **Cross-cutting tool-call hooks** — a scripted interceptor point in ToolRegistry::execute (audit-log
       every call, guard-check before any exec). Per-tool logic is already user-editable in each skill; this
       covers the cross-tool niche only.
+      *(2026-08-24)* **The observe half landed** as `ToolAuditSink` (see the P11 audit item): a
+      `Send + Sync` trait the registry calls exactly once per call, on every exit path, carrying the
+      resolved canonical name, argument key names, duration and outcome. That is the seam a scripted
+      hook would plug into. Remaining: the **guard** half — a hook that can *refuse* a call — which is a
+      different shape (it has to run before execution and be able to fail the call), and a scripting
+      binding so the interceptor is user-editable rather than Rust-only.
 - [ ] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
       `with_hour_cache_write`). One field + a config flag keeps the big prefix warm across heartbeat/cron
       gaps on the cloud escape hatch.
@@ -4341,7 +4549,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            new BubbleMenu wiring, extension API changes). Largest of the batch.
      - [ ] `vue-router 4 → 5` (major)
      - [ ] `vue-sonner 1 → 2` (major — toast API)
-     - [ ] `marked 17 → 18` (major — chat markdown renderer; audit render output)
+     - [x] `marked 17 → 18` (major — chat markdown renderer; audit render output)
+           *(2026-08-24)* **Landed, 17.0.6 → 18.0.10, zero source changes.** The audit the item asked for
+           is what made this cheap: the 26-test characterization suite written the same run (see the
+           P11 markdown-sanitization item) pins both the injection behaviour and the ordinary rendering
+           — emphasis, headings, ordered/unordered lists, GFM tables, strikethrough, task lists,
+           blockquotes, `breaks: true` soft line breaks, entity escaping, empty input. All 26 pass
+           unchanged on 18, and a side-by-side probe of the raw renderer output confirms the emitted
+           HTML is byte-identical for every one of those cases. 185/185 vitest, `pnpm build` green.
+           The suite is the durable half of this: the next renderer bump has to state what it changes
+           rather than being taken on faith.
      - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
@@ -4596,6 +4813,39 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `rustup update` alone, then a full `cargo build --release -p nanna-daemon` — and note that
      `.github/workflows/{test-compile,release-check}.yml` both hardcode the channel and must move in
      lockstep with the toml.
+   - *(2026-08-24 sweep)* `cargo update` → 60+ compatible bumps. `cargo upgrade --incompatible` → three
+     majors **applied green** — `wide 1.5 → 1.6` (`nanna-simd`, compiled unchanged), `uuid 1.24 → 1.25`
+     (workspace + `nanna-server`), `playwright-rs 0.15 → 0.16` (`nanna-browser`, compiled unchanged under
+     `--features playwright`) — and two **rejected**, each for a reason worth carrying forward:
+     - **`rten 0.24 → 0.25` is blocked by `ocrs`, not by us.** `ocrs 0.12.2` (the latest) pins
+       `rten 0.24`, and `ocr.rs` hands an `rten::Model` straight into `OcrEngineParams`, so bumping the
+       direct req only puts **two incompatible `rten` copies** in the tree and the two `Model` types stop
+       being the same type. Reverted to `0.24`; re-check when `ocrs` ships against `rten 0.25`.
+     - **`cargo upgrade` reports `criterion` "latest 0.7.0" against our req `0.8` — that is a
+       downgrade, and it is wrong.** `cargo info criterion` says `0.8.2`, and `0.8.2` is what the lock
+       already resolves. Same class as the `vuedraggable`/`lucide` traps: never take an "upgrade" whose
+       proposed version is *lower* than the current req without checking the registry directly.
+     - **A compatible-range bump broke the build, which is the case the `--incompatible` review misses.**
+       Plain `cargo update` pulled `malachite-bigint 0.10.0` for `pymath 0.2.0` while
+       `rustpython-common` stayed on `0.9.2`, putting **two `BigInt` types** in `rustpython-stdlib` —
+       17 `E0308`/`E0277` errors. Pinned back with
+       `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; the lockfile is the only place this
+       can be held, so a future `cargo update` will re-break it until `rustpython 0.5` moves to
+       malachite 0.10. **Recognise it by the symptom:** `BigInt: From<malachite_bigint::biguint::BigUint>
+       is not satisfied` inside `rustpython-stdlib`.
+     - [x] **The release-profile hole is now closed by the freshness gate itself** (the `[ ]` item two
+           bullets below): this sweep ran `cargo build --release -p nanna-daemon` green in **21m54s**
+           under the pinned `nightly-2026-08-03`, and the whole branch was re-gated the same way at the
+           end of the run (**22m14s**, green). Debug build, **1593 workspace tests / 0 failures**, and
+           clippy (**0 errors**, 2741 pre-existing warnings — one fewer than the 2742 baseline, from the
+           `execute_call` split) also green.
+     - Frontend: `pnpm outdated` showed **only the documented deferred majors** plus three safe dev
+       patches, applied green — `happy-dom 20.11.6`, `vitest 4.1.11`, `vue-tsc 3.3.11`
+       (**159/159 vitest**, `pnpm build` clean, 4 routes prerendered). `pnpm update --latest` was **not**
+       run: it would take the `lucide-vue-next 1.0.0` tombstone and downgrade `vuedraggable`.
+     - *Gotcha added:* `crates/nanna-tools/Cargo.toml` is **CRLF** while the other manifests are LF, so
+       `sed -i` on it rewrites the whole file (a 128-line diff for a one-line bump). Use
+       `perl -0777 -pi -e 'binmode(ARGV); binmode(ARGVOUT); …'` for that one.
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
@@ -4613,6 +4863,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      the GUI build inherit it. The file carries the full ICE text and its removal condition.
      - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
            every dependency-freshness pass, and report the ICE upstream if it survives.
+           *(2026-08-24 — deliberately NOT attempted, and worth saying why rather than leaving it
+           looking forgotten.)* The candidate is **`1.100.0-nightly (fb6531d55, 2026-08-23)`**, up from
+           the pinned `nightly-2026-08-03` (`1.99.0-nightly 11177f223`). The probe is not a cheap check:
+           it needs a from-scratch debug build, the full test suite, **and** a release build under the
+           new toolchain. This machine's `~/.cargo/config.toml` points every crate at one shared
+           `target-dir` (`D:\Development\Cargo Target`), and throughout this run a build from a
+           *different* project was holding that directory's lock — a toolchain switch would have evicted
+           the workspace's cached artifacts mid-run for a probe that could not then be finished and
+           verified. **Next run should do this first**, before any other cargo work, so the cache
+           eviction is paid once at the start rather than stranding an increment.
+           - [ ] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
+                 The shared target dir is a standing tax: two toolchains and several worktrees contend
+                 for one lock, so builds serialise behind unrelated projects (observed this run: a
+                 4-minute incremental build took 12, and a 22-minute release build was mostly waiting).
+                 It is also the hazard already recorded for benchmarks — a binary in the shared
+                 `release/` may have been produced by another worktree.
      - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
@@ -4671,6 +4937,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      typecheck in ~55s, with no `pnpm build` and no daemon build. Packaging stays `release.yml`'s job,
      with the real artifacts. **Verified it catches the actual regression**: reverting the
      `channels.rs` fix makes the job's exact command report both `E0063`s.
+           *(2026-08-24)* **Now part of every freshness increment** — the 2026-08-24 sweep ran
+           `cargo build --release -p nanna-daemon` as a gate and it finished green in 21m54s. It is the
+           `nanna-daemon` package specifically because that is the one the pin's two known failures
+           (`tokio` codegen ICE, `turso_core` const-eval depth overflow) both surface through, and it is
+           what `pnpm build:daemon` ships as the Tauri sidecar.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at

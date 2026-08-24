@@ -192,6 +192,8 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         tools_dir: config.tools.tools_dir.clone(),
         tool_allowlist: Some(config.tools.enabled.clone()),
         tool_denylist: config.tools.disabled.clone(),
+        tool_audit_log: config.tools.audit_log,
+        tool_audit_log_values: config.tools.audit_log_values,
         // Legacy single-binary path: channels are not started here (matches the
         // field's Default). The daemon path wires channel config separately.
         channels: None,

@@ -95,6 +95,8 @@ A fully local run needs none.
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
 - **39 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
+- **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
+- **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
