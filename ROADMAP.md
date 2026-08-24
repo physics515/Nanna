@@ -487,7 +487,6 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       an app that renders model output and untrusted markdown. Tauri enables devtools automatically
       under `debug_assertions`, so `tauri dev` is unaffected, and a release build gets the inspector
       only by asking for `--features devtools`. No other reference to the feature exists in the crate.
-- [ ] Per-tool toggles visible in GUI; audit log for every tool call.
 - [x] **Chat markdown was rendered unsanitized into `v-html` — the CSP was the only layer.**
       *(2026-08-24)* `MarkdownContent.vue` ran `marked.parse()` straight into `v-html`, and `marked`
       has not sanitized since v5 (the `sanitize` option was removed). Verified against the installed
@@ -527,12 +526,6 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       is a pure function whose 26 tests already assert against a real DOM, so the marginal value was low
       next to a full release build of the whole workspace on a contended shared target dir. Worth doing
       on a run that is building the GUI anyway.
-- [x] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
-      *(2026-08-24 — verified, the roadmap was stale, not the code.)* `gui/src-tauri/Cargo.toml` already
-      has `default = ["custom-protocol"]` with `devtools = ["tauri/devtools"]` kept **out** of it, and a
-      comment saying why (the webview renders model output and untrusted markdown; Tauri enables devtools
-      automatically under `debug_assertions`, so `tauri dev` is unaffected). A release build opts in with
-      `--features devtools`.
 - [~] Per-tool toggles visible in GUI; audit log for every tool call.
       *(2026-08-24)* **The audit half shipped.** New `nanna-tools::audit` records **one structured JSON
       line per tool call** at the single chokepoint every caller funnels through — `ToolRegistry::execute`.
