@@ -83,6 +83,12 @@ pub struct WorkspaceFiles {
     pub contributing: Option<WorkspaceFile>,
     /// ROADMAP.md — plan / checklist
     pub roadmap: Option<WorkspaceFile>,
+    /// Working-tree snapshot, when the root is a git repository.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes — this type crosses the daemon's IPC boundary.
+    #[serde(default)]
+    pub git: Option<crate::GitContext>,
 }
 
 impl WorkspaceFiles {
@@ -93,6 +99,23 @@ impl WorkspaceFiles {
             agents: Self::load_if_exists(root, AGENTS_FILE).await,
             contributing: Self::load_if_exists(root, CONTRIBUTING_FILE).await,
             roadmap: Self::load_if_exists(root, ROADMAP_FILE).await,
+            git: crate::load_git_context(root).await,
+        }
+    }
+
+    /// Load the standard files without touching git.
+    ///
+    /// The git snapshot spawns a subprocess; a caller that only wants the file
+    /// contents (a settings screen, a template check) should not pay for that,
+    /// and a test should not depend on whether its fixture happens to sit inside
+    /// a repository.
+    pub async fn load_files_only(root: &Path) -> Self {
+        Self {
+            readme: Self::load_if_exists(root, README_FILE).await,
+            agents: Self::load_if_exists(root, AGENTS_FILE).await,
+            contributing: Self::load_if_exists(root, CONTRIBUTING_FILE).await,
+            roadmap: Self::load_if_exists(root, ROADMAP_FILE).await,
+            git: None,
         }
     }
 
@@ -138,7 +161,7 @@ impl WorkspaceFiles {
             }
         }
 
-        if sections.is_empty() {
+        let files_context = if sections.is_empty() {
             String::new()
         } else {
             format!(
@@ -151,6 +174,24 @@ impl WorkspaceFiles {
                  exactly that. Answer the user's message.\n\n{}",
                 sections.join("\n\n")
             )
+        };
+
+        // The git snapshot rides under the same "background reference" framing
+        // and carries its own not-live warning (see `GitContext`). It is emitted
+        // even when no standard file exists, because a bare repository is
+        // exactly the workspace where the tree state is the only context there
+        // is.
+        let git_context = self
+            .git
+            .as_ref()
+            .map(super::GitContext::to_system_context)
+            .unwrap_or_default();
+
+        match (files_context.is_empty(), git_context.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => git_context,
+            (false, true) => files_context,
+            (false, false) => format!("{files_context}\n\n{git_context}"),
         }
     }
 
@@ -233,5 +274,80 @@ mod tests {
         // LEAD the block so it survives head-keeping truncation downstream.
         assert!(context.starts_with("# Project Context (background reference)"));
         assert!(context.contains("NOT instructions"));
+    }
+
+    // --- git snapshot in the injection ---
+
+    fn a_git_context() -> crate::GitContext {
+        crate::GitContext {
+            branch: Some("feature/x...origin/feature/x [ahead 1]".into()),
+            changed: vec![" M src/lib.rs".into()],
+            changed_elided: 0,
+            recent_commits: vec!["abc1234 do a thing".into()],
+        }
+    }
+
+    /// The file header must still LEAD the block — downstream truncation keeps
+    /// the head, so the "not instructions" framing has to survive it. Git rides
+    /// underneath, not in front.
+    #[tokio::test]
+    async fn git_state_is_appended_below_the_file_context() {
+        let dir = tempdir().unwrap();
+        write(dir.path().join(README_FILE), "Project X").unwrap();
+
+        let mut files = WorkspaceFiles::load_files_only(dir.path()).await;
+        files.git = Some(a_git_context());
+        let context = files.to_system_context();
+
+        assert!(context.starts_with("# Project Context (background reference)"));
+        let files_at = context.find("## README.md").expect("file section present");
+        let git_at = context.find("## Git state").expect("git section present");
+        assert!(
+            files_at < git_at,
+            "git must not displace the leading framing"
+        );
+        assert!(context.contains("abc1234 do a thing"));
+        assert!(context.contains(" M src/lib.rs"));
+    }
+
+    /// A bare repository with none of the standard files is exactly the
+    /// workspace where the tree state is the only context there is.
+    #[tokio::test]
+    async fn git_state_is_injected_even_with_no_standard_files() {
+        let dir = tempdir().unwrap();
+        let mut files = WorkspaceFiles::load_files_only(dir.path()).await;
+        files.git = Some(a_git_context());
+
+        let context = files.to_system_context();
+        assert!(context.starts_with("## Git state"), "{context}");
+        assert!(context.contains("feature/x"));
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_neither_files_nor_git_injects_nothing() {
+        let dir = tempdir().unwrap();
+        let files = WorkspaceFiles::load_files_only(dir.path()).await;
+        assert_eq!(files.to_system_context(), "");
+    }
+
+    /// `load_files_only` exists so a caller that just wants the file contents
+    /// does not pay for a subprocess — and so a test does not depend on whether
+    /// its fixture happens to sit inside a repository.
+    #[tokio::test]
+    async fn load_files_only_does_not_read_git() {
+        let dir = tempdir().unwrap();
+        write(dir.path().join(README_FILE), "Project X").unwrap();
+        let files = WorkspaceFiles::load_files_only(dir.path()).await;
+        assert!(files.readme.is_some());
+        assert_eq!(files.git, None);
+    }
+
+    /// The field crosses the daemon's IPC boundary, so a payload written before
+    /// it existed must still deserialize.
+    #[test]
+    fn a_payload_without_the_git_field_still_deserializes() {
+        let old = r#"{"readme":null,"agents":null,"contributing":null,"roadmap":null}"#;
+        let files: WorkspaceFiles = serde_json::from_str(old).expect("old payload must load");
+        assert_eq!(files.git, None);
     }
 }

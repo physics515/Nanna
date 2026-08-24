@@ -7190,6 +7190,7 @@ mod workspace_reference_tests {
             contributing: None,
             // A 1000-line roadmap — far past what a 16k window can spare.
             roadmap: Some("- [ ] migrate a file off lucide-vue-next\n".repeat(1_000)),
+            git: None,
         };
 
         let mut ctx = AgentContext::new("t");

@@ -11,11 +11,17 @@
 
 mod discovery;
 mod files;
+mod git;
 mod manager;
 mod templates;
 
 pub use discovery::{discover_workspace, find_workspace_root, get_markers, is_workspace, WorkspaceMarker};
 pub use files::{WorkspaceFile, WorkspaceFiles};
+pub use git::{
+    GIT_CHANGED_PATHS_MAX, GIT_LINE_BYTES_MAX, GIT_OUTPUT_BYTES_MAX, GIT_RECENT_COMMITS_MAX,
+    GIT_TIMEOUT, GitContext, is_git_repo, load_git_context,
+};
+
 pub use manager::{Workspace, WorkspaceConfig, WorkspaceManager};
 pub use templates::{create_from_template, list_templates, WorkspaceTemplate};
 

@@ -69,6 +69,14 @@ pub struct WorkspaceContext {
     pub contributing: Option<String>,
     /// ROADMAP.md — plan / checklist
     pub roadmap: Option<String>,
+    /// Working-tree snapshot, when the root is a git repository.
+    ///
+    /// The type is `nanna_workspace`'s rather than a copy, so the two parallel
+    /// injection producers cannot drift on what a git snapshot is or how it is
+    /// bounded. `#[serde(default)]` keeps payloads written before this field
+    /// existed loadable — this type crosses the daemon's IPC boundary.
+    #[serde(default)]
+    pub git: Option<nanna_workspace::GitContext>,
 }
 
 impl WorkspaceContext {
@@ -79,6 +87,7 @@ impl WorkspaceContext {
             && self.agents.is_none()
             && self.contributing.is_none()
             && self.roadmap.is_none()
+            && self.git.is_none()
     }
 
     /// Build a system prompt injection from the standard project files.
@@ -92,7 +101,8 @@ impl WorkspaceContext {
     /// model, and the user's message decides what to do with them.
     ///
     /// Keep the header in sync with `WorkspaceFiles::to_system_context` in
-    /// `nanna-workspace` (parallel producer, no shared crate between them).
+    /// `nanna-workspace` (parallel producer; only the git half is shared —
+    /// [`nanna_workspace::GitContext`] renders itself for both).
     #[must_use]
     pub fn build_system_prompt_injection(&self) -> String {
         let mut parts = Vec::new();
@@ -110,7 +120,7 @@ impl WorkspaceContext {
             parts.push(format!("## ROADMAP.md\n{roadmap}"));
         }
 
-        if parts.is_empty() {
+        let files_context = if parts.is_empty() {
             String::new()
         } else {
             format!(
@@ -123,10 +133,31 @@ impl WorkspaceContext {
                  exactly that. Answer the user's message.\n\n{}",
                 parts.join("\n\n")
             )
+        };
+
+        // The git snapshot goes BELOW the files, never above: downstream
+        // truncation keeps the head, so the "NOT instructions" framing has to
+        // stay in front of everything it governs.
+        let git_context = self
+            .git
+            .as_ref()
+            .map(nanna_workspace::GitContext::to_system_context)
+            .unwrap_or_default();
+
+        match (files_context.is_empty(), git_context.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => git_context,
+            (false, true) => files_context,
+            (false, false) => format!("{files_context}\n\n{git_context}"),
         }
     }
 
-    /// Get total character count of all context
+    /// Character count of the *file* context.
+    ///
+    /// The git snapshot is excluded deliberately: this number exists to size the
+    /// unbounded half (a 1000-line ROADMAP.md is what overran a 16k window), and
+    /// the snapshot is bounded by construction, so folding it in would only blur
+    /// the signal this is read for.
     #[must_use]
     pub fn total_chars(&self) -> usize {
         self.readme.as_ref().map_or(0, String::len)
@@ -256,6 +287,10 @@ impl Workspace {
             agents: read_optional_file(&root.join(AGENTS_FILE)).await?,
             contributing: read_optional_file(&root.join(CONTRIBUTING_FILE)).await?,
             roadmap: read_optional_file(&root.join(ROADMAP_FILE)).await?,
+            // Re-read every time this runs, which the chat path does per turn:
+            // a stale tree snapshot is worse than none, and the whole point is
+            // that it reflects what is on disk right now.
+            git: nanna_workspace::load_git_context(root).await,
         };
 
         // One-shot legacy import: if root AGENTS.md is missing but `.nanna/AGENTS.md`
@@ -585,6 +620,7 @@ mod tests {
             agents: Some("Be careful".into()),
             contributing: None,
             roadmap: Some("Ship it".into()),
+            git: None,
         };
         let injection = ctx.build_system_prompt_injection();
         assert!(injection.contains("README.md"));
