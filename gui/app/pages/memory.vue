@@ -87,7 +87,7 @@
               <div class="flex items-center gap-1 shrink-0">
                 <button
                   v-if="editingMemoryId !== memory.id"
-                  @click="startEditMemory(memory)"
+                  @click="startEditing(memory)"
                   class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-white/50 transition-all p-1"
                   title="Edit memory"
                 >
@@ -98,7 +98,7 @@
                   size="xs"
                   color="accent"
                   pill
-                  @click="saveEditMemory(memory)"
+                  @click="saveEditing(memory.id)"
                 >
                   Save
                 </UiGlassButton>
@@ -107,7 +107,7 @@
                   size="xs"
                   color="default"
                   pill
-                  @click="cancelEditMemory"
+                  @click="cancelEditing"
                 >
                   Cancel
                 </UiGlassButton>
@@ -148,7 +148,7 @@
               <div class="flex items-center gap-1 shrink-0">
                 <button
                   v-if="editingMemoryId !== memory.id"
-                  @click="startEditMemory(memory)"
+                  @click="startEditing(memory)"
                   class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-white/50 transition-all p-1"
                   title="Edit memory"
                 >
@@ -159,7 +159,7 @@
                   size="xs"
                   color="accent"
                   pill
-                  @click="saveEditMemory(memory)"
+                  @click="saveEditing(memory.id)"
                 >
                   Save
                 </UiGlassButton>
@@ -168,7 +168,7 @@
                   size="xs"
                   color="default"
                   pill
-                  @click="cancelEditMemory"
+                  @click="cancelEditing"
                 >
                   Cancel
                 </UiGlassButton>

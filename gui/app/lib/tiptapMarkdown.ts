@@ -14,16 +14,25 @@ export function markdownToHtml(md: string): string {
   const html: string[] = []
   let i = 0
 
+  // Total accessor. `noUncheckedIndexedAccess` types `lines[i]` as
+  // `string | undefined` even under an `i < lines.length` guard, and every read
+  // below sits under one — so `at()` never actually substitutes. It supplies the
+  // proof the checker cannot derive, without a `!` assertion: `!` is erased at
+  // runtime, so it would let a genuine out-of-range read stringify into the
+  // user's message as "undefined". A characterization suite
+  // (`tiptapMarkdownGolden.spec.ts`) pins that the output is byte-identical.
+  const at = (n: number): string => lines[n] ?? ''
+
   while (i < lines.length) {
-    const line = lines[i]
+    const line = at(i)
 
     // Fenced code blocks → MonacoCodeBlock node
     if (line.startsWith('```')) {
       const lang = line.slice(3).trim()
       const codeLines: string[] = []
       i++
-      while (i < lines.length && !lines[i].startsWith('```')) {
-        codeLines.push(lines[i])
+      while (i < lines.length && !at(i).startsWith('```')) {
+        codeLines.push(at(i))
         i++
       }
       i++ // skip closing ```
@@ -36,8 +45,8 @@ export function markdownToHtml(md: string): string {
     // Headings
     const headingMatch = line.match(/^(#{1,6})\s+(.*)/)
     if (headingMatch) {
-      const level = headingMatch[1].length
-      html.push(`<h${level}>${inlineMd(headingMatch[2])}</h${level}>`)
+      const level = (headingMatch[1] ?? '').length
+      html.push(`<h${level}>${inlineMd(headingMatch[2] ?? '')}</h${level}>`)
       i++
       continue
     }
@@ -45,8 +54,8 @@ export function markdownToHtml(md: string): string {
     // Blockquote
     if (line.startsWith('> ')) {
       const quoteLines: string[] = []
-      while (i < lines.length && lines[i].startsWith('> ')) {
-        quoteLines.push(lines[i].slice(2))
+      while (i < lines.length && at(i).startsWith('> ')) {
+        quoteLines.push(at(i).slice(2))
         i++
       }
       html.push(`<blockquote><p>${inlineMd(quoteLines.join('<br>'))}</p></blockquote>`)
@@ -57,10 +66,10 @@ export function markdownToHtml(md: string): string {
     if (line.match(/^- \[([ x])\]\s/)) {
       const items: string[] = []
       while (i < lines.length) {
-        const tm = lines[i].match(/^- \[([ x])\]\s+(.*)/)
+        const tm = at(i).match(/^- \[([ x])\]\s+(.*)/)
         if (!tm) break
         const checked = tm[1] === 'x' ? ' data-checked="true"' : ''
-        items.push(`<li data-type="taskItem"${checked}><p>${inlineMd(tm[2])}</p></li>`)
+        items.push(`<li data-type="taskItem"${checked}><p>${inlineMd(tm[2] ?? '')}</p></li>`)
         i++
       }
       html.push(`<ul data-type="taskList">${items.join('')}</ul>`)
@@ -70,8 +79,8 @@ export function markdownToHtml(md: string): string {
     // Unordered list
     if (line.match(/^[-*]\s+/)) {
       const items: string[] = []
-      while (i < lines.length && lines[i].match(/^[-*]\s+/)) {
-        items.push(`<li><p>${inlineMd(lines[i].replace(/^[-*]\s+/, ''))}</p></li>`)
+      while (i < lines.length && at(i).match(/^[-*]\s+/)) {
+        items.push(`<li><p>${inlineMd(at(i).replace(/^[-*]\s+/, ''))}</p></li>`)
         i++
       }
       html.push(`<ul>${items.join('')}</ul>`)
@@ -81,8 +90,8 @@ export function markdownToHtml(md: string): string {
     // Ordered list
     if (line.match(/^\d+\.\s+/)) {
       const items: string[] = []
-      while (i < lines.length && lines[i].match(/^\d+\.\s+/)) {
-        items.push(`<li><p>${inlineMd(lines[i].replace(/^\d+\.\s+/, ''))}</p></li>`)
+      while (i < lines.length && at(i).match(/^\d+\.\s+/)) {
+        items.push(`<li><p>${inlineMd(at(i).replace(/^\d+\.\s+/, ''))}</p></li>`)
         i++
       }
       html.push(`<ol>${items.join('')}</ol>`)
@@ -99,7 +108,7 @@ export function markdownToHtml(md: string): string {
     // Image
     const imgMatch = line.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
     if (imgMatch) {
-      html.push(`<img src="${escAttr(imgMatch[2])}" alt="${escAttr(imgMatch[1])}" />`)
+      html.push(`<img src="${escAttr(imgMatch[2] ?? '')}" alt="${escAttr(imgMatch[1] ?? '')}" />`)
       i++
       continue
     }
@@ -169,7 +178,7 @@ export function jsonToMarkdown(doc: any): string {
     }
   }).reduce((acc: string, block: string, i: number, arr: string[]) => {
     if (i === 0) return block
-    const prev = arr[i - 1]
+    const prev = arr[i - 1] ?? ''
     const isCodeBlock = block.startsWith('```')
     const prevIsCodeBlock = prev.endsWith('```')
     if (isCodeBlock || prevIsCodeBlock) return acc + '\n' + block

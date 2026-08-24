@@ -322,6 +322,15 @@ pub struct TelegramConfig {
     pub bot_token: String,
     pub webhook_url: Option<String>,
     pub allowed_users: Option<Vec<i64>>,
+    /// Secret token passed to Telegram's `setWebhook` and echoed back on every
+    /// inbound POST as `X-Telegram-Bot-Api-Secret-Token`.
+    ///
+    /// This is the ONLY origin proof the Telegram webhook has: the route is a
+    /// fixed path with no bot token in it, so without this value anyone who can
+    /// reach the port can drive the agent. The endpoint refuses to serve until
+    /// it is set.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +349,15 @@ pub struct SlackConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalConfig {
+    /// Shared secret the signal-cli-rest-api bridge must present on every
+    /// inbound webhook, as `Authorization: Bearer <secret>` or
+    /// `X-Webhook-Secret: <secret>`.
+    ///
+    /// signal-cli-rest-api does not sign its callbacks, so a shared secret is
+    /// the strongest proof available on this path. Without it the endpoint
+    /// cannot tell the bridge from any other caller and refuses to serve.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     /// Phone number registered with Signal (e.g., "+1234567890")
     pub phone_number: String,
     /// URL of signal-cli-rest-api instance
@@ -797,6 +815,7 @@ impl Config {
                 bot_token: token,
                 webhook_url: std::env::var("TELEGRAM_WEBHOOK_URL").ok(),
                 allowed_users: None,
+                webhook_secret: std::env::var("TELEGRAM_WEBHOOK_SECRET").ok(),
             });
         }
 

@@ -30,6 +30,7 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "@tiptap/core": "2.27.2",
     "@tiptap/extension-bubble-menu": "2.27.2",
     "@tiptap/extension-code-block": "^2.27.2",
     "@tiptap/extension-image": "2.27.2",
@@ -64,12 +65,12 @@
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/test-utils": "^2.4.11",
-    "happy-dom": "^20.11.2",
+    "happy-dom": "^20.11.6",
     "postcss": "^8.5.26",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10",
-    "vue-tsc": "^3.3.9"
+    "vitest": "^4.1.11",
+    "vue-tsc": "^3.3.11"
   },
   "packageManager": "pnpm@9.11.0"
 }

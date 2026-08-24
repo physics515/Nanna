@@ -3792,12 +3792,16 @@ pub struct DaemonBuilder {
 }
 
 /// Copy the signature-verification secrets from the user's channel config into a
-/// [`WebhookConfig`]. Only providers the user configured are set; each verifier
-/// skips when its secret is `None`, so unset providers keep the previous value.
+/// [`WebhookConfig`]. Only providers the user configured are set, so unset
+/// providers keep the previous value — and a provider that ends up with no
+/// secret serves no webhook at all (`refuse_unconfigured` in `webhook.rs`).
 ///
-/// Telegram is intentionally absent: its `TelegramConfig` carries no webhook
-/// secret (Telegram authenticates via the bot token in the URL), only the bot
-/// token (registered for outbound sends).
+/// Telegram used to be absent here on the reasoning that "Telegram
+/// authenticates via the bot token in the URL". That was wrong about this
+/// implementation: the route is the fixed path `/webhook/telegram` with no
+/// token in it, so nothing was ever verified. `telegram_secret` now carries the
+/// `setWebhook` secret token, which Telegram echoes as
+/// `X-Telegram-Bot-Api-Secret-Token` on every POST.
 fn apply_channel_webhook_secrets(
     webhook: &mut WebhookConfig,
     channels: &nanna_config::ChannelsConfig,
@@ -3814,6 +3818,7 @@ fn apply_channel_webhook_secrets(
     }
     if let Some(ref telegram) = channels.telegram {
         webhook.telegram_token = Some(telegram.bot_token.clone());
+        webhook.telegram_secret = telegram.webhook_secret.clone();
     }
 }
 

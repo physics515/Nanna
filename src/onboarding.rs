@@ -185,10 +185,25 @@ fn configure_channels(config: &mut Config, theme: &ColorfulTheme) -> anyhow::Res
             .interact()?;
 
         if !token.is_empty() {
+            // Mint the webhook secret here rather than asking for one. It is
+            // the ONLY origin proof the Telegram webhook route has (the path
+            // carries no bot token), the endpoint refuses to serve without it,
+            // and a secret a human invents is a secret a human can guess. A
+            // v4 UUID with the dashes stripped is 32 hex chars / 122 random
+            // bits, well inside Telegram's 1-256 `[A-Za-z0-9_-]` limit.
+            let webhook_secret = uuid::Uuid::new_v4().simple().to_string();
+            println!(
+                "  {CHECK}Telegram webhook secret generated. Register it with Telegram:\n    \
+                 curl -s \"https://api.telegram.org/bot<token>/setWebhook\" \\\n      \
+                 -d url=<your-webhook-url>/webhook/telegram \\\n      \
+                 -d secret_token={webhook_secret}\n  \
+                 Until Telegram sends this token back, the webhook endpoint refuses every request."
+            );
             config.channels.telegram = Some(TelegramConfig {
                 bot_token: token,
                 webhook_url: None,
                 allowed_users: None,
+                webhook_secret: Some(webhook_secret),
             });
             println!("  {CHECK}Telegram configured");
         }

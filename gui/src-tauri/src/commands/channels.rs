@@ -28,10 +28,27 @@ pub async fn save_channel_config(
                     if ids.is_empty() { None } else { Some(ids) }
                 });
 
+            // The webhook secret is the ONLY origin proof the Telegram route
+            // has — the path carries no bot token — and the endpoint refuses to
+            // serve without it. So a channel configured here without one would
+            // be permanently 503, which is why this is minted rather than left
+            // `None`. Matches what `nanna init` does: a v4 UUID with the dashes
+            // stripped is 32 hex chars / 122 random bits, well inside Telegram's
+            // 1-256 `[A-Za-z0-9_-]` limit — and a secret a human invents is a
+            // secret a human can guess. An explicitly supplied one wins, so
+            // re-running this never silently rotates a secret already
+            // registered with Telegram's `setWebhook`.
+            let webhook_secret = config
+                .get("webhook_secret")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
             state_guard.config.channels.telegram = Some(nanna_config::TelegramConfig {
                 bot_token,
                 webhook_url,
                 allowed_users,
+                webhook_secret: Some(webhook_secret),
             });
         }
         "discord" => {
@@ -74,10 +91,23 @@ pub async fn save_channel_config(
             let allowed_numbers = config.get("allowed_numbers")
                 .map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
 
+            // Unlike Telegram's, this secret cannot be minted here: the
+            // signal-cli-rest-api bridge is a separate process that must be
+            // configured to present it, so a value this end invents would arm
+            // an endpoint the bridge cannot satisfy. Carry through what the
+            // operator supplies, and leave it unset otherwise — the endpoint
+            // then refuses with a 503 that names the key, which is the honest
+            // outcome for "half configured".
+            let webhook_secret = config
+                .get("webhook_secret")
+                .filter(|s| !s.trim().is_empty())
+                .cloned();
+
             state_guard.config.channels.signal = Some(nanna_config::SignalConfig {
                 phone_number,
                 api_url,
                 allowed_numbers,
+                webhook_secret,
             });
         }
         "whatsapp" => {

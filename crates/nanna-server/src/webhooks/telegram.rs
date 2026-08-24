@@ -1,7 +1,8 @@
 //! Telegram webhook handler
 
 use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use crate::webhooks::auth;
+use axum::{Json, body::Bytes, extract::State, http::HeaderMap, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -101,10 +102,36 @@ pub struct TelegramResponse {
 }
 
 /// Handle incoming Telegram webhook
+///
+/// Origin proof is the `secret_token` given to Telegram's `setWebhook`, which
+/// it echoes as `X-Telegram-Bot-Api-Secret-Token` on every POST. This route is
+/// a fixed path with no bot token in it, so that header is the ONLY thing
+/// separating Telegram from any other caller who can reach the port — and the
+/// payload drives the agent, which runs tools. No secret configured means no
+/// service (see `auth::refuse_unconfigured`).
 pub async fn handle(
     State(state): State<AppState>,
-    Json(update): Json<TelegramUpdate>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<TelegramResponse>, StatusCode> {
+    let Some(secret) = auth::configured(state.telegram_webhook_secret.as_ref()) else {
+        return Err(auth::refuse_unconfigured(
+            "Telegram",
+            "channels.telegram.webhook_secret",
+        ));
+    };
+    let presented = headers
+        .get("X-Telegram-Bot-Api-Secret-Token")
+        .and_then(|v| v.to_str().ok());
+    if !auth::secret_matches(secret, presented) {
+        warn!("Telegram webhook: invalid secret token");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Parse only now. `Bytes` rather than `Json<T>` so the credential check
+    // above runs first — see `auth::parse_authenticated_body`.
+    let update: TelegramUpdate = auth::parse_authenticated_body("Telegram", &body)?;
+
     debug!("Received Telegram update: {:?}", update.update_id);
 
     // Handle message reactions (for memory feedback)

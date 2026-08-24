@@ -172,8 +172,8 @@ async function confirmDelete() {
   const confirmed = await confirm({
     title: 'Delete Session',
     message: `Delete "${props.session.name}"? This cannot be undone.`,
-    confirmText: 'Delete',
-    destructive: true
+    confirmLabel: 'Delete',
+    danger: true
   })
   if (!confirmed) return
   try {
