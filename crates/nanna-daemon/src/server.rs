@@ -1079,6 +1079,12 @@ pub struct DaemonConfig {
     /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
     /// tool actually stop executing (previously the list was parsed but ignored).
     pub tool_denylist: Vec<String>,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    /// Mirrors `[tools] audit_log`.
+    pub tool_audit_log: bool,
+    /// Include a bounded preview of tool arguments in that trail.
+    /// Mirrors `[tools] audit_log_values`.
+    pub tool_audit_log_values: bool,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -1223,6 +1229,8 @@ impl Default for DaemonConfig {
             tools_dir: None,
             tool_allowlist: None,
             tool_denylist: Vec::new(),
+            tool_audit_log: true,
+            tool_audit_log_values: false,
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -3592,6 +3600,25 @@ impl DaemonServer {
             tools.set_policy(policy).await;
         }
 
+        // Attach the per-call audit trail. It sits on the registry rather than
+        // on the agent loop deliberately: the loop is only one of the callers
+        // (chat harness, task tool, scheduled runs and the MCP bridge all call
+        // the registry directly), and an audit that saw only one of them would
+        // be worse than none — it would read as a complete account.
+        if self.config.tool_audit_log {
+            let path = self.config.data_dir.join("logs").join("tool-audit.jsonl");
+            let sink = nanna_tools::JsonlAuditSink::new(
+                path.clone(),
+                nanna_tools::ToolAuditConfig {
+                    include_values: self.config.tool_audit_log_values,
+                    ..Default::default()
+                },
+            );
+            tools.set_audit_sink(Some(Arc::new(sink))).await;
+            info!(path = %path.display(), values = self.config.tool_audit_log_values,
+                  "Tool audit trail enabled");
+        }
+
         // Create agent service with multi-provider router
         let event_tx = self.ipc.event_sender();
         let mut agent_service = AgentService::with_data_dir(
@@ -3883,6 +3910,8 @@ impl DaemonBuilder {
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
         builder.config.tool_denylist = config.tools.disabled.clone();
+        builder.config.tool_audit_log = config.tools.audit_log;
+        builder.config.tool_audit_log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()

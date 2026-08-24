@@ -382,6 +382,22 @@ pub struct ToolsConfig {
     /// Directory containing tool scripts (default: {data_dir}/tools/)
     /// Can be overridden with NANNA_TOOLS_DIR environment variable
     pub tools_dir: Option<PathBuf>,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    ///
+    /// On by default: the daemon runs unattended, and "what did it do while I
+    /// was asleep" has no other answer — the aggregate counters live only on the
+    /// agent-loop path, and the per-call `debug!` lines are off at the default
+    /// level. The trail is size-capped with one generation of rollover, so
+    /// leaving it on cannot grow without bound.
+    pub audit_log: bool,
+    /// Include a bounded preview of tool *arguments* in the audit trail.
+    ///
+    /// Off by default, and deliberately separate from [`Self::audit_log`]:
+    /// arguments carry secrets (an API key in a request, the body of a file
+    /// being written), and the trail is durable plaintext that outlives the run
+    /// that produced it. Key *names* are always recorded, which answers most
+    /// audit questions without creating a secret sink.
+    pub audit_log_values: bool,
 }
 
 impl Default for ToolsConfig {
@@ -394,6 +410,8 @@ impl Default for ToolsConfig {
             brave_api_key: None,
             use_script_tools: true,
             tools_dir: None,
+            audit_log: true,
+            audit_log_values: false,
         }
     }
 }
