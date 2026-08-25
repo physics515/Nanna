@@ -32,8 +32,20 @@ pub enum BrowserError {
     ElementNotFound(String),
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
-    #[error("Timeout")]
-    Timeout,
+    /// A page operation ran past the browser's configured deadline.
+    ///
+    /// Carries what was waiting and for how long. The bare `Timeout` this
+    /// replaces had no consumers and no constructors — the deadline it stood
+    /// for was configured (`BrowserConfig::timeout_ms`, default 30 s), threaded
+    /// into `CdpPage`, and then never applied to a single CDP round-trip, so
+    /// every page operation waited forever on a hung page.
+    #[error("browser {operation} did not finish within {timeout_ms} ms")]
+    Timeout {
+        /// The page operation that ran out of time.
+        operation: String,
+        /// The deadline it exceeded — `BrowserConfig::timeout_ms`.
+        timeout_ms: u64,
+    },
     #[error("Unsupported browser: {0}")]
     UnsupportedBrowser(String),
 }

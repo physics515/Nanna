@@ -1770,6 +1770,30 @@ Kept as a compact ledger; the full dated rationale and `file:line` anchors for e
 - [x] Deterministic tests — env-flaky keyring fallback + env-race `resolve_tools_dir` fixed; latent test/compile drift repaired; `test-compile.yml` CI smoke check added (first run green, 16m cold). *(2026-07-06 → 17)*
 - [x] Python interpreter runs on a sized 256 MiB thread stack with `sys.setrecursionlimit` clamped so it can't abort. The floor is principled — derived from the empirical overflow bisection (release passes at 128 MiB) — and a separate in-process *setup*-stack measurement was found **Windows-infeasible** (paint-and-scan faults on the lazily-committed stack past the guard page; overflow aborts uncatchably — verified), so the size stays anchored to the bisection rather than a magic number. *(2026-07-16 / 18)*
 
+**Dead-code warnings were two disabled features, not two unused names (2026-08-25).** Both surfaced
+as `field ... is never read` and both turned out to be a bound or a feature that had been wired up to
+the edge and then not connected. Recorded because "delete the field" would have been the wrong reading
+of either one:
+- [x] **Every CDP browser page operation was unbounded.** `BrowserConfig::timeout_ms` (default 30 s,
+      with a public builder) was threaded into `CdpPage` and read by nothing, and
+      `BrowserError::Timeout` had no constructors either — so `goto`, `screenshot`, `evaluate` and
+      `wait_for_selector` waited on a hung page forever, with no cancellation and no error. All 13 page
+      operations now run under that deadline via one `bounded` helper; `fill` and `goto` take a single
+      budget for their whole multi-call sequence rather than one per CDP round-trip, so a degraded page
+      cannot spend 4× the stated timeout while every step stays inside it. `Timeout` now carries the
+      operation and the deadline it exceeded. The bound is extracted as a free function so it is
+      testable without a live browser — the missing test dependency is a large part of why it went
+      unapplied — and **4 tests** cover it: a hung operation is cut off (without the bound this test
+      does not fail, it hangs; verified by disabling the timeout and killing the run at 45 s), a
+      finished one keeps its result, a real failure is not relabelled a timeout, and a slow-but-legal
+      operation still succeeds.
+- [x] **`TursoTaskSource::workdir` was the last residue of a deliberately cut experiment.** Hard-coded
+      to `None` by the only constructor and read by nothing, while its doc comment read as though
+      ancestor-promotion existed and was merely switched off. The experiment was cut as
+      benchmark-shaped (it converted the eval metric directly and would almost never fire in a chat
+      workflow); the field is removed and the reason now lives at the surviving `clear_open_descendants`
+      call, so nobody re-derives it from a suggestive field name.
+
 **Architecture (all done, 2026-07-16):** decomposed `gui/src-tauri/src/lib.rs`, `control.rs`, `settings.vue`, and `main.rs` into per-domain modules; unified the embedded↔daemon agent loop onto `AgentService` (later removed wholesale by P16).
 
 **Embedded-mode items — superseded by P16 (2026-07-18):** the GUI embedding-dimension probe, the silent daemon→embedded fallback, `recall`-broken-in-embedded, and "only three tools in embedded" are all closed by P16's deletion of embedded mode — the GUI is now a pure daemon client, a failed connect is an explicit `Disconnected`, and the daemon loads all 39 skills. The one real remainder — a **local offline embedder** — is a P12 deliverable ("Local embeddings in Burn"); the P11 soft-degrade (actionable `NoEmbeddingProvider`, non-error `recall` result) is done. Stale `9833` sidecar-port doc fixed to `5149`.

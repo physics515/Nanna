@@ -1128,10 +1128,6 @@ pub struct TursoTaskSource {
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1149,7 +1145,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 
@@ -1302,7 +1297,13 @@ impl TaskSource for TursoTaskSource {
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
         // the eval metric directly and would almost never fire in a chat
-        // workflow, where tasks rarely carry machine checks). This is pure
+        // workflow, where tasks rarely carry machine checks). Its last residue
+        // was a `workdir: Option<PathBuf>` on this struct, hard-coded to `None`
+        // by the only constructor and read by nothing — a dead-code warning
+        // whose doc comment nonetheless read as though promotion existed and
+        // was merely switched off. Removed; if promotion is ever wanted back it
+        // needs a deliberate design, not a field waiting to be filled in. This
+        // is pure
         // coherence: a parent proven done with scaffolding still open is a
         // contradictory state, and working those children is spending steps on
         // a goal that no longer exists.
