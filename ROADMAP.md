@@ -4147,7 +4147,7 @@ MissionEnd honesty, repeat-done escalation, structural shrink holds, byte-floor 
 truthful tool acks (zero phantom registry saves, against 201 previously), exit-reason
 file. The series produced one crash bug and five carry-forward items below.
 
-### P24 — Sessions that keep their work, and tell the truth about it 🌱 (new — 2026-08-17, review-driven)
+### P24 — Sessions that keep their work, and tell the truth about it ✅ (2026-08-17; all 21 items landed, audited 2026-08-25)
 
 Successor to P23. Produced by a systematic review of five long autonomous sessions on
 v0.3.8-beta.13: 93 candidate findings, each put through two independent adversarial
@@ -4213,9 +4213,69 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       the chunks no longer cost the turn anything — and the cap must still not be derived from the
       retrieval top-k (see the item's own note).
       - [ ] Bound the chunk *count* per tool result on a principle that is not the retrieval top-k.
-- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
-      listed above and deliberately did not claim the rest; a per-item pass would let this whole
-      section collapse to a few lines of history.
+- [x] **Audited item by item, 2026-08-25 — every P24 item has landed.** The 2026-08-21 pass
+      verified 8 anchors and deliberately declined to claim the rest; this pass checked the
+      remaining 13 against the tree. Each verdict below names the anchor that proves it, so the
+      next reader can re-check one item without re-deriving the whole section. **The defect
+      write-ups below are kept as the reasoning record, not as open work** — the section header
+      says so, and they are the only place the evidence lives.
+      - **P24.7** — `attempt_side_effects: Vec<ToolMark>` beside the turn-scoped `last_side_effect`
+        (`liveness.rs:167-185`), rendered through the bounded `step_activity_digest`
+        (`loop_runner.rs:1112`, used at four step-exit sites).
+      - **P24.9** — `NannaBridge::msys_drive_path` (`bridge.rs:560-569`) with the literal-first
+        guard, called from `resolve_path_with_workdir` before the relative branch (`:537`), and a
+        test that a shell-printed `/d/...` reaches the real file (`:1428`). The `runStructuralCheck`
+        exit-127 split is present at `write_file/tool.ts:613`.
+      - **P24.10** — the threshold is derived from the live input budget, not `max_tokens`:
+        `loop_runner.rs:6882` reads `self.context.read().await.hard_limit` and scales by
+        `CHARS_PER_TOKEN_ESTIMATE`. *(Residual: the doc comment at `:1152` still describes the old
+        `(max_tokens * 2).clamp(2000, 32000)` formula — see the `[ ]` below.)*
+      - **P24.11** — solved by a different shape than the item proposed, and correctly: rather than
+        adding `ToolCallRecord::error`, `record_output` (`loop_runner.rs:868`) falls back to
+        `result.error` when `content` is empty, so both the repeat detector and the novelty check
+        stop comparing empty strings. `structure_broken` sits beside it for the third outcome.
+      - **P24.12** — `backstop_timeout` (`registry.rs:1058`) is params-aware via
+        `ScriptEngine::supervising_timeout_ms`, which applies the existing
+        `ENGINE_TIMEOUT_HANDOFF_MARGIN_MS` (`engine.rs:344`), so the inner message wins by
+        construction.
+      - **P24.14** — `(dry_replans, escalated_asks, last_result)` at `harness.rs:2138` with an
+        `escalate` branch at `:2394` that takes a different prompt path, and the replan-allowance
+        accounting at `:2566`.
+      - **P24.15** — `is_line_structured` (`compressor.rs:383`) routes line-structured content away
+        from sentence scoring at `:245` and short-circuits the wasted round-trip at `:369`.
+      - **P24.16** — `abandoned_unverifiable: Vec<AbandonedUnverifiable>` (`harness.rs:1433`)
+        populated at **both** abandonment sites (`:2192`, `:2537`); `items_completed_unverified`
+        merged (`:3252`); and the cancel path renders evidence bannerlessly through
+        `unresolved_evidence` (`chat_harness.rs:2367`, called at `:2473`).
+      - **P24.17** — (a) `DaemonEvent::LivenessBeat` exists in the GUI client
+        (`daemon_client.rs:143`) with a deserialization test (`:1463`); (b) the harness sets
+        `on_usage` (`tasks.rs:3036`) with the comment naming the gap it closed (`:3031`).
+      - **P24.18** — (a) `store_unembedded` is the embed-failure path on every write route
+        (16 call sites in `service.rs`); (b) `search_reports_what_it_could_actually_compare`
+        (`lib.rs:2435`) pins the three distinguishable empty answers; (c) the 30,000-byte behead is
+        gone, with the reasoning kept at `service.rs:1092`.
+      - **P24.20** — (b) `scripted.rs:83` overwrites the file-stem name with the manifest name at
+        load time, for exactly the stated reason (every skill's entry point is `tool.ts`, so the
+        engine logged nearly every tool as `tool`); (c) zero reduction is reported as zero
+        (`context.rs:2221`, `:3587`).
+      - **P24.21** — `web_search/tool.ts:23` names an action available in this session and says
+        nothing was searched; `exec/tool.ts` names itself, says nothing ran, and lists all five
+        accepted aliases.
+      - **Method and its limit, stated honestly:** this is an **anchor** audit — for each item the
+        named mechanism was located in the tree and read. It is not a line-by-line re-derivation of
+        every sub-bullet, and it did not re-run each item's original evidence. An item whose
+        mechanism is present but subtly wrong would pass this audit.
+- [x] **`BREAKER_REPLAY_MAX_BYTES` was derived from a formula that no longer exists.**
+      *(2026-08-25 — found by the P24 audit above, fixed the same run.)* Its derivation read
+      "2000 bytes is the floor of the dynamic `context_result_threshold`
+      (`(max_tokens * 2).clamp(2000, 32000)`)" — the boot-frozen `max_tokens` formula P24.10 was
+      raised about, which `loop_runner.rs:6882` replaced with `(hard_limit / 4) *
+      CHARS_PER_TOKEN_ESTIMATE`. There is no `clamp` and no floor of 2000 any more, so the stated
+      justification was for code that had been deleted. The **value is unchanged** — the constraint
+      it encodes (small enough to reach context untouched) still holds, now argued from the live
+      input budget and the `min_viable_num_ctx` floor below which the loop refuses to run at all.
+      Only the sentence was wrong, and a bound whose derivation has gone stale is the next magic
+      constant: nobody can tell whether it is still right.
 
 
 #### What is already working — do not re-litigate
