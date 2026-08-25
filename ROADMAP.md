@@ -1814,6 +1814,16 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
+      - [ ] *(research 2026-08-25)* **Qwen 3.8-27B landed 2026-08-05 (Apache 2.0, 64 layers, 262K
+            context; community GGUFs 08-13/08-14) — and on independently measured tasks it is *level with
+            3.6*, not ahead of it.** That is the actionable half: a newer number is not a reason to re-point
+            the default. This repo's governing metric is task success @ budget, and a level model at a larger
+            size is a regression in capability density. Concretely: **do not move the 8 GB default off
+            Qwen3.5-9B on release-date alone**; 27B dense is a 24 GB-tier candidate at best and belongs in the
+            same eval as the existing tier list, decided on **tool-call validity rate**, not on a leaderboard.
+            Worth noting for Mummu's port ordering only if the 24 GB tier is being worked. Sources:
+            [Best Qwen models to run locally, mid-2026](https://insiderllm.com/guides/qwen-models-guide/),
+            [Qwen3-Coder-Next](https://qwen.ai/blog?id=qwen3-coder-next).
       - [ ] *(research 2026-07-24)* **Qwen3.5's *Small* series gives the sub-8 GB tiers a real ladder, not just
             a quantization knob.** The family now spans **0.8B / 2B / 4B / 9B** alongside the big MoEs, all
             with **256K context** and tool-calling, so the CPU-only and low-VRAM guardrail tiers can drop to a
@@ -2278,6 +2288,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
             the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
             useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
+      - [ ] *(research 2026-08-25 — re-check; the shortlist is stable, and a fourth candidate appeared)*
+            The three-way decision below has not moved: `hnsw_rs` and `hnswlib-rs` are both still live and
+            still differ on exactly the axis that matters here (in-traversal filtering + parallel batch build
+            vs. lock-free concurrent read/mutate), and `instant-distance` is still the one to rule out. Two
+            additions worth a look before building anything:
+            **`small-world-rs`** (HNSW with cosine *and* euclidean, serde persistence) and **`swarc`** —
+            notable because it advertises **`remove`** as a first-class operation. That is not a nice-to-have
+            for us: the "Ghost Vectors" item above says a deleted memory must actually destroy its embedding,
+            and HNSW's classic weakness is that deletion is a tombstone, not a removal. If `swarc`'s remove is
+            a real graph repair rather than a mark, it collapses two open items into one dependency choice.
+            **Decide the deletion semantics before the crate**, or the crate decides them for us. Sources:
+            [small-world-rs](https://crates.io/crates/small-world-rs), [swarc](https://crates.io/crates/swarc),
+            [hnswlib-rs](https://lib.rs/crates/hnswlib-rs), [hnsw_rs](https://docs.rs/hnsw_rs/latest/hnsw_rs/).
       - [ ] *(research 2026-07-16, corrects the crate shortlist)* Two of the three shortlisted crates need
             re-reading. **`instant-distance` is dormant — rule it out**: no release since **0.6.1 (June 2023)**
             despite repo activity, so the "smallest/simplest pure-Rust HNSW" option is not a live choice.
