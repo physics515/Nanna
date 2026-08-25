@@ -388,4 +388,62 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert!(all[0].content.contains("3 tests failed"));
     }
+
+    // ── Write-path instrument (bench/BASELINE.md, Suite 2 — write path) ──
+    //
+    // The governing quantity for P24.3 part 3 is not wall-clock: it is how many
+    // embedding round-trips a tool result puts on the turn's critical path
+    // before the loop can take its next step. Wall-clock follows from that
+    // number and from the provider's RTT, which is hardware- and load-
+    // dependent; the count is exact, deterministic, and reproducible on any
+    // host, so that is what the baseline records.
+
+    /// Round-trips the critical path spends ingesting `chunk_count` chunks of
+    /// one tool result, plus the same for an equal number of ordinary facts.
+    ///
+    /// Returns `(tool_result_round_trips, ordinary_fact_round_trips)`.
+    async fn critical_path_round_trips(chunk_count: usize) -> (usize, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = sink_fixture(&calls);
+
+        for idx in 0..chunk_count {
+            store_extracted_memory(
+                &service,
+                extracted(TOOL_RESULT_CATEGORY, &format!("[exec → build — ok] chunk {idx}")),
+                None,
+            )
+            .await
+            .expect("write");
+        }
+        let tool_result_round_trips = calls.swap(0, Ordering::Relaxed);
+
+        for idx in 0..chunk_count {
+            store_extracted_memory(&service, extracted("fact", &format!("fact {idx}")), None)
+                .await
+                .expect("write");
+        }
+        (tool_result_round_trips, calls.load(Ordering::Relaxed))
+    }
+
+    /// The baseline row. A 200 KB non-repetitive tool result splits into ~63
+    /// chunks at `MEMORY_CHUNK_TARGET_CHARS`; 64 is that rounded up, and the
+    /// number is only a scale — the claim is that the count is **zero at any
+    /// chunk count**, which is what makes it a budget rather than a
+    /// measurement.
+    #[tokio::test]
+    async fn write_path_round_trips_baseline() {
+        for chunk_count in [1, 8, 64] {
+            let (tool_result, ordinary) = critical_path_round_trips(chunk_count).await;
+            assert_eq!(
+                tool_result, 0,
+                "a tool result must cost the critical path no embedding round-trips                  ({chunk_count} chunks)"
+            );
+            // The comparison arm: this is what the tool-result path used to
+            // cost, and what every other category still correctly costs.
+            assert_eq!(
+                ordinary, chunk_count,
+                "an ordinary fact still embeds inline, one round-trip each"
+            );
+        }
+    }
 }

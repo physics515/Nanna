@@ -2701,9 +2701,16 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       - [ ] **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
             row having a vector, p50/p95, under a live mission. This is Nanna's staleness number and it does
             not exist yet.
-      - [ ] **Add a write-path suite to `bench/BASELINE.md`** (Suite 2 today measures recall and search).
-            Budget candidate: a tool result's ingest must not add measurable wall-clock to the step that
-            produced it — which is now a claim the architecture makes and nothing checks.
+      - [x] **Add a write-path suite to `bench/BASELINE.md`** *(2026-08-25)* — "Suite 2 (write path)",
+            two rows, gated in `bench/budgets.toml`. It records **counts, not milliseconds**: embedding
+            round-trips on the turn's critical path, **0** per tool result (was 1 per chunk; ~63 chunks
+            for a 200 KB non-repetitive result) and **1** per ordinary extracted fact. That framing is
+            the point — wall-clock follows from the count and the provider's RTT, which is load-dependent
+            and unreproducible, while the count is exact and hardware-independent. The tool-result budget
+            is `exact = 0` **at any chunk count** (asserted at 1, 8, 64), so it is a structural claim
+            rather than a sample; the ordinary-fact budget is a **floor**, because 0 there would mean the
+            deferral had swallowed a path that must still dedup inline. Instrument:
+            `cargo test -p nanna-daemon write_path`.
       - [ ] **Report embedding-generation latency separately from vector-search latency.** The retrieval
             budget is per *stage* (embed → search → rerank → assemble); a 4 ms search behind a 400 ms embed
             is a 400 ms retrieval, and our numbers currently name only the second half.
