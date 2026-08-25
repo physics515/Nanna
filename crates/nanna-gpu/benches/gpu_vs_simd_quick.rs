@@ -40,6 +40,13 @@ fn flatten_vectors(vectors: &[Vec<f32>]) -> Vec<f32> {
     vectors.iter().flat_map(|v| v.iter().copied()).collect()
 }
 
+/// One measurement series: its centre and its spread.
+///
+/// `min`/`max` were computed here and printed nowhere, which read to the
+/// compiler as dead fields and to a reader as a mean with no error bar. That
+/// is the wrong thing to discard in *this* bench: it is the source of the
+/// GPU-vs-SIMD crossover number, and a crossover claimed from two means whose
+/// ranges overlap is not a crossover. The spread is on every row now.
 struct Stats { mean: Duration, min: Duration, max: Duration }
 
 impl Stats {
@@ -83,6 +90,25 @@ fn fmt_dur(d: Duration) -> String {
     else { format!("{:>8.2}ms", us / 1000.0) }
 }
 
+/// Spread as a percentage of the mean: the sampled range over the centre.
+///
+/// A ratio, not two more durations, because the column answers one question
+/// at a glance: is the gap between these two means bigger than the noise? A
+/// crossover read off means whose ranges overlap is not a crossover, and this
+/// bench is where the GPU_THRESHOLD number comes from.
+///
+/// A zero mean is guarded rather than assumed away: it would divide by zero
+/// and print `inf`, which reads as a measurement instead of an absence.
+fn fmt_spread(s: &Stats) -> String {
+    let mean_ns = s.mean.as_nanos();
+    if mean_ns == 0 {
+        return "  n/a".to_string();
+    }
+    let range_ns = s.max.as_nanos().saturating_sub(s.min.as_nanos());
+    let percent = (range_ns as f64 / mean_ns as f64) * 100.0;
+    format!("{percent:>4.0}%")
+}
+
 fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -114,7 +140,7 @@ fn main() {
 
     println!("  Dimension: {dim}  |  Iterations: {iters}  |  Warmup: {warmup}");
     println!("──────────────────────────────────────────────────────────────");
-    println!("  Vectors │    SIMD mean │     GPU mean │  Ratio  │ Winner");
+    println!("  Vectors │    SIMD mean │ ±sprd │     GPU mean │ ±sprd │  Ratio  │ Winner");
     println!("──────────┼─────────────┼──────────────┼─────────┼────────");
 
     let mut crossover: Option<usize> = None;
@@ -136,9 +162,22 @@ fn main() {
                 crossover = Some(count);
             }
 
-            println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}", count, fmt_dur(simd.mean), fmt_dur(gpu_stats.mean), ratio);
+            println!(
+                "  {:>7} │ {} │ {} │ {} │ {} │ {:>6.2}× │ {winner}",
+                count,
+                fmt_dur(simd.mean),
+                fmt_spread(&simd),
+                fmt_dur(gpu_stats.mean),
+                fmt_spread(&gpu_stats),
+                ratio
+            );
         } else {
-            println!("  {:>7} │ {} │     N/A      │   N/A   │ SIMD", count, fmt_dur(simd.mean));
+            println!(
+                "  {:>7} │ {} │ {} │     N/A      │   n/a │   N/A   │ SIMD",
+                count,
+                fmt_dur(simd.mean),
+                fmt_spread(&simd)
+            );
         }
     }
 
@@ -151,7 +190,7 @@ fn main() {
         let counts2 = [100, 500, 1000, 5000];
         println!("  Dimension: {dim2} (spot check)");
         println!("──────────────────────────────────────────────────────────────");
-        println!("  Vectors │    SIMD mean │     GPU mean │  Ratio  │ Winner");
+        println!("  Vectors │    SIMD mean │ ±sprd │     GPU mean │ ±sprd │  Ratio  │ Winner");
         println!("──────────┼─────────────┼──────────────┼─────────┼────────");
 
         for &count in &counts2 {
@@ -165,7 +204,15 @@ fn main() {
                 let gpu_stats = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, query, &flat), warmup, iters);
                 let ratio = gpu_stats.mean.as_nanos() as f64 / simd.mean.as_nanos() as f64;
                 let winner = if ratio < 1.0 { "GPU" } else { "SIMD" };
-                println!("  {:>7} │ {} │ {} │ {:>6.2}× │ {winner}", count, fmt_dur(simd.mean), fmt_dur(gpu_stats.mean), ratio);
+                println!(
+                    "  {:>7} │ {} │ {} │ {} │ {} │ {:>6.2}× │ {winner}",
+                    count,
+                    fmt_dur(simd.mean),
+                    fmt_spread(&simd),
+                    fmt_dur(gpu_stats.mean),
+                    fmt_spread(&gpu_stats),
+                    ratio
+                );
             }
         }
         println!("──────────────────────────────────────────────────────────────");
@@ -179,8 +226,8 @@ fn main() {
         let sv = flatten_vectors(&generate_vectors(1, 768));
         let overhead = bench_async_fn(&rt, || gpu_batch_search(pipeline, ctx, q, &sv), 3, 20);
         let simd1 = bench_sync(|| { std::hint::black_box(nanna_simd::cosine_similarity_f32(q, &sv)); }, 3, 20);
-        println!("    GPU dispatch: {}", fmt_dur(overhead.mean));
-        println!("    SIMD single:  {}", fmt_dur(simd1.mean));
+        println!("    GPU dispatch: {} (±{})", fmt_dur(overhead.mean), fmt_spread(&overhead).trim());
+        println!("    SIMD single:  {} (±{})", fmt_dur(simd1.mean), fmt_spread(&simd1).trim());
         println!("    Overhead ratio: {:.0}×", overhead.mean.as_nanos() as f64 / simd1.mean.as_nanos() as f64);
         println!();
     }

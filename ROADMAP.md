@@ -1787,6 +1787,15 @@ of either one:
       does not fail, it hangs; verified by disabling the timeout and killing the run at 45 s), a
       finished one keeps its result, a real failure is not relabelled a timeout, and a slow-but-legal
       operation still succeeds.
+- [x] **The GPU-vs-SIMD bench measured its own spread and printed only the mean.** `Stats` computed
+      `min`/`max` and reported neither, so every row was a mean with no error bar — in the one bench
+      the `GPU_THRESHOLD = 50_000` number comes from, where a crossover read off two means whose
+      ranges overlap is not a crossover at all. Both tables and the fixed-overhead block now carry a
+      spread column (range as a percentage of the mean — a ratio, because the question the column
+      answers is "is this gap bigger than the noise?", which absolute durations across mixed
+      magnitudes do not answer). `threshold_benchmark.rs`'s unused `format_duration_short` was
+      genuinely dead — that bench already prints `mean ± stddev (min, max)` — and is deleted. The
+      workspace now has **zero** dead-code warnings.
 - [x] **`TursoTaskSource::workdir` was the last residue of a deliberately cut experiment.** Hard-coded
       to `None` by the only constructor and read by nothing, while its doc comment read as though
       ancestor-promotion existed and was merely switched off. The experiment was cut as
