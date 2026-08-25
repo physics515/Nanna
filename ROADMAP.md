@@ -1805,6 +1805,9 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
         pin above is current and needs no action this pass. Re-check on each freshness sweep. Remember
         this is **Mummu's** dependency, not Nanna's: nothing here should pull `burn` into this tree.
         Source: [tracel-ai/burn releases](https://github.com/tracel-ai/burn/releases).
+      - *(research 2026-08-25)* **Re-checked; unchanged — `burn` 0.21 is still the newest release.** No
+        action, and recorded so the next sweep does not spend a search on it: check the releases page,
+        not crates.io's "updated" date, which moves on sub-crate republishes.
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
@@ -2681,6 +2684,33 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             [Memanto (arXiv:2604.22085)](https://arxiv.org/pdf/2604.22085),
             [Multi-layered memory architectures (arXiv:2603.29194)](https://arxiv.org/html/2603.29194v1),
             [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List).
+- [ ] *(research 2026-08-25 — grades the deferred-vector change that landed the same day)* **The write
+      path is the agent-memory cost centre the benchmarks do not report, and asynchrony buys latency with
+      *staleness*.** Two findings worth holding side by side. First, write-path cost is measured at **over
+      80% of total agent execution time** in stateful long-horizon workloads and is simply absent from most
+      memory-system benchmarks — which is the same discovery P24.3 made from a log (189 of 246 minutes with
+      no model decision) rather than from a paper, and is the strongest argument yet that `nanna-bench`
+      Suite 2 needs a **write**-side number, not only recall/search latency. Second, the survey's framing of
+      the choice is exactly ours: *synchronous scheduling puts construction latency on the critical path;
+      asynchronous scheduling admits unbounded staleness*, and five of the systems it measures (SimpleMem,
+      MIRIX, Letta, Mem0, A-Mem) retrieve against memory one or more sessions behind their ingestion
+      stream. Nanna's deferred-vector path deliberately takes the asynchronous side, so **its staleness must
+      be bounded and measured, not assumed** — the drain's budget bound (embed only what this process
+      parked) is the mechanism, and the missing half is evidence that it converges within a turn.
+      Concrete, in reach:
+      - [ ] **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
+            row having a vector, p50/p95, under a live mission. This is Nanna's staleness number and it does
+            not exist yet.
+      - [ ] **Add a write-path suite to `bench/BASELINE.md`** (Suite 2 today measures recall and search).
+            Budget candidate: a tool result's ingest must not add measurable wall-clock to the step that
+            produced it — which is now a claim the architecture makes and nothing checks.
+      - [ ] **Report embedding-generation latency separately from vector-search latency.** The retrieval
+            budget is per *stage* (embed → search → rerank → assemble); a 4 ms search behind a 400 ms embed
+            is a 400 ms retrieval, and our numbers currently name only the second half.
+      Sources: [Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads
+      (arXiv:2606.06448)](https://arxiv.org/html/2606.06448v1),
+      [MemDelta (arXiv:2606.29914)](https://arxiv.org/pdf/2606.29914),
+      [Memory retrieval latency budgets](https://supermemory.ai/blog/latency-budgets-memory-retrieval).
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
@@ -4143,12 +4173,46 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
 **Read this before picking P24 work:** treat each item as landed unless you have checked its
 "Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
 
-- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
-      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
-      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
-      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
-      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
-      from the retrieval top-k (see the item's own note).
+- [x] **P24.3 part 3 — the embedding is off the turn's critical path.** *(2026-08-25)* Parts 1, 2
+      and 4 had landed (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`)
+      and the "two memory sinks disagree" rider was resolved 2026-08-21; this was the remainder.
+      **What shipped:** a tool-result chunk is now persisted synchronously and only its *vector* is
+      queued (`MemoryService::remember_deferred_vector`), so the loop's next step no longer waits on
+      an embedding round-trip against the same local server that serves generation. The row is
+      durable before the call returns and keeps its `source_id`, so the `recall(...)` handle the
+      model is handed in the same turn still resolves — only similarity search waits.
+      **The hard half was the drain, exactly as the item said.** `drain_backfill` cannot pick these
+      up: when the embedder is the local provider it first waits for *no harness run to be live*, so
+      a row queued **by** a live run would wait for the run that queued it — hours, during a mission.
+      So `drain_queued_vectors` skips that yield gate, and pays for the exception with a bound the
+      gate was standing in for: **it may only embed rows this process parked**, budgeted by
+      `MemoryService::take_queued_vector_count()`. An inherited backlog (2167 rows, in the incident
+      that motivated the queue) is still `drain_backfill`'s job at `drain_backfill`'s priority. It
+      keeps the RTT-repayment window and still takes `drain_serial`, so it can never exceed half the
+      provider's wall-clock and cannot multiply the request rate. Net: the same embedding work, at
+      half the duty cycle, concurrent with the turn instead of blocking it.
+      **One latent bug fixed on the way:** `drain_backfill` parked on `wait_idle()` *while holding*
+      `drain_serial`, so a drain waiting for a mission to end held the one process-wide drain lock
+      for the length of that mission and starved every drain behind it. The yield now happens outside
+      the lock; the passes and the repayment sleep still happen under it, so both stated invariants
+      are unchanged.
+      **And the third duplicated policy is gone.** The filter and the importance table were unified
+      into `memory_adapter` in 2026-08-21 after they drifted and cost 704 writes; the *route* was
+      about to become the same story, so the whole sink now lives in
+      `memory_adapter::store_extracted_memory` and both `agent_service.rs` (chat) and `tasks.rs`
+      (harness) differ only in how they log. `TOOL_RESULT_CATEGORY` is a constant in `nanna-agent`
+      so the end that stamps it and the end that routes on it cannot drift either.
+      **12 tests**, none of which passed before the change: the deferred write never consults the
+      embedder (asserted by a counting embedder, so it distinguishes this from the outage path
+      `store_unembedded` already had), an ordinary fact still embeds inline, the queue publishes a
+      drainable count that resets when taken, only a tool result defers, the noise filter runs on
+      both routes, and a FAILED tool result still reaches the store. Disabling the route makes
+      `only_a_tool_result_defers_its_vector` fail on "no inline embed for a tool result".
+      **Still open from the item:** `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)`
+      is bounded only by bytes. That is now a storage-footprint question rather than a latency one —
+      the chunks no longer cost the turn anything — and the cap must still not be derived from the
+      retrieval top-k (see the item's own note).
+      - [ ] Bound the chunk *count* per tool result on a principle that is not the retrieval top-k.
 - [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.

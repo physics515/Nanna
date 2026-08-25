@@ -108,6 +108,38 @@ pub struct MemoryService {
     /// Consecutive writes whose vector width disagreed with the binding, and
     /// the width they all reported. See [`MemoryService::note_width_mismatch`].
     width_mismatch_streak: RwLock<(usize, usize)>,
+    /// Rows parked without a vector since the last drain woke, and the wake-up
+    /// that tells a drain they exist.
+    ///
+    /// The memory crate cannot drain its own queue — draining costs embedding
+    /// round-trips, and who may spend those, and when, is the daemon's call
+    /// (it owns the router and the chat-run gate). What the crate *can* do is
+    /// stop the queue from being invisible. Before this, a row parked by
+    /// [`Self::store_unembedded`] waited for the next **binding** event —
+    /// daemon start, provider switch, width reprobe — so a row parked mid-run
+    /// stayed unsearchable for the rest of the session because no switch ever
+    /// happened. That gap is written up in `store_unembedded`'s own comment as
+    /// "a drain trigger the memory crate does not own"; this is the half the
+    /// crate does own.
+    ///
+    /// The counter is what bounds the drain. It counts rows *this process
+    /// parked*, so a drain woken by it knows exactly how much work the live
+    /// session created and can stop there — rather than treating a historical
+    /// backlog (2167 rows, once) as equally urgent.
+    vector_queue: VectorQueueSignal,
+}
+
+/// Rows waiting for a vector, and the wake-up for whoever drains them.
+#[derive(Debug, Default)]
+struct VectorQueueSignal {
+    /// Rows parked since the last reader took them. Reset by
+    /// [`MemoryService::take_queued_vector_count`], never by the drain's
+    /// progress, so a park racing a drain is counted once and not lost.
+    queued: std::sync::atomic::AtomicUsize,
+    /// Signalled once per park. `Notify` collapses repeated signals into one
+    /// permit, which is exactly right: the count carries "how much", the
+    /// notify carries only "there is some".
+    notify: tokio::sync::Notify,
 }
 
 /// The identity half of the embedding binding.
@@ -144,6 +176,7 @@ impl MemoryService {
             min_score_override: RwLock::new(None),
             binding: RwLock::new(EmbeddingBinding::default()),
             width_mismatch_streak: RwLock::new((0, 0)),
+            vector_queue: VectorQueueSignal::default(),
         }
     }
 
@@ -694,14 +727,15 @@ impl MemoryService {
         };
 
         self.store.add(entry).await?;
-        // The row is durable and honest, but nothing drains it until the next
-        // BINDING event: the daemon's unconditional drain runs when a model is
-        // bound (daemon start, provider switch, width reprobe), and a switch
-        // handler drains after a switch. A row parked here by a TRANSIENT
-        // provider failure therefore stays unsearchable for the rest of the
-        // session, because no switch happened. It is recovered, not lost —
-        // but the latency is a session, not a moment, and closing that needs
-        // a drain trigger the memory crate does not own.
+        // The row is durable and honest. It used to wait for the next BINDING
+        // event to become searchable — daemon start, provider switch, width
+        // reprobe — so a row parked mid-session by a transient failure stayed
+        // invisible to recall for the rest of that session, because no switch
+        // ever happened. The trigger this comment used to say the crate "does
+        // not own" is now half-owned: the crate publishes the fact that rows
+        // are waiting, and the daemon decides when to spend embeddings on
+        // them. See [`VectorQueueSignal`].
+        self.note_vector_queued();
         warn!(
             "Stored without a vector ({}) — the write landed and is queued for embedding \
              backfill: {} (id: {})",
@@ -710,6 +744,98 @@ impl MemoryService {
             id
         );
         Ok((id, IngestAction::Create))
+    }
+
+    /// Record that one more row is waiting for a vector, and wake a drain.
+    fn note_vector_queued(&self) {
+        let before = self
+            .vector_queue
+            .queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Positive space: the count only ever rises here, so a wrap would mean
+        // `usize::MAX` parks in one process — not reachable, and if it were,
+        // the drain bound derived from it would be meaningless.
+        debug_assert!(before < usize::MAX, "queued-vector count must not wrap");
+        self.vector_queue.notify.notify_one();
+    }
+
+    /// Park until at least one row is waiting for a vector.
+    ///
+    /// Returns immediately if rows were parked since the last waiter ran —
+    /// `Notify` holds a permit — so a drain that starts after the writes it
+    /// should handle does not miss them.
+    pub async fn vector_queue_notified(&self) {
+        self.vector_queue.notify.notified().await;
+    }
+
+    /// Take the count of rows parked since the last call, resetting it to zero.
+    ///
+    /// This is the drain's **budget**, not a progress meter: it says how many
+    /// rows *this process* parked, which is the work a live session created
+    /// and is therefore the only work that may skip the yield-to-chat gate.
+    /// Anything beyond it — a backlog inherited from an earlier run — is the
+    /// idle-gated drain's job, at the idle-gated drain's priority.
+    pub fn take_queued_vector_count(&self) -> usize {
+        self.vector_queue
+            .queued
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Persist `content` now and leave its vector for the backfill — the write
+    /// path for content that must not put an embedding round-trip on a turn's
+    /// critical path.
+    ///
+    /// Tool-result ingestion is the caller. Every chunk of every tool result
+    /// used to be embedded inline, against the same local model server that
+    /// serves generation, before the loop could take its next step: one
+    /// round-trip plus a vector search plus an insert, per chunk, awaited. A
+    /// large non-repetitive result is tens of chunks, and one measured run made
+    /// zero model decisions for 189 of its 246 minutes.
+    ///
+    /// What is traded, stated plainly: **the neighbour-dedup search is skipped**
+    /// (there is no query vector to search with), so a burst of near-identical
+    /// tool results lands as its own rows instead of folding into one. That is
+    /// the same trade [`Self::store_unembedded`] already makes and for the same
+    /// reason — squeezing the store is dreaming's job, done later with the whole
+    /// corpus in view — and run-length collapse upstream has already removed the
+    /// case that made it expensive.
+    ///
+    /// What is NOT traded: the row is durable before this returns, and it keeps
+    /// its `source_id` handle, so the `recall(...)` handle the model is given in
+    /// the same turn resolves. Only similarity search waits for the drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics on empty `content` or a non-finite `importance`. Both are
+    /// programmer errors, not operational ones: every caller reaches this
+    /// through `memory_adapter::store_extracted_memory`, which filters empty
+    /// content before routing, and importance comes from a fixed table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if the store rejects the write.
+    pub async fn remember_deferred_vector(
+        &self,
+        content: &str,
+        metadata: HashMap<String, String>,
+        importance: f32,
+        workspace_id: Option<String>,
+    ) -> Result<(String, IngestAction), MemoryError> {
+        assert!(!content.is_empty(), "deferred memory content must not be empty");
+        assert!(
+            importance.is_finite(),
+            "deferred memory importance must be a real number, got {importance}"
+        );
+        let mut fsrs = FsrsState::new();
+        fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+        self.store_unembedded(
+            content,
+            metadata,
+            fsrs,
+            workspace_id,
+            "deferred by design — a tool result's vector must not sit on the turn's critical path",
+        )
+        .await
     }
 
     /// Smart ingest - handles duplicates via prediction error gating.
@@ -4781,5 +4907,116 @@ mod tests {
                 "'{needle}' was written during the fold and must not be lost"
             );
         }
+    }
+
+    // ── Deferred vectors: the write lands now, the embedding does not ──
+
+    /// A constant embedder that also counts how many times it was consulted.
+    /// The count is the whole point: the deferred path must not consult it.
+    fn counting_embed_fn(calls: Arc<std::sync::atomic::AtomicUsize>) -> EmbedFn {
+        Arc::new(move |_t: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) })
+        })
+    }
+
+    fn deferred_fixture(calls: &Arc<std::sync::atomic::AtomicUsize>) -> MemoryService {
+        MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(counting_embed_fn(calls.clone()))
+    }
+
+    /// The defect: every tool-result chunk cost an embedding round-trip against
+    /// the same server that serves generation, awaited on the turn's critical
+    /// path. The deferred write must not spend one — even though an embedder is
+    /// configured and working, which is exactly what distinguishes this from
+    /// the outage path `store_unembedded` already had.
+    #[tokio::test]
+    async fn a_deferred_write_never_consults_the_embedder() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+
+        let (id, action) = service
+            .remember_deferred_vector("cargo test output, chunk 1", HashMap::new(), 1.5, None)
+            .await
+            .expect("a deferred write must land");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the deferred path must not embed inline"
+        );
+        assert_eq!(action, IngestAction::Create);
+        // Positive space: the row is real and readable right now — this is the
+        // half that must NOT be deferred, because the model is handed a
+        // `recall(...)` handle to it inside the same turn.
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert_eq!(
+            service.list_all().await.len(),
+            1,
+            "the row must be durable before the call returns"
+        );
+        assert!(
+            stored.content.contains("cargo test output"),
+            "the row must carry the content in full"
+        );
+        // Negative space: and it must be honest about having no vector, so the
+        // backfill can find it.
+        assert!(stored.embedding.is_empty(), "the vector must be queued, not invented");
+        assert!(stored.embedding_model.is_none(), "an unembedded row claims no model");
+    }
+
+    /// An ordinary extracted fact still embeds inline — the deferral is scoped
+    /// to tool results, not a blanket change of the write path.
+    #[tokio::test]
+    async fn an_ordinary_write_still_embeds_inline() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+
+        let (id, _) = service
+            .remember_with_importance("the user prefers tabs", HashMap::new(), 4.0)
+            .await
+            .expect("an ordinary write must land");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the inline path must still produce a vector"
+        );
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert!(!stored.embedding.is_empty(), "an inline write is searchable at once");
+    }
+
+    /// The queue must be *visible*, or the deferral trades a slow turn for a
+    /// permanently unsearchable row. Before this signal a parked row waited for
+    /// the next binding event — daemon start, provider switch, width reprobe —
+    /// which during a long session never comes.
+    #[tokio::test]
+    async fn deferred_writes_publish_a_drainable_count() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+        assert_eq!(service.take_queued_vector_count(), 0, "nothing is queued yet");
+
+        for i in 0..3 {
+            service
+                .remember_deferred_vector(&format!("chunk {i}"), HashMap::new(), 1.5, None)
+                .await
+                .expect("write");
+        }
+
+        // A drain woken by the notify must find a budget equal to what was
+        // parked — that count is what bounds it to the live session's own work.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.vector_queue_notified(),
+        )
+        .await
+        .expect("a parked row must wake a waiting drain");
+        assert_eq!(service.take_queued_vector_count(), 3);
+        // Taking it resets it: the next drain must not re-claim work already
+        // budgeted, or the bound stops bounding anything.
+        assert_eq!(service.take_queued_vector_count(), 0);
     }
 }

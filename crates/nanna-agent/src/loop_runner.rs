@@ -6990,7 +6990,7 @@ impl Agent {
                                 Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
                                 None => format!("[{name} — {outcome}] {chunk_content}"),
                             },
-                            category: "tool_result".to_string(),
+                            category: TOOL_RESULT_CATEGORY.to_string(),
                             // A tool result is always agent-observed, never a user statement.
                             provenance: MemoryProvenance::Observed,
                             tags: Some(tags),
@@ -8488,6 +8488,15 @@ impl MemoryProvenance {
         }
     }
 }
+
+/// The `category` every tool-result memory carries.
+///
+/// A constant rather than two string literals because the two ends are in
+/// different crates: this file stamps it, and the daemon's memory sink routes
+/// on it to keep a tool result's vector off the turn's critical path. Two
+/// privately-duplicated policies drifting apart is precisely how the two memory
+/// filters ended up disagreeing (see `memory_adapter::is_low_signal_memory`).
+pub const TOOL_RESULT_CATEGORY: &str = "tool_result";
 
 /// A memory extracted from conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]

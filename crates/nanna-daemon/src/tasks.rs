@@ -2834,47 +2834,32 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if crate::memory_adapter::is_low_signal_memory(&memory.content) {
+                // Filter, importance and route all live in `memory_adapter` —
+                // ONE copy, shared with the interactive-chat sink in
+                // `agent_service.rs`. This path only decides what to log.
+                let category = memory.category.clone();
+                let bytes = memory.content.len();
+                match crate::memory_adapter::store_extracted_memory(
+                    &service,
+                    memory,
+                    workspace_id,
+                )
+                .await
+                {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
                     // shortfall was invisible until someone counted by hand.
                     // A dropped memory is a fact about the run, not a detail.
-                    tracing::info!(
-                        category = %memory.category,
-                        bytes = memory.content.len(),
+                    Ok(None) => tracing::info!(
+                        category = %category,
+                        bytes,
                         "dropping low-signal memory (machine noise)"
-                    );
-                    return;
-                }
-                let mut metadata = memory.tags.unwrap_or_default();
-                metadata.insert("category".to_string(), memory.category.clone());
-                metadata.insert(
-                    "fact_type".to_string(),
-                    memory.provenance.as_str().to_string(),
-                );
-                // A tool result is raw episodic material — worth keeping, but
-                // it must not outrank a stated preference when recall ranks.
-                let importance = crate::memory_adapter::episodic_importance(&memory.category);
-                let stored = match &workspace_id {
-                    Some(ws) => {
-                        service
-                            .remember_scoped(
-                                &memory.content,
-                                metadata,
-                                importance,
-                                Some(ws.clone()),
-                            )
-                            .await
+                    ),
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to store tool result in memory");
                     }
-                    None => {
-                        service
-                            .remember_with_importance(&memory.content, metadata, importance)
-                            .await
-                    }
-                };
-                if let Err(e) = stored {
-                    tracing::warn!(error = %e, "failed to store tool result in memory");
                 }
             })
         }))

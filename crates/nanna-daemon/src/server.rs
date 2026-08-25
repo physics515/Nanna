@@ -1379,15 +1379,24 @@ async fn drain_backfill(
     chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
     drain_serial: &Arc<tokio::sync::Mutex<()>>,
 ) {
-    let _one_drain = drain_serial.lock().await;
     // "provider:model" is the router's spec shape; the local provider is the
     // one that shares its single generation slot with chat.
     let local = model.starts_with("ollama:");
 
     loop {
+        // The yield happens OUTSIDE `drain_serial`, and this is load-bearing.
+        // Parking on `wait_idle` while holding the one process-wide drain lock
+        // means a drain waiting for a mission to end holds that lock for the
+        // length of the mission — starving every other drain behind it,
+        // including the bounded foreground one ([`drain_queued_vectors`])
+        // whose entire reason to exist is not to wait for that mission. The
+        // lock still serializes the passes, and the repayment sleep still
+        // happens under it, so both invariants above — one drain at a time,
+        // at most half the provider's wall-clock — are unchanged.
         if local {
             chat_runs.wait_idle().await;
         }
+        let _one_drain = drain_serial.lock().await;
         let pass_started = std::time::Instant::now();
         match mem.backfill_embeddings(model, DRAIN_STEP).await {
             Ok(0) => break,
@@ -1411,6 +1420,7 @@ async fn drain_backfill(
         if local {
             chat_runs.wait_idle().await;
         }
+        let _one_drain = drain_serial.lock().await;
         let pass_started = std::time::Instant::now();
         match mem.backfill_chunks(model, DRAIN_STEP).await {
             Ok((0, 0)) => break,
@@ -1424,6 +1434,86 @@ async fn drain_backfill(
             Err(e) => {
                 warn!("Chunk backfill for '{model}' halted: {e}");
                 break;
+            }
+        }
+    }
+}
+
+/// Embed the rows a LIVE turn parked, without making them wait for that turn
+/// to end (P24.3 part 3).
+///
+/// Tool-result ingestion no longer embeds inline: a chunk is persisted
+/// immediately and its vector is queued
+/// ([`MemoryService::remember_deferred_vector`]). Something has to pick those
+/// vectors up, and [`drain_backfill`] cannot be it — when the embedder is the
+/// local provider that drain first waits for **no harness run to be live**, so
+/// a row queued *by* a live run would wait for the run that queued it. During
+/// a long autonomous mission that is hours, and for those hours the model is
+/// being handed `recall(...)` handles to rows that similarity search cannot
+/// see.
+///
+/// So this drain skips the yield gate — and pays for that with a bound the
+/// yield gate was standing in for:
+///
+/// - **It may only embed rows this process parked.** The budget comes from
+///   [`MemoryService::take_queued_vector_count`], so an inherited backlog (2167
+///   rows, in the incident that motivated the queue) is NOT swept up at
+///   foreground priority; that is still [`drain_backfill`]'s job at
+///   [`drain_backfill`]'s priority. The exception is sized to the work the live
+///   session created and nothing more.
+/// - **It still repays every request.** Same rule as [`drain_backfill`]: a pass
+///   that consulted the provider is followed by an idle window equal to that
+///   call's RTT, so it can never exceed half the provider's wall-clock, and a
+///   loaded provider answering slowly earns proportionally longer gaps.
+/// - **It still takes `drain_serial`.** One drain's passes at a time,
+///   process-wide, so this cannot multiply the request rate that pacing bounds.
+/// - **Row vectors only.** Chunk vectors stay with [`drain_backfill`], for the
+///   same reason that drain does rows before chunks: without a row vector a
+///   memory is invisible to recall entirely, whereas one with a row vector and
+///   no chunk vectors is merely coarser to retrieve. Coarser can wait for idle;
+///   invisible cannot.
+///
+/// Net against what it replaces: the same embedding work, at half the duty
+/// cycle, off the turn's critical path instead of blocking it.
+async fn drain_queued_vectors(
+    mem: &Arc<MemoryService>,
+    drain_serial: &Arc<tokio::sync::Mutex<()>>,
+) {
+    loop {
+        mem.vector_queue_notified().await;
+        let mut budget_rows = mem.take_queued_vector_count();
+        // A wake with an empty budget is not an error — `Notify` holds one
+        // permit however many parks happened, so a drain that already took the
+        // count can be woken once more with nothing to do.
+        if budget_rows == 0 {
+            continue;
+        }
+        let Some(model) = mem.active_binding().await.0 else {
+            // No binding yet: the rows stay queued and the next binding event's
+            // unconditional drain takes them. Putting the budget back would
+            // spin, since nothing re-notifies.
+            debug!("{budget_rows} queued vectors wait for an embedding binding");
+            continue;
+        };
+        debug!("Draining {budget_rows} queued vectors for '{model}'");
+        while budget_rows > 0 {
+            let step = DRAIN_STEP.min(budget_rows);
+            debug_assert!(step > 0, "a positive budget must yield a positive step");
+            let _one_drain = drain_serial.lock().await;
+            let pass_started = std::time::Instant::now();
+            match mem.backfill_embeddings(&model, step).await {
+                // Nothing left for this model — either the rows landed under a
+                // different binding, or another drain got there first. Either
+                // way the budget is stale, not owed.
+                Ok(0) => break,
+                Ok(embedded) => {
+                    budget_rows = budget_rows.saturating_sub(embedded);
+                    tokio::time::sleep(pass_started.elapsed()).await;
+                }
+                Err(e) => {
+                    warn!("Queued-vector drain for '{model}' halted: {e}");
+                    break;
+                }
             }
         }
     }
@@ -3472,6 +3562,16 @@ impl DaemonServer {
                     // Wire the memory service into the embed_fn's OnceCell
                     // so provider-switch re-embedding can find it
                     let _ = memory_for_reembed.set(memory_arc.clone());
+
+                    // One long-lived worker for the vectors a live turn parks.
+                    // It sleeps on the queue's notify and costs nothing until a
+                    // tool result is ingested; see `drain_queued_vectors` for
+                    // why it is a separate drain and what bounds it.
+                    let memory_for_queue = memory_arc.clone();
+                    let drain_serial_for_queue = drain_serial.clone();
+                    tokio::spawn(async move {
+                        drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
+                    });
 
                     Some(memory_arc)
                 }
