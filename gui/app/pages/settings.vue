@@ -109,7 +109,7 @@ import { invoke } from '@tauri-apps/api/core'
 import {
   ArrowLeft, Save, CheckCircle, XCircle,
   Brain, Bot, BrainCircuit, Wrench, Clock, Database
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { provideSettingsPage } from '~/composables/useSettingsPage'
 import { useBackend } from '~/composables/useBackend'
 

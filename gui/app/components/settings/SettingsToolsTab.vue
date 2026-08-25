@@ -48,7 +48,7 @@
 </template>
 
 <script setup lang="ts">
-import { Key, Wrench } from 'lucide-vue-next'
+import { Key, Wrench } from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()

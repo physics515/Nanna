@@ -318,7 +318,7 @@ import { ref, computed } from 'vue'
 import { 
   ExternalLink, ArrowRight, ArrowLeft, Zap, Save, 
   Cloud, Smartphone, AlertTriangle, QrCode 
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 interface ChannelStatus {
   name: string

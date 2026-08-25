@@ -262,7 +262,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { 
   Bot, RefreshCw, FolderOpen, ChevronDown, X, StopCircle, 
   Activity, Clock, Cpu, Zap
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 const { isOnline } = useBackend()
 const toast = useToast()

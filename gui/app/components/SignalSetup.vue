@@ -266,7 +266,7 @@ docker run -d --name signal-api \
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ExternalLink, ArrowRight, ArrowLeft, Zap, Save, Terminal, Webhook } from 'lucide-vue-next'
+import { ExternalLink, ArrowRight, ArrowLeft, Zap, Save, Terminal, Webhook } from '@lucide/vue'
 
 interface ChannelStatus {
   name: string

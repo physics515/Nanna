@@ -43,7 +43,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { Eye, EyeOff } from 'lucide-vue-next'
+import { Eye, EyeOff } from '@lucide/vue'
 import { validateApiKey } from '~/lib/formValidation'
 
 const props = defineProps<{

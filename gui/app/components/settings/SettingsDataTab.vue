@@ -93,7 +93,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Database, Trash2, FileDown, FileUp, Moon } from 'lucide-vue-next'
+import { Database, Trash2, FileDown, FileUp, Moon } from '@lucide/vue'
 import { useConfirm } from '~/composables/useConfirm'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 

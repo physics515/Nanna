@@ -89,7 +89,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Search, Folder, FolderPlus, Check, Settings } from 'lucide-vue-next'
+import { Search, Folder, FolderPlus, Check, Settings } from '@lucide/vue'
 
 interface WorkspaceInfo {
   id: string

@@ -1122,6 +1122,23 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       animate their mesh forever, so Playwright's stability check never settles — assert
       visible+enabled, then `click({ force: true })`.
       Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
+      **(3)** *(2026-08-25)* `tests/unit/packageComponentExports.spec.ts` — closes the half guard (1)
+      cannot see. Guard (1) allows any tag the file `import`s, which is correct for the Nuxt-registry
+      bug it was built for but says nothing about whether the **package** still exports that name.
+      Tiptap 3 proved the gap the same day it was written: `import { BubbleMenu } from '@tiptap/vue-3'`
+      kept compiling, kept typechecking, and evaluated to `undefined` because v3 moved the menu
+      components to `@tiptap/vue-3/menus`. This guard resolves each such binding for real —
+      `await import(module)` for every PascalCase tag a template renders that comes from a *bare*
+      package specifier — and asserts the export is defined. **221 bindings across 3 modules today**,
+      and the cost is bounded by distinct *modules* (the loader caches), not by bindings, which is why
+      every `@lucide/vue` icon can be checked for free. Relative/`~`/`#` imports are excluded: a
+      missing export there is a loud build error, not a silent `undefined`. It also pins the Tiptap
+      root-vs-`/menus` fact as a fixture, so if upstream moves them back the guard's premise gets
+      re-read rather than rotting. Reverting either the Tiptap import or the lucide rename reproduces
+      a failure. One trap found while writing it, worth not re-learning: the first version read the
+      *comment* explaining the moved import as a real import statement, so it must strip comments
+      before parsing — a guard that fires on prose about the bug is worse than none, because the fix
+      is to delete the explanation.
       *(2026-07-24)* **Command palette gained a fuzzy tier — `subsequenceScore` in `lib/commandPalette.ts`.**
       `filterActions` was substring-only, so the way people actually type into a palette (`mstats`,
       `tglogs`, `nchat`) returned **nothing at all**. It now falls through to a subsequence match over the
@@ -4544,11 +4561,30 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
          (client+nitro, 3365 modules) **and** a `pnpm dev` boot serving a real 200 `__nuxt` shell on :3000.
          **Deferred majors (each needs a code migration — do one per run, verify via `cargo tauri build`
          + WebDriver before landing):**
-     - [ ] `@tiptap/* 2.11.5 → 3.x` — tiptap v3 **removed the `BubbleMenu` named export from
-           `@tiptap/vue-3`** (breaks `FloatingToolbar.vue`; the whole P7 editor needs the v2→v3 migration:
-           new BubbleMenu wiring, extension API changes). Largest of the batch.
-     - [ ] `vue-router 4 → 5` (major)
-     - [ ] `vue-sonner 1 → 2` (major — toast API)
+     - [x] `@tiptap/* 2.27.2 → 3.30.3` — *(2026-08-25)* **landed; three silent breakages, none of which
+           `vue-tsc` or the 234-test suite caught.** (1) `BubbleMenu` is gone from the `@tiptap/vue-3`
+           root and lives at `@tiptap/vue-3/menus` — the old import still compiled and still typechecked
+           (the package re-exports `@tiptap/core`, so the name looks present) and evaluated to
+           `undefined`, so the floating toolbar would have rendered as an inert unknown element.
+           (2) v3 dropped tippy for Floating UI, so `:tippy-options` fell through to the DOM as an
+           unknown attribute — replaced with `:options` (`placement: 'top'`, `offset: 8`) and the now
+           dead `nanna-bubble` tippy theme CSS deleted. (3) StarterKit 3 registers `link` itself
+           (verified by enumerating its members), so the separate `Link.configure({ autolink: false })`
+           was a duplicate extension name whose config Tiptap would have discarded — and that
+           `autolink: false` is the content-integrity fix that stopped `test_01.sh` becoming
+           `test_[01.sh](http://01.sh)` in outbound mission text. Link is now configured through
+           `StarterKit.configure({ link: {…} })` and `@tiptap/extension-link` dropped as a direct dep.
+           `@tiptap/extension-placeholder` 3.x is a thin re-export of `@tiptap/extensions` and still
+           works. 237 vitest, `vue-tsc --noEmit` clean, `pnpm build` green.
+     - [x] `vue-router 4 → 5` (major) — *(2026-08-25)* landed, zero source changes. The direct
+           `^4.6.4` req was the *mismatch*: `nuxt 4.5.2` already depends on `vue-router ^5.2.0`, so the
+           tree carried the router Nuxt owns plus a stale 4.x pin. `pnpm why` now shows a single 5.2.0.
+     - [x] `vue-sonner 1 → 2` (major — toast API) — *(2026-08-25)* landed. The toast API itself is
+           unchanged; the breaking part is CSS: **v1 injected its stylesheet at runtime, v2 ships it as
+           a separate `vue-sonner/style.css` export you must import.** Without it the toaster mounts,
+           renders, and passes the "a toast really renders" e2e — completely unstyled and unpositioned.
+           Added the explicit import in `ui/sonner/Sonner.vue` (the `vue-sonner/nuxt` module would do
+           it automatically; we mount the component directly).
      - [x] `marked 17 → 18` (major — chat markdown renderer; audit render output)
            *(2026-08-24)* **Landed, 17.0.6 → 18.0.10, zero source changes.** The audit the item asked for
            is what made this cheap: the 26-test characterization suite written the same run (see the
@@ -4559,7 +4595,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            HTML is byte-identical for every one of those cases. 185/185 vitest, `pnpm build` green.
            The suite is the durable half of this: the next renderer bump has to state what it changes
            rather than being taken on faith.
-     - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
+     - [x] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-08-25)*
+           **Landed: `@lucide/vue@1.34.0`, specifier rewritten across 45 files, zero other changes.**
+           One correction to the write-up below: `lucide-vue-next@1.0.0` **is** deprecated on npm
+           ("Package deprecated. Please use `@lucide/vue` instead") but it is *not* an empty tombstone —
+           it ships a real 38 MB dist and every icon resolves from it. That made it worse, not better:
+           `pnpm update --latest` installs a working-but-dead package and nothing fails, so the trap is
+           silence rather than breakage. Migrated to the live package instead of pinning back to
+           0.577.0. The new `packageComponentExports` guard resolves all 221 icon bindings the
+           templates render, so the rename is proven at the export level rather than assumed;
+           `vue-tsc --noEmit` clean, 237 vitest, `pnpm build` green. *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
            `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
@@ -4577,6 +4622,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            it as a migration item, not a sweep bump: needs a full `pnpm build` + `pnpm tauri dev` boot +
            `cargo tauri build` + WebDriver pass. Also note **Nuxt 3 EOL 2026-07-31** (we are on 4.x, so
            informational). Source: [Nuxt 4.5](https://nuxt.com/blog/v4-5).
+     - [ ] *(re-tried 2026-08-25 — still blocked, now with the exact failure)* `typescript@7.0.2` +
+           `vue-tsc@3.3.11` reverted: `vue-tsc` resolves `typescript/lib/tsc` at startup and TS 7's
+           `package.json` no longer lists that subpath in `exports`, so the CI typecheck gate dies with
+           `ERR_PACKAGE_PATH_NOT_EXPORTED` before reading a single file. Nothing in our source is
+           involved — re-check when `vue-tsc` ships against the 7.1 programmatic API.
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -4588,6 +4638,25 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
+   - **`rten` is pinned at `0.24` by `ocrs`, not by us** *(2026-08-25)* — `cargo upgrade --incompatible`
+     offers `rten 0.24 → 0.25`, and taking it is a hard error, not a migration: `ocrs 0.12.2` (latest)
+     requires `rten ^0.24`, so the bump resolves **two** semver-incompatible `rten` crates and
+     `OcrEngineParams { detection_model, recognition_model }` is then handed `rten-0.25::Model` where
+     `rten-0.24::Model` is expected (E0308, verified by building it). Re-check when `ocrs` publishes
+     against 0.25; until then the direct req must track whatever `ocrs` requires.
+     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it.
+   - **`malachite-bigint` must stay at 0.9.2 — a bare `cargo update` breaks the release build**
+     *(2026-08-25)*. `pymath 0.2.0` accepts `malachite-bigint 0.10` while `rustpython-codegen 0.5.0`
+     requires 0.9, so `cargo update` resolves both and `rustpython-stdlib` fails to compile
+     (`there are multiple different versions of crate malachite_bigint in the dependency graph`,
+     17 errors, E0277/E0308). **This is release-only in practice** — it is the second failure of the
+     exact shape the `rust-toolchain.toml` comment describes, so it is another reason a freshness pass
+     is not verified until `cargo build --release -p nanna-daemon` is green. Held with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; the pin lives only in `Cargo.lock`, so
+     **every future run must redo it after `cargo update`** until `rustpython` widens its req.
+     - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+     - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
+           **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
