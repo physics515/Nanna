@@ -64,6 +64,39 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
 
+      # An auto-update fires only when latest.json advertises a version GREATER
+      # than the one the running app reports, and the app reports whatever
+      # tauri.conf.json was built with. Those two drifted apart and nobody
+      # noticed for four releases: the workspace version was last bumped for
+      # beta.14, so beta.15, beta.16 and beta.18 all shipped as 0.3.9 against a
+      # latest.json also saying 0.3.9 -- every one of them invisible to the
+      # updater, while looking like a perfectly good release.
+      #
+      # This costs five seconds and fails BEFORE the hour-long build, which is
+      # the whole point: the two bugs already hit in this series both surfaced
+      # only after everything expensive had already succeeded.
+      - name: Guard - dispatched version must match the version being built
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT="${{ inputs.version }}"
+          BASE="${INPUT%%-*}"                      # 0.3.10-beta.19 -> 0.3.10
+          CONF=$(node -e "console.log(require('./gui/src-tauri/tauri.conf.json').version)")
+          if [ "$BASE" != "$CONF" ]; then
+            echo "::error::Dispatched version '$INPUT' (base '$BASE') does not match"
+            echo "::error::tauri.conf.json version '$CONF'. The installer would report"
+            echo "::error::'$CONF', so an updater pointed at '$BASE' would loop forever."
+            exit 1
+          fi
+          PUBLISHED=$(node -e "console.log(require('./.updater/latest.json').version)")
+          if [ "$BASE" = "$PUBLISHED" ]; then
+            echo "::error::Version '$BASE' is already what .updater/latest.json advertises."
+            echo "::error::Auto-update compares semver and equal is not greater, so no"
+            echo "::error::installed client would ever see this release. Bump the version."
+            exit 1
+          fi
+          echo "version guard OK: building $CONF, dispatching $INPUT, previous $PUBLISHED"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -304,7 +337,16 @@ jobs:
           # directories, which gh rejects.
           find artifacts -type f -print0 | xargs -0 -I{} cp {} .
           shopt -s nullglob
-          files=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          # Filter to files that EXIST rather than relying on nullglob, because
+          # nullglob only drops unmatched GLOBS -- a literal name with no
+          # wildcard survives whether or not the file is there. That is exactly
+          # how the first beta.18 publish failed: Linux was skipped, so the bare
+          # `nanna-daemon` (the Linux binary) stayed in the list and gh rejected
+          # the whole upload with "no matches found for `nanna-daemon`" -- after
+          # a 65-minute build that had produced a correctly signed installer.
+          candidates=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          files=()
+          for f in "${candidates[@]}"; do [ -f "$f" ] && files+=("$f"); done
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::Nothing to upload"; exit 1
           fi

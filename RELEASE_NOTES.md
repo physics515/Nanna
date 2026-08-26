@@ -1,4 +1,4 @@
-# Nanna v0.3.9-beta.18 — The Embedding Gets Out of the Way
+# Nanna v0.3.10-beta.19 — The Embedding Gets Out of the Way
 
 ## What's New
 
@@ -156,6 +156,28 @@ without a signature**.
 - **Channel abstraction** — all clients share state via daemon
 - **Workspace context** — auto-detects project files for system prompt injection
 
+### Fixed: auto-update could not fire, and had not since beta.14
+
+The updater compares the version in `.updater/latest.json` against the version the running app
+reports, and offers an update only when the advertised one is **greater**. The app's version comes
+from `tauri.conf.json`, which was last bumped for **beta.14** — so beta.15, beta.16 and beta.18 all
+shipped reporting `0.3.9` against a manifest also saying `0.3.9`. Equal is not greater, so no
+installed client was ever offered any of them. Each looked like a perfectly good release.
+
+Raising only the manifest would have been worse than leaving it: the installer would still *be*
+`0.3.9`, so a client would update, still report `0.3.9`, and be offered the same update forever.
+The version had to move in the build, which is what this release does — `0.3.9` → **`0.3.10`**
+across `Cargo.toml` (both the package and workspace entries), `gui/package.json` and
+`tauri.conf.json`.
+
+A dispatch-time guard now refuses to start when the dispatched version disagrees with
+`tauri.conf.json`, or when it matches what the manifest already advertises. It costs five seconds
+and runs before the hour-long build — deliberately, because both release bugs found in this series
+surfaced only *after* everything expensive had already succeeded.
+
+**If you are on beta.14 through beta.18, you will not be prompted.** Install this one manually;
+auto-update works again from here.
+
 ## Release Checklist
 
 - [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope
@@ -163,10 +185,14 @@ without a signature**.
       — *repaired across beta.17/18.* Every blocker named in beta.16's note is fixed, and a real
       dispatch has now **built and signed** a Windows installer on a runner: the toolchain pin is
       honoured, Node/pnpm and the Tauri CLI are actually installed, and the signing secrets work
-      (the collect step fails when the `.sig` is missing, and it passed). That first attempt still
-      did not publish — a `cache: pnpm` **post-job** step failed after the build succeeded, and a
-      failed post step fails the job — so the cache was removed. Box stays `[~]` until a dispatch
-      has published end to end.
+      (the collect step fails when the `.sig` is missing, and it passed). **beta.18 shipped**, with
+      a signed installer, its `.sig` and the daemon attached. Box stays `[~]` for one more release
+      because the *workflow* did not do the final upload itself: two bugs surfaced only at the very
+      end of ~50-minute builds — a `cache: pnpm` **post-job** step that failed the job after a
+      successful build, and an upload list mixing globs with literal filenames (`nullglob` drops
+      unmatched globs but not literals, so a skipped Linux job left `nanna-daemon` in the list and
+      gh rejected the whole upload). Both are fixed; beta.18's assets were published from the run's
+      own verified artifact. Tick this when a dispatch publishes unaided.
 - [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (code signing pending;
       the updater signature is applied at upload time from the local minisign key)
 - [ ] Publish signed and notarized macOS .dmg
