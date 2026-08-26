@@ -4199,19 +4199,36 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       **Real-binary verification, stated honestly.** The freshly built `nanna-daemon.exe` was booted
       against an isolated `--data-dir` on ports 51997/51998: it reached "Daemon ready", served IPC and
       health, stayed up for 75s and exited with **zero panics** — so the new long-lived task does not
-      wedge startup or shutdown. It did **not** prove the supervisor ARMS, and the reason is worth
-      recording: this machine's config carries `embedding=disabled:bge-m3:latest`, so no provider
-      resolves, and the spawn sits inside the provider-resolved branch by design. The arm-time
-      `info!("Idle-backfill supervisor armed …")` exists precisely so that a daemon which *does* have
-      an embedding provider says so in one line at boot.
-      - [ ] *(found 2026-08-26)* **The daemon cannot be pointed at an alternate config, which caps
-            what any boot smoke can prove.** `--data-dir` isolates the database but NOT the config:
+      wedge startup or shutdown.
+      That first smoke did **not** prove the supervisor ARMS — this machine's config carries
+      `embedding=disabled:bge-m3:latest`, so no provider resolves and the spawn sits inside the
+      provider-resolved branch by design.
+      **It was proved later in the same run**, once `NANNA_CONFIG_PATH` (below) made an alternate
+      config reachable: booted against a scratch config carrying an embedding provider, the real
+      binary logs `Idle-backfill supervisor armed: queued embedding rows now drain at the end of a
+      turn`, still with zero panics. That arm-time line exists for exactly this purpose — one line at
+      boot, because the drain already announces its own work and a per-turn line for the common
+      nothing-queued case would be noise proportional to conversation length.
+      - [x] *(found AND fixed 2026-08-26)* ~~**The daemon cannot be pointed at an alternate
+            config.**~~ **`NANNA_CONFIG_PATH` now overrides config resolution.** The problem was
+            real: `--data-dir` isolates the database but NOT the config:
             `nanna_config` resolves through the `directories` crate, which on Windows reads the
             *known-folder* API, so a run always loads the operator's real
             `%APPDATA%/nanna/nanna/config/config.toml` (setting `APPDATA` does not redirect it).
-            An unattended run therefore cannot exercise a provider-dependent boot path without
-            editing the developer's own config. Add a `--config <path>` flag (or a
-            `NANNA_CONFIG_PATH` env override) so boot-time behaviour is testable in isolation.
+            An unattended run therefore could not exercise a provider-dependent boot path without
+            editing the developer's own config.
+            Fixed in `Config::default_config_path()` — the single funnel every consumer already goes
+            through, so the daemon's four `Config::load()` sites plus the GUI and CLI all inherit it
+            with **no call-site changes**; a `--config` flag would have had to be threaded through
+            each of them. The override is taken BEFORE the legacy `bot/clawd/Nanna` migration (a
+            caller naming an explicit file is not asking for a tree copy as a side effect), and
+            whitespace-only is treated as unset, so an empty variable in a shell profile cannot
+            silently redirect every consumer to `""`. All three cases share ONE `#[test]`
+            deliberately: `std::env` is process-wide and Rust runs tests in threads, so splitting
+            them invites the classic env-var flake.
+            **It paid for itself the same run** — see the drain-supervisor item above, whose
+            verification went from "startup is not wedged" to "the mechanism arms on the real
+            binary" as soon as an alternate config became reachable.
 
 - [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
       (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two

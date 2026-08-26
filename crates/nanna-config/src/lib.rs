@@ -742,15 +742,58 @@ impl Config {
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
     }
 
+    /// Environment variable that redirects config resolution to an explicit file.
+    ///
+    /// Exists because there was previously **no way to run Nanna against a
+    /// config it does not own**. `--data-dir` isolates the database but not the
+    /// settings, and the settings path is resolved through `directories`, which
+    /// on Windows reads the known-folder API — so `%APPDATA%` cannot redirect it
+    /// either. Any boot-time behaviour that depends on configuration (which
+    /// providers resolve, whether embeddings are enabled at all) was therefore
+    /// only reachable by editing the operator's real `config.toml`, which an
+    /// unattended run must never do. One variable, honoured in the single place
+    /// every consumer already funnels through, makes those paths testable
+    /// without touching anything the operator owns.
+    pub const CONFIG_PATH_ENV: &'static str = "NANNA_CONFIG_PATH";
+
     /// Get default config path.
+    ///
+    /// [`Self::CONFIG_PATH_ENV`] wins when it is set to a non-empty value. The
+    /// override is deliberately taken BEFORE the legacy migration: a caller
+    /// naming an explicit file is not asking for the `bot/clawd/Nanna` tree to
+    /// be copied into the canonical one as a side effect, and a test harness
+    /// least of all.
+    ///
+    /// A path is returned whether or not it exists — the same contract the
+    /// unset case has always had, since [`Self::load`] treats a missing file as
+    /// "use defaults" rather than as an error. Whitespace-only is treated as
+    /// unset, so an empty variable in a shell profile cannot silently redirect
+    /// every consumer to `""`.
     ///
     /// # Errors
     ///
     /// Returns `ConfigError::NoDirFound` if the system config directory cannot be determined.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+        if let Some(path) = Self::config_path_override() {
+            info!("Config path overridden by {}: {path:?}", Self::CONFIG_PATH_ENV);
+            return Ok(path);
+        }
         Self::migrate_legacy_config_if_needed();
         let dirs = project_dirs().ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.config_dir().join("config.toml"))
+    }
+
+    /// The explicit config path, if one is set and meaningful.
+    ///
+    /// Pure apart from the environment read, so the trimming policy is testable
+    /// on its own: see [`config_path_override_ignores_blank`].
+    fn config_path_override() -> Option<PathBuf> {
+        let raw = std::env::var(Self::CONFIG_PATH_ENV).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(trimmed))
     }
 
     /// Get default data directory.
@@ -1072,5 +1115,52 @@ streaming_enabled = true
             !cfg.contains("clawd"),
             "canonical path must not use legacy clawd slug: {cfg}"
         );
+    }
+
+    /// The whole point of the override: an explicit path wins over the
+    /// known-folder location, so a harness can run against a config the
+    /// operator does not own.
+    ///
+    /// These three share one `#[test]` deliberately. `std::env` is process-wide
+    /// and Rust runs tests in threads, so splitting them would let a sibling
+    /// observe this variable mid-mutation — the classic env-var test flake.
+    #[test]
+    fn config_path_override_wins_and_ignores_blank() {
+        // Save and restore: this variable is process-global, and leaking it
+        // would redirect every later test in this binary.
+        let restore = std::env::var(Config::CONFIG_PATH_ENV).ok();
+
+        // SAFETY: single-threaded section of this test; the variable is
+        // restored before returning.
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "") };
+        let blank = Config::default_config_path().expect("blank must fall through, not fail");
+        assert!(
+            blank.ends_with("config.toml"),
+            "an empty override must be treated as unset, not as a path of \"\": {blank:?}"
+        );
+
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "   ") };
+        let spaces = Config::default_config_path().expect("whitespace must fall through");
+        assert_eq!(
+            spaces, blank,
+            "whitespace-only must resolve identically to unset"
+        );
+
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "D:/somewhere/custom.toml") };
+        let overridden = Config::default_config_path().expect("an explicit path must resolve");
+        assert_eq!(
+            overridden,
+            PathBuf::from("D:/somewhere/custom.toml"),
+            "an explicit override must be returned verbatim"
+        );
+        assert_ne!(
+            overridden, blank,
+            "the override must not collapse to the known-folder path"
+        );
+
+        match restore {
+            Some(prev) => unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, prev) },
+            None => unsafe { std::env::remove_var(Config::CONFIG_PATH_ENV) },
+        }
     }
 }
