@@ -4695,6 +4695,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            SVGs carry the attribute. Whatever the docs mean, it is not unconditional, so nothing here
            should be assumed to have changed about accessibility. The other v1 note (UMD build
            dropped, ESM/CJS only) does not affect this app, which is ESM.
+           The dev-server check was run too, because a built app can hide a Nuxt boot-loop: the dev
+           server returns **200** with a real `<div id="__nuxt"` shell and `<title>Nanna</title>`.
+           Worth recording for the next run — it binds **IPv6 `[::1]:3000` only**, so a
+           `curl 127.0.0.1:3000` check reports `000` and reads as a dead server when it is healthy.
            *Original note, kept for the reasoning:* *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the

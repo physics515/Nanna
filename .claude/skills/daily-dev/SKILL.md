@@ -124,8 +124,10 @@ cargo build                                                  # release if perf-r
   and for `panicked`. **Never point a smoke run at the real data dir or the real config.**
 - **Fallback only:** `mcp__computer-use__*` — use only for a native OS dialog WebDriver can't reach; it
   needs a live `request_access` approval that does **not** persist across runs, so prefer WebDriver unattended.
-- If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm
-  `http://localhost:3000` serves a real 200 `__nuxt` shell (catches Nuxt boot-loops the built app hides), then kill it cleanly.
+- If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm it
+  serves a real 200 `__nuxt` shell (catches Nuxt boot-loops the built app hides), then kill it cleanly.
+  **Curl `http://[::1]:3000/`, not `127.0.0.1`** — measured 2026-08-26, the dev server binds IPv6
+  loopback ONLY, so the IPv4 form returns `000` and looks like a dead server when it is healthy.
 
 ### 5 — Update the roadmap (surgically)
 - Tick the item `[x]` and append a short dated note: `(2026-07-06) what shipped + the key number/decision`.
