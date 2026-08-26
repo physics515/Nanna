@@ -74,10 +74,19 @@ Follow the **Engineering doctrine (Appendix A)**. The always-check subset:
 ### 4 — Verify (must be green)
 ```bash
 cargo fmt
-cargo clippy --all-targets      # pedantic + nursery — clean, no new warnings
-cargo test                      # (or -p <crate> for the touched crate)
-cargo build                     # release if perf-relevant
+cargo clippy --workspace --all-targets --exclude nanna-gui   # pedantic + nursery, no NEW warnings
+cargo test --workspace --exclude nanna-gui                   # (or -p <crate> for the touched crate)
+cargo build                                                  # release if perf-relevant
 ```
+- **Say `--workspace`, and mean it.** This repo has a package at the workspace ROOT, so a bare
+  `cargo clippy --all-targets` checks only that root package and its path dependencies — measured
+  2026-08-26, that is **16 of the 20 members**, silently skipping `nanna-browser`, `nanna-proc`,
+  `nanna-bench` and `nanna-gui`. It looks like a full-workspace gate and is not one. `--exclude
+  nanna-gui` is the same exclusion `test-compile.yml` already makes (the Tauri crate needs a built
+  frontend), so this command matches CI's scope deliberately instead of by coincidence.
+- **`cargo fmt` is NOT clean on this tree and must not be made clean in passing.** There are ~2735
+  pre-existing rustfmt diffs repo-wide; a crate-wide reformat would bury an increment's real diff and
+  is forbidden. Check only that the lines YOUR change adds are fmt-neutral.
 - **A dependency, toolchain or `Cargo.lock` change ALSO requires a release build** —
   `cargo build --release -p nanna-daemon` (the crate the Tauri sidecar and every benchmark number
   come from). Debug `build`/`test`/`clippy` cannot see a **release-only** codegen break, and both

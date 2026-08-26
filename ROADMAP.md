@@ -4799,20 +4799,71 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      0.9.2 while `pymath` pulls 0.10.0, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308`s
      about `malachite_bigint::{BigUint,BigInt}`. Third consecutive run hitting it — it is a standing
      step, not an incident.
+     *(2026-08-26)* **Stopped being a per-run step: the pin moved into the manifest.**
+     `crates/nanna-scripting/Cargo.toml` now carries `malachite-bigint = { version = "=0.9.2",
+     optional = true }` under the `python` feature, as a transitive-version pin — exactly the lever
+     `aegis` already uses in `nanna-storage`, and for the same reason. A lockfile pin is what
+     `cargo update` is *entitled* to move, which is why this recurred on four consecutive sweeps; a
+     manifest constraint is not. Optional so it never enters a build without Python, while still
+     binding resolution (the daemon enables `python`, so the release build did compile it — that is
+     why the failure was release-visible). Drop it when `rustpython-common` and `pymath` agree on one
+     malachite.
    - *(research 2026-08-23)* **`ocrs` is still 0.12.2, so `rten 0.24 → 0.25` remains blocked.**
      Re-verified against crates.io this run rather than assumed. `ocrs` still requires `rten ^0.24`
      and `ocr.rs` hands an `rten::Model` straight into `ocrs::OcrEngineParams`, so bumping the direct
      req puts two `rten` versions in one graph and the two `Model` types stop being the same type.
-   - [ ] *(research 2026-08-23)* **Re-try the toolchain pin — not done this run.** `rust-toolchain.toml`
-     is on `nightly-2026-08-03`, and today's `cargo build --release -p nanna-daemon` proves it still
-     holds (exit 0, 15m29s, against a graph freshly invalidated by turso 0.7.2). A *newer* nightly was
-     **not** tried, deliberately: `rustup update` run concurrently with a `cargo build` fails and rolls
-     back on Windows (component files are locked), and a release build plus a Tauri build were in
-     flight for most of this run. Nothing was found upstream confirming the `rustc_codegen_ssa` tokio
-     ICE is fixed, so the pin's removal condition is still unverified. Sequence it first next run:
-     `rustup update` alone, then a full `cargo build --release -p nanna-daemon` — and note that
-     `.github/workflows/{test-compile,release-check}.yml` both hardcode the channel and must move in
-     lockstep with the toml.
+   - [x] *(research 2026-08-23)* ~~**Re-try the toolchain pin.**~~ **Done (2026-08-26): the pin moved
+     `nightly-2026-08-03` -> `nightly-2026-08-25`** (rustc 1.100.0-nightly, e7769602a). Sequenced
+     exactly as the previous run prescribed — `rustup update` **alone** with no cargo in flight, then
+     a full `cargo build --release -p nanna-daemon`: **exit 0 in 18m55s**, no `rustc_codegen_ssa`
+     tokio ICE and no `turso_core` const-eval depth overflow. The three CI channels that mirror the
+     toml moved in lockstep (`budget-gate.yml`, `release-check.yml`, `test-compile.yml` x3).
+     The new nightly surfaces one thing the old one did not, and it is a real future-incompat rather
+     than noise: `recursion_depth_exceeding_limit` ([rust#159228](https://github.com/rust-lang/rust/issues/159228)),
+     raised proving `DaemonServer::run`'s scheduler closure is `Send` through
+     `MemoryService` -> `VectorStore` -> `CosineSimilaritySearch` -> wgpu's `Global`/`Hub`/`Registry`
+     graph — deeper than the default limit of 128. It is scheduled to become a **hard error**, so it
+     is answered now, at the crate roots (`#![recursion_limit = "256"]` on both
+     `nanna-daemon/src/lib.rs` and `src/main.rs`) rather than left to break a later bump. Solver depth
+     only: no behaviour and no codegen change.
+   - *(2026-08-26)* **A third hole in the verify gate, found by the toolchain bump and closed in the
+     skill.** The two already on record were about the release profile; this one is about *scope*.
+     This repo has a package at the workspace **root**, so a bare `cargo clippy --all-targets` checks
+     only that root package and its path dependencies — **16 of the 20 members**, silently skipping
+     `nanna-browser`, `nanna-proc`, `nanna-bench` and `nanna-gui`. It reads as a full-workspace gate
+     and is not one. It mattered immediately: nightly-2026-08-25's new
+     `recursion_depth_exceeding_limit` warning fired in **six** crate roots, and the
+     `-p nanna-daemon` release build showed exactly one of them. `daily-dev`'s step 4 now prescribes
+     `--workspace --all-targets --exclude nanna-gui`, matching `test-compile.yml`'s existing
+     exclusion deliberately rather than by coincidence. The same step also now states plainly that
+     `cargo fmt` is **not** clean on this tree (~2735 pre-existing diffs) and must not be made clean
+     in passing — only the lines an increment adds need to be fmt-neutral.
+   - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
+     aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
+     others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
+     the reasons already on record, re-verified against the registry this run rather than assumed**:
+     - `rten 0.24 -> 0.25` — still blocked by `ocrs`, which `cargo info` confirms is **still 0.12.2**
+       and still requires `rten ^0.24`. Unchanged since 2026-08-23.
+     - `criterion 0.8 -> "0.7.0"` — still the **downgrade trap**. `cargo info criterion` says the real
+       latest is **0.8.2**, which is what the lock already holds. cargo-edit's "latest" column is
+       wrong here; never take an upgrade whose proposed version is lower than the current req.
+     Also re-checked and left pinned on purpose: `boa` (crates.io latest is still **0.21.1**, which
+     pins icu ~2.0 while the tree is on icu 2.2 / temporal_capi 0.2.6 — the git rev `4f98f644` stays),
+     `turso =0.7.2`, `aegis =0.9.15`.
+     - [ ] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
+       [#7660](https://github.com/tursodatabase/turso/issues/7660) asks for `aegis` and `simsimd` to
+       be put behind feature flags so `turso_core` defaults to pure Rust — which is precisely the
+       property the `aegis =0.9.15` pin exists to preserve (0.9.8+ mandates a clang-cl C build,
+       unavailable on stock Windows MSVC). The issue is **still open** as of this run, with a linked
+       PR (#7905) whose status was not readable from the issue page. Re-check on the next sweep: if a
+       turso release ships default-pure-Rust `turso_core`, drop the transitive `aegis` pin entirely
+       instead of carrying an exact version forward.
+     GUI: `pnpm install` then `pnpm outdated` — every compatible-range package is already at latest;
+     the only entries left are the five known-deferred majors (tiptap 3, typescript 7, vue-router 5,
+     vue-sonner 2, and the `lucide-vue-next` -> `@lucide/vue` rename). **`lucide-vue-next@1.0.0` was
+     re-confirmed as a tombstone this run, not a release**: `npm view` reports it
+     `deprecated: "Package deprecated. Please use @lucide/vue instead"`, and the live package is
+     `@lucide/vue@1.34.0`. `pnpm update --latest` would still silently install the dead one.
    - *(2026-08-24 sweep)* `cargo update` → 60+ compatible bumps. `cargo upgrade --incompatible` → three
      majors **applied green** — `wide 1.5 → 1.6` (`nanna-simd`, compiled unchanged), `uuid 1.24 → 1.25`
      (workspace + `nanna-server`), `playwright-rs 0.15 → 0.16` (`nanna-browser`, compiled unchanged under
