@@ -74,10 +74,22 @@ Follow the **Engineering doctrine (Appendix A)**. The always-check subset:
 ### 4 — Verify (must be green)
 ```bash
 cargo fmt
-cargo clippy --all-targets      # pedantic + nursery — clean, no new warnings
-cargo test                      # (or -p <crate> for the touched crate)
-cargo build                     # release if perf-relevant
+cargo clippy --workspace --all-targets --exclude nanna-gui   # pedantic + nursery, no NEW warnings
+cargo test --workspace --exclude nanna-gui                   # (or -p <crate> for the touched crate)
+cargo build                                                  # release if perf-relevant
 ```
+- **Say `--workspace`, and mean it.** This repo has a package at the workspace ROOT, so a bare
+  `cargo clippy --all-targets` checks only that root package and its path dependencies. Measured
+  2026-08-26 on the same tree: the bare command reported **16** workspace crates, the `--workspace`
+  form reported **18**, the two extra being `nanna-bench` and `nanna-browser`. (`nanna-proc` emits no
+  warnings under either, so whether it was checked cannot be told from the output — which is itself
+  the point: a gate whose coverage you cannot read is a gate you cannot trust.) It looks like a
+  full-workspace gate and is not one. `--exclude nanna-gui` is the same exclusion
+  `test-compile.yml` already makes (the Tauri crate needs a built frontend), so this command matches
+  CI's scope deliberately instead of by coincidence.
+- **`cargo fmt` is NOT clean on this tree and must not be made clean in passing.** There are ~2735
+  pre-existing rustfmt diffs repo-wide; a crate-wide reformat would bury an increment's real diff and
+  is forbidden. Check only that the lines YOUR change adds are fmt-neutral.
 - **A dependency, toolchain or `Cargo.lock` change ALSO requires a release build** —
   `cargo build --release -p nanna-daemon` (the crate the Tauri sidecar and every benchmark number
   come from). Debug `build`/`test`/`clippy` cannot see a **release-only** codegen break, and both
@@ -99,10 +111,23 @@ cargo build                     # release if perf-relevant
   computer-use grant and works every run** — it is the reason a run CAN honestly verify the GUI.
   (`tauri-driver` + `msedgedriver` are installed on PATH under `~/.cargo/bin`; the harness's `ensure`
   auto-matches msedgedriver to the live WebView2 Runtime — `cargo install tauri-driver` if missing.)
+- **Backend runtime verification — boot the daemon against a SCRATCH config, never the operator's.**
+  `NANNA_CONFIG_PATH=<file>` overrides config resolution (added 2026-08-26); `--data-dir <dir>`,
+  `--no-pid-file`, `--port`/`--health-port` isolate everything else. Without the config override a
+  run loads the developer's real `config.toml` — `--data-dir` does NOT isolate settings, and
+  `%APPDATA%` cannot redirect them because `directories` reads the Windows known-folder API. With
+  it, provider-dependent boot paths are reachable unattended:
+  ```bash
+  NANNA_CONFIG_PATH=<scratch>/cfg.toml <target>/debug/nanna-daemon.exe     --data-dir <scratch>/data --no-pid-file --port 51997 --health-port 51998     --no-file-log --log-level info run
+  ```
+  (subcommand LAST — global flags precede it). Grep the captured log for the behaviour you added
+  and for `panicked`. **Never point a smoke run at the real data dir or the real config.**
 - **Fallback only:** `mcp__computer-use__*` — use only for a native OS dialog WebDriver can't reach; it
   needs a live `request_access` approval that does **not** persist across runs, so prefer WebDriver unattended.
-- If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm
-  `http://localhost:3000` serves a real 200 `__nuxt` shell (catches Nuxt boot-loops the built app hides), then kill it cleanly.
+- If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm it
+  serves a real 200 `__nuxt` shell (catches Nuxt boot-loops the built app hides), then kill it cleanly.
+  **Curl `http://[::1]:3000/`, not `127.0.0.1`** — measured 2026-08-26, the dev server binds IPv6
+  loopback ONLY, so the IPv4 form returns `000` and looks like a dead server when it is healthy.
 
 ### 5 — Update the roadmap (surgically)
 - Tick the item `[x]` and append a short dated note: `(2026-07-06) what shipped + the key number/decision`.

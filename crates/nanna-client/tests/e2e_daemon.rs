@@ -1,3 +1,12 @@
+// An integration test is its OWN crate root, so the crate-level attribute the
+// six library roots carry does not reach it. This target drives a real daemon,
+// so proving its futures are `Send` walks the same
+// MemoryService -> VectorStore -> CosineSimilaritySearch -> wgpu graph that is
+// deeper than the default limit of 128, and nightly-2026-08-25 makes that the
+// future-incompatible `recursion_depth_exceeding_limit` warning (rust#159228)
+// which is scheduled to become a hard error. Solver depth only.
+#![recursion_limit = "256"]
+
 //! End-to-end daemon tests: start a real daemon, attach a real client over the
 //! WebSocket IPC, and drive it the way the GUI/CLI do.
 //!

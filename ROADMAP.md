@@ -1719,6 +1719,15 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       `default-features = false`, no `image`/FFI) — matching the "no C where avoidable" doctrine.
       Sources: [onyums](https://github.com/basic-automation/onyums),
       [onyums crate](https://crates.io/crates/onyums), [arti-client](https://crates.io/api/v1/crates/arti-client).
+- [ ] *(research 2026-08-26)* **arti 2.5.1 (2026-08-04) adds onion-service features worth having, but
+      `onyums` has not moved.** 2.5.1 brings unix-socket target addresses for onion services, plus
+      experimental congestion control and Counter Galois Onion cryptography on onion-service circuits.
+      `onyums` — the crate P9 requires all Tor traffic to go through, and the reason `arti-*` must
+      never be pinned directly — is still **0.2.5, roughly three months old**, so none of that reaches
+      us until onyums re-exports a newer arti. Nothing to do now: re-check onyums's arti floor on the
+      next sweep, and do NOT reach for a direct `arti-*` pin, which this phase forbids. Sources:
+      [Arti 2.5.1](https://blog.torproject.org/arti_2_5_1_released/),
+      [onyums](https://crates.io/crates/onyums).
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -2180,6 +2189,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Sequence it that way — measure SQL-side exact k-NN against the current in-RAM SIMD scan on the
             `nanna-memory::retention` harness *first*, since it is exact (no recall trade to prove) and
             drops the RAM ceiling; only then decide whether ANN is still needed.
+            - [ ] *(research 2026-08-26)* **`hnswlib-rs` is the ANN shape that actually fits a
+                  Turso-only store**, if ANN is ever needed. It deliberately **decouples the graph
+                  from vector storage** — the caller supplies a `VectorStore` keyed by `NodeId` and
+                  vectors are fetched on demand — which is exactly this split: Turso keeps owning the
+                  f32 BLOBs, the index owns only the graph, and nothing is mirrored into a second
+                  store. Alternatives seen: `swarc`, `vicinity` (HNSW behind a feature), `hnsw_rs`.
+                  **Do not schedule this on recall grounds.** Appendix C's measured figure is ~0.1us
+                  per 768-dim SIMD cosine, linear — a full scan of 100k memories is ~10ms, so an
+                  index earns nothing at today's corpus size. The real trigger is the **O(N^2)
+                  clustering in dreaming**, not recall. Source:
+                  [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+            - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
+                  saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
+                  parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
+                  7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
+                  0.8334, ...`), and six of them — `w13, w14, w15, w17, w18, w19` — are **zeroed**,
+                  which matches neither table (FSRS-5's are all non-zero).
+                  **`w20 = 0.0658` is NOT in question and must not be "corrected" by this item:** it
+                  is already justified in-tree by a retention-harness experiment (an 800-day-aged
+                  corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`).
+                  Not changed blind, because every weight feeds the decay of every stored memory and
+                  the zeroed entries may well be deliberate — the short-term/same-day terms have no
+                  meaning for a store whose "reviews" are recalls rather than study sessions. What is
+                  wanted is the decision written down: either adopt FSRS-6's table with an A/B on the
+                  `retention` harness exactly as `w20` got, or rename the constant and its doc to say
+                  what the table actually is. Note the upstream wiki is internally inconsistent about
+                  the decay INDEX (its prose says `w20 = 0.0658` while its own 21-entry array puts
+                  `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
+                  source before touching anything. Source:
+                  [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:
@@ -4340,6 +4379,73 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       Only the sentence was wrong, and a bound whose derivation has gone stale is the next magic
       constant: nobody can tell whether it is still right.
 
+- [x] **A drain trigger the daemon owns — the backlog `drain_queued_vectors` deliberately does not sweep.**
+      *(2026-08-26)* Complements the item above rather than duplicating it. `drain_queued_vectors`
+      drains what **this process** deferred, at foreground priority, and is budgeted so it will not
+      sweep an inherited backlog — its own doc says that remainder is "still `drain_backfill`'s job
+      at `drain_backfill`'s priority". The gap: **nothing was calling `drain_backfill` at that
+      priority during a session.** Its only triggers are BINDING events (daemon start, provider
+      switch, width reprobe) and an ordinary session has none, so a row parked by a *transient*
+      embedding failure — or a backlog inherited from a previous run — waited for a restart.
+      `MemoryService::store_unembedded`'s own doc named this exactly: "it is recovered, not lost —
+      but the latency is a session, not a moment, and closing that needs a drain trigger the memory
+      crate does not own."
+      `supervise_idle_backfill` is that trigger: one task for the daemon's life running
+      `wait_active().await; wait_idle().await` — exactly one turn's lifetime — then the existing
+      `drain_backfill`. **It adds a trigger, never a second rate:** same process-wide `drain_serial`
+      mutex, same chat-priority gate, same per-request RTT repayment.
+      **Bound.** One probe per active→idle edge, so the probe rate is bounded by the *turn* rate.
+      The probe is what a complete store already costs `drain_backfill`:
+      `entries_missing_model(model, 1)` is an **in-memory** scan of the entries cache that
+      short-circuits on the first unbucketed entry (walking it whole only when there is nothing to
+      do), plus two `LIMIT 1` local Turso queries. No provider request unless work is found.
+      **Known, deliberate limit:** `wait_active` registers interest and then reads the flag, so a
+      turn that begins AND ends inside that window leaves no edge and its rows wait for the next
+      turn. Bounded by one turn, with the rows durable and handle-addressable throughout. Not
+      "fixed" by probing before parking — that turns the loop into a spin on an idle daemon.
+      **4 tests** in `chat_harness` pin the registry contract the bound rests on, and the fourth
+      exists because the second **failed first**: it had asserted the stronger guarantee and failed
+      by timeout, exercising the very race the design note described in prose. Rather than weaken
+      the check, the contract that does hold is tested with a `Notify` handshake, and the limitation
+      is pinned as its own named test so anyone who later "fixes" the loop is told which property
+      they traded away.
+      - [x] *(found AND fixed 2026-08-26)* ~~**The daemon cannot be pointed at an alternate
+            config.**~~ **`NANNA_CONFIG_PATH` now overrides config resolution.** The problem was
+            real: `--data-dir` isolates the database but NOT the config:
+            `nanna_config` resolves through the `directories` crate, which on Windows reads the
+            *known-folder* API, so a run always loads the operator's real
+            `%APPDATA%/nanna/nanna/config/config.toml` (setting `APPDATA` does not redirect it).
+            An unattended run therefore could not exercise a provider-dependent boot path without
+            editing the developer's own config.
+            Fixed in `Config::default_config_path()` — the single funnel every consumer already goes
+            through, so the daemon's four `Config::load()` sites plus the GUI and CLI all inherit it
+            with **no call-site changes**; a `--config` flag would have had to be threaded through
+            each of them. The override is taken BEFORE the legacy `bot/clawd/Nanna` migration (a
+            caller naming an explicit file is not asking for a tree copy as a side effect), and
+            whitespace-only is treated as unset, so an empty variable in a shell profile cannot
+            silently redirect every consumer to `""`. All three cases share ONE `#[test]`
+            deliberately: `std::env` is process-wide and Rust runs tests in threads, so splitting
+            them invites the classic env-var flake.
+            **It paid for itself the same run** — see the drain-supervisor item above, whose
+            verification went from "startup is not wedged" to "the mechanism arms on the real
+            binary" as soon as an alternate config became reachable.
+
+- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
+      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
+      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
+      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
+      from the retrieval top-k (see the item's own note).
+      *(2026-08-26)* **Its prerequisite now exists.** Part 3 wants the row persisted synchronously
+      and only the vector queued — which was previously unsafe to do deliberately, because nothing
+      drained a queued vector until the next provider-binding event. `supervise_idle_backfill`
+      (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
+      rather than at the next restart. The chunk-COUNT bound is still open and still needs a
+      derivation, not a magic number.
+- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+      listed above and deliberately did not claim the rest; a per-item pass would let this whole
+      section collapse to a few lines of history.
+
 
 #### What is already working — do not re-litigate
 
@@ -4792,6 +4898,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.577.0. The new `packageComponentExports` guard resolves all 221 icon bindings the
            templates render, so the rename is proven at the export level rather than assumed;
            `vue-tsc --noEmit` clean, 237 vitest, `pnpm build` green. *(2026-07-16 —
+           *(2026-08-26, measured)* One claim about v1 that circulates in its release summaries is
+           **wrong for this build**: icons are said to set `aria-hidden="true"` themselves. Driving
+           the built app under WebDriver, **0 of the 10** rendered lucide SVGs carry the attribute.
+           Whatever the docs mean, it is not unconditional — so nothing here should be assumed to
+           have changed about accessibility.
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
            `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
@@ -5055,20 +5166,73 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      0.9.2 while `pymath` pulls 0.10.0, and `rustpython-stdlib` then fails with 17 `E0277`/`E0308`s
      about `malachite_bigint::{BigUint,BigInt}`. Third consecutive run hitting it — it is a standing
      step, not an incident.
+     *(2026-08-26)* **Stopped being a per-run step: the pin moved into the manifest.**
+     `crates/nanna-scripting/Cargo.toml` now carries `malachite-bigint = { version = "=0.9.2",
+     optional = true }` under the `python` feature, as a transitive-version pin — exactly the lever
+     `aegis` already uses in `nanna-storage`, and for the same reason. A lockfile pin is what
+     `cargo update` is *entitled* to move, which is why this recurred on four consecutive sweeps; a
+     manifest constraint is not. Optional so it never enters a build without Python, while still
+     binding resolution (the daemon enables `python`, so the release build did compile it — that is
+     why the failure was release-visible). Drop it when `rustpython-common` and `pymath` agree on one
+     malachite.
    - *(research 2026-08-23)* **`ocrs` is still 0.12.2, so `rten 0.24 → 0.25` remains blocked.**
      Re-verified against crates.io this run rather than assumed. `ocrs` still requires `rten ^0.24`
      and `ocr.rs` hands an `rten::Model` straight into `ocrs::OcrEngineParams`, so bumping the direct
      req puts two `rten` versions in one graph and the two `Model` types stop being the same type.
-   - [ ] *(research 2026-08-23)* **Re-try the toolchain pin — not done this run.** `rust-toolchain.toml`
-     is on `nightly-2026-08-03`, and today's `cargo build --release -p nanna-daemon` proves it still
-     holds (exit 0, 15m29s, against a graph freshly invalidated by turso 0.7.2). A *newer* nightly was
-     **not** tried, deliberately: `rustup update` run concurrently with a `cargo build` fails and rolls
-     back on Windows (component files are locked), and a release build plus a Tauri build were in
-     flight for most of this run. Nothing was found upstream confirming the `rustc_codegen_ssa` tokio
-     ICE is fixed, so the pin's removal condition is still unverified. Sequence it first next run:
-     `rustup update` alone, then a full `cargo build --release -p nanna-daemon` — and note that
-     `.github/workflows/{test-compile,release-check}.yml` both hardcode the channel and must move in
-     lockstep with the toml.
+   - [x] *(research 2026-08-23)* ~~**Re-try the toolchain pin.**~~ **Done (2026-08-26): the pin moved
+     `nightly-2026-08-03` -> `nightly-2026-08-25`** (rustc 1.100.0-nightly, e7769602a). Sequenced
+     exactly as the previous run prescribed — `rustup update` **alone** with no cargo in flight, then
+     a full `cargo build --release -p nanna-daemon`: **exit 0 in 18m55s**, no `rustc_codegen_ssa`
+     tokio ICE and no `turso_core` const-eval depth overflow. The three CI channels that mirror the
+     toml moved in lockstep (`budget-gate.yml`, `release-check.yml`, `test-compile.yml` x3).
+     The new nightly surfaces one thing the old one did not, and it is a real future-incompat rather
+     than noise: `recursion_depth_exceeding_limit` ([rust#159228](https://github.com/rust-lang/rust/issues/159228)),
+     raised proving `DaemonServer::run`'s scheduler closure is `Send` through
+     `MemoryService` -> `VectorStore` -> `CosineSimilaritySearch` -> wgpu's `Global`/`Hub`/`Registry`
+     graph — deeper than the default limit of 128. It is scheduled to become a **hard error**, so it
+     is answered now, at the crate roots (`#![recursion_limit = "256"]` on both
+     `nanna-daemon/src/lib.rs` and `src/main.rs`) rather than left to break a later bump. Solver depth
+     only: no behaviour and no codegen change.
+   - *(2026-08-26)* **A third hole in the verify gate, found by the toolchain bump and closed in the
+     skill.** The two already on record were about the release profile; this one is about *scope*.
+     This repo has a package at the workspace **root**, so a bare `cargo clippy --all-targets` checks
+     only that root package and its path dependencies. Measured on the same tree: the bare command
+     reported **16** workspace crates, `--workspace` reported **18** — the extra two being
+     `nanna-bench` and `nanna-browser`. (`nanna-proc` is silent under both, so its coverage cannot be
+     read off the output at all, which is the same problem in a smaller box.) It reads as a
+     full-workspace gate and is not one. It mattered immediately: nightly-2026-08-25's new
+     `recursion_depth_exceeding_limit` warning fired in **six** crate roots, and the
+     `-p nanna-daemon` release build showed exactly one of them. `daily-dev`'s step 4 now prescribes
+     `--workspace --all-targets --exclude nanna-gui`, matching `test-compile.yml`'s existing
+     exclusion deliberately rather than by coincidence. The same step also now states plainly that
+     `cargo fmt` is **not** clean on this tree (~2735 pre-existing diffs) and must not be made clean
+     in passing — only the lines an increment adds need to be fmt-neutral.
+   - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
+     aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
+     others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
+     the reasons already on record, re-verified against the registry this run rather than assumed**:
+     - `rten 0.24 -> 0.25` — still blocked by `ocrs`, which `cargo info` confirms is **still 0.12.2**
+       and still requires `rten ^0.24`. Unchanged since 2026-08-23.
+     - `criterion 0.8 -> "0.7.0"` — still the **downgrade trap**. `cargo info criterion` says the real
+       latest is **0.8.2**, which is what the lock already holds. cargo-edit's "latest" column is
+       wrong here; never take an upgrade whose proposed version is lower than the current req.
+     Also re-checked and left pinned on purpose: `boa` (crates.io latest is still **0.21.1**, which
+     pins icu ~2.0 while the tree is on icu 2.2 / temporal_capi 0.2.6 — the git rev `4f98f644` stays),
+     `turso =0.7.2`, `aegis =0.9.15`.
+     - [ ] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
+       [#7660](https://github.com/tursodatabase/turso/issues/7660) asks for `aegis` and `simsimd` to
+       be put behind feature flags so `turso_core` defaults to pure Rust — which is precisely the
+       property the `aegis =0.9.15` pin exists to preserve (0.9.8+ mandates a clang-cl C build,
+       unavailable on stock Windows MSVC). The issue is **still open** as of this run, with a linked
+       PR (#7905) whose status was not readable from the issue page. Re-check on the next sweep: if a
+       turso release ships default-pure-Rust `turso_core`, drop the transitive `aegis` pin entirely
+       instead of carrying an exact version forward.
+     GUI: `pnpm install` then `pnpm outdated` — every compatible-range package is already at latest;
+     the only entries left are the five known-deferred majors (tiptap 3, typescript 7, vue-router 5,
+     vue-sonner 2, and the `lucide-vue-next` -> `@lucide/vue` rename). **`lucide-vue-next@1.0.0` was
+     re-confirmed as a tombstone this run, not a release**: `npm view` reports it
+     `deprecated: "Package deprecated. Please use @lucide/vue instead"`, and the live package is
+     `@lucide/vue@1.34.0`. `pnpm update --latest` would still silently install the dead one.
    - *(2026-08-24 sweep)* `cargo update` → 60+ compatible bumps. `cargo upgrade --incompatible` → three
      majors **applied green** — `wide 1.5 → 1.6` (`nanna-simd`, compiled unchanged), `uuid 1.24 → 1.25`
      (workspace + `nanna-server`), `playwright-rs 0.15 → 0.16` (`nanna-browser`, compiled unchanged under

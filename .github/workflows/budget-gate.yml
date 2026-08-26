@@ -41,7 +41,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-08-03
+          toolchain: nightly-2026-08-25
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

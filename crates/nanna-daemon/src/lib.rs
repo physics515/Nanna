@@ -1,5 +1,15 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
+// The auto-trait solver proves `DaemonServer::run`'s scheduler closure is
+// `Send` by walking the whole state tuple, and that walk descends through
+// `MemoryService` -> `VectorStore` -> `CosineSimilaritySearch` -> wgpu's
+// `Global`/`Hub`/`Registry` graph, which is deeper than the default limit of
+// 128. nightly-2026-08-25 turned the resulting overflow into the
+// future-incompatible `recursion_depth_exceeding_limit` warning (rust#159228)
+// — it is scheduled to become a hard error, so the limit is raised here rather
+// than left to break a future toolchain bump. This costs solver depth only;
+// it changes no behaviour and no generated code.
+#![recursion_limit = "256"]
 
 //! Nanna Daemon - Headless background service
 //!
