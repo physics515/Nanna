@@ -1516,23 +1516,26 @@ async fn drain_queued_vectors(
                 }
             }
         }
+    }
+}
 
-/// How this differs from [`drain_queued_vectors`] above, since both drain the
-/// same queue and only one of them is obvious:
+/// How this differs from [`drain_queued_vectors`] above, since both end up
+/// draining the same queue and only one of them is obvious:
 ///
 /// `drain_queued_vectors` handles what THIS PROCESS deliberately deferred, at
-/// foreground priority, during the turn — and it is explicitly budgeted so it
+/// foreground priority, during the turn -- and it is explicitly budgeted so it
 /// will NOT sweep up an inherited backlog. Its own doc says that remainder is
 /// "still `drain_backfill`'s job at `drain_backfill`'s priority".
 ///
-/// The catch is that nothing was ever calling `drain_backfill` at that
-/// priority during a session. Its only triggers are BINDING events — daemon
-/// start, provider switch, width reprobe — and an ordinary session has none of
-/// them. So a row parked by a *transient* embedding failure, or a backlog
-/// inherited from a previous run, waited for a restart. That is the gap this
-/// closes, and it is why the two coexist rather than one replacing the other:
-/// one drains the work the turn created, the other drains everything else, at
-/// the first moment no turn is live.
+/// The catch is that nothing was calling `drain_backfill` at that priority
+/// during a session. Its only triggers are BINDING events -- daemon start,
+/// provider switch, width reprobe -- and an ordinary session has none of them.
+/// So a row parked by a *transient* embedding failure, or a backlog inherited
+/// from a previous run, waited for a restart. That is the gap this closes, and
+/// it is why the two coexist rather than one replacing the other: one drains
+/// the work the turn created, the other drains everything else, at the first
+/// moment no turn is live.
+///
 /// Drain rows that were parked mid-session, at the first moment no turn is live.
 ///
 /// [`nanna_memory::MemoryService::store_unembedded`] is durable and honest —
@@ -3650,9 +3653,11 @@ impl DaemonServer {
                         // One supervisor for the daemon's life: it turns the
                         // end of every turn into a drain opportunity, which is
                         // what closes the "parked until the next binding event"
-                        // gap `store_unembedded` documents. Spawned beside the
-                        // startup bind because that is where the binding, the
-                        // run registry and the drain mutex are all in scope.
+                        // gap `store_unembedded` documents -- the backlog
+                        // `drain_queued_vectors` is budgeted not to sweep.
+                        // Spawned beside the startup bind because that is where
+                        // the binding, the run registry and the drain mutex are
+                        // all in scope.
                         let memory_for_supervisor = memory_arc.clone();
                         let chat_runs_for_supervisor = chat_runs.clone();
                         let drain_serial_for_supervisor = drain_serial.clone();
