@@ -210,7 +210,7 @@ import { ref, computed, watch, onMounted, onUnmounted, provide, nextTick } from 
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, MoreHorizontal } from 'lucide-vue-next'
+import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, MoreHorizontal } from '@lucide/vue'
 import { statusBarLabel } from '~/lib/backendLabels'
 import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'

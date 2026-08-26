@@ -203,7 +203,7 @@ import {
   Send, Eye, X, Square, ImagePlus,
   Bold, Italic, Strikethrough, Code,
   Heading2, List, Quote, ListChecks,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { useSplatter } from '~/composables/useSplatter'
 import { useGroundGlass } from '~/composables/useGroundGlass'
 

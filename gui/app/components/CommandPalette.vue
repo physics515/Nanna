@@ -59,7 +59,7 @@
 </template>
 
 <script setup lang="ts">
-import { Search } from 'lucide-vue-next'
+import { Search } from '@lucide/vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { filterActions } from '~/lib/commandPalette'

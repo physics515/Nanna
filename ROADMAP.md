@@ -4663,8 +4663,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            parsing the import lists, not by eye). Verified: `pnpm build` exit 0 (**this is the gate
            that matters** — Rollup has to resolve all 87 named exports, so a renamed icon would fail
            here), `pnpm test` 27 files / 234 tests green, `cargo tauri build` + WebDriver below.
-           Also inherited from v1: icons now set `aria-hidden="true"` themselves, and the UMD build
-           is gone (ESM/CJS only) — neither affects this app.
+           **Verified on the real binary, not just the bundler.** `cargo tauri build` produced
+           `nanna-gui.exe` plus the NSIS installer; the run's only non-zero exit was the updater
+           signing step, which needs `TAURI_SIGNING_PRIVATE_KEY` — a release secret an unattended run
+           has no business holding. Driven under the shared WebDriver harness, the built app reports
+           `__TAURI_INTERNALS__` as an `object` (a real Tauri shell, not a browser), renders **10
+           lucide SVGs** on the default view — brain, wrench, radio, ellipsis, settings, chevron-down,
+           bell, x, sparkles, arrow-right — and contains no `[object Object]`, i.e. no icon resolved
+           to an undefined component. The rendered class is `lucide lucide-brain-icon lucide-brain`,
+           and the `-icon`-suffixed variant is v1 naming, so this also confirms the NEW package is
+           the one live rather than a stale install.
+           **Corrected against observation:** v1's release notes are summarised as saying icons set
+           `aria-hidden="true"` automatically. **This build does not** — 0 of the 10 rendered lucide
+           SVGs carry the attribute. Whatever the docs mean, it is not unconditional, so nothing here
+           should be assumed to have changed about accessibility. The other v1 note (UMD build
+           dropped, ESM/CJS only) does not affect this app, which is ESM.
            *Original note, kept for the reasoning:* *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the

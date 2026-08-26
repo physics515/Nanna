@@ -7,7 +7,7 @@
 import {
   Bold, Italic, Strikethrough, Code,
   Heading2, List, ListOrdered, Quote, ListChecks, Minus,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { useSplatter } from '~/composables/useSplatter'
 
 const props = withDefaults(defineProps<{

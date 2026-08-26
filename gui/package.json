@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
+    "@lucide/vue": "^1.34.0",
     "@monaco-editor/loader": "^1.7.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
@@ -46,7 +47,6 @@
     "@vueuse/core": "^14.4.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "lucide-vue-next": "^0.577.0",
     "marked": "^18.0.10",
     "monaco-editor": "^0.56.0",
     "nuxt": "^4.5.2",

@@ -5,7 +5,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { ArrowRight, Check, HeartPulse, KeyRound, Sparkles, X } from 'lucide-vue-next'
+import { ArrowRight, Check, HeartPulse, KeyRound, Sparkles, X } from '@lucide/vue'
 
 const props = defineProps<{
   open: boolean

@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { ChevronDown } from 'lucide-vue-next'
+import { ChevronDown } from '@lucide/vue'
 import { modelDisplayName } from '~/lib/modelSpecs'
 import { useSessionState } from '~/composables/useSessionState'
 import { useToast } from '~/composables/useToast'

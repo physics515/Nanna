@@ -61,7 +61,7 @@
 
 <script setup lang="ts">
 import { BubbleMenu } from '@tiptap/vue-3'
-import { Bold, Italic, Strikethrough, Code, Link as LinkIcon, Unlink } from 'lucide-vue-next'
+import { Bold, Italic, Strikethrough, Code, Link as LinkIcon, Unlink } from '@lucide/vue'
 import type { Editor } from '@tiptap/core'
 
 const props = defineProps<{

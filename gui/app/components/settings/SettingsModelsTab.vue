@@ -316,7 +316,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   Key, CheckCircle, XCircle, LogOut, Terminal, Download, RefreshCw,
   Brain, AlertTriangle, Layers, Link, ScanText, Bot
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()

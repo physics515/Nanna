@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { DialogRoot, DialogTrigger, DialogPortal, DialogOverlay, DialogContent, DialogClose, DialogTitle, DialogDescription } from 'radix-vue'
-import { X } from 'lucide-vue-next'
+import { X } from '@lucide/vue'
 
 interface Props {
   modelValue?: boolean

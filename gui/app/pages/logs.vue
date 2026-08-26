@@ -192,7 +192,7 @@
 import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { filterLogs } from '~/lib/logFilters'
-import { ChevronDown, Trash2, Circle, Copy } from 'lucide-vue-next'
+import { ChevronDown, Trash2, Circle, Copy } from '@lucide/vue'
 const toastApi = useToast()
 const { confirm } = useConfirm()
 

@@ -198,7 +198,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Globe, FolderKanban, Trash2, Pencil } from 'lucide-vue-next'
+import { Globe, FolderKanban, Trash2, Pencil } from '@lucide/vue'
 
 const { status: backendStatus, isOnline } = useBackend()
 const { confirm } = useConfirm()
