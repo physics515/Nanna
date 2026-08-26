@@ -1702,6 +1702,15 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       `default-features = false`, no `image`/FFI) — matching the "no C where avoidable" doctrine.
       Sources: [onyums](https://github.com/basic-automation/onyums),
       [onyums crate](https://crates.io/crates/onyums), [arti-client](https://crates.io/api/v1/crates/arti-client).
+- [ ] *(research 2026-08-26)* **arti 2.5.1 (2026-08-04) adds onion-service features worth having, but
+      `onyums` has not moved.** 2.5.1 brings unix-socket target addresses for onion services, plus
+      experimental congestion control and Counter Galois Onion cryptography on onion-service circuits.
+      `onyums` — the crate P9 requires all Tor traffic to go through, and the reason `arti-*` must
+      never be pinned directly — is still **0.2.5, roughly three months old**, so none of that reaches
+      us until onyums re-exports a newer arti. Nothing to do now: re-check onyums's arti floor on the
+      next sweep, and do NOT reach for a direct `arti-*` pin, which this phase forbids. Sources:
+      [Arti 2.5.1](https://blog.torproject.org/arti_2_5_1_released/),
+      [onyums](https://crates.io/crates/onyums).
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -2117,6 +2126,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Sequence it that way — measure SQL-side exact k-NN against the current in-RAM SIMD scan on the
             `nanna-memory::retention` harness *first*, since it is exact (no recall trade to prove) and
             drops the RAM ceiling; only then decide whether ANN is still needed.
+            - [ ] *(research 2026-08-26)* **`hnswlib-rs` is the ANN shape that actually fits a
+                  Turso-only store**, if ANN is ever needed. It deliberately **decouples the graph
+                  from vector storage** — the caller supplies a `VectorStore` keyed by `NodeId` and
+                  vectors are fetched on demand — which is exactly this split: Turso keeps owning the
+                  f32 BLOBs, the index owns only the graph, and nothing is mirrored into a second
+                  store. Alternatives seen: `swarc`, `vicinity` (HNSW behind a feature), `hnsw_rs`.
+                  **Do not schedule this on recall grounds.** Appendix C's measured figure is ~0.1us
+                  per 768-dim SIMD cosine, linear — a full scan of 100k memories is ~10ms, so an
+                  index earns nothing at today's corpus size. The real trigger is the **O(N^2)
+                  clustering in dreaming**, not recall. Source:
+                  [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+            - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
+                  saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
+                  parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
+                  7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
+                  0.8334, ...`), and six of them — `w13, w14, w15, w17, w18, w19` — are **zeroed**,
+                  which matches neither table (FSRS-5's are all non-zero).
+                  **`w20 = 0.0658` is NOT in question and must not be "corrected" by this item:** it
+                  is already justified in-tree by a retention-harness experiment (an 800-day-aged
+                  corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`).
+                  Not changed blind, because every weight feeds the decay of every stored memory and
+                  the zeroed entries may well be deliberate — the short-term/same-day terms have no
+                  meaning for a store whose "reviews" are recalls rather than study sessions. What is
+                  wanted is the decision written down: either adopt FSRS-6's table with an A/B on the
+                  `retention` harness exactly as `w20` got, or rename the constant and its doc to say
+                  what the table actually is. Note the upstream wiki is internally inconsistent about
+                  the decay INDEX (its prose says `w20 = 0.0658` while its own 21-entry array puts
+                  `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
+                  source before touching anything. Source:
+                  [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:
