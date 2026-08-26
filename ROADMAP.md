@@ -4242,6 +4242,22 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
       rather than at the next restart. The chunk-COUNT bound is still open and still needs a
       derivation, not a magic number.
+      **A consequence the item does not currently state, found while reading the path for it — settle
+      this BEFORE writing the code.** "Queue only the vector" means taking `store_unembedded`, and
+      that function *skips the neighbour-dedup search, by construction*: there is no query vector to
+      search with. Today's inline path runs `store.search(&embedding, 1)` and folds a
+      `Reinforce`/`Update` hit into an existing row instead of creating one. So deferring the vector
+      for **all** tool-result ingest does not merely move latency — it turns dedup off for the single
+      highest-volume writer in the system, and chunks of one result are near-duplicates of each other
+      by construction. The store gets more rows, and every future recall's candidate set carries
+      them.
+      That may well be acceptable: `store_unembedded`'s own doc already argues the trade ("losing a
+      vector costs temporary searchability; losing the write cost the memory") and says squeezing the
+      store is dreaming's job. But it is a **behaviour** decision about the shape of memory, not the
+      latency fix the item reads as, and it interacts directly with the still-underived chunk-count
+      bound — fewer, wider rows would shrink the dedup loss too. Decide the two together, and
+      consider re-running the dedup search on the drain side once the vector exists, which would
+      recover folding without putting it back on the turn.
 - [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.
