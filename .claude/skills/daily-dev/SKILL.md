@@ -108,6 +108,17 @@ cargo build                                                  # release if perf-r
   computer-use grant and works every run** — it is the reason a run CAN honestly verify the GUI.
   (`tauri-driver` + `msedgedriver` are installed on PATH under `~/.cargo/bin`; the harness's `ensure`
   auto-matches msedgedriver to the live WebView2 Runtime — `cargo install tauri-driver` if missing.)
+- **Backend runtime verification — boot the daemon against a SCRATCH config, never the operator's.**
+  `NANNA_CONFIG_PATH=<file>` overrides config resolution (added 2026-08-26); `--data-dir <dir>`,
+  `--no-pid-file`, `--port`/`--health-port` isolate everything else. Without the config override a
+  run loads the developer's real `config.toml` — `--data-dir` does NOT isolate settings, and
+  `%APPDATA%` cannot redirect them because `directories` reads the Windows known-folder API. With
+  it, provider-dependent boot paths are reachable unattended:
+  ```bash
+  NANNA_CONFIG_PATH=<scratch>/cfg.toml <target>/debug/nanna-daemon.exe     --data-dir <scratch>/data --no-pid-file --port 51997 --health-port 51998     --no-file-log --log-level info run
+  ```
+  (subcommand LAST — global flags precede it). Grep the captured log for the behaviour you added
+  and for `panicked`. **Never point a smoke run at the real data dir or the real config.**
 - **Fallback only:** `mcp__computer-use__*` — use only for a native OS dialog WebDriver can't reach; it
   needs a live `request_access` approval that does **not** persist across runs, so prefer WebDriver unattended.
 - If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm

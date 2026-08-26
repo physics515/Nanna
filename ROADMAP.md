@@ -4409,6 +4409,42 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       the check, the contract that does hold is tested with a `Notify` handshake, and the limitation
       is pinned as its own named test so anyone who later "fixes" the loop is told which property
       they traded away.
+      - [x] *(found AND fixed 2026-08-26)* ~~**The daemon cannot be pointed at an alternate
+            config.**~~ **`NANNA_CONFIG_PATH` now overrides config resolution.** The problem was
+            real: `--data-dir` isolates the database but NOT the config:
+            `nanna_config` resolves through the `directories` crate, which on Windows reads the
+            *known-folder* API, so a run always loads the operator's real
+            `%APPDATA%/nanna/nanna/config/config.toml` (setting `APPDATA` does not redirect it).
+            An unattended run therefore could not exercise a provider-dependent boot path without
+            editing the developer's own config.
+            Fixed in `Config::default_config_path()` — the single funnel every consumer already goes
+            through, so the daemon's four `Config::load()` sites plus the GUI and CLI all inherit it
+            with **no call-site changes**; a `--config` flag would have had to be threaded through
+            each of them. The override is taken BEFORE the legacy `bot/clawd/Nanna` migration (a
+            caller naming an explicit file is not asking for a tree copy as a side effect), and
+            whitespace-only is treated as unset, so an empty variable in a shell profile cannot
+            silently redirect every consumer to `""`. All three cases share ONE `#[test]`
+            deliberately: `std::env` is process-wide and Rust runs tests in threads, so splitting
+            them invites the classic env-var flake.
+            **It paid for itself the same run** — see the drain-supervisor item above, whose
+            verification went from "startup is not wedged" to "the mechanism arms on the real
+            binary" as soon as an alternate config became reachable.
+
+- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
+      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
+      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
+      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
+      from the retrieval top-k (see the item's own note).
+      *(2026-08-26)* **Its prerequisite now exists.** Part 3 wants the row persisted synchronously
+      and only the vector queued — which was previously unsafe to do deliberately, because nothing
+      drained a queued vector until the next provider-binding event. `supervise_idle_backfill`
+      (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
+      rather than at the next restart. The chunk-COUNT bound is still open and still needs a
+      derivation, not a magic number.
+- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+      listed above and deliberately did not claim the rest; a per-item pass would let this whole
+      section collapse to a few lines of history.
 
 
 #### What is already working — do not re-litigate
