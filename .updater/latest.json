@@ -1,11 +1,11 @@
 {
   "version": "0.3.9",
-  "notes": "Public Beta 18 - tool-result ingestion is off the turn's critical path, queued vectors drain at the end of a turn instead of at the next restart, four frontend majors, toolchain moved to nightly-2026-08-25, and NANNA_CONFIG_PATH for running against an isolated config.",
-  "pub_date": "2026-08-26T18:30:00.000Z",
+  "notes": "P24: per-chat model pins, chat-scoped tool roots, the em-dash crash fix, and the honesty batch — see the release page.",
+  "pub_date": "2026-08-21T05:44:58.705Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.9-beta.18/Nanna_0.3.9_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWdxZktma3NCOGtDMHUyR1NDZTg0WUd0VjlyTVJ1YzVJcjljRThINnJaKzNoTmp5UE5WUXc5Rmx3VnYyaG1CaEkrMjQ0MFF4SENvY0NIWWh3OUxWZ3dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NzY4MzM0CWZpbGU6TmFubmFfMC4zLjlfeDY0LXNldHVwLmV4ZQpLajRCd0pmRTVubzBpMzJWa01Mb1NYdkVjam9pWFJKcGpKMk1lOXNCUVRSaVIrcEdYRm4veDN0YmVjVEFWWU1Sd1FDcjNNQ0p0bTU0ZGcxNzFReFJDQT09Cg=="
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.9-beta.15/Nanna_0.3.9_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWl2RDgyM1F0MnAzcVhudkJxUTFnTGp3Rm5DRUxEQmJrZjhqNHZJSTFUZWx1ZnR3YUZWYm1ZSU0wU3hIVHF5Wkl4elhHcXpjWEtudUZxVTZNSGpydWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3MjkxMDMxCWZpbGU6TmFubmFfMC4zLjlfeDY0LXNldHVwLmV4ZQorRWM5elBrTGNyM0xIc2VkVXlOblZ6d0RyMzBZclJ3eXUrNzdTRW9uQTBtMnptbkdKbXNsbGJuK3l5RXBGaFFwdEFia3J6cXcvTEpjZXI4c2FZcVFCZz09Cg=="
     }
   }
 }
