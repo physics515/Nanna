@@ -79,11 +79,14 @@ cargo test --workspace --exclude nanna-gui                   # (or -p <crate> fo
 cargo build                                                  # release if perf-relevant
 ```
 - **Say `--workspace`, and mean it.** This repo has a package at the workspace ROOT, so a bare
-  `cargo clippy --all-targets` checks only that root package and its path dependencies — measured
-  2026-08-26, that is **16 of the 20 members**, silently skipping `nanna-browser`, `nanna-proc`,
-  `nanna-bench` and `nanna-gui`. It looks like a full-workspace gate and is not one. `--exclude
-  nanna-gui` is the same exclusion `test-compile.yml` already makes (the Tauri crate needs a built
-  frontend), so this command matches CI's scope deliberately instead of by coincidence.
+  `cargo clippy --all-targets` checks only that root package and its path dependencies. Measured
+  2026-08-26 on the same tree: the bare command reported **16** workspace crates, the `--workspace`
+  form reported **18**, the two extra being `nanna-bench` and `nanna-browser`. (`nanna-proc` emits no
+  warnings under either, so whether it was checked cannot be told from the output — which is itself
+  the point: a gate whose coverage you cannot read is a gate you cannot trust.) It looks like a
+  full-workspace gate and is not one. `--exclude nanna-gui` is the same exclusion
+  `test-compile.yml` already makes (the Tauri crate needs a built frontend), so this command matches
+  CI's scope deliberately instead of by coincidence.
 - **`cargo fmt` is NOT clean on this tree and must not be made clean in passing.** There are ~2735
   pre-existing rustfmt diffs repo-wide; a crate-wide reformat would bury an increment's real diff and
   is forbidden. Check only that the lines YOUR change adds are fmt-neutral.

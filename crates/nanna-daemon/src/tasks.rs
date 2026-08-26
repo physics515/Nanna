@@ -1122,16 +1122,22 @@ pub fn build_task_services(
 // ---------------------------------------------------------------------------
 
 /// The P15 store as the harness's task source, scoped to one run.
+///
+/// It carries no `workdir`. It used to, for "where ancestor acceptance checks
+/// run during promotion" — but the ancestor-promotion experiment was cut as
+/// benchmark-shaped (see the note on [`Self::complete`]: it converted the eval
+/// metric directly and would almost never fire in a chat workflow). The field
+/// outlived the feature, was never read, and was always `None`, so it was a
+/// standing invitation to "finish wiring it" — which the no-benchmark-shaped-
+/// levers rule forbids. Removed 2026-08-26; per-call acceptance checks still
+/// take their own `workdir` from `tasks.done {workdir?}`, which is a different
+/// and live mechanism.
 pub struct TursoTaskSource {
     storage: Arc<Storage>,
     scope: String,
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1149,7 +1155,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 

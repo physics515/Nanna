@@ -4965,9 +4965,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    - *(2026-08-26)* **A third hole in the verify gate, found by the toolchain bump and closed in the
      skill.** The two already on record were about the release profile; this one is about *scope*.
      This repo has a package at the workspace **root**, so a bare `cargo clippy --all-targets` checks
-     only that root package and its path dependencies — **16 of the 20 members**, silently skipping
-     `nanna-browser`, `nanna-proc`, `nanna-bench` and `nanna-gui`. It reads as a full-workspace gate
-     and is not one. It mattered immediately: nightly-2026-08-25's new
+     only that root package and its path dependencies. Measured on the same tree: the bare command
+     reported **16** workspace crates, `--workspace` reported **18** — the extra two being
+     `nanna-bench` and `nanna-browser`. (`nanna-proc` is silent under both, so its coverage cannot be
+     read off the output at all, which is the same problem in a smaller box.) It reads as a
+     full-workspace gate and is not one. It mattered immediately: nightly-2026-08-25's new
      `recursion_depth_exceeding_limit` warning fired in **six** crate roots, and the
      `-p nanna-daemon` release build showed exactly one of them. `daily-dev`'s step 4 now prescribes
      `--workspace --all-targets --exclude nanna-gui`, matching `test-compile.yml`'s existing
