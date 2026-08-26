@@ -1,6 +1,58 @@
-# Nanna v0.3.9-beta.16 — Fail Closed, and Say So
+# Nanna v0.3.9-beta.17 — The Embedding Gets Out of the Way
 
 ## What's New
+
+### Memory: tool-result ingestion is off the turn's critical path (this release)
+
+Every chunk of every tool result used to be embedded **inline** — one round-trip to the same local
+model server that serves generation, plus a vector search, plus an insert, awaited before the agent
+could take its next step. One measured run made **zero model decisions for 189 of its 246 minutes**.
+
+A chunk is now persisted synchronously and only its *vector* is queued
+(`MemoryService::remember_deferred_vector`). The row is durable before the call returns and keeps its
+`source_id`, so a `recall(...)` handle handed to the model in the same turn still resolves — only
+similarity search waits for the drain.
+
+The hard part was the drain. `drain_backfill` could not do it: when the embedder is the local
+provider it first waits for *no harness run to be live*, so a row queued **by** a live run would wait
+for the run that queued it — hours, during a long mission. `drain_queued_vectors` skips that gate and
+pays for the exception with a bound: it may only embed rows **this process parked**, it still repays
+every request with an equal idle window, and it still takes the process-wide drain lock. Same
+embedding work, half the duty cycle, concurrent with the turn instead of blocking it.
+
+**One latent bug fixed on the way:** `drain_backfill` parked on `wait_idle()` *while holding* the
+process-wide drain lock, so a drain waiting for a mission to end starved every drain behind it for
+the length of that mission.
+
+**Trade, stated plainly:** the neighbour-dedup search is skipped for deferred rows (there is no query
+vector to search with), so near-identical tool results land as separate rows instead of folding.
+Squeezing the store is dreaming's job, and run-length collapse upstream already removed the case that
+made this expensive.
+
+### Frontend: four major dependency migrations (this release)
+
+`@tiptap/* 2 → 3`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, and `lucide-vue-next → @lucide/vue 1.34`.
+
+The lucide one is a **package rename, not a version bump**, and it is a trap worth naming:
+`lucide-vue-next@1.0.0` is deprecated but is *not* an empty tombstone — it ships a real dist where
+every icon resolves. So `pnpm update --latest` installs a working-but-dead package and nothing fails.
+The failure mode is silence. A new `packageComponentExports` guard now resolves all **221** icon
+bindings the templates render, so the rename is proven at the export level rather than assumed.
+
+### Release engineering: `release.yml` can actually produce a release (this release)
+
+The workflow had never completed a successful dispatch, and several steps could not have worked as
+written: three jobs installed `stable` while `rust-toolchain.toml` pins a nightly that rustup uses
+anyway; macOS requested `universal-apple-darwin`, which is not a rustup target; all three ran
+`cargo tauri build` with the CLI never installed and no Node or pnpm present at all; **no signing key
+was wired in anywhere**, though `createUpdaterArtifacts` requires one; and the publish job set `TAG`
+in one shell and used it in three others, so every upload targeted the tag `""`.
+
+All fixed. Windows builds by default; macOS and Linux are opt-in inputs defaulting to false, because
+neither has ever been verified on a runner and defaulting them on would let an unverified platform
+take the Windows release down with it. The build now **fails loudly if an installer is produced
+without a signature**.
+
 
 ### Core Features
 - **Headless daemon** with WebSocket IPC, PID lockfile, and health endpoints
@@ -72,11 +124,10 @@
 
 - [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope
 - [~] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases
-      — *corrected this release:* `release.yml` exists but has **never completed a successful
-      dispatch**. Its one recorded run (2026-08-15) failed in 23s on all three platforms at
-      toolchain install: it requests `dtolnay/rust-toolchain@stable` while the repo pins a nightly
-      in `rust-toolchain.toml`, and the macOS job asks for a `universal-apple-darwin` std that is
-      not published. Releases have in practice been built and uploaded by hand.
+      — *repaired in beta.17.* Every blocker named in beta.16's note is fixed (toolchain pin
+      honoured, real macOS targets, Tauri CLI and Node actually installed, signing key wired in,
+      tag no longer empty at upload). **This release is the first dispatch attempt**, so the box
+      stays `[~]` until a run has actually published — not because anything known is still broken.
 - [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (code signing pending;
       the updater signature is applied at upload time from the local minisign key)
 - [ ] Publish signed and notarized macOS .dmg
@@ -90,8 +141,8 @@
 ## Known Issues
 
 - Code signing not yet implemented (SmartScreen warnings expected)
-- `release.yml` has never succeeded; Windows artifacts are built and signed locally, and macOS/Linux
-  are not published at all
+- `release.yml` was repaired in this release but beta.17 is its **first** dispatch; macOS and Linux
+  remain opt-in and unverified, so those artifacts are still not published
 - Burn local runner still in development (in the `Mummu` repo)
 
 ## Installation
