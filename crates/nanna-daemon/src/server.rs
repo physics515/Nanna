@@ -1516,6 +1516,134 @@ async fn drain_queued_vectors(
                 }
             }
         }
+
+/// How this differs from [`drain_queued_vectors`] above, since both drain the
+/// same queue and only one of them is obvious:
+///
+/// `drain_queued_vectors` handles what THIS PROCESS deliberately deferred, at
+/// foreground priority, during the turn — and it is explicitly budgeted so it
+/// will NOT sweep up an inherited backlog. Its own doc says that remainder is
+/// "still `drain_backfill`'s job at `drain_backfill`'s priority".
+///
+/// The catch is that nothing was ever calling `drain_backfill` at that
+/// priority during a session. Its only triggers are BINDING events — daemon
+/// start, provider switch, width reprobe — and an ordinary session has none of
+/// them. So a row parked by a *transient* embedding failure, or a backlog
+/// inherited from a previous run, waited for a restart. That is the gap this
+/// closes, and it is why the two coexist rather than one replacing the other:
+/// one drains the work the turn created, the other drains everything else, at
+/// the first moment no turn is live.
+/// Drain rows that were parked mid-session, at the first moment no turn is live.
+///
+/// [`nanna_memory::MemoryService::store_unembedded`] is durable and honest —
+/// the write lands, the row is reachable by its `source_id` handle, and it is
+/// queued for backfill — but until now the ONLY things that started a drain
+/// were **binding** events: daemon start, a provider switch, a width reprobe.
+/// An ordinary session has none of those. So a row parked by a *transient*
+/// embedding failure stayed unsearchable for the rest of the session, and the
+/// store's own doc comment says exactly that: it "is recovered, not lost — but
+/// the latency is a session, not a moment, and closing that needs a drain
+/// trigger the memory crate does not own". This is that trigger, and it lives
+/// here because the daemon is what owns both the run registry and the drain.
+///
+/// **Bound: one probe per active→idle cycle** — not per write, and not on a
+/// timer. [`ChatRunRegistry::wait_active`] followed by
+/// [`ChatRunRegistry::wait_idle`] is precisely one turn's lifetime, so the
+/// probe rate is bounded above by the *turn* rate, which is bounded by a human
+/// typing. A timer would have had to pick an interval that is either too slow
+/// to matter or a poll; an edge does not.
+///
+/// The probe is what [`drain_backfill`] already costs on a store that is
+/// complete for the bound model, and it is worth stating exactly rather than
+/// as "a query": `entries_missing_model(model, 1)` is an **in-memory** scan of
+/// the entries cache under a read lock — it short-circuits at the first entry
+/// with no bucket for `model`, so it walks the whole cache only in the case
+/// where there is nothing to do — followed by two `LIMIT 1` local Turso
+/// queries (`parents_without_chunks`, `chunks_needing_embedding`). No provider
+/// request is made unless work is actually found. At a 100k-entry store that
+/// is single-digit milliseconds, once per turn.
+///
+/// **Worst case is one turn of latency, not one session.** `wait_active`
+/// registers interest and then reads the flag, so a turn that begins AND ends
+/// inside that window leaves no edge to observe and its rows wait for the next
+/// turn. That is a bounded miss and a deliberate non-fix: the rows are durable
+/// and handle-addressable the whole time, and the alternative — probing before
+/// parking — turns the loop into a spin on an idle daemon, which is the exact
+/// property this shape was chosen to avoid.
+///
+/// **It adds a trigger, never a second rate.** The drain it may start is the
+/// existing [`drain_backfill`], so it inherits the process-wide `drain_serial`
+/// mutex (one drain at a time), the `wait_idle` priority gate (a turn arriving
+/// mid-drain takes the slot back within one in-flight embed) and the
+/// per-request RTT repayment that caps the drain at half the provider's
+/// wall-clock. Starting from an idle edge means the common case is that the
+/// gate is already open and the queue is already empty.
+async fn supervise_idle_backfill(
+    memory: Arc<MemoryService>,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    drain_serial: Arc<tokio::sync::Mutex<()>>,
+) {
+    // Said once, at arm time, because the useful thing to know from a log is
+    // that this exists at all. The drain it starts already announces its own
+    // work ("Backfilled N embeddings"), and a per-turn line for the overwhelming
+    // case -- nothing queued, nothing to do -- would be noise proportional to
+    // conversation length.
+    info!(
+        "Idle-backfill supervisor armed: queued embedding rows now drain at the end of a turn"
+    );
+    loop {
+        // A turn started, then every turn finished. Waiting on `active` FIRST is
+        // what makes this an edge rather than a spin: with only `wait_idle`, an
+        // already-idle daemon would loop as fast as the scheduler allows.
+        chat_runs.wait_active().await;
+        chat_runs.wait_idle().await;
+        // Deliberately NOT asserted here: `!any_active()`. `wait_idle` certifies
+        // that no run was live at the instant it returned -- a PAST instant. A
+        // turn may legally claim the slot again before the next line runs, so
+        // asserting it would fire on ordinary concurrency instead of on a
+        // programmer error, and an assertion that can be false is worse than an
+        // absent one. The property is real but belongs to the registry, where it
+        // can be stated without a race: see the chat_harness test
+        // `one_turn_drives_one_active_then_idle_cycle`. Nothing below needs the
+        // daemon to still be idle -- the drain re-takes the gate itself, once
+        // per provider request.
+
+        // No binding means nothing can be drained INTO a bucket: the drain
+        // refuses to fill a bucket that is not the active binding, so calling it
+        // here would be a no-op with extra steps.
+        let Some(model) = memory.active_embedding_model().await else {
+            continue;
+        };
+        // Two things must hold about a binding before it is worth draining, and
+        // both are far cheaper than the drain they guard, so they are checked
+        // always rather than in debug only. The spec must name something; and
+        // the drain must be able to tell a LOCAL provider from a remote one.
+        // That second test is load-bearing rather than cosmetic --
+        // `drain_backfill` decides whether to yield to a live chat turn by
+        // reading the provider off this spec, so a spec with no provider segment
+        // would silently classify the local embedder as remote and drain
+        // straight through the contention gate that exists to keep it off the
+        // shared generation slot.
+        //
+        // Both are ASSERTIONS rather than branches because both are structural,
+        // not configuration-dependent: the binding string is produced by
+        // `EmbeddingProviderInfo`'s `Display`, which is literally
+        // `write!("{}:{}", name, model)`, and `drain_backfill` already reads the
+        // prefix back off it. Neither can be made false by a config file, so
+        // neither is a failure to handle -- only a way to notice if the shape
+        // this depends on is ever changed somewhere else.
+        assert!(
+            !model.is_empty(),
+            "the active embedding binding must name a model: an empty spec would \
+             drain into an unaddressable bucket"
+        );
+        assert!(
+            model.contains(':'),
+            "the active embedding binding must be a `provider:model` spec (got \
+             {model:?}): `drain_backfill` reads the provider off this string to \
+             decide whether to yield the local generation slot to a live turn"
+        );
+        drain_backfill(&memory, &model, &chat_runs, &drain_serial).await;
     }
 }
 
@@ -3519,6 +3647,20 @@ impl DaemonServer {
                             )
                             .await;
                         });
+                        // One supervisor for the daemon's life: it turns the
+                        // end of every turn into a drain opportunity, which is
+                        // what closes the "parked until the next binding event"
+                        // gap `store_unembedded` documents. Spawned beside the
+                        // startup bind because that is where the binding, the
+                        // run registry and the drain mutex are all in scope.
+                        let memory_for_supervisor = memory_arc.clone();
+                        let chat_runs_for_supervisor = chat_runs.clone();
+                        let drain_serial_for_supervisor = drain_serial.clone();
+                        tokio::spawn(supervise_idle_backfill(
+                            memory_for_supervisor,
+                            chat_runs_for_supervisor,
+                            drain_serial_for_supervisor,
+                        ));
                         let chat_runs_for_probe = chat_runs.clone();
                         let drain_serial_for_probe = drain_serial.clone();
                         tokio::spawn(async move {

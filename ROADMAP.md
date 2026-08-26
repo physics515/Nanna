@@ -4340,6 +4340,37 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       Only the sentence was wrong, and a bound whose derivation has gone stale is the next magic
       constant: nobody can tell whether it is still right.
 
+- [x] **A drain trigger the daemon owns — the backlog `drain_queued_vectors` deliberately does not sweep.**
+      *(2026-08-26)* Complements the item above rather than duplicating it. `drain_queued_vectors`
+      drains what **this process** deferred, at foreground priority, and is budgeted so it will not
+      sweep an inherited backlog — its own doc says that remainder is "still `drain_backfill`'s job
+      at `drain_backfill`'s priority". The gap: **nothing was calling `drain_backfill` at that
+      priority during a session.** Its only triggers are BINDING events (daemon start, provider
+      switch, width reprobe) and an ordinary session has none, so a row parked by a *transient*
+      embedding failure — or a backlog inherited from a previous run — waited for a restart.
+      `MemoryService::store_unembedded`'s own doc named this exactly: "it is recovered, not lost —
+      but the latency is a session, not a moment, and closing that needs a drain trigger the memory
+      crate does not own."
+      `supervise_idle_backfill` is that trigger: one task for the daemon's life running
+      `wait_active().await; wait_idle().await` — exactly one turn's lifetime — then the existing
+      `drain_backfill`. **It adds a trigger, never a second rate:** same process-wide `drain_serial`
+      mutex, same chat-priority gate, same per-request RTT repayment.
+      **Bound.** One probe per active→idle edge, so the probe rate is bounded by the *turn* rate.
+      The probe is what a complete store already costs `drain_backfill`:
+      `entries_missing_model(model, 1)` is an **in-memory** scan of the entries cache that
+      short-circuits on the first unbucketed entry (walking it whole only when there is nothing to
+      do), plus two `LIMIT 1` local Turso queries. No provider request unless work is found.
+      **Known, deliberate limit:** `wait_active` registers interest and then reads the flag, so a
+      turn that begins AND ends inside that window leaves no edge and its rows wait for the next
+      turn. Bounded by one turn, with the rows durable and handle-addressable throughout. Not
+      "fixed" by probing before parking — that turns the loop into a spin on an idle daemon.
+      **4 tests** in `chat_harness` pin the registry contract the bound rests on, and the fourth
+      exists because the second **failed first**: it had asserted the stronger guarantee and failed
+      by timeout, exercising the very race the design note described in prose. Rather than weaken
+      the check, the contract that does hold is tested with a `Notify` handshake, and the limitation
+      is pinned as its own named test so anyone who later "fixes" the loop is told which property
+      they traded away.
+
 
 #### What is already working — do not re-litigate
 
@@ -4792,6 +4823,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.577.0. The new `packageComponentExports` guard resolves all 221 icon bindings the
            templates render, so the rename is proven at the export level rather than assumed;
            `vue-tsc --noEmit` clean, 237 vitest, `pnpm build` green. *(2026-07-16 —
+           *(2026-08-26, measured)* One claim about v1 that circulates in its release summaries is
+           **wrong for this build**: icons are said to set `aria-hidden="true"` themselves. Driving
+           the built app under WebDriver, **0 of the 10** rendered lucide SVGs carry the attribute.
+           Whatever the docs mean, it is not unconditional — so nothing here should be assumed to
+           have changed about accessibility.
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
            `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
