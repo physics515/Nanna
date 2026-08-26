@@ -1,4 +1,4 @@
-# Nanna v0.3.9-beta.17 — The Embedding Gets Out of the Way
+# Nanna v0.3.9-beta.18 — The Embedding Gets Out of the Way
 
 ## What's New
 
@@ -28,6 +28,42 @@ the length of that mission.
 vector to search with), so near-identical tool results land as separate rows instead of folding.
 Squeezing the store is dreaming's job, and run-length collapse upstream already removed the case that
 made this expensive.
+
+### Memory: queued vectors no longer wait for a restart (this release)
+
+The companion to the change above. `drain_queued_vectors` drains what the current
+process deliberately deferred, at foreground priority — and it is deliberately budgeted **not** to
+sweep an inherited backlog, leaving that to `drain_backfill`. The gap was that nothing actually
+called `drain_backfill` at that priority during a session: its only triggers are *binding* events
+(daemon start, provider switch, width reprobe), and an ordinary session has none of them. A row
+parked by a **transient** embedding failure therefore stayed unsearchable until the next restart —
+recovered, but a session late rather than a moment late.
+
+`supervise_idle_backfill` closes that: one task for the daemon's life that waits for a turn to start
+and then finish, and drains at the first moment no run is live. It adds a *trigger*, never a second
+request rate — same process-wide drain lock, same chat-priority gate, same per-request repayment
+window. Its probe is one in-memory scan that short-circuits on the first unembedded row plus two
+`LIMIT 1` queries, once per turn.
+
+### Toolchain and dependencies (this release)
+
+Pinned nightly moved `2026-08-03` → `2026-08-25`, verified by a full release build before the pin
+moved. The new nightly raises `recursion_depth_exceeding_limit` ([rust#159228](https://github.com/rust-lang/rust/issues/159228)),
+scheduled to become a **hard error**, while proving futures are `Send` through wgpu's type graph —
+answered at **seven** crate roots (six libraries plus an integration-test crate root, which does not
+inherit the library attributes).
+
+`malachite-bigint` is now pinned in the *manifest* rather than the lockfile. It had been hand-repaired
+on four consecutive dependency sweeps, because a lockfile pin is exactly what `cargo update` is
+entitled to move; a manifest constraint is not.
+
+### New: point Nanna at a config it does not own (this release)
+
+`NANNA_CONFIG_PATH=<file>` overrides config resolution. Previously `--data-dir` isolated the database
+but **not** the settings, and the settings path resolves through the platform's known-folder API, so
+even `%APPDATA%` could not redirect it — meaning any second instance, or any test of a
+configuration-dependent startup path, had to edit the config you actually use. Pair it with
+`--data-dir` for a fully isolated instance.
 
 ### Frontend: four major dependency migrations (this release)
 
@@ -124,10 +160,13 @@ without a signature**.
 
 - [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope
 - [~] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases
-      — *repaired in beta.17.* Every blocker named in beta.16's note is fixed (toolchain pin
-      honoured, real macOS targets, Tauri CLI and Node actually installed, signing key wired in,
-      tag no longer empty at upload). **This release is the first dispatch attempt**, so the box
-      stays `[~]` until a run has actually published — not because anything known is still broken.
+      — *repaired across beta.17/18.* Every blocker named in beta.16's note is fixed, and a real
+      dispatch has now **built and signed** a Windows installer on a runner: the toolchain pin is
+      honoured, Node/pnpm and the Tauri CLI are actually installed, and the signing secrets work
+      (the collect step fails when the `.sig` is missing, and it passed). That first attempt still
+      did not publish — a `cache: pnpm` **post-job** step failed after the build succeeded, and a
+      failed post step fails the job — so the cache was removed. Box stays `[~]` until a dispatch
+      has published end to end.
 - [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (code signing pending;
       the updater signature is applied at upload time from the local minisign key)
 - [ ] Publish signed and notarized macOS .dmg
@@ -141,8 +180,10 @@ without a signature**.
 ## Known Issues
 
 - Code signing not yet implemented (SmartScreen warnings expected)
-- `release.yml` was repaired in this release but beta.17 is its **first** dispatch; macOS and Linux
-  remain opt-in and unverified, so those artifacts are still not published
+- `release.yml` now builds and signs on a runner, but has not yet completed a publish end to end;
+  macOS and Linux remain opt-in and unverified, so those artifacts are still not published
+- beta.17 was tagged for release but never published (see above); beta.18 supersedes it and carries
+  the same scope plus the 2026-08-26 nightly
 - Burn local runner still in development (in the `Mummu` repo)
 
 ## Installation
