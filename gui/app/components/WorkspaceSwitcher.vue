@@ -5,7 +5,7 @@ import {
   SelectItem, SelectItemText, SelectItemIndicator,
   SelectSeparator, SelectGroup,
 } from 'radix-vue'
-import { Globe, FolderKanban, ChevronDown, Plus, Settings, Check } from 'lucide-vue-next'
+import { Globe, FolderKanban, ChevronDown, Plus, Settings, Check } from '@lucide/vue'
 
 interface WorkspaceInfo {
   id: string

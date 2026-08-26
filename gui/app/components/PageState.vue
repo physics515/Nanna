@@ -36,7 +36,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { AlertCircle, Inbox, WifiOff, Loader2 } from 'lucide-vue-next'
+import { AlertCircle, Inbox, WifiOff, Loader2 } from '@lucide/vue'
 
 export type PageStateKind = 'loading' | 'empty' | 'error' | 'offline'
 

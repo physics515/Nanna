@@ -481,7 +481,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import {
   describeMarkers,
   hasWorkspaceMarker as folderHasMarker,

@@ -13,7 +13,10 @@ import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
-import Link from '@tiptap/extension-link'
+// Link is NOT imported separately any more: Tiptap 3's StarterKit registers
+// `link` itself, so adding it again is a duplicate extension name — Tiptap
+// keeps the first registration and drops the second, which would have silently
+// discarded the `autolink: false` below. It is configured through the kit.
 import TaskList from '@tiptap/extension-task-list'
 import TaskItem from '@tiptap/extension-task-item'
 import Image from '@tiptap/extension-image'
@@ -57,19 +60,21 @@ const emit = defineEmits<{
 // ── Build extensions list ──
 function buildExtensions() {
   const exts: any[] = [
-    StarterKit.configure({ codeBlock: false }),
-    MonacoCodeBlock,
-    Link.configure({
-      openOnClick: !props.editable,
-      // Content integrity: what leaves the composer must be what the user
-      // typed or pasted. Autolink rewrites bare text as it is entered — a
-      // pasted "test_01.sh" came out as "test_[01.sh](http://01.sh)" because
-      // ".sh" is a live TLD, and that corrupted mission text reached the
-      // model. Only the READ-ONLY view (rendering markdown we received) keeps
-      // autolinking, where there is no outbound text to corrupt.
-      autolink: !props.editable,
-      HTMLAttributes: { class: 'text-nanna-accent hover:underline' },
+    StarterKit.configure({
+      codeBlock: false,
+      link: {
+        openOnClick: !props.editable,
+        // Content integrity: what leaves the composer must be what the user
+        // typed or pasted. Autolink rewrites bare text as it is entered — a
+        // pasted "test_01.sh" came out as "test_[01.sh](http://01.sh)" because
+        // ".sh" is a live TLD, and that corrupted mission text reached the
+        // model. Only the READ-ONLY view (rendering markdown we received) keeps
+        // autolinking, where there is no outbound text to corrupt.
+        autolink: !props.editable,
+        HTMLAttributes: { class: 'text-nanna-accent hover:underline' },
+      },
     }),
+    MonacoCodeBlock,
     Placeholder.configure({
       placeholder: props.placeholder,
       emptyEditorClass: 'is-empty',

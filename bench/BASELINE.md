@@ -558,6 +558,29 @@ for CI noise). N=100k and RAM/100k remain unbaselined until a criterion body cov
 GPU half of the crossover stays in `nanna-gpu` benches (adapter-dependent) and is not a CI gate.
 Machine-readable rows: `suite = "vector_search"` in `bench/budgets.toml`.
 
+### Suite 2 (write path) — embedding round-trips on the turn's critical path
+
+Instrument: `nanna-daemon::memory_adapter::tests::write_path_round_trips_baseline`. Run with
+`cargo test -p nanna-daemon write_path`. Deterministic and hardware-independent — it counts
+provider consultations, not milliseconds.
+
+**Why a count and not a latency.** The defect P24.3 part 3 fixed was not that embedding is slow;
+it is that a tool result put N embedding round-trips *in front of the loop's next step*, against
+the same local server that serves generation. Wall-clock follows from the count and the provider's
+RTT, which is load-dependent and unreproducible; the count is exact. A latency number for the
+other half — how long a queued vector takes to become searchable — is still missing and is tracked
+as an open item in the roadmap.
+
+| Metric | Baseline | Budget | Source | Notes |
+| --- | --- | --- | --- | --- |
+| Embedding round-trips on the critical path, per tool result | **0** | **0** (any chunk count) | `write_path_round_trips_baseline` | was 1 per chunk; ~63 chunks for a 200 KB non-repetitive result |
+| Embedding round-trips on the critical path, per ordinary extracted fact | **1** | **1** | same | unchanged by design — one round-trip buys neighbour-dedup on a few sentences |
+
+Budget: the tool-result row is **zero at any chunk count**, which is a structural claim, not a
+measurement — the test asserts it at 1, 8 and 64 chunks. The ordinary-fact row is a floor, not a
+ceiling: it must not drop to 0, or the deferral has silently swallowed the paths that should still
+dedup inline.
+
 ---
 
 ## Suite 5 — Resource guardrails (not yet baselined)

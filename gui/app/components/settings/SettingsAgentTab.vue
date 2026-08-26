@@ -220,7 +220,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Bot, Cpu, MessageSquare, Trash2, Plus } from 'lucide-vue-next'
+import { Bot, Cpu, MessageSquare, Trash2, Plus } from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()

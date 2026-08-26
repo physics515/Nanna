@@ -1128,10 +1128,6 @@ pub struct TursoTaskSource {
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1149,7 +1145,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 
@@ -1302,7 +1297,13 @@ impl TaskSource for TursoTaskSource {
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
         // the eval metric directly and would almost never fire in a chat
-        // workflow, where tasks rarely carry machine checks). This is pure
+        // workflow, where tasks rarely carry machine checks). Its last residue
+        // was a `workdir: Option<PathBuf>` on this struct, hard-coded to `None`
+        // by the only constructor and read by nothing — a dead-code warning
+        // whose doc comment nonetheless read as though promotion existed and
+        // was merely switched off. Removed; if promotion is ever wanted back it
+        // needs a deliberate design, not a field waiting to be filled in. This
+        // is pure
         // coherence: a parent proven done with scaffolding still open is a
         // contradictory state, and working those children is spending steps on
         // a goal that no longer exists.
@@ -2834,47 +2835,32 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if crate::memory_adapter::is_low_signal_memory(&memory.content) {
+                // Filter, importance and route all live in `memory_adapter` —
+                // ONE copy, shared with the interactive-chat sink in
+                // `agent_service.rs`. This path only decides what to log.
+                let category = memory.category.clone();
+                let bytes = memory.content.len();
+                match crate::memory_adapter::store_extracted_memory(
+                    &service,
+                    memory,
+                    workspace_id,
+                )
+                .await
+                {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
                     // shortfall was invisible until someone counted by hand.
                     // A dropped memory is a fact about the run, not a detail.
-                    tracing::info!(
-                        category = %memory.category,
-                        bytes = memory.content.len(),
+                    Ok(None) => tracing::info!(
+                        category = %category,
+                        bytes,
                         "dropping low-signal memory (machine noise)"
-                    );
-                    return;
-                }
-                let mut metadata = memory.tags.unwrap_or_default();
-                metadata.insert("category".to_string(), memory.category.clone());
-                metadata.insert(
-                    "fact_type".to_string(),
-                    memory.provenance.as_str().to_string(),
-                );
-                // A tool result is raw episodic material — worth keeping, but
-                // it must not outrank a stated preference when recall ranks.
-                let importance = crate::memory_adapter::episodic_importance(&memory.category);
-                let stored = match &workspace_id {
-                    Some(ws) => {
-                        service
-                            .remember_scoped(
-                                &memory.content,
-                                metadata,
-                                importance,
-                                Some(ws.clone()),
-                            )
-                            .await
+                    ),
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to store tool result in memory");
                     }
-                    None => {
-                        service
-                            .remember_with_importance(&memory.content, metadata, importance)
-                            .await
-                    }
-                };
-                if let Err(e) = stored {
-                    tracing::warn!(error = %e, "failed to store tool result in memory");
                 }
             })
         }))

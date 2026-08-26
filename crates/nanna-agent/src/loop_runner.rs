@@ -1148,11 +1148,24 @@ pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
 /// Derivation: the notice is re-injected into context on EVERY
 /// short-circuited call, and the full text already reached the model each of
 /// the K times the call actually ran — the replay is a reminder, not the
-/// primary delivery. 2000 bytes is the floor of the dynamic
-/// `context_result_threshold` (`(max_tokens * 2).clamp(2000, 32000)`): the
-/// largest size guaranteed to reach context untouched for every model size,
-/// so the notice itself can never trip the summarization or compression
-/// machinery.
+/// primary delivery. So it must be small enough to reach context untouched,
+/// or the reminder itself trips the summarization it is warning about.
+///
+/// The bound is a quarter of the smallest input budget this loop will run at,
+/// expressed in bytes. The dynamic `context_result_threshold` is
+/// `(hard_limit / 4) * CHARS_PER_TOKEN_ESTIMATE` — a quarter of the live input
+/// window — and `min_viable_num_ctx` is the floor below which the loop fails
+/// loudly rather than running truncated (`ContextBelowFloor`), so a window
+/// small enough to stub this notice is a window the step already refused.
+///
+/// **This derivation was stale and is restated, not re-derived.** It used to
+/// read "2000 bytes is the floor of the dynamic `context_result_threshold`
+/// (`(max_tokens * 2).clamp(2000, 32000)`)" — the boot-frozen `max_tokens`
+/// formula P24.10 was raised about and which `:6882` replaced with the live
+/// input budget. There is no `clamp` and no floor of 2000 any more. The value
+/// is unchanged because the constraint it encodes is unchanged; only the
+/// sentence explaining it was describing code that no longer exists, which is
+/// exactly how the original defect stayed invisible for as long as it did.
 const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
 /// Byte bound on the task-anchor rendered at the head of every injected
@@ -6990,7 +7003,7 @@ impl Agent {
                                 Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
                                 None => format!("[{name} — {outcome}] {chunk_content}"),
                             },
-                            category: "tool_result".to_string(),
+                            category: TOOL_RESULT_CATEGORY.to_string(),
                             // A tool result is always agent-observed, never a user statement.
                             provenance: MemoryProvenance::Observed,
                             tags: Some(tags),
@@ -8488,6 +8501,15 @@ impl MemoryProvenance {
         }
     }
 }
+
+/// The `category` every tool-result memory carries.
+///
+/// A constant rather than two string literals because the two ends are in
+/// different crates: this file stamps it, and the daemon's memory sink routes
+/// on it to keep a tool result's vector off the turn's critical path. Two
+/// privately-duplicated policies drifting apart is precisely how the two memory
+/// filters ended up disagreeing (see `memory_adapter::is_low_signal_memory`).
+pub const TOOL_RESULT_CATEGORY: &str = "tool_result";
 
 /// A memory extracted from conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]

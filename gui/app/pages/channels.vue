@@ -168,7 +168,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle, Activity } from 'lucide-vue-next'
+import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle, Activity } from '@lucide/vue'
 
 const { isOnline } = useBackend()
 

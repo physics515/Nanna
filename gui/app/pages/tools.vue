@@ -342,7 +342,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import {
   Plus, RefreshCw, Loader2, FileCode2, Wrench, Play, Save, Trash2, X
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 const { isOnline } = useBackend()
 const toast = useToast()

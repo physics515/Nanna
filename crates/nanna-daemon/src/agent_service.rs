@@ -1114,49 +1114,29 @@ impl AgentService {
                         let ws_id = ws_id_for_memory.clone();
                         Box::pin(async move {
                             if let Some(ref service) = mem_service {
-                                let mut metadata = memory.tags.unwrap_or_default();
-                                metadata.insert("category".to_string(), memory.category.clone());
-                                // Persist provenance so the store records STATED vs
-                                // OBSERVED instead of everything defaulting to "stated".
-                                metadata.insert(
-                                    "fact_type".to_string(),
-                                    memory.provenance.as_str().to_string(),
-                                );
-                                // Derive importance from category. Memories never
-                                // expire — all categories are permanent. ONE table,
-                                // shared with the harness sink (`tasks.rs`) — two
-                                // private copies is how the two sinks' policies
-                                // drifted apart in the first place.
-                                let importance = crate::memory_adapter::episodic_importance(
-                                    &memory.category,
-                                );
-
-                                // Machine noise, and ONLY machine noise. This used
-                                // to be a private, older filter that also matched
-                                // six failure substrings anywhere in the body — so
-                                // ordinary chat could not remember a single failed
-                                // tool call, nor a successful one whose output
-                                // merely quoted an error — plus a 20-byte floor and
-                                // a "not ASCII means binary" test that ate `tree`
-                                // output and every non-Latin script. The harness
-                                // path had already been fixed; chat had not. See
-                                // `memory_adapter::is_low_signal_memory`.
-                                if crate::memory_adapter::is_low_signal_memory(&memory.content) {
-                                    info!("Skipping low-signal memory [{}]: {}", memory.category, truncate(&memory.content, 50));
-                                    return;
-                                }
-
-                                // Store with workspace scope if session has a workspace
-                                if let Some(ref ws_id) = ws_id {
-                                    if let Err(e) = service.remember_scoped(&memory.content, metadata, importance, Some(ws_id.clone())).await {
-                                        warn!("Failed to auto-store scoped memory: {}", e);
-                                    } else {
-                                        info!("Auto-extracted memory [{}] (workspace: {}): {}", memory.category, ws_id, truncate(&memory.content, 50));
-                                    }
-                                } else if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
-                                    warn!("Failed to auto-store memory: {}", e);
-                                } else {
-                                    info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                                // Filter, importance and route all live in
+                                // `memory_adapter` — ONE copy, shared with the
+                                // harness sink in `tasks.rs`. Two private
+                                // copies is how those two sinks' policies
+                                // drifted apart before, at a cost of 704
+                                // discarded writes in a single run; this path
+                                // only decides what to say about the outcome.
+                                let category = memory.category.clone();
+                                let excerpt = truncate(&memory.content, 50);
+                                match crate::memory_adapter::store_extracted_memory(
+                                    service,
+                                    memory,
+                                    ws_id,
+                                )
+                                .await
+                                {
+                                    Ok(None) => info!(
+                                        "Skipping low-signal memory [{category}]: {excerpt}"
+                                    ),
+                                    Ok(Some(_)) => info!(
+                                        "Auto-extracted memory [{category}]: {excerpt}"
+                                    ),
+                                    Err(e) => warn!("Failed to auto-store memory: {e}"),
                                 }
                             }
                         })

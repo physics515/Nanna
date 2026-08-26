@@ -1122,6 +1122,23 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       animate their mesh forever, so Playwright's stability check never settles — assert
       visible+enabled, then `click({ force: true })`.
       Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
+      **(3)** *(2026-08-25)* `tests/unit/packageComponentExports.spec.ts` — closes the half guard (1)
+      cannot see. Guard (1) allows any tag the file `import`s, which is correct for the Nuxt-registry
+      bug it was built for but says nothing about whether the **package** still exports that name.
+      Tiptap 3 proved the gap the same day it was written: `import { BubbleMenu } from '@tiptap/vue-3'`
+      kept compiling, kept typechecking, and evaluated to `undefined` because v3 moved the menu
+      components to `@tiptap/vue-3/menus`. This guard resolves each such binding for real —
+      `await import(module)` for every PascalCase tag a template renders that comes from a *bare*
+      package specifier — and asserts the export is defined. **221 bindings across 3 modules today**,
+      and the cost is bounded by distinct *modules* (the loader caches), not by bindings, which is why
+      every `@lucide/vue` icon can be checked for free. Relative/`~`/`#` imports are excluded: a
+      missing export there is a loud build error, not a silent `undefined`. It also pins the Tiptap
+      root-vs-`/menus` fact as a fixture, so if upstream moves them back the guard's premise gets
+      re-read rather than rotting. Reverting either the Tiptap import or the lucide rename reproduces
+      a failure. One trap found while writing it, worth not re-learning: the first version read the
+      *comment* explaining the moved import as a real import statement, so it must strip comments
+      before parsing — a guard that fires on prose about the bug is worse than none, because the fix
+      is to delete the explanation.
       *(2026-07-24)* **Command palette gained a fuzzy tier — `subsequenceScore` in `lib/commandPalette.ts`.**
       `filterActions` was substring-only, so the way people actually type into a palette (`mstats`,
       `tglogs`, `nchat`) returned **nothing at all**. It now falls through to a subsequence match over the
@@ -1753,6 +1770,39 @@ Kept as a compact ledger; the full dated rationale and `file:line` anchors for e
 - [x] Deterministic tests — env-flaky keyring fallback + env-race `resolve_tools_dir` fixed; latent test/compile drift repaired; `test-compile.yml` CI smoke check added (first run green, 16m cold). *(2026-07-06 → 17)*
 - [x] Python interpreter runs on a sized 256 MiB thread stack with `sys.setrecursionlimit` clamped so it can't abort. The floor is principled — derived from the empirical overflow bisection (release passes at 128 MiB) — and a separate in-process *setup*-stack measurement was found **Windows-infeasible** (paint-and-scan faults on the lazily-committed stack past the guard page; overflow aborts uncatchably — verified), so the size stays anchored to the bisection rather than a magic number. *(2026-07-16 / 18)*
 
+**Dead-code warnings were two disabled features, not two unused names (2026-08-25).** Both surfaced
+as `field ... is never read` and both turned out to be a bound or a feature that had been wired up to
+the edge and then not connected. Recorded because "delete the field" would have been the wrong reading
+of either one:
+- [x] **Every CDP browser page operation was unbounded.** `BrowserConfig::timeout_ms` (default 30 s,
+      with a public builder) was threaded into `CdpPage` and read by nothing, and
+      `BrowserError::Timeout` had no constructors either — so `goto`, `screenshot`, `evaluate` and
+      `wait_for_selector` waited on a hung page forever, with no cancellation and no error. All 13 page
+      operations now run under that deadline via one `bounded` helper; `fill` and `goto` take a single
+      budget for their whole multi-call sequence rather than one per CDP round-trip, so a degraded page
+      cannot spend 4× the stated timeout while every step stays inside it. `Timeout` now carries the
+      operation and the deadline it exceeded. The bound is extracted as a free function so it is
+      testable without a live browser — the missing test dependency is a large part of why it went
+      unapplied — and **4 tests** cover it: a hung operation is cut off (without the bound this test
+      does not fail, it hangs; verified by disabling the timeout and killing the run at 45 s), a
+      finished one keeps its result, a real failure is not relabelled a timeout, and a slow-but-legal
+      operation still succeeds.
+- [x] **The GPU-vs-SIMD bench measured its own spread and printed only the mean.** `Stats` computed
+      `min`/`max` and reported neither, so every row was a mean with no error bar — in the one bench
+      the `GPU_THRESHOLD = 50_000` number comes from, where a crossover read off two means whose
+      ranges overlap is not a crossover at all. Both tables and the fixed-overhead block now carry a
+      spread column (range as a percentage of the mean — a ratio, because the question the column
+      answers is "is this gap bigger than the noise?", which absolute durations across mixed
+      magnitudes do not answer). `threshold_benchmark.rs`'s unused `format_duration_short` was
+      genuinely dead — that bench already prints `mean ± stddev (min, max)` — and is deleted. The
+      workspace now has **zero** dead-code warnings.
+- [x] **`TursoTaskSource::workdir` was the last residue of a deliberately cut experiment.** Hard-coded
+      to `None` by the only constructor and read by nothing, while its doc comment read as though
+      ancestor-promotion existed and was merely switched off. The experiment was cut as
+      benchmark-shaped (it converted the eval metric directly and would almost never fire in a chat
+      workflow); the field is removed and the reason now lives at the surviving `clear_open_descendants`
+      call, so nobody re-derives it from a suggestive field name.
+
 **Architecture (all done, 2026-07-16):** decomposed `gui/src-tauri/src/lib.rs`, `control.rs`, `settings.vue`, and `main.rs` into per-domain modules; unified the embedded↔daemon agent loop onto `AgentService` (later removed wholesale by P16).
 
 **Embedded-mode items — superseded by P16 (2026-07-18):** the GUI embedding-dimension probe, the silent daemon→embedded fallback, `recall`-broken-in-embedded, and "only three tools in embedded" are all closed by P16's deletion of embedded mode — the GUI is now a pure daemon client, a failed connect is an explicit `Disconnected`, and the daemon loads all 39 skills. The one real remainder — a **local offline embedder** — is a P12 deliverable ("Local embeddings in Burn"); the P11 soft-degrade (actionable `NoEmbeddingProvider`, non-error `recall` result) is done. Stale `9833` sidecar-port doc fixed to `5149`.
@@ -1788,12 +1838,25 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
         pin above is current and needs no action this pass. Re-check on each freshness sweep. Remember
         this is **Mummu's** dependency, not Nanna's: nothing here should pull `burn` into this tree.
         Source: [tracel-ai/burn releases](https://github.com/tracel-ai/burn/releases).
+      - *(research 2026-08-25)* **Re-checked; unchanged — `burn` 0.21 is still the newest release.** No
+        action, and recorded so the next sweep does not spend a search on it: check the releases page,
+        not crates.io's "updated" date, which moves on sub-crate republishes.
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
+      - [ ] *(research 2026-08-25)* **Qwen 3.8-27B landed 2026-08-05 (Apache 2.0, 64 layers, 262K
+            context; community GGUFs 08-13/08-14) — and on independently measured tasks it is *level with
+            3.6*, not ahead of it.** That is the actionable half: a newer number is not a reason to re-point
+            the default. This repo's governing metric is task success @ budget, and a level model at a larger
+            size is a regression in capability density. Concretely: **do not move the 8 GB default off
+            Qwen3.5-9B on release-date alone**; 27B dense is a 24 GB-tier candidate at best and belongs in the
+            same eval as the existing tier list, decided on **tool-call validity rate**, not on a leaderboard.
+            Worth noting for Mummu's port ordering only if the 24 GB tier is being worked. Sources:
+            [Best Qwen models to run locally, mid-2026](https://insiderllm.com/guides/qwen-models-guide/),
+            [Qwen3-Coder-Next](https://qwen.ai/blog?id=qwen3-coder-next).
       - [ ] *(research 2026-07-24)* **Qwen3.5's *Small* series gives the sub-8 GB tiers a real ladder, not just
             a quantization knob.** The family now spans **0.8B / 2B / 4B / 9B** alongside the big MoEs, all
             with **256K context** and tool-calling, so the CPU-only and low-VRAM guardrail tiers can drop to a
@@ -2258,6 +2321,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
             the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
             useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
+      - [ ] *(research 2026-08-25 — re-check; the shortlist is stable, and a fourth candidate appeared)*
+            The three-way decision below has not moved: `hnsw_rs` and `hnswlib-rs` are both still live and
+            still differ on exactly the axis that matters here (in-traversal filtering + parallel batch build
+            vs. lock-free concurrent read/mutate), and `instant-distance` is still the one to rule out. Two
+            additions worth a look before building anything:
+            **`small-world-rs`** (HNSW with cosine *and* euclidean, serde persistence) and **`swarc`** —
+            notable because it advertises **`remove`** as a first-class operation. That is not a nice-to-have
+            for us: the "Ghost Vectors" item above says a deleted memory must actually destroy its embedding,
+            and HNSW's classic weakness is that deletion is a tombstone, not a removal. If `swarc`'s remove is
+            a real graph repair rather than a mark, it collapses two open items into one dependency choice.
+            **Decide the deletion semantics before the crate**, or the crate decides them for us. Sources:
+            [small-world-rs](https://crates.io/crates/small-world-rs), [swarc](https://crates.io/crates/swarc),
+            [hnswlib-rs](https://lib.rs/crates/hnswlib-rs), [hnsw_rs](https://docs.rs/hnsw_rs/latest/hnsw_rs/).
       - [ ] *(research 2026-07-16, corrects the crate shortlist)* Two of the three shortlisted crates need
             re-reading. **`instant-distance` is dormant — rule it out**: no release since **0.6.1 (June 2023)**
             despite repo activity, so the "smallest/simplest pure-Rust HNSW" option is not a live choice.
@@ -2664,6 +2740,40 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             [Memanto (arXiv:2604.22085)](https://arxiv.org/pdf/2604.22085),
             [Multi-layered memory architectures (arXiv:2603.29194)](https://arxiv.org/html/2603.29194v1),
             [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List).
+- [ ] *(research 2026-08-25 — grades the deferred-vector change that landed the same day)* **The write
+      path is the agent-memory cost centre the benchmarks do not report, and asynchrony buys latency with
+      *staleness*.** Two findings worth holding side by side. First, write-path cost is measured at **over
+      80% of total agent execution time** in stateful long-horizon workloads and is simply absent from most
+      memory-system benchmarks — which is the same discovery P24.3 made from a log (189 of 246 minutes with
+      no model decision) rather than from a paper, and is the strongest argument yet that `nanna-bench`
+      Suite 2 needs a **write**-side number, not only recall/search latency. Second, the survey's framing of
+      the choice is exactly ours: *synchronous scheduling puts construction latency on the critical path;
+      asynchronous scheduling admits unbounded staleness*, and five of the systems it measures (SimpleMem,
+      MIRIX, Letta, Mem0, A-Mem) retrieve against memory one or more sessions behind their ingestion
+      stream. Nanna's deferred-vector path deliberately takes the asynchronous side, so **its staleness must
+      be bounded and measured, not assumed** — the drain's budget bound (embed only what this process
+      parked) is the mechanism, and the missing half is evidence that it converges within a turn.
+      Concrete, in reach:
+      - [ ] **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
+            row having a vector, p50/p95, under a live mission. This is Nanna's staleness number and it does
+            not exist yet.
+      - [x] **Add a write-path suite to `bench/BASELINE.md`** *(2026-08-25)* — "Suite 2 (write path)",
+            two rows, gated in `bench/budgets.toml`. It records **counts, not milliseconds**: embedding
+            round-trips on the turn's critical path, **0** per tool result (was 1 per chunk; ~63 chunks
+            for a 200 KB non-repetitive result) and **1** per ordinary extracted fact. That framing is
+            the point — wall-clock follows from the count and the provider's RTT, which is load-dependent
+            and unreproducible, while the count is exact and hardware-independent. The tool-result budget
+            is `exact = 0` **at any chunk count** (asserted at 1, 8, 64), so it is a structural claim
+            rather than a sample; the ordinary-fact budget is a **floor**, because 0 there would mean the
+            deferral had swallowed a path that must still dedup inline. Instrument:
+            `cargo test -p nanna-daemon write_path`.
+      - [ ] **Report embedding-generation latency separately from vector-search latency.** The retrieval
+            budget is per *stage* (embed → search → rerank → assemble); a 4 ms search behind a 400 ms embed
+            is a 400 ms retrieval, and our numbers currently name only the second half.
+      Sources: [Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads
+      (arXiv:2606.06448)](https://arxiv.org/html/2606.06448v1),
+      [MemDelta (arXiv:2606.29914)](https://arxiv.org/pdf/2606.29914),
+      [Memory retrieval latency budgets](https://supermemory.ai/blog/latency-budgets-memory-retrieval).
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
@@ -4100,7 +4210,7 @@ MissionEnd honesty, repeat-done escalation, structural shrink holds, byte-floor 
 truthful tool acks (zero phantom registry saves, against 201 previously), exit-reason
 file. The series produced one crash bug and five carry-forward items below.
 
-### P24 — Sessions that keep their work, and tell the truth about it 🌱 (new — 2026-08-17, review-driven)
+### P24 — Sessions that keep their work, and tell the truth about it ✅ (2026-08-17; all 21 items landed, audited 2026-08-25)
 
 Successor to P23. Produced by a systematic review of five long autonomous sessions on
 v0.3.8-beta.13: 93 candidate findings, each put through two independent adversarial
@@ -4126,15 +4236,109 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
 **Read this before picking P24 work:** treat each item as landed unless you have checked its
 "Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
 
-- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
-      (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
-      memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
-      `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
-      each chunk is still awaited inline on the turn's critical path. The cap must not be derived
-      from the retrieval top-k (see the item's own note).
-- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
-      listed above and deliberately did not claim the rest; a per-item pass would let this whole
-      section collapse to a few lines of history.
+- [x] **P24.3 part 3 — the embedding is off the turn's critical path.** *(2026-08-25)* Parts 1, 2
+      and 4 had landed (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`)
+      and the "two memory sinks disagree" rider was resolved 2026-08-21; this was the remainder.
+      **What shipped:** a tool-result chunk is now persisted synchronously and only its *vector* is
+      queued (`MemoryService::remember_deferred_vector`), so the loop's next step no longer waits on
+      an embedding round-trip against the same local server that serves generation. The row is
+      durable before the call returns and keeps its `source_id`, so the `recall(...)` handle the
+      model is handed in the same turn still resolves — only similarity search waits.
+      **The hard half was the drain, exactly as the item said.** `drain_backfill` cannot pick these
+      up: when the embedder is the local provider it first waits for *no harness run to be live*, so
+      a row queued **by** a live run would wait for the run that queued it — hours, during a mission.
+      So `drain_queued_vectors` skips that yield gate, and pays for the exception with a bound the
+      gate was standing in for: **it may only embed rows this process parked**, budgeted by
+      `MemoryService::take_queued_vector_count()`. An inherited backlog (2167 rows, in the incident
+      that motivated the queue) is still `drain_backfill`'s job at `drain_backfill`'s priority. It
+      keeps the RTT-repayment window and still takes `drain_serial`, so it can never exceed half the
+      provider's wall-clock and cannot multiply the request rate. Net: the same embedding work, at
+      half the duty cycle, concurrent with the turn instead of blocking it.
+      **One latent bug fixed on the way:** `drain_backfill` parked on `wait_idle()` *while holding*
+      `drain_serial`, so a drain waiting for a mission to end held the one process-wide drain lock
+      for the length of that mission and starved every drain behind it. The yield now happens outside
+      the lock; the passes and the repayment sleep still happen under it, so both stated invariants
+      are unchanged.
+      **And the third duplicated policy is gone.** The filter and the importance table were unified
+      into `memory_adapter` in 2026-08-21 after they drifted and cost 704 writes; the *route* was
+      about to become the same story, so the whole sink now lives in
+      `memory_adapter::store_extracted_memory` and both `agent_service.rs` (chat) and `tasks.rs`
+      (harness) differ only in how they log. `TOOL_RESULT_CATEGORY` is a constant in `nanna-agent`
+      so the end that stamps it and the end that routes on it cannot drift either.
+      **12 tests**, none of which passed before the change: the deferred write never consults the
+      embedder (asserted by a counting embedder, so it distinguishes this from the outage path
+      `store_unembedded` already had), an ordinary fact still embeds inline, the queue publishes a
+      drainable count that resets when taken, only a tool result defers, the noise filter runs on
+      both routes, and a FAILED tool result still reaches the store. Disabling the route makes
+      `only_a_tool_result_defers_its_vector` fail on "no inline embed for a tool result".
+      **Still open from the item:** `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)`
+      is bounded only by bytes. That is now a storage-footprint question rather than a latency one —
+      the chunks no longer cost the turn anything — and the cap must still not be derived from the
+      retrieval top-k (see the item's own note).
+      - [ ] Bound the chunk *count* per tool result on a principle that is not the retrieval top-k.
+- [x] **Audited item by item, 2026-08-25 — every P24 item has landed.** The 2026-08-21 pass
+      verified 8 anchors and deliberately declined to claim the rest; this pass checked the
+      remaining 13 against the tree. Each verdict below names the anchor that proves it, so the
+      next reader can re-check one item without re-deriving the whole section. **The defect
+      write-ups below are kept as the reasoning record, not as open work** — the section header
+      says so, and they are the only place the evidence lives.
+      - **P24.7** — `attempt_side_effects: Vec<ToolMark>` beside the turn-scoped `last_side_effect`
+        (`liveness.rs:167-185`), rendered through the bounded `step_activity_digest`
+        (`loop_runner.rs:1112`, used at four step-exit sites).
+      - **P24.9** — `NannaBridge::msys_drive_path` (`bridge.rs:560-569`) with the literal-first
+        guard, called from `resolve_path_with_workdir` before the relative branch (`:537`), and a
+        test that a shell-printed `/d/...` reaches the real file (`:1428`). The `runStructuralCheck`
+        exit-127 split is present at `write_file/tool.ts:613`.
+      - **P24.10** — the threshold is derived from the live input budget, not `max_tokens`:
+        `loop_runner.rs:6882` reads `self.context.read().await.hard_limit` and scales by
+        `CHARS_PER_TOKEN_ESTIMATE`. *(Residual: the doc comment at `:1152` still describes the old
+        `(max_tokens * 2).clamp(2000, 32000)` formula — see the `[ ]` below.)*
+      - **P24.11** — solved by a different shape than the item proposed, and correctly: rather than
+        adding `ToolCallRecord::error`, `record_output` (`loop_runner.rs:868`) falls back to
+        `result.error` when `content` is empty, so both the repeat detector and the novelty check
+        stop comparing empty strings. `structure_broken` sits beside it for the third outcome.
+      - **P24.12** — `backstop_timeout` (`registry.rs:1058`) is params-aware via
+        `ScriptEngine::supervising_timeout_ms`, which applies the existing
+        `ENGINE_TIMEOUT_HANDOFF_MARGIN_MS` (`engine.rs:344`), so the inner message wins by
+        construction.
+      - **P24.14** — `(dry_replans, escalated_asks, last_result)` at `harness.rs:2138` with an
+        `escalate` branch at `:2394` that takes a different prompt path, and the replan-allowance
+        accounting at `:2566`.
+      - **P24.15** — `is_line_structured` (`compressor.rs:383`) routes line-structured content away
+        from sentence scoring at `:245` and short-circuits the wasted round-trip at `:369`.
+      - **P24.16** — `abandoned_unverifiable: Vec<AbandonedUnverifiable>` (`harness.rs:1433`)
+        populated at **both** abandonment sites (`:2192`, `:2537`); `items_completed_unverified`
+        merged (`:3252`); and the cancel path renders evidence bannerlessly through
+        `unresolved_evidence` (`chat_harness.rs:2367`, called at `:2473`).
+      - **P24.17** — (a) `DaemonEvent::LivenessBeat` exists in the GUI client
+        (`daemon_client.rs:143`) with a deserialization test (`:1463`); (b) the harness sets
+        `on_usage` (`tasks.rs:3036`) with the comment naming the gap it closed (`:3031`).
+      - **P24.18** — (a) `store_unembedded` is the embed-failure path on every write route
+        (16 call sites in `service.rs`); (b) `search_reports_what_it_could_actually_compare`
+        (`lib.rs:2435`) pins the three distinguishable empty answers; (c) the 30,000-byte behead is
+        gone, with the reasoning kept at `service.rs:1092`.
+      - **P24.20** — (b) `scripted.rs:83` overwrites the file-stem name with the manifest name at
+        load time, for exactly the stated reason (every skill's entry point is `tool.ts`, so the
+        engine logged nearly every tool as `tool`); (c) zero reduction is reported as zero
+        (`context.rs:2221`, `:3587`).
+      - **P24.21** — `web_search/tool.ts:23` names an action available in this session and says
+        nothing was searched; `exec/tool.ts` names itself, says nothing ran, and lists all five
+        accepted aliases.
+      - **Method and its limit, stated honestly:** this is an **anchor** audit — for each item the
+        named mechanism was located in the tree and read. It is not a line-by-line re-derivation of
+        every sub-bullet, and it did not re-run each item's original evidence. An item whose
+        mechanism is present but subtly wrong would pass this audit.
+- [x] **`BREAKER_REPLAY_MAX_BYTES` was derived from a formula that no longer exists.**
+      *(2026-08-25 — found by the P24 audit above, fixed the same run.)* Its derivation read
+      "2000 bytes is the floor of the dynamic `context_result_threshold`
+      (`(max_tokens * 2).clamp(2000, 32000)`)" — the boot-frozen `max_tokens` formula P24.10 was
+      raised about, which `loop_runner.rs:6882` replaced with `(hard_limit / 4) *
+      CHARS_PER_TOKEN_ESTIMATE`. There is no `clamp` and no floor of 2000 any more, so the stated
+      justification was for code that had been deleted. The **value is unchanged** — the constraint
+      it encodes (small enough to reach context untouched) still holds, now argued from the live
+      input budget and the `min_viable_num_ctx` floor below which the loop refuses to run at all.
+      Only the sentence was wrong, and a bound whose derivation has gone stale is the next magic
+      constant: nobody can tell whether it is still right.
 
 
 #### What is already working — do not re-litigate
@@ -4544,11 +4748,30 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
          (client+nitro, 3365 modules) **and** a `pnpm dev` boot serving a real 200 `__nuxt` shell on :3000.
          **Deferred majors (each needs a code migration — do one per run, verify via `cargo tauri build`
          + WebDriver before landing):**
-     - [ ] `@tiptap/* 2.11.5 → 3.x` — tiptap v3 **removed the `BubbleMenu` named export from
-           `@tiptap/vue-3`** (breaks `FloatingToolbar.vue`; the whole P7 editor needs the v2→v3 migration:
-           new BubbleMenu wiring, extension API changes). Largest of the batch.
-     - [ ] `vue-router 4 → 5` (major)
-     - [ ] `vue-sonner 1 → 2` (major — toast API)
+     - [x] `@tiptap/* 2.27.2 → 3.30.3` — *(2026-08-25)* **landed; three silent breakages, none of which
+           `vue-tsc` or the 234-test suite caught.** (1) `BubbleMenu` is gone from the `@tiptap/vue-3`
+           root and lives at `@tiptap/vue-3/menus` — the old import still compiled and still typechecked
+           (the package re-exports `@tiptap/core`, so the name looks present) and evaluated to
+           `undefined`, so the floating toolbar would have rendered as an inert unknown element.
+           (2) v3 dropped tippy for Floating UI, so `:tippy-options` fell through to the DOM as an
+           unknown attribute — replaced with `:options` (`placement: 'top'`, `offset: 8`) and the now
+           dead `nanna-bubble` tippy theme CSS deleted. (3) StarterKit 3 registers `link` itself
+           (verified by enumerating its members), so the separate `Link.configure({ autolink: false })`
+           was a duplicate extension name whose config Tiptap would have discarded — and that
+           `autolink: false` is the content-integrity fix that stopped `test_01.sh` becoming
+           `test_[01.sh](http://01.sh)` in outbound mission text. Link is now configured through
+           `StarterKit.configure({ link: {…} })` and `@tiptap/extension-link` dropped as a direct dep.
+           `@tiptap/extension-placeholder` 3.x is a thin re-export of `@tiptap/extensions` and still
+           works. 237 vitest, `vue-tsc --noEmit` clean, `pnpm build` green.
+     - [x] `vue-router 4 → 5` (major) — *(2026-08-25)* landed, zero source changes. The direct
+           `^4.6.4` req was the *mismatch*: `nuxt 4.5.2` already depends on `vue-router ^5.2.0`, so the
+           tree carried the router Nuxt owns plus a stale 4.x pin. `pnpm why` now shows a single 5.2.0.
+     - [x] `vue-sonner 1 → 2` (major — toast API) — *(2026-08-25)* landed. The toast API itself is
+           unchanged; the breaking part is CSS: **v1 injected its stylesheet at runtime, v2 ships it as
+           a separate `vue-sonner/style.css` export you must import.** Without it the toaster mounts,
+           renders, and passes the "a toast really renders" e2e — completely unstyled and unpositioned.
+           Added the explicit import in `ui/sonner/Sonner.vue` (the `vue-sonner/nuxt` module would do
+           it automatically; we mount the component directly).
      - [x] `marked 17 → 18` (major — chat markdown renderer; audit render output)
            *(2026-08-24)* **Landed, 17.0.6 → 18.0.10, zero source changes.** The audit the item asked for
            is what made this cheap: the 26-test characterization suite written the same run (see the
@@ -4559,7 +4782,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            HTML is byte-identical for every one of those cases. 185/185 vitest, `pnpm build` green.
            The suite is the durable half of this: the next renderer bump has to state what it changes
            rather than being taken on faith.
-     - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
+     - [x] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-08-25)*
+           **Landed: `@lucide/vue@1.34.0`, specifier rewritten across 45 files, zero other changes.**
+           One correction to the write-up below: `lucide-vue-next@1.0.0` **is** deprecated on npm
+           ("Package deprecated. Please use `@lucide/vue` instead") but it is *not* an empty tombstone —
+           it ships a real 38 MB dist and every icon resolves from it. That made it worse, not better:
+           `pnpm update --latest` installs a working-but-dead package and nothing fails, so the trap is
+           silence rather than breakage. Migrated to the live package instead of pinning back to
+           0.577.0. The new `packageComponentExports` guard resolves all 221 icon bindings the
+           templates render, so the rename is proven at the export level rather than assumed;
+           `vue-tsc --noEmit` clean, 237 vitest, `pnpm build` green. *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
            `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
@@ -4577,6 +4809,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            it as a migration item, not a sweep bump: needs a full `pnpm build` + `pnpm tauri dev` boot +
            `cargo tauri build` + WebDriver pass. Also note **Nuxt 3 EOL 2026-07-31** (we are on 4.x, so
            informational). Source: [Nuxt 4.5](https://nuxt.com/blog/v4-5).
+     - [ ] *(re-tried 2026-08-25 — still blocked, now with the exact failure)* `typescript@7.0.2` +
+           `vue-tsc@3.3.11` reverted: `vue-tsc` resolves `typescript/lib/tsc` at startup and TS 7's
+           `package.json` no longer lists that subpath in `exports`, so the CI typecheck gate dies with
+           `ERR_PACKAGE_PATH_NOT_EXPORTED` before reading a single file. Nothing in our source is
+           involved — re-check when `vue-tsc` ships against the 7.1 programmatic API.
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -4588,6 +4825,25 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
+   - **`rten` is pinned at `0.24` by `ocrs`, not by us** *(2026-08-25)* — `cargo upgrade --incompatible`
+     offers `rten 0.24 → 0.25`, and taking it is a hard error, not a migration: `ocrs 0.12.2` (latest)
+     requires `rten ^0.24`, so the bump resolves **two** semver-incompatible `rten` crates and
+     `OcrEngineParams { detection_model, recognition_model }` is then handed `rten-0.25::Model` where
+     `rten-0.24::Model` is expected (E0308, verified by building it). Re-check when `ocrs` publishes
+     against 0.25; until then the direct req must track whatever `ocrs` requires.
+     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it.
+   - **`malachite-bigint` must stay at 0.9.2 — a bare `cargo update` breaks the release build**
+     *(2026-08-25)*. `pymath 0.2.0` accepts `malachite-bigint 0.10` while `rustpython-codegen 0.5.0`
+     requires 0.9, so `cargo update` resolves both and `rustpython-stdlib` fails to compile
+     (`there are multiple different versions of crate malachite_bigint in the dependency graph`,
+     17 errors, E0277/E0308). **This is release-only in practice** — it is the second failure of the
+     exact shape the `rust-toolchain.toml` comment describes, so it is another reason a freshness pass
+     is not verified until `cargo build --release -p nanna-daemon` is green. Held with
+     `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; the pin lives only in `Cargo.lock`, so
+     **every future run must redo it after `cargo update`** until `rustpython` widens its req.
+     - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+     - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
+           **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →

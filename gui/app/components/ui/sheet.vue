@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { DialogRoot, DialogTrigger, DialogPortal, DialogOverlay, DialogContent, DialogClose } from 'radix-vue'
-import { X } from 'lucide-vue-next'
+import { X } from '@lucide/vue'
 
 interface Props {
   open?: boolean
