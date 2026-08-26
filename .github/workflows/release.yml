@@ -68,11 +68,20 @@ jobs:
         with:
           version: 10
 
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: gui/pnpm-lock.yaml
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -141,11 +150,20 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 10
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: gui/pnpm-lock.yaml
 
       - name: Install frontend dependencies
         working-directory: gui
@@ -199,11 +217,20 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 10
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: gui/pnpm-lock.yaml
 
       - name: Install frontend dependencies
         working-directory: gui
