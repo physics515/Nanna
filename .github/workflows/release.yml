@@ -304,7 +304,16 @@ jobs:
           # directories, which gh rejects.
           find artifacts -type f -print0 | xargs -0 -I{} cp {} .
           shopt -s nullglob
-          files=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          # Filter to files that EXIST rather than relying on nullglob, because
+          # nullglob only drops unmatched GLOBS -- a literal name with no
+          # wildcard survives whether or not the file is there. That is exactly
+          # how the first beta.18 publish failed: Linux was skipped, so the bare
+          # `nanna-daemon` (the Linux binary) stayed in the list and gh rejected
+          # the whole upload with "no matches found for `nanna-daemon`" -- after
+          # a 65-minute build that had produced a correctly signed installer.
+          candidates=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          files=()
+          for f in "${candidates[@]}"; do [ -f "$f" ] && files+=("$f"); done
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::Nothing to upload"; exit 1
           fi

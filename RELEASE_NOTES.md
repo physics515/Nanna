@@ -163,10 +163,14 @@ without a signature**.
       — *repaired across beta.17/18.* Every blocker named in beta.16's note is fixed, and a real
       dispatch has now **built and signed** a Windows installer on a runner: the toolchain pin is
       honoured, Node/pnpm and the Tauri CLI are actually installed, and the signing secrets work
-      (the collect step fails when the `.sig` is missing, and it passed). That first attempt still
-      did not publish — a `cache: pnpm` **post-job** step failed after the build succeeded, and a
-      failed post step fails the job — so the cache was removed. Box stays `[~]` until a dispatch
-      has published end to end.
+      (the collect step fails when the `.sig` is missing, and it passed). **beta.18 shipped**, with
+      a signed installer, its `.sig` and the daemon attached. Box stays `[~]` for one more release
+      because the *workflow* did not do the final upload itself: two bugs surfaced only at the very
+      end of ~50-minute builds — a `cache: pnpm` **post-job** step that failed the job after a
+      successful build, and an upload list mixing globs with literal filenames (`nullglob` drops
+      unmatched globs but not literals, so a skipped Linux job left `nanna-daemon` in the list and
+      gh rejected the whole upload). Both are fixed; beta.18's assets were published from the run's
+      own verified artifact. Tick this when a dispatch publishes unaided.
 - [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (code signing pending;
       the updater signature is applied at upload time from the local minisign key)
 - [ ] Publish signed and notarized macOS .dmg
