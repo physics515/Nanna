@@ -4126,12 +4126,66 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
 **Read this before picking P24 work:** treat each item as landed unless you have checked its
 "Where" anchors yourself. The one gap re-confirmed as genuinely open this run:
 
+- [x] **A drain trigger the daemon owns — rows parked mid-session no longer wait for a binding event.**
+      *(2026-08-26)* `MemoryService::store_unembedded` is the queued-for-backfill path: the write
+      lands, the row is durable, and it is reachable by its `source_id` handle. Its own doc comment
+      named what was still missing — "nothing drains it until the next BINDING event … it is
+      recovered, not lost — but the latency is a session, not a moment, and closing that needs a
+      drain trigger the memory crate does not own." Every existing trigger was a binding event
+      (daemon start, provider switch, width reprobe), and an ordinary session has none, so a row
+      parked by a *transient* embedding failure stayed unsearchable until restart.
+      `supervise_idle_backfill` in `nanna-daemon/src/server.rs` is that trigger. It is one task for
+      the daemon's life running `wait_active().await; wait_idle().await` — exactly one turn's
+      lifetime — and then calling the existing `drain_backfill`. **It adds a trigger, never a second
+      rate:** the drain it starts still takes the process-wide `drain_serial` mutex, still yields to
+      a live chat turn, and still repays each provider request with an equal idle window.
+      **Bound.** One probe per active→idle edge, so the probe rate is bounded by the *turn* rate.
+      The probe is what a complete store already costs `drain_backfill`: `entries_missing_model(model, 1)`
+      is an **in-memory** scan of the entries cache that short-circuits on the first unbucketed
+      entry (walking it whole only when there is nothing to do), plus two `LIMIT 1` local Turso
+      queries. No provider request happens unless work is found.
+      **Known, deliberate limit:** `wait_active` registers interest and then reads the flag, so a
+      turn that begins AND ends inside that window leaves no edge and its rows wait for the next
+      turn. Bounded by one turn, and not "fixed" by probing before parking — that would turn the
+      loop into a spin on an idle daemon, which is the property this shape exists to avoid.
+      **4 tests** in `chat_harness` pin the registry contract the bound rests on: `wait_active` parks
+      on an idle registry (without which the loop is a spin, not an edge); one claim/release pair
+      drives exactly one full cycle; `wait_idle` does NOT open when one of two live runs releases;
+      and — added after the third test caught it — a turn that opens and closes between polls is
+      **missed**, deliberately. That last one began as a test that FAILED: it had asserted the
+      stronger guarantee, and it failed by timeout, i.e. by exercising the very race the design note
+      described in prose. Rather than weaken the check, the contract that does hold is now tested
+      with a `Notify` handshake, and the limitation is pinned as its own named test so that anyone
+      who later "fixes" the loop is told which property they traded away.
+      **Real-binary verification, stated honestly.** The freshly built `nanna-daemon.exe` was booted
+      against an isolated `--data-dir` on ports 51997/51998: it reached "Daemon ready", served IPC and
+      health, stayed up for 75s and exited with **zero panics** — so the new long-lived task does not
+      wedge startup or shutdown. It did **not** prove the supervisor ARMS, and the reason is worth
+      recording: this machine's config carries `embedding=disabled:bge-m3:latest`, so no provider
+      resolves, and the spawn sits inside the provider-resolved branch by design. The arm-time
+      `info!("Idle-backfill supervisor armed …")` exists precisely so that a daemon which *does* have
+      an embedding provider says so in one line at boot.
+      - [ ] *(found 2026-08-26)* **The daemon cannot be pointed at an alternate config, which caps
+            what any boot smoke can prove.** `--data-dir` isolates the database but NOT the config:
+            `nanna_config` resolves through the `directories` crate, which on Windows reads the
+            *known-folder* API, so a run always loads the operator's real
+            `%APPDATA%/nanna/nanna/config/config.toml` (setting `APPDATA` does not redirect it).
+            An unattended run therefore cannot exercise a provider-dependent boot path without
+            editing the developer's own config. Add a `--config <path>` flag (or a
+            `NANNA_CONFIG_PATH` env override) so boot-time behaviour is testable in isolation.
+
 - [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
       (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
       memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
       `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
       each chunk is still awaited inline on the turn's critical path. The cap must not be derived
       from the retrieval top-k (see the item's own note).
+      *(2026-08-26)* **Its prerequisite now exists.** Part 3 wants the row persisted synchronously
+      and only the vector queued — which was previously unsafe to do deliberately, because nothing
+      drained a queued vector until the next provider-binding event. `supervise_idle_backfill`
+      (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
+      rather than at the next restart. The chunk-COUNT bound is still open and still needs a
+      derivation, not a magic number.
 - [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.
@@ -4559,7 +4613,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            HTML is byte-identical for every one of those cases. 185/185 vitest, `pnpm build` green.
            The suite is the durable half of this: the next renderer bump has to state what it changes
            rather than being taken on faith.
-     - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
+     - [x] ~~**`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).**~~
+           **Done (2026-08-26).** `lucide-vue-next@^0.577.0` removed, `@lucide/vue@^1.34.0` added, and
+           the import specifier rewritten across **45 files**; zero occurrences of the old specifier
+           remain outside `node_modules`. The tombstone was re-confirmed before acting rather than
+           taken on trust: `npm view lucide-vue-next@1.0.0` still reports
+           `deprecated: "Package deprecated. Please use @lucide/vue instead"` on the `latest`
+           dist-tag. **v1's one real breaking change is brand-icon removal, and it does not touch
+           us** — the GUI imports **87 distinct icons**, every one a generic UI glyph (established by
+           parsing the import lists, not by eye). Verified: `pnpm build` exit 0 (**this is the gate
+           that matters** — Rollup has to resolve all 87 named exports, so a renamed icon would fail
+           here), `pnpm test` 27 files / 234 tests green, `cargo tauri build` + WebDriver below.
+           Also inherited from v1: icons now set `aria-hidden="true"` themselves, and the UMD build
+           is gone (ESM/CJS only) — neither affects this app.
+           *Original note, kept for the reasoning:* *(2026-07-16 —
            corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
            **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
            `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
