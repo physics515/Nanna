@@ -1,16 +1,51 @@
 name: Release Build & Publish
 
+# Dispatch this to build, sign and publish a release.
+#
+# Windows is the platform that actually ships today: `.updater/latest.json`
+# points at a Windows NSIS setup.exe, and that is what installed clients check.
+# It runs by default. macOS and Linux are OPT-IN (see the inputs) because they
+# have never been produced by this workflow and nothing here has verified them
+# on a real runner — defaulting them on would mean every dispatch fails on an
+# unverified platform and takes the Windows release down with it.
+#
+# SIGNING. `bundle.createUpdaterArtifacts` is true in tauri.conf.json, so the
+# build emits a `.sig` beside each installer and REQUIRES the updater private
+# key. Add these two repository secrets (Settings -> Secrets and variables ->
+# Actions), or the build fails with "A public key has been found, but no
+# private key":
+#
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/nanna-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the passphrase for that key
+#
+# The public half is already committed as `plugins.updater.pubkey` in
+# tauri.conf.json, so the pair must match or clients reject the update.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Semver version tag (e.g. 0.3.6)"
+        description: "Version WITHOUT the leading v (e.g. 0.3.9-beta.17)"
         required: true
-        default: "0.3.6"
       release_type:
         description: "release or pre-release"
         required: false
-        default: "release"
+        default: "pre-release"
+        type: choice
+        options: [pre-release, release]
+      build_macos:
+        description: "Also build macOS (UNVERIFIED — has never produced an artifact)"
+        required: false
+        default: false
+        type: boolean
+      build_linux:
+        description: "Also build Linux (UNVERIFIED — has never produced an artifact)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
 
 jobs:
   # ── Windows ──────────────────────────────────────────────────────────────
@@ -19,216 +54,259 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` pins an exact nightly, and rustup honours that
+      # file for every cargo invocation inside the repo. Asking
+      # dtolnay/rust-toolchain for `stable` therefore installed a toolchain
+      # that was never used, while the pinned one was still downloaded
+      # implicitly on first use — `rustup show` just does it explicitly and
+      # up front, so a toolchain problem fails here with a clear message
+      # instead of midway through a build.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - uses: pnpm/action-setup@v4
         with:
-          targets: x86_64-pc-windows-msvc
+          version: 10
 
-      - name: Install WebView2 runtime
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      # One command builds everything. tauri.conf.json's beforeBuildCommand is
+      # `pnpm build:daemon && pnpm generate`, so this compiles the nanna-daemon
+      # sidecar, generates the Nuxt frontend, builds the Tauri app, produces the
+      # NSIS installer and — because createUpdaterArtifacts is on — signs it.
+      # The previous `cargo tauri build` could not have worked: cargo-tauri was
+      # never installed. The CLI is a devDependency, so pnpm has it.
+      - name: Build and sign (Tauri + daemon sidecar + frontend)
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Collect Windows artifacts
+        shell: bash
         run: |
-          $webview2_url = "https://github.com/microsoft/webview2-bin/releases/download/1.0.1475.0/Microsoft.Web.WebView2.1.0.1475.0-win64.zip"
-          Invoke-WebRequest -Uri $webview2_url -OutFile "$env:TEMP\webview2.zip"
-          Expand-Archive -Path "$env:TEMP\webview2.zip" -DestinationPath "$env:TEMP\webview2" -Force
+          set -euo pipefail
+          mkdir -p dist
+          # Fail loudly if the bundle is missing rather than publishing an
+          # empty release: a green build that uploaded nothing is the worst
+          # possible outcome here.
+          shopt -s nullglob
+          setup=(target/release/bundle/nsis/*-setup.exe)
+          if [ ${#setup[@]} -eq 0 ]; then
+            echo "::error::No NSIS installer at target/release/bundle/nsis/"
+            ls -R target/release/bundle || true
+            exit 1
+          fi
+          cp "${setup[@]}" dist/
+          sigs=(target/release/bundle/nsis/*-setup.exe.sig)
+          if [ ${#sigs[@]} -eq 0 ]; then
+            echo "::error::Installer built but NOT signed — is TAURI_SIGNING_PRIVATE_KEY set?"
+            exit 1
+          fi
+          cp "${sigs[@]}" dist/
+          cp target/release/nanna-daemon.exe dist/
+          ls -la dist/
 
-      - name: Install build dependencies
-        run: |
-          choco install -y --params '/IAutoUpdate:false' 7zip
-          choco install -y --params '/IAutoUpdate:false' cmake
-          choco install -y --params '/IAutoUpdate:false' ninja
-
-      - name: Build daemon (release)
-        run: cargo build --release --package nanna-daemon
-
-      - name: Build GUI (release)
-        run: cargo tauri build
-
-      - name: Bundle installer
-        run: |
-          $daemonPath = "target\release\nanna-daemon.exe"
-          $guiPath = "target\release\gui\x86_64-pc-windows-msvc\release\tauri-app.exe"
-          if (Test-Path $daemonPath) {
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [System.IO.Compression.ZipFile]::CreateFromDirectory(
-              "target\release",
-              "build\windows-artifacts.zip",
-              [System.IO.Compression.CompressionLevel]::Optimal
-            )
-          }
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: windows-artifacts
-          path: build/windows-artifacts.zip
+          path: dist/
+          if-no-files-found: error
 
-  # ── macOS ────────────────────────────────────────────────────────────────
+  # ── macOS (opt-in, unverified) ───────────────────────────────────────────
   build-macos:
+    if: ${{ inputs.build_macos }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # `universal-apple-darwin` is NOT a rustup target and installing it fails
+      # outright — that is one of the two errors that killed the 2026-08-15 run
+      # at 23s. Tauri builds a universal binary by lipo-ing the two real
+      # targets, so those are what must be installed.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: pnpm/action-setup@v4
         with:
-          targets: universal-apple-darwin
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
 
-      - name: Install dependencies
-        run: brew install cmake ninja pkg-config
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
 
-      - name: Build daemon (release)
-        run: cargo build --release --package nanna-daemon
+      # The hand-rolled `hdiutil create` this replaces was building a DMG from a
+      # directory Tauri had already bundled properly. Tauri emits dmg/app itself
+      # (bundle.targets), so let it.
+      - name: Build and sign
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target universal-apple-darwin
 
-      - name: Build GUI (release)
-        run: cargo tauri build
+      - name: Collect macOS artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          found=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::No DMG produced"; ls -R target/universal-apple-darwin/release/bundle || true; exit 1
+          fi
+          cp "${found[@]}" dist/
+          cp target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz* dist/ 2>/dev/null || true
+          ls -la dist/
 
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: macos-artifacts
-          path: target/release/gui/universal-apple-darwin/release/
+          path: dist/
+          if-no-files-found: error
 
-  # ── Linux ────────────────────────────────────────────────────────────────
+  # ── Linux (opt-in, unverified) ───────────────────────────────────────────
   build-linux:
-    runs-on: ubuntu-latest
+    if: ${{ inputs.build_linux }}
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev dpkg-deb debhelper
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf file
 
-      - name: Build daemon (release)
-        run: cargo build --release --package nanna-daemon
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
 
-      - name: Build GUI (release)
-        run: cargo tauri build
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
 
-      - name: Create .deb package
+      # Replaces ~90 lines of hand-rolled dpkg-deb and a "tar.gz named
+      # .AppImage". Both were broken — the deb built from the wrong directory
+      # with its control file outside DEBIAN/, and the AppImage was not an
+      # AppImage — and both duplicated what Tauri already emits from
+      # bundle.targets.
+      - name: Build and sign
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Collect Linux artifacts
         run: |
-          # Copy built artifacts to a staging directory
-          mkdir -p build/staging/opt/nanna/usr/bin
-          mkdir -p build/staging/opt/nanna/usr/lib/nanna
-          mkdir -p build/staging/opt/nanna/usr/share/applications
-          mkdir -p build/staging/opt/nanna/usr/share/icons/hicolor/256x256/apps
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          cp target/release/bundle/deb/*.deb dist/ 2>/dev/null || true
+          cp target/release/bundle/appimage/*.AppImage* dist/ 2>/dev/null || true
+          if [ -z "$(ls -A dist/)" ]; then
+            echo "::error::No Linux bundles produced"; ls -R target/release/bundle || true; exit 1
+          fi
+          cp target/release/nanna-daemon dist/
+          ls -la dist/
 
-          # Copy binaries (Linux native binary, not .exe)
-          cp target/release/gui/x86_64-unknown-linux-gnu/release/nanna build/staging/opt/nanna/usr/bin/nanna
-          cp target/release/nanna-daemon build/staging/opt/nanna/usr/bin/nanna-daemon
-
-          # Create desktop entry
-          cat > build/staging/opt/nanna/usr/share/applications/nanna.desktop << 'EOF'
-          [Desktop Entry]
-          Name=Nanna
-          Exec=nanna %U
-          Icon=nanna
-          Type=Application
-          Categories=Utility;
-          Terminal=false
-          EOF
-
-          # Create control file for dpkg-deb
-          cat > build/control << 'EOF'
-          Package: nanna
-          Version: 0.3.6
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Depends: libgtk-3-0, libwebkit2gtk-4.1-0, libayatana-appindicator3-1
-          Maintainer: physics515 <physics515@example.com>
-          Description: Personal AI presence — local-first, always-on
-          EOF
-
-          # Create changelog
-          cat > build/changelog << 'EOF'
-          nanna (0.3.6) stable; urgency=medium
-
-            * Initial public preview release
-            * Local-first AI agent with cognitive memory
-            * Multi-channel support (Telegram, Discord, Slack, Signal, WhatsApp)
-
-          -- physics515 <physics515@example.com>  $(date -R)
-
-          EOF
-
-          # Create the .deb package
-          dpkg-deb --build build/ nanna_0.3.6_amd64.deb
-
-      - name: Create AppImage
-        run: |
-          # Create proper AppImage structure
-          mkdir -p build/appimage-root/App
-          mkdir -p build/appimage-root/usr/bin
-
-          # Copy binaries to AppImage structure
-          cp target/release/gui/x86_64-unknown-linux-gnu/release/nanna build/appimage-root/App/nanna
-          cp target/release/nanna-daemon build/appimage-root/App/nanna-daemon
-
-          # Create AppRun wrapper (required for AppImage)
-          cat > build/appimage-root/AppRun << 'EOF'
-          #!/bin/bash
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-          exec "$HERE/App/nanna" "$@"
-          EOF
-          chmod +x build/appimage-root/AppRun
-
-          # Create the AppImage (tar.gz with executable bit)
-          tar -C build --create --files-from /dev/null \
-            -C build/appimage-root \
-            . | gzip > "build/nanna.AppImage"
-
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: linux-artifacts
-          path: |
-            build/nanna_0.3.6_amd64.deb
-            build/nanna.AppImage
+          path: dist/
+          if-no-files-found: error
 
-  # ── Publish Release ──────────────────────────────────────────────────────
+  # ── Publish ──────────────────────────────────────────────────────────────
   publish-release:
     needs: [build-windows, build-macos, build-linux]
+    # `needs` on a skipped job makes the dependent skip too, so the opt-in
+    # platforms must be tolerated explicitly. Windows must still have SUCCEEDED
+    # — `!failure() && !cancelled()` alone would publish an empty release if it
+    # were skipped.
+    if: ${{ always() && needs.build-windows.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
-      - name: Create GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ github.event.inputs.version }}"
-          TAG="v${VERSION}"
-          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+      # TAG was previously assigned inside one `run:` and referenced from
+      # later ones. Each `run` is its own shell, so it was empty everywhere it
+      # was used and every upload targeted the tag "". It goes in the job env.
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
 
-          if [ "$RELEASE_TYPE" = "pre-release" ]; then
-            gh release create "$TAG" \
-              --prerelease \
-              --title "Nanna v${VERSION} (Pre-release)" \
-              --notes "Pre-release build for Nanna v${VERSION}"
+      - name: Create release and attach artifacts
+        env:
+          # Needed by EVERY gh call, not just `release create` — the upload
+          # steps used to run unauthenticated.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Flatten: `gh release upload` takes FILES. The old workflow passed
+          # directories, which gh rejects.
+          find artifacts -type f -print0 | xargs -0 -I{} cp {} .
+          shopt -s nullglob
+          files=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::Nothing to upload"; exit 1
+          fi
+          printf 'attaching: %s\n' "${files[@]}"
+
+          PRERELEASE=""
+          if [ "${{ inputs.release_type }}" = "pre-release" ]; then PRERELEASE="--prerelease"; fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
           else
-            gh release create "$TAG" \
-              --title "Nanna v${VERSION}" \
-              --notes "Release build for Nanna v${VERSION}"
+            gh release create "$TAG" $PRERELEASE \
+              --title "Nanna $TAG" \
+              --notes-file RELEASE_NOTES.md \
+              "${files[@]}"
           fi
 
-      - name: Attach Windows artifacts
+      # The updater manifest is NOT written automatically. It needs the real
+      # signature emitted next to the installer, so it is printed here for a
+      # human to commit — publishing a release without updating it means
+      # installed clients keep pointing at the previous version.
+      - name: Print .updater/latest.json block to commit
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          gh release upload "$TAG" "artifacts/windows-artifacts.zip" --clobber
-
-      - name: Attach macOS artifacts
-        run: |
-          gh release upload "$TAG" "artifacts/macos-artifacts/" --clobber
-
-      - name: Attach Linux artifacts
-        run: |
-          gh release upload "$TAG" "artifacts/linux-artifacts/" --clobber
+          set -euo pipefail
+          sig_file=$(ls *-setup.exe.sig 2>/dev/null | head -1 || true)
+          exe_file=$(ls *-setup.exe 2>/dev/null | head -1 || true)
+          if [ -z "$sig_file" ]; then echo "No signature found; skipping."; exit 0; fi
+          echo "::notice::Commit this into .updater/latest.json, then push to master:"
+          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/physics515/Nanna/releases/download/%s/%s"\n}\n' \
+            "$(cat "$sig_file")" "$TAG" "$exe_file"
