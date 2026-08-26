@@ -252,8 +252,17 @@ port = 3000
 | `BRAVE_API_KEY` | Web search tool |
 | `TELEGRAM_BOT_TOKEN` | Telegram channel |
 | `DISCORD_BOT_TOKEN` | Discord channel |
+| `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
 **Ports:** Health HTTP `5148` · WebSocket IPC `5149`
+
+`NANNA_CONFIG_PATH` is useful for running a second instance, or for trying a
+configuration without touching the one you use day to day — pair it with the
+daemon's `--data-dir` to isolate the database as well:
+
+```bash
+NANNA_CONFIG_PATH=/tmp/try.toml nanna-daemon --data-dir /tmp/try-data run
+```
 
 ---
 
