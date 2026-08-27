@@ -22,7 +22,7 @@ const mountInput = (props: Record<string, unknown> = {}) => mount(ChatInput, {
 describe('ChatInput', () => {
   it('submits non-empty content from Send', async () => {
     const wrapper = mountInput({ modelValue: 'Ask the moon' })
-    const send = wrapper.findAllComponents(ButtonStub).find(button => button.text().includes('Send'))!
+    const send = wrapper.findAll('button').find(button => button.text().includes('Send'))!
     await send.trigger('click')
     expect(wrapper.emitted('submit')).toHaveLength(1)
   })

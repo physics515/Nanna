@@ -1,18 +1,18 @@
 <template>
-  <div class="space-y-1">
+  <div class="flex w-full flex-col gap-4">
     <template v-for="(item, idx) in items" :key="timelineKey(item, idx)">
       <!-- Thinking burst: its own block, inline where it happened. Gated
            exactly like the text branch below — a burst that closed empty
            (a lone newline delta between two tool calls) otherwise drew its
-           own "💭 Thinking · 1 words" card. -->
-      <ThinkingCard
+           own "Thinking · 1 words" card. -->
+      <NuiThinkingMessage
         v-if="item.kind === 'thinking' && hasRenderableText(item.content)"
         :content="item.content ?? ''"
-        :is-active="isLive && idx === items.length - 1"
+        :active="isLive && idx === items.length - 1"
       />
 
       <!-- Tool call, with its wall-clock timestamp and token spend -->
-      <ToolCallCard
+      <NuiToolCallMessage
         v-else-if="item.kind === 'tool'"
         :tool-call="toToolCall(item)"
         :status="toolStatus(item)"
@@ -26,31 +26,24 @@
            Marker-only and whitespace-only segments are skipped too: models
            emit stray newlines and bare TASK COMPLETE lines between tool
            calls, and each opens its own segment (the previous item is a
-           tool), which otherwise draws an empty "☽ Nanna" card. -->
-      <MessageBubble
+           tool), which otherwise draws an empty card. -->
+      <NuiMessage
         v-else-if="item.kind === 'text' && !(isLive && idx === items.length - 1) && hasRenderableText(item.content)"
-        variant="assistant"
+        role="assistant"
       >
-        <div class="flex items-start gap-2 sm:gap-3">
-          <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
-          <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
-          <div class="flex-1 min-w-0">
-            <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-            <MarkdownContent :content="stripHarnessMarkers(item.content ?? '')" />
-          </div>
-        </div>
-      </MessageBubble>
+        <MarkdownContent :content="stripHarnessMarkers(item.content ?? '')" />
+      </NuiMessage>
 
       <!-- Healed provider fault: a seam in the run. Recorded so restarted
            thinking/text after it reads as "new attempt", not corruption. -->
       <div
         v-else-if="item.kind === 'fault'"
-        class="fault-marker"
+        class="mx-32 flex items-center gap-2 border-l-8 border-solid border-nui-yellow py-1 pl-4 text-xs leading-normal text-nui-yellow"
         :title="item.message"
       >
-        <span class="fault-icon">⚡</span>
-        <span class="fault-text">stream fault — healed and continued</span>
-        <span class="fault-time">{{ dayStamp(item.at) }}</span>
+        <span class="shrink-0">⚡</span>
+        <span>stream fault — healed and continued</span>
+        <span class="ml-auto shrink-0 text-nui-muted">{{ dayStamp(item.at) }}</span>
       </div>
     </template>
   </div>
@@ -110,29 +103,3 @@ function dayStamp(iso: string): string {
   return `${weekday}, ${month} ${d.getDate()} ${d.getFullYear()}`
 }
 </script>
-
-<style scoped>
-.fault-marker {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  font-size: 11px;
-  color: rgba(251, 191, 36, 0.7);
-  background: rgba(251, 191, 36, 0.05);
-  border-left: 2px solid rgba(251, 191, 36, 0.3);
-  border-radius: 0.25rem;
-}
-.fault-icon {
-  flex-shrink: 0;
-}
-.fault-text {
-  font-family: var(--font-mono, monospace);
-}
-.fault-time {
-  margin-left: auto;
-  font-size: 10px;
-  color: rgba(148, 163, 184, 0.5);
-  flex-shrink: 0;
-}
-</style>

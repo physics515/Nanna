@@ -189,7 +189,7 @@ async function windowControl(action: 'minimize' | 'maximize' | 'close') {
               </div>
             </NuiMessage>
 
-            <NuiThinkingMessage :content="thinkingContent" />
+            <NuiThinkingMessage :content="thinkingContent" default-expanded />
 
             <NuiMessage role="assistant">
               <div class="flex w-full flex-col items-start">
@@ -198,17 +198,17 @@ async function windowControl(action: 'minimize' | 'maximize' | 'close') {
             </NuiMessage>
 
             <NuiToolCallMessage
-              name="discover_tools"
-              description="run shell commands, read and edit files, search code"
-              :output="toolOutput"
-            >
-              <template #input>
-                <pre class="whitespace-pre-wrap break-words font-nui text-xs font-[450] leading-normal text-nui-fg">{
-  <span class="text-nui-key">"limit"</span>: <span class="text-nui-number">8</span>,
-  <span class="text-nui-key">"query"</span>: <span class="text-nui-green">"run shell commands, read and edit files, search code"</span>
-}</pre>
-              </template>
-            </NuiToolCallMessage>
+              :tool-call="{
+                id: 'demo-1',
+                name: 'discover_tools',
+                input: { limit: 8, query: 'run shell commands, read and edit files, search code' },
+                output: toolOutput,
+                success: true,
+                duration_ms: 412,
+              }"
+              status="completed"
+              default-expanded
+            />
 
             <NuiMessage v-for="(msg, i) in sentMessages" :key="i" role="user">
               <p class="w-full whitespace-pre-wrap break-words text-xs leading-normal text-nui-fg">{{ msg }}</p>

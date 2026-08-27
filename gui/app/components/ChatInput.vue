@@ -1,211 +1,127 @@
 <template>
-  <div class="chat-input-container">
-    <!-- Preview pane (collapsible) -->
+  <div class="chat-input-container w-full">
+    <!-- Preview pane (Ctrl+P) -->
     <Transition name="preview">
       <div
         v-if="showPreview && modelValue.trim()"
-        class="preview-pane mb-2 rounded-xl overflow-hidden glass-editor-wrap"
+        class="mb-2 border-b border-t border-dashed border-nui-muted"
       >
-        <div class="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.04]">
-          <span class="text-[10px] uppercase tracking-wider text-nanna-text-dim font-medium">Preview</span>
-          <button
-            @click="showPreview = false"
-            class="text-nanna-text-dim hover:text-nanna-text p-0.5"
-          >
-            <X class="w-3.5 h-3.5" />
+        <div class="flex items-center justify-between px-3 py-1.5">
+          <span class="text-xs font-semibold leading-normal text-nui-muted">Preview</span>
+          <button class="p-1 text-nui-muted hover:text-nui-fg" aria-label="Close preview" @click="showPreview = false">
+            <NuiIcon name="close" :size="16" />
           </button>
         </div>
-        <div class="p-3 max-h-[200px] overflow-y-auto">
+        <div class="max-h-[200px] overflow-y-auto p-3 nui-scroll">
           <MarkdownContent :content="modelValue" />
         </div>
       </div>
     </Transition>
 
-    <!-- Combined input card -->
-    <div class="input-card" :class="{ 'input-card--focused': isFocused }">
-
-      <!-- ═══ Top: Editor with Splatter ═══ -->
-      <div class="input-editor-zone">
-        <!-- Splatter layer -->
-        <span class="input-editor-zone__splatter" :style="{ background: splatterBg }" />
+    <!-- Chatbox: editor column + purple base bar, action buttons beside it -->
+    <div class="flex h-64 w-full items-start gap-2.5">
+      <div
+        class="flex h-full min-w-0 flex-1 flex-col border-b-[32px] border-solid p-4 transition-colors"
+        :class="isFocused ? 'border-nui-accent' : 'border-nui-accent/80'"
+      >
+        <!-- Attachment previews -->
+        <div v-if="pendingAttachments.length > 0" class="flex gap-2 overflow-x-auto pb-2">
+          <div v-for="att in pendingAttachments" :key="att.id" class="relative h-16 w-16 shrink-0 overflow-hidden border border-solid border-nui-accent/60">
+            <img :src="att.preview" :alt="att.filename" class="h-full w-full object-cover" />
+            <button
+              class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-nui-bg/80 text-nui-pink hover:bg-nui-pink hover:text-nui-bg"
+              :aria-label="`Remove ${att.filename}`"
+              @click="removeAttachment(att.id)"
+            >
+              <NuiIcon name="close" :size="12" />
+            </button>
+          </div>
+        </div>
 
         <!-- Rich text editor (extracted Tiptap core) -->
         <RichTextEditor
           ref="richEditorRef"
           :model-value="modelValue"
           :editable="!disabled"
-          :placeholder="placeholder || 'Type a message... (Ctrl+Enter to send, / for commands)'"
+          :placeholder="placeholder || 'Type your message...'"
           floating-toolbar
           slash-commands
           images
-          editor-class="prose prose-invert prose-sm max-w-none focus:outline-none"
-          class="chat-editor"
+          editor-class="nui-editor-content focus:outline-none"
+          class="nui-chat-editor min-h-0 flex-1 overflow-y-auto nui-scroll"
           :class="{ 'opacity-50 cursor-not-allowed': disabled }"
           @update:model-value="emit('update:modelValue', $event)"
-          @focus="isFocused = true; splatterEnter()"
-          @blur="isFocused = false; splatterLeave()"
+          @focus="isFocused = true"
+          @blur="isFocused = false"
           @keydown="handleKeyDown"
           @image-paste="addImageFile"
           @image-drop="addImageFile"
         />
-      </div>
 
-      <!-- ═══ Mobile formatting toolbar ═══ -->
-      <div v-if="isFocused && tiptapEditor" class="mobile-toolbar sm:hidden">
-        <button
-          @click="tiptapEditor.chain().focus().toggleBold().run()"
-          :class="{ active: tiptapEditor.isActive('bold') }"
-          class="mobile-toolbar__btn"
-        >
-          <Bold class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleItalic().run()"
-          :class="{ active: tiptapEditor.isActive('italic') }"
-          class="mobile-toolbar__btn"
-        >
-          <Italic class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleStrike().run()"
-          :class="{ active: tiptapEditor.isActive('strike') }"
-          class="mobile-toolbar__btn"
-        >
-          <Strikethrough class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleCode().run()"
-          :class="{ active: tiptapEditor.isActive('code') }"
-          class="mobile-toolbar__btn"
-        >
-          <Code class="w-4 h-4" />
-        </button>
-        <span class="mobile-toolbar__divider" />
-        <button
-          @click="tiptapEditor.chain().focus().toggleHeading({ level: 2 }).run()"
-          :class="{ active: tiptapEditor.isActive('heading') }"
-          class="mobile-toolbar__btn"
-        >
-          <Heading2 class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleBulletList().run()"
-          :class="{ active: tiptapEditor.isActive('bulletList') }"
-          class="mobile-toolbar__btn"
-        >
-          <List class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleBlockquote().run()"
-          :class="{ active: tiptapEditor.isActive('blockquote') }"
-          class="mobile-toolbar__btn"
-        >
-          <Quote class="w-4 h-4" />
-        </button>
-        <button
-          @click="tiptapEditor.chain().focus().toggleTaskList().run()"
-          :class="{ active: tiptapEditor.isActive('taskList') }"
-          class="mobile-toolbar__btn"
-        >
-          <ListChecks class="w-4 h-4" />
-        </button>
-      </div>
-
-      <!-- ═══ Bottom: Toolbar with Ground Glass ═══ -->
-    <!-- Attachment previews -->
-    <div v-if="pendingAttachments.length > 0" class="attachment-strip">
-      <div v-for="att in pendingAttachments" :key="att.id" class="attachment-thumb">
-        <img :src="att.preview" :alt="att.filename" />
-        <button class="attachment-remove" @click="removeAttachment(att.id)">
-          <X class="w-3 h-3" />
-        </button>
-      </div>
-    </div>
-      <div
-        class="input-toolbar"
-        :style="glassStyle"
-        @mouseenter="handleToolbarEnter"
-        @mouseleave="handleToolbarLeave"
-      >
-        <!-- Glass mesh layer -->
-        <span class="input-toolbar__mesh" :style="{ background: meshBg }" />
-
-        <!-- Glass noise overlay -->
-        <span class="input-toolbar__noise" />
-
-        <!-- Toolbar content -->
-        <div class="input-toolbar__content">
-          <!-- Left: formatting hints + preview toggle -->
-          <div class="flex items-center gap-2 text-xs" style="color: rgba(203, 213, 225, 0.85);">
-            <UiGlassButton
-              pill
-              size="sm"
-              :color="showPreview ? 'accent' : 'default'"
-              @click="showPreview = !showPreview"
-              title="Toggle preview (Ctrl+P)"
-            >
-              <Eye class="w-3.5 h-3.5 sm:mr-1" />
-              <span class="hidden sm:inline">Preview</span>
-            </UiGlassButton>
-            <UiGlassButton
-              pill
-              size="sm"
-              @click="openFilePicker"
-              title="Attach image"
-            >
-              <ImagePlus class="w-3.5 h-3.5 sm:mr-1" />
-              <span class="hidden sm:inline">Image</span>
-            </UiGlassButton>
-            <span class="text-nanna-text-muted hidden sm:inline">&middot;</span>
-            <span class="hidden md:inline">
-              <kbd class="px-1 py-0.5 rounded bg-white/[0.04] text-[10px]">Ctrl+Enter</kbd> send
-              <span class="text-nanna-text-muted ml-1">&middot;</span>
-              <kbd class="px-1 py-0.5 rounded bg-white/[0.04] text-[10px] ml-1">/</kbd> commands
-            </span>
+        <!-- Shortcut hints -->
+        <div class="flex w-full items-center gap-4 pt-2.5">
+          <div class="flex items-center">
+            <NuiKbd keys="Ctrl+Enter" />
+            <span class="whitespace-nowrap text-xs leading-normal text-nui-muted">&nbsp;to send</span>
           </div>
-
-          <!-- Right: stop or send button -->
-          <UiGlassButton
-            v-if="isActive"
-            @click="emit('stop')"
-            size="sm"
-            color="danger"
-            pill
-            class="shrink-0"
-            aria-label="Stop"
-            title="Stop"
-            data-testid="stop-generation"
-          >
-            <Square class="w-3.5 h-3.5 sm:mr-1 fill-current" />
-            <span class="hidden sm:inline">Stop</span>
-          </UiGlassButton>
-          <UiGlassButton
-            v-else
-            @click="submit"
-            :disabled="isEmpty || disabled"
-            size="sm"
-            color="accent"
-            pill
-            class="shrink-0"
-          >
-            <Send class="w-4 h-4 sm:mr-1" />
-            <span class="hidden sm:inline">Send</span>
-          </UiGlassButton>
+          <NuiIcon name="dot" :size="16" class="text-nui-muted" />
+          <div class="flex items-center">
+            <NuiKbd keys="/" />
+            <span class="whitespace-nowrap text-xs leading-normal text-nui-muted">&nbsp;commands</span>
+          </div>
+          <NuiIcon name="dot" :size="16" class="hidden text-nui-muted sm:inline-block" />
+          <div class="hidden items-center sm:flex">
+            <NuiKbd keys="Ctrl+P" />
+            <span class="whitespace-nowrap text-xs leading-normal text-nui-muted">&nbsp;preview</span>
+          </div>
+          <span class="min-w-0 flex-1" />
+          <span v-if="isActive" class="flex items-center gap-1 whitespace-nowrap text-xs leading-normal text-nui-yellow">
+            <span class="h-2 w-2 animate-pulse rounded-full bg-nui-yellow" />
+            working — Esc stops
+          </span>
         </div>
+      </div>
+
+      <!-- Side actions: stop-or-send, attach -->
+      <div class="flex h-full w-12 shrink-0 flex-col gap-1">
+        <button
+          v-if="isActive"
+          type="button"
+          class="flex w-full items-center justify-center p-2 text-nui-pink transition-colors hover:text-nui-fg"
+          title="Stop"
+          data-testid="stop-generation"
+          @click="emit('stop')"
+        >
+          <NuiIcon name="close" :size="32" />
+          <span class="sr-only">Stop</span>
+        </button>
+        <button
+          v-else
+          type="button"
+          class="flex w-full items-center justify-center p-2 text-nui-pink transition-colors hover:text-nui-fg disabled:pointer-events-none disabled:opacity-40"
+          title="Send"
+          :disabled="isEmpty || disabled"
+          @click="submit"
+        >
+          <NuiIcon name="send" :size="32" />
+          <span class="sr-only">Send</span>
+        </button>
+        <button
+          type="button"
+          class="flex w-full items-center justify-center p-2 text-nui-fg transition-colors hover:text-white"
+          title="Attach image"
+          @click="openFilePicker"
+        >
+          <NuiIcon name="attach" :size="32" />
+          <span class="sr-only">Attach image</span>
+        </button>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
-import {
-  Send, Eye, X, Square, ImagePlus,
-  Bold, Italic, Strikethrough, Code,
-  Heading2, List, Quote, ListChecks,
-} from '@lucide/vue'
-import { useSplatter } from '~/composables/useSplatter'
-import { useGroundGlass } from '~/composables/useGroundGlass'
+import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 
 const props = defineProps<{
   modelValue: string
@@ -284,40 +200,10 @@ function getAttachments() {
   return atts
 }
 
-
-// Splatter for the editor area (focus-driven)
-const {
-  splatterBg,
-  onEnter: splatterEnter,
-  onLeave: splatterLeave,
-} = useSplatter({
-  opacityRanges: [[0.08, 0.12], [0.06, 0.10], [0.04, 0.08]],
-  sizes: ['65%', '60%', '50%'],
-  lerpSpeed: 0.008,
-  interval: 3000,
-})
-
-// Ground glass for the toolbar (hover-driven)
-const {
-  meshBg,
-  containerStyle: glassStyle,
-  onEnter: glassEnter,
-  onLeave: glassLeave,
-} = useGroundGlass({
-  opacity: 1.8,
-  sizes: ['55%', '50%', '45%'],
-  lerpSpeed: 0.008,
-  interval: 2200,
-  blur: 8,
-})
-
-// Prevent mount animation
-const ready = ref(false)
 function onFocusEvent() { focus() }
 function onStopEvent() { if (props.isActive) emit('stop') }
 
 onMounted(() => {
-  setTimeout(() => { ready.value = true }, 200)
   window.addEventListener('nanna:focus-chat-input', onFocusEvent)
   window.addEventListener('nanna:stop-generation', onStopEvent)
 })
@@ -327,16 +213,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('nanna:stop-generation', onStopEvent)
 })
 
-function handleToolbarEnter() {
-  if (ready.value) glassEnter()
-}
-function handleToolbarLeave() {
-  if (ready.value) glassLeave()
-}
-
 // ── RichTextEditor ref ──
 const richEditorRef = ref<any>(null)
-const tiptapEditor = computed(() => richEditorRef.value?.editor)
 
 const isEmpty = computed(() => richEditorRef.value?.isEmpty ?? !props.modelValue.trim())
 
@@ -375,115 +253,19 @@ defineExpose({ focus, getAttachments })
 <style>
 @reference "../assets/css/main.css";
 
-/* ═══ Input Card (outer shell) ═══ */
-.input-card {
-  border-radius: 0 0 0.75rem 0.75rem;
-  overflow: hidden;
+/* ═══ Chat-specific editor overrides (base styles live in RichTextEditor) ═══ */
+.nui-chat-editor .rich-text-editor__content .ProseMirror {
+  padding: 0;
+  min-height: 60px;
+  font-family: var(--font-nui);
+  font-size: 12px;
+  font-weight: 450;
+  line-height: normal;
+  color: var(--color-nui-fg);
 }
 
-/* ═══ Editor Zone (splatter) ═══ */
-.input-editor-zone {
-  position: relative;
-  isolation: isolate;
-}
-
-.input-editor-zone__splatter {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  transition: opacity 0.4s ease;
-  opacity: 0.5;
-}
-.input-card--focused .input-editor-zone__splatter {
-  opacity: 1;
-}
-
-/* ═══ Mobile formatting toolbar ═══ */
-.mobile-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 0.125rem;
-  padding: 0.375rem 0.5rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
-  background: rgba(15, 23, 42, 0.3);
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-}
-
-.mobile-toolbar__btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 2rem;
-  height: 2rem;
-  border-radius: 0.375rem;
-  color: rgba(203, 213, 225, 0.7);
-  transition: all 0.15s ease;
-  flex-shrink: 0;
-}
-
-.mobile-toolbar__btn:hover,
-.mobile-toolbar__btn:active {
-  background: rgba(99, 102, 241, 0.15);
-  color: #e2e8f0;
-}
-
-.mobile-toolbar__btn.active {
-  background: rgba(99, 102, 241, 0.25);
-  color: rgba(165, 180, 252, 1);
-}
-
-.mobile-toolbar__divider {
-  width: 1px;
-  height: 1.25rem;
-  margin: 0 0.25rem;
-  background: rgba(71, 85, 105, 0.4);
-  flex-shrink: 0;
-}
-
-/* ═══ Toolbar (ground glass) ═══ */
-.input-toolbar {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  background: rgba(30, 41, 59, 0.25);
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
-}
-
-.input-toolbar__mesh {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-}
-
-.input-toolbar__noise {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: none;
-  opacity: 0.14;
-  background-blend-mode: soft-light;
-  background: repeating-radial-gradient(
-    circle,
-    #1a2035,
-    #1a2035 2px,
-    #253050 2px 4px,
-    #1a2035 4px 6px,
-    #253050 6px 8px,
-    #1a2035 8px 10px,
-    #253050 10px 12px
-  ) 0 0 / 100% 100%;
-}
-
-.input-toolbar__content {
-  position: relative;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.5rem 0.75rem;
+.nui-chat-editor .rich-text-editor__content .ProseMirror p.is-empty:first-child::before {
+  color: color-mix(in srgb, var(--color-nui-fg) 70%, transparent);
 }
 
 /* ═══ Preview transition ═══ */
@@ -496,94 +278,4 @@ defineExpose({ focus, getAttachments })
   opacity: 0;
   transform: translateY(8px);
 }
-
-.preview-pane {
-  @apply text-sm;
-}
-
-/* ═══ Glass preview wrap ═══ */
-.glass-editor-wrap {
-  background: rgba(15, 23, 42, 0.5);
-  border: 1px solid rgba(71, 85, 105, 0.2);
-}
-
-/* ═══ Chat-specific editor overrides (base styles live in RichTextEditor) ═══ */
-.chat-editor {
-  position: relative;
-  z-index: 1;
-  @apply min-h-[60px] max-h-[400px] overflow-y-auto;
-}
-
-.chat-editor :deep(.rich-text-editor__content .ProseMirror) {
-  @apply px-4 py-3;
-  min-height: 60px;
-}
-
-/* ═══ Drag handles for blocks ═══ */
-.chat-editor :deep(.ProseMirror > *) {
-  position: relative;
-}
-
-.chat-editor :deep(.ProseMirror > *:not(p:first-child)::before) {
-  content: '⠿';
-  position: absolute;
-  left: -1.25rem;
-  top: 0.125rem;
-  font-size: 0.75rem;
-  color: transparent;
-  cursor: grab;
-  user-select: none;
-  transition: color 0.15s ease;
-  line-height: 1.5;
-}
-
-.chat-editor :deep(.ProseMirror > *:not(p:first-child):hover::before) {
-  color: rgba(148, 163, 184, 0.35);
-}
-
-/* === Attachment strip === */
-.attachment-strip {
-  display: flex;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
-  overflow-x: auto;
-}
-
-.attachment-thumb {
-  position: relative;
-  flex-shrink: 0;
-  width: 4rem;
-  height: 4rem;
-  border-radius: 0.5rem;
-  overflow: hidden;
-  border: 1px solid rgba(99, 102, 241, 0.3);
-}
-
-.attachment-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.attachment-remove {
-  position: absolute;
-  top: 0.125rem;
-  right: 0.125rem;
-  width: 1.25rem;
-  height: 1.25rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 9999px;
-  background: rgba(0, 0, 0, 0.7);
-  color: rgba(248, 113, 113, 0.9);
-  transition: all 0.15s ease;
-}
-
-.attachment-remove:hover {
-  background: rgba(220, 38, 38, 0.8);
-  color: white;
-}
-
 </style>

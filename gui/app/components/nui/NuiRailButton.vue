@@ -8,6 +8,8 @@ const props = withDefaults(defineProps<{
   /** Color of the active-item edge. */
   accent?: 'accent' | 'green'
   size?: number
+  /** Small pink counter over the icon (e.g. unread notifications). */
+  badge?: number
 }>(), {
   accent: 'accent',
   size: 32,
@@ -22,7 +24,7 @@ const accentClass = {
 <template>
   <button
     type="button"
-    class="flex items-center justify-center border-l px-4 py-2 transition-colors"
+    class="relative flex items-center justify-center border-l px-4 py-2 transition-colors"
     :class="props.active
       ? [accentClass[props.accent], 'text-nui-fg']
       : 'border-transparent text-nui-fg/70 hover:text-nui-fg'"
@@ -31,5 +33,9 @@ const accentClass = {
     :title="props.label"
   >
     <NuiIcon :name="props.icon" :size="props.size" />
+    <span
+      v-if="props.badge && props.badge > 0"
+      class="absolute right-2 top-0 min-w-4 rounded-full bg-nui-pink px-1 text-center text-[10px] font-semibold leading-4 text-nui-bg"
+    >{{ props.badge > 9 ? '9+' : props.badge }}</span>
   </button>
 </template>

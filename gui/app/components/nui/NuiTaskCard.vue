@@ -4,12 +4,21 @@ import { computed } from 'vue'
 const props = withDefaults(defineProps<{
   title: string
   status: 'upcoming' | 'in-progress' | 'complete'
+  /** Override the derived status word (e.g. "Cancelled"). */
+  statusLabel?: string
   description?: string
   assignee?: string
   /** Fraction complete, 0–1. Defaults from status when omitted. */
   progress?: number
+  /** Interjected / urgent task — pink "!" marker in the header. */
+  urgent?: boolean
+  /** Show the edit action. */
+  editable?: boolean
+  /** An action is in flight — buttons disable. */
+  busy?: boolean
 }>(), {
   assignee: 'Nanna',
+  editable: true,
 })
 
 const emit = defineEmits<{
@@ -18,11 +27,11 @@ const emit = defineEmits<{
   delete: []
 }>()
 
-const statusLabel = computed(() => ({
+const statusLabel = computed(() => props.statusLabel ?? {
   'upcoming': 'Upcoming',
   'in-progress': 'In Progress',
   'complete': 'Complete',
-}[props.status]))
+}[props.status])
 
 const complete = computed(() => props.status === 'complete')
 
@@ -40,23 +49,27 @@ const progressValue = computed(() => {
     <div class="flex w-full flex-col gap-4 py-4 pl-4">
       <div class="flex w-full items-center gap-4">
         <div class="flex min-w-0 flex-1 items-center gap-2.5">
-          <p class="whitespace-nowrap text-sm font-semibold leading-normal">
+          <p class="min-w-0 truncate text-sm font-semibold leading-normal" :title="props.title">
             <span :class="complete ? 'text-nui-bg' : 'text-nui-fg'">{{ props.title }}</span>
             <span :class="complete ? 'text-nui-accent' : 'text-nui-muted'">{{ ' ' + statusLabel }}</span>
           </p>
+          <span v-if="props.urgent && !complete" class="shrink-0 text-sm font-semibold text-nui-pink" title="Interjected / urgent">!</span>
           <span class="min-w-0 flex-1" />
           <NuiIconButton
+            v-if="!complete"
             icon="circle-check"
             label="Mark complete"
             class="!p-0"
-            :class="complete ? 'text-nui-bg hover:text-nui-bg/70' : ''"
+            :disabled="props.busy"
             @click="emit('complete')"
           />
           <NuiIconButton
+            v-if="props.editable"
             icon="edit-task"
             label="Edit task"
             class="!p-0"
             :class="complete ? 'text-nui-bg hover:text-nui-bg/70' : ''"
+            :disabled="props.busy"
             @click="emit('edit')"
           />
           <NuiIconButton
@@ -64,10 +77,11 @@ const progressValue = computed(() => {
             label="Delete task"
             class="!p-0"
             :class="complete ? 'text-nui-bg hover:text-nui-bg/70' : ''"
+            :disabled="props.busy"
             @click="emit('delete')"
           />
         </div>
-        <p class="whitespace-nowrap text-xs font-semibold leading-normal">
+        <p class="shrink-0 whitespace-nowrap text-xs font-semibold leading-normal">
           <span :class="complete ? 'text-nui-bg' : 'text-nui-fg'">{{ complete ? 'Completed by' : 'Assigned to' }}</span>
           <span :class="complete ? 'text-nui-accent' : 'text-nui-muted'">{{ ' ' + props.assignee }}</span>
         </p>
@@ -79,6 +93,8 @@ const progressValue = computed(() => {
       >
         {{ props.description }}
       </p>
+      <!-- Subtasks or any extra rows the caller wants inside the card -->
+      <slot />
     </div>
     <NuiProgress :value="progressValue" />
   </div>

@@ -5,6 +5,8 @@ export interface NuiRailItem {
   id: string
   icon: NuiIconName
   label: string
+  /** Small pink counter over the icon (e.g. unread notifications). */
+  badge?: number
 }
 
 const props = defineProps<{
@@ -20,7 +22,10 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <nav class="flex w-24 shrink-0 flex-col items-center gap-4 overflow-clip pl-8 pr-4 pt-8 pb-4">
+  <!-- Scrolls (with a hidden scrollbar) rather than clipping: on a short
+       window the bottom items must stay reachable, not vanish under the
+       status bar. -->
+  <nav class="nui-rail flex w-24 shrink-0 flex-col items-center gap-4 overflow-y-auto overflow-x-clip pl-8 pr-4 pt-8 pb-4">
     <div class="pb-4">
       <NuiLogo :height="20" />
     </div>
@@ -30,6 +35,7 @@ const emit = defineEmits<{
       :icon="item.icon"
       :label="item.label"
       :active="item.id === props.activeId"
+      :badge="item.badge"
       @click="emit('select', item.id)"
     />
     <div class="flex-1" />
@@ -43,3 +49,12 @@ const emit = defineEmits<{
     />
   </nav>
 </template>
+
+<style scoped>
+.nui-rail {
+  scrollbar-width: none;
+}
+.nui-rail::-webkit-scrollbar {
+  display: none;
+}
+</style>

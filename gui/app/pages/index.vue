@@ -1,20 +1,16 @@
 <template>
-  <div class="flex flex-col h-full">
+  <div class="flex h-full min-h-0 flex-col">
     <!-- Empty state: no session selected -->
-    <div v-if="!currentSession" class="flex items-center justify-center h-full">
-      <div class="text-center max-w-md px-4">
-        <img src="/logo.svg" alt="Nanna" class="w-32 sm:w-40 mx-auto mb-6" />
-        <h2 class="text-lg font-semibold text-nanna-text mb-2">Start a new conversation</h2>
-        <p class="text-nanna-text-dim text-sm mb-6">
-          The moon awaits. Create a chat to begin.
-        </p>
+    <div v-if="!currentSession" class="flex h-full items-center justify-center">
+      <div class="flex max-w-md flex-col items-center gap-4 px-4 text-center">
+        <img src="/logo.svg" alt="Nanna" class="mx-auto w-40" />
+        <h2 class="text-sm font-semibold leading-normal text-nui-fg">Start a new conversation</h2>
+        <p class="text-xs leading-normal text-nui-muted">The moon awaits. Create a chat to begin.</p>
         <button
+          class="flex items-center gap-2 rounded-lg bg-nui-accent px-4 py-2 text-xs leading-normal text-nui-fg transition-opacity hover:opacity-90"
           @click="createNewChat"
-          class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-nanna-primary/20 text-nanna-primary hover:bg-nanna-primary/30 transition-colors text-sm font-medium"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-          </svg>
+          <NuiIcon name="add" :size="16" />
           New Chat
         </button>
       </div>
@@ -22,274 +18,225 @@
 
     <!-- Chat view: session selected -->
     <template v-else>
-    <!-- Chat header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4">
-      <div class="flex items-center justify-between gap-2">
-        <h2 class="text-base sm:text-lg font-semibold text-nanna-text truncate">
-          {{ currentSession?.name || 'New Chat' }}
-        </h2>
-        <div class="flex items-center gap-2">
-          <!-- Live context-window usage (updates on every LLM request) -->
-          <span
-            v-if="contextWindow > 0"
-            class="flex items-center gap-1.5 text-xs font-mono rounded-full px-2 py-0.5 glass-tag"
-            :class="contextPct >= 90 ? 'text-red-400' : contextPct >= 70 ? 'text-amber-400' : 'text-nanna-text-muted'"
-            :title="`Context window: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens in use`"
-          >
-            <span class="ctx-meter" aria-hidden="true">
-              <span class="ctx-meter-fill" :style="{ width: Math.min(100, contextPct) + '%' }"
-                :class="contextPct >= 90 ? 'bg-red-400' : contextPct >= 70 ? 'bg-amber-400' : 'bg-nanna-primary'" />
-            </span>
-            ctx {{ contextPct }}%
+      <!-- Chat header: title + live badges + model pin -->
+      <NuiChatHeader :title="currentSession?.name || 'New Chat'">
+        <!-- Live context-window usage (updates on every LLM request) -->
+        <span
+          v-if="contextWindow > 0"
+          class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs leading-normal"
+          :class="contextPct >= 90 ? 'text-nui-pink' : contextPct >= 70 ? 'text-nui-yellow' : 'text-nui-muted'"
+          :title="`Context window: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens in use`"
+        >
+          <span class="ctx-meter" aria-hidden="true">
+            <span
+              class="ctx-meter-fill"
+              :style="{ width: Math.min(100, contextPct) + '%' }"
+              :class="contextPct >= 90 ? 'bg-nui-pink' : contextPct >= 70 ? 'bg-nui-yellow' : 'bg-nui-accent'"
+            />
           </span>
-          <!-- Active work indicator -->
-          <SessionActivityBadge v-if="currentSession" :session-id="currentSession.id" />
-          <!-- Daemon-level queue depth (messages from other channels waiting) -->
-          <span
-            v-if="daemonQueueCount > 0"
-            class="flex items-center gap-1 text-xs text-nanna-text-muted glass-tag rounded-full px-2 py-0.5"
-            :title="`${daemonQueueCount} message${daemonQueueCount > 1 ? 's' : ''} queued at daemon`"
-          >
-            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-            </svg>
-            {{ daemonQueueCount }} queued
-          </span>
-          <!-- Which model THIS chat replies with, then the provider's health.
-               A pin supersedes only the global badge's NAME — that name comes
-               from the daemon's process-wide ModelSwitch event and would
-               confidently name a model this chat is not using. Fallback state
-               and the rate-limited count are process-wide facts that hold for
-               a pinned chat too, so the badge keeps reporting them. -->
-          <SessionModelPicker v-if="currentSession" :session-id="currentSession.id" />
-          <ModelStatusBadge :model-name-superseded="!!chatModel" />
-        </div>
-      </div>
-      <p class="text-xs text-nanna-text-dim mt-1">
-        <span v-if="config?.available_tools?.length">
-          {{ config.available_tools.length }} tools available
+          ctx {{ contextPct }}%
         </span>
-      </p>
-    </header>
+        <!-- Active work indicator -->
+        <SessionActivityBadge v-if="currentSession" :session-id="currentSession.id" class="shrink-0" />
+        <!-- Daemon-level queue depth (messages from other channels waiting) -->
+        <span
+          v-if="daemonQueueCount > 0"
+          class="flex shrink-0 items-center gap-1 whitespace-nowrap text-xs leading-normal text-nui-muted"
+          :title="`${daemonQueueCount} message${daemonQueueCount > 1 ? 's' : ''} queued at daemon`"
+        >
+          <NuiIcon name="dot" :size="16" />
+          {{ daemonQueueCount }} queued
+        </span>
+        <!-- Which model THIS chat replies with, then the provider's health.
+             A pin supersedes only the global badge's NAME — that name comes
+             from the daemon's process-wide ModelSwitch event and would
+             confidently name a model this chat is not using. Fallback state
+             and the rate-limited count are process-wide facts that hold for
+             a pinned chat too, so the badge keeps reporting them. -->
+        <SessionModelPicker v-if="currentSession" :session-id="currentSession.id" />
+        <ModelStatusBadge :model-name-superseded="!!chatModel" class="shrink-0" />
+      </NuiChatHeader>
 
-    <!-- Body: messages + input column, with the run's task checklist beside
-         it (the chat's live window into the task store — P19). -->
-    <div class="flex flex-1 min-h-0">
-    <div class="flex flex-col flex-1 min-w-0">
-    <!-- Messages area -->
-    <div ref="messagesContainer" @scroll="handleScroll" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
-      <ConnectionStatus
-        v-if="!isOnline"
-        status="offline"
-        :visible="true"
-        :can-retry="true"
-        :message="offlineDetail"
-        @retry="onReconnect"
-      />
-      <!-- Welcome message -->
-      <div v-if="messages.length === 0 && !hasActiveWork" class="flex items-center justify-center h-full">
-        <div class="text-center max-w-md px-4">
-          <img src="/logo.svg" alt="Nanna" class="w-32 sm:w-40 mx-auto mb-4" />
-          <p class="text-nanna-text-muted italic mb-2 text-sm sm:text-base">
-            Patron deity of Ur
-          </p>
-          <p class="text-nanna-text-dim text-xs sm:text-sm">
-            The moon is here. What would you illuminate?
-          </p>
-          <div v-if="config?.available_tools?.length" class="mt-6 text-xs text-nanna-text-dim opacity-60">
-            {{ config.available_tools.length }} tools await
-          </div>
-        </div>
-      </div>
-
-      <!-- Messages -->
-      <template v-for="(msg, idx) in messages" :key="msg.id || idx">
-        <!-- Chronological run timeline: thinking bursts, tool calls, text,
-             and healed faults rendered inline, in the order they happened. -->
-        <template v-if="msg.role === 'assistant' && msg.timeline?.length">
-          <div class="max-w-[1800px] mx-auto">
-            <div class="mx-4 sm:mx-12 my-2">
-              <RunTimeline :items="msg.timeline" />
-            </div>
-          </div>
-          <!-- Content bubble only when the timeline carries no text of its
-               own (older runs journaled before text capture existed). -->
-          <div v-if="!timelineHasText(msg.timeline) && hasSpokenText(msg.content)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-            <MessageBubble variant="assistant">
-              <div class="flex items-start gap-2 sm:gap-3">
-                <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
-                <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
-                <div class="flex-1 min-w-0">
-                  <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-                  <MarkdownContent :content="stripHarnessMarkers(msg.content)" />
-                </div>
-              </div>
-            </MessageBubble>
-          </div>
-          <!-- Run benchmark: tokens + time for this run -->
-          <div v-if="msg.usage" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-            <div class="mx-4 sm:mx-12 mt-1 text-[10px] font-mono text-nanna-text-dim opacity-70">
-              {{ formatRunUsage(msg.usage) }}
-            </div>
-          </div>
-        </template>
-
-        <!-- Legacy layout for messages without a journal -->
-        <template v-else>
-          <!-- Thinking block rendered as its own card (before tools and
-               response). Gated like every other card: a burst that is only
-               whitespace has nothing to show. -->
-          <div v-if="msg.role === 'assistant' && hasRenderableText(msg.reasoning)" class="max-w-[1800px] mx-auto">
-            <div class="mx-4 sm:mx-12 my-2">
-              <ThinkingCard :content="msg.reasoning ?? ''" />
-            </div>
-          </div>
-
-          <!-- Tool calls rendered BEFORE the assistant response (between user msg and response) -->
-          <div v-if="msg.role === 'assistant' && msg.tool_calls?.length" class="max-w-[1800px] mx-auto">
-            <div class="space-y-1 mx-4 sm:mx-12 my-2">
-              <ToolCallCard
-                v-for="tool in msg.tool_calls"
-                :key="tool.id"
-                :tool-call="tool"
-                :status="toolCardStatus(tool)"
+      <!-- Body: messages column beside the task pane (the chat's live window
+           into the task store — P19). -->
+      <div class="flex min-h-0 w-full flex-1 items-start gap-4">
+        <div class="flex min-h-0 min-w-0 flex-1 flex-col self-stretch">
+          <!-- Messages area -->
+          <div
+            ref="messagesContainer"
+            class="nui-scroll flex min-h-0 flex-1 flex-col gap-8 overflow-y-auto py-2"
+            @scroll="handleScroll"
+          >
+            <div class="px-8 empty:hidden">
+              <ConnectionStatus
+                v-if="!isOnline"
+                status="offline"
+                :visible="true"
+                :can-retry="true"
+                :message="offlineDetail"
+                @retry="onReconnect"
               />
             </div>
-          </div>
 
-          <!-- Message bubble — text only; a turn that just acted has none. -->
-          <div
-            v-if="msg.role === 'user' || hasSpokenText(msg.content)"
-            class="max-w-[1800px] mx-auto"
-            :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'"
-          >
-            <MessageBubble :variant="msg.role">
-              <div class="flex items-start gap-2 sm:gap-3">
-                <UiAvatar
-                  :variant="msg.role === 'user' ? 'primary' : 'accent'"
-                  :fallback="msg.role === 'user' ? 'U' : '☽'"
-                  size="sm"
-                  class="flex-shrink-0 sm:hidden"
-                />
-                <UiAvatar
-                  :variant="msg.role === 'user' ? 'primary' : 'accent'"
-                  :fallback="msg.role === 'user' ? 'U' : '☽'"
-                  class="flex-shrink-0 hidden sm:flex"
-                />
-                <div class="flex-1 min-w-0">
-                  <div class="text-xs text-nanna-text-dim mb-1">
-                    {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
-                  </div>
-                  <MarkdownContent :content="msg.role === 'assistant' ? stripHarnessMarkers(msg.content) : msg.content" />
+            <!-- Welcome message -->
+            <div v-if="messages.length === 0 && !hasActiveWork" class="flex h-full items-center justify-center">
+              <div class="flex max-w-md flex-col items-center gap-2 px-4 text-center">
+                <img src="/logo.svg" alt="Nanna" class="mx-auto mb-2 w-40" />
+                <p class="text-xs italic leading-normal text-nui-muted">Patron deity of Ur</p>
+                <p class="text-xs leading-normal text-nui-muted">The moon is here. What would you illuminate?</p>
+                <div v-if="config?.available_tools?.length" class="mt-4 text-xs leading-normal text-nui-muted opacity-70">
+                  {{ config.available_tools.length }} tools await
                 </div>
               </div>
-            </MessageBubble>
-          </div>
-          <!-- Run benchmark: tokens + time for this run -->
-          <div v-if="msg.role === 'assistant' && msg.usage" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-            <div class="mx-4 sm:mx-12 mt-1 text-[10px] font-mono text-nanna-text-dim opacity-70">
-              {{ formatRunUsage(msg.usage) }}
             </div>
-          </div>
-        </template>
-      </template>
 
-      <!-- Live chronological journal: thinking and tool calls interleaved as
-           they happen. The current thinking burst is the last block — always
-           just above the streaming response. -->
-      <div v-if="liveTimeline.length > 0" class="max-w-[1800px] mx-auto">
-        <div class="mx-4 sm:mx-12 my-2">
-          <RunTimeline :items="liveTimeline" :is-live="true" />
-        </div>
-      </div>
+            <!-- Messages -->
+            <template v-for="(msg, idx) in messages" :key="msg.id || idx">
+              <!-- Chronological run timeline: thinking bursts, tool calls, text,
+                   and healed faults rendered inline, in the order they happened. -->
+              <template v-if="msg.role === 'assistant' && msg.timeline?.length">
+                <RunTimeline :items="msg.timeline" />
+                <!-- Content bubble only when the timeline carries no text of its
+                     own (older runs journaled before text capture existed). -->
+                <NuiMessage
+                  v-if="!timelineHasText(msg.timeline) && hasSpokenText(msg.content)"
+                  role="assistant"
+                >
+                  <MarkdownContent :content="stripHarnessMarkers(msg.content)" />
+                </NuiMessage>
+                <!-- Run benchmark: tokens + time for this run -->
+                <div v-if="msg.usage" class="w-full pl-32 pr-24">
+                  <p class="text-xs leading-normal text-nui-muted opacity-80">{{ formatRunUsage(msg.usage) }}</p>
+                </div>
+              </template>
 
-      <!-- Legacy live blocks (only when no journal exists — e.g. daemon
-           predating the timeline) -->
-      <template v-else>
-        <!-- Live thinking card during streaming -->
-        <div v-if="hasLiveThinking" class="max-w-[1800px] mx-auto">
-          <div class="mx-4 sm:mx-12 my-2">
-            <ThinkingCard :content="streamingThinking" :is-active="isStreaming" />
-          </div>
-        </div>
+              <!-- Legacy layout for messages without a journal -->
+              <template v-else>
+                <!-- Thinking block rendered as its own card (before tools and
+                     response). Gated like every other card: a burst that is only
+                     whitespace has nothing to show. -->
+                <NuiThinkingMessage
+                  v-if="msg.role === 'assistant' && hasRenderableText(msg.reasoning)"
+                  :content="msg.reasoning ?? ''"
+                />
 
-        <!-- Active tool calls during streaming -->
-        <div v-if="activeToolCalls.length > 0" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-          <div class="space-y-2">
-            <ToolCallCard
-              v-for="tool in activeToolCalls"
-              :key="tool.id"
-              :tool-call="tool"
-              :status="tool.status === 'started' ? 'started' : toolCardStatus(tool)"
-            />
-          </div>
-        </div>
-      </template>
+                <!-- Tool calls rendered BEFORE the assistant response -->
+                <template v-if="msg.role === 'assistant' && msg.tool_calls?.length">
+                  <NuiToolCallMessage
+                    v-for="tool in msg.tool_calls"
+                    :key="tool.id"
+                    :tool-call="tool"
+                    :status="toolCardStatus(tool)"
+                  />
+                </template>
 
-      <!-- Streaming indicator. With a live journal, this bubble shows ONLY
-           the trailing open text segment — earlier text lives in the
-           timeline where it happened, so nothing renders twice. When the
-           journal's tail is a tool/thinking item there is no open text, so
-           the bubble hides entirely rather than sit hollow — and a tail
-           that is only harness markers or whitespace counts as no text. -->
-      <div v-if="isStreaming && (liveBubbleHasText || !liveTimeline.length)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-        <MessageBubble variant="assistant">
-          <div class="flex items-start gap-2 sm:gap-3">
-            <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
-            <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
-            <div class="flex-1">
-              <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-              <div v-if="liveBubbleHasText" class="prose prose-invert prose-sm max-w-none">
+                <!-- Message bubble — text only; a turn that just acted has none. -->
+                <NuiMessage
+                  v-if="msg.role === 'user' || hasSpokenText(msg.content)"
+                  :role="msg.role"
+                >
+                  <MarkdownContent :content="msg.role === 'assistant' ? stripHarnessMarkers(msg.content) : msg.content" />
+                </NuiMessage>
+                <!-- Run benchmark: tokens + time for this run -->
+                <div v-if="msg.role === 'assistant' && msg.usage" class="w-full pl-32 pr-24">
+                  <p class="text-xs leading-normal text-nui-muted opacity-80">{{ formatRunUsage(msg.usage) }}</p>
+                </div>
+              </template>
+            </template>
+
+            <!-- Live chronological journal: thinking and tool calls interleaved as
+                 they happen. The current thinking burst is the last block — always
+                 just above the streaming response. -->
+            <RunTimeline v-if="liveTimeline.length > 0" :items="liveTimeline" :is-live="true" />
+
+            <!-- Legacy live blocks (only when no journal exists — e.g. daemon
+                 predating the timeline) -->
+            <template v-else>
+              <!-- Live thinking card during streaming -->
+              <NuiThinkingMessage
+                v-if="hasLiveThinking"
+                :content="streamingThinking"
+                :active="isStreaming"
+                default-expanded
+              />
+
+              <!-- Active tool calls during streaming -->
+              <template v-if="activeToolCalls.length > 0">
+                <NuiToolCallMessage
+                  v-for="tool in activeToolCalls"
+                  :key="tool.id"
+                  :tool-call="tool"
+                  :status="tool.status === 'started' ? 'started' : toolCardStatus(tool)"
+                />
+              </template>
+            </template>
+
+            <!-- Streaming indicator. With a live journal, this bubble shows ONLY
+                 the trailing open text segment — earlier text lives in the
+                 timeline where it happened, so nothing renders twice. When the
+                 journal's tail is a tool/thinking item there is no open text, so
+                 the bubble hides entirely rather than sit hollow — and a tail
+                 that is only harness markers or whitespace counts as no text. -->
+            <NuiMessage v-if="isStreaming && (liveBubbleHasText || !liveTimeline.length)" role="assistant">
+              <div v-if="liveBubbleHasText" class="w-full">
                 <MarkdownContent :content="stripHarnessMarkers(liveBubbleContent)" />
-                <span class="cursor-blink inline-block ml-0.5">▋</span>
+                <span class="cursor-blink ml-0.5 inline-block text-xs text-nui-fg">▋</span>
               </div>
-              <div v-else-if="!hasLiveThinking && !liveTimeline.length" class="text-nanna-text-muted flex items-center gap-2">
+              <div v-else-if="!hasLiveThinking && !liveTimeline.length" class="flex items-center gap-2 text-xs text-nui-muted">
                 <span class="animate-pulse">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
               </div>
+            </NuiMessage>
+
+            <!-- Loading indicator (before streaming starts) -->
+            <NuiMessage v-if="isLoading && !isStreaming && activeToolCalls.length === 0" role="assistant">
+              <div class="flex items-center gap-2 text-xs text-nui-muted">
+                <span class="animate-pulse">●</span>
+                <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
+                <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
+              </div>
+            </NuiMessage>
+
+            <!-- Message queue indicator -->
+            <div v-if="hasQueuedMessages" class="px-8">
+              <QueueIndicator
+                :count="queueCount"
+                :messages="messageQueue"
+                @clear="clearQueue"
+                @remove="removeFromQueue"
+              />
+            </div>
+
+            <!-- Error message -->
+            <div class="px-8 empty:hidden">
+              <ConnectionStatus
+                :status="connectionError ? 'error' : 'connected'"
+                :message="connectionError ?? undefined"
+                :visible="!!connectionError"
+                :can-retry="true"
+                :can-dismiss="true"
+                :is-retrying="isRetrying"
+                @retry="retryLastMessage"
+                @dismiss="dismissError"
+              />
             </div>
           </div>
-        </MessageBubble>
-      </div>
+        </div>
 
-      <!-- Loading indicator (before streaming starts) -->
-      <div v-if="isLoading && !isStreaming && activeToolCalls.length === 0" class="max-w-[1800px] mx-auto">
-        <MessageSkeleton :lines="2" />
-      </div>
-
-      <!-- Message queue indicator -->
-      <div v-if="hasQueuedMessages" class="max-w-[1800px] mx-auto">
-        <QueueIndicator
-          :count="queueCount"
-          :messages="messageQueue"
-          @clear="clearQueue"
-          @remove="removeFromQueue"
+        <!-- Task pane + action rail (renders the rail always, cards when the
+             session has tasks) -->
+        <TaskChecklist
+          v-if="currentSession"
+          :session-id="currentSession.id"
         />
       </div>
 
-      <!-- Error message -->
-      <ConnectionStatus
-        :status="connectionError ? 'error' : 'connected'"
-        :message="connectionError ?? undefined"
-        :visible="!!connectionError"
-        :can-retry="true"
-        :can-dismiss="true"
-        :is-retrying="isRetrying"
-        @retry="retryLastMessage"
-        @dismiss="dismissError"
-      />
-    </div>
-
-    <!-- Input area -->
-    <div class="p-3 sm:p-4">
-      <div class="max-w-[1800px] mx-auto">
+      <!-- Input area -->
+      <div class="w-full shrink-0 px-32 py-2">
         <!-- Queue mode indicator -->
-        <div v-if="hasActiveWork && input.trim()" class="mb-2 text-xs text-nanna-primary flex items-center gap-1">
-          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-          </svg>
+        <div v-if="hasActiveWork && input.trim()" class="mb-2 flex items-center gap-1 text-xs leading-normal text-nui-accent">
+          <NuiIcon name="dot" :size="16" />
           Press Enter to queue this message
         </div>
         <ChatInput
@@ -302,16 +249,6 @@
           @stop="stopSession"
         />
       </div>
-    </div>
-    </div>
-
-    <!-- Task checklist sidebar (renders only when the session has tasks) -->
-    <TaskChecklist
-      v-if="currentSession"
-      :session-id="currentSession.id"
-      class="hidden lg:flex"
-    />
-    </div>
     </template>
   </div>
 </template>
@@ -1287,17 +1224,12 @@ function scrollToBottom(force = false) {
   display: inline-block;
   width: 34px;
   height: 4px;
-  border-radius: 2px;
-  /* Recessed glass track — matches the glass-well tier at meter scale. */
-  background: rgba(2, 6, 23, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.25);
+  border: 1px solid color-mix(in srgb, var(--color-nui-muted) 40%, transparent);
   overflow: hidden;
 }
 .ctx-meter-fill {
   display: block;
   height: 100%;
-  border-radius: 2px;
   transition: width 0.4s ease;
 }
 </style>

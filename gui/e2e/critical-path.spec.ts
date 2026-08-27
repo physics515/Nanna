@@ -58,18 +58,16 @@ test.describe('critical path', () => {
     await mock.gotoWithMock('/')
     await openChatSession(page)
 
-    // Open the chat side panel (activity-bar Chats toggle) so New Chat is reachable.
-    const chatsToggle = page
-      .getByRole('button', { name: /^chats$/i })
-      .or(page.getByTitle(/^chats$/i))
-      .first()
-    await chatsToggle.click()
-    await page.waitForTimeout(200)
-
+    // The chat panel opens by default on the chat route; the rail's Chats
+    // item toggles it, so only click the toggle when the panel is closed.
     const newChat = page
       .getByTitle(/new chat/i)
       .or(page.getByRole('button', { name: /new chat/i }))
       .first()
+    if (!(await newChat.isVisible().catch(() => false))) {
+      await page.getByRole('button', { name: /^chats$/i }).first().click()
+      await page.waitForTimeout(200)
+    }
     await expect(newChat).toBeVisible({ timeout: 10_000 })
     await newChat.click()
     await page.waitForTimeout(400)

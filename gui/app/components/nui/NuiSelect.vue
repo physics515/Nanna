@@ -13,6 +13,8 @@ const props = withDefaults(defineProps<{
   modelValue?: string
   options: Option[]
   placeholder?: string
+  /** Accessible name for the underlying select control. */
+  label?: string
   /** Optional leading glyph (e.g. 'workspaces' on the workspace picker). */
   icon?: NuiIconName
   /** 'attached' squares off the top corners — the pill hangs from the edge above it. */
@@ -49,6 +51,7 @@ const selectedLabel = computed(() =>
     <select
       :value="props.modelValue"
       :disabled="props.disabled"
+      :aria-label="props.label ?? selectedLabel"
       class="absolute inset-0 h-full w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
       @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)"
     >
