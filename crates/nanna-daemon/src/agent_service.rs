@@ -59,7 +59,7 @@ struct SessionQueue {
 pub struct AgentServiceConfig {
     /// Default model to use
     pub model: String,
-    /// Model priority list for fallback (e.g., ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"])
+    /// Model priority list for fallback (e.g., ["claude-opus-5", "claude-sonnet-5"])
     pub model_priority: Vec<String>,
     /// Maximum tokens per response
     pub max_tokens: u32,

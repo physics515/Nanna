@@ -1241,7 +1241,7 @@ pub struct CompletionRequest {
 impl Default for CompletionRequest {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             messages: Vec::new(),
             anthropic_messages: Vec::new(),
             max_tokens: Some(4096),

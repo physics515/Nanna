@@ -432,7 +432,7 @@ pub struct AgentConfig {
     /// When enabled, the agent classifies each iteration's complexity and routes
     /// to the cheapest model capable of handling it.
     /// Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
     pub model_routing: Vec<ModelTier>,
     /// Whether to always use the primary model for the first iteration
     /// (user-facing response quality). Default: true.
@@ -492,7 +492,7 @@ pub enum TaskComplexity {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: None,

@@ -1460,6 +1460,43 @@ Open: swarm execution view in GUI (CriticalPathMetrics tracked but not visualize
 ### P6 — Production Hardening 🚧 (partial)
 Done: outbound rate limiting (per-provider token buckets), error recovery / exponential backoff with
 jitter, priority message queue, graceful 429 handling, health endpoint, PID file. Open:
+- [x] **The shipped default model was a retired snapshot** *(found by a real daemon boot,
+      2026-08-27)* — every unconfigured install sent its scheduled heartbeat to a `404
+      not_found_error`, and nothing said so above `WARN`. Found the only way it could be: the
+      nightly's smoke run booted the freshly built **release** daemon against a scratch config
+      (`NANNA_CONFIG_PATH` + `--data-dir`) and the log carried
+      `Model claude-sonnet-4-20250514 failed: API error: 404`. No unit test could have caught
+      it — the id is only wrong *outside* the process.
+      **Why it was wrong is the general lesson, not the specific id.** Anthropic publishes two
+      shapes: an undated family alias (`claude-sonnet-5`) that tracks the live model, and a
+      **dated snapshot** (`claude-sonnet-4-20250514`) pinned to one release and retired on a
+      schedule. A dated default ships with an expiry date. Pinning a snapshot is a legitimate
+      choice for a *user* to make in their own config; it is not a legitimate *default*.
+      Six production defaults carried the retired id — `nanna-config` (`LlmConfig`),
+      `nanna-core` (`default_model`, `summarization_model`), `nanna-agent` (`AgentConfig`),
+      `nanna-llm` (`CompletionRequest`), `nanna-server` (`AppState`) — all moved to
+      `claude-sonnet-5`, the same-tier live alias. **No contract work was needed**:
+      `anthropic_model_contract` already classifies `sonnet-5` as current-generation (adaptive
+      thinking, sampling removed), so the new default lands on a path with tests behind it.
+      Four doc examples that taught the dated shape were updated too; the tests that
+      *deliberately* exercise legacy dated ids (`a_legacy_anthropic_request_carries_a_budget…`,
+      the contract-classification fixtures) were left alone — they are the regression cover for
+      dated ids still resolving correctly when a user pins one.
+      Guarded so it cannot come back: `the_default_model_is_not_a_dated_snapshot` asserts the
+      shipped default carries no `-YYYYMMDD` suffix, with a dependency-free detector and its own
+      test for both shapes (including the negative space — `claude-opus-4-1` and `ollama/qwen3:14b`
+      must not trip it). Verified it catches the real regression by reverting the id.
+      **Proven live, not argued** — the fix was verified the same way the bug was found: rebuild
+      the release daemon, boot it against a scratch config, and diff the log against the
+      pre-fix one. Before: `3 ×` `API error: 404`, `2 ×` "All models exhausted", heartbeat dead.
+      After: **0 and 0**, `0` ERROR lines, and a completed run —
+      `RUN SUMMARY model=claude-sonnet-5 duration_s=5 input_tokens=4 output_tokens=197
+      tool_calls=2 faults_healed=0`.
+      - [ ] **Not fixed here: a failing heartbeat is only a `WARN`.** The 404 repeated every
+            scheduled cycle and the daemon reported itself healthy throughout. A model that fails
+            on *every* attempt is a configuration fault, not a transient one, and deserves to
+            surface (health endpoint degradation, or a once-per-boot loud notice) rather than
+            scroll past. Needs a decision on where operator-visible faults belong.
 - [ ] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.

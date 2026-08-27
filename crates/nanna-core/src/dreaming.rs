@@ -45,7 +45,7 @@ impl Default for DreamingRuntimeConfig {
     fn default() -> Self {
         Self {
             dreaming: DreamingConfig::default(),
-            summarization_model: "claude-sonnet-4-20250514".to_string(),
+            summarization_model: "claude-sonnet-5".to_string(),
             auto_start: true,
         }
     }
