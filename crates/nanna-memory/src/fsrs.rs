@@ -10,8 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// FSRS-6 parameters (21 parameters optimized on 700M+ reviews)
-/// These are the default parameters from FSRS-6
+/// The 21 FSRS weights, in FSRS-6's slot order.
+///
+/// [`Default`] is **not** FSRS-6's published weight table — only `w20` is (see
+/// its field doc). The rest are FSRS-5 values with six slots zeroed, and only
+/// `w6..=w12` and `w20` are read at all. Adopting the published table for the
+/// others is an open decision (ROADMAP P13), not an oversight: Nanna's
+/// stability update is not FSRS's, so transcribing its constants into a
+/// differently-shaped formula would be cargo-culting, not correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsrsParameters {
     /// Initial stability for first review (w0-w3 for different ratings)
@@ -41,22 +47,54 @@ pub struct FsrsParameters {
     pub w17: f32, // Long-term stability factor
     pub w18: f32, // Forgetting curve decay
     pub w19: f32, // Reserved
-    /// Forgetting-curve decay exponent.
+    /// Forgetting-curve decay exponent — the only weight in this struct that
+    /// feeds a formula shaped exactly like FSRS's own, so it is the only one
+    /// whose published default transfers directly.
     ///
-    /// Defaults to FSRS-6's `0.0658`. This was previously `0.5` — FSRS-4.5/5's
-    /// hardcoded `DECAY` — mistakenly paired with the FSRS-6 curve, which decayed
-    /// retrievability ~7.6x too fast and made aged-but-valid memories fall below
-    /// the recall weight gate and vanish. The flip was gated on the retention
-    /// harness ([`crate::retention`]): its `w20` experiment showed a 800-day-aged
-    /// corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`. Making this
-    /// exponent *trainable* (fit `w0..=w20` from access history) is the eventual
-    /// FSRS-6 goal — see ROADMAP P13.
+    /// Defaults to [`FSRS6_DEFAULT_DECAY`] (`0.1542`).
+    ///
+    /// Two corrections are folded into that number, in order:
+    /// 1. It was `0.5` — FSRS-4.5/5's hardcoded `DECAY` — paired with the
+    ///    FSRS-6 curve, which decayed retrievability far too fast and made
+    ///    aged-but-valid memories fall below the recall weight gate and vanish.
+    /// 2. The fix for (1) took `0.0658`, which is **`w[19]` of the FSRS-6
+    ///    parameter vector, not `w[20]`** — an off-by-one into the published
+    ///    array. `fsrs-rs` names the real value `FSRS6_DEFAULT_DECAY = 0.1542`
+    ///    and clamps this parameter to [`DECAY_MIN`]`..=`[`DECAY_MAX`]
+    ///    (`0.1..=0.8`), a range `0.0658` sits **below** — so the optimizer
+    ///    could never have produced it.
+    ///
+    /// Both flips are gated on the retention harness ([`crate::retention`]);
+    /// its `w20` experiment measures aged recall at all three exponents so the
+    /// correction is shown not to reintroduce (1). Making this exponent
+    /// *trainable* (fit from access history) is the eventual goal — ROADMAP P13.
     pub w20: f32,
 }
 
+/// FSRS-6's published forgetting-curve decay, matching `fsrs-rs`'s
+/// `FSRS6_DEFAULT_DECAY` — the last element of its 21-value `DEFAULT_PARAMETERS`.
+pub const FSRS6_DEFAULT_DECAY: f32 = 0.1542;
+
+/// FSRS-5's hardcoded decay, kept named so the comparison in
+/// [`crate::retention`] reads as the documented constant it is rather than a
+/// magic number.
+pub const FSRS5_DEFAULT_DECAY: f32 = 0.5;
+
+/// Lower clamp `fsrs-rs`'s optimizer applies to the decay exponent. A default
+/// outside this range cannot be a fitted FSRS parameter.
+pub const DECAY_MIN: f32 = 0.1;
+
+/// Upper clamp `fsrs-rs`'s optimizer applies to the decay exponent.
+pub const DECAY_MAX: f32 = 0.8;
+
 impl Default for FsrsParameters {
     fn default() -> Self {
-        // Default FSRS-6 parameters
+        // NOT the FSRS-6 weight table, despite the module heading — `w0..w18`
+        // are FSRS-5 values and six entries are zeroed, matching neither
+        // published table. Left as-is on purpose: only `w20` feeds a formula
+        // shaped like FSRS's own, so only `w20`'s published default transfers
+        // without an A/B on the retention harness. Adopting the rest is its
+        // own decision, open in ROADMAP P13.
         Self {
             w0: 0.4072,
             w1: 1.1829,
@@ -78,8 +116,10 @@ impl Default for FsrsParameters {
             w17: 0.0,
             w18: 0.0,
             w19: 0.0,
-            // FSRS-6 default decay exponent (was 0.5, the FSRS-5 constant) — see the field doc.
-            w20: 0.0658,
+            // FSRS-6's published decay. Was 0.5 (the FSRS-5 constant), then
+            // 0.0658 (w[19] of the FSRS-6 vector, read one slot short) — see
+            // the field doc for both corrections.
+            w20: FSRS6_DEFAULT_DECAY,
         }
     }
 }
@@ -404,5 +444,85 @@ mod tests {
         assert_eq!(IngestAction::from_similarity(0.95), IngestAction::Reinforce);
         assert_eq!(IngestAction::from_similarity(0.85), IngestAction::Update);
         assert_eq!(IngestAction::from_similarity(0.5), IngestAction::Create);
+    }
+
+    /// The default decay must be a value the reference optimizer could have
+    /// produced. This is the check that would have caught reading `w[19]`
+    /// (`0.0658`) as `w[20]`: it is below `fsrs-rs`'s clamp floor, so no fitted
+    /// FSRS-6 parameter set can contain it in that slot.
+    #[test]
+    fn default_decay_is_inside_the_reference_clamp_range() {
+        let default_decay = FsrsParameters::default().w20;
+        assert_eq!(default_decay, FSRS6_DEFAULT_DECAY);
+        assert!(
+            default_decay >= DECAY_MIN,
+            "decay {default_decay} is below the optimizer's floor {DECAY_MIN} — \
+             a value this small is not a fitted FSRS parameter"
+        );
+        assert!(
+            default_decay <= DECAY_MAX,
+            "decay {default_decay} is above the optimizer's ceiling {DECAY_MAX}"
+        );
+        // Negative space: the two values this default has wrongly held are
+        // exactly the ones the range rejects and accepts-but-is-not.
+        assert!(
+            0.0658_f32 < DECAY_MIN,
+            "the w[19] misread must be out of range"
+        );
+        assert!(
+            FSRS5_DEFAULT_DECAY <= DECAY_MAX,
+            "FSRS-5's decay is in range, just wrong for FSRS-6"
+        );
+        assert!(FSRS5_DEFAULT_DECAY != FSRS6_DEFAULT_DECAY);
+    }
+
+    /// The curve is anchored: whatever the exponent, retrievability is 0.9 at
+    /// `t == S`. That is the definition of stability, and it is what makes the
+    /// `factor = 0.9^(-1/decay) - 1` term correct rather than a fudge — so a
+    /// decay change moves the *tail*, never the anchor.
+    #[test]
+    fn every_decay_keeps_the_ninety_percent_anchor_at_one_stability() {
+        for decay in [
+            FSRS5_DEFAULT_DECAY,
+            FSRS6_DEFAULT_DECAY,
+            DECAY_MIN,
+            DECAY_MAX,
+        ] {
+            let r = power_law_retrievability(10.0, 10.0, decay);
+            assert!(
+                (r - 0.9).abs() < 1e-3,
+                "decay {decay} broke the anchor: R(t=S) = {r}, expected 0.9"
+            );
+        }
+    }
+
+    /// A smaller exponent is a flatter tail. Stated as an ordering rather than
+    /// as fixed numbers so it documents the *property* the decay controls.
+    #[test]
+    fn smaller_decay_retains_aged_memories_longer() {
+        // 800 days at 1-day stability — the retention harness's aged corpus.
+        let aged = |decay: f32| power_law_retrievability(800.0, 1.0, decay);
+        let fsrs5 = aged(FSRS5_DEFAULT_DECAY);
+        let fsrs6 = aged(FSRS6_DEFAULT_DECAY);
+        let misread = aged(0.0658);
+        assert!(
+            fsrs5 < fsrs6,
+            "FSRS-5's 0.5 must decay faster: {fsrs5} vs {fsrs6}"
+        );
+        assert!(
+            fsrs6 < misread,
+            "the w[19] misread was flatter still: {fsrs6} vs {misread}"
+        );
+        // The correction must not undo what the first flip bought: the default
+        // recall gate is `min_weight = 0.1`, and FSRS-6's exponent clears it at
+        // this age while FSRS-5's does not.
+        assert!(
+            fsrs5 < 0.1,
+            "FSRS-5's decay drops an 800-day memory below the gate: {fsrs5}"
+        );
+        assert!(
+            fsrs6 > 0.1,
+            "FSRS-6's decay must keep it retrievable: {fsrs6}"
+        );
     }
 }

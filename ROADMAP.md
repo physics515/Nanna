@@ -2214,15 +2214,28 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+            - [ ] *(research 2026-08-27)* **Do not reach for DiskANN here — check what the graph is
+                  keyed to before adopting it.** The "Turso brings native vector search" material
+                  points at DiskANN, and pure-Rust ports now exist
+                  ([infinilabs/diskann](https://github.com/infinilabs/diskann), which extends
+                  Microsoft's partial Rust port with the missing disk-query path; also `diskann-rs`,
+                  `rust-diskann`). But DiskANN's premise is a corpus too large for RAM, which is the
+                  opposite of the measured situation above (~10ms full SIMD scan at 100k), and the
+                  `libsql_vector_idx` DiskANN belongs to the **libSQL fork**, not the pinned `turso`
+                  crate — so adopting it means a second on-disk structure beside the f32 BLOBs, which
+                  is exactly the mirroring `hnswlib-rs` was shortlisted for avoiding. Record the
+                  option, keep the shortlist as-is.
             - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
                   saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
                   parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
                   7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
                   0.8334, ...`), and six of them — `w13, w14, w15, w17, w18, w19` — are **zeroed**,
                   which matches neither table (FSRS-5's are all non-zero).
-                  **`w20 = 0.0658` is NOT in question and must not be "corrected" by this item:** it
-                  is already justified in-tree by a retention-harness experiment (an 800-day-aged
-                  corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`).
+                  **`w20` WAS in question after all, and is now settled** *(2026-08-27, see the
+                  ticked item below)*: the wiki's index inconsistency this note flagged resolved
+                  against `fsrs-rs` in favour of **`w20 = 0.1542`**, so `0.0658` was `w[19]` read one
+                  slot short. The rest of this item — the `w0..w18` table and the six zeroed entries
+                  — stands unchanged and is still not to be touched blind.
                   Not changed blind, because every weight feeds the decay of every stored memory and
                   the zeroed entries may well be deliberate — the short-term/same-day terms have no
                   meaning for a store whose "reviews" are recalls rather than study sessions. What is
@@ -2443,7 +2456,9 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
       - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
-            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17), the eventual "learn the
+            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17, corrected off-by-one
+            2026-08-27 — `fsrs-rs`'s own source is what settled it, which is a second reason to take the
+            crate rather than transcribe from a wiki), the eventual "learn the
             params from history" step has a ready tool: `fsrs-rs` (6.6.x, 2026-06) exposes
             `FSRS::compute_parameters(ComputeParametersInput) -> Result<Parameters>`, fed a `Vec<FSRSItem>` where
             each `FSRSItem` is a review vector of `FSRSReview { rating, delta_t }`. Our `FsrsState.access_count` +
@@ -2493,6 +2508,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             age past a year and hold uniform importance to reach a compressible band; still 60→6, recall 1.0→1.0).
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
+      - [x] *(2026-08-27)* **Corrected again — `w20` is `0.1542`, not `0.0658`. The 2026-07-17 flip fixed
+            the right bug with the wrong number.** The 2026-08-26 research note above spotted that the
+            upstream wiki contradicts itself about the decay's INDEX and said to settle it against source
+            before touching anything; settled here. `fsrs-rs` `src/inference.rs` defines
+            `FSRS6_DEFAULT_DECAY = 0.1542` and a 21-value `DEFAULT_PARAMETERS` ending
+            `…, 0.0912, 0.0658, 0.1542` — so **`0.0658` is `w[19]`**, and the flip read one slot short.
+            The decisive corroboration is `src/parameter_clipper.rs`: the optimizer **clamps this
+            parameter to `0.1..=0.8`**, a range `0.0658` sits *below*, so no fitted FSRS-6 parameter set
+            can contain it in that slot. (`FSRS5_DEFAULT_DECAY = 0.5` is also named there, confirming the
+            2026-07-17 diagnosis of the original constant.)
+            **The correction must not undo what the first flip bought**, so it is gated the same way:
+            `w20_experiment_aged_recall` is now a three-way over one corpus and one probe set —
+            `0.5` (loses aged recall), `0.1542` (full), `0.0658` (full) — asserting the corrected default
+            recalls *exactly* as much as the misread one, not merely "enough". Napkin math for why that
+            holds: at 800 days / `stability = 1` / `importance = 1`, `R` is `0.073` at `0.5`,
+            `0.358` at `0.1542` and `0.588` at `0.0658`, against a `min_weight` gate of `0.1` — the
+            FSRS-5 constant is the only one that falls through it, and by a wide margin (the power-law
+            tail is flat enough that `0.1542` would not reach the gate for millennia). What actually
+            differs between `0.1542` and `0.0658` is the *consolidation band* an aged memory lands in,
+            which is why fidelity to the published curve is the whole justification for the number.
+            Named constants replace the magic values (`FSRS6_DEFAULT_DECAY`, `FSRS5_DEFAULT_DECAY`,
+            `DECAY_MIN`, `DECAY_MAX`) and a new invariant test asserts the default sits inside the
+            reference clamp range — the check that would have caught the off-by-one the first time.
+            Two more tests pin the properties a decay change must preserve: the `R(t=S) = 0.9` anchor
+            holds at every exponent (so a change moves the tail, never the anchor), and the ordering
+            `0.5 < 0.1542 < 0.0658` in aged retrievability is stated as a property rather than as
+            frozen numbers. **162 nanna-memory tests green**, including the consolidation test
+            (`dreaming_shrinks_store_while_holding_recall`) that had to be re-baselined the last time
+            this constant moved — it needed no re-baselining this time, which is itself evidence the
+            correction is small where the first flip was large.
 - [~] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
       *(2026-07-23)* **Model-selection + fallback half shipped.** The two dream paths disagreed: the IPC
       `MemoryAction::Consolidate` already walked the whole `summarization_priority` with failover, while the

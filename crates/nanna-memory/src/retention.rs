@@ -17,7 +17,7 @@
 //! importance) lands in a *compressible* band; `w20` is the forgetting-curve decay
 //! exponent, so it directly moves where an aged memory lands. The same aged corpus
 //! consolidates differently under `w20 = 0.5` (the lagging FSRS-5 constant we ship)
-//! versus `w20 = 0.0658` (the FSRS-6 default). This harness is how we tell whether
+//! versus `w20 = 0.1542` (the FSRS-6 default). This harness is how we tell whether
 //! flipping that constant actually recalls better instead of guessing — run the same
 //! [`RetentionCorpus`] through [`run_retention_cycle`] with each parameter set and
 //! compare [`RetentionReport::recall_retention`].
@@ -1025,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn dreaming_shrinks_store_while_holding_recall() {
         let dim = 48;
-        // Under the FSRS-6 decay exponent (w20 = 0.0658, now the default) memories
+        // Under the FSRS-6 decay exponent (w20 = 0.1542, now the default) memories
         // decay slowly, so a corpus must be aged well past a year for its weight to
         // fall into a compressible band; importance is held uniform so no topic sits
         // in the never-consolidated high-weight tail.
@@ -1134,13 +1134,23 @@ mod tests {
         );
     }
 
-    /// The w20 experiment the harness exists to run: on a heavily-aged corpus,
-    /// the FSRS-5 constant we currently ship (`w20 = 0.5`) decays retrievability
-    /// so fast that valid memories fall below the recall weight gate and vanish,
-    /// while the correct FSRS-6 default (`w20 = 0.0658`) keeps them retrievable.
+    /// The w20 experiment the harness exists to run, now across all three
+    /// exponents this default has held:
     ///
-    /// This is the evidence that flipping the default is an improvement — kept as
-    /// a live gate so a future default change is validated, not guessed.
+    /// | `w20`    | what it is                          | aged recall |
+    /// |----------|-------------------------------------|-------------|
+    /// | `0.5`    | FSRS-5's hardcoded decay (shipped first) | lost        |
+    /// | `0.1542` | FSRS-6's published decay (**current**)  | full        |
+    /// | `0.0658` | `w[19]` misread as `w[20]` (shipped second) | full    |
+    ///
+    /// On a heavily-aged corpus the FSRS-5 constant decays retrievability so
+    /// fast that valid memories fall below the recall weight gate and vanish.
+    /// Both later values clear the gate — which is the point of running all
+    /// three: correcting the off-by-one from `0.0658` to the real FSRS-6
+    /// `0.1542` must **not** reintroduce the loss the first flip fixed, and the
+    /// only honest way to say that is to measure it.
+    ///
+    /// Kept as a live gate so a future default change is validated, not guessed.
     #[tokio::test]
     async fn w20_experiment_aged_recall() {
         let dim = 32;
@@ -1157,30 +1167,39 @@ mod tests {
 
         let corpus = RetentionCorpus::generate(2024, params);
 
-        // Ship-current (wrong) exponent.
-        let svc_fast = service_with_w20(dim, 0.5, corpus.topic_embed_fn());
-        corpus.load_into(&svc_fast).await.unwrap();
-        let recall_fast = measure_gated_recall(&svc_fast, &corpus.probes)
-            .await
-            .unwrap();
+        // Same corpus, same probes, one variable — measured, not asserted from
+        // the curve, because the gate is `weight = retrievability × importance`
+        // against `min_weight` and it is the gate's verdict that matters.
+        let recall_at = async |w20: f32| {
+            let service = service_with_w20(dim, w20, corpus.topic_embed_fn());
+            corpus.load_into(&service).await.unwrap();
+            measure_gated_recall(&service, &corpus.probes)
+                .await
+                .unwrap()
+        };
 
-        // FSRS-6 default exponent.
-        let svc_slow = service_with_w20(dim, 0.0658, corpus.topic_embed_fn());
-        corpus.load_into(&svc_slow).await.unwrap();
-        let recall_slow = measure_gated_recall(&svc_slow, &corpus.probes)
-            .await
-            .unwrap();
+        let recall_fsrs5 = recall_at(crate::fsrs::FSRS5_DEFAULT_DECAY).await;
+        let recall_fsrs6 = recall_at(crate::fsrs::FSRS6_DEFAULT_DECAY).await;
+        let recall_misread = recall_at(0.0658).await;
 
         // The FSRS-6 exponent keeps every aged topic retrievable...
         assert!(
-            recall_slow >= 0.99,
-            "FSRS-6 w20 should still recall aged memories, got {recall_slow}"
+            recall_fsrs6 >= 0.99,
+            "FSRS-6 w20 should still recall aged memories, got {recall_fsrs6}"
         );
-        // ...while the ship-current fast-decay exponent has lost some of them.
+        // ...while the originally-shipped fast-decay exponent has lost some.
         assert!(
-            recall_fast < recall_slow,
+            recall_fsrs5 < recall_fsrs6,
             "fast decay (w20=0.5) should lose aged recall the FSRS-6 default keeps: \
-             fast={recall_fast} slow={recall_slow}"
+             fsrs5={recall_fsrs5} fsrs6={recall_fsrs6}"
+        );
+        // And correcting the off-by-one costs nothing at the gate: the flatter
+        // misread value recalls no more than the real default does. This is the
+        // assertion that makes the correction safe to take.
+        assert!(
+            (recall_fsrs6 - recall_misread).abs() < 1e-6,
+            "correcting w[19]→w[20] must not lose aged recall: \
+             fsrs6={recall_fsrs6} misread={recall_misread}"
         );
     }
 }
