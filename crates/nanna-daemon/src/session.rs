@@ -120,6 +120,20 @@ pub enum TimelineItem {
         /// Run-total tokens spent at the moment this call was issued.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_tokens: Option<u64>,
+        /// `Some(true)` when the zero-information breaker replaced this call
+        /// with a steering notice instead of running the tool. Back-filled
+        /// with `success`/`output`, so an in-flight call is `None` ("not yet
+        /// known"), never `Some(false)`.
+        ///
+        /// Without it the journal cannot tell a replay from a failure: a
+        /// short circuit reports `success: false` (the model did not get what
+        /// it asked for) with a notice as its output, so a timeline rebuilt
+        /// from this record after a remount rendered a wall of steering as a
+        /// wall of tool errors — while the same run rendered them correctly
+        /// live, off the event's structured data. Omitted from the wire when
+        /// `None`, so journals written before this field deserialize as-is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        short_circuited: Option<bool>,
         at: String,
     },
     /// A provider fault the run healed through (stream drop, timeout, …).
@@ -1379,6 +1393,22 @@ mod tests {
                 duration_ms: Some(12),
                 tokens: None,
                 total_tokens: None,
+                short_circuited: Some(false),
+                at: at.clone(),
+            },
+            // A breaker replay beside it: `success: false` with a notice for
+            // output, distinguishable from a crash ONLY by the marker. This is
+            // the entry a restored timeline used to render as a tool error.
+            TimelineItem::Tool {
+                call_id: "c2".to_string(),
+                name: "exec".to_string(),
+                input: Some(serde_json::json!({"cmd": "ls"})),
+                output: Some("[replayed: you already ran this]".to_string()),
+                success: Some(false),
+                duration_ms: Some(0),
+                tokens: None,
+                total_tokens: None,
+                short_circuited: Some(true),
                 at: at.clone(),
             },
             TimelineItem::Text {
@@ -1409,7 +1439,7 @@ mod tests {
             .last()
             .expect("assistant message survives restart");
         assert_eq!(msg.content, "there is one file: file.txt");
-        assert_eq!(msg.timeline.len(), 3, "the full journal round-trips");
+        assert_eq!(msg.timeline.len(), 4, "the full journal round-trips");
         assert!(matches!(
             &msg.timeline[1],
             TimelineItem::Tool {
@@ -1418,8 +1448,21 @@ mod tests {
                 output: Some(output),
                 success: Some(true),
                 duration_ms: Some(12),
+                short_circuited: Some(false),
                 ..
             } if call_id == "c1" && input["cmd"] == "ls" && output == "file.txt"
+        ));
+        // The replay survives the restart AS a replay. Without the marker on
+        // the persisted item this entry is `success: false` and nothing else,
+        // so the rebuilt timeline had no way to render it as steering.
+        assert!(matches!(
+            &msg.timeline[2],
+            TimelineItem::Tool {
+                call_id,
+                success: Some(false),
+                short_circuited: Some(true),
+                ..
+            } if call_id == "c2"
         ));
     }
 

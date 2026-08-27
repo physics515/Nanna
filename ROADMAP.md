@@ -4239,9 +4239,38 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       the sub-agent `AgentConfig`, and script-services summarizer models each clone the
       list once at boot). The per-turn chat/harness path — the one that degraded the
       series — now re-reads it; these three need the same treatment.
-- [ ] **Steering marker on re-seeded timelines**: breaker replays render as steering
-      live, but a timeline rebuilt from the run journal after a remount does not carry
-      `short_circuited`, so history still shows them as failures.
+- [x] **Steering marker on re-seeded timelines** *(2026-08-27)* — the run journal now
+      carries `short_circuited` beside `success`, so a timeline rebuilt after a remount
+      renders breaker replays as steering exactly as the live stream does.
+      The marker was never missing from the *system*: it rides in the tool result's
+      structured `data`, and `tasks.rs::tool_end` already read it for three consumers
+      (the liveness ledger, `tool_stats`, and the "a replay is not an error" suppression).
+      The journal was the one consumer that dropped it — `timeline_tool_end` took
+      `success`/`output`/`duration_ms` and not `data` — so the record that survives a
+      remount was the only representation still calling steering a failure. A replay
+      reports `success: false` (the model did not get its result) with a notice as its
+      output, which is indistinguishable from a crash once the marker is gone.
+      Both journal writers fixed: `agent_service.rs` (chat path, via a new
+      `is_short_circuited(data)` reader) and `tasks.rs` (harness path, which already had
+      the boolean in hand). `Option<bool>`, back-filled with the rest of the outcome, so
+      an in-flight call is `None` ("not yet known") rather than a decided non-replay —
+      the same shape as `success`. `skip_serializing_if = "Option::is_none"` keeps it
+      additive: journals written before the field deserialize unchanged and round-trip
+      without gaining a `null`.
+      **No GUI change was needed** — `RunTimeline.vue` has tested `item.short_circuited
+      === true` for the steering status since P22, and `setLiveTimeline(runState.timeline)`
+      passes the daemon's items straight through; the field simply never arrived. The
+      stale comment in `useSessionState.ts` that documented the gap ("the daemon's own
+      journal does not carry the marker") is corrected.
+      Also fixed while here: the crash-recovery checkpoint's output-trim notice labelled
+      a trimmed replay `the call failed`, which is the same lie one layer down; it now
+      says the tool never ran. 6 new tests: marker read defensively from `data` (absent
+      key, wrong type, no data at all); back-fill onto an open call; a real failure stays
+      `Some(false)`; an orphan `tool_end` still carries it; a pre-field journal loads and
+      round-trips without gaining a `null`; and the existing daemon-restart round-trip
+      (`a_runs_tool_calls_survive_daemon_restart`) gained a replay entry beside its normal
+      call, so the end-to-end claim — a replay survives a restart AS a replay — is
+      asserted through Turso rather than argued. 318 nanna-daemon tests green.
 - [ ] **No lift path for a declared file invariant**: once registered, a prohibition
       stands until the registry file is removed. "You can edit tests/ now" is exactly
       the permissive phrasing a conservative extractor must not act on, so lifting

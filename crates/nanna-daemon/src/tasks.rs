@@ -1610,6 +1610,8 @@ impl ChatSink {
                     duration_ms: None,
                     tokens: None,
                     total_tokens: None,
+                    // Back-filled with the rest of the outcome in `tool_end`.
+                    short_circuited: None,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
         }
@@ -1664,6 +1666,7 @@ impl ChatSink {
                 output: slot_output,
                 success: slot_success,
                 duration_ms: slot_duration,
+                short_circuited: slot_short_circuited,
                 ..
             }) = journal
                 .iter_mut()
@@ -1673,6 +1676,11 @@ impl ChatSink {
                 *slot_output = Some(output.to_string());
                 *slot_success = Some(success);
                 *slot_duration = Some(duration_ms);
+                // Stats, the liveness ledger and the live event already
+                // distinguish a replay from a failure; the run record is the
+                // last consumer that did not, which is why a timeline
+                // rebuilt after a remount showed steering as tool errors.
+                *slot_short_circuited = Some(short_circuited);
             }
         }
         if let Some(stats) = &self.tool_stats {

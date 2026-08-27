@@ -314,6 +314,9 @@ fn timeline_tool_start(
         duration_ms: None,
         tokens: (tokens > 0).then_some(tokens),
         total_tokens: (total_tokens > 0).then_some(total_tokens),
+        // Unknown until the call ends — see the field doc for why this is
+        // not `Some(false)`.
+        short_circuited: None,
         at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -343,14 +346,40 @@ fn timeline_tool_end(
     output: &str,
     ok: bool,
     duration: u64,
+    replayed: bool,
 ) {
+    // No assertions on `call_id` or on the `ok`/`replayed` combination: both
+    // are derived from provider and tool output, so an assert here would turn
+    // a malformed response into a panic inside a spawned turn — this repo has
+    // already lost a run to exactly that shape. Deviant input is *recorded*,
+    // which is the whole point of a journal.
     let mut items = timeline_lock(timeline);
+    // Only read under `debug_assertions`, so it must not exist in release —
+    // an unconditional binding would be a dead local the moment the assert
+    // below compiles away.
+    #[cfg(debug_assertions)]
+    let count_before = items.len();
     for item in items.iter_mut().rev() {
-        if let TimelineItem::Tool { call_id: id, output: out, success, duration_ms, .. } = item {
+        if let TimelineItem::Tool {
+            call_id: id,
+            output: out,
+            success,
+            duration_ms,
+            short_circuited,
+            ..
+        } = item
+        {
             if id == call_id && out.is_none() {
                 *out = Some(timeline_cap_output(output));
                 *success = Some(ok);
                 *duration_ms = Some(duration);
+                *short_circuited = Some(replayed);
+                // The outcome fields are back-filled as a set: a reader that
+                // sees `success` decided must never find the replay marker
+                // still undecided, or it is back to guessing.
+                debug_assert!(out.is_some(), "a closed call must carry its output");
+                debug_assert!(success.is_some(), "a closed call must carry its verdict");
+                debug_assert!(short_circuited.is_some(), "…and whether it was a replay");
                 return;
             }
         }
@@ -364,8 +393,22 @@ fn timeline_tool_end(
         duration_ms: Some(duration),
         tokens: None,
         total_tokens: None,
+        short_circuited: Some(replayed),
         at: chrono::Utc::now().to_rfc3339(),
     });
+    // Either branch records the call: back-filled in place (early return) or
+    // appended here. The journal never loses a completed call, which is the
+    // property the fallback exists for.
+    #[cfg(debug_assertions)]
+    debug_assert!(items.len() == count_before + 1, "the fallback must append exactly one item");
+}
+
+/// Read the breaker's machine-readable replay marker out of a tool result's
+/// structured data. Absent marker means the tool really ran.
+fn is_short_circuited(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|d| d.get("short_circuited"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Info about a tool call currently executing
@@ -1094,7 +1137,11 @@ impl AgentService {
                                 duration_ms,
                             });
                         }
-                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms);
+                        // The replay marker rides in the result's structured
+                        // data, which the event carries but the journal used
+                        // to drop — so a restored timeline showed steering as
+                        // failures. Record it where the run record lives.
+                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms, is_short_circuited(data));
                         let _ = event_tx_tool_end.send(Event::ToolEnd {
                             session_id: session_id_tool_end.clone(),
                             call_id: call_id.to_string(),
@@ -1210,12 +1257,19 @@ impl AgentService {
                             .clone()
                             .into_iter()
                             .map(|item| match item {
-                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at } => {
+                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at } => {
                                     let output = output.map(|o| {
                                         if o.len() > 200 {
-                                            let outcome = if success == Some(false) { "failed" } else { "completed" };
+                                            // A short circuit is neither: the tool never ran,
+                                            // so calling it "failed" is the same lie the
+                                            // journal used to tell about the whole entry.
+                                            let outcome = match (short_circuited, success) {
+                                                (Some(true), _) => "the tool never ran — the breaker replaced this call with a steering notice",
+                                                (_, Some(false)) => "the call failed exactly as recorded",
+                                                _ => "the call completed exactly as recorded",
+                                            };
                                             format!(
-                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; the call {outcome} exactly as recorded]",
+                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; {outcome}]",
                                                 truncate(&o, 200)
                                             )
                                         } else {
@@ -1233,7 +1287,7 @@ impl AgentService {
                                             i
                                         }
                                     });
-                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at }
+                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at }
                                 }
                                 TimelineItem::Thinking { content, at } if content.len() > 500 => {
                                     let total = content.len();
@@ -2342,5 +2396,167 @@ mod tests {
         // lands inside the emoji, so it must back off to byte 1 (after 'a')
         // rather than panic — result "a...".
         assert_eq!(truncate("a🚀bc", 2), "a...");
+    }
+
+    /// The breaker's marker lives in the tool result's structured data, and
+    /// only there — so read it defensively: absent key, wrong type and no
+    /// data at all all mean "the tool really ran".
+    #[test]
+    fn short_circuit_marker_is_read_only_when_it_is_a_true_bool() {
+        assert!(is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": true })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": false })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": "true" })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "other": true })
+        )));
+        assert!(!is_short_circuited(Some(&serde_json::json!(
+            "not an object"
+        ))));
+        assert!(!is_short_circuited(None));
+    }
+
+    /// A breaker replay reports `success: false` with a notice as its output.
+    /// The journal has to record *why* that outcome happened, or a timeline
+    /// rebuilt from it renders steering as a wall of tool errors.
+    #[test]
+    fn journal_back_fills_the_replay_marker_beside_the_outcome() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(
+            &timeline,
+            "c1",
+            "exec",
+            &serde_json::json!({ "cmd": "ls" }),
+            0,
+            0,
+        );
+
+        // In flight: the outcome is not yet known, and neither is the marker.
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert!(success.is_none(), "an open call has no outcome yet");
+                assert!(
+                    short_circuited.is_none(),
+                    "an open call is not a decided non-replay"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        timeline_tool_end(&timeline, "c1", "exec", "[replayed]", false, 1, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(
+            items.len(),
+            1,
+            "the end must back-fill the open call, not append"
+        );
+        match &items[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(
+                    *success,
+                    Some(false),
+                    "a replay did not give the model its result"
+                );
+                assert_eq!(
+                    *short_circuited,
+                    Some(true),
+                    "…but it is steering, not a failure"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// Negative space: a real failure must stay a failure. `Some(false)` and
+    /// `None` are both non-replays to the GUI (it tests `=== true`), but the
+    /// journal states the decided answer once the call has ended.
+    #[test]
+    fn journal_marks_a_real_failure_as_not_replayed() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+        timeline_tool_end(&timeline, "c1", "exec", "boom", false, 7, false);
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(*success, Some(false));
+                assert_eq!(
+                    *short_circuited,
+                    Some(false),
+                    "a decided non-replay is not None"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// An end with no journaled start still records the call — and must carry
+    /// the marker on that fresh item too, or the recovery path loses exactly
+    /// the entries a crashed run most needs explained.
+    #[test]
+    fn orphan_tool_end_records_the_replay_marker_too() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_end(&timeline, "c9", "exec", "[replayed]", false, 2, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the call must not vanish from the record");
+        match &items[0] {
+            TimelineItem::Tool {
+                short_circuited, ..
+            } => {
+                assert_eq!(*short_circuited, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// The field is additive on the wire: journals written before it exists
+    /// must still load, and an unmarked entry must not read as a replay.
+    #[test]
+    fn journals_without_the_marker_still_deserialize() {
+        let legacy = serde_json::json!({
+            "kind": "tool",
+            "call_id": "c1",
+            "name": "exec",
+            "output": "ok",
+            "success": true,
+            "duration_ms": 3,
+            "at": "2026-08-27T00:00:00Z",
+        });
+        let item: TimelineItem =
+            serde_json::from_value(legacy).expect("a pre-field journal entry must still load");
+        match &item {
+            TimelineItem::Tool {
+                short_circuited,
+                success,
+                ..
+            } => {
+                assert_eq!(*short_circuited, None, "absent means unknown, not replayed");
+                assert_eq!(*success, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        // And `None` is omitted again on the way out, so round-tripping an
+        // old journal does not rewrite it with a field it never had.
+        let round_tripped = serde_json::to_value(&item).expect("tool item must serialize");
+        assert!(
+            round_tripped.get("short_circuited").is_none(),
+            "None must not be written as null: {round_tripped}"
+        );
     }
 }
