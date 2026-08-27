@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gui-dev",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "gui", "dev"],
+      "port": 3000
+    }
+  ]
+}
