@@ -4316,6 +4316,30 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       (`a_runs_tool_calls_survive_daemon_restart`) gained a replay entry beside its normal
       call, so the end-to-end claim — a replay survives a restart AS a replay — is
       asserted through Turso rather than argued. 318 nanna-daemon tests green.
+- [x] **One panic under the journal lock could wedge a whole harness run** *(found and
+      fixed 2026-08-27, while working the item above)* — the two writers to the run
+      journal disagreed about what a poisoned mutex means. `agent_service.rs` has always
+      used `timeline_lock`, which ignores poisoning with a stated reason ("a panicking
+      thread must not erase the run's record"). `tasks.rs` — the **harness** sink,
+      writing to the *same* `Arc<Mutex<Vec<TimelineItem>>>` — reached it through
+      `.lock().expect("timeline lock poisoned")` at **five** production sites (text
+      merge, thinking merge, tool start, tool end, step). So a single panic anywhere
+      under that lock turned every subsequent text delta, tool call and step of that run
+      into another panic, **inside a spawned turn where a panic is invisible and the run
+      just stops** — the exact failure shape recorded on 2026-08-10, where a `&text[..200]`
+      slice panic in a fire-and-forget turn read as a step wedge for a day.
+      Worse, one of those sites carried a comment asserting "the journal lock is
+      std::sync and infallible by design" directly above an `.expect()` — the comment
+      had the right intent and the code contradicted it.
+      Fixed by sharing ONE policy: `timeline_lock` is now `pub(crate)` and both writers
+      call it. **Ignoring poisoning is justified here specifically**, not by habit: the
+      guarded value is a `Vec<TimelineItem>` with no cross-field invariant a panic can
+      leave half-established, and the type already models an interrupted call
+      (`output`/`success`/`duration_ms` are `Option`, documented as "a run that dies
+      mid-call leaves them None"). A panicking thread leaves a well-formed journal, so
+      the only thing `expect` added was a second panic that destroys the record exactly
+      when it is most wanted. New test poisons the mutex from a real panicking thread and
+      asserts the earlier entry survives AND a later write still lands.
 - [ ] **No lift path for a declared file invariant**: once registered, a prohibition
       stands until the registry file is removed. "You can edit tests/ now" is exactly
       the permissive phrasing a conservative extractor must not act on, so lifting
@@ -4323,6 +4347,17 @@ green. Known remainders, deliberately scoped rather than silently dropped:
 - [ ] **Evidence hashing is anchored at run start, not at task-write time**: the
       repository layer has no workspace root to resolve a relative acceptance path,
       so the hash baseline is taken where the workdir is known instead.
+      *(examined and deliberately not taken 2026-08-27)* — this is a **design
+      decision, not a mechanical fix**, and `EvidenceGuard::ensure_baseline` already
+      states the tradeoff in-tree ("the truly first moment is the acceptance's
+      canonicalization at write time, but the store has no workspace root … this is
+      the earliest point that holds both the canonical check and the workdir").
+      Closing it means threading a workspace root into the storage layer, which is
+      an architectural change that wants an owner decision about whether the task
+      store may know about workspaces at all. The current anchor is already
+      *before* the step that could modify the evidence, so the exposure is narrow:
+      a write between task creation and item selection. Sizing that window against
+      real runs is the next step, not the code change.
 
 Full evidence: the 40-agent forensic analysis (per-leg + cross-cutting, adversarially
 verified) in the 2026-08-15 session; per-leg ledgers and per-poll history under

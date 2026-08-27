@@ -1535,9 +1535,10 @@ impl ChatSink {
                 acc.push_str(text);
             }
             // The journal lock is std::sync and infallible by design (see
-            // ActiveChat::timeline) — merge into the trailing Text item so a
-            // token stream stays one item, not thousands.
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            // `agent_service::timeline_lock`, which both writers share) — merge
+            // into the trailing Text item so a token stream stays one item, not
+            // thousands.
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
                 content.push_str(text);
             } else {
@@ -1564,7 +1565,7 @@ impl ChatSink {
             if let Ok(mut acc) = run.accumulated_thinking.try_write() {
                 acc.push_str(text);
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
             {
                 content.push_str(text);
@@ -1598,9 +1599,7 @@ impl ChatSink {
                     started_at: chrono::Utc::now(),
                 });
             }
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1661,7 +1660,7 @@ impl ChatSink {
                     duration_ms,
                 });
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Tool {
                 output: slot_output,
                 success: slot_success,
@@ -1795,9 +1794,7 @@ impl ChatSink {
             item_id: request.item_id,
         });
         if let Some(run) = &self.run {
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Step {
                     phase: kind.to_string(),
                     label,

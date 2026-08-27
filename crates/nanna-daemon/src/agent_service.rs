@@ -259,9 +259,24 @@ struct ActiveChat {
 /// (persisted per message, shipped on remount) stays bounded.
 const TIMELINE_OUTPUT_CAP: usize = 4000;
 
-/// Lock the journal, surviving a poisoned mutex (a panicking thread must
-/// not erase the run's record — the data inside is still valid).
-fn timeline_lock(
+/// Lock the journal, surviving a poisoned mutex.
+///
+/// Poisoning is ignored here on purpose, and the justification is specific to
+/// what this mutex guards: a `Vec<TimelineItem>` has no cross-field invariant a
+/// panic could leave half-established. Every write is either a `push` or a
+/// back-fill of one item's outcome fields, and the type ALREADY models an
+/// interrupted call — `output`/`success`/`duration_ms` are `Option`, documented
+/// as "a run that dies mid-call leaves them None". So a panicking thread leaves
+/// a well-formed journal, and the only thing `unwrap()` would add is a second
+/// panic that erases the run's record precisely when it is most wanted.
+///
+/// Both journal writers must agree on this. The harness sink in `tasks.rs`
+/// writes to the *same* `Arc<Mutex<..>>` and used to `.expect("timeline lock
+/// poisoned")`, so one panic anywhere under the lock turned every later tool
+/// call in that run into another panic — inside a spawned turn, where a panic
+/// is invisible and the run just stops. Hence `pub(crate)`: one policy, one
+/// implementation, no second opinion about what a poisoned journal means.
+pub(crate) fn timeline_lock(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
 ) -> std::sync::MutexGuard<'_, Vec<TimelineItem>> {
     timeline.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2558,5 +2573,45 @@ mod tests {
             round_tripped.get("short_circuited").is_none(),
             "None must not be written as null: {round_tripped}"
         );
+    }
+
+    /// A panic under the journal lock must not take the journal with it.
+    ///
+    /// This is the property `tasks.rs` used to get wrong: it wrote to the same
+    /// `Arc<Mutex<..>>` through `.expect("timeline lock poisoned")`, so one
+    /// panic anywhere under the lock turned every later tool call in that run
+    /// into another panic — inside a spawned turn, where a panic is invisible
+    /// and the run simply stops. Both writers now go through `timeline_lock`.
+    #[test]
+    fn a_poisoned_journal_still_records_and_keeps_what_it_had() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+
+        // Poison it exactly the way a panicking spawned turn would.
+        let poisoner = Arc::clone(&timeline);
+        let panicked = std::thread::spawn(move || {
+            let _guard = timeline_lock(&poisoner);
+            panic!("a step panicked while holding the journal");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the helper thread must actually have panicked"
+        );
+        assert!(timeline.is_poisoned(), "…and left the mutex poisoned");
+
+        // The record survives, and the run can still write to it.
+        timeline_tool_end(&timeline, "c1", "exec", "ok", true, 3, false);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the earlier entry must not be lost");
+        match &items[0] {
+            TimelineItem::Tool {
+                success, output, ..
+            } => {
+                assert_eq!(*success, Some(true), "the write after poisoning landed");
+                assert!(output.is_some(), "…and carried its output");
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
     }
 }
