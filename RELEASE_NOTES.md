@@ -1,220 +1,106 @@
-# Nanna v0.3.10-beta.19 — The Embedding Gets Out of the Way
+# Nanna v0.3.11-beta.20 — True in the Code, False in the World
+
+Five fixes, two of which no test could have caught because the code was self-consistent and wrong
+about the outside world. The other three turn standing "remember to do X" notes into checks that
+fail in milliseconds.
 
 ## What's New
 
-### Memory: tool-result ingestion is off the turn's critical path (this release)
+### Scheduled work reached a model that no longer exists (this release)
 
-Every chunk of every tool result used to be embedded **inline** — one round-trip to the same local
-model server that serves generation, plus a vector search, plus an insert, awaited before the agent
-could take its next step. One measured run made **zero model decisions for 189 of its 246 minutes**.
+Every install that had never configured `llm.model_priority` sent its scheduled heartbeat to
+**`claude-sonnet-4-20250514`**, a retired model snapshot, and got a `404 not_found_error` back. The
+daemon reported itself healthy throughout — the failure was logged at `WARN` and swallowed, so the
+only visible symptom was that scheduled work silently never happened.
 
-A chunk is now persisted synchronously and only its *vector* is queued
-(`MemoryService::remember_deferred_vector`). The row is durable before the call returns and keeps its
-`source_id`, so a `recall(...)` handle handed to the model in the same turn still resolves — only
-similarity search waits for the drain.
+The shipped default is now **`claude-sonnet-5`**, the live same-tier alias. Six defaults carried the
+dead id (`nanna-config`, `nanna-core` ×2, `nanna-agent`, `nanna-llm`, `nanna-server`) and all six
+moved together.
 
-The hard part was the drain. `drain_backfill` could not do it: when the embedder is the local
-provider it first waits for *no harness run to be live*, so a row queued **by** a live run would wait
-for the run that queued it — hours, during a long mission. `drain_queued_vectors` skips that gate and
-pays for the exception with a bound: it may only embed rows **this process parked**, it still repays
-every request with an equal idle window, and it still takes the process-wide drain lock. Same
-embedding work, half the duty cycle, concurrent with the turn instead of blocking it.
+The general lesson is in the fix, not the id. Anthropic publishes an **undated family alias** that
+tracks the live model and a **dated snapshot** pinned to one release and retired on a schedule. A
+dated *default* ships with an expiry date built into it. Pinning a snapshot is a perfectly good
+choice for a user to make in their own config — it is not a good default for the product to ship, and
+a new test refuses to let one become the default again.
 
-**One latent bug fixed on the way:** `drain_backfill` parked on `wait_idle()` *while holding* the
-process-wide drain lock, so a drain waiting for a mission to end starved every drain behind it for
-the length of that mission.
+Verified on the real binary, not argued: booting the release daemon against a scratch config went
+from `3 ×` `API error: 404` and `2 ×` "All models exhausted" to **zero of each**, with a completed
+run — `model=claude-sonnet-5, duration_s=5, tool_calls=2, faults_healed=0`.
 
-**Trade, stated plainly:** the neighbour-dedup search is skipped for deferred rows (there is no query
-vector to search with), so near-identical tool results land as separate rows instead of folding.
-Squeezing the store is dreaming's job, and run-length collapse upstream already removed the case that
-made this expensive.
+**If you have a model pinned in your own config, nothing changes for you.** This only affects installs
+running on the built-in default.
 
-### Memory: queued vectors no longer wait for a restart (this release)
+### Steering no longer looks like breakage after a reload
 
-The companion to the change above. `drain_queued_vectors` drains what the current
-process deliberately deferred, at foreground priority — and it is deliberately budgeted **not** to
-sweep an inherited backlog, leaving that to `drain_backfill`. The gap was that nothing actually
-called `drain_backfill` at that priority during a session: its only triggers are *binding* events
-(daemon start, provider switch, width reprobe), and an ordinary session has none of them. A row
-parked by a **transient** embedding failure therefore stayed unsearchable until the next restart —
-recovered, but a session late rather than a moment late.
+When the zero-information breaker answers a repeated tool call itself, the timeline renders it as
+*steering* — the tool never ran, so nothing failed. That was true only while the run was live. A
+timeline **rebuilt after navigating away and back** showed the same calls as a wall of red tool
+errors, because the run journal recorded the outcome (`success: false`) without recording *why*.
 
-`supervise_idle_backfill` closes that: one task for the daemon's life that waits for a turn to start
-and then finish, and drains at the first moment no run is live. It adds a *trigger*, never a second
-request rate — same process-wide drain lock, same chat-priority gate, same per-request repayment
-window. Its probe is one in-memory scan that short-circuits on the first unembedded row plus two
-`LIMIT 1` queries, once per turn.
+The journal now carries the replay marker beside the outcome, so a restored timeline reads the same
+as the live one. The marker is additive on the wire: journals written before this release load
+unchanged.
 
-### Toolchain and dependencies (this release)
+Also fixed one layer down — a trimmed replay in a crash-recovery checkpoint used to be labelled
+"the call failed". It now says the tool never ran.
 
-Pinned nightly moved `2026-08-03` → `2026-08-25`, verified by a full release build before the pin
-moved. The new nightly raises `recursion_depth_exceeding_limit` ([rust#159228](https://github.com/rust-lang/rust/issues/159228)),
-scheduled to become a **hard error**, while proving futures are `Send` through wgpu's type graph —
-answered at **seven** crate roots (six libraries plus an integration-test crate root, which does not
-inherit the library attributes).
+### A panic under the journal lock could take the rest of the run with it
 
-`malachite-bigint` is now pinned in the *manifest* rather than the lockfile. It had been hand-repaired
-on four consecutive dependency sweeps, because a lockfile pin is exactly what `cargo update` is
-entitled to move; a manifest constraint is not.
+The two writers to a run's journal disagreed about what a poisoned mutex means. The chat path had
+always treated poisoning as survivable, with a stated reason: a panicking thread must not erase the
+run's record. The **harness** path — writing to the very same journal — panicked instead, at five
+places.
 
-### New: point Nanna at a config it does not own (this release)
+So one panic anywhere under that lock turned every later text delta, tool call and step of that run
+into another panic, inside a spawned turn where a panic is invisible and the run simply stops. That
+is the shape of a bug that once read as a mysterious wedge for a day. Both writers now share one
+policy, and a test poisons the lock from a real panicking thread to prove the record survives and
+later writes still land.
 
-`NANNA_CONFIG_PATH=<file>` overrides config resolution. Previously `--data-dir` isolated the database
-but **not** the settings, and the settings path resolves through the platform's known-folder API, so
-even `%APPDATA%` could not redirect it — meaning any second instance, or any test of a
-configuration-dependent startup path, had to edit the config you actually use. Pair it with
-`--data-dir` for a fully isolated instance.
+### Memory: the forgetting curve's decay constant was off by one slot
 
-### Frontend: four major dependency migrations (this release)
+The FSRS decay exponent was `0.0658`, believed to be FSRS-6's published default. It is
+FSRS-6's **`w[19]`**. The decay is `w[20]` = **`0.1542`** — confirmed against the reference
+implementation, which also clamps that parameter to `0.1..=0.8`, a range the old value sat *below*.
+No fitted parameter set could have contained it.
 
-`@tiptap/* 2 → 3`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, and `lucide-vue-next → @lucide/vue 1.34`.
+The correction is deliberately gated so it cannot re-break what the previous fix bought: the
+retention harness now measures aged recall at **all three** exponents the default has held and
+asserts the corrected value recalls exactly as much as the misread one — not merely "enough". At the
+practical extreme (800-day-old memories) both clear the recall gate comfortably; what actually
+differs is which consolidation band an aged memory lands in, which is why matching the published
+curve is the whole point.
 
-The lucide one is a **package rename, not a version bump**, and it is a trap worth naming:
-`lucide-vue-next@1.0.0` is deprecated but is *not* an empty tombstone — it ships a real dist where
-every icon resolves. So `pnpm update --latest` installs a working-but-dead package and nothing fails.
-The failure mode is silence. A new `packageComponentExports` guard now resolves all **221** icon
-bindings the templates render, so the rename is proven at the export level rather than assumed.
+### Dependency freshness
 
-### Release engineering: `release.yml` can actually produce a release (this release)
+`uuid 1.26`, `which 8.0.6`, the tiptap suite at `3.30.5`, `vue 3.5.42`, `happy-dom 20.11.8`, and the
+Rust toolchain moved to `nightly-2026-08-27`. TypeScript 7 was attempted and reverted for the third
+time — `vue-tsc` cannot run on it until TypeScript 7.1 exposes a programmatic compiler API, which is
+an upstream constraint affecting Vue, Angular and ESLint alike.
 
-The workflow had never completed a successful dispatch, and several steps could not have worked as
-written: three jobs installed `stable` while `rust-toolchain.toml` pins a nightly that rustup uses
-anyway; macOS requested `universal-apple-darwin`, which is not a rustup target; all three ran
-`cargo tauri build` with the CLI never installed and no Node or pnpm present at all; **no signing key
-was wired in anywhere**, though `createUpdaterArtifacts` requires one; and the publish job set `TAG`
-in one shell and used it in three others, so every upload targeted the tag `""`.
+Two dependency pins that previously lived only as a note ("remember to redo this after every
+update") are now enforced by a test that runs in **0.00 seconds** and prints the exact fix command.
+It was verified against the real regression rather than assumed.
 
-All fixed. Windows builds by default; macOS and Linux are opt-in inputs defaulting to false, because
-neither has ever been verified on a runner and defaulting them on would let an unverified platform
-take the Windows release down with it. The build now **fails loudly if an installer is produced
-without a signature**.
+## Fixed
 
+- Scheduled heartbeats failing with `404` on every unconfigured install.
+- Breaker replays rendering as tool failures in any timeline restored after a reload.
+- A single panic under the run-journal lock cascading into a stalled run.
+- FSRS forgetting-curve decay using `w[19]` where `w[20]` was meant.
+- A crash-recovery checkpoint describing a trimmed replay as a failed call.
 
-### Core Features
-- **Headless daemon** with WebSocket IPC, PID lockfile, and health endpoints
-- **Tauri GUI** as pure daemon client with auto-reconnect
-- **Agentic chat** with streaming responses, tool calling, and chronological run journal
-- **Cognitive memory** (FSRS-6 spaced repetition) with dreaming consolidation
-- **LLM routing** — local-first (Ollama), cloud-optional (Anthropic/OpenAI/OpenRouter)
-- **Tools & MCP** — 39 default skills via Boa/Deno engines, MCP server mode
-- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp
-- **Desktop GUI** — Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme)
+## Known / still open
 
-### Security (this release)
-- **Inbound webhooks fail closed.** Every route verifies its provider signature or shared secret
-  before the payload reaches the agent, and a channel with no credential configured now refuses to
-  serve (503) rather than accepting anonymous requests. Discord and Slack captures expire on a
-  5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
-- **Webhook bodies are authenticated before they are deserialized**, so a hostile payload cannot
-  reach the parser at all.
-- **Chat markdown is sanitized.** Assistant output, user input, and anything the assistant quotes
-  from a tool went into `v-html` unsanitized — `marked` has not sanitized since v5, so an
-  `<img onerror>` in model output was live markup with only the Tauri CSP standing between it and
-  script execution. Author HTML is now escaped rather than emitted, and link/image URLs are
-  scheme-checked against an allowlist.
-- **A per-call tool audit trail.** One JSON line per tool call — including refused and not-found
-  ones — recorded at the registry chokepoint, so calls made outside the agent loop are covered too.
-  Argument *key names* are recorded; values stay out unless you opt in with
-  `[tools] audit_log_values`.
+- **A heartbeat that fails on every attempt is still only a `WARN`**, and the daemon still reports
+  itself healthy while it happens. A model that fails *every* time is a configuration fault, not a
+  transient one, and deserves to surface. Where operator-visible faults belong is not yet decided.
+- The `malachite-bigint` and `rten` version pins remain, both waiting on upstream
+  (`rustpython-codegen` accepting malachite 0.10; `ocrs` moving to `rten 0.25`).
+- TypeScript 7 stays deferred until 7.1 or a tsgo-backed `vue-tsc`.
 
-### Memory & dreaming (this release)
-- **User-stated memories are pinned verbatim** against summarization drift, and the `remember` tool
-  can now produce a pinnable memory.
-- **A session is compressed once, never re-compressed from a summary** — the drift mitigation that
-  stops meaning eroding across passes.
-- **A summary can no longer impersonate one of its sources**, and enrichment adds rather than
-  rewrites (the Expand prompt was fighting its own guard).
-- **One episodic write policy** — chat could not previously remember a failed tool call.
+## Verification
 
-### Agent & context (this release)
-- **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot
-  of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in
-  flight before it edits. Explicitly stamped "not live" so a stale tree is never mistaken for
-  current.
-- **Regression attribution** — when a file stops parsing, the agent is told what landed since it last
-  parsed.
-- **A health probe answering "I am broken" no longer passes.**
-
-### Fixed
-- **Every generic webhook shared one conversation** (both the daemon and `nanna serve` copies).
-- **`nanna-gui` did not compile, and no CI job would have said so** — the release profile is now
-  gated on push and PR, and the `vue-tsc` gate type-checks for real.
-- **Memory editing was dead** in the GUI, `@tiptap/core` was never declared, a chart drew nothing,
-  and a dropdown had no options.
-- **Destructive dialogs said "Confirm"** rather than naming the destructive act, and one guard never
-  ran.
-- **Two flaky test suites** that asserted wall-clock while measuring something else — they went red
-  on loaded CI and green alone.
-
-### Performance
-- **SIMD vector ops** (AVX-512/AVX2/NEON) — 768-dim cosine similarity in ~0.1µs
-- **GPU compute** (wgpu) for scale above 50k vectors
-- **Local inference on Burn** — moved to the shared `Mummu` runner (ROADMAP P12 is now integration-only)
-
-### Architecture
-- **17 workspace crates** layered bottom-up by dependency
-- **Channel abstraction** — all clients share state via daemon
-- **Workspace context** — auto-detects project files for system prompt injection
-
-### Fixed: auto-update could not fire, and had not since beta.14
-
-The updater compares the version in `.updater/latest.json` against the version the running app
-reports, and offers an update only when the advertised one is **greater**. The app's version comes
-from `tauri.conf.json`, which was last bumped for **beta.14** — so beta.15, beta.16 and beta.18 all
-shipped reporting `0.3.9` against a manifest also saying `0.3.9`. Equal is not greater, so no
-installed client was ever offered any of them. Each looked like a perfectly good release.
-
-Raising only the manifest would have been worse than leaving it: the installer would still *be*
-`0.3.9`, so a client would update, still report `0.3.9`, and be offered the same update forever.
-The version had to move in the build, which is what this release does — `0.3.9` → **`0.3.10`**
-across `Cargo.toml` (both the package and workspace entries), `gui/package.json` and
-`tauri.conf.json`.
-
-A dispatch-time guard now refuses to start when the dispatched version disagrees with
-`tauri.conf.json`, or when it matches what the manifest already advertises. It costs five seconds
-and runs before the hour-long build — deliberately, because both release bugs found in this series
-surfaced only *after* everything expensive had already succeeded.
-
-**If you are on beta.14 through beta.18, you will not be prompted.** Install this one manually;
-auto-update works again from here.
-
-## Release Checklist
-
-- [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope
-- [~] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases
-      — *repaired across beta.17/18.* Every blocker named in beta.16's note is fixed, and a real
-      dispatch has now **built and signed** a Windows installer on a runner: the toolchain pin is
-      honoured, Node/pnpm and the Tauri CLI are actually installed, and the signing secrets work
-      (the collect step fails when the `.sig` is missing, and it passed). **Done as of
-      v0.3.10-beta.19**, which a single `workflow_dispatch` built, signed, tagged and published with
-      no manual step — the first time this workflow has ever completed. Three bugs had to go first,
-      and all three shared a shape worth remembering: each surfaced only *after* an hour-long build
-      had already succeeded. A `cache: pnpm` **post-job** step that failed the job after a clean
-      build; an upload list mixing globs with literal filenames (`nullglob` drops unmatched globs but
-      not literals, so a skipped Linux job left `nanna-daemon` in the list and gh rejected the entire
-      upload); and a stale `Cargo.lock` against `--locked`. The version guard added in beta.19 now
-      fails that class in five seconds instead.
-- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (code signing pending;
-      the updater signature is applied at upload time from the local minisign key)
-- [ ] Publish signed and notarized macOS .dmg
-- [ ] Publish Linux AppImage and/or .deb/.rpm — *corrected: no release has shipped Linux artifacts*
-- [x] App launches without terminal; daemon starts automatically
-- [x] Add Start Menu / tray / launch-at-login support
-- [x] WebView2 handling on Windows
-- [x] Document uninstall process
-- [x] Add "check for updates" or auto-update mechanism
-
-## Known Issues
-
-- Code signing not yet implemented (SmartScreen warnings expected)
-- macOS and Linux remain opt-in and unverified in `release.yml`, so those artifacts are still not
-  published — Windows is the only platform a dispatch produces
-- beta.17 was tagged for release but never published (see above); beta.18 supersedes it and carries
-  the same scope plus the 2026-08-26 nightly
-- Burn local runner still in development (in the `Mummu` repo)
-
-## Installation
-
-1. Install [Ollama](https://ollama.com) and pull `qwen3.5:9b`
-2. Download installer from [Releases](https://github.com/physics515/Nanna/releases)
-3. Run installer (expect SmartScreen warning → "Run anyway")
+1691 workspace tests green · clippy clean with no new warnings in any changed file · release build
+green on the new toolchain · frontend typecheck clean with 237 tests · release daemon booted against
+a scratch config with a before/after log diff proving the model fix.
