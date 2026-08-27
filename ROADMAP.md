@@ -1921,6 +1921,20 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             [localllm.in 8 GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025),
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/),
             [Burn releases](https://github.com/tracel-ai/burn/releases).
+      - [ ] *(research 2026-08-27)* **Nothing moved again — and one candidate is worth a look purely
+            because it is *narrow*.** Re-checked this run: **Burn is still 0.21.0** (no 0.22), so every
+            0.21 note above stands and the Mummu contract needs no revision. On models, the only
+            datapoint not already recorded here is **`Llama-3-Groq-8B-Tool-Use`**, cited at **89.06%
+            overall on BFCL** (its 70B sibling at 90.76%, the highest of any open model) — a
+            tool-use-*specialised* fine-tune rather than a general model that also calls tools, which
+            is the axis Nanna's harness actually stresses. Do NOT swap the reference default for it on
+            a leaderboard number: the roadmap's own rule is that a model is judged on task-success at
+            budget, not BFCL, and this repo has a cautionary tale on exactly that (ministral:8b smoked
+            well and could not endure). Worth **one leg** on the existing ladder against the current
+            local champion, nothing more, and only when a leg is being run anyway. Also re-confirmed:
+            Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
+            per-model call formatting, not a live dependency. Source:
+            [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -4925,6 +4939,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `package.json` no longer lists that subpath in `exports`, so the CI typecheck gate dies with
            `ERR_PACKAGE_PATH_NOT_EXPORTED` before reading a single file. Nothing in our source is
            involved — re-check when `vue-tsc` ships against the 7.1 programmatic API.
+           *(re-tried 2026-08-27 on `typescript@7.0.2` — **identical failure**, byte for byte:
+           `ERR_PACKAGE_PATH_NOT_EXPORTED: Package subpath './lib/tsc' is not defined by "exports"`,
+           thrown from `vue-tsc/index.js:73` `resolveTscPath` before any file is read. Reverted;
+           `vue-tsc --noEmit` clean and 237 vitest green on 5.9.3. Upstream confirms this is not a
+           Vue-only problem — `@vue/compiler-sfc`, Angular and ESLint all patch TypeScript's
+           Compiler API, which the Go-native core does not expose until **7.1**; the tracking issue
+           is [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381).
+           Do NOT re-attempt until 7.1 ships or `vue-tsc` publishes a tsgo-backed release.)*
+     - [ ] *(research 2026-08-27)* **Evaluate `vue-tsgo` as the TS-7 escape hatch if 7.1 slips.**
+           Two independent Go/tsgo-backed Vue SFC type checkers now exist —
+           [KazariEX/vue-tsgo](https://github.com/KazariEX/vue-tsgo) (by a Vue Language Tools core
+           contributor) and [NikhilVerma/vue-tsgo](https://github.com/NikhilVerma/vue-tsgo), the
+           latter claiming 10–50× faster checks with zero `.vue` error delta against `vue-tsc`.
+           Only worth taking if it is a drop-in for the `gui.yml` typecheck job — swapping the gate
+           for a less-proven checker to gain speed we do not need would be a bad trade. Decide by
+           running both over `gui/` and diffing the diagnostics, not by the README claim.
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -4942,7 +4972,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `OcrEngineParams { detection_model, recognition_model }` is then handed `rten-0.25::Model` where
      `rten-0.24::Model` is expected (E0308, verified by building it). Re-check when `ocrs` publishes
      against 0.25; until then the direct req must track whatever `ocrs` requires.
-     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it.
+     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it. *(re-checked 2026-08-27: `ocrs`
+           latest is still 0.12.2 on `rten ^0.24`. Now enforced by the unification guard above rather
+           than by remembering.)*
    - **`malachite-bigint` must stay at 0.9.2 — a bare `cargo update` breaks the release build**
      *(2026-08-25)*. `pymath 0.2.0` accepts `malachite-bigint 0.10` while `rustpython-codegen 0.5.0`
      requires 0.9, so `cargo update` resolves both and `rustpython-stdlib` fails to compile
@@ -4952,7 +4984,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      is not verified until `cargo build --release -p nanna-daemon` is green. Held with
      `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; the pin lives only in `Cargo.lock`, so
      **every future run must redo it after `cargo update`** until `rustpython` widens its req.
+     - [x] *(2026-08-27)* **Both pin-backs are now a gate, not a habit.** The `malachite-bigint` and
+           `rten` unification requirements lived only in this file as "remember to redo it after every
+           `cargo update`" — a note, which the last three runs each had to rediscover, and which
+           `malachite` announces ~20 minutes into a release build. New
+           `crates/nanna-storage/tests/dep_version_unification.rs` asserts that each crate whose
+           **types cross a crate boundary** resolves to exactly ONE version in `Cargo.lock`
+           (`malachite-bigint`, `rten`, `rten-tensor`), and prints the exact remedy command in the
+           failure message. It sits beside `dep_guard.rs` (already the lockfile-guard home: cheap
+           crate, already in CI's `cargo test` scope) and runs in **0.00s**. Deliberately narrow:
+           duplicate versions are normal and this lockfile has ~100 of them (`syn`, `bitflags`,
+           `windows-sys`, …), so an entry is added only when a real build failure proved the crate
+           cannot split. It also fails if a guarded crate leaves the graph, so a dead guard gets
+           removed on purpose rather than passing forever. **Verified it catches the real
+           regression**: re-running `cargo update -p malachite-bigint` makes it report
+           `resolved to 2 versions ["0.9.2", "0.10.0"]` plus the pin-back command.
      - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+           *(re-checked 2026-08-27: `rustpython-{codegen,stdlib}` still 0.5.0 and `pymath` still
+           0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
@@ -5207,6 +5256,28 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      exclusion deliberately rather than by coincidence. The same step also now states plainly that
      `cargo fmt` is **not** clean on this tree (~2735 pre-existing diffs) and must not be made clean
      in passing — only the lines an increment adds need to be fmt-neutral.
+   - *(2026-08-27 sweep)* `cargo update` → 2 compatible bumps (`uuid 1.25.0 → 1.26.0`,
+     `which 8.0.5 → 8.0.6`) plus the standing `malachite-bigint` pin-back.
+     `cargo upgrade --incompatible` proposed exactly the same **two rejects as the previous run**,
+     both re-verified against the registry rather than assumed: `rten 0.24 → 0.25` (`ocrs` is still
+     0.12.2 on `rten ^0.24`) and the `criterion 0.8 → "0.7"` downgrade trap (the lock holds 0.8.2,
+     which IS latest). The one req actually taken was `uuid 1.25 → 1.26` (workspace root +
+     `nanna-server`), source unchanged. **The headline is not a bump — it is that the two standing
+     pin-backs stopped being a habit and became a test** (see the unification-guard item above).
+     Toolchain: pin moved `nightly-2026-08-25 → nightly-2026-08-27` (rustc 1.100.0-nightly
+     `bff8e12ff`), mirrored into `budget-gate.yml` / `release-check.yml` / `test-compile.yml`.
+     `cargo build --release -p nanna-daemon --locked` green in **20m08s from a cold target dir**
+     — no `tokio` ICE, no `turso_core` depth overflow, and the previous pin's
+     `recursion_depth_exceeding_limit` does not return. One future-incompat warning is new and
+     **is not ours to fix**: `attribute-derive-macro 0.10.5` (trailing semicolon in macro
+     expression position, rust#79813) sits five levels down a rustpython chain
+     (`rustpython-pylib → …-codegen → …-ruff_python_ast → get-size2 → get-size-derive2 →
+     attribute-derive`). Recorded in `rust-toolchain.toml` so a later run does not mistake it
+     for new breakage in our own code.
+     GUI: `pnpm update --latest` (excluding typescript) took the tiptap suite 3.30.3 → 3.30.5 across
+     all 12 packages, `vue 3.5.41 → 3.5.42`, `happy-dom 20.11.6 → 20.11.8`; `vue-tsc --noEmit` clean,
+     **237 vitest green**. `typescript@7.0.2` attempted and reverted for the third time — the exact
+     failure and the upstream tracking issue are recorded on the deferred item above.
    - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
      aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
      others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
@@ -5227,6 +5298,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
        PR (#7905) whose status was not readable from the issue page. Re-check on the next sweep: if a
        turso release ships default-pure-Rust `turso_core`, drop the transitive `aegis` pin entirely
        instead of carrying an exact version forward.
+       *(re-checked 2026-08-27: issue #7660 is **still open**, still unassigned and with no milestone;
+       PR #7905 still the only linked work. The `aegis` pin stays.)*
      GUI: `pnpm install` then `pnpm outdated` — every compatible-range package is already at latest;
      the only entries left are the five known-deferred majors (tiptap 3, typescript 7, vue-router 5,
      vue-sonner 2, and the `lucide-vue-next` -> `@lucide/vue` rename). **`lucide-vue-next@1.0.0` was
