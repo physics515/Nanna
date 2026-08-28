@@ -1460,6 +1460,21 @@ Open: swarm execution view in GUI (CriticalPathMetrics tracked but not visualize
 ### P6 — Production Hardening 🚧 (partial)
 Done: outbound rate limiting (per-provider token buckets), error recovery / exponential backoff with
 jitter, priority message queue, graceful 429 handling, health endpoint, PID file. Open:
+- [x] **A release could be right about its binaries and wrong about its source**
+      *(found by cutting v0.3.11-beta.20, 2026-08-27)* — `release.yml` called
+      `gh release create` without `--target`, so a NEW tag is created on the repository's
+      **default branch** regardless of which ref the build ran from. Dispatching the workflow
+      with `--ref <branch>` therefore produced a release whose assets were built from the
+      branch (`Nanna_0.3.11_x64-setup.exe`, correct) under a tag pointing at `master`, whose
+      `Cargo.toml` still said `0.3.10` and which contained none of the shipped fixes. The
+      release body was even the branch's own `RELEASE_NOTES.md` — the job checks the branch
+      out; it just never told `gh` which commit to tag.
+      **The defining property is silence**: every asset is correct, so nothing looks wrong
+      until someone checks out the tag and gets different code. Fixed with
+      `--target "$GITHUB_SHA"` on the create path only (the upload path re-uses an existing
+      tag, where a different commit is legitimate), plus a guard that resolves the tag back
+      through the API and fails the job unless it equals the built commit — the same
+      assert-don't-trust shape as the version guard already in that job.
 - [x] **The shipped default model was a retired snapshot** *(found by a real daemon boot,
       2026-08-27)* — every unconfigured install sent its scheduled heartbeat to a `404
       not_found_error`, and nothing said so above `WARN`. Found the only way it could be: the
