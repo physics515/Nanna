@@ -2506,6 +2506,60 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       tests (mixed-direction flood → all 36 signals counted, fixed 16-byte accumulator, exact −5.2 aggregate
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
+      *(2026-08-28)* **The thumbs half is now real — and it was worse than unwired: it was wired to
+      the wrong answer.** Slack `reaction_added` events already reached
+      `AppState::record_message_feedback`, so this path has been live in `nanna serve` all along.
+      What it did with them: `is_positive_reaction` matched **substrings** and **fell through to
+      `true`**. Two consequences, both read off the shipped code. (1) *Any* unrecognised emoji counted
+      as praise — a pizza on an answer applied `MemoryFeedback::Helpful` (+0.3 FSRS boost) to **every**
+      memory the session had stored in the last ten minutes. Silence is the honest response to an emoji
+      nobody assigned a meaning to, and a `bool` return had nowhere to put it. (2) Substring matching
+      inverted real signals: `broken_heart` contains `heart`, so a broken heart **promoted**. Replaced
+      by `classify_reaction() -> ReactionFeedback::{Positive, Negative, NotFeedback}`, exact-matching a
+      canonical name after stripping Slack's `::skin-tone-N` modifier (documented 2..=6 — a
+      `thumbsup::skin-tone-6` previously matched nothing and fell through to the default). 5 tests,
+      including both inversions and a disjoint/lowercase check across the two tables.
+      **And the accumulator behind it was unbounded.** `session_recent_memories` had *two* write paths
+      — `track_memory_for_session`, capped at 50 per session, and an inline copy inside the
+      memory-extraction callback with **no cap at all** — and the callback is the one that actually
+      runs, so the cap lived on the path nothing called. The ten-minute recency filter ran only inside
+      `record_message_feedback`, i.e. only if somebody reacted, which on the common path never happens:
+      a daemon nobody thumbs-ups grew that map for the lifetime of the process. Now one write path
+      (`track_memory_in`) that prunes by the attribution window **on write** — the principled bound,
+      since an entry past the window can never be read by anything — dropping sessions left empty, with
+      a stated 256-session backstop (about 1.3 MB ceiling) for a burst inside one window. Also stopped
+      `record_message_feedback` from `entry().or_default()`-ing an empty vector for every session it
+      merely asked about. 3 tests; 30 `nanna-server` lib + 7 fail-closed tests green.
+      Still open here: **corrections and tool-success/failure**, which is where the
+      `UsedSuccessfully`/`CausedError` variants finally get fed — reactions only ever produce
+      Helpful/Unhelpful.
+      - [ ] *(2026-08-28)* **Telegram could feed the same loop; today it cannot see reactions.**
+            `crates/nanna-channels/src/listeners/telegram.rs:87` requests
+            `allowed_updates = ["message","edited_message"]`, and Telegram delivers
+            `message_reaction` **only** to bots that name it explicitly in `allowed_updates` *and* are
+            an administrator in the chat (reactions set by bots are never delivered at all). Wiring it
+            means handling `MessageReactionUpdated` — an old/new reaction **list diff**, not a single
+            emoji — and mapping Telegram's emoji onto the same classifier. Source:
+            [Bot API, MessageReactionUpdated](https://core.telegram.org/bots/api#messagereactionupdated).
+      - [ ] *(2026-08-28)* **Discord reactions need the Gateway, which this repo does not run.**
+            `webhooks/discord.rs` already notes it in a comment; recorded here so a future run does not
+            re-derive it. Interaction webhooks never carry `MESSAGE_REACTION_ADD`, so the
+            `link_message_to_session` call Discord makes today can never be consumed.
+      *(2026-08-28, follow-on)* **The other half of the attribution path had the same defect, in a
+      quieter form.** `message_session_map` is what turns a reaction back into a session, and its
+      cap read `map.keys().take(MAX_ENTRIES / 2)` — `HashMap` iteration order, so it discarded
+      **5000 arbitrary links at once**. The message a person was about to react to was exactly as
+      likely to be dropped as one from an hour earlier, which makes the cap smaller without making
+      it more useful. Worse, nothing expired: a link from last week sat there forever pointing at a
+      session whose memories had aged out of the ten-minute window long ago, so the map grew with
+      uptime rather than with traffic.
+      Links now carry their timestamp (`LinkedSession`) and prune by the **same**
+      `FEEDBACK_ATTRIBUTION_WINDOW` the memories use — which is exactly right rather than merely
+      convenient: both are stamped inside one turn, so a link older than the window can only ever
+      resolve to memories that have already expired, and dropping it loses nothing a reaction could
+      have used. The 10 000-link cap survives as a burst backstop, but it now evicts the **oldest**
+      link, one at a time. 2 tests, including one that proves a recent link is not collateral damage
+      when the cap fires.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
       - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
             Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17, corrected off-by-one
@@ -3326,8 +3380,38 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       listeners already extract voice-note file ids, but the daemon drops non-text messages
       (crates/nanna-daemon/src/channels.rs:231). Register the service, download channel media, transcribe
       before the ignore-non-text branch. Voice note from your phone → answer is hallmark personal-daemon UX.
-- [ ] **`pdf.read`** — complete ReadPdfTool (text + OCR fallback, tested) registered nowhere; read_pdf skill
+- [x] **`pdf.read`** — complete ReadPdfTool (text + OCR fallback, tested) registered nowhere; read_pdf skill
       errors at runtime. Pure registration fix.
+      *(2026-08-28)* **Landed — and it was not purely a registration fix.** The service is now
+      registered in `build_script_services` (`crates/nanna-daemon/src/server.rs`), so the bundled
+      `read_pdf` skill stops answering every call with *"PDF reading service not available"*. Two
+      things the registration alone would have shipped broken:
+      **(1) The `pages` argument was being discarded in silence.** The skill has always sent
+      `pages: "1-5"` / `"3"`; `ReadPdfTool` only ever read an integer `max_pages`, so asking for
+      page 3 of a forty-page contract would have returned all forty with nothing saying the request
+      was ignored — a wrong answer that looks like a right one, which is worse than the error the
+      skill used to return. Added `PageSelection` + `parse_page_selection` covering `"3"`, `"2-5"`,
+      `"4-"`, `"-4"` and empty, refusing what it cannot read rather than guessing: `"5-2"` is an
+      error, not a silently reversed range, and page `0` is named as a caller bug. A selection past
+      the end reads nothing and says so, instead of quietly yielding the last page. `max_pages` still
+      works; `pages` wins when both arrive, being the more specific request.
+      **(2) It was an unbounded read.** `read_file` refuses a file over 10 MB; `read_pdf` had no
+      ceiling at all, so it was a way into exactly what the file reader turns away. Same constant,
+      stated as such (`PDF_MAX_BYTES`), checked from `metadata()` before the bytes are buffered. The
+      service also returns `page_count` / `pages_read` / `empty_pages` beside the text — the same
+      contract `read_file`'s `total_lines`/`lines_returned` offers, so a caller can tell it did not
+      get the whole document without inferring it from the prose. `lopdf` parsing is synchronous and
+      runs under `spawn_blocking`, off the runtime workers.
+      5 tests over the selection grammar and clamping.
+      - [ ] **Wire the OCR fallback.** `ReadPdfTool::with_ocr_fn` exists and is tested, but `OcrTool`
+            is itself registered nowhere, so image-only pages still come back empty. Deliberately not
+            faked in this increment: a half-wired OCR path is indistinguishable from a scanned
+            document that genuinely has no text, and the extractor already says which pages yielded
+            nothing.
+      - [ ] **`create_vision_tool` has no callers either.** `vision_wiring::create_vision_tool` and
+            `OcrTool` are both complete, exported, and unreachable — the same shape of gap `pdf.read`
+            had. Worth one audit pass over `nanna-tools`' built-ins asking which are actually
+            registered anywhere, rather than finding them one at a time.
 - [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
       (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
       local model, largely redundant with exec + browser).
@@ -5439,6 +5523,48 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      all 12 packages, `vue 3.5.41 → 3.5.42`, `happy-dom 20.11.6 → 20.11.8`; `vue-tsc --noEmit` clean,
      **237 vitest green**. `typescript@7.0.2` attempted and reverted for the third time — the exact
      failure and the upstream tracking issue are recorded on the deferred item above.
+   - *(2026-08-28 sweep)* `cargo update` -> 6 compatible bumps (`chacha20 0.10.2`,
+     `cpufeatures 0.3.1`, `flate2 1.1.10`, `libredox 0.1.21`, `twox-hash 2.1.4`, `wide 1.7.0`).
+     `cargo upgrade --incompatible` offered four; **two applied green, both compiled unchanged** —
+     **`wide 1.6 -> 1.7`** (workspace root, consumed by `nanna-simd`) and **`deno_core 0.410 ->
+     0.411`** (`nanna-scripting`, which pulled `deno_ops 0.287`, `deno_v8 0.3`, `serde_v8 0.320`).
+     Both manifests hand-edited rather than run through `cargo-upgrade`, per its documented CRLF
+     churn. The other two were **re-verified against the registry this run, not assumed**:
+     `rten 0.24 -> 0.25` still blocked (`cargo info ocrs` -> still **0.12.2**, still `rten ^0.24`)
+     and `criterion 0.8 -> "0.7"` still the downgrade trap (`cargo info criterion` -> **0.8.2**,
+     which the lock already holds).
+     **Correction to the 2026-08-26 claim that the `malachite-bigint` pin "stopped being a per-run
+     step".** It did not, and the reasoning behind it was wrong. `pymath 0.2.0` requires
+     `malachite-bigint = "0"` — *any* 0.x — so `cargo update` always takes the newest; this run it
+     took **0.11.0** while `rustpython-common` stayed on 0.9.2. The `=0.9.2` req added to
+     `crates/nanna-scripting/Cargo.toml` binds only **our own edge** and never constrained `pymath`,
+     so it cannot prevent the split — it is worth keeping as documentation of the constraint, but it
+     is not the gate. Re-pinned with `cargo update -p malachite-bigint@0.11.0 --precise 0.9.2`.
+     **What actually held the line is the test**, which reported the split in 0.00s instead of ~20
+     minutes into a release build — the outcome that item was written for.
+     **The guard's own remedy was stale, though, and is now derived rather than written down.**
+     `dep_version_unification.rs` printed `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`;
+     against this run's graph that command errors out, because 0.10.0 is not in it — a fix message
+     that does not work is worse than none, since it costs a cycle to discover. `Remedy` is now an
+     enum: `PinBackTo(keep)` builds one exact command **per stray version actually observed** (and
+     asserts the keep-version is still in the graph, so a vanished pin target is re-decided rather
+     than re-pinned), `Manual(text)` carries the `rten`/`rten-tensor` cases where the fix is a
+     manifest change and no command exists. +2 unit tests over `Remedy::describe`; 5/5 green.
+     **Verified in a CLEAN target dir, and that is the headline, not a footnote** — the first pass
+     reported 1697 passing tests and then died in `nanna-agent`'s doctests on an `E0514` from a
+     neighbouring project's toolchain (see the `CARGO_TARGET_DIR` item below, now ticked and landed
+     in the routine's guardrails). Re-run cold under a worktree-specific target dir: workspace
+     (excl. `nanna-gui`) `--all-targets` build green, **1703 tests pass / 0 fail / 12 ignored,
+     doctests included**, and `cargo build --release -p nanna-daemon --locked` green. Toolchain
+     stays on `nightly-2026-08-27`; that release build is the evidence the pin still holds.
+     Frontend: `pnpm outdated` showed four in-range bumps and the one known blocker. Applied green —
+     `@lucide/vue 1.35.0`, `vue-router 5.3.0`, `@vue/test-utils 2.5.0`, `happy-dom 20.11.12`
+     (`vue-tsc --noEmit` clean, **238/238 vitest**, `pnpm build` green). `typescript 7.0.2` **not
+     attempted** this run: the failure and its upstream tracking issue are recorded on the deferred
+     item above and nothing has moved, so a fourth identical attempt would be ceremony.
+     *Gotcha worth recording:* `pnpm install` failed once with `ERR_PNPM_EPERM` renaming
+     `monaco-editor_tmp_*` into place on Windows; an immediate identical re-run succeeded. Treat a
+     single EPERM rename as flaky-retry-once, not as a corrupt store.
    - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
      aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
      others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
@@ -5527,12 +5653,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            the workspace's cached artifacts mid-run for a probe that could not then be finished and
            verified. **Next run should do this first**, before any other cargo work, so the cache
            eviction is paid once at the start rather than stranding an increment.
-           - [ ] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
+           - [x] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
                  The shared target dir is a standing tax: two toolchains and several worktrees contend
                  for one lock, so builds serialise behind unrelated projects (observed this run: a
                  4-minute incremental build took 12, and a 22-minute release build was mostly waiting).
                  It is also the hazard already recorded for benchmarks — a binary in the shared
                  `release/` may have been produced by another worktree.
+                 *(2026-08-28 — no longer a "consider": it corrupted a gate, and the routine now
+                 requires the pin.)* The tax was the smaller half. On this run
+                 `cargo test --workspace --exclude nanna-gui` reported **1697 passed / 0 failed** and
+                 then died compiling `nanna-agent`'s doctests with **`E0514: found crate
+                 `unicode_ident` compiled by an incompatible version of rustc`** — the shared
+                 `D:\Development\Cargo Target` held an rmeta built by **nightly `787af2b8c`
+                 (2026-08-25)** while this workspace pins **`bff8e12ff` (2026-08-26)**, because a
+                 neighbouring project had built it there under its own toolchain. Nothing in this
+                 repo was wrong; the gate was. That is the real cost — not slow builds, but a run
+                 unable to distinguish a genuine failure from a contaminated one, which makes every
+                 number it reports unearned. Re-run under a worktree-specific `CARGO_TARGET_DIR`:
+                 cold build green, **1703 tests pass / 0 fail / 12 ignored with doctests included**.
+                 Landed as a hard guardrail in `.claude/skills/daily-dev/SKILL.md` (export it before
+                 the FIRST cargo command, on every invocation — shell state does not survive between
+                 tool calls) rather than as a repo-level `.cargo/config.toml`: the shared dir is the
+                 operator's deliberate choice for their own work, so this is the routine's concern,
+                 not the repo's. Cost is one cold build (~10 min debug, ~16-23 min release).
+                 *(same day, a correction to where it goes)* The first attempt put it in a
+                 **sibling** directory, `D:\Development\Cargo Target-nightly`. That does not
+                 survive on this machine: the whole ~30 GB tree vanished minutes after the final
+                 release build finished, taking the freshly-built `nanna-daemon.exe` with it — the
+                 builds had already been observed green so no result was lost, but the real-binary
+                 smoke run had to be rebuilt for. The machine already has a convention and it is a
+                 **subdirectory of the shared dir**: `Cargo Target\{nanna-nightly,
+                 mummu-nightly-*, wt-*, *-routine}` are all already there. Use
+                 `Cargo Target\<worktree-name>`; the skill now says so explicitly.
      - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at

@@ -27,8 +27,51 @@ struct UnifiedCrate {
     name: &'static str,
     /// Why a second copy breaks the build — the type that crosses the boundary.
     reason: &'static str,
-    /// The concrete command that restores unification.
-    remedy: &'static str,
+    /// How to restore unification once it has split.
+    remedy: Remedy,
+}
+
+/// How a split is repaired.
+///
+/// The distinction is not cosmetic: one form can be turned into an exact
+/// command from what the lockfile actually holds, and the other cannot.
+enum Remedy {
+    /// A permissive transitive requirement drifted upward, and the fix is a
+    /// lockfile pin back onto the version the rest of the graph needs. The
+    /// command is *derived* from the strays actually observed — a hardcoded
+    /// one goes stale the moment upstream publishes again, and then prints a
+    /// `cargo update -p name@<gone>` that errors out instead of fixing
+    /// anything. Not hypothetical: this entry named `@0.10.0` while the graph
+    /// had already drifted to `0.11.0`.
+    PinBackTo(&'static str),
+    /// No mechanical command — a manifest requirement has to change.
+    /// Carries the instruction verbatim.
+    Manual(&'static str),
+}
+
+impl Remedy {
+    /// Render the fix for a crate that resolved to `versions` (len >= 2).
+    fn describe(&self, name: &str, versions: &[&str]) -> String {
+        debug_assert!(versions.len() >= 2, "only called on an actual split");
+        debug_assert!(!name.is_empty(), "crate name must be non-empty");
+        match self {
+            Remedy::Manual(text) => (*text).to_string(),
+            Remedy::PinBackTo(keep) => {
+                assert!(
+                    versions.contains(keep),
+                    "`{name}` must keep {keep}, but the graph holds {versions:?} — the pin \
+                     target left the graph, so this entry needs re-deciding, not re-pinning"
+                );
+                let commands: Vec<String> = versions
+                    .iter()
+                    .filter(|version| *version != keep)
+                    .map(|stray| format!("cargo update -p {name}@{stray} --precise {keep}"))
+                    .collect();
+                assert!(!commands.is_empty(), "a split must have at least one stray");
+                commands.join("\n       ")
+            }
+        }
+    }
 }
 
 /// Crates that MUST appear exactly once in the resolved graph.
@@ -39,24 +82,29 @@ struct UnifiedCrate {
 const UNIFIED_CRATES: &[UnifiedCrate] = &[
     UnifiedCrate {
         name: "malachite-bigint",
-        reason: "`pymath` accepts 0.10 while `rustpython-codegen` requires 0.9, so a bare \
-                 `cargo update` resolves both and `rustpython-stdlib` fails to compile with 17 \
-                 E0277/E0308 errors about `malachite_bigint::{BigInt, BigUint}`",
-        remedy: "cargo update -p malachite-bigint@0.10.0 --precise 0.9.2",
+        reason: "`pymath` requires `malachite-bigint = \"0\"` — any 0.x, so a \
+                 bare `cargo update` always takes the newest — while `rustpython-common` \
+                 resolves 0.9, and `rustpython-stdlib`, which depends on both, then fails to \
+                 compile with 17 E0277/E0308 errors about `malachite_bigint::{BigInt, \
+                 BigUint}`. The `=0.9.2` req in crates/nanna-scripting/Cargo.toml pins only \
+                 OUR edge and does not constrain `pymath`, so the split recurs every sweep",
+        remedy: Remedy::PinBackTo("0.9.2"),
     },
     UnifiedCrate {
         name: "rten",
         reason: "`ocrs` takes `rten::Model` in `OcrEngineParams { detection_model, \
                  recognition_model }`; a direct `rten` req ahead of what `ocrs` pins hands it a \
                  model from the other copy (E0308)",
-        remedy: "keep `rten` in crates/nanna-tools/Cargo.toml at whatever version `ocrs` requires \
-                 (`cargo tree -p ocrs -e normal --depth 1`)",
+        remedy: Remedy::Manual(
+            "keep `rten` in crates/nanna-tools/Cargo.toml at whatever version `ocrs` \
+             requires (`cargo tree -p ocrs -e normal --depth 1`)",
+        ),
     },
     UnifiedCrate {
         name: "rten-tensor",
         reason: "the tensor types `rten` and `ocrs` exchange live here, so it splits for the same \
                  reason `rten` does and is the half that reports the mismatch",
-        remedy: "same as `rten` — track `ocrs`'s requirement",
+        remedy: Remedy::Manual("same as `rten` — track `ocrs`'s requirement"),
     },
 ];
 
@@ -144,7 +192,7 @@ fn type_crossing_crates_resolve_to_one_version() {
             versions.len(),
             versions,
             guarded.reason,
-            guarded.remedy,
+            guarded.remedy.describe(guarded.name, &versions),
         );
     }
 }
@@ -204,4 +252,34 @@ version = \"0.10.0\"
         versions.contains(&"0.10.0"),
         "the offending copy must be visible: {versions:?}"
     );
+}
+
+#[test]
+fn pin_back_remedy_names_the_versions_actually_present() {
+    // The whole point of deriving the command: the stray version is whatever the
+    // lockfile drifted to, not whatever was written down when the entry was added.
+    let remedy = Remedy::PinBackTo("0.9.2");
+    let text = remedy.describe("malachite-bigint", &["0.9.2", "0.11.0"]);
+    assert!(
+        text == "cargo update -p malachite-bigint@0.11.0 --precise 0.9.2",
+        "got {text:?}"
+    );
+
+    // Two strays at once still produce one runnable command each.
+    let text = remedy.describe("malachite-bigint", &["0.9.2", "0.10.0", "0.11.0"]);
+    assert!(
+        text.lines().count() == 2,
+        "expected one command per stray, got {text:?}"
+    );
+    assert!(
+        text.contains("@0.10.0 --precise 0.9.2") && text.contains("@0.11.0 --precise 0.9.2"),
+        "both strays must be named: {text:?}"
+    );
+}
+
+#[test]
+fn manual_remedy_is_passed_through_unchanged() {
+    let remedy = Remedy::Manual("track `ocrs`'s requirement");
+    let text = remedy.describe("rten", &["0.24.0", "0.25.0"]);
+    assert!(text == "track `ocrs`'s requirement", "got {text:?}");
 }
