@@ -41,3 +41,61 @@ updates:
     schedule:
       interval: monthly
     labels: ["dependencies", "ci"]
+
+  # Group updates for non-critical dependencies
+  - package-ecosystem: cargo
+    directory: "/"
+    groups:
+      dev-dependencies:
+        patterns:
+          - "*test*"
+          - "*dev*"
+        update-types: "minor"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "rust"]
+
+  # Group updates for npm dev dependencies
+  - package-ecosystem: npm
+    directory: "/gui"
+    groups:
+      dev-dependencies:
+        patterns:
+          - "*dev*"
+          - "*test*"
+        update-types: "minor"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "javascript"]
+
+  # Security updates (critical)
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "rust", "security"]
+    ignore:
+      - dependency-name: turso
+        update-types: ["version-update:semver-major"]
+      - dependency-name: aegis
+        update-types: ["version-update:semver-major"]
+
+  # Security updates for npm
+  - package-ecosystem: npm
+    directory: "/gui"
+    schedule:
+      interval: daily
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "javascript", "security"]
+
+  # Security updates for GitHub Actions
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "06:00"
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "ci", "security"]

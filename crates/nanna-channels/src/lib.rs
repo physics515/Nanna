@@ -270,7 +270,7 @@ impl ChannelCapabilities {
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Get the provider name
-    fn provider(&self) -> &str;
+    fn provider(&self) -> String;
 
     /// Get channel capabilities
     fn capabilities(&self) -> ChannelCapabilities;

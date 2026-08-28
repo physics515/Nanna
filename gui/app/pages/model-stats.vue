@@ -153,6 +153,12 @@
           <span v-if="model.consecutive_failures > 0" class="text-nanna-error">
             {{ model.consecutive_failures }} consecutive failures
           </span>
+          <span v-if="model.cost_priced" class="text-nanna-accent font-medium">
+            Cost: ${{ model.cost_usd.toFixed(2) }}
+          </span>
+          <span v-else class="text-nanna-text-dim">
+            Cost: Unknown pricing
+          </span>
         </div>
       </div>
     </div>
@@ -162,7 +168,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { RefreshCw, BarChart3 } from 'lucide-vue-next'
+import { RefreshCw, BarChart3, DollarSign, Calendar, Clock } from 'lucide-vue-next'
 
 const { isOnline } = useBackend()
 const toast = useToast()
@@ -181,6 +187,15 @@ interface ModelStat {
   consecutive_failures: number
   is_healthy: boolean
   escalation_count: number
+  cost_usd: number
+  cost_priced: boolean
+}
+
+interface CostAggregation {
+  model: string
+  cost_usd: number
+  requests: number
+  tokens: number
 }
 
 const models = ref<ModelStat[]>([])

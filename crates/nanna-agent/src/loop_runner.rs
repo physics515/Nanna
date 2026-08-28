@@ -170,51 +170,10 @@ pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 /// user-facing way to turn it off: the config flag and the Settings switch
 /// that used to gate it were deleted, and every `AgentConfig`-shaped default
 /// in the workspace now starts from [`ThinkingMode::default`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThinkingMode {
-    /// No explicit thinking — fast responses.
-    ///
-    /// INTERNAL ONLY. No config, IPC command, or UI control selects this;
-    /// it exists so an internal caller (planner, sub-agent, swarm) can pass
-    /// it through the per-run `RunOptions::thinking_mode` escape hatch when
-    /// a step genuinely wants no reasoning budget.
-    Instant,
-    /// Low thinking budget (1024 tokens) — the API minimum.
-    Low,
-    /// Medium thinking budget (4096 tokens). **The default.**
-    ///
-    /// Derived from the request contract, not taste. The shipped output
-    /// budget is `max_tokens: 8192`, and the sent budget must leave the
-    /// visible answer at least [`MIN_OUTPUT_RESERVE_TOKENS`] (1112) of room
-    /// — so the largest step that fits is the largest `budget < 8192 - 1112
-    /// = 7080`. `High` (8192) and `Maximum` (16384) both exceed the whole
-    /// output budget and would be clamped on every single request, i.e. the
-    /// enum value would be a lie. `Medium` is the largest step that survives
-    /// the standard budget unclamped.
-    ///
-    /// The budget reaches the wire only on the pre-4.6 contract; on adaptive
-    /// models the model chooses its own depth, and this figure survives as the
-    /// reasoning room reserved in the context budget and added to the request
-    /// ceiling (`max_tokens` covers thinking and the answer together — see
-    /// [`request_output_budget`]). See also [`thinking_for_model`].
-    #[default]
-    Medium,
-    /// High thinking budget (8192 tokens).
-    High,
-    /// Maximum thinking budget (16384 tokens).
-    Maximum,
-}
-
-impl ThinkingMode {
-    /// Get the thinking budget in tokens for this mode
-    #[must_use]
-    pub const fn budget_tokens(&self) -> Option<u32> {
-        match self {
-            Self::Instant => None,
-            Self::Low => Some(MIN_THINKING_BUDGET_TOKENS),
-            Self::Medium => Some(4096),
-            Self::High => Some(8192),
-            Self::Maximum => Some(16384),
+#[doc = r#"
+See [`crate::types::ThinkingMode`] for the enum definition.
+See [`crate::types::ThinkingMode::budget_tokens`] for the budget getter.
+"#]
         }
     }
 

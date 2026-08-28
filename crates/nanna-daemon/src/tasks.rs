@@ -1411,6 +1411,15 @@ pub struct AgentStepRunner {
     /// than once per step — the runner is one object for the whole run, while
     /// each step gets a fresh `RunState`.
     pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Tools the user manually added to this chat's context (per-session
+    /// selection, stored on the session and threaded through `ChatTurnPrep`).
+    ///
+    /// Strictly additive: unioned into every step's active set AFTER the core
+    /// set and BEFORE run-discovered tools, deduplicated. Empty = no manual
+    /// selection, which leaves the active set byte-identical to the
+    /// pre-feature behavior (core + discovered only). Unknown names cost
+    /// nothing — the registry simply has nothing to activate for them.
+    pub user_selected_tools: Vec<String>,
     /// The sibling breakers' repeat-call ledger for THIS run.
     ///
     /// Shared across steps for exactly the reason `discovered_tools` above
@@ -1966,6 +1975,35 @@ pub(crate) fn last_side_effect_note(name: &str, secs_ago: u64) -> String {
 /// of `command`. If a prompt ever needs to name a tool, the answer is to fix
 /// the prompt, not to widen this list.
 const CORE_TOOLS: &[&str] = &["discover_tools"];
+
+/// The one place a step's starting active-tool set is assembled: the default
+/// set (core + tools discovered so far this run, exactly as before), with the
+/// user's manual per-chat selections APPENDED.
+///
+/// The contract this function exists to make testable:
+/// - **Empty selection = unchanged.** With no user selections the result is
+///   byte-identical to the pre-feature computation — core first, then
+///   discovered — so default behavior (core tools, `discover_tools` paging,
+///   per-task scopes) cannot drift.
+/// - **Selections only ever ADD.** A user pick already present in the default
+///   set is not duplicated; nothing is ever removed or reordered by a pick.
+fn merge_active_tools(
+    core: &[&str],
+    discovered: &std::collections::HashSet<String>,
+    user_selected: &[String],
+) -> Vec<String> {
+    let mut active: Vec<String> = core
+        .iter()
+        .map(|t| (*t).to_string())
+        .chain(discovered.iter().cloned())
+        .collect();
+    for tool in user_selected {
+        if !active.iter().any(|t| t == tool) {
+            active.push(tool.clone());
+        }
+    }
+    active
+}
 
 /// Content not worth a memory: machine noise rather than an observation.
 ///
@@ -2881,11 +2919,7 @@ impl AgentStepRunner {
         // which is what the design said all along.
         let active: Vec<String> = {
             let discovered = self.discovered_tools.read().await;
-            CORE_TOOLS
-                .iter()
-                .map(|t| (*t).to_string())
-                .chain(discovered.iter().cloned())
-                .collect()
+            merge_active_tools(CORE_TOOLS, &discovered, &self.user_selected_tools)
         };
         let restrict_to_active = true;
 
@@ -6868,6 +6902,76 @@ mod core_tool_gating_tests {
             "the list is one tool. Every past widening started as a good local \
              reason and ended as the prompt and the request disagreeing about \
              what the model can call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_active_tools_tests {
+    use super::{merge_active_tools, CORE_TOOLS};
+    use std::collections::HashSet;
+
+    fn discovered(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// THE compatibility assertion: with no user selection the merge is
+    /// byte-identical to the pre-feature computation (core first, then
+    /// discovered) — default tool behavior cannot drift.
+    #[test]
+    fn empty_selection_is_unchanged() {
+        let disc = discovered(&["exec", "read_file"]);
+        let legacy: Vec<String> = CORE_TOOLS
+            .iter()
+            .map(|t| (*t).to_string())
+            .chain(disc.iter().cloned())
+            .collect();
+        assert_eq!(
+            merge_active_tools(CORE_TOOLS, &disc, &[]),
+            legacy,
+            "no picks must mean the exact same active set as before the feature"
+        );
+    }
+
+    /// User picks are unioned in — appended after the default set.
+    #[test]
+    fn selection_adds_tools() {
+        let disc = discovered(&["exec"]);
+        let picks = vec!["web_search".to_string(), "read_pdf".to_string()];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert!(active.contains(&"web_search".to_string()));
+        assert!(active.contains(&"read_pdf".to_string()));
+        // And the defaults are all still there — picks only ever ADD.
+        assert!(active.contains(&"discover_tools".to_string()));
+        assert!(active.contains(&"exec".to_string()));
+    }
+
+    /// A pick already in the default set is not duplicated — selecting a core
+    /// or already-discovered tool is a no-op, never a reorder or removal.
+    #[test]
+    fn duplicate_picks_are_not_doubled() {
+        let disc = discovered(&["exec"]);
+        let picks = vec![
+            "discover_tools".to_string(), // core
+            "exec".to_string(),           // discovered
+            "exec".to_string(),           // repeated pick
+            "todo".to_string(),           // genuinely new
+        ];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert_eq!(
+            active.iter().filter(|t| *t == "discover_tools").count(),
+            1,
+            "picking a core tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "exec").count(),
+            1,
+            "picking a discovered tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "todo").count(),
+            1,
+            "a repeated pick lands once"
         );
     }
 }

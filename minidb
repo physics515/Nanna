@@ -1,0 +1,69 @@
+#!/bin/sh
+# minidb - A POSIX shell key-value store CLI
+# Data lives in $MINIDB_FILE (default: ./minidb_data)
+# Format: key<TAB>value (one record per line)
+
+DATA_FILE="${MINIDB_FILE:-./minidb_data}"
+
+usage() {
+    echo "Usage: minidb <command> [args]"
+    echo "Commands:"
+    echo "  set <key> <value>   Set a key-value pair"
+    echo "  get <key>           Get value for key (or 'nil' if not found)"
+    echo "  del <key>           Delete a key"
+    echo "  list                List all keys"
+    echo "  clear               Clear all data"
+    echo "  help                Show this help"
+    exit 2
+}
+
+# Ensure data file exists
+touch "$DATA_FILE"
+
+case "$1" in
+    set)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: minidb set <key> <value>" >&2
+            exit 1
+        fi
+        key="$2"
+        value="$3"
+        printf '%s\t%s\n' "$key" "$value" >> "$DATA_FILE"
+        ;;
+    get)
+        if [ -z "$2" ]; then
+            echo "Usage: minidb get <key>" >&2
+            exit 1
+        fi
+        key="$2"
+        result=$(grep "^${key}	" "$DATA_FILE" | head -n1 | cut -f2)
+        if [ -z "$result" ]; then
+            echo "nil"
+        else
+            echo "$result"
+        fi
+        ;;
+    del)
+        if [ -z "$2" ]; then
+            echo "Usage: minidb del <key>" >&2
+            exit 1
+        fi
+        key="$2"
+        # Delete lines matching the key (exact tab-separated match)
+        grep -v "^${key}	" "$DATA_FILE" > "${DATA_FILE}.tmp" || true
+        mv "${DATA_FILE}.tmp" "$DATA_FILE"
+        ;;
+    list)
+        cut -f1 "$DATA_FILE" | sort
+        ;;
+    clear)
+        > "$DATA_FILE"
+        ;;
+    help|--help|-h|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage
+        ;;
+esac

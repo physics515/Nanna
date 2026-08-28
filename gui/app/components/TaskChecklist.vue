@@ -325,13 +325,14 @@ function handleDragLeave() {
   dragOverIndex.value = null
 }
 
-async function handleDrop(e: DragEvent, targetIndex: number) {
-  e.preventDefault()
-  dragOverIndex.value = null
+    async function handleDrop(e: DragEvent, targetIndex: number) {
+    e.preventDefault()
+    if (e.dataTransfer && draggedIndex.value !== null) {
+      e.dataTransfer.setData('text/plain', String(draggedIndex.value))
+    }
+    dragOverIndex.value = null
 
-  if (draggedIndex.value === null || draggedIndex.value === targetIndex) {
-    draggedIndex.value = null
-    return
+   if (draggedIndex.value === null || draggedIndex.value === targetIndex) {
   }
 
   const draggedTask = tasks.value[draggedIndex.value]

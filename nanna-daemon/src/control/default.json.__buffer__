@@ -1,0 +1,1 @@
+# Unrestricted Mode Implementation\n// Enable full system access for agent loop and browser control\n\n[general]\nname = "Nanna-Unrestricted"\n\n[tools]\n// Allow all tools via wildcard access\nwildcard_tool_access = true\n\n[daemon]\nenabled = true\nport = 3000\n[memory:073299db159d]

@@ -1,0 +1,111 @@
+//! Agent core implementation - extracted from loop_runner.rs
+//! Contains the Agent struct and all its methods
+
+use std::sync::Arc;
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use crate::types::*;
+use crate::utilities::*;
+
+/// The central agent orchestrator that manages the mission harness,
+/// tool loop, and cognitive state.
+#[derive(Debug)]
+pub struct Agent {
+    /// Current task anchor for context tracking
+    pub task_anchor: Option<String>,
+    /// Accumulated token usage across iterations
+    pub cumulative_tokens: u64,
+    /// Mission budget in tokens
+    pub mission_budget: u64,
+    /// Active capabilities with their states
+    pub capabilities: HashMap<String, CapabilityState>,
+    /// Current iteration count
+    pub iteration: usize,
+    /// Reasoning history for the current step
+    pub reasoning_history: Vec<ReasoningStep>,
+    /// Tool call history
+    pub tool_history: Vec<ToolCallRecord>,
+    /// Memory provenance tracking
+    pub memory_provenance: MemoryProvenance,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self {
+            task_anchor: None,
+            cumulative_tokens: 0,
+            mission_budget: 100_000,
+            capabilities: HashMap::new(),
+            iteration: 0,
+            reasoning_history: Vec::new(),
+            tool_history: Vec::new(),
+            memory_provenance: MemoryProvenance::Observed,
+        }
+    }
+}
+
+impl Agent {
+    /// Initialize a new agent with optional task context
+    pub fn new(task_anchor: Option<String>) -> Self {
+        Self {
+            task_anchor,
+            ..Default::default()
+        }
+    }
+
+    /// Record a tool call in the history
+    pub fn record_tool_call(&mut self, call: ToolCallRecord) {
+        self.tool_history.push(call);
+    }
+
+    /// Add reasoning step to history
+    pub fn add_reasoning(&mut self, step: ReasoningStep) {
+        self.reasoning_history.push(step);
+    }
+
+    /// Update capability state
+    pub fn update_capability(&mut self, capability: &str, state: CapabilityState) {
+        self.capabilities.insert(capability.to_string(), state);
+    }
+
+    /// Check if agent is within budget
+    pub fn within_budget(&self) -> bool {
+        self.cumulative_tokens < self.mission_budget
+    }
+
+    /// Get current status message
+    pub fn status_message(&self) -> String {
+        format!(
+            "Iteration: {} | Tokens: {}/{} ({:.1}%) | Capabilities: {}",
+            self.iteration,
+            self.cumulative_tokens,
+            self.mission_budget,
+            (self.cumulative_tokens as f64 / self.mission_budget as f64) * 100.0,
+            self.capabilities.len()
+        )
+    }
+
+    /// Check for tool loop stagnation
+    pub fn check_tool_loop(&self) -> Option<ToolLoopIssue> {
+        if self.tool_history.len() < 2 {
+            return None;
+        }
+
+        // Check for repeated tool calls with same arguments
+        let mut seen = std::collections::HashMap::new();
+        for call in &self.tool_history {
+            let key = format!("{}:{}", call.name, call.args);
+            if let Some(count) = seen.get(&key) {
+                if *count >= 2 {
+                    return Some(ToolLoopIssue::RepeatedToolCall {
+                        tool: call.name.clone(),
+                        count: *count + 1,
+                    });
+                }
+            }
+            seen.insert(key, count.unwrap_or(0) + 1);
+        }
+
+        None
+    }
+}

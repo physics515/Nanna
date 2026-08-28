@@ -448,6 +448,7 @@ impl ControlPlane {
             // message was accepted — not one a Settings click may land halfway
             // through a run that has already started streaming.
             chat_model: session.chat_model().map(str::to_string),
+            chat_tools: session.chat_tools(),
         })
     }
 }

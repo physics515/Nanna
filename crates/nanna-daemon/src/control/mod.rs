@@ -44,7 +44,7 @@ mod tests;
 
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
-    sessions: Arc<SessionManager>,
+    pub(crate) sessions: Arc<SessionManager>,
     agent: Option<Arc<AgentService>>,
     memory: Option<Arc<MemoryService>>,
     tools: Option<Arc<ToolRegistry>>,
@@ -103,7 +103,7 @@ pub struct ControlPlane {
     /// Live long-horizon chat runs and their interjection intake (P18).
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
-    chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    pub(crate) chat_runs: Arc<chat_harness::ChatRunRegistry>,
     /// Per-session liveness ledgers (P22): current phase, last tool, last
     /// side-effecting call, stop state — stamped by the chat sink, read by
     /// the liveness beat and the `session.liveness` verb.

@@ -835,6 +835,20 @@ impl DaemonClient {
         })).await
     }
 
+    /// Set or clear the user-selected extra tools for a session.
+    ///
+    /// Additive by contract (the daemon unions them into the default active
+    /// set); an empty list clears the selection and restores byte-identical
+    /// default tool behavior.
+    pub async fn session_set_tools(&self, session_id: &str, tools: Vec<String>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "set_tools",
+            "id": session_id,
+            "tools": tools
+        })).await
+    }
+
     /// Get session history
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({

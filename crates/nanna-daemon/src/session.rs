@@ -177,6 +177,16 @@ pub struct AttachmentRecord {
 /// global — see `[llm]` and `[embedding]` in the config.
 const CHAT_MODEL_KEY: &str = "chat_model";
 
+/// Metadata key holding a session's user-selected extra tools.
+///
+/// Named `chat_tools` beside `chat_model` because it is the same kind of
+/// per-chat override: a selection the user made for THIS conversation. The
+/// semantics are strictly additive — these tools are unioned into the active
+/// set a turn starts with, and an empty/absent list means "exactly the
+/// default behavior", so a session that never picked is byte-identical to
+/// before the feature existed.
+const CHAT_TOOLS_KEY: &str = "chat_tools";
+
 /// A conversation session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -247,6 +257,25 @@ impl Session {
     /// `LlmRouter::client_for_model`.
     pub fn chat_model(&self) -> Option<&str> {
         self.metadata.get(CHAT_MODEL_KEY).and_then(serde_json::Value::as_str)
+    }
+
+    /// Tools the user manually added to this chat's context, if any.
+    ///
+    /// Empty means "no manual selection" — the unset state — so a turn built
+    /// from it behaves exactly as it did before per-chat tool selection
+    /// existed. Selections only ever ADD to the default active set; they
+    /// never remove or replace defaults.
+    pub fn chat_tools(&self) -> Vec<String> {
+        self.metadata
+            .get(CHAT_TOOLS_KEY)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Add a message to the session (in-memory only — use SessionManager for persistence)
@@ -370,6 +399,10 @@ pub struct SessionSummary {
     /// sessions can render the pin without a `session.get` per row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_model: Option<String>,
+    /// User-selected extra tools, mirrored out of `metadata` for the same
+    /// reason as `chat_model`. Empty = no manual selection (default behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_tools: Vec<String>,
 }
 
 impl From<&Session> for SessionSummary {
@@ -384,6 +417,7 @@ impl From<&Session> for SessionSummary {
             owner: session.owner.clone(),
             workspace_id: session.workspace_id.clone(),
             chat_model: session.chat_model().map(str::to_string),
+            chat_tools: session.chat_tools(),
         }
     }
 }
@@ -821,6 +855,54 @@ impl SessionManager {
         }
         session.updated_at = Utc::now();
         info!("Session {} chat model set to {:?}", session_id, session.chat_model());
+        Some(SessionRow::from(&*session))
+    }
+
+    /// Set or clear this session's user-selected extra tools (empty = no
+    /// manual selection, i.e. default tool behavior).
+    ///
+    /// Additive by contract: the turn unions these into its default active
+    /// set — they never remove or replace defaults. This writes one metadata
+    /// key and touches nothing else.
+    pub async fn set_chat_tools(&self, session_id: &str, tools: Vec<String>) -> bool {
+        let Some(row) = self.apply_chat_tools(session_id, tools).await else {
+            return false;
+        };
+        // The database round trip runs with the map unlocked — see
+        // `apply_chat_model` for why that split exists.
+        self.persist_row(&row).await;
+        true
+    }
+
+    /// Apply a tool selection to the cached session and hand back the row that
+    /// still has to be written; `None` when there is no such session.
+    ///
+    /// Same lock discipline as `apply_chat_model`: the write guard dies with
+    /// this function; only the row crosses into the persist.
+    async fn apply_chat_tools(&self, session_id: &str, tools: Vec<String>) -> Option<SessionRow> {
+        // Normalize at the boundary: blank names are noise, and an empty
+        // selection is stored as ABSENCE of the key so "never picked" and
+        // "cleared the picks" are the same unset state.
+        let tools: Vec<String> = tools
+            .into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_id)?;
+        if tools.is_empty() {
+            session.metadata.remove(CHAT_TOOLS_KEY);
+        } else {
+            session.metadata.insert(
+                CHAT_TOOLS_KEY.to_string(),
+                serde_json::Value::Array(
+                    tools.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+        }
+        session.updated_at = Utc::now();
+        info!("Session {} chat tools set to {:?}", session_id, session.chat_tools());
         Some(SessionRow::from(&*session))
     }
 

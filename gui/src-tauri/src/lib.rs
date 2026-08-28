@@ -211,6 +211,7 @@ pub fn run() {
             commands::sessions::rename_session,
             commands::sessions::set_session_workspace,
             commands::sessions::set_session_model,
+            commands::sessions::set_session_tools,
             commands::settings::get_config,
             commands::settings::set_model,
             commands::settings::set_api_key,

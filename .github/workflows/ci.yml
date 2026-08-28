@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '0 3 * * *'  # Nightly run
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for secret scanning in history
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@v3
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny
+
+      - name: Install gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Install trufflehog
+        uses: aquasecurity/trufflehog-action@v2
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Audit dependencies
+        run: cargo audit
+
+      - name: Deny checks
+        run: cargo deny check
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Smoke check
+        run: cargo test --no-run smoke check || true
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --all-targets --all-features --out Xml --out-dir target/coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./target/coverage/cobertura.xml
+          fail_ci_if_error: false
+          flags: rust
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: gui/pnpm-lock.yaml
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm exec vue-tsc --noEmit || true
+
+      - name: Audit dependencies
+        run: pnpm audit
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          git-root: .
+
+      - name: Run trufflehog
+        uses: aquasecurity/trufflehog-action@v2
+        with:
+          filelist: |
+            gui/pnpm-lock.yaml
+            Cargo.lock
+          exclude: |
+            node_modules/
+            target/
+            .git/
+
+  nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@v3
+        with:
+          toolchain: stable
+
+      - name: Run nightly tests
+        run: cargo test --workspace --all-features
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          git-root: .

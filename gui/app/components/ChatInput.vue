@@ -112,15 +112,19 @@
       </div>
 
       <!-- ═══ Bottom: Toolbar with Ground Glass ═══ -->
-    <!-- Attachment previews -->
-    <div v-if="pendingAttachments.length > 0" class="attachment-strip">
-      <div v-for="att in pendingAttachments" :key="att.id" class="attachment-thumb">
-        <img :src="att.preview" :alt="att.filename" />
-        <button class="attachment-remove" @click="removeAttachment(att.id)">
-          <X class="w-3 h-3" />
-        </button>
+<!-- Attachment previews with confirmation indicator -->
+      <div v-if="pendingAttachments.length > 0" class="attachment-strip">
+        <div v-for="att in pendingAttachments" :key="att.id" class="attachment-thumb">
+          <img :src="att.preview" :alt="att.filename" />
+          <button class="attachment-remove" @click="removeAttachment(att.id)">
+            <X class="w-3 h-3" />
+          </button>
+        </div>
       </div>
-    </div>
+      <!-- Confirmation indicator for pending attachments -->
+      <div v-if="pendingAttachments.length > 0" class="confirmation-indicator">
+        <span>✓ Attachments ready</span>
+      </div>
       <div
         class="input-toolbar"
         :style="glassStyle"

@@ -1,21 +1,29 @@
-import { fileURLToPath, URL } from 'node:url'
-import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vitest/config'
+import vue from '@vitejs/plugin-vue'
+import { fileURLToPath } from 'url'
+import { dirname, join } from 'path'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
 
 export default defineConfig({
   plugins: [vue()],
-  resolve: {
-    alias: {
-      '~': fileURLToPath(new URL('./app', import.meta.url)),
-      '@': fileURLToPath(new URL('./app', import.meta.url)),
-    },
-  },
   test: {
-    environment: 'happy-dom',
     globals: true,
-    setupFiles: ['./tests/unit/setup.ts'],
-    include: ['./tests/unit/**/*.spec.ts'],
-    clearMocks: true,
-    restoreMocks: true,
+    environment: 'happy-dom',
+    include: ['tests/**/*.test.ts'],
+    exclude: ['node_modules/**', '.nuxt/**', '.output/**'],
+    setupFiles: ['./tests/setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      reportsDirectory: './test-results/coverage',
+      exclude: [
+        '**/node_modules/**',
+        '**/.nuxt/**',
+        '**/.output/**',
+        '**/dist/**',
+      ],
+    },
   },
 })

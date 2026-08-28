@@ -1,0 +1,126 @@
+
+/// Task complexity level for model routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskComplexity {
+    /// Direct tool calls, simple Q&A, acknowledgments
+    Simple = 0,
+    /// Multi-step reasoning, code generation, summarization
+    Medium = 1,
+    /// Novel problem solving, long-form analysis, ambiguous requests
+    Complex = 2,
+}
+
+impl std::fmt::Display for TaskComplexity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskComplexity::Simple => write!(f, "simple"),
+            TaskComplexity::Medium => write!(f, "medium"),
+            TaskComplexity::Complex => write!(f, "complex"),
+        }
+    }
+}
+
+impl std::str::FromStr for TaskComplexity {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "simple" => Ok(TaskComplexity::Simple),
+            "medium" => Ok(TaskComplexity::Medium),
+            "complex" => Ok(TaskComplexity::Complex),
+            _ => Err("invalid complexity level"),
+        }
+    }
+}
+
+/// Callback for streaming text chunks
+pub type StreamCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Callback for storing extracted memories
+pub type MemoryCallback = Box<
+    dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+>;
+
+/// Callback for streaming thinking chunks
+pub type ThinkingCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// (call_id, name, input, model)
+pub type ToolStartCallback = Box<dyn Fn(&str, &str, &serde_json::Value, Option<&str>) + Send + Sync>;
+/// Callback for tool completion: (call_id, name, output, success, duration_ms, data)
+pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64, Option<&serde_json::Value>) + Send + Sync>;
+/// Callback for checkpointing conversation state (messages as JSON, iteration count).
+/// The daemon can persist this to recover if the process crashes mid-run.
+pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sync>;
+
+/// Usage callback: (tokens_used, tokens_remaining, cost_in_cents)
+pub type UsageCallback = Box<dyn Fn(u32, u32, u64) + Send + Sync>;
+
+/// Options for running the agent
+#[derive(Default)]
+pub struct RunOptions {
+    /// Override max iterations for this run
+    pub max_iterations: Option<usize>,
+    /// Additional context to prepend
+    pub context_prefix: Option<String>,
+    /// Callback for streaming text (called with each text chunk)
+    pub on_text: Option<StreamCallback>,
+    /// Callback for streaming thinking/reasoning (called with each thinking chunk)
+    pub on_thinking: Option<ThinkingCallback>,
+    /// Auto-extract memories after each run
+    pub auto_extract_memories: bool,
+    /// Callback for storing extracted memories (required if auto_extract_memories is true)
+    pub on_memory: Option<MemoryCallback>,
+    /// Enable uncertainty/confidence tracking
+    pub track_uncertainty: bool,
+    /// Enable emotional context analysis
+    pub track_emotions: bool,
+
+/// Ledger tracking repeated tool calls to prevent loops
+#[derive(Debug, Default)]
+pub struct RepeatLedger {
+    inner: tokio::sync::RwLock<HashMap<String, RepeatCallState>>,
+}
+
+impl RepeatLedger {
+    pub fn new() -> Self {
+        Self {
+            inner: Default::default(),
+        }
+    }
+
+    /// Record a tool call and check if it's a repeat
+    pub async fn record(&self, tool_name: &str, call_id: &str) -> bool {
+        let mut ledger = self.inner.write().await;
+        ledger.entry(tool_name.to_string()).or_default().calls.push(call_id.to_string());
+        
+        // Keep last 5 calls per tool
+        if ledger[tool_name].calls.len() > 5 {
+            ledger[tool_name].calls.remove(0);
+        }
+        
+        ledger[tool_name].last_call_id = call_id.to_string();
+        false // Not a repeat
+    }
+
+    /// Check if this is a repeated call
+    pub async fn is_repeat(&self, tool_name: &str, call_id: &str) -> bool {
+        let ledger = self.inner.read().await;
+        if let Some(state) = ledger.get(tool_name) {
+            return state.calls.contains(&call_id.to_string());
+        }
+        false
+    }
+
+    /// Reset the ledger for a specific tool
+    pub async fn reset(&self, tool_name: &str) {
+        let mut ledger = self.inner.write().await;
+        ledger.remove(tool_name);
+    }
+}
+
+/// State for tracking repeated calls
+#[derive(Debug, Default)]
+struct RepeatCallState {
+    calls: Vec<String>,
+    last_call_id: String,
+}

@@ -1,0 +1,108 @@
+//! Extracted types from loop_runner.rs
+//! 
+//! This file contains all public type definitions extracted from loop_runner.rs
+//! to reduce the monolithic file size and improve maintainability.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Agent configuration
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    /// Model to use (primary / most capable model)
+    pub model: String,
+    /// Maximum tokens in response
+    pub max_tokens: u32,
+    /// Temperature for sampling
+    pub temperature: f32,
+    /// Top-p sampling parameter
+    pub top_p: f32,
+}
+
+/// A model with its maximum complexity tier for routing purposes.
+#[derive(Debug, Clone)]
+pub struct ModelTier {
+    /// Full model spec (may include provider prefix e.g. "ollama/deepseek-r1:14b")
+    pub model: String,
+    /// Maximum complexity this model can handle
+    pub max_complexity: u32,
+}
+
+/// A tool registry for managing available tools
+pub struct ToolRegistry;
+
+/// Memory provenance marker
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryProvenance {
+    Stated,
+    Observed,
+}
+
+impl Default for MemoryProvenance {
+    fn default() -> Self {
+        Self::Observed
+    }
+}
+
+impl MemoryProvenance {
+    /// Classify a free-form model label. Only an explicit, case-insensitive
+    /// "stated" yields `Stated`; everything else is `Observed`.
+    #[must_use]
+    pub fn from_label(label: &str) -> Self {
+        if label.trim().eq_ignore_ascii_case("stated") {
+            Self::Stated
+        } else {
+            Self::Observed
+        }
+    }
+
+    /// The metadata string persisted under the `fact_type` key.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stated => "stated",
+            Self::Observed => "observed",
+        }
+    }
+}
+
+/// A memory extracted from conversation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMemory {
+    pub content: String,
+    pub category: String,
+    /// Provenance: did the user state this, or did the agent observe/infer it?
+    #[serde(default)]
+    pub provenance: MemoryProvenance,
+    /// Optional metadata tags (e.g. tool name, source_id, chunk index)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtractedMemoryRaw {
+    content: String,
+    category: String,
+    /// Model-classified provenance label ("stated"/"observed"). Optional: an
+    /// omitted or unrecognized value falls back to `Observed` in
+    /// [`MemoryProvenance::from_label`].
+    #[serde(default)]
+    provenance: Option<String>,
+}
+
+/// Marker fencing the untrusted conversation inside the memory-extraction prompt.
+const EXTRACTION_FENCE: &str = "=====CONVERSATION (UNTRUSTED DATA)=====";
+
+/// Build the memory-extraction prompt with the conversation isolated as untrusted
+/// data: it is fenced and the model is told to treat everything inside strictly as
+/// data and never obey instructions embedded in it. Mitigates prompt injection via
+/// chat content (the raw conversation used to be interpolated straight in).
+fn build_extraction_prompt(conversation_text: &str) -> String {
+    // Defang any attempt to forge the fence and break out of the data block.
+    let fenced = conversation_text.replace(EXTRACTION_FENCE, "[fence]");
+    format!(
+        "Extract memories from the following conversation (untrusted data):\n\n{}",
+        fenced
+    )
+}

@@ -445,8 +445,8 @@ impl WhatsAppChannel {
 
 #[async_trait]
 impl Channel for WhatsAppChannel {
-    fn provider(&self) -> &str {
-        "whatsapp"
+    fn provider(&self) -> String {
+        "whatsapp".to_string()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {

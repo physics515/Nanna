@@ -379,6 +379,21 @@ impl ChatRunRegistry {
     /// Wakeup-loss safety: interest in the next edge is registered (`enable`)
     /// BEFORE the condition is read, so a release landing between the read
     /// and the await still wakes the waiter.
+    /// Wait until `session_id` has no live harness run. Interest is
+    /// registered before the read so a release between the check and the
+    /// await still wakes us — same wakeup-loss shape as [`Self::wait_idle`].
+    pub async fn wait_until_idle(&self, session_id: &str) {
+        loop {
+            let waiter = self.changed.notified();
+            tokio::pin!(waiter);
+            waiter.enable();
+            if !self.active.read().await.contains_key(session_id) {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
     pub async fn wait_idle(&self) {
         loop {
             let waiter = self.changed.notified();
@@ -421,7 +436,7 @@ impl ControlPlane {
     /// proceeds in a spawned task and the caller should ACK immediately.
     /// Returns `Ok(None)` when a run is already live for the session: the
     /// message was admitted to that run instead.
-    pub(super) async fn run_chat_turn(
+    pub(crate) async fn run_chat_turn(
         self: &Arc<Self>,
         session_id: &str,
         content: &str,
@@ -677,6 +692,8 @@ impl ControlPlane {
                         discovered_tools: Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::new(),
                         )),
+                        // Planning calls no tools, so user picks are noise here.
+                        user_selected_tools: Vec::new(),
                         chat_sink: None,
                         router: step_runner.router.clone(),
                         tools: step_runner.tools.clone(),
@@ -2951,6 +2968,10 @@ fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
         discovered_tools: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashSet::new(),
         )),
+        // The user's picks are a fact about the SESSION, not run-scoped
+        // state: a runner reset discards stale discovery, never the
+        // selection the user made.
+        user_selected_tools: previous.user_selected_tools.clone(),
         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
         router: previous.router.clone(),
         tools: previous.tools.clone(),
@@ -3204,6 +3225,7 @@ mod tests {
             workspace_root: None,
             workspace_context: None,
             chat_model: chat_model.map(str::to_string),
+            chat_tools: Vec::new(),
         }
     }
 
