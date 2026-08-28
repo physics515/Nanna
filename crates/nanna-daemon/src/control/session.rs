@@ -143,6 +143,13 @@ impl ControlPlane {
                     json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
                 }
             }
+            SessionAction::SetTools { id, tools } => {
+                if self.sessions.set_chat_tools(&id, tools.clone()).await {
+                    json!({ "ok": true, "session_id": id, "tools": tools })
+                } else {
+                    json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
+                }
+            }
             SessionAction::Fork { id, name } => {
                 if let Some(original) = self.sessions.get(&id).await {
                     let mut forked = self.sessions.create(

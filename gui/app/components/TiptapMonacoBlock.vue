@@ -59,7 +59,7 @@
 import { ref, computed, watch } from 'vue'
 import { NodeViewWrapper, nodeViewProps } from '@tiptap/vue-3'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
-import { X, Copy, Check } from 'lucide-vue-next'
+import { X, Copy, Check } from '@lucide/vue'
 import { useSplatter } from '~/composables/useSplatter'
 import { useGroundGlass } from '~/composables/useGroundGlass'
 import type * as Monaco from 'monaco-editor'

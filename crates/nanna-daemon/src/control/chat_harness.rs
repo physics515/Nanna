@@ -379,6 +379,21 @@ impl ChatRunRegistry {
     /// Wakeup-loss safety: interest in the next edge is registered (`enable`)
     /// BEFORE the condition is read, so a release landing between the read
     /// and the await still wakes the waiter.
+    /// Wait until `session_id` has no live harness run. Interest is
+    /// registered before the read so a release between the check and the
+    /// await still wakes us — same wakeup-loss shape as [`Self::wait_idle`].
+    pub async fn wait_until_idle(&self, session_id: &str) {
+        loop {
+            let waiter = self.changed.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            if !self.active.read().await.contains_key(session_id) {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
     pub async fn wait_idle(&self) {
         loop {
             let waiter = self.changed.notified();
@@ -421,7 +436,7 @@ impl ControlPlane {
     /// proceeds in a spawned task and the caller should ACK immediately.
     /// Returns `Ok(None)` when a run is already live for the session: the
     /// message was admitted to that run instead.
-    pub(super) async fn run_chat_turn(
+    pub(crate) async fn run_chat_turn(
         self: &Arc<Self>,
         session_id: &str,
         content: &str,
@@ -603,6 +618,7 @@ impl ControlPlane {
                         workspace_root,
                         workspace_context,
                         chat_model,
+                        chat_tools,
                     } = prep;
 
                     // The active workspace scopes stored memories, so a run's
@@ -649,6 +665,8 @@ impl ControlPlane {
                         discovered_tools: Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::new(),
                         )),
+                        // The tools the user picked for this chat, verbatim.
+                        user_selected_tools: chat_tools,
                         // One ledger for the whole turn: the breakers' streaks
                         // must outlive the step boundary that discards every
                         // other RunState field, or their thresholds are
@@ -677,6 +695,8 @@ impl ControlPlane {
                         discovered_tools: Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::new(),
                         )),
+                        // Planning calls no tools, so user picks are noise here.
+                        user_selected_tools: Vec::new(),
                         chat_sink: None,
                         router: step_runner.router.clone(),
                         tools: step_runner.tools.clone(),
@@ -3121,6 +3141,10 @@ fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
         discovered_tools: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashSet::new(),
         )),
+        // The user's picks are a fact about the SESSION, not run-scoped
+        // state: a runner reset discards stale discovery, never the
+        // selection the user made.
+        user_selected_tools: previous.user_selected_tools.clone(),
         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
         router: previous.router.clone(),
         tools: previous.tools.clone(),
@@ -3374,6 +3398,7 @@ mod tests {
             workspace_root: None,
             workspace_context: None,
             chat_model: chat_model.map(str::to_string),
+            chat_tools: Vec::new(),
         }
     }
 
@@ -4551,6 +4576,7 @@ mod tests {
                 duration_ms: Some(3),
                 tokens: None,
                 total_tokens: None,
+                short_circuited: None,
                 at: at.clone(),
             },
         ];
@@ -4588,6 +4614,7 @@ mod tests {
                 duration_ms: Some(3),
                 tokens: None,
                 total_tokens: None,
+                short_circuited: None,
                 at: at.clone(),
             },
             TimelineItem::Fault {
@@ -4605,5 +4632,127 @@ mod tests {
         ));
         assert!(matches!(&sanitized[1], TimelineItem::Tool { .. }));
         assert!(matches!(&sanitized[2], TimelineItem::Fault { .. }));
+    }
+
+    /// The idle-backfill supervisor's bound is "one pass per turn", and it
+    /// gets that from `wait_active` — NOT from a timer. If `wait_active`
+    /// returned on an idle registry, the supervisor would spin as fast as the
+    /// scheduler allows and the "one probe per turn" claim would be false.
+    #[tokio::test]
+    async fn wait_active_does_not_return_while_nothing_is_running() {
+        let runs = ChatRunRegistry::new();
+        assert!(!runs.any_active().await, "a fresh registry has no live run");
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runs.wait_active(),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "wait_active must park on an idle registry — returning here is what \
+             would turn the supervisor's edge into a spin"
+        );
+    }
+
+    /// One claim/release pair drives exactly one active→idle cycle — the
+    /// supervisor's whole loop body — PROVIDED the observer is parked on
+    /// `wait_active` when the claim lands. The handshake is not test
+    /// scaffolding for its own sake: without it this test fails by timeout,
+    /// which is the missed-edge property `supervise_idle_backfill` documents
+    /// (and which `a_turn_that_ends_before_the_observer_parks_is_missed` pins
+    /// deliberately below).
+    #[tokio::test]
+    async fn one_turn_drives_one_active_then_idle_cycle() {
+        let runs = Arc::new(ChatRunRegistry::new());
+        let observer = runs.clone();
+        let saw_active = Arc::new(tokio::sync::Notify::new());
+        let saw_active_signal = saw_active.clone();
+        let cycle = tokio::spawn(async move {
+            observer.wait_active().await;
+            // `notify_one` stores a permit when nobody is waiting yet, so the
+            // main task cannot miss this regardless of poll order.
+            saw_active_signal.notify_one();
+            observer.wait_idle().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(runs.try_claim("session-1").await, "the slot is free");
+        assert!(runs.any_active().await, "the claim is visible");
+
+        // Release only once the observer has actually consumed the active edge.
+        tokio::time::timeout(std::time::Duration::from_secs(5), saw_active.notified())
+            .await
+            .expect("the observer must see the active edge it was parked on");
+        runs.release("session-1").await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), cycle)
+            .await
+            .expect("the release must complete the cycle")
+            .expect("the observer task must not panic");
+        assert!(!runs.any_active().await, "the cycle ends with the registry idle");
+    }
+
+    /// The missed edge, pinned on purpose rather than left to be rediscovered.
+    ///
+    /// `wait_active` registers interest and THEN reads the flag, so a turn that
+    /// begins and ends before the observer is polled leaves no edge behind and
+    /// the observer stays parked. `supervise_idle_backfill` inherits exactly
+    /// this: such a turn's queued rows wait for the NEXT turn rather than
+    /// draining at the end of their own.
+    ///
+    /// That is a bounded, deliberate cost — the rows are durable and reachable
+    /// by their `source_id` handle throughout — and the alternative (probing
+    /// before parking) would make the supervisor spin on an idle daemon. This
+    /// test exists so that if anyone ever "fixes" the loop, they are told which
+    /// property they traded away.
+    #[tokio::test]
+    async fn a_turn_that_ends_before_the_observer_parks_is_missed() {
+        let runs = Arc::new(ChatRunRegistry::new());
+        let observer = runs.clone();
+        let cycle = tokio::spawn(async move {
+            observer.wait_active().await;
+            observer.wait_idle().await;
+        });
+        tokio::task::yield_now().await;
+
+        // A whole turn, start to finish, with no chance for the observer to run
+        // in between.
+        assert!(runs.try_claim("session-1").await);
+        runs.release("session-1").await;
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cycle).await;
+        assert!(
+            outcome.is_err(),
+            "a turn that opens and closes between polls leaves no edge — if this now \
+             completes, the registry gained edge buffering and supervise_idle_backfill's \
+             documented one-turn worst case is stale"
+        );
+    }
+
+    /// A release with other runs still live is NOT an idle edge. The drain
+    /// must not start while a second session is still holding the local
+    /// provider — that is the contention this gate exists to prevent.
+    #[tokio::test]
+    async fn wait_idle_holds_until_the_last_run_releases() {
+        let runs = Arc::new(ChatRunRegistry::new());
+        assert!(runs.try_claim("session-1").await);
+        assert!(runs.try_claim("session-2").await);
+
+        runs.release("session-1").await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runs.wait_idle(),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "one of two runs releasing is not an idle edge"
+        );
+
+        runs.release("session-2").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), runs.wait_idle())
+            .await
+            .expect("the last release opens the gate");
     }
 }

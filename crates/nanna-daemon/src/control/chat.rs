@@ -24,6 +24,8 @@ pub(super) struct ChatTurnPrep {
     /// answer could differ, and the planner and the step runner must never
     /// disagree about which model this chat runs on.
     pub chat_model: Option<String>,
+    /// Tools the user selected for THIS chat (empty = no restriction).
+    pub chat_tools: Vec<String>,
 }
 
 impl ControlPlane {
@@ -324,7 +326,11 @@ impl ControlPlane {
             {
                 let mut registry = self.workspaces.write().await;
                 if let Some(ws) = registry.get_mut(ws_id) {
-                    if let Err(e) = ws.load_context().await {
+                    // The git-aware variant, and only here: this is the one
+                    // workspace the turn is bound to, so the two `git` calls it
+                    // costs are paid once per turn rather than once per
+                    // registered workspace at boot.
+                    if let Err(e) = ws.load_context_with_git().await {
                         warn!("Failed to reload workspace context: {}", e);
                     }
                 }
@@ -448,6 +454,7 @@ impl ControlPlane {
             // message was accepted — not one a Settings click may land halfway
             // through a run that has already started streaming.
             chat_model: session.chat_model().map(str::to_string),
+            chat_tools: session.chat_tools(),
         })
     }
 }

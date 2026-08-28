@@ -138,19 +138,6 @@ impl std::fmt::Display for BenchResult {
     }
 }
 
-fn format_duration_short(d: Duration) -> String {
-    let nanos = d.as_nanos();
-    if nanos < 1_000 {
-        std::format!("{}ns", nanos)
-    } else if nanos < 1_000_000 {
-        std::format!("{:.1}µs", nanos as f64 / 1_000.0)
-    } else if nanos < 1_000_000_000 {
-        std::format!("{:.2}ms", nanos as f64 / 1_000_000.0)
-    } else {
-        std::format!("{:.3}s", nanos as f64 / 1_000_000_000.0)
-    }
-}
-
 fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 

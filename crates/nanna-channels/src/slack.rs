@@ -503,8 +503,8 @@ impl SlackChannel {
 
 #[async_trait]
 impl Channel for SlackChannel {
-    fn provider(&self) -> &str {
-        "slack"
+    fn provider(&self) -> String {
+        "slack".to_string()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {

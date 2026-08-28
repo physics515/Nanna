@@ -6,7 +6,7 @@ use crate::{
     MemoryEntry, MemoryError, VectorStore, VectorStoreConfig,
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
-    MemoryCluster, cluster_memories, create_consolidated_entry,
+    MemoryCluster, cluster_memories, create_consolidated_entry, is_verbatim_pinned,
 };
 use crate::chunking::{derive_chunk_params, ChunkParams};
 use std::collections::HashMap;
@@ -108,6 +108,38 @@ pub struct MemoryService {
     /// Consecutive writes whose vector width disagreed with the binding, and
     /// the width they all reported. See [`MemoryService::note_width_mismatch`].
     width_mismatch_streak: RwLock<(usize, usize)>,
+    /// Rows parked without a vector since the last drain woke, and the wake-up
+    /// that tells a drain they exist.
+    ///
+    /// The memory crate cannot drain its own queue — draining costs embedding
+    /// round-trips, and who may spend those, and when, is the daemon's call
+    /// (it owns the router and the chat-run gate). What the crate *can* do is
+    /// stop the queue from being invisible. Before this, a row parked by
+    /// [`Self::store_unembedded`] waited for the next **binding** event —
+    /// daemon start, provider switch, width reprobe — so a row parked mid-run
+    /// stayed unsearchable for the rest of the session because no switch ever
+    /// happened. That gap is written up in `store_unembedded`'s own comment as
+    /// "a drain trigger the memory crate does not own"; this is the half the
+    /// crate does own.
+    ///
+    /// The counter is what bounds the drain. It counts rows *this process
+    /// parked*, so a drain woken by it knows exactly how much work the live
+    /// session created and can stop there — rather than treating a historical
+    /// backlog (2167 rows, once) as equally urgent.
+    vector_queue: VectorQueueSignal,
+}
+
+/// Rows waiting for a vector, and the wake-up for whoever drains them.
+#[derive(Debug, Default)]
+struct VectorQueueSignal {
+    /// Rows parked since the last reader took them. Reset by
+    /// [`MemoryService::take_queued_vector_count`], never by the drain's
+    /// progress, so a park racing a drain is counted once and not lost.
+    queued: std::sync::atomic::AtomicUsize,
+    /// Signalled once per park. `Notify` collapses repeated signals into one
+    /// permit, which is exactly right: the count carries "how much", the
+    /// notify carries only "there is some".
+    notify: tokio::sync::Notify,
 }
 
 /// The identity half of the embedding binding.
@@ -144,6 +176,7 @@ impl MemoryService {
             min_score_override: RwLock::new(None),
             binding: RwLock::new(EmbeddingBinding::default()),
             width_mismatch_streak: RwLock::new((0, 0)),
+            vector_queue: VectorQueueSignal::default(),
         }
     }
 
@@ -694,14 +727,15 @@ impl MemoryService {
         };
 
         self.store.add(entry).await?;
-        // The row is durable and honest, but nothing drains it until the next
-        // BINDING event: the daemon's unconditional drain runs when a model is
-        // bound (daemon start, provider switch, width reprobe), and a switch
-        // handler drains after a switch. A row parked here by a TRANSIENT
-        // provider failure therefore stays unsearchable for the rest of the
-        // session, because no switch happened. It is recovered, not lost —
-        // but the latency is a session, not a moment, and closing that needs
-        // a drain trigger the memory crate does not own.
+        // The row is durable and honest. It used to wait for the next BINDING
+        // event to become searchable — daemon start, provider switch, width
+        // reprobe — so a row parked mid-session by a transient failure stayed
+        // invisible to recall for the rest of that session, because no switch
+        // ever happened. The trigger this comment used to say the crate "does
+        // not own" is now half-owned: the crate publishes the fact that rows
+        // are waiting, and the daemon decides when to spend embeddings on
+        // them. See [`VectorQueueSignal`].
+        self.note_vector_queued();
         warn!(
             "Stored without a vector ({}) — the write landed and is queued for embedding \
              backfill: {} (id: {})",
@@ -710,6 +744,98 @@ impl MemoryService {
             id
         );
         Ok((id, IngestAction::Create))
+    }
+
+    /// Record that one more row is waiting for a vector, and wake a drain.
+    fn note_vector_queued(&self) {
+        let before = self
+            .vector_queue
+            .queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Positive space: the count only ever rises here, so a wrap would mean
+        // `usize::MAX` parks in one process — not reachable, and if it were,
+        // the drain bound derived from it would be meaningless.
+        debug_assert!(before < usize::MAX, "queued-vector count must not wrap");
+        self.vector_queue.notify.notify_one();
+    }
+
+    /// Park until at least one row is waiting for a vector.
+    ///
+    /// Returns immediately if rows were parked since the last waiter ran —
+    /// `Notify` holds a permit — so a drain that starts after the writes it
+    /// should handle does not miss them.
+    pub async fn vector_queue_notified(&self) {
+        self.vector_queue.notify.notified().await;
+    }
+
+    /// Take the count of rows parked since the last call, resetting it to zero.
+    ///
+    /// This is the drain's **budget**, not a progress meter: it says how many
+    /// rows *this process* parked, which is the work a live session created
+    /// and is therefore the only work that may skip the yield-to-chat gate.
+    /// Anything beyond it — a backlog inherited from an earlier run — is the
+    /// idle-gated drain's job, at the idle-gated drain's priority.
+    pub fn take_queued_vector_count(&self) -> usize {
+        self.vector_queue
+            .queued
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Persist `content` now and leave its vector for the backfill — the write
+    /// path for content that must not put an embedding round-trip on a turn's
+    /// critical path.
+    ///
+    /// Tool-result ingestion is the caller. Every chunk of every tool result
+    /// used to be embedded inline, against the same local model server that
+    /// serves generation, before the loop could take its next step: one
+    /// round-trip plus a vector search plus an insert, per chunk, awaited. A
+    /// large non-repetitive result is tens of chunks, and one measured run made
+    /// zero model decisions for 189 of its 246 minutes.
+    ///
+    /// What is traded, stated plainly: **the neighbour-dedup search is skipped**
+    /// (there is no query vector to search with), so a burst of near-identical
+    /// tool results lands as its own rows instead of folding into one. That is
+    /// the same trade [`Self::store_unembedded`] already makes and for the same
+    /// reason — squeezing the store is dreaming's job, done later with the whole
+    /// corpus in view — and run-length collapse upstream has already removed the
+    /// case that made it expensive.
+    ///
+    /// What is NOT traded: the row is durable before this returns, and it keeps
+    /// its `source_id` handle, so the `recall(...)` handle the model is given in
+    /// the same turn resolves. Only similarity search waits for the drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics on empty `content` or a non-finite `importance`. Both are
+    /// programmer errors, not operational ones: every caller reaches this
+    /// through `memory_adapter::store_extracted_memory`, which filters empty
+    /// content before routing, and importance comes from a fixed table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if the store rejects the write.
+    pub async fn remember_deferred_vector(
+        &self,
+        content: &str,
+        metadata: HashMap<String, String>,
+        importance: f32,
+        workspace_id: Option<String>,
+    ) -> Result<(String, IngestAction), MemoryError> {
+        assert!(!content.is_empty(), "deferred memory content must not be empty");
+        assert!(
+            importance.is_finite(),
+            "deferred memory importance must be a real number, got {importance}"
+        );
+        let mut fsrs = FsrsState::new();
+        fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+        self.store_unembedded(
+            content,
+            metadata,
+            fsrs,
+            workspace_id,
+            "deferred by design — a tool result's vector must not sit on the turn's critical path",
+        )
+        .await
     }
 
     /// Smart ingest - handles duplicates via prediction error gating.
@@ -1819,6 +1945,40 @@ impl MemoryService {
                 continue;
             }
 
+            // Drift mitigation (c): a user-STATED fact is never handed to the
+            // summarizer. (Not to be confused with dream *phase* (b) below —
+            // the (a)/(b)/(c) here are the drift-research item's mitigations.)
+            //
+            // Repeated summarization erases low-frequency detail — the clause
+            // that appears once in a band is exactly the one a gist drops, and
+            // `retention`'s drift fixture reproduces that against this pipeline
+            // (a rare safety-critical clause gone in ONE cycle, while the topic
+            // stayed perfectly recallable, so recall could not see the loss).
+            // What the user asserted is where that loss is least acceptable, so
+            // provenance — not a tuned importance threshold — takes those
+            // memories out of the paraphrasing path entirely.
+            //
+            // The split happens BEFORE the dedup fold, not after, and that
+            // ordering is load-bearing: the fold merges a source INTO a
+            // survivor and keeps the survivor's metadata, so a stated memory
+            // folding into an observed one would come back out marked
+            // `observed` — laundering the provenance and un-pinning itself. Two
+            // folds over disjoint partitions can't do that, and cost strictly
+            // less than one fold over their union (|A|² + |B|² <= (|A|+|B|)²).
+            let band_count = memories.len();
+            let (pinned, unpinned): (Vec<_>, Vec<_>) = memories
+                .into_iter()
+                .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
+            debug_assert_eq!(
+                pinned.len() + unpinned.len(),
+                band_count,
+                "the provenance partition must not drop a memory"
+            );
+            debug_assert!(
+                pinned.iter().all(|entry| is_verbatim_pinned(&entry.metadata)),
+                "the pinned partition must hold only pinned memories"
+            );
+
             // Phase (b): fold true duplicates deterministically FIRST, so the
             // summarizer is only ever paid for genuinely distinct content.
             //
@@ -1830,14 +1990,61 @@ impl MemoryService {
             // no reason to let exact restatements of your most important facts
             // accumulate forever. It also removes the most valuable memories
             // from the drift-exposed path entirely.
-            let deduped_before = result.memories_deduped;
-            let memories = self
-                .fold_near_duplicates(memories, removal_budget, &mut result)
+            //
+            // It runs over the pinned partition too, for the same reason: a
+            // stated fact repeated across three sessions should still collapse
+            // to one row, so pinning cannot make the store grow without bound.
+            let (unpinned, budget_left) = self
+                .fold_and_charge(unpinned, removal_budget, &mut result)
                 .await;
-            let folded_here = result.memories_deduped - deduped_before;
-            removal_budget = removal_budget.saturating_sub(folded_here);
-            result.memories_processed += folded_here;
+            removal_budget = budget_left;
+            let (pinned, budget_left) = self
+                .fold_and_charge(pinned, removal_budget, &mut result)
+                .await;
+            removal_budget = budget_left;
+
+            // Pinned survivors are finished for this cycle — deduplicated if they
+            // had restatements, and never offered to the summarizer.
+            result.memories_processed += pinned.len();
+
             if removal_budget == 0 {
+                continue;
+            }
+
+            // Drift mitigation (b): compress a session, never re-compress a summary.
+            //
+            // The complementary half of the pin above, and the one bound in
+            // this area that needs no number chosen for it. Asking "how many
+            // summarization passes are safe?" has no derivable answer — our own
+            // drift fixture loses a rare clause in ONE — so the rule forbids the
+            // CLASS instead: raw episodes may be summarized, a summary of a
+            // summary is never formed. `FsrsState::generation` already records
+            // exactly this (`max(sources) + 1` at every consolidation), so the
+            // predicate is `generation > 0` and there is nothing to tune.
+            //
+            // Gists are exempted from the CLUSTERER, not from the cycle. They
+            // went through the lossless dedup fold above like everything else,
+            // so two gists that restate each other still collapse to one row and
+            // the store keeps compressing; what is refused is paraphrasing a
+            // paraphrase. The `Expand` band is covered by the same exemption,
+            // deliberately: re-expanding a gist would invent the detail it lost.
+            let unpinned_count = unpinned.len();
+            let (gists, fresh): (Vec<_>, Vec<_>) = unpinned
+                .into_iter()
+                .partition(|entry: &MemoryEntry| entry.fsrs.generation > 0);
+            debug_assert_eq!(
+                gists.len() + fresh.len(),
+                unpinned_count,
+                "the generation partition must not drop a memory"
+            );
+            debug_assert!(
+                fresh.iter().all(|entry| entry.fsrs.generation == 0),
+                "only raw episodes may reach the summarizing clusterer"
+            );
+            result.memories_processed += gists.len();
+
+            let memories = fresh;
+            if memories.is_empty() {
                 continue;
             }
 
@@ -1946,6 +2153,40 @@ impl MemoryService {
         }
 
         Ok(result)
+    }
+
+    /// Run the deterministic dedup fold over one partition of a band, charging
+    /// whatever it folded to the cycle's removal budget and to `result`.
+    ///
+    /// Returns the survivors and the budget that is left. Split out because the
+    /// band loop now folds two disjoint partitions (verbatim-pinned and not),
+    /// and the budget arithmetic between them must not drift apart.
+    async fn fold_and_charge(
+        &self,
+        memories: Vec<MemoryEntry>,
+        removal_budget_count: usize,
+        result: &mut ConsolidationResult,
+    ) -> (Vec<MemoryEntry>, usize) {
+        let memories_count_before = memories.len();
+        let deduped_before = result.memories_deduped;
+
+        let survivors = self
+            .fold_near_duplicates(memories, removal_budget_count, result)
+            .await;
+
+        let folded_count = result.memories_deduped - deduped_before;
+        debug_assert!(
+            folded_count <= removal_budget_count,
+            "a fold charged more than the budget it was given"
+        );
+        debug_assert_eq!(
+            survivors.len() + folded_count,
+            memories_count_before,
+            "every memory must either survive or be folded — none may vanish"
+        );
+
+        result.memories_processed += folded_count;
+        (survivors, removal_budget_count.saturating_sub(folded_count))
     }
 
     /// Dream phase (b): fold near-duplicate memories together **deterministically,
@@ -2058,6 +2299,16 @@ impl MemoryService {
                         .importance
                         .max(candidate.fsrs.importance);
                     survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
+                    // Generation is monotone across a fold, for the same reason
+                    // importance is: an entry that absorbed a consolidation
+                    // product still CONTAINS a consolidation product. Without
+                    // this a generation-1 gist folding into a generation-0 row
+                    // would launder itself back into the summarizer's input and
+                    // defeat the never-re-summarize rule below.
+                    survivors[target_index].fsrs.generation = survivors[target_index]
+                        .fsrs
+                        .generation
+                        .max(candidate.fsrs.generation);
                     folded_sources.push((candidate.id.clone(), candidate.content.clone()));
                     folded_count += 1;
                     result.memories_deduped += 1;
@@ -2193,10 +2444,15 @@ impl MemoryService {
 
         let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
         let inherited_access = source.fsrs.access_count;
+        // See the in-memory mirror in `fold_near_duplicates`: absorbing a gist
+        // makes the survivor a gist-carrier, and the stored row has to say so
+        // or the next cycle reads a stale generation off disk.
+        let inherited_generation = survivor.fsrs.generation.max(source.fsrs.generation);
         self.store
             .update_fsrs(&survivor.id, |fsrs| {
                 fsrs.importance = inherited_importance;
                 fsrs.access_count += inherited_access;
+                fsrs.generation = fsrs.generation.max(inherited_generation);
             })
             .await?;
 
@@ -2283,8 +2539,7 @@ impl MemoryService {
         Fut: Future<Output = Result<String, String>> + Send,
     {
         let prompt = format!(
-            "{}\n\nOriginal memory:\n{}\n\nEnriched memory:",
-            CompressionLevel::Expand.summarization_prompt(),
+            "{SINGLE_MEMORY_ENRICHMENT_PROMPT}\n\nOriginal memory:\n{}\n\nEnriched memory:",
             memory.content
         );
 
@@ -2292,40 +2547,76 @@ impl MemoryService {
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
-        // Only update if expansion added meaningful content
-        if expanded.len() > memory.content.len() {
-            // Re-embed the enriched content so the vector matches it. Updating
-            // content alone (the old `update_content` path) left the embedding
-            // pointing at the pre-expansion text, so recall matched the stale
-            // vector and the enrichment made the memory *harder* to find — the
-            // opposite of expansion's intent. Mirror the merge path, which
-            // re-embeds via `update_content_and_embedding` to keep content and
-            // embedding consistent. A failed re-embed returns before any write,
-            // so content and embedding never diverge.
-            let embed_fn = self
-                .embed_fn
-                .as_ref()
-                .ok_or(MemoryError::NoEmbeddingProvider)?;
-            let embedding = (embed_fn)(&expanded)
-                .await
-                .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-            // CAS on the snapshot content: the summarize call above takes
-            // seconds, and enrichment of a stale snapshot must not overwrite
-            // what a live write stored in the meantime. A declined swap just
-            // skips this expansion; the next cycle expands the fresh text.
-            if self
-                .rewrite_with_binding(&memory.id, &expanded, embedding, Some(&memory.content))
-                .await?
-                .is_none()
-            {
-                debug!(
-                    "Expansion of {} skipped — the memory changed mid-expansion",
-                    memory.id
-                );
-                return Ok(());
-            }
-            debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
+        // Enrichment is ADDITIVE or it does not happen. Growth alone was the
+        // old test, and growth alone is not evidence: a model that drops a
+        // clause and pads the rest comes back longer while the memory is
+        // poorer, and this band holds the highest-weight memories in the
+        // store — exactly the ones least worth risking on a paraphrase.
+        //
+        // The guard is the same one the dedup fold uses to decide a merge is
+        // safe to commit (`merged.contains(incoming)`): the result must still
+        // contain what was there. Trimmed on the original only, because the
+        // model may legitimately add before or after it.
+        let original = memory.content.trim();
+        let is_additive = expanded.len() > memory.content.len() && expanded.contains(original);
+        if !is_additive {
+            debug!(
+                "Enrichment of {} declined — the result did not contain the original \
+                 ({} -> {} chars); the memory is unchanged",
+                memory.id,
+                memory.content.len(),
+                expanded.len()
+            );
+            return Ok(());
         }
+
+        // Re-embed the enriched content so the vector matches it. Updating
+        // content alone (the old `update_content` path) left the embedding
+        // pointing at the pre-expansion text, so recall matched the stale
+        // vector and the enrichment made the memory *harder* to find — the
+        // opposite of expansion's intent. Mirror the merge path, which
+        // re-embeds via `update_content_and_embedding` to keep content and
+        // embedding consistent. A failed re-embed returns before any write,
+        // so content and embedding never diverge.
+        let embed_fn = self
+            .embed_fn
+            .as_ref()
+            .ok_or(MemoryError::NoEmbeddingProvider)?;
+        let embedding = (embed_fn)(&expanded)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        // CAS on the snapshot content: the summarize call above takes
+        // seconds, and enrichment of a stale snapshot must not overwrite
+        // what a live write stored in the meantime. A declined swap just
+        // skips this expansion; the next cycle expands the fresh text.
+        if self
+            .rewrite_with_binding(&memory.id, &expanded, embedding, Some(&memory.content))
+            .await?
+            .is_none()
+        {
+            debug!(
+                "Expansion of {} skipped — the memory changed mid-expansion",
+                memory.id
+            );
+            return Ok(());
+        }
+
+        // The appended half is model-authored, so the entry now carries
+        // generated text and must never be fed to the summarizer — the same
+        // rule that keeps a summary from being re-summarized. `generation`
+        // is what records that, so enrichment raises it.
+        self.store
+            .update_fsrs(&memory.id, |fsrs| {
+                fsrs.generation = fsrs.generation.saturating_add(1);
+            })
+            .await?;
+
+        debug!(
+            "Enriched memory {}: {} -> {} chars (original preserved)",
+            memory.id,
+            memory.content.len(),
+            expanded.len()
+        );
 
         Ok(())
     }
@@ -2588,6 +2879,32 @@ fn resolve_entry_vectors(
     }
     (model, embedding, buckets)
 }
+
+/// The prompt for enriching ONE high-weight memory, as distinct from
+/// consolidating a cluster into one.
+///
+/// `expand_memory` used to reuse [`CompressionLevel::Expand`]'s
+/// `summarization_prompt`, and the two disagreed in a way that made the feature
+/// misfire. That text is written for a CLUSTER — "no longer than the material
+/// it replaces", where the material is several memories — while
+/// `expand_memory`'s acceptance test is `expanded.len() > original.len()`. So
+/// the instruction asked the model not to grow, and the code committed the
+/// result only when it HAD grown: the only enrichments that ever landed were
+/// the ones that disobeyed the prompt.
+///
+/// This asks for the shape the caller can actually verify, and the only shape
+/// that cannot lose anything: **reproduce the memory, then add beneath it**.
+/// Enrichment is then provably additive — `expand_memory` commits only when the
+/// result still contains the original — so a model that rewrites instead of
+/// appending is declined rather than allowed to replace a high-weight memory
+/// with a paraphrase of it.
+const SINGLE_MEMORY_ENRICHMENT_PROMPT: &str = "\
+This memory matters. Reproduce it EXACTLY as given, word for word, and then \
+below it add what it connects to: what caused it, what it resembles, what it \
+predicts, what is still unresolved. Do not reword, shorten, correct or \
+re-order the original text — it must appear in your answer unchanged, or your \
+answer will be discarded. Mark anything speculative as speculation. Never \
+invent facts.";
 
 fn is_episodic_memory(entry: &MemoryEntry) -> bool {
     entry.metadata.contains_key("source_id") || entry.metadata.contains_key("kind")
@@ -2937,6 +3254,117 @@ mod tests {
         );
         assert!(service.get("a").await.is_some(), "source a survives");
         assert!(service.get("b").await.is_some(), "source b survives");
+    }
+
+
+    /// A fixture for the enrichment path: `(service, seeded entry)` with a
+    /// constant embedder, so the tests below differ only in what the
+    /// summarizer returns.
+    async fn enrichment_fixture(content: &str) -> (MemoryService, MemoryEntry) {
+        let embed: EmbedFn = Arc::new(|_t: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+        let entry = dedup_entry("m", content, vec![1.0, 0.0, 0.0], None);
+        service.add_entry(entry.clone()).await.expect("seed");
+        (service, entry)
+    }
+
+    /// Growth alone was the old acceptance test, and growth alone is not
+    /// evidence: a model that drops a clause and pads the rest comes back
+    /// LONGER while the memory is poorer. This band holds the highest-weight
+    /// memories in the store, so a paraphrase is the worst thing to accept
+    /// there.
+    #[tokio::test]
+    async fn an_enrichment_that_rewrites_instead_of_adding_is_declined() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password, vault Ops";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+
+        // Strictly longer, and it has dropped "vault Ops".
+        let rewrite = "the deploy key is stored in a password manager somewhere in the \
+                       organisation, and the team knows where to find it when needed";
+        assert!(rewrite.len() > ORIGINAL.len(), "the fixture must clear the old test");
+
+        service
+            .expand_memory(&entry, &move |_p: String| async move {
+                Ok::<_, String>(rewrite.to_string())
+            })
+            .await
+            .expect("a declined enrichment is not an error");
+
+        let stored = service.get("m").await.expect("the memory is still there");
+        assert_eq!(stored.content, ORIGINAL, "the memory must be untouched");
+    }
+
+    /// The additive case commits — and raises `generation`, because the
+    /// appended half is model-authored. That is what keeps the enriched entry
+    /// out of the summarizer on a later cycle, the same rule that stops a
+    /// summary being re-summarized.
+    #[tokio::test]
+    async fn an_additive_enrichment_commits_and_marks_the_entry_model_authored() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password, vault Ops";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+        assert_eq!(entry.fsrs.generation, 0, "the fixture starts as raw material");
+
+        let enriched = format!("{ORIGINAL}\n\nConnects to: the rotation runbook, unresolved.");
+        service
+            .expand_memory(&entry, &move |_p: String| {
+                let enriched = enriched.clone();
+                async move { Ok::<_, String>(enriched) }
+            })
+            .await
+            .expect("expansion must succeed");
+
+        let stored = service.get("m").await.expect("the memory is still there");
+        assert!(stored.content.contains(ORIGINAL), "the original survives verbatim");
+        assert!(stored.content.len() > ORIGINAL.len(), "and something was added");
+        let row = service.store.get("m").await.expect("the row is in the store");
+        assert!(
+            row.fsrs.generation >= 1,
+            "an entry carrying model-authored text must not read as raw material"
+        );
+    }
+
+    /// The prompt and the acceptance test have to agree, and they did not: the
+    /// cluster prompt this path used to borrow says the result "should be no
+    /// longer than the material it replaces", while the code committed only
+    /// when it HAD grown — so the only enrichments that ever landed were the
+    /// ones that disobeyed the instruction.
+    #[tokio::test]
+    async fn the_enrichment_prompt_asks_for_what_the_guard_accepts() {
+        const ORIGINAL: &str = "the deploy key lives in 1Password";
+        let (service, entry) = enrichment_fixture(ORIGINAL).await;
+        let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+        let captured = Arc::clone(&seen);
+        service
+            .expand_memory(&entry, &move |p: String| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().await = p;
+                    Ok::<_, String>(String::new())
+                }
+            })
+            .await
+            .expect("an empty answer is declined, not an error");
+
+        let prompt = seen.lock().await.clone();
+        assert!(prompt.contains(ORIGINAL), "the memory is in the prompt");
+        assert!(
+            prompt.contains("Reproduce it EXACTLY"),
+            "the instruction must ask for the additive shape the guard accepts: {prompt}"
+        );
+        assert!(
+            !prompt.contains("no longer than the material it replaces"),
+            "the cluster instruction must not be borrowed here: {prompt}"
+        );
+        assert_eq!(
+            service.get("m").await.expect("still there").content,
+            ORIGINAL,
+            "an empty answer changes nothing"
+        );
     }
 
     #[tokio::test]
@@ -4268,6 +4696,64 @@ mod tests {
         );
     }
 
+    /// Generation is monotone across a dedup fold, in the store as well as in
+    /// the in-memory survivor.
+    ///
+    /// The fold merges a source INTO a survivor and the survivor keeps its own
+    /// FSRS row, so a generation-1 gist folding into a generation-0 episode
+    /// would hand back a row that CONTAINS a summary while still reading as raw
+    /// material — and the "never re-summarize a summary" partition, which runs
+    /// after the fold, would then feed it straight back to the summarizer.
+    #[tokio::test]
+    async fn a_fold_that_absorbs_a_gist_marks_the_survivor_as_one() {
+        let embed: EmbedFn = Arc::new(|_text: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        // Identical vectors => the pair clears the Reinforce line and folds.
+        // Both weights sit inside ONE band (0.8..=1.0, `Detailed`) — the fold
+        // is per-band — and the gist is the lighter of the two, so the fold's
+        // descending-weight order makes it the source, not the survivor.
+        let mut episode = dedup_entry("episode", "the build passes", vec![1.0, 0.0, 0.0], None);
+        episode.fsrs.importance = 0.95;
+        let mut gist = dedup_entry(
+            "gist",
+            "the build passes, consistently, across the week",
+            vec![1.0, 0.0, 0.0],
+            None,
+        );
+        gist.fsrs.importance = 0.85;
+        gist.fsrs.generation = 1;
+
+        service.add_entry(episode).await.expect("seed");
+        service.add_entry(gist).await.expect("seed");
+
+        // Dedup-only cycle: an unreachable cluster size disables the clusterer.
+        let config = ConsolidationConfig {
+            min_cluster_size: usize::MAX,
+            min_remaining_memories: 1,
+            ..ConsolidationConfig::default()
+        };
+        let result = service
+            .consolidate(&config, |_p: String| async { Ok(String::new()) })
+            .await
+            .expect("consolidate");
+        assert_eq!(result.memories_deduped, 1, "the pair must fold: {result:?}");
+
+        let survivor = service
+            .store
+            .get("episode")
+            .await
+            .expect("the stronger memory survives the fold");
+        assert!(
+            survivor.fsrs.generation >= 1,
+            "a row that absorbed a generation-1 gist must not read as raw material"
+        );
+    }
+
     /// A live rewrite of the SOURCE after its fold committed must survive the
     /// end-of-pass batch removal: the survivor absorbed the source's OLD text,
     /// so deleting the source would delete the fresh write that exists nowhere
@@ -4421,5 +4907,116 @@ mod tests {
                 "'{needle}' was written during the fold and must not be lost"
             );
         }
+    }
+
+    // ── Deferred vectors: the write lands now, the embedding does not ──
+
+    /// A constant embedder that also counts how many times it was consulted.
+    /// The count is the whole point: the deferred path must not consult it.
+    fn counting_embed_fn(calls: Arc<std::sync::atomic::AtomicUsize>) -> EmbedFn {
+        Arc::new(move |_t: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) })
+        })
+    }
+
+    fn deferred_fixture(calls: &Arc<std::sync::atomic::AtomicUsize>) -> MemoryService {
+        MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(counting_embed_fn(calls.clone()))
+    }
+
+    /// The defect: every tool-result chunk cost an embedding round-trip against
+    /// the same server that serves generation, awaited on the turn's critical
+    /// path. The deferred write must not spend one — even though an embedder is
+    /// configured and working, which is exactly what distinguishes this from
+    /// the outage path `store_unembedded` already had.
+    #[tokio::test]
+    async fn a_deferred_write_never_consults_the_embedder() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+
+        let (id, action) = service
+            .remember_deferred_vector("cargo test output, chunk 1", HashMap::new(), 1.5, None)
+            .await
+            .expect("a deferred write must land");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the deferred path must not embed inline"
+        );
+        assert_eq!(action, IngestAction::Create);
+        // Positive space: the row is real and readable right now — this is the
+        // half that must NOT be deferred, because the model is handed a
+        // `recall(...)` handle to it inside the same turn.
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert_eq!(
+            service.list_all().await.len(),
+            1,
+            "the row must be durable before the call returns"
+        );
+        assert!(
+            stored.content.contains("cargo test output"),
+            "the row must carry the content in full"
+        );
+        // Negative space: and it must be honest about having no vector, so the
+        // backfill can find it.
+        assert!(stored.embedding.is_empty(), "the vector must be queued, not invented");
+        assert!(stored.embedding_model.is_none(), "an unembedded row claims no model");
+    }
+
+    /// An ordinary extracted fact still embeds inline — the deferral is scoped
+    /// to tool results, not a blanket change of the write path.
+    #[tokio::test]
+    async fn an_ordinary_write_still_embeds_inline() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+
+        let (id, _) = service
+            .remember_with_importance("the user prefers tabs", HashMap::new(), 4.0)
+            .await
+            .expect("an ordinary write must land");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the inline path must still produce a vector"
+        );
+        let stored = service.store.get(&id).await.expect("the row is in the store");
+        assert!(!stored.embedding.is_empty(), "an inline write is searchable at once");
+    }
+
+    /// The queue must be *visible*, or the deferral trades a slow turn for a
+    /// permanently unsearchable row. Before this signal a parked row waited for
+    /// the next binding event — daemon start, provider switch, width reprobe —
+    /// which during a long session never comes.
+    #[tokio::test]
+    async fn deferred_writes_publish_a_drainable_count() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = deferred_fixture(&calls);
+        assert_eq!(service.take_queued_vector_count(), 0, "nothing is queued yet");
+
+        for i in 0..3 {
+            service
+                .remember_deferred_vector(&format!("chunk {i}"), HashMap::new(), 1.5, None)
+                .await
+                .expect("write");
+        }
+
+        // A drain woken by the notify must find a budget equal to what was
+        // parked — that count is what bounds it to the live session's own work.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.vector_queue_notified(),
+        )
+        .await
+        .expect("a parked row must wake a waiting drain");
+        assert_eq!(service.take_queued_vector_count(), 3);
+        // Taking it resets it: the next drain must not re-claim work already
+        // budgeted, or the bound stops bounding anything.
+        assert_eq!(service.take_queued_vector_count(), 0);
     }
 }

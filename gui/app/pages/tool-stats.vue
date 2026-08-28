@@ -385,7 +385,7 @@
                       <div>
                         <h4 class="text-xs text-nanna-text-muted mb-2 uppercase tracking-wider">Latency Percentiles</h4>
                         <div class="flex items-end gap-1 h-8">
-                          <div v-for="(label, val) in { P50: tool.p50_latency_ms, P95: tool.p95_latency_ms, P99: tool.p99_latency_ms }" :key="label" class="flex flex-col items-center gap-0.5">
+                          <div v-for="(val, label) in { P50: tool.p50_latency_ms, P95: tool.p95_latency_ms, P99: tool.p99_latency_ms }" :key="label" class="flex flex-col items-center gap-0.5">
                             <div
                               class="w-8 rounded-t"
                               :class="val > 5000 ? 'bg-nanna-error/40' : val > 1000 ? 'bg-nanna-warning/40' : 'bg-nanna-accent/40'"
@@ -443,7 +443,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { RefreshCw, Wrench, AlertTriangle, Info } from 'lucide-vue-next'
+import { RefreshCw, Wrench, AlertTriangle, Info } from '@lucide/vue'
 
 const { isOnline } = useBackend()
 const toast = useToast()

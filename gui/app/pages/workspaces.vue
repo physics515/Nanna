@@ -281,7 +281,7 @@
                         type="checkbox"
                         v-model="createFiles"
                         :value="file.name"
-                        :disabled="createValidity && createValidity[file.existsKey]"
+                        :disabled="createValidity?.[file.existsKey] ?? false"
                         class="rounded border-white/20 bg-transparent"
                       />
                       <div class="flex-1">
@@ -481,11 +481,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import {
   describeMarkers,
   hasWorkspaceMarker as folderHasMarker,
   requiresStandardFile as folderNeedsFile,
+  type ContextFileKey,
   type WorkspaceValidity,
 } from '~/lib/workspaceMarkers'
 
@@ -531,21 +532,21 @@ const repairFiles = ref<string[]>([])
 
 const activeWorkspace = computed(() => workspaces.value.find(ws => ws.active))
 
-const contextFiles = [
+const contextFiles: Array<{ key: ContextFileKey; name: string; short: string }> = [
   { key: 'has_readme', name: 'README.md', short: 'R' },
   { key: 'has_agents', name: 'AGENTS.md', short: 'A' },
   { key: 'has_contributing', name: 'CONTRIBUTING.md', short: 'C' },
   { key: 'has_roadmap', name: 'ROADMAP.md', short: 'RM' },
 ]
 
-const detailFiles = [
+const detailFiles: Array<{ key: ContextFileKey; name: string }> = [
   { key: 'has_readme', name: 'README.md' },
   { key: 'has_agents', name: 'AGENTS.md' },
   { key: 'has_contributing', name: 'CONTRIBUTING.md' },
   { key: 'has_roadmap', name: 'ROADMAP.md' },
 ]
 
-const availableFiles = [
+const availableFiles: Array<{ name: string; desc: string; existsKey: ContextFileKey }> = [
   { name: 'AGENTS.md', desc: 'Agent instructions', existsKey: 'has_agents' },
   { name: 'README.md', desc: 'Project overview', existsKey: 'has_readme' },
   { name: 'CONTRIBUTING.md', desc: 'Contribution guide', existsKey: 'has_contributing' },

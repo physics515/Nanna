@@ -20,6 +20,9 @@ nanna-llm = { path = "../nanna-llm" }
 nanna-channels = { path = "../nanna-channels" }
 nanna-memory = { path = "../nanna-memory" }
 nanna-storage = { path = "../nanna-storage" }
+# Shared workspace types — in particular the one `GitContext` implementation, so
+# this crate and `nanna-workspace` cannot drift on what a git snapshot is.
+nanna-workspace = { path = "../nanna-workspace" }
 
 chrono = { version = "0.4", features = ["serde"] }
 

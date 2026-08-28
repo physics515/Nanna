@@ -53,6 +53,13 @@ struct AgentSpawnerImpl {
     workspace_context: Option<String>,
     /// Shared model stats tracker (sub-agents contribute to the same stats)
     stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Model fallback chain for sub-agents, in priority order — resolved via
+    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
+    /// sub-agent list already means "the main chat list". Never empty.
+    sub_agent_models: Vec<String>,
+    /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
+    /// chats on that plane — same `run_chat_turn` path as a user turn.
+    control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
 }
 
 #[async_trait]
@@ -63,8 +70,6 @@ impl AgentSpawner for AgentSpawnerImpl {
         description: &str,
         max_iterations: Option<usize>,
     ) -> Result<SpawnResult, String> {
-        use nanna_agent::{Agent, AgentContext, RunOptions};
-
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
         // One live read for the whole spawn: the model list, the chat model
@@ -88,9 +93,16 @@ impl AgentSpawner for AgentSpawnerImpl {
             sub_agent_models.clone()
         };
 
+        let control = self.control.read().await.clone();
+        let Some(control) = control else {
+            return Err(
+                "Sub-agent chat path is not bound yet (control plane not ready).".to_string(),
+            );
+        };
+
         let mut last_error = String::new();
         for (attempt, model_spec) in candidates.iter().enumerate() {
-            let Some(llm_client) = self.router.client_for_model(model_spec) else {
+            if self.router.client_for_model(model_spec).is_none() {
                 last_error = format!(
                     "No provider available for model '{}'. Available providers: {:?}",
                     model_spec,
@@ -98,75 +110,61 @@ impl AgentSpawner for AgentSpawnerImpl {
                 );
                 warn!(model = %model_spec, "Sub-agent model has no provider — trying next");
                 continue;
-            };
-
-            // Fresh isolated context per attempt: a failed candidate must not
-            // leak partial state into the next one.
-            let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
-                .with_system_prompt(&self.system_prompt);
-            if let Some(ref ws_root) = self.workspace_root {
-                context.workspace_root = Some(ws_root.clone());
             }
-            if let Some(ref ws_ctx) = self.workspace_context {
-                context.workspace_context = Some(ws_ctx.clone());
-            }
-
-            // Configure agent — sub-agents are full agents, no artificial iteration cap
-            let mut config = base_config.clone();
-            config.model_routing = self.sub_agent_routing.clone();
-            config.routing_first_turn_primary = true;
-            config.max_iterations = max_iterations;
-            let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
-            // Strip provider prefix from model name for the actual API call
-            config.model = LlmRouter::strip_model_prefix(model_spec);
 
             if attempt > 0 {
                 info!(model = %model_spec, attempt, "Sub-agent model attempt");
             }
 
-            let mut agent =
-                Agent::new(config, llm_client, self.tools.clone()).with_context(context);
+            let session = control
+                .sessions
+                .create(Some(format!("sub-agent: {description}")))
+                .await;
+            let session_id = session.id.clone();
+            info!(
+                description,
+                session_id = %session_id,
+                model = %model_spec,
+                attempt = attempt + 1,
+                of = candidates.len(),
+                max_iterations = ?max_iterations,
+                "Starting sub-agent as a managed chat"
+            );
 
-            // Share model stats tracker with sub-agents
-            if let Some(ref tracker) = self.stats {
-                agent = agent.with_stats(tracker.clone());
-            }
-
-            let options = RunOptions {
-                max_iterations,
-                is_sub_agent: true,
-                all_tools_active: true,
-                ..Default::default()
-            };
-
-            // Run without timeout — agent stops when done or cancelled
-            match agent.run(prompt, options).await {
-                Ok(result) => {
+            match control.run_chat_turn(&session_id, prompt).await {
+                Ok(_) => {
+                    control.chat_runs.wait_until_idle(&session_id).await;
+                    let text = last_assistant_text(&control.sessions, &session_id).await;
+                    if text.trim().is_empty() {
+                        last_error = format!(
+                            "Sub-agent on '{model_spec}' finished with no output (session {session_id})"
+                        );
+                        warn!(model = %model_spec, session_id = %session_id, "{last_error}");
+                        continue;
+                    }
                     info!(
-                        description = description,
-                        model = %model_display,
-                        iterations = result.iterations,
-                        tool_calls = result.tool_calls.len(),
-                        input_tokens = result.input_tokens,
-                        output_tokens = result.output_tokens,
-                        "Sub-agent completed"
+                        description,
+                        session_id = %session_id,
+                        model = %model_spec,
+                        "Sub-agent chat completed"
                     );
                     return Ok(SpawnResult {
-                        text: result.text,
-                        iterations: result.iterations,
-                        tool_calls: result.tool_calls.len(),
-                        input_tokens: result.input_tokens,
-                        output_tokens: result.output_tokens,
-                        model: model_display,
+                        text,
+                        iterations: 0,
+                        tool_calls: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        model: model_spec.clone(),
                     });
                 }
                 Err(e) => {
-                    last_error = format!("Sub-agent error on '{model_display}': {e}");
+                    last_error = format!("Sub-agent chat failed on '{model_spec}': {e}");
                     warn!(
-                        model = %model_display,
+                        model = %model_spec,
+                        session_id = %session_id,
                         error = %e,
                         remaining = candidates.len() - attempt - 1,
-                        "Sub-agent model failed — falling back"
+                        "Sub-agent chat failed — falling back"
                     );
                 }
             }
@@ -179,6 +177,19 @@ impl AgentSpawner for AgentSpawnerImpl {
             last_error
         ))
     }
+}
+
+async fn last_assistant_text(sessions: &SessionManager, session_id: &str) -> String {
+    let Some(session) = sessions.get(session_id).await else {
+        return String::new();
+    };
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::session::MessageRole::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Concrete implementation of ParentChannel that lives in the daemon.
@@ -328,6 +339,41 @@ use std::time::Duration;
 /// This allows the `session.history` service to return messages for the current session.
 pub type SharedSessionHistory = Arc<tokio::sync::RwLock<Vec<crate::session::SessionMessage>>>;
 
+/// Stamp a `memory.store` call's declared provenance onto its tags.
+///
+/// Until now the service wrote only the caller's `tags`, so a memory saved
+/// through the `remember` TOOL carried no `fact_type` at all — and the drift
+/// pin (`nanna_memory::is_verbatim_pinned`) can only protect what it can
+/// identify, so the memories a user most explicitly asked to keep were the ones
+/// it could never protect. This closes that, without letting the tool
+/// over-claim: the classification is `MemoryProvenance::from_label`, the SAME
+/// rule the extraction path uses, so only an explicit case-insensitive
+/// `"stated"` yields `stated` and everything else — absent, empty, misspelt —
+/// is `observed`.
+///
+/// A caller-supplied `fact_type` in `tags` is respected as the declaration if
+/// no explicit `provenance` field is given, so a script that already stamps the
+/// key keeps working; either way the value is re-classified rather than
+/// trusted verbatim, so `tags: {fact_type: "STATED-ish"}` cannot smuggle a pin.
+fn tags_with_provenance(
+    mut tags: HashMap<String, String>,
+    params: &serde_json::Value,
+) -> HashMap<String, String> {
+    let declared = params
+        .get("provenance")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| tags.get("fact_type").cloned())
+        .unwrap_or_default();
+    let provenance = nanna_agent::MemoryProvenance::from_label(&declared);
+    tags.insert("fact_type".to_string(), provenance.as_str().to_string());
+    debug_assert!(
+        tags.get("fact_type").is_some_and(|f| f == "stated" || f == "observed"),
+        "fact_type is a closed set"
+    );
+    tags
+}
+
 /// Resolve a memory handle — including one whose memory has since been
 /// consolidated away by dreaming.
 ///
@@ -367,17 +413,21 @@ async fn assemble_handle_content(
     let Some(source_id) = entry.metadata.get("source_id") else {
         return entry.content.clone();
     };
+    // `chunk` is `"i/N"`: the position, and the count the stub promised.
+    let mut expected_count = 0_usize;
     let mut chunks: Vec<(usize, String)> = memory
         .list_all()
         .await
         .into_iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
         .map(|e| {
-            let idx = e
-                .metadata
-                .get("chunk")
+            let mark = e.metadata.get("chunk");
+            let idx = mark
                 .and_then(|c| c.split('/').next()?.parse::<usize>().ok())
                 .unwrap_or(1);
+            if let Some(total) = mark.and_then(|c| c.split('/').nth(1)?.parse::<usize>().ok()) {
+                expected_count = expected_count.max(total);
+            }
             (idx, e.content)
         })
         .collect();
@@ -385,11 +435,31 @@ async fn assemble_handle_content(
         return entry.content.clone();
     }
     chunks.sort_by_key(|(idx, _)| *idx);
-    chunks
+    let found_count = chunks.len();
+    let assembled = chunks
         .into_iter()
         .map(|(_, content)| content)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // Say so when fewer rows came back than the stub promised. Dreaming
+    // REPLACES clusters, so a result whose chunks have been partly
+    // consolidated away reassembles short — and returning that silently is the
+    // exact failure this function was written to end: a model reading a
+    // fraction of a run and being told nothing was missing reports on what it
+    // saw. `expected_count` is 0 when no row carried an `i/N` mark, which is
+    // not evidence of loss, so that case says nothing.
+    if expected_count > found_count {
+        let missing_count = expected_count - found_count;
+        return format!(
+            "{assembled}\n\n[SYSTEM: {found_count} of {expected_count} stored chunks were \
+             reassembled — {missing_count} are no longer in the store as separate rows, most \
+             likely folded into a consolidated memory by a dream cycle. What is above is \
+             complete for the chunks that remain, and the artifact itself is unaffected: read \
+             it back off disk if you need the whole thing.]"
+        );
+    }
+    assembled
 }
 
 /// The byte range of `content` that one `memory.get` page covers.
@@ -603,6 +673,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -716,6 +791,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -1079,6 +1159,12 @@ pub struct DaemonConfig {
     /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
     /// tool actually stop executing (previously the list was parsed but ignored).
     pub tool_denylist: Vec<String>,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    /// Mirrors `[tools] audit_log`.
+    pub tool_audit_log: bool,
+    /// Include a bounded preview of tool arguments in that trail.
+    /// Mirrors `[tools] audit_log_values`.
+    pub tool_audit_log_values: bool,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -1223,6 +1309,8 @@ impl Default for DaemonConfig {
             tools_dir: None,
             tool_allowlist: None,
             tool_denylist: Vec::new(),
+            tool_audit_log: true,
+            tool_audit_log_values: false,
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -1302,15 +1390,24 @@ async fn drain_backfill(
     chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
     drain_serial: &Arc<tokio::sync::Mutex<()>>,
 ) {
-    let _one_drain = drain_serial.lock().await;
     // "provider:model" is the router's spec shape; the local provider is the
     // one that shares its single generation slot with chat.
     let local = model.starts_with("ollama:");
 
     loop {
+        // The yield happens OUTSIDE `drain_serial`, and this is load-bearing.
+        // Parking on `wait_idle` while holding the one process-wide drain lock
+        // means a drain waiting for a mission to end holds that lock for the
+        // length of the mission — starving every other drain behind it,
+        // including the bounded foreground one ([`drain_queued_vectors`])
+        // whose entire reason to exist is not to wait for that mission. The
+        // lock still serializes the passes, and the repayment sleep still
+        // happens under it, so both invariants above — one drain at a time,
+        // at most half the provider's wall-clock — are unchanged.
         if local {
             chat_runs.wait_idle().await;
         }
+        let _one_drain = drain_serial.lock().await;
         let pass_started = std::time::Instant::now();
         match mem.backfill_embeddings(model, DRAIN_STEP).await {
             Ok(0) => break,
@@ -1334,6 +1431,7 @@ async fn drain_backfill(
         if local {
             chat_runs.wait_idle().await;
         }
+        let _one_drain = drain_serial.lock().await;
         let pass_started = std::time::Instant::now();
         match mem.backfill_chunks(model, DRAIN_STEP).await {
             Ok((0, 0)) => break,
@@ -1349,6 +1447,217 @@ async fn drain_backfill(
                 break;
             }
         }
+    }
+}
+
+/// Embed the rows a LIVE turn parked, without making them wait for that turn
+/// to end (P24.3 part 3).
+///
+/// Tool-result ingestion no longer embeds inline: a chunk is persisted
+/// immediately and its vector is queued
+/// ([`MemoryService::remember_deferred_vector`]). Something has to pick those
+/// vectors up, and [`drain_backfill`] cannot be it — when the embedder is the
+/// local provider that drain first waits for **no harness run to be live**, so
+/// a row queued *by* a live run would wait for the run that queued it. During
+/// a long autonomous mission that is hours, and for those hours the model is
+/// being handed `recall(...)` handles to rows that similarity search cannot
+/// see.
+///
+/// So this drain skips the yield gate — and pays for that with a bound the
+/// yield gate was standing in for:
+///
+/// - **It may only embed rows this process parked.** The budget comes from
+///   [`MemoryService::take_queued_vector_count`], so an inherited backlog (2167
+///   rows, in the incident that motivated the queue) is NOT swept up at
+///   foreground priority; that is still [`drain_backfill`]'s job at
+///   [`drain_backfill`]'s priority. The exception is sized to the work the live
+///   session created and nothing more.
+/// - **It still repays every request.** Same rule as [`drain_backfill`]: a pass
+///   that consulted the provider is followed by an idle window equal to that
+///   call's RTT, so it can never exceed half the provider's wall-clock, and a
+///   loaded provider answering slowly earns proportionally longer gaps.
+/// - **It still takes `drain_serial`.** One drain's passes at a time,
+///   process-wide, so this cannot multiply the request rate that pacing bounds.
+/// - **Row vectors only.** Chunk vectors stay with [`drain_backfill`], for the
+///   same reason that drain does rows before chunks: without a row vector a
+///   memory is invisible to recall entirely, whereas one with a row vector and
+///   no chunk vectors is merely coarser to retrieve. Coarser can wait for idle;
+///   invisible cannot.
+///
+/// Net against what it replaces: the same embedding work, at half the duty
+/// cycle, off the turn's critical path instead of blocking it.
+async fn drain_queued_vectors(
+    mem: &Arc<MemoryService>,
+    drain_serial: &Arc<tokio::sync::Mutex<()>>,
+) {
+    loop {
+        mem.vector_queue_notified().await;
+        let mut budget_rows = mem.take_queued_vector_count();
+        // A wake with an empty budget is not an error — `Notify` holds one
+        // permit however many parks happened, so a drain that already took the
+        // count can be woken once more with nothing to do.
+        if budget_rows == 0 {
+            continue;
+        }
+        let Some(model) = mem.active_binding().await.0 else {
+            // No binding yet: the rows stay queued and the next binding event's
+            // unconditional drain takes them. Putting the budget back would
+            // spin, since nothing re-notifies.
+            debug!("{budget_rows} queued vectors wait for an embedding binding");
+            continue;
+        };
+        debug!("Draining {budget_rows} queued vectors for '{model}'");
+        while budget_rows > 0 {
+            let step = DRAIN_STEP.min(budget_rows);
+            debug_assert!(step > 0, "a positive budget must yield a positive step");
+            let _one_drain = drain_serial.lock().await;
+            let pass_started = std::time::Instant::now();
+            match mem.backfill_embeddings(&model, step).await {
+                // Nothing left for this model — either the rows landed under a
+                // different binding, or another drain got there first. Either
+                // way the budget is stale, not owed.
+                Ok(0) => break,
+                Ok(embedded) => {
+                    budget_rows = budget_rows.saturating_sub(embedded);
+                    tokio::time::sleep(pass_started.elapsed()).await;
+                }
+                Err(e) => {
+                    warn!("Queued-vector drain for '{model}' halted: {e}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// How this differs from [`drain_queued_vectors`] above, since both end up
+/// draining the same queue and only one of them is obvious:
+///
+/// `drain_queued_vectors` handles what THIS PROCESS deliberately deferred, at
+/// foreground priority, during the turn -- and it is explicitly budgeted so it
+/// will NOT sweep up an inherited backlog. Its own doc says that remainder is
+/// "still `drain_backfill`'s job at `drain_backfill`'s priority".
+///
+/// The catch is that nothing was calling `drain_backfill` at that priority
+/// during a session. Its only triggers are BINDING events -- daemon start,
+/// provider switch, width reprobe -- and an ordinary session has none of them.
+/// So a row parked by a *transient* embedding failure, or a backlog inherited
+/// from a previous run, waited for a restart. That is the gap this closes, and
+/// it is why the two coexist rather than one replacing the other: one drains
+/// the work the turn created, the other drains everything else, at the first
+/// moment no turn is live.
+///
+/// Drain rows that were parked mid-session, at the first moment no turn is live.
+///
+/// [`nanna_memory::MemoryService::store_unembedded`] is durable and honest —
+/// the write lands, the row is reachable by its `source_id` handle, and it is
+/// queued for backfill — but until now the ONLY things that started a drain
+/// were **binding** events: daemon start, a provider switch, a width reprobe.
+/// An ordinary session has none of those. So a row parked by a *transient*
+/// embedding failure stayed unsearchable for the rest of the session, and the
+/// store's own doc comment says exactly that: it "is recovered, not lost — but
+/// the latency is a session, not a moment, and closing that needs a drain
+/// trigger the memory crate does not own". This is that trigger, and it lives
+/// here because the daemon is what owns both the run registry and the drain.
+///
+/// **Bound: one probe per active→idle cycle** — not per write, and not on a
+/// timer. [`ChatRunRegistry::wait_active`] followed by
+/// [`ChatRunRegistry::wait_idle`] is precisely one turn's lifetime, so the
+/// probe rate is bounded above by the *turn* rate, which is bounded by a human
+/// typing. A timer would have had to pick an interval that is either too slow
+/// to matter or a poll; an edge does not.
+///
+/// The probe is what [`drain_backfill`] already costs on a store that is
+/// complete for the bound model, and it is worth stating exactly rather than
+/// as "a query": `entries_missing_model(model, 1)` is an **in-memory** scan of
+/// the entries cache under a read lock — it short-circuits at the first entry
+/// with no bucket for `model`, so it walks the whole cache only in the case
+/// where there is nothing to do — followed by two `LIMIT 1` local Turso
+/// queries (`parents_without_chunks`, `chunks_needing_embedding`). No provider
+/// request is made unless work is actually found. At a 100k-entry store that
+/// is single-digit milliseconds, once per turn.
+///
+/// **Worst case is one turn of latency, not one session.** `wait_active`
+/// registers interest and then reads the flag, so a turn that begins AND ends
+/// inside that window leaves no edge to observe and its rows wait for the next
+/// turn. That is a bounded miss and a deliberate non-fix: the rows are durable
+/// and handle-addressable the whole time, and the alternative — probing before
+/// parking — turns the loop into a spin on an idle daemon, which is the exact
+/// property this shape was chosen to avoid.
+///
+/// **It adds a trigger, never a second rate.** The drain it may start is the
+/// existing [`drain_backfill`], so it inherits the process-wide `drain_serial`
+/// mutex (one drain at a time), the `wait_idle` priority gate (a turn arriving
+/// mid-drain takes the slot back within one in-flight embed) and the
+/// per-request RTT repayment that caps the drain at half the provider's
+/// wall-clock. Starting from an idle edge means the common case is that the
+/// gate is already open and the queue is already empty.
+async fn supervise_idle_backfill(
+    memory: Arc<MemoryService>,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    drain_serial: Arc<tokio::sync::Mutex<()>>,
+) {
+    // Said once, at arm time, because the useful thing to know from a log is
+    // that this exists at all. The drain it starts already announces its own
+    // work ("Backfilled N embeddings"), and a per-turn line for the overwhelming
+    // case -- nothing queued, nothing to do -- would be noise proportional to
+    // conversation length.
+    info!(
+        "Idle-backfill supervisor armed: queued embedding rows now drain at the end of a turn"
+    );
+    loop {
+        // A turn started, then every turn finished. Waiting on `active` FIRST is
+        // what makes this an edge rather than a spin: with only `wait_idle`, an
+        // already-idle daemon would loop as fast as the scheduler allows.
+        chat_runs.wait_active().await;
+        chat_runs.wait_idle().await;
+        // Deliberately NOT asserted here: `!any_active()`. `wait_idle` certifies
+        // that no run was live at the instant it returned -- a PAST instant. A
+        // turn may legally claim the slot again before the next line runs, so
+        // asserting it would fire on ordinary concurrency instead of on a
+        // programmer error, and an assertion that can be false is worse than an
+        // absent one. The property is real but belongs to the registry, where it
+        // can be stated without a race: see the chat_harness test
+        // `one_turn_drives_one_active_then_idle_cycle`. Nothing below needs the
+        // daemon to still be idle -- the drain re-takes the gate itself, once
+        // per provider request.
+
+        // No binding means nothing can be drained INTO a bucket: the drain
+        // refuses to fill a bucket that is not the active binding, so calling it
+        // here would be a no-op with extra steps.
+        let Some(model) = memory.active_embedding_model().await else {
+            continue;
+        };
+        // Two things must hold about a binding before it is worth draining, and
+        // both are far cheaper than the drain they guard, so they are checked
+        // always rather than in debug only. The spec must name something; and
+        // the drain must be able to tell a LOCAL provider from a remote one.
+        // That second test is load-bearing rather than cosmetic --
+        // `drain_backfill` decides whether to yield to a live chat turn by
+        // reading the provider off this spec, so a spec with no provider segment
+        // would silently classify the local embedder as remote and drain
+        // straight through the contention gate that exists to keep it off the
+        // shared generation slot.
+        //
+        // Both are ASSERTIONS rather than branches because both are structural,
+        // not configuration-dependent: the binding string is produced by
+        // `EmbeddingProviderInfo`'s `Display`, which is literally
+        // `write!("{}:{}", name, model)`, and `drain_backfill` already reads the
+        // prefix back off it. Neither can be made false by a config file, so
+        // neither is a failure to handle -- only a way to notice if the shape
+        // this depends on is ever changed somewhere else.
+        assert!(
+            !model.is_empty(),
+            "the active embedding binding must name a model: an empty spec would \
+             drain into an unaddressable bucket"
+        );
+        assert!(
+            model.contains(':'),
+            "the active embedding binding must be a `provider:model` spec (got \
+             {model:?}): `drain_backfill` reads the provider off this string to \
+             decide whether to yield the local generation slot to a live turn"
+        );
+        drain_backfill(&memory, &model, &chat_runs, &drain_serial).await;
     }
 }
 
@@ -1454,6 +1763,9 @@ pub struct DaemonServer {
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
     _control: Arc<ControlPlane>,
+    /// Late-bound handle to the control plane for consumers created
+    /// before it exists (filled in run(), read by the agent service).
+    control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -1604,6 +1916,7 @@ impl DaemonServer {
             _brave_api_key: brave_api_key,
             sessions,
             _control: control,
+            control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             ipc,
             persistence,
             shutdown_tx,
@@ -2506,6 +2819,7 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server
         let mut request_rx =
@@ -3352,6 +3666,22 @@ impl DaemonServer {
                             )
                             .await;
                         });
+                        // One supervisor for the daemon's life: it turns the
+                        // end of every turn into a drain opportunity, which is
+                        // what closes the "parked until the next binding event"
+                        // gap `store_unembedded` documents -- the backlog
+                        // `drain_queued_vectors` is budgeted not to sweep.
+                        // Spawned beside the startup bind because that is where
+                        // the binding, the run registry and the drain mutex are
+                        // all in scope.
+                        let memory_for_supervisor = memory_arc.clone();
+                        let chat_runs_for_supervisor = chat_runs.clone();
+                        let drain_serial_for_supervisor = drain_serial.clone();
+                        tokio::spawn(supervise_idle_backfill(
+                            memory_for_supervisor,
+                            chat_runs_for_supervisor,
+                            drain_serial_for_supervisor,
+                        ));
                         let chat_runs_for_probe = chat_runs.clone();
                         let drain_serial_for_probe = drain_serial.clone();
                         tokio::spawn(async move {
@@ -3395,6 +3725,16 @@ impl DaemonServer {
                     // Wire the memory service into the embed_fn's OnceCell
                     // so provider-switch re-embedding can find it
                     let _ = memory_for_reembed.set(memory_arc.clone());
+
+                    // One long-lived worker for the vectors a live turn parks.
+                    // It sleeps on the queue's notify and costs nothing until a
+                    // tool result is ingested; see `drain_queued_vectors` for
+                    // why it is a separate drain and what bounds it.
+                    let memory_for_queue = memory_arc.clone();
+                    let drain_serial_for_queue = drain_serial.clone();
+                    tokio::spawn(async move {
+                        drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
+                    });
 
                     Some(memory_arc)
                 }
@@ -3505,6 +3845,8 @@ impl DaemonServer {
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
+                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
+                    control: self.control_slot.clone(),
                 }))
             } else {
                 None
@@ -3540,6 +3882,10 @@ impl DaemonServer {
         tools.register_alias("glob", "list_dir").await;
         tools.register_alias("Glob", "list_dir").await;
         tools.register_alias("ls", "list_dir").await;
+        tools.register_alias("task", "sub_agent").await;
+        tools.register_alias("Task", "sub_agent").await;
+        tools.register_alias("sub-agent", "sub_agent").await;
+        tools.register_alias("Sub-Agent", "sub_agent").await;
 
         {
             let tool_count = tools.definitions().await.len();
@@ -3590,6 +3936,25 @@ impl DaemonServer {
         );
         if !policy.is_unrestricted() {
             tools.set_policy(policy).await;
+        }
+
+        // Attach the per-call audit trail. It sits on the registry rather than
+        // on the agent loop deliberately: the loop is only one of the callers
+        // (chat harness, task tool, scheduled runs and the MCP bridge all call
+        // the registry directly), and an audit that saw only one of them would
+        // be worse than none — it would read as a complete account.
+        if self.config.tool_audit_log {
+            let path = self.config.data_dir.join("logs").join("tool-audit.jsonl");
+            let sink = nanna_tools::JsonlAuditSink::new(
+                path.clone(),
+                nanna_tools::ToolAuditConfig {
+                    include_values: self.config.tool_audit_log_values,
+                    ..Default::default()
+                },
+            );
+            tools.set_audit_sink(Some(Arc::new(sink))).await;
+            info!(path = %path.display(), values = self.config.tool_audit_log_values,
+                  "Tool audit trail enabled");
         }
 
         // Create agent service with multi-provider router
@@ -3723,12 +4088,16 @@ pub struct DaemonBuilder {
 }
 
 /// Copy the signature-verification secrets from the user's channel config into a
-/// [`WebhookConfig`]. Only providers the user configured are set; each verifier
-/// skips when its secret is `None`, so unset providers keep the previous value.
+/// [`WebhookConfig`]. Only providers the user configured are set, so unset
+/// providers keep the previous value — and a provider that ends up with no
+/// secret serves no webhook at all (`refuse_unconfigured` in `webhook.rs`).
 ///
-/// Telegram is intentionally absent: its `TelegramConfig` carries no webhook
-/// secret (Telegram authenticates via the bot token in the URL), only the bot
-/// token (registered for outbound sends).
+/// Telegram used to be absent here on the reasoning that "Telegram
+/// authenticates via the bot token in the URL". That was wrong about this
+/// implementation: the route is the fixed path `/webhook/telegram` with no
+/// token in it, so nothing was ever verified. `telegram_secret` now carries the
+/// `setWebhook` secret token, which Telegram echoes as
+/// `X-Telegram-Bot-Api-Secret-Token` on every POST.
 fn apply_channel_webhook_secrets(
     webhook: &mut WebhookConfig,
     channels: &nanna_config::ChannelsConfig,
@@ -3745,6 +4114,7 @@ fn apply_channel_webhook_secrets(
     }
     if let Some(ref telegram) = channels.telegram {
         webhook.telegram_token = Some(telegram.bot_token.clone());
+        webhook.telegram_secret = telegram.webhook_secret.clone();
     }
 }
 
@@ -3883,6 +4253,8 @@ impl DaemonBuilder {
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
         builder.config.tool_denylist = config.tools.disabled.clone();
+        builder.config.tool_audit_log = config.tools.audit_log;
+        builder.config.tool_audit_log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -4157,6 +4529,169 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+
+    /// A memory saved through the `remember` TOOL used to carry no `fact_type`
+    /// at all, so the drift pin — which can only protect what it can identify —
+    /// could never protect the memories a user most explicitly asked to keep.
+    #[test]
+    fn a_stated_declaration_pins_the_memory() {
+        let tags = tags_with_provenance(
+            HashMap::new(),
+            &serde_json::json!({"provenance": "stated"}),
+        );
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("stated"));
+        assert!(nanna_memory::is_verbatim_pinned(&tags));
+    }
+
+    /// The conservative default, and the whole reason this is classified rather
+    /// than copied: absence of a declaration is not evidence the user said
+    /// something. Only an explicit, case-insensitive "stated" pins.
+    #[test]
+    fn anything_that_is_not_stated_is_observed() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"provenance": ""}),
+            serde_json::json!({"provenance": "observed"}),
+            serde_json::json!({"provenance": "statedly"}),
+            serde_json::json!({"provenance": "user-said"}),
+        ] {
+            let tags = tags_with_provenance(HashMap::new(), &params);
+            assert_eq!(
+                tags.get("fact_type").map(String::as_str),
+                Some("observed"),
+                "{params}"
+            );
+            assert!(!nanna_memory::is_verbatim_pinned(&tags));
+        }
+    }
+
+    /// A caller that already stamps `fact_type` in its tags keeps working — but
+    /// the value is re-classified, never trusted verbatim, so a near-miss
+    /// spelling cannot smuggle a pin past the rule.
+    #[test]
+    fn a_fact_type_tag_is_reclassified_not_trusted() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "  StAtEd ".to_string());
+        let pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(pinned.get("fact_type").map(String::as_str), Some("stated"));
+
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "STATED-ish".to_string());
+        let not_pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(not_pinned.get("fact_type").map(String::as_str), Some("observed"));
+    }
+
+    /// An explicit `provenance` field wins over a `fact_type` tag: the field is
+    /// the declaration this call is making, the tag may be inherited metadata.
+    #[test]
+    fn the_explicit_field_wins_over_an_inherited_tag() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "stated".to_string());
+        tags.insert("topic".to_string(), "deploys".to_string());
+        let tags = tags_with_provenance(tags, &serde_json::json!({"provenance": "observed"}));
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("observed"));
+        assert_eq!(
+            tags.get("topic").map(String::as_str),
+            Some("deploys"),
+            "unrelated tags are untouched"
+        );
+    }
+
+    /// Seed one tool result's chunk rows: `stored_count` of a promised
+    /// `promised_count`, all sharing a `source_id`.
+    async fn seeded_chunk_store(
+        stored_count: usize,
+        promised_count: usize,
+    ) -> Arc<nanna_memory::MemoryService> {
+        let service = Arc::new(nanna_memory::MemoryService::new(
+            nanna_memory::MemoryServiceConfig {
+                dimension: 4,
+                ..Default::default()
+            },
+        ));
+        for idx in 1..=stored_count {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("source_id".to_string(), "abc123".to_string());
+            metadata.insert("chunk".to_string(), format!("{idx}/{promised_count}"));
+            service
+                .add_entry(nanna_memory::MemoryEntry {
+                    id: format!("chunk-{idx}"),
+                    content: format!("part {idx}"),
+                    // A distinct unit vector per chunk: the store asserts a
+                    // non-empty embedding on add, and reassembly is keyed on
+                    // metadata, so the direction is irrelevant here.
+                    embedding: vec![1.0, 0.0, 0.0, 0.0],
+                    embedding_model: None,
+                    embeddings: std::collections::HashMap::new(),
+                    metadata,
+                    timestamp: 0,
+                    fsrs: nanna_memory::FsrsState::new(),
+                    workspace_id: None,
+                })
+                .await
+                .expect("seed");
+        }
+        service
+    }
+
+    async fn first_entry(
+        service: &Arc<nanna_memory::MemoryService>,
+    ) -> nanna_memory::MemoryListEntry {
+        service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    /// The whole result is present: the reassembly is exactly the chunks, in
+    /// order, and says nothing extra. An announcement on a complete read would
+    /// be noise, and worse, would teach the model to ignore the real one.
+    #[tokio::test]
+    async fn a_complete_reassembly_announces_nothing() {
+        let service = seeded_chunk_store(3, 3).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert_eq!(assembled, "part 1\npart 2\npart 3");
+        assert!(!assembled.contains("[SYSTEM:"));
+    }
+
+    /// Dreaming REPLACES clusters, so a result whose chunks were partly
+    /// consolidated away reassembles short. Returning that silently is the
+    /// failure this function exists to end: the stub promised the result "was
+    /// stored whole in memory as N chunk(s)", and a model reading a fraction
+    /// while being told nothing is missing reports on what it saw.
+    #[tokio::test]
+    async fn a_short_reassembly_says_how_much_is_missing() {
+        let service = seeded_chunk_store(2, 17).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert!(assembled.starts_with("part 1\npart 2"), "content still comes first");
+        assert!(assembled.contains("2 of 17 stored chunks"), "{assembled}");
+        assert!(assembled.contains("15 are no longer in the store"), "{assembled}");
+        assert!(
+            assembled.contains("read it back off disk"),
+            "the announcement must point at the thing that IS intact: {assembled}"
+        );
+    }
+
+    /// Negative space: rows with no `i/N` mark carry no promise about a total,
+    /// so there is nothing to be short of. Absence of evidence must not become
+    /// an announcement of loss.
+    #[tokio::test]
+    async fn unmarked_chunks_never_claim_a_shortfall() {
+        let service = seeded_chunk_store(2, 2).await;
+        let mut entry = first_entry(&service).await;
+        entry.metadata.remove("chunk");
+        for stored in service.list_all().await {
+            assert!(stored.metadata.contains_key("source_id"));
+        }
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+        assert!(!assembled.contains("[SYSTEM:"), "{assembled}");
+    }
 
     /// The entry that motivated this: provider `openrouter`, model
     /// `nvidia/nemotron-3-embed-1b:free`. Splitting on the LAST slash would

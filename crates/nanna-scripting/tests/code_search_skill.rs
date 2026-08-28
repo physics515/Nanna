@@ -25,6 +25,8 @@
 
 #![cfg(feature = "boa")]
 
+mod common;
+
 use nanna_scripting::{ScriptEngine, ScriptedTool, ToolPermissions};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -38,7 +40,9 @@ fn skill_path() -> PathBuf {
 async fn run_search(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read code_search tool.ts")
-        .with_permissions(ToolPermissions::none().with_read([dir]));
+        .with_permissions(ToolPermissions::none().with_read([dir]))
+        // Scaffolding, not an assertion — see `common::FIXTURE_TIMEOUT_MS`.
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
     ScriptEngine::new()
         .execute(&tool, input, None, None)
         .await

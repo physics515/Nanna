@@ -29,9 +29,10 @@ impl TaskTool {
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
-            "task",
-            "Delegate an independent sub-task to a fresh sub-agent. The sub-agent gets its own \
-             context, full tool access, and returns a summary. Use this for: reading/analyzing \
+            "sub_agent",
+            "Spawn a Sub-Agent — an ordinary chat you own that runs the same chat/harness path \
+             as a normal turn, then returns its reply. Use to delegate isolated work (research, \
+             file analysis, a self-contained sub-problem) without filling your own context. \
              files that don't need to stay in your context, independent research tasks, any work \
              that can be done in isolation. The sub-agent cannot see your conversation history."
         )

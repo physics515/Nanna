@@ -7,7 +7,16 @@
 //! They must only be called after verifying CPU support via `is_x86_feature_detected!("avx512f")`.
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use std::arch::x86_64::{
+    _mm512_add_ps,
+    _mm512_fmadd_ps,
+    _mm512_loadu_ps,
+    _mm512_mul_ps,
+    _mm512_reduce_add_ps,
+    _mm512_set1_ps,
+    _mm512_setzero_ps,
+    _mm512_storeu_ps,
+};
 
 /// AVX-512 dot product: processes 16 floats per iteration.
 ///
@@ -39,7 +48,7 @@ pub unsafe fn dot_product_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     // Scalar remainder
     let rem_start = chunks * 16;
     for i in 0..remainder {
-        result += a[rem_start + i] * b[rem_start + i];
+        result = a[rem_start + i].mul_add(b[rem_start + i], result);
     }
 
     result
@@ -60,7 +69,7 @@ pub unsafe fn cosine_similarity_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
 
     let mut dot_acc = _mm512_setzero_ps();
     let mut norm_a_acc = _mm512_setzero_ps();
-    let mut norm_b_acc = _mm512_setzero_ps();
+    let mut norm_b_sum_acc = _mm512_setzero_ps();
 
     for i in 0..chunks {
         let offset = i * 16;
@@ -71,22 +80,22 @@ pub unsafe fn cosine_similarity_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
 
             dot_acc = _mm512_fmadd_ps(va, vb, dot_acc);
             norm_a_acc = _mm512_fmadd_ps(va, va, norm_a_acc);
-            norm_b_acc = _mm512_fmadd_ps(vb, vb, norm_b_acc);
+            norm_b_sum_acc = _mm512_fmadd_ps(vb, vb, norm_b_sum_acc);
         }
     }
 
     let mut dot_sum = _mm512_reduce_add_ps(dot_acc);
     let mut mag_a = _mm512_reduce_add_ps(norm_a_acc);
-    let mut mag_b = _mm512_reduce_add_ps(norm_b_acc);
+    let mut mag_b = _mm512_reduce_add_ps(norm_b_sum_acc);
 
     // Scalar remainder
     let rem_start = chunks * 16;
     for i in 0..remainder {
         let ai = a[rem_start + i];
         let bi = b[rem_start + i];
-        dot_sum += ai * bi;
-        mag_a += ai * ai;
-        mag_b += bi * bi;
+        dot_sum = ai.mul_add(bi, dot_sum);
+        mag_a = ai.mul_add(ai, mag_a);
+        mag_b = bi.mul_add(bi, mag_b);
     }
 
     dot_sum / (mag_a.sqrt() * mag_b.sqrt())

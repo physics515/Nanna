@@ -44,6 +44,9 @@ one clause that made it actionable is gone. That gap is what makes drift easy to
 | --- | --- | --- | --- |
 | Rare clause survives a **summarized** cluster | **NO** (lost in 1 cycle) | `retention::tests::summarized_memories_lose_a_rare_critical_clause_in_one_cycle` | the known exposure, reproduced against our own pipeline |
 | Rare clause survives a **deduplicated** band | **YES** (verbatim) | `retention::tests::deduplicated_memories_keep_their_rare_critical_clause` | dream phase (b) folds without paraphrasing; store still compresses |
+| Rare clause survives a **user-STATED** cluster | **YES** (verbatim) | `retention::tests::a_user_stated_clause_survives_the_summarizing_cycle` | mitigation (c), 2026-08-21: same corpus/spread/summarizer as the losing row above — only the provenance differs |
+| Stated provenance survives a **dedup fold** | **YES** | `retention::tests::a_dedup_fold_never_launders_stated_provenance_into_observed` | a fold keeps the *survivor's* metadata, so folding stated→observed used to launder the pin away |
+| Rare clause survives a band of **already-summarized** rows | **YES** (verbatim) | `retention::tests::a_summary_is_never_summarized_again` | mitigation (b), 2026-08-21: same corpus/spread/summarizer as the losing row above — only `generation` differs |
 
 Budget: the **dedup arm must never regress to NO** — that is a correctness fixture, and it is the
 concrete payoff of folding restatements deterministically. The summarized arm is a **baseline to
@@ -51,6 +54,34 @@ beat, not a budget to hold**: it currently asserts the clause *is* lost, so when
 lands (generation ceiling, or verbatim-pinning user-STATED memories — both logged in P13) that test
 will fail loudly and should be flipped to assert survival. A failing baseline arm means the system
 got better, and the assertion says so in its message.
+
+*(2026-08-21)* **Mitigation (c) landed — verbatim-pinning user-STATED memories.** Two rows added
+above. The summarized arm deliberately **stays at NO**: the exposure is real and unfixed for
+agent-*observed* content, and deleting the measurement that says so would be the dishonest move.
+What changed is that a memory whose `fact_type` provenance is `stated` is now split out of its band
+*before* both the dedup fold and the clusterer, so it is never handed to a summarizer. The split
+runs before the fold, not after, because a fold keeps the **survivor's** metadata — folding a stated
+row into an observed one handed back an `observed` row holding a user assertion, which the next
+cycle was then free to paraphrase. Both new rows fail (and name the laundered id) with the split
+removed, so neither is vacuous. Cost is one hash lookup per memory per band and strictly *fewer*
+summarizer calls; the price is that pinned rows no longer compress by paraphrase — they still
+deduplicate, so repetition cannot make them grow without bound.
+
+*(2026-08-21)* **Mitigation (b) landed too — "compress a session, never re-compress a summary".**
+The row above is the second controlled pair against the same losing baseline: identical corpus,
+spread, summarizer and config, differing only in `FsrsState::generation`. This is the bound that
+needed no number chosen for it. "How many summarization passes are safe?" has no derivable answer —
+the baseline arm loses a rare clause in **one** — so the class is forbidden rather than counted, and
+`generation` (already `max(sources) + 1` at every consolidation) records membership of that class
+exactly. Gists are exempt from the **clusterer**, not from the cycle: they still go through the
+lossless dedup fold, so two gists that restate each other still collapse and the store still
+compresses (`retention::tests::gists_that_restate_each_other_still_fold`). `generation` is now also
+monotone across a fold — absorbing a gist makes the survivor a gist-carrier — or a generation-1 row
+folding into a generation-0 one would launder itself straight back into the summarizer's input
+(`service::tests::a_fold_that_absorbs_a_gist_marks_the_survivor_as_one`, which fails with that one
+line removed). Cost: one `u32` compare per memory per band, and strictly fewer summarizer calls. The
+price is that a gist's footprint no longer shrinks by paraphrase — a bounded-drift-for-bounded-
+footprint trade, taken deliberately.
 
 *(2026-07-23)* The summarizer-call row is the newest budget and the point of dream phase (b):
 this corpus's within-topic pairs sit in the `IngestAction::Reinforce` band (cosine > 0.92), so
@@ -526,6 +557,29 @@ Budget: SIMD p95 must not exceed the ceilings above on the reference tier (≈2�
 for CI noise). N=100k and RAM/100k remain unbaselined until a criterion body covers them. The
 GPU half of the crossover stays in `nanna-gpu` benches (adapter-dependent) and is not a CI gate.
 Machine-readable rows: `suite = "vector_search"` in `bench/budgets.toml`.
+
+### Suite 2 (write path) — embedding round-trips on the turn's critical path
+
+Instrument: `nanna-daemon::memory_adapter::tests::write_path_round_trips_baseline`. Run with
+`cargo test -p nanna-daemon write_path`. Deterministic and hardware-independent — it counts
+provider consultations, not milliseconds.
+
+**Why a count and not a latency.** The defect P24.3 part 3 fixed was not that embedding is slow;
+it is that a tool result put N embedding round-trips *in front of the loop's next step*, against
+the same local server that serves generation. Wall-clock follows from the count and the provider's
+RTT, which is load-dependent and unreproducible; the count is exact. A latency number for the
+other half — how long a queued vector takes to become searchable — is still missing and is tracked
+as an open item in the roadmap.
+
+| Metric | Baseline | Budget | Source | Notes |
+| --- | --- | --- | --- | --- |
+| Embedding round-trips on the critical path, per tool result | **0** | **0** (any chunk count) | `write_path_round_trips_baseline` | was 1 per chunk; ~63 chunks for a 200 KB non-repetitive result |
+| Embedding round-trips on the critical path, per ordinary extracted fact | **1** | **1** | same | unchanged by design — one round-trip buys neighbour-dedup on a few sentences |
+
+Budget: the tool-result row is **zero at any chunk count**, which is a structural claim, not a
+measurement — the test asserts it at 1, 8 and 64 chunks. The ordinary-fact row is a floor, not a
+ceiling: it must not drop to 0, or the deferral has silently swallowed the paths that should still
+dedup inline.
 
 ---
 

@@ -1122,16 +1122,22 @@ pub fn build_task_services(
 // ---------------------------------------------------------------------------
 
 /// The P15 store as the harness's task source, scoped to one run.
+///
+/// It carries no `workdir`. It used to, for "where ancestor acceptance checks
+/// run during promotion" — but the ancestor-promotion experiment was cut as
+/// benchmark-shaped (see the note on [`Self::complete`]: it converted the eval
+/// metric directly and would almost never fire in a chat workflow). The field
+/// outlived the feature, was never read, and was always `None`, so it was a
+/// standing invitation to "finish wiring it" — which the no-benchmark-shaped-
+/// levers rule forbids. Removed 2026-08-26; per-call acceptance checks still
+/// take their own `workdir` from `tasks.done {workdir?}`, which is a different
+/// and live mechanism.
 pub struct TursoTaskSource {
     storage: Arc<Storage>,
     scope: String,
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1149,7 +1155,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 
@@ -1302,7 +1307,13 @@ impl TaskSource for TursoTaskSource {
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
         // the eval metric directly and would almost never fire in a chat
-        // workflow, where tasks rarely carry machine checks). This is pure
+        // workflow, where tasks rarely carry machine checks). Its last residue
+        // was a `workdir: Option<PathBuf>` on this struct, hard-coded to `None`
+        // by the only constructor and read by nothing — a dead-code warning
+        // whose doc comment nonetheless read as though promotion existed and
+        // was merely switched off. Removed; if promotion is ever wanted back it
+        // needs a deliberate design, not a field waiting to be filled in. This
+        // is pure
         // coherence: a parent proven done with scaffolding still open is a
         // contradictory state, and working those children is spending steps on
         // a goal that no longer exists.
@@ -1411,6 +1422,15 @@ pub struct AgentStepRunner {
     /// than once per step — the runner is one object for the whole run, while
     /// each step gets a fresh `RunState`.
     pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Tools the user manually added to this chat's context (per-session
+    /// selection, stored on the session and threaded through `ChatTurnPrep`).
+    ///
+    /// Strictly additive: unioned into every step's active set AFTER the core
+    /// set and BEFORE run-discovered tools, deduplicated. Empty = no manual
+    /// selection, which leaves the active set byte-identical to the
+    /// pre-feature behavior (core + discovered only). Unknown names cost
+    /// nothing — the registry simply has nothing to activate for them.
+    pub user_selected_tools: Vec<String>,
     /// The sibling breakers' repeat-call ledger for THIS run.
     ///
     /// Shared across steps for exactly the reason `discovered_tools` above
@@ -1524,9 +1544,10 @@ impl ChatSink {
                 acc.push_str(text);
             }
             // The journal lock is std::sync and infallible by design (see
-            // ActiveChat::timeline) — merge into the trailing Text item so a
-            // token stream stays one item, not thousands.
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            // `agent_service::timeline_lock`, which both writers share) — merge
+            // into the trailing Text item so a token stream stays one item, not
+            // thousands.
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
                 content.push_str(text);
             } else {
@@ -1553,7 +1574,7 @@ impl ChatSink {
             if let Ok(mut acc) = run.accumulated_thinking.try_write() {
                 acc.push_str(text);
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
             {
                 content.push_str(text);
@@ -1587,9 +1608,7 @@ impl ChatSink {
                     started_at: chrono::Utc::now(),
                 });
             }
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1599,6 +1618,8 @@ impl ChatSink {
                     duration_ms: None,
                     tokens: None,
                     total_tokens: None,
+                    // Back-filled with the rest of the outcome in `tool_end`.
+                    short_circuited: None,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
         }
@@ -1648,11 +1669,12 @@ impl ChatSink {
                     duration_ms,
                 });
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Tool {
                 output: slot_output,
                 success: slot_success,
                 duration_ms: slot_duration,
+                short_circuited: slot_short_circuited,
                 ..
             }) = journal
                 .iter_mut()
@@ -1662,6 +1684,11 @@ impl ChatSink {
                 *slot_output = Some(output.to_string());
                 *slot_success = Some(success);
                 *slot_duration = Some(duration_ms);
+                // Stats, the liveness ledger and the live event already
+                // distinguish a replay from a failure; the run record is the
+                // last consumer that did not, which is why a timeline
+                // rebuilt after a remount showed steering as tool errors.
+                *slot_short_circuited = Some(short_circuited);
             }
         }
         if let Some(stats) = &self.tool_stats {
@@ -1776,9 +1803,7 @@ impl ChatSink {
             item_id: request.item_id,
         });
         if let Some(run) = &self.run {
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Step {
                     phase: kind.to_string(),
                     label,
@@ -2077,50 +2102,33 @@ pub(crate) fn carried_side_effect_note(
 /// the prompt, not to widen this list.
 const CORE_TOOLS: &[&str] = &["discover_tools"];
 
-/// Content not worth a memory: machine noise rather than an observation.
+/// The one place a step's starting active-tool set is assembled: the default
+/// set (core + tools discovered so far this run, exactly as before), with the
+/// user's manual per-chat selections APPENDED.
 ///
-/// Deliberately narrow, and narrower than it used to be. This filter also
-/// matched six "failure shapes" — `"Error:"`, `"Command failed"` and friends —
-/// with `content.contains(s)` across the WHOLE body, not just the prefix.
-/// Upstream, `loop_runner` rewrites every unsuccessful tool result to
-/// `format!("Error: {…}")`, so the combination discarded **100% of failed tool
-/// calls**: 704 of them in one 2-hour run, with not a single ingest line in the
-/// whole day's log containing `FAILED`.
-///
-/// That is backwards. What went wrong is exactly what an agent must remember —
-/// an agent that cannot recall its own failures repeats them, which is what a
-/// long-horizon run looks like when it stalls. The substring form also ate
-/// SUCCESSFUL calls whose output merely mentioned an error: `cat ./minidb`
-/// stored nothing, twice, because the script contains its own error strings.
-/// The agent could not remember reading its own source.
-///
-/// Failure is now carried structurally instead — the episodic writer stamps
-/// `[tool → target — FAILED]` into the content and an `outcome` tag beside it —
-/// so it can be filtered at RECALL time by anyone who wants only successes,
-/// without being unwritable in the first place.
-fn is_low_signal_memory(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.is_empty() {
-        return true;
+/// The contract this function exists to make testable:
+/// - **Empty selection = unchanged.** With no user selections the result is
+///   byte-identical to the pre-feature computation — core first, then
+///   discovered — so default behavior (core tools, `discover_tools` paging,
+///   per-task scopes) cannot drift.
+/// - **Selections only ever ADD.** A user pick already present in the default
+///   set is not duplicated; nothing is ever removed or reordered by a pick.
+fn merge_active_tools(
+    core: &[&str],
+    discovered: &std::collections::HashSet<String>,
+    user_selected: &[String],
+) -> Vec<String> {
+    let mut active: Vec<String> = core
+        .iter()
+        .map(|t| (*t).to_string())
+        .chain(discovered.iter().cloned())
+        .collect();
+    for tool in user_selected {
+        if !active.iter().any(|t| t == tool) {
+            active.push(tool.clone());
+        }
     }
-    // Binary/garbled output. Judged by CONTROL characters and decode failures,
-    // not by "not ASCII" — the old test counted every non-ASCII char as noise,
-    // so 40 box-drawing characters in `tree` output, or any text in a
-    // non-Latin script, was classified as binary and deleted. It also flagged
-    // this very writer's own `[exec → cmd — ok]` header punctuation.
-    //
-    // Real binary shows up as C0 control bytes and U+FFFD replacement
-    // characters after a lossy decode; legitimate text does not.
-    let noise = trimmed
-        .chars()
-        .take(200)
-        .filter(|c| (c.is_control() && !c.is_whitespace()) || *c == '\u{FFFD}')
-        .count();
-    if noise > 40 {
-        return true;
-    }
-    // Heartbeat chatter is the machinery talking to itself — not an observation.
-    trimmed.starts_with("HEARTBEAT_OK")
+    active
 }
 
 /// Faults that mean the local runner's STATE is bad, not that the request
@@ -2880,52 +2888,32 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if is_low_signal_memory(&memory.content) {
+                // Filter, importance and route all live in `memory_adapter` —
+                // ONE copy, shared with the interactive-chat sink in
+                // `agent_service.rs`. This path only decides what to log.
+                let category = memory.category.clone();
+                let bytes = memory.content.len();
+                match crate::memory_adapter::store_extracted_memory(
+                    &service,
+                    memory,
+                    workspace_id,
+                )
+                .await
+                {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
                     // shortfall was invisible until someone counted by hand.
                     // A dropped memory is a fact about the run, not a detail.
-                    tracing::info!(
-                        category = %memory.category,
-                        bytes = memory.content.len(),
+                    Ok(None) => tracing::info!(
+                        category = %category,
+                        bytes,
                         "dropping low-signal memory (machine noise)"
-                    );
-                    return;
-                }
-                let mut metadata = memory.tags.unwrap_or_default();
-                metadata.insert("category".to_string(), memory.category.clone());
-                metadata.insert(
-                    "fact_type".to_string(),
-                    memory.provenance.as_str().to_string(),
-                );
-                // A tool result is raw episodic material — worth keeping, but
-                // it must not outrank a stated preference when recall ranks.
-                let importance: f32 = match memory.category.as_str() {
-                    "tool_result" => 1.5,
-                    "preference" | "identity" => 4.0,
-                    "fact" | "insight" => 3.5,
-                    _ => 3.0,
-                };
-                let stored = match &workspace_id {
-                    Some(ws) => {
-                        service
-                            .remember_scoped(
-                                &memory.content,
-                                metadata,
-                                importance,
-                                Some(ws.clone()),
-                            )
-                            .await
+                    ),
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to store tool result in memory");
                     }
-                    None => {
-                        service
-                            .remember_with_importance(&memory.content, metadata, importance)
-                            .await
-                    }
-                };
-                if let Err(e) = stored {
-                    tracing::warn!(error = %e, "failed to store tool result in memory");
                 }
             })
         }))
@@ -3015,11 +3003,7 @@ impl AgentStepRunner {
         // which is what the design said all along.
         let active: Vec<String> = {
             let discovered = self.discovered_tools.read().await;
-            CORE_TOOLS
-                .iter()
-                .map(|t| (*t).to_string())
-                .chain(discovered.iter().cloned())
-                .collect()
+            merge_active_tools(CORE_TOOLS, &discovered, &self.user_selected_tools)
         };
         let restrict_to_active = true;
 
@@ -7164,6 +7148,76 @@ mod core_tool_gating_tests {
 }
 
 #[cfg(test)]
+mod merge_active_tools_tests {
+    use super::{merge_active_tools, CORE_TOOLS};
+    use std::collections::HashSet;
+
+    fn discovered(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// THE compatibility assertion: with no user selection the merge is
+    /// byte-identical to the pre-feature computation (core first, then
+    /// discovered) — default tool behavior cannot drift.
+    #[test]
+    fn empty_selection_is_unchanged() {
+        let disc = discovered(&["exec", "read_file"]);
+        let legacy: Vec<String> = CORE_TOOLS
+            .iter()
+            .map(|t| (*t).to_string())
+            .chain(disc.iter().cloned())
+            .collect();
+        assert_eq!(
+            merge_active_tools(CORE_TOOLS, &disc, &[]),
+            legacy,
+            "no picks must mean the exact same active set as before the feature"
+        );
+    }
+
+    /// User picks are unioned in — appended after the default set.
+    #[test]
+    fn selection_adds_tools() {
+        let disc = discovered(&["exec"]);
+        let picks = vec!["web_search".to_string(), "read_pdf".to_string()];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert!(active.contains(&"web_search".to_string()));
+        assert!(active.contains(&"read_pdf".to_string()));
+        // And the defaults are all still there — picks only ever ADD.
+        assert!(active.contains(&"discover_tools".to_string()));
+        assert!(active.contains(&"exec".to_string()));
+    }
+
+    /// A pick already in the default set is not duplicated — selecting a core
+    /// or already-discovered tool is a no-op, never a reorder or removal.
+    #[test]
+    fn duplicate_picks_are_not_doubled() {
+        let disc = discovered(&["exec"]);
+        let picks = vec![
+            "discover_tools".to_string(), // core
+            "exec".to_string(),           // discovered
+            "exec".to_string(),           // repeated pick
+            "todo".to_string(),           // genuinely new
+        ];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert_eq!(
+            active.iter().filter(|t| *t == "discover_tools").count(),
+            1,
+            "picking a core tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "exec").count(),
+            1,
+            "picking a discovered tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "todo").count(),
+            1,
+            "a repeated pick lands once"
+        );
+    }
+}
+
+#[cfg(test)]
 mod workspace_reference_tests {
     use nanna_agent::harness::{build_step_prompt, TaskStep};
     use nanna_agent::AgentContext;
@@ -7190,6 +7244,7 @@ mod workspace_reference_tests {
             contributing: None,
             // A 1000-line roadmap — far past what a 16k window can spare.
             roadmap: Some("- [ ] migrate a file off lucide-vue-next\n".repeat(1_000)),
+            git: None,
         };
 
         let mut ctx = AgentContext::new("t");

@@ -26,6 +26,20 @@ export interface WorkspaceValidity {
   has_manifest: boolean
 }
 
+/**
+ * The four standard context files, as keys into both `WorkspaceValidity` and
+ * the workspace rows the list renders.
+ *
+ * A literal union rather than `string`: the UI indexes those objects by these
+ * keys (`ws[file.key]`), and a `string` key is not provably a member of either
+ * shape — which is what made every such read an implicit `any`.
+ */
+export type ContextFileKey =
+  | 'has_readme'
+  | 'has_agents'
+  | 'has_contributing'
+  | 'has_roadmap'
+
 /** Does the folder already carry a marker the backend recognises? */
 export function hasWorkspaceMarker(validity: WorkspaceValidity | null): boolean {
   return validity?.is_valid === true

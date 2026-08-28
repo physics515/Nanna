@@ -432,7 +432,7 @@ pub struct AgentConfig {
     /// When enabled, the agent classifies each iteration's complexity and routes
     /// to the cheapest model capable of handling it.
     /// Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
     pub model_routing: Vec<ModelTier>,
     /// Whether to always use the primary model for the first iteration
     /// (user-facing response quality). Default: true.
@@ -492,7 +492,7 @@ pub enum TaskComplexity {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: None,
@@ -1148,11 +1148,24 @@ pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
 /// Derivation: the notice is re-injected into context on EVERY
 /// short-circuited call, and the full text already reached the model each of
 /// the K times the call actually ran — the replay is a reminder, not the
-/// primary delivery. 2000 bytes is the floor of the dynamic
-/// `context_result_threshold` (`(max_tokens * 2).clamp(2000, 32000)`): the
-/// largest size guaranteed to reach context untouched for every model size,
-/// so the notice itself can never trip the summarization or compression
-/// machinery.
+/// primary delivery. So it must be small enough to reach context untouched,
+/// or the reminder itself trips the summarization it is warning about.
+///
+/// The bound is a quarter of the smallest input budget this loop will run at,
+/// expressed in bytes. The dynamic `context_result_threshold` is
+/// `(hard_limit / 4) * CHARS_PER_TOKEN_ESTIMATE` — a quarter of the live input
+/// window — and `min_viable_num_ctx` is the floor below which the loop fails
+/// loudly rather than running truncated (`ContextBelowFloor`), so a window
+/// small enough to stub this notice is a window the step already refused.
+///
+/// **This derivation was stale and is restated, not re-derived.** It used to
+/// read "2000 bytes is the floor of the dynamic `context_result_threshold`
+/// (`(max_tokens * 2).clamp(2000, 32000)`)" — the boot-frozen `max_tokens`
+/// formula P24.10 was raised about and which `:6882` replaced with the live
+/// input budget. There is no `clamp` and no floor of 2000 any more. The value
+/// is unchanged because the constraint it encodes is unchanged; only the
+/// sentence explaining it was describing code that no longer exists, which is
+/// exactly how the original defect stayed invisible for as long as it did.
 const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
 /// Byte bound on the task-anchor rendered at the head of every injected
@@ -1392,17 +1405,63 @@ impl RepeatLedger {
     /// observed twenty-five times.
     ///
     /// A verdict that the file parses clears the streak: the edits worked.
+    /// Record that a call mutated `path`, whether or not it produced a
+    /// structural verdict.
+    ///
+    /// This is the half the streak counter cannot supply. A verdict only exists
+    /// where a checker applies and actually ran, so between the last passing
+    /// check and the next failing one there can be mutations nothing observed —
+    /// and those are exactly the ones worth naming, because the model has no
+    /// other way to know they are in the span.
+    ///
+    /// The names are bounded by [`REGRESSION_SPAN_NAME_BUDGET_BYTES`]; the
+    /// COUNT never is, so a span too long to list still reports its true size.
+    async fn record_mutation(&self, path: &str, tool: &str, summary: &str) {
+        debug_assert!(!path.is_empty(), "a mutation must name the file it changed");
+        debug_assert!(!tool.is_empty(), "a mutation must name the tool that made it");
+
+        let line = if summary.is_empty() {
+            format!("`{tool}`")
+        } else {
+            format!("`{tool}` ({summary})")
+        };
+
+        // The guard is released before the postcondition is checked: an assert
+        // is not a reason to hold a write lock over the whole ledger.
+        let mut streaks = self.structural.write().await;
+        let entry = streaks.entry(canonical_verdict_path(path)).or_default();
+        entry.span.total_count = entry.span.total_count.saturating_add(1);
+        let used: usize = entry.span.named.iter().map(String::len).sum();
+        if used.saturating_add(line.len()) <= REGRESSION_SPAN_NAME_BUDGET_BYTES {
+            entry.span.named.push(line);
+        }
+        let named_count = entry.span.named.len();
+        let total_count = entry.span.total_count;
+        drop(streaks);
+
+        debug_assert!(
+            u32::try_from(named_count).unwrap_or(u32::MAX) <= total_count,
+            "more names retained than mutations counted"
+        );
+    }
+
     async fn record_structural_verdict(
         &self,
         path: &str,
         parses: bool,
         signature: &str,
-    ) -> Option<usize> {
+    ) -> StructuralVerdictOutcome {
         let mut streaks = self.structural.write().await;
         let entry = streaks.entry(canonical_verdict_path(path)).or_default();
         if parses {
-            *entry = StructuralVerdictStreak::default();
-            return None;
+            // A pass is the new baseline: the streak dies, the span it would
+            // have been attributed to is closed, and the next break is a fresh
+            // edge that may be announced again.
+            *entry = StructuralVerdictStreak {
+                seen_passing: true,
+                ..StructuralVerdictStreak::default()
+            };
+            return StructuralVerdictOutcome::default();
         }
         if entry.signature == signature {
             entry.count += 1;
@@ -1413,11 +1472,27 @@ impl RepeatLedger {
             entry.count = 1;
             entry.escalated = false;
         }
-        if entry.count >= STRUCTURAL_REPEAT_ESCALATE_AFTER && !entry.escalated {
+
+        // Said once per pass→fail edge, and only for a file this run has
+        // actually seen parse. The span is kept, not cleared: a file that stays
+        // broken keeps accumulating, and a later pass is what closes it.
+        let regression = if entry.seen_passing && !entry.regression_announced {
+            entry.regression_announced = true;
+            Some(entry.span.clone())
+        } else {
+            None
+        };
+
+        let repeat_edits = if entry.count >= STRUCTURAL_REPEAT_ESCALATE_AFTER && !entry.escalated {
             entry.escalated = true;
             Some(entry.count)
         } else {
             None
+        };
+
+        StructuralVerdictOutcome {
+            repeat_edits,
+            regression,
         }
     }
 
@@ -1465,6 +1540,42 @@ impl RepeatLedger {
     }
 }
 
+/// The mutations that landed on one file between the last time it parsed and
+/// the failure being reported, newest last.
+///
+/// `named` is bounded by [`REGRESSION_SPAN_NAME_BUDGET_BYTES`] while
+/// `total_count` always counts every mutation, so a span too long to list still
+/// reports its true size instead of silently shrinking. Same shape as the
+/// carried-side-effect note: name what fits, count what does not.
+#[derive(Debug, Default, Clone)]
+struct RegressionSpan {
+    named: Vec<String>,
+    total_count: u32,
+}
+
+/// What one structural verdict is worth saying about, if anything.
+///
+/// Two independent findings, because they answer different questions: the
+/// streak says *this fix is not working*, the regression says *this used to
+/// work and something between then and now broke it*. A file can be in both
+/// states at once and neither should suppress the other.
+#[derive(Debug, Default)]
+struct StructuralVerdictOutcome {
+    /// The streak length, the first time a repeated identical break reaches
+    /// [`STRUCTURAL_REPEAT_ESCALATE_AFTER`].
+    repeat_edits: Option<usize>,
+    /// What landed across a pass→fail edge, said once per edge.
+    regression: Option<RegressionSpan>,
+}
+
+/// How many bytes of mutation names one regression sentence may carry.
+///
+/// Not a cap on the span — the span's true length is always reported. This
+/// bounds only the LIST, so an attribution sentence cannot itself become the
+/// thing that crowds a small model's window. Sized to the same order as the
+/// other in-context notices in this file: a couple of lines.
+const REGRESSION_SPAN_NAME_BUDGET_BYTES: usize = 320;
+
 /// How many consecutive mutations of one file have left the same normalized
 /// parse error, and whether the escalation has already been said.
 #[derive(Debug, Default)]
@@ -1472,6 +1583,17 @@ struct StructuralVerdictStreak {
     signature: String,
     count: usize,
     escalated: bool,
+    /// Has this path been observed PARSING at least once this run? Only then
+    /// is a later failure a regression; a file that has never parsed is not
+    /// something that broke, it is something not finished yet, and accusing
+    /// the model of breaking it would be false.
+    seen_passing: bool,
+    /// What has been mutated since that last pass — the span a regression is
+    /// attributed to. Cleared on a pass and after the attribution is said.
+    span: RegressionSpan,
+    /// Whether the pass→fail edge has already been announced. One sentence per
+    /// edge: repeating it every step would turn attribution into nagging.
+    regression_announced: bool,
 }
 
 /// How many consecutive calls to one tool NAME have returned the same
@@ -1612,6 +1734,66 @@ fn name_outcome_signature(record: &ToolCallRecord) -> u64 {
     hasher.finish()
 }
 
+/// Fold one executed write-family call into the structural ledger and return
+/// whatever the ledger has to SAY about it, ready to append to the result.
+///
+/// Extracted rather than inlined at the call site: the caller is already far
+/// past any reasonable function length, and this is a self-contained
+/// record-then-report step over one call's outcome.
+///
+/// Order is load-bearing. The mutation is recorded BEFORE the verdict is read,
+/// so the call carrying a failing verdict is inside its own attribution span —
+/// it is the most likely culprit and must not be the one name missing. And the
+/// regression sentence comes before the repeat-streak sentence, because *what
+/// changed* is the question that precedes *your fix is not working*.
+async fn structural_notices_for_call(
+    ledger: &RepeatLedger,
+    name: &str,
+    input: &Value,
+    result: &nanna_tools::ToolResult,
+) -> String {
+    let Some(path) = mutated_path(input) else {
+        return String::new();
+    };
+
+    if is_claim_write_family(name) && result.success {
+        ledger.record_mutation(path, name, "").await;
+    }
+
+    let Some((parses, detail)) = structural_verdict(result) else {
+        return String::new();
+    };
+    let verdict = ledger
+        .record_structural_verdict(path, parses, &structural_verdict_signature(&detail))
+        .await;
+
+    let mut notices = String::new();
+    if let Some(span) = verdict.regression {
+        warn!(
+            tool = %name,
+            path = %path,
+            mutations = span.total_count,
+            "🧨 Structural regression — {} parsed earlier this run and does not now; naming \
+             the {} mutation(s) in between",
+            path,
+            span.total_count
+        );
+        notices.push_str(&structural_regression_notice(path, &detail, &span));
+    }
+    if let Some(edits) = verdict.repeat_edits {
+        warn!(
+            tool = %name,
+            path = %path,
+            edits,
+            "🧱 Same structural break across {} consecutive edits — escalating past the static \
+             fix-that-line sentence",
+            edits
+        );
+        notices.push_str(&structural_repeat_escalation(path, edits, &detail));
+    }
+    notices
+}
+
 /// The escalated structural sentence, said once when N different edits have
 /// each left the same break.
 ///
@@ -1621,7 +1803,39 @@ fn name_outcome_signature(record: &ToolCallRecord) -> u64 {
 /// the parser gave up — for an unclosed quote, bracket or heredoc that is
 /// after the real mistake, so "fix that line" sends the model to the wrong
 /// line forever. Information, never a gate: the edit landed and the file is on
-/// disk exactly as sent.
+/// Regression attribution: this file parsed before, and does not now.
+///
+/// The streak sentence above answers "your fix is not working". This answers
+/// the question that comes first and was never asked for the model: *what
+/// changed between the last time this was fine and now?* The interesting span
+/// is more than one call — a mutation whose checker did not apply, or whose
+/// check was not run, leaves a gap the streak counter cannot see, and the model
+/// is left re-reading the file that broke rather than the edit that broke it.
+fn structural_regression_notice(path: &str, detail: &str, span: &RegressionSpan) -> String {
+    let listed = if span.named.is_empty() {
+        String::new()
+    } else {
+        format!(" Since then: {}.", span.named.join(", "))
+    };
+    let unlisted = span.total_count.saturating_sub(
+        u32::try_from(span.named.len()).unwrap_or(u32::MAX),
+    );
+    let omitted = if unlisted > 0 {
+        format!(" ({unlisted} earlier one(s) not listed.)")
+    } else {
+        String::new()
+    };
+    format!(
+        "\n\n[REGRESSION — {path} PARSED the last time it was checked this run, and does not \
+         now ({detail}). {} mutation(s) landed in between.{listed}{omitted} The break came in \
+         one of those, not from wherever the parser reported it — read what those calls \
+         changed rather than the line number, and if one of them was a whole-file rewrite, \
+         compare against {path}.__prev__ before editing further.]",
+        span.total_count
+    )
+}
+
+// disk exactly as sent.
 fn structural_repeat_escalation(path: &str, edits: usize, detail: &str) -> String {
     format!(
         "\n\n[SAME BREAK, {edits} EDITS RUNNING — {edits} different edits to {path} in a row \
@@ -6570,32 +6784,18 @@ impl Agent {
             // a breaker manufacture its own streak.
             let mut result_notices = String::new();
             if !short_circuited {
-                // N different edits, one unchanging break. Every guard above is
-                // blind to it — each edit is a different call, so a different
-                // key, and each edit is also a successful side-effectful call,
-                // so it re-arms everything by bumping the world epoch.
-                if let Some((parses, detail)) = structural_verdict(&response.result)
-                    && let Some(path) = mutated_path(&input)
-                {
-                    let signature = structural_verdict_signature(&detail);
-                    if let Some(edits) = state
-                        .repeat_calls
-                        .record_structural_verdict(path, parses, &signature)
-                        .await
-                    {
-                        warn!(
-                            tool = %name,
-                            path = %path,
-                            edits,
-                            "🧱 Same structural break across {} consecutive edits — escalating \
-                             past the static fix-that-line sentence",
-                            edits
-                        );
-                        result_notices.push_str(&structural_repeat_escalation(
-                            path, edits, &detail,
-                        ));
-                    }
-                }
+                // Record-then-report over this call's structural outcome —
+                // see `structural_notices_for_call` for why the order inside
+                // it is load-bearing.
+                result_notices.push_str(
+                    &structural_notices_for_call(
+                        &state.repeat_calls,
+                        &name,
+                        &input,
+                        &response.result,
+                    )
+                    .await,
+                );
 
                 // Rewording a call that keeps returning the same thing. The
                 // per-shape streaks never build, because every rewording opens
@@ -6803,7 +7003,7 @@ impl Agent {
                                 Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
                                 None => format!("[{name} — {outcome}] {chunk_content}"),
                             },
-                            category: "tool_result".to_string(),
+                            category: TOOL_RESULT_CATEGORY.to_string(),
                             // A tool result is always agent-observed, never a user statement.
                             provenance: MemoryProvenance::Observed,
                             tags: Some(tags),
@@ -8301,6 +8501,15 @@ impl MemoryProvenance {
         }
     }
 }
+
+/// The `category` every tool-result memory carries.
+///
+/// A constant rather than two string literals because the two ends are in
+/// different crates: this file stamps it, and the daemon's memory sink routes
+/// on it to keep a tool result's vector off the turn's critical path. Two
+/// privately-duplicated policies drifting apart is precisely how the two memory
+/// filters ended up disagreeing (see `memory_adapter::is_low_signal_memory`).
+pub const TOOL_RESULT_CATEGORY: &str = "tool_result";
 
 /// A memory extracted from conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10128,15 +10337,21 @@ mod outcome_keyed_guard_tests {
         let ledger = RepeatLedger::new();
         let sig = structural_verdict_signature("x.sh: line 3: unexpected EOF while looking for `\"'");
 
-        assert_eq!(ledger.record_structural_verdict("./x.sh", false, &sig).await, None);
-        assert_eq!(ledger.record_structural_verdict("x.sh", false, &sig).await, None);
         assert_eq!(
-            ledger.record_structural_verdict("X.SH", false, &sig).await,
+            ledger.record_structural_verdict("./x.sh", false, &sig).await.repeat_edits,
+            None
+        );
+        assert_eq!(
+            ledger.record_structural_verdict("x.sh", false, &sig).await.repeat_edits,
+            None
+        );
+        assert_eq!(
+            ledger.record_structural_verdict("X.SH", false, &sig).await.repeat_edits,
             Some(STRUCTURAL_REPEAT_ESCALATE_AFTER),
             "three spellings of one path are one streak"
         );
         assert_eq!(
-            ledger.record_structural_verdict("x.sh", false, &sig).await,
+            ledger.record_structural_verdict("x.sh", false, &sig).await.repeat_edits,
             None,
             "the sentence escalates once, not once per edit"
         );
@@ -10151,11 +10366,14 @@ mod outcome_keyed_guard_tests {
         let sig = structural_verdict_signature("a.json: Unexpected token } at position 412");
         for _ in 0..2 {
             ledger.bump_epoch();
-            assert_eq!(ledger.record_structural_verdict("a.json", false, &sig).await, None);
+            assert_eq!(
+                ledger.record_structural_verdict("a.json", false, &sig).await.repeat_edits,
+                None
+            );
         }
         ledger.bump_epoch();
         assert_eq!(
-            ledger.record_structural_verdict("a.json", false, &sig).await,
+            ledger.record_structural_verdict("a.json", false, &sig).await.repeat_edits,
             Some(STRUCTURAL_REPEAT_ESCALATE_AFTER)
         );
     }
@@ -10169,10 +10387,112 @@ mod outcome_keyed_guard_tests {
         ledger.record_structural_verdict("a.sh", false, &sig).await;
         ledger.record_structural_verdict("a.sh", true, "").await;
         assert_eq!(
-            ledger.record_structural_verdict("a.sh", false, &sig).await,
+            ledger.record_structural_verdict("a.sh", false, &sig).await.repeat_edits,
             None,
             "the streak restarted at one after the file parsed"
         );
+    }
+
+
+    /// A file that has NEVER parsed is not something that broke. Accusing the
+    /// model of regressing a file it is still writing would be false, and the
+    /// sentence would fire on every half-finished script.
+    #[tokio::test]
+    async fn a_file_that_never_parsed_is_never_called_a_regression() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("new.sh: line 4: syntax error near `fi'");
+        ledger.record_mutation("new.sh", "write_file", "").await;
+
+        let verdict = ledger.record_structural_verdict("new.sh", false, &sig).await;
+
+        assert!(verdict.regression.is_none());
+    }
+
+    /// The whole point: the span crosses calls no checker saw. Two of these
+    /// three mutations produce no verdict at all, and they are exactly the ones
+    /// the model has no other way to learn are implicated.
+    #[tokio::test]
+    async fn a_regression_names_every_mutation_since_the_file_last_parsed() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("a.sh: line 9: unexpected end of file");
+
+        ledger.record_mutation("a.sh", "write_file", "").await;
+        ledger.record_structural_verdict("a.sh", true, "").await;
+
+        // Three mutations; only the last one carries a verdict.
+        ledger.record_mutation("./a.sh", "edit_file", "").await;
+        ledger.record_mutation("A.SH", "exec", "").await;
+        ledger.record_mutation("a.sh", "write_file", "").await;
+        let verdict = ledger.record_structural_verdict("a.sh", false, &sig).await;
+
+        let span = verdict.regression.expect("a file that parsed, and now does not");
+        assert_eq!(span.total_count, 3, "all three spellings are one file");
+        assert_eq!(span.named.len(), 3);
+        assert!(span.named.iter().any(|m| m.contains("edit_file")));
+        assert!(span.named.iter().any(|m| m.contains("exec")));
+
+        let notice = structural_regression_notice("a.sh", "line 9", &span);
+        assert!(notice.contains("3 mutation(s) landed in between"), "{notice}");
+        assert!(notice.contains("edit_file"), "{notice}");
+        assert!(notice.contains("__prev__"), "{notice}");
+    }
+
+    /// Said once per edge. A file that stays broken keeps accumulating the span
+    /// but must not repeat the accusation every step — that turns attribution
+    /// into nagging, and the model stops reading it.
+    #[tokio::test]
+    async fn a_regression_is_announced_once_per_edge_and_re_arms_after_a_pass() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("b.sh: line 2: oops");
+        ledger.record_structural_verdict("b.sh", true, "").await;
+
+        ledger.record_mutation("b.sh", "edit_file", "").await;
+        assert!(
+            ledger.record_structural_verdict("b.sh", false, &sig).await.regression.is_some(),
+            "the edge is announced"
+        );
+        ledger.record_mutation("b.sh", "edit_file", "").await;
+        assert!(
+            ledger.record_structural_verdict("b.sh", false, &sig).await.regression.is_none(),
+            "and not again while it stays broken"
+        );
+
+        // A pass closes the edge; the next break is a new one.
+        ledger.record_structural_verdict("b.sh", true, "").await;
+        ledger.record_mutation("b.sh", "write_file", "").await;
+        let reopened = ledger.record_structural_verdict("b.sh", false, &sig).await;
+        let span = reopened.regression.expect("a fresh edge");
+        assert_eq!(span.total_count, 1, "a pass closes the span it would attribute");
+    }
+
+    /// The name list is bounded; the COUNT never is. A span too long to print
+    /// must still report its true size, or the bound would quietly turn a
+    /// 40-mutation span into a 6-mutation claim.
+    #[tokio::test]
+    async fn a_long_span_reports_its_true_size_and_says_what_it_omitted() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("c.sh: line 1: oops");
+        ledger.record_structural_verdict("c.sh", true, "").await;
+        for _ in 0..200 {
+            ledger.record_mutation("c.sh", "edit_file", "").await;
+        }
+
+        let span = ledger
+            .record_structural_verdict("c.sh", false, &sig)
+            .await
+            .regression
+            .expect("a regression");
+
+        assert_eq!(span.total_count, 200);
+        assert!(span.named.len() < 200, "the list is bounded");
+        let named_bytes: usize = span.named.iter().map(String::len).sum();
+        assert!(
+            named_bytes <= REGRESSION_SPAN_NAME_BUDGET_BYTES,
+            "{named_bytes} bytes of names"
+        );
+        let notice = structural_regression_notice("c.sh", "line 1", &span);
+        assert!(notice.contains("200 mutation(s)"), "{notice}");
+        assert!(notice.contains("not listed"), "{notice}");
     }
 
     fn failed_record(name: &str, input: Value, output: &str) -> ToolCallRecord {

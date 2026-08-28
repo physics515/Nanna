@@ -42,7 +42,7 @@ pub use loop_runner::{
     DegradationLedger, EmotionalContext, ExtractedMemory, MemoryCallback,
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RepeatLedger,
     RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
-    TASK_ANCHOR_MAX_BYTES, TaskComplexity,
+    TASK_ANCHOR_MAX_BYTES, TOOL_RESULT_CATEGORY, TaskComplexity,
     ThinkingCallback, ThinkingMode, ToolCallRecord,
     budget_warning_message, claim_nudge_message, is_work_evidence_tool, min_viable_num_ctx,
     narration_nudge_message, repetition_nudge_message, thinking_spiral_nudge_message,

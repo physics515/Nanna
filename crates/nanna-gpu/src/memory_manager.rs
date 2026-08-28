@@ -65,7 +65,7 @@ impl GpuVectorStore {
         }
 
         let bytes_per_vector = (vector_dim * std::mem::size_of::<f32>()) as u64;
-        let max_buffer_size = ctx.device.limits().max_storage_buffer_binding_size as u64;
+        let max_buffer_size = ctx.device.limits().max_storage_buffer_binding_size;
 
         Ok(Self {
             vectors: Vec::new(),
@@ -82,13 +82,13 @@ impl GpuVectorStore {
     ///
     /// # Arguments
     ///
-    /// * `new_vectors` - Flattened array of vectors (length must be multiple of vector_dim)
+    /// * `new_vectors` - Flattened array of vectors (length must be multiple of `vector_dim`)
     ///
     /// # Errors
     ///
     /// Returns error if vector dimensions don't match.
     pub fn append(&mut self, new_vectors: &[f32]) -> Result<(), MemoryError> {
-        if new_vectors.len() % self.vector_dim != 0 {
+        if !new_vectors.len().is_multiple_of(self.vector_dim) {
             return Err(MemoryError::InvalidDimensions {
                 expected: self.vector_dim,
                 got: new_vectors.len(),
@@ -109,7 +109,7 @@ impl GpuVectorStore {
     /// # Arguments
     ///
     /// * `index` - Vector index
-    /// * `vector` - New vector data (must match vector_dim)
+    /// * `vector` - New vector data (must match `vector_dim`)
     ///
     /// # Errors
     ///

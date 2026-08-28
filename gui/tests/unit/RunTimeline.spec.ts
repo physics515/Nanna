@@ -13,19 +13,18 @@ import type { TimelineEntry } from '~/composables/useSessionState'
  */
 
 const stubs = {
-  ThinkingCard: {
-    props: ['content', 'isActive'],
+  NuiThinkingMessage: {
+    props: ['content', 'active'],
     template: '<div data-testid="thinking" />',
   },
-  ToolCallCard: {
+  NuiToolCallMessage: {
     props: ['toolCall', 'status', 'timestamp', 'tokens', 'totalTokens'],
     template: '<div data-testid="tool" :data-status="status" />',
   },
-  MessageBubble: {
-    props: ['variant'],
+  NuiMessage: {
+    props: ['role', 'accent', 'author'],
     template: '<div data-testid="bubble"><slot /></div>',
   },
-  UiAvatar: { template: '<span />' },
   MarkdownContent: {
     props: ['content'],
     template: '<div data-testid="markdown">{{ content }}</div>',

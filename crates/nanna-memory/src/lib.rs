@@ -1,5 +1,12 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
+// Raised for the same reason as `nanna-daemon`'s: proving a future or closure
+// is `Send` walks into wgpu's `Global`/`Hub`/`Registry` graph by way of
+// `CosineSimilaritySearch`, which is deeper than the default limit of 128.
+// nightly-2026-08-25 turned that overflow into the future-incompatible
+// `recursion_depth_exceeding_limit` warning (rust#159228), which is scheduled
+// to become a hard error. Solver depth only — no behaviour, no codegen change.
+#![recursion_limit = "256"]
 
 //! Memory and embedding system for Nanna
 //!
@@ -25,6 +32,7 @@ pub use consolidation::{
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
     create_consolidated_entry, composite_cluster_score,
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
+    is_verbatim_pinned, FACT_TYPE_METADATA_KEY,
 };
 pub use dreaming::{
     dream_trigger, DreamOutcome, DreamTrigger, DreamingConfig, DreamingService, DreamingStats,
@@ -34,6 +42,10 @@ pub use fsrs::{
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
     power_law_retrievability,
 };
+// The decay exponent's published value and the range a fitted one may take.
+// Exported because `FsrsParameters::w20` is public and its doc names them: a
+// caller overriding the exponent needs the same bounds the default is held to.
+pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
     MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
     MemoryStats, MemoryListEntry, ConsolidationBands,

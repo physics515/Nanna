@@ -21,7 +21,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '~/lib/markdown'
 
 const props = defineProps<{
   content: string
@@ -81,19 +81,12 @@ const blocks = computed<ContentBlock[]>(() => {
   return result
 })
 
-// Configure marked - don't handle code blocks (we do it ourselves)
-marked.setOptions({
-  breaks: true,
-  gfm: true,
-})
-
-function renderMarkdown(text: string): string {
-  try {
-    return marked.parse(text) as string
-  } catch {
-    return text
-  }
-}
+// Rendering lives in `~/lib/markdown`: everything below is untrusted (assistant
+// output, user input, and whatever a tool returned that the assistant quoted),
+// and it goes straight into `v-html`. That module escapes author HTML and
+// scheme-checks link/image URLs so this component cannot hand parsed markup to
+// the webview. Fenced code blocks never reach it — they are split out above and
+// rendered by Monaco.
 </script>
 
 <style>

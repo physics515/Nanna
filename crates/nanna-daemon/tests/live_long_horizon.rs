@@ -118,6 +118,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     }
     let router = Arc::new(router);
     let runner = AgentStepRunner {
+        user_selected_tools: Vec::new(),
         // One ledger for the whole eval run, matching production.
         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
         // Fresh per run: discovery is paid once per tool, then carried across

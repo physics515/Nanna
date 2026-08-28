@@ -393,6 +393,8 @@ impl ControlPlane {
                 );
                 let runner = AgentStepRunner {
                     discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+                    // Background runs have no chat, so no user tool picks.
+                    user_selected_tools: Vec::new(),
                     // One ledger for the whole background run — a long-horizon
                     // run is exactly where a per-step reset hurts most.
                     repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
