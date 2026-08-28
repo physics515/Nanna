@@ -104,13 +104,18 @@ async fn track_memory_in(
         let excess = memories.len() - MAX_MEMORIES_PER_SESSION;
         memories.drain(0..excess);
     }
+    // Read the two sizes, then release the guard: nothing below needs the map,
+    // and holding a write lock across an assertion is a lock held for no work.
+    let per_session = memories.len();
+    let session_count = sessions.len();
+    drop(sessions);
 
     assert!(
-        memories.len() <= MAX_MEMORIES_PER_SESSION,
+        per_session <= MAX_MEMORIES_PER_SESSION,
         "per-session feedback tracking must stay bounded"
     );
     assert!(
-        sessions.len() <= MAX_TRACKED_SESSIONS,
+        session_count <= MAX_TRACKED_SESSIONS,
         "the feedback attribution map must stay bounded"
     );
 }
@@ -174,9 +179,11 @@ async fn link_message_in(
         let Some(oldest) = oldest else { break };
         links.remove(&oldest);
     }
+    let link_count = links.len();
+    drop(links);
 
     assert!(
-        links.len() <= MAX_LINKED_MESSAGES,
+        link_count <= MAX_LINKED_MESSAGES,
         "the message-link map must stay bounded"
     );
 }
@@ -844,8 +851,13 @@ mod tests {
             track_memory_in(&tracked, "session-a", &format!("mem-{i}")).await;
         }
 
-        let sessions = tracked.read().await;
-        let memories = sessions.get("session-a").expect("session is tracked");
+        let memories = {
+            let sessions = tracked.read().await;
+            sessions
+                .get("session-a")
+                .expect("session is tracked")
+                .clone()
+        };
         assert_eq!(memories.len(), MAX_MEMORIES_PER_SESSION);
         // The cap keeps the newest, which are the ones a reaction can be about.
         let newest = format!("mem-{}", MAX_MEMORIES_PER_SESSION * 3 - 1);
@@ -866,14 +878,17 @@ mod tests {
             track_memory_in(&tracked, &format!("session-{i}"), "mem").await;
         }
 
-        let sessions = tracked.read().await;
+        let tracked_ids: Vec<String> = {
+            let sessions = tracked.read().await;
+            sessions.keys().cloned().collect()
+        };
         assert!(
-            sessions.len() <= MAX_TRACKED_SESSIONS,
+            tracked_ids.len() <= MAX_TRACKED_SESSIONS,
             "tracked {} sessions, cap is {MAX_TRACKED_SESSIONS}",
-            sessions.len()
+            tracked_ids.len()
         );
         assert!(
-            sessions.contains_key(&format!("session-{}", MAX_TRACKED_SESSIONS + 39)),
+            tracked_ids.contains(&format!("session-{}", MAX_TRACKED_SESSIONS + 39)),
             "the newest session must be the one that is kept"
         );
     }
@@ -966,20 +981,27 @@ mod tests {
 
         link_message_in(&links, "message-newest", "session-newest").await;
 
-        let map = links.read().await;
-        assert!(map.len() <= MAX_LINKED_MESSAGES, "cap held: {}", map.len());
+        let link_ids: Vec<String> = {
+            let map = links.read().await;
+            map.keys().cloned().collect()
+        };
         assert!(
-            map.contains_key("message-newest"),
+            link_ids.len() <= MAX_LINKED_MESSAGES,
+            "cap held: {}",
+            link_ids.len()
+        );
+        assert!(
+            link_ids.contains(&"message-newest".to_string()),
             "the link just made must survive its own insertion"
         );
         // The old prune took HALF the map in HashMap order; this one takes the
         // single oldest link, which is `message-0`.
         assert!(
-            !map.contains_key("message-0"),
+            !link_ids.contains(&"message-0".to_string()),
             "the oldest link is the one that should go"
         );
         assert!(
-            map.contains_key(&format!("message-{}", MAX_LINKED_MESSAGES - 1)),
+            link_ids.contains(&format!("message-{}", MAX_LINKED_MESSAGES - 1)),
             "a recent link must not be collateral damage"
         );
     }

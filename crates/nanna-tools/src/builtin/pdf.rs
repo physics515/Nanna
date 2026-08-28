@@ -209,6 +209,143 @@ impl ReadPdfTool {
         self.ocr_fn = Some(f);
         self
     }
+
+    /// Recover text from image-only pages, or say plainly why none was.
+    ///
+    /// Silence here would be indistinguishable from a scanned document that
+    /// genuinely holds no text, so every branch writes something.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolError` when image extraction fails.
+    async fn append_ocr_fallback(
+        &self,
+        bytes: &[u8],
+        selection: PageSelection,
+        enabled: bool,
+        empty_pages: &[u32],
+        out: &mut String,
+    ) -> Result<(), ToolError> {
+        if !enabled || empty_pages.is_empty() {
+            return Ok(());
+        }
+        let Some(ref ocr_fn) = self.ocr_fn else {
+            out.push_str(&format!(
+                "
+
+*Note: {} page(s) had no extractable text. Configure an OCR \
+                 pipeline to recover text from image-only pages.*",
+                empty_pages.len()
+            ));
+            return Ok(());
+        };
+
+        let images = extract_pdf_images(bytes, selection)?;
+        if images.is_empty() {
+            out.push_str(
+                "
+
+*Note: Some pages had no extractable text and no embedded \
+                 images were found for OCR fallback.*",
+            );
+            return Ok(());
+        }
+
+        out.push_str(
+            "
+
+## OCR Text (from image-only pages)
+
+",
+        );
+        for (index, (image_data, media_type)) in images.into_iter().enumerate() {
+            let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
+            let prompt = "Extract ALL text from this image using OCR. Output the \
+                          extracted text only."
+                .to_string();
+            match ocr_fn(encoded, prompt, media_type).await {
+                Ok(text) if !text.trim().is_empty() => {
+                    out.push_str(&format!(
+                        "### Image {} (OCR)
+{text}
+
+",
+                        index + 1
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    out.push_str(&format!(
+                        "### Image {} (OCR failed)
+Error: {e}
+
+",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Describe embedded images with the vision model, if one is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolError` when image extraction fails.
+    async fn append_image_descriptions(
+        &self,
+        bytes: &[u8],
+        selection: PageSelection,
+        prompt: &str,
+        out: &mut String,
+    ) -> Result<(), ToolError> {
+        let Some(ref vision_fn) = self.vision_fn else {
+            out.push_str(
+                "
+
+*Note: Image extraction requested but vision model not configured.*",
+            );
+            return Ok(());
+        };
+
+        let images = extract_pdf_images(bytes, selection)?;
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        out.push_str(
+            "
+
+## Extracted Images
+
+",
+        );
+        for (index, (image_data, media_type)) in images.into_iter().enumerate() {
+            let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
+            match vision_fn(encoded, prompt.to_string(), media_type).await {
+                Ok(description) => {
+                    out.push_str(&format!(
+                        "### Image {}
+{description}
+
+",
+                        index + 1
+                    ));
+                }
+                Err(e) => {
+                    out.push_str(&format!(
+                        "### Image {} (analysis failed)
+Error: {e}
+
+",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ReadPdfTool {
@@ -319,79 +456,14 @@ impl Tool for ReadPdfTool {
         let (text, empty_pages) = (extracted.text, extracted.empty_pages);
         let mut result = format!("# PDF Content: {}\n\n{}", path_str, text);
 
-        // ------------------------------------------------------------------
-        // Tier 2: OCR fallback for empty pages
-        // ------------------------------------------------------------------
-        if ocr_fallback && !empty_pages.is_empty() {
-            if let Some(ref ocr_fn) = self.ocr_fn {
-                let all_images = extract_pdf_images(&bytes, selection)?;
-                if !all_images.is_empty() {
-                    result.push_str("\n\n## OCR Text (from image-only pages)\n\n");
-                    for (i, (image_data, media_type)) in all_images.into_iter().enumerate() {
-                        let b64 = base64_simd::STANDARD.encode_to_string(&image_data);
-                        let ocr_prompt = "Extract ALL text from this image using OCR. Output the extracted text only.".to_string();
-                        match ocr_fn(b64, ocr_prompt, media_type).await {
-                            Ok(t) if !t.trim().is_empty() => {
-                                result.push_str(&format!("### Image {} (OCR)\n{}\n\n", i + 1, t));
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                result.push_str(&format!(
-                                    "### Image {} (OCR failed)\nError: {}\n\n",
-                                    i + 1,
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                } else {
-                    result.push_str("\n\n*Note: Some pages had no extractable text and no embedded images were found for OCR fallback.*");
-                }
-            } else {
-                result.push_str(&format!(
-                    "\n\n*Note: {} page(s) had no extractable text. Configure an OCR pipeline to recover text from image-only pages.*",
-                    empty_pages.len()
-                ));
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Optional: extract + analyze embedded images via vision model
-        // ------------------------------------------------------------------
+        // Both optional stages live in their own methods: `execute` is the
+        // one place a reader looks to see what a call does, and it should not
+        // have to scroll past two independent enrichment passes to find out.
+        self.append_ocr_fallback(&bytes, selection, ocr_fallback, &empty_pages, &mut result)
+            .await?;
         if extract_images {
-            if let Some(ref vision_fn) = self.vision_fn {
-                let images = extract_pdf_images(&bytes, selection)?;
-
-                if !images.is_empty() {
-                    result.push_str("\n\n## Extracted Images\n\n");
-
-                    for (i, (image_data, media_type)) in images.into_iter().enumerate() {
-                        let base64_image =
-                            base64_simd::STANDARD.encode_to_string(&image_data);
-
-                        match vision_fn(base64_image, image_prompt.to_string(), media_type).await {
-                            Ok(description) => {
-                                result.push_str(&format!(
-                                    "### Image {}\n{}\n\n",
-                                    i + 1,
-                                    description
-                                ));
-                            }
-                            Err(e) => {
-                                result.push_str(&format!(
-                                    "### Image {} (analysis failed)\nError: {}\n\n",
-                                    i + 1,
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else {
-                result.push_str(
-                    "\n\n*Note: Image extraction requested but vision model not configured.*",
-                );
-            }
+            self.append_image_descriptions(&bytes, selection, image_prompt, &mut result)
+                .await?;
         }
 
         Ok(ToolResult::success(result))
@@ -666,10 +738,7 @@ mod tests {
                     Operation::new("BT", vec![]),
                     Operation::new("Tf", vec!["F1".into(), 24.into()]),
                     Operation::new("Td", vec![72.into(), 720.into()]),
-                    Operation::new(
-                        "Tj",
-                        vec![Object::string_literal(format!("MARKER{page}"))],
-                    ),
+                    Operation::new("Tj", vec![Object::string_literal(format!("MARKER{page}"))]),
                     Operation::new("ET", vec![]),
                 ],
             };
@@ -677,12 +746,12 @@ mod tests {
                 dictionary! {},
                 content.encode().expect("content encodes"),
             ));
-            let page_id = doc.add_object(dictionary! {
+            let leaf_id = doc.add_object(dictionary! {
                 "Type" => "Page",
                 "Parent" => pages_id,
                 "Contents" => content_id,
             });
-            kids.push(page_id.into());
+            kids.push(leaf_id.into());
         }
 
         let count = i64::try_from(kids.len()).expect("three fits");
@@ -749,5 +818,4 @@ mod tests {
         );
         assert!(!extract.text.contains("MARKER"), "no page may leak");
     }
-
 }
