@@ -1,7 +1,0 @@
-{
-    "read": ["*"],
-    "write": ["*"],
-    "run": true,
-    "net": ["*"],
-    "env": true
-}

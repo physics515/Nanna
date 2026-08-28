@@ -16,7 +16,7 @@
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:tauri": "node scripts/tauri-driver-smoke.mjs",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "pnpm build:daemon:debug && tauri dev",
     "tauri:build": "tauri build",
     "build:daemon": "node scripts/build-daemon.js",
     "build:daemon:debug": "node scripts/build-daemon.js --debug"
