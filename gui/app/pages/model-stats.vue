@@ -168,7 +168,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { RefreshCw, BarChart3, DollarSign, Calendar, Clock } from 'lucide-vue-next'
+import { RefreshCw, BarChart3 } from '@lucide/vue'
 
 const { isOnline } = useBackend()
 const toast = useToast()

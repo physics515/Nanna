@@ -107,7 +107,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { BrainCircuit, Moon } from 'lucide-vue-next'
+import { BrainCircuit, Moon } from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()

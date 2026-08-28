@@ -323,6 +323,41 @@ fn nanna_search_tools(_: &JsValue, args: &[JsValue], context: &mut Context) -> J
     }
 }
 
+/// Byte bound on one captured-output excerpt in the exec log line.
+///
+/// Reuses the width the exec skill itself already uses when it puts a one-line
+/// excerpt of a bridge error or a checker's stderr in front of the model
+/// (`default-skills/exec/tool.ts`: `if (err.length > 200) err =
+/// err.substring(0, 200)`). Same job — identify an output, do not reproduce it
+/// — so it gets the same width rather than a second number.
+const EXEC_LOG_EXCERPT_BYTES: usize = 200;
+
+/// One log-safe line identifying a captured stream: its first non-empty line,
+/// bounded.
+///
+/// The first non-empty line is the identity the rest of this codebase already
+/// uses for a result (`loop_runner`'s failure signature normalizes to exactly
+/// that), and it keeps a log LINE a line — output arrives with its own
+/// newlines and an embedded one would split the record in two.
+///
+/// Slices on a char boundary, never a byte index: what comes back here is
+/// arbitrary command output, and a byte index that splits a multi-byte
+/// character panics (an em dash in an error message has already killed this
+/// daemon once).
+fn log_excerpt(text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return String::new();
+    };
+    if line.len() <= EXEC_LOG_EXCERPT_BYTES {
+        return line.to_string();
+    }
+    let mut end = EXEC_LOG_EXCERPT_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
 fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let command = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let workdir = args.get(1)
@@ -362,8 +397,22 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     
     match result {
         Ok(response) => {
-            tracing::info!(target: "script", "Exec success: {}, code: {:?}, stdout: {}, stderr: {}", 
-                response.success, response.code, response.stdout, response.stderr);
+            // Excerpts, plus the real sizes. This used to print stdout and
+            // stderr in full: a command whose output was one line repeated put
+            // ~300 MB of it into a single day's log, and the log write itself
+            // is on the turn's critical path. The lengths are the diagnostic
+            // that was actually missing anyway — a reader could not tell a
+            // huge result from a small one without measuring the log line.
+            tracing::info!(
+                target: "script",
+                "Exec success: {}, code: {:?}, stdout: {} bytes [{}], stderr: {} bytes [{}]",
+                response.success,
+                response.code,
+                response.stdout.len(),
+                log_excerpt(&response.stdout),
+                response.stderr.len(),
+                log_excerpt(&response.stderr)
+            );
             // Build result object
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
             obj.set(js_string!("success"), JsValue::from(response.success), false, context)?;
@@ -788,5 +837,44 @@ mod tests {
         assert_eq!(output["count"].as_f64().unwrap() as i64, 42);
         assert_eq!(output["enabled"], true);
         assert_eq!(output["tags"].as_array().unwrap().len(), 3);
+    }
+
+    /// The exec log line used to print stdout in full: one repeated line
+    /// produced ~300 MB of log in a single day. The excerpt is bounded and
+    /// stays ONE line whatever the command emitted.
+    #[test]
+    fn exec_log_excerpt_is_bounded_and_single_line() {
+        let repetitive = "same line\n".repeat(100_000);
+        let excerpt = log_excerpt(&repetitive);
+        assert_eq!(excerpt, "same line");
+
+        let one_huge_line = "x".repeat(10_000_000);
+        let excerpt = log_excerpt(&one_huge_line);
+        assert!(
+            excerpt.len() <= EXEC_LOG_EXCERPT_BYTES + '…'.len_utf8(),
+            "excerpt of a 10 MB single line was {} bytes",
+            excerpt.len()
+        );
+        assert!(!excerpt.contains('\n'));
+    }
+
+    /// Command output is arbitrary bytes, and a byte index that splits a
+    /// multi-byte character panics — the defect that killed the daemon once.
+    #[test]
+    fn exec_log_excerpt_cuts_on_a_char_boundary() {
+        // Every char is 3 bytes, so the bound lands mid-character.
+        let em_dashes = "—".repeat(500);
+        let excerpt = log_excerpt(&em_dashes);
+        assert!(excerpt.len() <= EXEC_LOG_EXCERPT_BYTES + '…'.len_utf8());
+        assert!(excerpt.ends_with('…'));
+    }
+
+    /// Leading blank lines are skipped: the identifying line is the first one
+    /// with content, not whatever whitespace the shell emitted first.
+    #[test]
+    fn exec_log_excerpt_skips_leading_blank_lines() {
+        assert_eq!(log_excerpt("\n\n  \nreal output\nmore\n"), "real output");
+        assert_eq!(log_excerpt(""), "");
+        assert_eq!(log_excerpt("\n \n"), "");
     }
 }

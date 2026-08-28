@@ -94,3 +94,27 @@ direction = "max"
 value = 25.0
 source = "nanna_bench::benches::vector_search::simd_batch/50000"
 note = "Measured p95 11.0 ms @ N=50000 (GPU_THRESHOLD); ceiling leaves ~2× CI headroom."
+
+# --- Suite 2 (write path) — embedding round-trips on the turn's critical path ---
+#
+# Counts, not milliseconds: the defect was N embedding round-trips standing in
+# front of the loop's next step, and the count is exact and hardware-independent
+# where the wall-clock it implies is neither.
+
+[[budget]]
+id = "vector_search.tool_result_critical_path_round_trips"
+suite = "vector_search"
+metric = "tool_result_critical_path_round_trips"
+direction = "exact"
+value = 0.0
+source = "nanna_daemon::memory_adapter::tests::write_path_round_trips_baseline"
+note = "Zero at ANY chunk count (asserted at 1, 8, 64); was 1 per chunk before P24.3 part 3."
+
+[[budget]]
+id = "vector_search.extracted_fact_critical_path_round_trips"
+suite = "vector_search"
+metric = "extracted_fact_critical_path_round_trips"
+direction = "exact"
+value = 1.0
+source = "nanna_daemon::memory_adapter::tests::write_path_round_trips_baseline"
+note = "A floor, not a ceiling: 0 would mean the deferral swallowed a path that must dedup inline."

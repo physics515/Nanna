@@ -58,18 +58,16 @@ test.describe('critical path', () => {
     await mock.gotoWithMock('/')
     await openChatSession(page)
 
-    // Open the chat side panel (activity-bar Chats toggle) so New Chat is reachable.
-    const chatsToggle = page
-      .getByRole('button', { name: /^chats$/i })
-      .or(page.getByTitle(/^chats$/i))
-      .first()
-    await chatsToggle.click()
-    await page.waitForTimeout(200)
-
+    // The chat panel opens by default on the chat route; the rail's Chats
+    // item toggles it, so only click the toggle when the panel is closed.
     const newChat = page
       .getByTitle(/new chat/i)
       .or(page.getByRole('button', { name: /new chat/i }))
       .first()
+    if (!(await newChat.isVisible().catch(() => false))) {
+      await page.getByRole('button', { name: /^chats$/i }).first().click()
+      await page.waitForTimeout(200)
+    }
     await expect(newChat).toBeVisible({ timeout: 10_000 })
     await newChat.click()
     await page.waitForTimeout(400)
@@ -86,14 +84,27 @@ test.describe('critical path', () => {
     await page.getByRole('button', { name: /^Save$/i }).click()
     await expect(page.getByText('Renamed E2E').first()).toBeVisible({ timeout: 10_000 })
 
-    // Delete via menu (confirm dialog if present).
+    // Delete via the menu. The confirmation is NOT optional: SessionItem's
+    // confirmDelete() always awaits confirm(), so a missing dialog is a
+    // regression and must fail rather than be skipped.
+    //
+    // Scope the click to the dialog itself. The old page-wide
+    // `/delete|confirm|yes/i` matched BOTH the context menu's "Delete" item and
+    // the dialog's confirm button, so once the menu detached Playwright
+    // re-resolved onto the dialog button and then spun on
+    // "confirm-overlay ... intercepts pointer events" until the 60s timeout —
+    // the flake this test was known for. `role="alertdialog"` is unambiguous.
     await menuBtn.click()
     await page.getByRole('button', { name: /^Delete$/i }).click()
-    const confirm = page.getByRole('button', { name: /delete|confirm|yes/i }).first()
-    if (await confirm.isVisible().catch(() => false)) {
-      await confirm.click()
-    }
-    await page.waitForTimeout(300)
+
+    const dialog = page.getByRole('alertdialog')
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    await dialog.getByRole('button', { name: /^Delete$/i }).click()
+
+    // Wait for the overlay's own transition to finish rather than sleeping a
+    // fixed 300ms: while it is fading it still intercepts pointer events, and a
+    // fixed sleep is either a stall or a race depending on the machine.
+    await expect(dialog).toBeHidden({ timeout: 10_000 })
   })
 
   test('backend disconnect → toast + reconnect affordance', async ({ page, mock }) => {

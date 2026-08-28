@@ -1,11 +1,11 @@
 {
-  "version": "0.3.9",
-  "notes": "Public Beta 14 — P24 per-chat model pin and chat-scoped tool roots, UTF-8 char-boundary slice safety, stale-shrink hold names the true reason, live summarization priority, and P0.2/P0.3 documentation.",
-  "pub_date": "2026-08-17T21:01:33.160Z",
+  "version": "0.3.10",
+  "notes": "Public Beta 19 - auto-update works again (it could not fire from beta.14 through beta.18, because the app's version never moved). Tool-result ingestion is off the turn's critical path, queued vectors drain at the end of a turn, four frontend majors, toolchain nightly-2026-08-25, and NANNA_CONFIG_PATH.",
+  "pub_date": "2026-08-26T22:15:00.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWkxR3Bzem5HTzhqUTdQeU1DVTNkUlV1N1Z3dzV0M05lc3czMWwwbDNOKzAybWUvNE1NU2VFMHNWREhkdUpUNndYSCs4YjVNd1ArVWROSlhsK0I2MkFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3MDAwNDc4CWZpbGU6TmFubmFfMC4zLjlfeDY0LXNldHVwLmV4ZQpJYkRVMDBsTDNpRXZqN08ybUlpUDdXMjExZXhmS1Y0OHRPTDcvdmEyU3dqelhyVkczKzY2Q1RoVlFJOHJ6QnJvYmlyc0V4aFJybytOSlI3RHFoQW5EUT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.9-beta.14/Nanna_0.3.9_x64-setup.exe"
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.10-beta.19/Nanna_0.3.10_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWovYWxpTW96VVpuK21GY1AyVmRmbFdTL0JxdjRveXg2bDVsVjRUd3pVUFBMZko3R29KaFRpY3J1QjRTRzFTWllqMWltMmw4QjlkS1B4SnhXYnc0M3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NzgyMTMyCWZpbGU6TmFubmFfMC4zLjEwX3g2NC1zZXR1cC5leGUKY2UxRnM4TjNNSDRiSm5HSDRVZ0xFYmNXVENtbTFBRFI5ODdlWHJERzNNbFYxd0pIbzdMZ0RMSlFXL28yUlFjNUdYQUNwZWZZRmdDUGNPRWlvN0wwQ2c9PQo="
     }
   }
 }

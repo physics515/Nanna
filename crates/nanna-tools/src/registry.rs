@@ -1,8 +1,9 @@
 //! Tool registry for managing available tools
 
+use crate::audit::{self, SharedAuditSink, ToolAuditOutcome, ToolAuditRecord};
 use crate::skills::{discover_skills, load_skill};
 use crate::{
-    OutputTarget, Tool, ToolCall, ToolDefinition, ToolPolicy, ToolResponse, ToolResult,
+    DenyReason, OutputTarget, Tool, ToolCall, ToolDefinition, ToolPolicy, ToolResponse, ToolResult,
     format_tool_output,
 };
 use serde_json::Value;
@@ -54,6 +55,9 @@ pub struct ToolRegistry {
     /// Allow/deny policy over canonical tool names. Default permits everything.
     /// Enforced in `execute` AFTER alias/fuzzy resolution — see `policy` module docs.
     policy: RwLock<ToolPolicy>,
+    /// Where per-call audit records go. `None` (the default) records nothing, so
+    /// a registry built without an audit behaves exactly as it did before.
+    audit: RwLock<Option<SharedAuditSink>>,
 }
 
 impl ToolRegistry {
@@ -67,7 +71,25 @@ impl ToolRegistry {
             session_workdirs: RwLock::new(HashMap::new()),
             session_id: RwLock::new(None),
             policy: RwLock::new(ToolPolicy::allow_all()),
+            audit: RwLock::new(None),
         }
+    }
+
+    /// Attach (or, with `None`, detach) the per-call audit sink.
+    ///
+    /// The sink sees **every** call that enters [`Self::execute`], including the
+    /// ones that short-circuit before a tool body runs — a not-found name and a
+    /// policy refusal are exactly the events an audit exists to show.
+    pub async fn set_audit_sink(&self, sink: Option<SharedAuditSink>) {
+        if sink.is_some() {
+            info!("Tool audit: recording one record per tool call");
+        }
+        *self.audit.write().await = sink;
+    }
+
+    /// The active audit sink, if one is attached.
+    pub async fn audit_sink(&self) -> Option<SharedAuditSink> {
+        self.audit.read().await.clone()
     }
 
     /// Replace the active tool policy.
@@ -588,11 +610,17 @@ impl ToolRegistry {
 
     /// Enforce the tool policy on an already-resolved call.
     ///
-    /// `resolved_name` is the registry key `resolve_tool` landed on; it is
-    /// canonicalized here so a denied tool cannot be reached via an alias, a
-    /// case variant, or a fuzzy near-miss. Returns `Some(refusal)` to short-circuit
-    /// `execute`, or `None` when the call is permitted.
-    async fn refuse_by_policy(&self, call: &ToolCall, resolved_name: &str) -> Option<ToolResponse> {
+    /// `resolved_name` is the name the call landed on. Callers pass the already
+    /// canonicalized name; canonicalizing again here is idempotent and keeps the
+    /// gate correct on its own terms, so a denied tool cannot be reached via an
+    /// alias, a case variant, or a fuzzy near-miss even if a future caller
+    /// forgets. Returns `Some((refusal, reason))` to short-circuit `execute`, or
+    /// `None` when the call is permitted.
+    async fn refuse_by_policy(
+        &self,
+        call: &ToolCall,
+        resolved_name: &str,
+    ) -> Option<(ToolResponse, DenyReason)> {
         let canonical = self.canonical_name(resolved_name).await;
         // Bind the verdict so the read guard drops before we build the response.
         let verdict = self.policy.read().await.check(&canonical);
@@ -603,7 +631,7 @@ impl ToolRegistry {
             "Tool call refused: {}",
             reason.as_str()
         );
-        Some(ToolResponse {
+        let response = ToolResponse {
             id: call.id.clone(),
             name: call.name.clone(),
             result: ToolResult::error(format!(
@@ -611,11 +639,56 @@ impl ToolRegistry {
                 reason.as_str()
             )),
             output_target: OutputTarget::default(),
-        })
+        };
+        Some((response, reason))
     }
 
-    /// Execute a tool call
+    /// Execute a tool call, recording exactly one audit record for it.
+    ///
+    /// The audit lives here rather than inside [`Self::execute_call`] so that it
+    /// cannot be bypassed by an early return: every exit — not-found, policy
+    /// refusal, success, failure — flows back through this one point. That is
+    /// the whole property an audit trail rests on, so it is enforced by the
+    /// shape of the code rather than by remembering to log at four sites.
     pub async fn execute(&self, call: ToolCall) -> ToolResponse {
+        let started = std::time::Instant::now();
+        let call_id = call.id.clone();
+        let requested = call.name.clone();
+        let param_keys = audit::param_key_names(&call.parameters);
+        let sink = self.audit_sink().await;
+        // Serialize the arguments only when a sink actually wants them: the
+        // preview costs a full JSON render of every call's parameters, and the
+        // default posture is that values never reach the trail at all.
+        let params_preview = sink
+            .as_ref()
+            .filter(|sink| sink.includes_values())
+            .and_then(|_| audit::params_preview(&call.parameters));
+
+        let (response, outcome, resolved) = self.execute_call(call).await;
+
+        if let Some(sink) = sink {
+            let record = ToolAuditRecord {
+                ts_unix_ms: audit::now_unix_ms(),
+                call_id,
+                requested,
+                resolved,
+                session_id: self.current_session_id().await,
+                param_keys,
+                params_preview,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome,
+            };
+            sink.record(&record);
+        }
+
+        response
+    }
+
+    /// Execute a tool call, reporting how it ended and what it resolved to.
+    async fn execute_call(
+        &self,
+        call: ToolCall,
+    ) -> (ToolResponse, ToolAuditOutcome, Option<String>) {
         // Log input parameters (truncated for readability)
         let params_str = serde_json::to_string(&call.parameters).unwrap_or_default();
         let params_preview = if params_str.len() > 300 {
@@ -629,32 +702,45 @@ impl ToolRegistry {
             call.name, call.id, params_preview
         );
 
-        let (resolved_name, tool) = match self.resolve_tool(&call.name).await {
-            Some(pair) => pair,
-            None => {
-                warn!("Tool not found: {}", call.name);
-                return ToolResponse {
-                    id: call.id,
-                    name: call.name.clone(),
-                    result: ToolResult::error(format!(
-                        "Tool not found: {}. Use discover_tools to see available tools.",
-                        call.name
-                    )),
-                    output_target: OutputTarget::default(),
-                };
-            }
+        let Some((resolved_name, tool)) = self.resolve_tool(&call.name).await else {
+            warn!("Tool not found: {}", call.name);
+            let response = ToolResponse {
+                id: call.id,
+                name: call.name.clone(),
+                result: ToolResult::error(format!(
+                    "Tool not found: {}. Use discover_tools to see available tools.",
+                    call.name
+                )),
+                output_target: OutputTarget::default(),
+            };
+            return (response, ToolAuditOutcome::NotFound, None);
         };
 
         if resolved_name != call.name {
             debug!("Tool '{}' resolved to '{}'", call.name, resolved_name);
         }
 
+        // `resolve_tool` returns the *registry key*, which for an alias is the
+        // alias itself (`Bash`), not the tool it points at. Canonicalize once:
+        // the canonical name is the identity both the policy gate and the audit
+        // trail must speak in, or an aliased call would read as a decision about
+        // some other tool.
+        let canonical = self.canonical_name(&resolved_name).await;
+        debug_assert_eq!(
+            canonical,
+            self.canonical_name(&canonical).await,
+            "canonicalization must be idempotent, or the two consumers can disagree"
+        );
+
         // Policy gate. Deliberately AFTER resolution: `resolve_tool` matches
         // exact → case-insensitive → fuzzy, and aliases map onto canonical
         // tools, so gating on `call.name` would let `Bash`, `EXEC`, or a fuzzy
         // near-miss slip past a denylist entry for `exec`.
-        if let Some(refusal) = self.refuse_by_policy(&call, &resolved_name).await {
-            return refusal;
+        if let Some((refusal, reason)) = self.refuse_by_policy(&call, &canonical).await {
+            let outcome = ToolAuditOutcome::Refused {
+                reason: reason.as_str().to_string(),
+            };
+            return (refusal, outcome, Some(canonical));
         }
 
         let output_target = tool.output_target();
@@ -666,33 +752,7 @@ impl ToolRegistry {
         // removing the originals so either convention works.
         let parameters = normalize_param_keys(call.parameters.clone());
 
-        // Execute with timeout if specified
-        let result = if let Some(timeout_secs) = tool.timeout_secs() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                tool.execute(parameters.clone()),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => {
-                    warn!("Tool {} execution error: {}", call.name, e);
-                    ToolResult::error(e.to_string())
-                }
-                Err(_) => {
-                    warn!("Tool {} timed out after {}s", call.name, timeout_secs);
-                    ToolResult::error("Tool execution timed out")
-                }
-            }
-        } else {
-            match tool.execute(parameters.clone()).await {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!("Tool {} execution error: {}", call.name, e);
-                    ToolResult::error(e.to_string())
-                }
-            }
-        };
+        let result = run_under_backstop(&tool, &call.name, &parameters, start).await;
 
         let duration_ms = start.elapsed().as_millis();
 
@@ -712,24 +772,32 @@ impl ToolRegistry {
         // (`ToolResult::error` leaves `content` empty), so the preview prefers it.
         let output_preview = result_log_preview(&result);
 
-        if result.success {
+        let outcome = if result.success {
             debug!(
                 "Tool {} completed in {}ms: {}",
                 call.name, duration_ms, output_preview
             );
+            ToolAuditOutcome::Succeeded
         } else {
             warn!(
                 "Tool {} failed in {}ms: {}",
                 call.name, duration_ms, output_preview
             );
-        }
+            // `output_preview` is already bounded and char-boundary safe; the
+            // second bound is what pins the record's size to the audit module's
+            // own ceiling rather than to whatever the log preview happens to use.
+            ToolAuditOutcome::Failed {
+                error: audit::bounded(&output_preview, audit::AUDIT_PREVIEW_BYTES_MAX).to_string(),
+            }
+        };
 
-        ToolResponse {
+        let response = ToolResponse {
             id: call.id,
             name: call.name,
             result,
             output_target,
-        }
+        };
+        (response, outcome, Some(canonical))
     }
 
     /// Execute multiple tool calls in parallel
@@ -972,6 +1040,127 @@ fn normalize_param_keys(
         params.insert(key, val);
     }
     params
+}
+
+/// Wall-clock ceiling for the registry's backstop timer on one call.
+///
+/// `timeout_secs` is what the tool declares for itself, out of a static
+/// manifest that has never seen this call. A scripted tool's engine knows more:
+/// it derives its deadline from this call's `timeout` input and deliberately
+/// extends past it so the shell bridge — the layer that can actually kill the
+/// child — fires first, and it answers with elapsed time, which deadline fired,
+/// and what is on disk. A backstop pinned to the declared ceiling preempts that
+/// answer. It also loses when the two are nominally equal, because the inner
+/// handoff still costs something: observed as the backstop firing at 180_004 ms
+/// with the tool's own account arriving 1.03 s later, to nobody.
+///
+/// So derive the backstop from the deadline the engine will really enforce plus
+/// one more handoff margin — the same slack the engine already stacks above the
+/// bridge — and the inner message wins by construction. A caller who asks for a
+/// longer command deadline stops being cut short as a side effect.
+#[cfg(feature = "scripting")]
+fn backstop_timeout(timeout_secs: u64, parameters: &HashMap<String, Value>) -> std::time::Duration {
+    std::time::Duration::from_millis(nanna_scripting::ScriptEngine::supervising_timeout_ms(
+        timeout_secs.saturating_mul(1000),
+        parameters.get("timeout"),
+    ))
+}
+
+/// Without the scripting engine there is no inner deadline to outlive: this
+/// timer is the only one, so it fires exactly at the declared ceiling.
+#[cfg(not(feature = "scripting"))]
+fn backstop_timeout(
+    timeout_secs: u64,
+    _parameters: &HashMap<String, Value>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs)
+}
+
+/// What the backstop says when it has to abandon a call.
+///
+/// This is the last resort, reached only when the tool's own deadline did not
+/// report first, so it has nothing to relay about the work. Say that plainly:
+/// how long we actually waited, that this was the outer net rather than the
+/// tool's own limit, and that a tool killed mid-flight may already have written
+/// part of its work — disk is the truth, not this message.
+/// Run one tool, under the registry's backstop timer when it declares a ceiling.
+///
+/// The backstop is the *outer* net: a tool that enforces its own deadline must
+/// report first, so the ceiling it declares is a floor for this timer rather
+/// than the timer itself (see [`backstop_timeout`]). A tool with no declared
+/// ceiling runs unbounded here by design — the caller's own cancellation is what
+/// stops it.
+///
+/// Every failure path lands on a `ToolResult` rather than an `Err`, because the
+/// model needs to be *told* what happened; a lost error reads to it as a tool
+/// that silently did nothing.
+async fn run_under_backstop(
+    tool: &Arc<dyn Tool>,
+    call_name: &str,
+    parameters: &HashMap<String, Value>,
+    start: std::time::Instant,
+) -> ToolResult {
+    let Some(timeout_secs) = tool.timeout_secs() else {
+        return match tool.execute(parameters.clone()).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Tool {} execution error: {}", call_name, e);
+                ToolResult::error(e.to_string())
+            }
+        };
+    };
+
+    // Only a tool that DECLARES a timeout parameter may have its caller extend
+    // the outer net. Passing the raw arguments for every tool let a stray
+    // `timeout` key stretch the backstop past the ceiling of a tool that cannot
+    // honour it — the safety net is the declared ceiling for those, not whatever
+    // the caller typed.
+    let declares_timeout = tool
+        .definition()
+        .parameters
+        .iter()
+        .any(|p| p.name == "timeout");
+    let backstop = if declares_timeout {
+        backstop_timeout(timeout_secs, parameters)
+    } else {
+        backstop_timeout(timeout_secs, &HashMap::new())
+    };
+    // With the scripting engine there is an inner deadline to outlive, so the
+    // backstop is strictly longer; without it this timer *is* the ceiling, so
+    // equality is correct. Either way it may never come in under the ceiling —
+    // that is the case where the outer net preempts the tool's own account.
+    debug_assert!(
+        backstop >= std::time::Duration::from_secs(timeout_secs),
+        "the backstop must never fire before the tool's own ceiling"
+    );
+
+    match tokio::time::timeout(backstop, tool.execute(parameters.clone())).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            warn!("Tool {} execution error: {}", call_name, e);
+            ToolResult::error(e.to_string())
+        }
+        Err(_) => {
+            let elapsed_ms = start.elapsed().as_millis();
+            let limit_ms = backstop.as_millis();
+            warn!(
+                "Tool {} hit the registry backstop after {}ms (limit {}ms, ceiling {}s)",
+                call_name, elapsed_ms, limit_ms, timeout_secs
+            );
+            ToolResult::error(backstop_message(call_name, elapsed_ms, limit_ms))
+        }
+    }
+}
+
+fn backstop_message(tool_name: &str, elapsed_ms: u128, limit_ms: u128) -> String {
+    format!(
+        "Tool '{tool_name}' was still running {elapsed_ms}ms after it was called and hit \
+         the registry's {limit_ms}ms backstop. That is the outer safety net, not the \
+         tool's own deadline, so the tool never reported what it managed to do. Anything \
+         it finished before this point is on disk; disk is truth, so check the current \
+         state before re-running. If the work genuinely needs longer and this tool \
+         accepts a `timeout` (seconds), raise it."
+    )
 }
 
 fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
@@ -1866,5 +2055,284 @@ mod tests {
             "teardown must remove the binding entirely, not leave a stale entry \
              that now wins over the default"
         );
+    }
+
+    // --- backstop timer (the registry is the outer net, not the authority) ---
+
+    /// A tool that outlives its declared ceiling and then answers for itself,
+    /// the way a shell command running under a longer command deadline does.
+    #[cfg(feature = "scripting")]
+    struct SlowTool;
+
+    #[cfg(feature = "scripting")]
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "slow".to_string(),
+                description: "Runs past its declared ceiling".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, crate::ToolError> {
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            Ok(ToolResult::success("answer from the tool itself"))
+        }
+
+        fn timeout_secs(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    /// The bug this guards: a caller asking for a longer command deadline was
+    /// killed at the static manifest ceiling, and the account the tool had
+    /// built of what happened arrived a second later, to nobody.
+    #[cfg(feature = "scripting")]
+    #[tokio::test]
+    async fn backstop_does_not_preempt_a_call_that_asked_for_longer() {
+        let reg = ToolRegistry::new();
+        reg.register(SlowTool).await;
+
+        let response = reg
+            .execute(ToolCall {
+                id: "slow-1".to_string(),
+                name: "slow".to_string(),
+                parameters: [("timeout".to_string(), Value::from(3))]
+                    .into_iter()
+                    .collect(),
+            })
+            .await;
+
+        assert!(
+            response.result.success,
+            "the tool answered within the deadline it was given, so the \
+             backstop must not have fired first: {:?}",
+            response.result
+        );
+        assert_eq!(response.result.content, "answer from the tool itself");
+    }
+
+    /// The derivation itself: the backstop must sit strictly above the deadline
+    /// the script engine will enforce, both when the call requests a longer
+    /// command deadline and when it requests nothing at all.
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn backstop_outlives_every_inner_deadline() {
+        let requested: HashMap<String, Value> = [("timeout".to_string(), Value::from(600))]
+            .into_iter()
+            .collect();
+        assert!(
+            backstop_timeout(180, &requested) > std::time::Duration::from_secs(600),
+            "a 600s command deadline must not be cut short by a 180s ceiling"
+        );
+        assert!(
+            backstop_timeout(180, &HashMap::new()) > std::time::Duration::from_secs(180),
+            "even with nothing requested the backstop must outlive the \
+             ceiling, or the two race and the outer one wins"
+        );
+    }
+
+    /// When the backstop really is the last resort it has no tool report to
+    /// relay, so it must say how long it waited and warn that the abandoned
+    /// tool may already have written part of its work.
+    #[test]
+    fn backstop_message_states_elapsed_time_and_side_effects() {
+        let msg = backstop_message("exec", 180_004, 190_000);
+        assert!(msg.contains("exec"));
+        assert!(msg.contains("180004ms"), "must state elapsed wall time: {msg}");
+        assert!(msg.contains("190000ms"), "must state the limit that fired: {msg}");
+        assert!(msg.contains("on disk"), "must warn about side effects: {msg}");
+    }
+
+    // --- per-call audit trail ---
+
+    /// Collects every record the registry hands it, for the invariant tests.
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: std::sync::Mutex<Vec<ToolAuditRecord>>,
+        /// When true the sink asks for argument values, exercising the opt-in.
+        with_values: bool,
+    }
+
+    impl RecordingSink {
+        fn taken(&self) -> Vec<ToolAuditRecord> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl crate::ToolAuditSink for RecordingSink {
+        fn includes_values(&self) -> bool {
+            self.with_values
+        }
+
+        fn record(&self, record: &ToolAuditRecord) {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record.clone());
+        }
+    }
+
+    /// A tool that always reports failure, so the `Failed` arm is reachable.
+    struct FailingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for FailingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new("failing", "always fails")
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> std::result::Result<ToolResult, crate::ToolError> {
+            Ok(ToolResult::error("deliberate failure"))
+        }
+    }
+
+    async fn registry_with_sink(sink: Arc<RecordingSink>) -> ToolRegistry {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.register(FailingTool).await;
+        reg.set_audit_sink(Some(sink)).await;
+        reg
+    }
+
+    /// The property the whole trail rests on: no exit path from `execute` can
+    /// skip the record, including the two that never reach a tool body.
+    #[tokio::test]
+    async fn every_outcome_produces_exactly_one_record() {
+        let sink = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&sink)).await;
+        reg.set_policy(ToolPolicy::deny_only(["failing"])).await;
+
+        reg.execute(call("echo")).await; // succeeds
+        reg.execute(call("failing")).await; // refused by policy
+        reg.execute(call("no_such_tool_at_all")).await; // not found
+
+        let seen = sink.taken();
+        assert_eq!(seen.len(), 3, "one record per call: {seen:#?}");
+        let labels: Vec<&str> = seen.iter().map(|r| r.outcome.label()).collect();
+        assert_eq!(labels, ["succeeded", "refused", "not_found"]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_records_its_error() {
+        let sink = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&sink)).await;
+
+        reg.execute(call("failing")).await;
+
+        let seen = sink.taken();
+        assert_eq!(seen.len(), 1);
+        match &seen[0].outcome {
+            ToolAuditOutcome::Failed { error } => {
+                assert!(error.contains("deliberate failure"), "got {error:?}");
+            }
+            other => panic!("expected a failure record, got {other:?}"),
+        }
+    }
+
+    /// A denylist that a model walks past with an alias is the exact attack the
+    /// policy gate exists to stop — so the record must name what the call
+    /// *resolved to*, not what the model typed, or the trail would read as
+    /// though a different tool was refused.
+    #[tokio::test]
+    async fn the_record_names_the_resolved_tool_not_the_requested_one() {
+        let sink = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&sink)).await;
+        reg.register_alias("Echo", "echo").await;
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        reg.execute(call("Echo")).await;
+
+        let seen = sink.taken();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].requested, "Echo");
+        assert_eq!(seen[0].resolved.as_deref(), Some("echo"));
+        assert!(seen[0].outcome.short_circuited());
+    }
+
+    /// A not-found call has nothing to resolve to, and saying otherwise would
+    /// invent a tool that never existed.
+    #[tokio::test]
+    async fn a_not_found_call_records_no_resolution() {
+        let sink = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&sink)).await;
+
+        reg.execute(call("zzzzzzzzzzzz_nothing_like_this")).await;
+
+        let seen = sink.taken();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].resolved, None);
+        assert_eq!(seen[0].outcome, ToolAuditOutcome::NotFound);
+    }
+
+    /// Argument *values* are the secret-bearing part. The default sink must
+    /// never see them, and the opt-in must actually take effect — a flag that
+    /// silently did nothing would be worse than no flag.
+    #[tokio::test]
+    async fn values_stay_out_unless_the_sink_asks_for_them() {
+        let quiet = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&quiet)).await;
+        reg.execute(call("echo")).await;
+        let quiet_seen = quiet.taken();
+        assert_eq!(quiet_seen[0].params_preview, None);
+        assert_eq!(
+            quiet_seen[0].param_keys,
+            vec!["text".to_string()],
+            "key names are still recorded — that is the point of the default"
+        );
+
+        let loud = Arc::new(RecordingSink {
+            seen: std::sync::Mutex::new(Vec::new()),
+            with_values: true,
+        });
+        let reg = registry_with_sink(Arc::clone(&loud)).await;
+        reg.execute(call("echo")).await;
+        let loud_seen = loud.taken();
+        assert!(
+            loud_seen[0]
+                .params_preview
+                .as_deref()
+                .is_some_and(|p| p.contains("hi")),
+            "the opt-in must carry the value: {:?}",
+            loud_seen[0].params_preview
+        );
+    }
+
+    /// The audit is opt-in, so a registry without a sink must behave exactly as
+    /// it did before this existed.
+    #[tokio::test]
+    async fn a_registry_without_a_sink_still_executes() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        assert!(reg.audit_sink().await.is_none());
+
+        let resp = reg.execute(call("echo")).await;
+        assert!(resp.result.success);
+    }
+
+    /// Parallel execution funnels through the same `execute`, so the count has
+    /// to match there too — a fan-out that lost records would hide exactly the
+    /// bursts worth reviewing.
+    #[tokio::test]
+    async fn parallel_execution_records_every_call() {
+        let sink = Arc::new(RecordingSink::default());
+        let reg = registry_with_sink(Arc::clone(&sink)).await;
+
+        let calls = vec![call("echo"), call("failing"), call("echo")];
+        let responses = reg.execute_parallel(calls).await;
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(sink.taken().len(), 3);
     }
 }

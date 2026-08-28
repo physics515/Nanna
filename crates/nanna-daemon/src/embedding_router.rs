@@ -201,8 +201,31 @@ impl EmbeddingRouter {
         &self,
         text: &str,
     ) -> Result<(Vec<f32>, Option<EmbeddingProviderInfo>), String> {
-        let current_idx = *self.active_index.read().await;
+        let active_idx = *self.active_index.read().await;
         let total = self.providers.len();
+
+        // A fallback that wins once must not hold the binding forever.
+        //
+        // The sweep returns on the FIRST success starting from the active
+        // provider, so once a fallback is active the primary is never called
+        // again: the store stays bound to the fallback's model and width for
+        // the life of the daemon. There was a `try_restore_primary` for this,
+        // whose doc said "call this periodically" — and nothing anywhere
+        // called it.
+        //
+        // Rather than a timer nobody owns, the restore rides THIS call: when a
+        // fallback is active and the primary is out of its bench cooldown, the
+        // sweep starts at the primary instead. That costs no extra request in
+        // the healthy case (the primary embeds the real text and wins), and a
+        // switch back is reported with the vector that produced it, so the
+        // caller rebinds to a consistent (model, width) pair exactly as it
+        // does for a switch away.
+        //
+        // The period is a bound already derived here: a provider whose probe
+        // fails is held for `DEMOTION_SECS`, so a displaced primary is
+        // re-probed at that same horizon and no sooner.
+        let reprobing_primary = active_idx != 0 && !self.is_demoted(0).await;
+        let current_idx = if reprobing_primary { 0 } else { active_idx };
 
         // Sweep EVERY provider before waiting on any of them.
         //
@@ -262,11 +285,31 @@ impl EmbeddingRouter {
                         // Wait only as long as the SOONEST provider needs, not
                         // as long as the slowest — the schedule is a fallback
                         // for providers that decline to say.
-                        if let nanna_llm::LlmError::RateLimit { retry_after, .. } = &e
-                            && let Some(secs) = retry_after
-                        {
+                        let published =
+                            if let nanna_llm::LlmError::RateLimit { retry_after, .. } = &e {
+                                *retry_after
+                            } else {
+                                None
+                            };
+                        if let Some(secs) = published {
                             soonest_retry =
-                                Some(soonest_retry.map_or(*secs, |cur: u64| cur.min(*secs)));
+                                Some(soonest_retry.map_or(secs, |cur: u64| cur.min(secs)));
+                        }
+                        // Congestion normally never benches: it clears on its
+                        // own and waiting is the right answer. But the primary
+                        // was called here OUT OF TURN, purely to see whether it
+                        // had recovered — a healthy fallback is already
+                        // serving. Paying that question once per embed is the
+                        // per-call retry this file exists to avoid, so hold it
+                        // for as long as it published, or the standard horizon
+                        // when it published nothing.
+                        if reprobing_primary && idx == 0 {
+                            let cooldown = published.unwrap_or(DEMOTION_SECS);
+                            debug!(
+                                "Primary {} is still congested; next restore probe in {}s",
+                                entry.info, cooldown
+                            );
+                            self.demote(0, Duration::from_secs(cooldown)).await;
                         }
                         debug!("Embedding provider {} is congested", entry.info);
                         last_error = e.to_string();
@@ -332,34 +375,12 @@ impl EmbeddingRouter {
         ))
     }
 
-    /// Try to restore the primary provider.
-    ///
-    /// Call this periodically (e.g., on a timer or every N embed calls) to
-    /// check if the primary has recovered. Only probes if currently on a
-    /// fallback, and never inside the primary's bench cooldown.
-    ///
-    /// Returns `true` if primary was restored.
-    pub async fn try_restore_primary(&self) -> bool {
-        let current_idx = *self.active_index.read().await;
-        if current_idx == 0 {
-            return false; // Already on primary
-        }
-        if self.is_demoted(0).await {
-            return false; // Benched — probing now is the per-call retry again
-        }
-
-        let primary = &self.providers[0];
-        match primary.client.embed_one("probe").await {
-            Ok(embedding) if !embedding.is_empty() => {
-                self.commit_success(0).await.is_some()
-            }
-            _ => {
-                debug!("Primary embedding provider {} still unavailable", primary.info);
-                self.demote(0, Duration::from_secs(DEMOTION_SECS)).await;
-                false
-            }
-        }
-    }
+    // There is no separate `try_restore_primary` here any more. It probed with
+    // a throwaway "probe" string, committed the switch without a vector to
+    // carry it, and — the reason it is gone — had no callers anywhere despite
+    // a doc saying "call this periodically". Restoring the primary is now part
+    // of the sweep in `embed_one`, so it happens on the real text, reports the
+    // switch alongside the vector that produced it, and cannot be forgotten.
 
     /// Number of configured providers (primary + fallbacks)
     pub fn provider_count(&self) -> usize {
@@ -512,6 +533,88 @@ mod tests {
             dead_hits.load(Ordering::SeqCst),
             1,
             "the dead primary was benched by the first sweep"
+        );
+    }
+
+    /// A fallback that wins once must not hold the binding forever. Once the
+    /// primary's bench expires, the next embed reaches for it again and hands
+    /// the binding back — and reports the switch WITH the vector, so the store
+    /// rebinds to a consistent (model, width) pair. Without this the store
+    /// stayed bound to the fallback for the life of the daemon.
+    #[tokio::test]
+    async fn a_recovered_primary_takes_the_binding_back() {
+        let (primary_url, primary_hits) = spawn_counting_server(200, HEALTHY_BODY).await;
+        let (fallback_url, _fallback_hits) = spawn_counting_server(200, HEALTHY_BODY).await;
+        let (primary_info, primary_client) = openai_provider("openrouter", &primary_url);
+        let (fallback_info, fallback_client) = openai_provider("ollama", &fallback_url);
+        let router = EmbeddingRouter::new(primary_info, primary_client)
+            .with_fallback(fallback_info, fallback_client);
+
+        // Put the router on the fallback the way an outage would: bench the
+        // primary, then embed once so the fallback commits.
+        router.demote(0, Duration::from_secs(DEMOTION_SECS)).await;
+        let (_, switched) = router.embed_one("text").await.expect("the fallback answers");
+        assert_eq!(
+            switched.expect("the first call flips the active provider").name,
+            "ollama"
+        );
+
+        // Still benched — the fallback keeps answering and the primary is not
+        // called at all.
+        let (_, switched) = router.embed_one("text").await.expect("still healthy");
+        assert!(switched.is_none(), "a benched primary is not re-probed");
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            0,
+            "the bench is what keeps the restore off the per-call path"
+        );
+
+        // The cooldown passes. The very next embed must hand the binding back.
+        router.demote(0, Duration::ZERO).await;
+        let (embedding, switched) = router.embed_one("text").await.expect("the primary answers");
+        assert_eq!(embedding.len(), 3, "the restore rides a real embedding");
+        assert_eq!(
+            switched.expect("the restore is reported as a switch").name,
+            "openrouter",
+            "a recovered primary reclaims the binding without an external timer"
+        );
+        assert_eq!(
+            router.active_provider().await.name,
+            "openrouter",
+            "and stays active"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "restoring costs the one call that produced the vector, no probe on the side"
+        );
+    }
+
+    /// The restore must not become the per-call retry it replaced: a primary
+    /// that is merely CONGESTED publishes when to come back, and is not asked
+    /// again until then. (When the primary is the active provider, congestion
+    /// still never benches it — that path is unchanged.)
+    #[tokio::test]
+    async fn a_congested_primary_is_not_re_probed_on_every_embed() {
+        let (busy_url, busy_hits) =
+            spawn_counting_server(429, r#"{"error":{"message":"rate limited"}}"#).await;
+        let (healthy_url, _healthy_hits) = spawn_counting_server(200, HEALTHY_BODY).await;
+        let (busy_info, busy_client) = openai_provider("openrouter", &busy_url);
+        let (ok_info, ok_client) = openai_provider("ollama", &healthy_url);
+        let router = EmbeddingRouter::new(busy_info, busy_client).with_fallback(ok_info, ok_client);
+
+        for _ in 0..3 {
+            router.embed_one("text").await.expect("the fallback answers");
+        }
+        assert_eq!(
+            router.active_provider().await.name,
+            "ollama",
+            "the healthy fallback is serving"
+        );
+        assert_eq!(
+            busy_hits.load(Ordering::SeqCst),
+            2,
+            "once on the way to the fallback, once as the restore attempt — then held"
         );
     }
 

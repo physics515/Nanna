@@ -125,7 +125,13 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
           tr.insert(range.from, node)
           // Add a paragraph after for continued typing
           const paragraphPos = range.from + node.nodeSize
-          tr.insert(paragraphPos, state.schema.nodes.paragraph.create())
+          // A schema is not guaranteed to define a paragraph node. If it does
+          // not, the code block is still inserted — only the trailing
+          // continue-typing paragraph is skipped. Calling .create() on an
+          // absent node type would throw inside an input rule, i.e. while the
+          // user is mid-keystroke.
+          const paragraph = state.schema.nodes.paragraph
+          if (paragraph) tr.insert(paragraphPos, paragraph.create())
         },
       }),
     ]

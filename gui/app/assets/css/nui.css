@@ -1,0 +1,65 @@
+/* ════ Nanna UI (Figma redesign) design tokens ════
+   Source of truth: Figma file "Nanna" (node 15:511, chat screen).
+   Components under app/components/nui/ consume these tokens; keep the two in
+   sync with the Figma variables panel when the design changes. */
+
+@theme {
+  /* Surfaces */
+  --color-nui-bg: #1e2939;      /* Background */
+
+  /* Text */
+  --color-nui-fg: #cad5e2;      /* Foreground */
+  --color-nui-muted: #90a1b9;   /* Muted Text */
+
+  /* Accents */
+  --color-nui-accent: #8e51ff;  /* Accent purple */
+  --color-nui-info: #00bcff;    /* Info Blue */
+  --color-nui-pink: #f6339a;    /* Hot pink */
+  --color-nui-green: #d8f999;   /* String green */
+  --color-nui-yellow: #ffb86a;  /* Class yellow */
+
+  /* Syntax colors (code blocks in messages) */
+  --color-nui-key: #7c86ff;     /* JSON keys / properties */
+  --color-nui-number: #ff8904;  /* Numeric literals */
+
+  /* Typography */
+  --font-nui: 'Fira Code', 'JetBrains Mono', monospace;
+}
+
+/* Root class for screens built on the new design system: Fira Code Retina
+   (weight 450) as the base text style.
+
+   The app's global root font-size is 14px, which would shrink every rem-based
+   Tailwind unit to 87.5% of the Figma values. The design is specified in
+   pixels, so inside .nui-root the spacing/type/radius scales are pinned to
+   exact device pixels: w-24 = 96px, text-xs = 12px, rounded-lg = 8px — the
+   numbers in the Figma file. */
+.nui-root {
+  --spacing: 4px;
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --radius-lg: 8px;
+  font-family: var(--font-nui);
+  font-weight: 450;
+  color: var(--color-nui-fg);
+  background: var(--color-nui-bg);
+}
+
+/* Chunky accent scrollbar used inside code/output wells and long panels. */
+@utility nui-scroll {
+  &::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: var(--color-nui-accent);
+    border-radius: 8px;
+    border: none;
+  }
+  &::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}

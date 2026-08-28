@@ -57,10 +57,31 @@ export interface TimelineEntry {
   total_tokens?: number | null
   /** P22 Tier 4 breaker replay: the harness answered this call itself and the
    *  tool never ran. `success` is false because there is no tool result, but
-   *  nothing failed — steering, not an error. Live-stream only; the daemon's
-   *  own journal does not carry the marker, so a restored timeline renders
-   *  these as plain failures until it does. */
+   *  nothing failed — steering, not an error. Carried both by the live event
+   *  and (since 2026-08-27) by the daemon's own run journal, so a timeline
+   *  restored after a remount renders these as steering too. Absent/null
+   *  means "not marked" — every consumer tests `=== true`. */
   short_circuited?: boolean | null
+}
+
+/**
+ * The daemon's last liveness beat for a running turn — what it is waiting on
+ * and for how long. Beats arrive at the daemon's derived cadence (~30s), so
+ * these figures are as of `beat`, not as of now; nothing here is extrapolated
+ * between beats, because a badge inventing elapsed time is the same dishonesty
+ * as a badge asserting activity it never observed.
+ */
+export interface LivenessBeat {
+  /** Seconds since the turn started, as of this beat. */
+  elapsedS: number
+  /** Seconds since the last observed output; `null` = nothing to report yet. */
+  quietS: number | null
+  /** Coarse phase: planning | step_pending | streaming | thinking | tool. */
+  phase: string
+  /** The daemon's own sentence for what the turn is waiting on. */
+  awaiting: string
+  /** Monotone beat counter within the turn — a gap means beats stopped. */
+  beat: number
 }
 
 interface SessionState {
@@ -70,6 +91,8 @@ interface SessionState {
   streamingThinking: string
   activeToolCalls: (ToolCallInfo & { status: 'started' | 'completed' | 'error' })[]
   liveTimeline: TimelineEntry[]
+  /** Last liveness beat for the turn in flight; `null` = none seen. */
+  liveness: LivenessBeat | null
   messageQueue: QueuedMessage[]
   lastError: string | null
   daemonQueueCount: number
@@ -115,6 +138,7 @@ function getSessionState(sessionId: string): SessionState {
       streamingThinking: '',
       activeToolCalls: [],
       liveTimeline: [],
+      liveness: null,
       messageQueue: [],
       lastError: null,
       daemonQueueCount: 0,
@@ -207,6 +231,13 @@ export function useSessionState(sessionId: Ref<string | null>) {
     get: () => state.value?.chatModelPendingNextTurn ?? false,
     set: (val: boolean) => {
       if (state.value) state.value.chatModelPendingNextTurn = val
+    }
+  })
+
+  const liveness = computed({
+    get: () => state.value?.liveness ?? null,
+    set: (val: LivenessBeat | null) => {
+      if (state.value) state.value.liveness = val
     }
   })
 
@@ -384,6 +415,9 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.liveTimeline = []
+      // A beat is an observation about the turn in flight; quoting it after
+      // the turn ends asserts activity nothing is performing.
+      state.value.liveness = null
       state.value.isLoading = false
       // The turn the pin could not reach is over, so the pin is no longer
       // waiting on anything — the next message resolves against it.
@@ -403,6 +437,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.liveTimeline = []
+      state.value.liveness = null
       state.value.messageQueue = []
       state.value.lastError = null
       state.value.daemonQueueCount = 0
@@ -431,6 +466,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
     streamingThinking,
     activeToolCalls,
     liveTimeline,
+    liveness,
     messageQueue,
     lastError,
     daemonQueueCount,

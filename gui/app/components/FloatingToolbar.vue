@@ -1,7 +1,7 @@
 <template>
   <BubbleMenu
     :editor="editor"
-    :tippy-options="{ duration: 150, theme: 'nanna-bubble', maxWidth: 'none' }"
+    :options="bubbleOptions"
     :should-show="shouldShow"
     v-if="editor"
   >
@@ -60,13 +60,29 @@
 </template>
 
 <script setup lang="ts">
-import { BubbleMenu } from '@tiptap/vue-3'
-import { Bold, Italic, Strikethrough, Code, Link as LinkIcon, Unlink } from 'lucide-vue-next'
+// Tiptap 3 moved the menu components out of the package root into `/menus`.
+// The root subpath still resolves, so `import { BubbleMenu } from '@tiptap/vue-3'`
+// keeps compiling and keeps typechecking — it just evaluates to `undefined`, the
+// component never resolves, and the whole floating toolbar silently stops
+// rendering. Same failure shape as the `<UiSonnerSonner/>` toaster that never
+// mounted. Verified against the installed package: the root exports no
+// `BubbleMenu`; `@tiptap/vue-3/menus` exports `BubbleMenu` and `FloatingMenu`.
+import { BubbleMenu } from '@tiptap/vue-3/menus'
+import { Bold, Italic, Strikethrough, Code, Link as LinkIcon, Unlink } from '@lucide/vue'
 import type { Editor } from '@tiptap/core'
 
 const props = defineProps<{
   editor: Editor
 }>()
+
+// Tiptap 3 replaced tippy with Floating UI, so the old `tippy-options` prop
+// no longer exists — it fell through to the DOM as an unknown attribute and
+// took the positioning with it. These are Floating UI `computePosition`
+// options: sit just above the selection, and flip below when there is no room.
+const bubbleOptions = {
+  placement: 'top' as const,
+  offset: 8,
+}
 
 function shouldShow({ editor, state }: { editor: Editor; state: any }) {
   const { from, to } = state.selection
@@ -127,18 +143,11 @@ function setLink() {
   background: rgba(71, 85, 105, 0.4);
 }
 
-/* Tippy theme */
-.tippy-box[data-theme~='nanna-bubble'] {
-  background: transparent;
-  border: none;
-  box-shadow: none;
-}
-
-.tippy-box[data-theme~='nanna-bubble'] > .tippy-content {
-  padding: 0;
-}
-
-.tippy-box[data-theme~='nanna-bubble'] > .tippy-arrow {
-  display: none;
-}
+/*
+ * The `nanna-bubble` tippy theme that used to live here existed only to strip
+ * tippy's own chrome (opaque background, padding, arrow) so `.floating-toolbar`
+ * could supply the real surface. Tiptap 3 positions with Floating UI and adds
+ * no chrome of its own, so those overrides now match nothing — removed rather
+ * than left as dead selectors that imply a themed wrapper still exists.
+ */
 </style>

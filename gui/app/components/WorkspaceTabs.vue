@@ -61,7 +61,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Globe, FolderKanban, X, Plus } from 'lucide-vue-next'
+import { Globe, FolderKanban, X, Plus } from '@lucide/vue'
 
 interface WorkspaceInfo {
   id: string

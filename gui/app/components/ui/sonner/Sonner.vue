@@ -1,5 +1,13 @@
 <script setup lang="ts">
 import { Toaster as Sonner, type ToasterProps } from 'vue-sonner'
+// REQUIRED as of vue-sonner 2.0: v1 injected its stylesheet at runtime, v2
+// separated it out and ships it as an export you must import. Without this line
+// the toaster still mounts, still renders, and still passes the "a toast really
+// renders" e2e — it is simply unstyled and unpositioned, which is the silent
+// failure mode this component already has a static guard for. The Nuxt module
+// (`vue-sonner/nuxt`) would import it automatically; we mount the component
+// directly, so we import it directly.
+import 'vue-sonner/style.css'
 import { computed } from 'vue'
 
 const props = withDefaults(defineProps<ToasterProps & { class?: string }>(), {

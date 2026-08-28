@@ -22,7 +22,9 @@ for (const { path, hit } of PAGES) {
   test(`smoke: ${path}`, async ({ page, mock }) => {
     await mock.gotoWithMock(path)
     await expect(page.locator('#__nuxt')).toBeAttached({ timeout: 20_000 })
-    await expect(page.getByText(hit).first()).toBeVisible({ timeout: 25_000 })
+    // Scoped to <main>: the shell's workspace select carries hidden
+    // "Open Workspace…" option text that would otherwise be the first match.
+    await expect(page.locator('main').getByText(hit).first()).toBeVisible({ timeout: 25_000 })
     const textLen = await page.locator('body').innerText().then((t) => t.trim().length)
     expect(textLen).toBeGreaterThan(20)
   })
@@ -36,7 +38,19 @@ for (const { path, hit } of PAGES) {
  * rendering a page-level error. Workspaces regressed exactly this way when
  * `@tauri-apps/plugin-dialog` reached Vite's dep optimizer mid-session.
  */
-const RAIL_PRIMARY = new Set(['/memory', '/tools', '/channels', '/settings'])
+/** The nui rail names every route directly — no overflow flyout. */
+const RAIL_LABELS: Record<string, string> = {
+  '/agents': 'Agents',
+  '/channels': 'Channels',
+  '/memory': 'Memory',
+  '/model-stats': 'Model Stats',
+  '/scheduler': 'Scheduler',
+  '/settings': 'Settings',
+  '/tool-stats': 'Tool Stats',
+  '/tools': 'Tools',
+  '/workspaces': 'Workspaces',
+  '/logs': 'Logs',
+}
 
 test('client-side nav: every rail route mounts without blanking the shell', async ({ page, mock }) => {
   await mock.gotoWithMock('/')
@@ -44,12 +58,7 @@ test('client-side nav: every rail route mounts without blanking the shell', asyn
   for (const { path, hit } of PAGES) {
     if (path === '/') continue
 
-    if (RAIL_PRIMARY.has(path)) {
-      await page.locator(`a[href="${path}"]`).first().click()
-    } else {
-      await page.getByRole('button', { name: 'More' }).click()
-      await page.locator(`.admin-flyout a[href="${path}"]`).click()
-    }
+    await page.getByRole('button', { name: RAIL_LABELS[path], exact: true }).click()
 
     // The rail itself carries several of these words, so scope the content
     // assertion to <main> and confirm the route actually committed.

@@ -59,7 +59,7 @@ struct SessionQueue {
 pub struct AgentServiceConfig {
     /// Default model to use
     pub model: String,
-    /// Model priority list for fallback (e.g., ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"])
+    /// Model priority list for fallback (e.g., ["claude-opus-5", "claude-sonnet-5"])
     pub model_priority: Vec<String>,
     /// Maximum tokens per response
     pub max_tokens: u32,
@@ -259,9 +259,24 @@ struct ActiveChat {
 /// (persisted per message, shipped on remount) stays bounded.
 const TIMELINE_OUTPUT_CAP: usize = 4000;
 
-/// Lock the journal, surviving a poisoned mutex (a panicking thread must
-/// not erase the run's record — the data inside is still valid).
-fn timeline_lock(
+/// Lock the journal, surviving a poisoned mutex.
+///
+/// Poisoning is ignored here on purpose, and the justification is specific to
+/// what this mutex guards: a `Vec<TimelineItem>` has no cross-field invariant a
+/// panic could leave half-established. Every write is either a `push` or a
+/// back-fill of one item's outcome fields, and the type ALREADY models an
+/// interrupted call — `output`/`success`/`duration_ms` are `Option`, documented
+/// as "a run that dies mid-call leaves them None". So a panicking thread leaves
+/// a well-formed journal, and the only thing `unwrap()` would add is a second
+/// panic that erases the run's record precisely when it is most wanted.
+///
+/// Both journal writers must agree on this. The harness sink in `tasks.rs`
+/// writes to the *same* `Arc<Mutex<..>>` and used to `.expect("timeline lock
+/// poisoned")`, so one panic anywhere under the lock turned every later tool
+/// call in that run into another panic — inside a spawned turn, where a panic
+/// is invisible and the run just stops. Hence `pub(crate)`: one policy, one
+/// implementation, no second opinion about what a poisoned journal means.
+pub(crate) fn timeline_lock(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
 ) -> std::sync::MutexGuard<'_, Vec<TimelineItem>> {
     timeline.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -314,6 +329,9 @@ fn timeline_tool_start(
         duration_ms: None,
         tokens: (tokens > 0).then_some(tokens),
         total_tokens: (total_tokens > 0).then_some(total_tokens),
+        // Unknown until the call ends — see the field doc for why this is
+        // not `Some(false)`.
+        short_circuited: None,
         at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -343,14 +361,40 @@ fn timeline_tool_end(
     output: &str,
     ok: bool,
     duration: u64,
+    replayed: bool,
 ) {
+    // No assertions on `call_id` or on the `ok`/`replayed` combination: both
+    // are derived from provider and tool output, so an assert here would turn
+    // a malformed response into a panic inside a spawned turn — this repo has
+    // already lost a run to exactly that shape. Deviant input is *recorded*,
+    // which is the whole point of a journal.
     let mut items = timeline_lock(timeline);
+    // Only read under `debug_assertions`, so it must not exist in release —
+    // an unconditional binding would be a dead local the moment the assert
+    // below compiles away.
+    #[cfg(debug_assertions)]
+    let count_before = items.len();
     for item in items.iter_mut().rev() {
-        if let TimelineItem::Tool { call_id: id, output: out, success, duration_ms, .. } = item {
+        if let TimelineItem::Tool {
+            call_id: id,
+            output: out,
+            success,
+            duration_ms,
+            short_circuited,
+            ..
+        } = item
+        {
             if id == call_id && out.is_none() {
                 *out = Some(timeline_cap_output(output));
                 *success = Some(ok);
                 *duration_ms = Some(duration);
+                *short_circuited = Some(replayed);
+                // The outcome fields are back-filled as a set: a reader that
+                // sees `success` decided must never find the replay marker
+                // still undecided, or it is back to guessing.
+                debug_assert!(out.is_some(), "a closed call must carry its output");
+                debug_assert!(success.is_some(), "a closed call must carry its verdict");
+                debug_assert!(short_circuited.is_some(), "…and whether it was a replay");
                 return;
             }
         }
@@ -364,8 +408,22 @@ fn timeline_tool_end(
         duration_ms: Some(duration),
         tokens: None,
         total_tokens: None,
+        short_circuited: Some(replayed),
         at: chrono::Utc::now().to_rfc3339(),
     });
+    // Either branch records the call: back-filled in place (early return) or
+    // appended here. The journal never loses a completed call, which is the
+    // property the fallback exists for.
+    #[cfg(debug_assertions)]
+    debug_assert!(items.len() == count_before + 1, "the fallback must append exactly one item");
+}
+
+/// Read the breaker's machine-readable replay marker out of a tool result's
+/// structured data. Absent marker means the tool really ran.
+fn is_short_circuited(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|d| d.get("short_circuited"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Info about a tool call currently executing
@@ -1094,7 +1152,11 @@ impl AgentService {
                                 duration_ms,
                             });
                         }
-                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms);
+                        // The replay marker rides in the result's structured
+                        // data, which the event carries but the journal used
+                        // to drop — so a restored timeline showed steering as
+                        // failures. Record it where the run record lives.
+                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms, is_short_circuited(data));
                         let _ = event_tx_tool_end.send(Event::ToolEnd {
                             session_id: session_id_tool_end.clone(),
                             call_id: call_id.to_string(),
@@ -1114,60 +1176,29 @@ impl AgentService {
                         let ws_id = ws_id_for_memory.clone();
                         Box::pin(async move {
                             if let Some(ref service) = mem_service {
-                                let mut metadata = memory.tags.unwrap_or_default();
-                                metadata.insert("category".to_string(), memory.category.clone());
-                                // Persist provenance so the store records STATED vs
-                                // OBSERVED instead of everything defaulting to "stated".
-                                metadata.insert(
-                                    "fact_type".to_string(),
-                                    memory.provenance.as_str().to_string(),
-                                );
-                                // Derive importance from category. Memories never
-                                // expire — all categories are permanent.
-                                let importance: f32 = match memory.category.as_str() {
-                                    "tool_result" => 1.5,
-                                    "preference" | "identity" => 4.0,
-                                    "fact" | "insight" => 3.5,
-                                    "context" => 3.0,
-                                    _ => 3.0,
-                                };
-
-                                // Skip low-signal content: errors, tiny results, or garbled output
-                                let dominated_by_non_ascii = memory.content.chars().take(200)
-                                    .filter(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace() && !c.is_ascii_punctuation())
-                                    .count() > 40;
-
-                                if memory.content.starts_with("Error:")
-                                    || memory.content.contains("HEARTBEAT_OK")
-                                    || memory.content.trim_start().starts_with("[Tool:")
-                                    || memory.content.starts_with("Execution failed:")
-                                    || memory.content.contains("Error: Execution failed")
-                                    || memory.content.contains("Command failed")
-                                    || memory.content.contains("Missing required parameter")
-                                    || memory.content.contains("cannot find the path specified")
-                                    || memory.content.contains("Parameter format not correct")
-                                    || memory.content.contains("not recognized as an internal")
-                                    || memory.content.contains("Bridge error:")
-                                    || memory.content.contains("JS execution failed")
-                                    || (memory.category == "tool_result" && memory.content.contains("Error"))
-                                    || memory.content.len() < 20
-                                    || dominated_by_non_ascii
+                                // Filter, importance and route all live in
+                                // `memory_adapter` — ONE copy, shared with the
+                                // harness sink in `tasks.rs`. Two private
+                                // copies is how those two sinks' policies
+                                // drifted apart before, at a cost of 704
+                                // discarded writes in a single run; this path
+                                // only decides what to say about the outcome.
+                                let category = memory.category.clone();
+                                let excerpt = truncate(&memory.content, 50);
+                                match crate::memory_adapter::store_extracted_memory(
+                                    service,
+                                    memory,
+                                    ws_id,
+                                )
+                                .await
                                 {
-                                    info!("Skipping low-signal memory [{}]: {}", memory.category, truncate(&memory.content, 50));
-                                    return;
-                                }
-
-                                // Store with workspace scope if session has a workspace
-                                if let Some(ref ws_id) = ws_id {
-                                    if let Err(e) = service.remember_scoped(&memory.content, metadata, importance, Some(ws_id.clone())).await {
-                                        warn!("Failed to auto-store scoped memory: {}", e);
-                                    } else {
-                                        info!("Auto-extracted memory [{}] (workspace: {}): {}", memory.category, ws_id, truncate(&memory.content, 50));
-                                    }
-                                } else if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
-                                    warn!("Failed to auto-store memory: {}", e);
-                                } else {
-                                    info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                                    Ok(None) => info!(
+                                        "Skipping low-signal memory [{category}]: {excerpt}"
+                                    ),
+                                    Ok(Some(_)) => info!(
+                                        "Auto-extracted memory [{category}]: {excerpt}"
+                                    ),
+                                    Err(e) => warn!("Failed to auto-store memory: {e}"),
                                 }
                             }
                         })
@@ -1241,12 +1272,19 @@ impl AgentService {
                             .clone()
                             .into_iter()
                             .map(|item| match item {
-                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at } => {
+                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at } => {
                                     let output = output.map(|o| {
                                         if o.len() > 200 {
-                                            let outcome = if success == Some(false) { "failed" } else { "completed" };
+                                            // A short circuit is neither: the tool never ran,
+                                            // so calling it "failed" is the same lie the
+                                            // journal used to tell about the whole entry.
+                                            let outcome = match (short_circuited, success) {
+                                                (Some(true), _) => "the tool never ran — the breaker replaced this call with a steering notice",
+                                                (_, Some(false)) => "the call failed exactly as recorded",
+                                                _ => "the call completed exactly as recorded",
+                                            };
                                             format!(
-                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; the call {outcome} exactly as recorded]",
+                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; {outcome}]",
                                                 truncate(&o, 200)
                                             )
                                         } else {
@@ -1264,7 +1302,7 @@ impl AgentService {
                                             i
                                         }
                                     });
-                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at }
+                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at }
                                 }
                                 TimelineItem::Thinking { content, at } if content.len() > 500 => {
                                     let total = content.len();
@@ -2373,5 +2411,207 @@ mod tests {
         // lands inside the emoji, so it must back off to byte 1 (after 'a')
         // rather than panic — result "a...".
         assert_eq!(truncate("a🚀bc", 2), "a...");
+    }
+
+    /// The breaker's marker lives in the tool result's structured data, and
+    /// only there — so read it defensively: absent key, wrong type and no
+    /// data at all all mean "the tool really ran".
+    #[test]
+    fn short_circuit_marker_is_read_only_when_it_is_a_true_bool() {
+        assert!(is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": true })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": false })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": "true" })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "other": true })
+        )));
+        assert!(!is_short_circuited(Some(&serde_json::json!(
+            "not an object"
+        ))));
+        assert!(!is_short_circuited(None));
+    }
+
+    /// A breaker replay reports `success: false` with a notice as its output.
+    /// The journal has to record *why* that outcome happened, or a timeline
+    /// rebuilt from it renders steering as a wall of tool errors.
+    #[test]
+    fn journal_back_fills_the_replay_marker_beside_the_outcome() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(
+            &timeline,
+            "c1",
+            "exec",
+            &serde_json::json!({ "cmd": "ls" }),
+            0,
+            0,
+        );
+
+        // In flight: the outcome is not yet known, and neither is the marker.
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert!(success.is_none(), "an open call has no outcome yet");
+                assert!(
+                    short_circuited.is_none(),
+                    "an open call is not a decided non-replay"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        timeline_tool_end(&timeline, "c1", "exec", "[replayed]", false, 1, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(
+            items.len(),
+            1,
+            "the end must back-fill the open call, not append"
+        );
+        match &items[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(
+                    *success,
+                    Some(false),
+                    "a replay did not give the model its result"
+                );
+                assert_eq!(
+                    *short_circuited,
+                    Some(true),
+                    "…but it is steering, not a failure"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// Negative space: a real failure must stay a failure. `Some(false)` and
+    /// `None` are both non-replays to the GUI (it tests `=== true`), but the
+    /// journal states the decided answer once the call has ended.
+    #[test]
+    fn journal_marks_a_real_failure_as_not_replayed() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+        timeline_tool_end(&timeline, "c1", "exec", "boom", false, 7, false);
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(*success, Some(false));
+                assert_eq!(
+                    *short_circuited,
+                    Some(false),
+                    "a decided non-replay is not None"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// An end with no journaled start still records the call — and must carry
+    /// the marker on that fresh item too, or the recovery path loses exactly
+    /// the entries a crashed run most needs explained.
+    #[test]
+    fn orphan_tool_end_records_the_replay_marker_too() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_end(&timeline, "c9", "exec", "[replayed]", false, 2, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the call must not vanish from the record");
+        match &items[0] {
+            TimelineItem::Tool {
+                short_circuited, ..
+            } => {
+                assert_eq!(*short_circuited, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// The field is additive on the wire: journals written before it exists
+    /// must still load, and an unmarked entry must not read as a replay.
+    #[test]
+    fn journals_without_the_marker_still_deserialize() {
+        let legacy = serde_json::json!({
+            "kind": "tool",
+            "call_id": "c1",
+            "name": "exec",
+            "output": "ok",
+            "success": true,
+            "duration_ms": 3,
+            "at": "2026-08-27T00:00:00Z",
+        });
+        let item: TimelineItem =
+            serde_json::from_value(legacy).expect("a pre-field journal entry must still load");
+        match &item {
+            TimelineItem::Tool {
+                short_circuited,
+                success,
+                ..
+            } => {
+                assert_eq!(*short_circuited, None, "absent means unknown, not replayed");
+                assert_eq!(*success, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        // And `None` is omitted again on the way out, so round-tripping an
+        // old journal does not rewrite it with a field it never had.
+        let round_tripped = serde_json::to_value(&item).expect("tool item must serialize");
+        assert!(
+            round_tripped.get("short_circuited").is_none(),
+            "None must not be written as null: {round_tripped}"
+        );
+    }
+
+    /// A panic under the journal lock must not take the journal with it.
+    ///
+    /// This is the property `tasks.rs` used to get wrong: it wrote to the same
+    /// `Arc<Mutex<..>>` through `.expect("timeline lock poisoned")`, so one
+    /// panic anywhere under the lock turned every later tool call in that run
+    /// into another panic — inside a spawned turn, where a panic is invisible
+    /// and the run simply stops. Both writers now go through `timeline_lock`.
+    #[test]
+    fn a_poisoned_journal_still_records_and_keeps_what_it_had() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+
+        // Poison it exactly the way a panicking spawned turn would.
+        let poisoner = Arc::clone(&timeline);
+        let panicked = std::thread::spawn(move || {
+            let _guard = timeline_lock(&poisoner);
+            panic!("a step panicked while holding the journal");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the helper thread must actually have panicked"
+        );
+        assert!(timeline.is_poisoned(), "…and left the mutex poisoned");
+
+        // The record survives, and the run can still write to it.
+        timeline_tool_end(&timeline, "c1", "exec", "ok", true, 3, false);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the earlier entry must not be lost");
+        match &items[0] {
+            TimelineItem::Tool {
+                success, output, ..
+            } => {
+                assert_eq!(*success, Some(true), "the write after poisoning landed");
+                assert!(output.is_some(), "…and carried its output");
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
     }
 }

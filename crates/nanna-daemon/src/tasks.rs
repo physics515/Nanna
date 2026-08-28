@@ -1122,16 +1122,22 @@ pub fn build_task_services(
 // ---------------------------------------------------------------------------
 
 /// The P15 store as the harness's task source, scoped to one run.
+///
+/// It carries no `workdir`. It used to, for "where ancestor acceptance checks
+/// run during promotion" — but the ancestor-promotion experiment was cut as
+/// benchmark-shaped (see the note on [`Self::complete`]: it converted the eval
+/// metric directly and would almost never fire in a chat workflow). The field
+/// outlived the feature, was never read, and was always `None`, so it was a
+/// standing invitation to "finish wiring it" — which the no-benchmark-shaped-
+/// levers rule forbids. Removed 2026-08-26; per-call acceptance checks still
+/// take their own `workdir` from `tasks.done {workdir?}`, which is a different
+/// and live mechanism.
 pub struct TursoTaskSource {
     storage: Arc<Storage>,
     scope: String,
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1149,7 +1155,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 
@@ -1302,7 +1307,13 @@ impl TaskSource for TursoTaskSource {
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
         // the eval metric directly and would almost never fire in a chat
-        // workflow, where tasks rarely carry machine checks). This is pure
+        // workflow, where tasks rarely carry machine checks). Its last residue
+        // was a `workdir: Option<PathBuf>` on this struct, hard-coded to `None`
+        // by the only constructor and read by nothing — a dead-code warning
+        // whose doc comment nonetheless read as though promotion existed and
+        // was merely switched off. Removed; if promotion is ever wanted back it
+        // needs a deliberate design, not a field waiting to be filled in. This
+        // is pure
         // coherence: a parent proven done with scaffolding still open is a
         // contradictory state, and working those children is spending steps on
         // a goal that no longer exists.
@@ -1533,9 +1544,10 @@ impl ChatSink {
                 acc.push_str(text);
             }
             // The journal lock is std::sync and infallible by design (see
-            // ActiveChat::timeline) — merge into the trailing Text item so a
-            // token stream stays one item, not thousands.
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            // `agent_service::timeline_lock`, which both writers share) — merge
+            // into the trailing Text item so a token stream stays one item, not
+            // thousands.
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
                 content.push_str(text);
             } else {
@@ -1562,7 +1574,7 @@ impl ChatSink {
             if let Ok(mut acc) = run.accumulated_thinking.try_write() {
                 acc.push_str(text);
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
             {
                 content.push_str(text);
@@ -1596,9 +1608,7 @@ impl ChatSink {
                     started_at: chrono::Utc::now(),
                 });
             }
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1608,6 +1618,8 @@ impl ChatSink {
                     duration_ms: None,
                     tokens: None,
                     total_tokens: None,
+                    // Back-filled with the rest of the outcome in `tool_end`.
+                    short_circuited: None,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
         }
@@ -1657,11 +1669,12 @@ impl ChatSink {
                     duration_ms,
                 });
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Tool {
                 output: slot_output,
                 success: slot_success,
                 duration_ms: slot_duration,
+                short_circuited: slot_short_circuited,
                 ..
             }) = journal
                 .iter_mut()
@@ -1671,6 +1684,11 @@ impl ChatSink {
                 *slot_output = Some(output.to_string());
                 *slot_success = Some(success);
                 *slot_duration = Some(duration_ms);
+                // Stats, the liveness ledger and the live event already
+                // distinguish a replay from a failure; the run record is the
+                // last consumer that did not, which is why a timeline
+                // rebuilt after a remount showed steering as tool errors.
+                *slot_short_circuited = Some(short_circuited);
             }
         }
         if let Some(stats) = &self.tool_stats {
@@ -1708,6 +1726,33 @@ impl ChatSink {
                 stats.record(observation).await;
             });
         }
+    }
+
+    /// The per-request usage callback — the daemon's only live context-usage
+    /// signal, and the reason a client can show "23k of 27k" instead of a bare
+    /// spinner.
+    ///
+    /// `window` is the agent loop's OWN enforced input bound at the moment of
+    /// the request (`AgentContext::hard_limit`), so used-vs-window is measured
+    /// against the limit that request was actually judged against — a mid-run
+    /// `num_ctx` demotion moves the denominator with it.
+    ///
+    /// Only the event is filled here. The run-scoped token totals the retired
+    /// in-service path also accumulated (`run_input_tokens` /
+    /// `run_output_tokens`, served in `RunStateSnapshot`) live on
+    /// `ActiveChat`, and `ExternalRunHandle` — this path's only handle on that
+    /// state — does not expose them; when it does, they belong here beside the
+    /// event.
+    fn usage_callback(&self) -> Box<dyn Fn(u32, u32, u64) + Send + Sync> {
+        let event_tx = self.event_tx.clone();
+        let session_id = self.session_id.clone();
+        Box::new(move |input: u32, _output: u32, window: u64| {
+            let _ = event_tx.send(Event::ContextUsage {
+                session_id: session_id.clone(),
+                used: u64::from(input),
+                window,
+            });
+        })
     }
 
     /// Announce which item the run is starting, so the transcript reads as
@@ -1758,9 +1803,7 @@ impl ChatSink {
             item_id: request.item_id,
         });
         if let Some(run) = &self.run {
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Step {
                     phase: kind.to_string(),
                     label,
@@ -1902,6 +1945,11 @@ pub(crate) fn transient_fault_kind(message: &str) -> &'static str {
 /// message and the wedge fingerprint, nothing else), and a half transcript
 /// re-fed as history is exactly the corrupted state the re-anchor exists to
 /// escape. Naming the situation costs a fixed handful of sentences instead.
+///
+/// What the retry carries BESIDE this warning is [`carried_side_effect_note`]:
+/// the calls that actually landed, surfaced from the liveness ledger. That is
+/// a record of what changed on disk, not a half transcript posing as history,
+/// so it does not reopen the state this note exists to escape.
 pub(crate) fn transient_retry_note(attempt: usize, fault: &str) -> String {
     format!(
         "\n\n[SYSTEM: this same step was interrupted mid-flight by a provider fault (attempt \
@@ -1913,17 +1961,95 @@ pub(crate) fn transient_retry_note(attempt: usize, fault: &str) -> String {
     )
 }
 
-/// One line naming the last side-effecting call the liveness ledger holds, so
-/// the re-anchor points at a specific artifact instead of a general warning.
+/// Byte budget for the carried side-effect list, as a share of the model's
+/// LIVE hard input limit.
 ///
-/// Constant size by construction — one tool name and one age, from the P22
-/// Tier 4 [`crate::liveness::SessionLiveness`] record, which keeps exactly one
-/// such mark.
-pub(crate) fn last_side_effect_note(name: &str, secs_ago: u64) -> String {
-    format!(
-        "\n[SYSTEM: the last side-effecting tool call recorded in this turn was {name} \
-         ({secs_ago}s ago). Its effect landed — read the file it touched before writing over it.]"
-    )
+/// Derived, not chosen. The harness has already decided how many bytes of a
+/// step prompt may be spent re-stating work the model cannot see: one
+/// screenful — [`nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES`], the slice
+/// of the previous step's output it feeds forward — and that number was sized
+/// against the universal window floor ([`nanna_llm::UNKNOWN_CONTEXT_WINDOW`]).
+/// Read as a SHARE rather than as a constant, it is 2000 bytes of that floor's
+/// hard input limit, ~1.8% of the input budget once bytes are converted at the
+/// usual ~4 chars/token. Scaling by the live hard limit holds the share fixed
+/// while the window moves: a `num_ctx`-demoted model pays the demoted window's
+/// worth, a large window may afford more.
+///
+/// A share is the bound precisely because "however many calls the attempt
+/// made" is not one: 104 side-effecting calls were observed in a single
+/// aborted attempt, which rendered in full is ~13% of everything a small model
+/// can read — a re-anchor large enough to displace the work it re-anchors.
+pub(crate) fn carried_side_effect_budget_bytes(hard_input_limit_tokens: usize) -> usize {
+    let floor_hard_limit = nanna_llm::unknown_model_info("", "").hard_input_limit();
+    nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES.saturating_mul(hard_input_limit_tokens)
+        / floor_hard_limit.max(1)
+}
+
+/// The interrupted attempt's side-effecting calls, newest first, plus the
+/// pointer saying where their full inputs and outputs still are.
+///
+/// This is the concrete half of the re-anchor. [`transient_retry_note`] can
+/// only say that tool calls "DID execute"; a warning with no subject is not
+/// something a model can act on, and the model's next move after a blind
+/// re-entry is a whole-file rewrite. The calls are SURFACED from the P22
+/// Tier 4 [`crate::liveness::SessionLiveness`] ledger, which recorded them as
+/// they ran — nothing here is reconstructed, and no partial transcript is
+/// replayed.
+///
+/// The shape follows the harness's own bounded synthesis
+/// (`loop_runner::step_activity_digest`): newest calls first, cut at the
+/// budget, and the calls that did not fit announced as a count rather than
+/// dropped in silence. The announcement itself always ships — a budget too
+/// small for even one line must still leave the model knowing the attempt
+/// acted, which is the whole fact it is otherwise missing.
+///
+/// It names only `discover_tools`, the one tool every request ships. A prompt
+/// that names a tool whose schema was never sent is how malformed acceptance
+/// checks went from 3.1% to 53-66% (see [`CORE_TOOLS`]).
+///
+/// `outputs_recallable` is whether this run HAS a memory service writing tool
+/// results (`memory_sink`). Without one, `loop_runner` keeps results in
+/// context instead of storing them, so pointing the model at a store that was
+/// never written is a promise the run cannot keep — the note then says only
+/// what remains true.
+pub(crate) fn carried_side_effect_note(
+    marks: &[crate::liveness::ToolMarkSnapshot],
+    budget_bytes: usize,
+    outputs_recallable: bool,
+) -> String {
+    if marks.is_empty() {
+        return String::new();
+    }
+    let head = format!(
+        "\n[SYSTEM: that attempt made {} side-effecting tool call{} before it was cut, newest \
+         first — each one ran, and whatever it changed is already on disk:",
+        marks.len(),
+        if marks.len() == 1 { "" } else { "s" }
+    );
+    let tail = if outputs_recallable {
+        "\nMost of what those calls produced was stored as it ran and may be readable out of \
+         your memory — reach the memory tools with discover_tools. Do not rely on it: read the \
+         artifact back off disk rather than assuming what a file now holds.]"
+    } else {
+        "\nWhat those calls produced is not in this conversation any more — read the artifact \
+         back off disk before you write over it rather than assuming what it holds.]"
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = head.len() + tail.len();
+    for (idx, mark) in marks.iter().enumerate() {
+        let line = format!("\n- {} ({}s ago)", mark.name, mark.secs_ago);
+        if used + line.len() > budget_bytes {
+            let omitted = marks.len() - idx;
+            lines.push(format!(
+                "\n- …and {omitted} earlier call{}",
+                if omitted == 1 { "" } else { "s" }
+            ));
+            break;
+        }
+        used += line.len();
+        lines.push(line);
+    }
+    format!("{head}{}{tail}", lines.concat())
 }
 
 /// The only tool definitions shipped with a step. Everything else is reached
@@ -2003,52 +2129,6 @@ fn merge_active_tools(
         }
     }
     active
-}
-
-/// Content not worth a memory: machine noise rather than an observation.
-///
-/// Deliberately narrow, and narrower than it used to be. This filter also
-/// matched six "failure shapes" — `"Error:"`, `"Command failed"` and friends —
-/// with `content.contains(s)` across the WHOLE body, not just the prefix.
-/// Upstream, `loop_runner` rewrites every unsuccessful tool result to
-/// `format!("Error: {…}")`, so the combination discarded **100% of failed tool
-/// calls**: 704 of them in one 2-hour run, with not a single ingest line in the
-/// whole day's log containing `FAILED`.
-///
-/// That is backwards. What went wrong is exactly what an agent must remember —
-/// an agent that cannot recall its own failures repeats them, which is what a
-/// long-horizon run looks like when it stalls. The substring form also ate
-/// SUCCESSFUL calls whose output merely mentioned an error: `cat ./minidb`
-/// stored nothing, twice, because the script contains its own error strings.
-/// The agent could not remember reading its own source.
-///
-/// Failure is now carried structurally instead — the episodic writer stamps
-/// `[tool → target — FAILED]` into the content and an `outcome` tag beside it —
-/// so it can be filtered at RECALL time by anyone who wants only successes,
-/// without being unwritable in the first place.
-fn is_low_signal_memory(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.is_empty() {
-        return true;
-    }
-    // Binary/garbled output. Judged by CONTROL characters and decode failures,
-    // not by "not ASCII" — the old test counted every non-ASCII char as noise,
-    // so 40 box-drawing characters in `tree` output, or any text in a
-    // non-Latin script, was classified as binary and deleted. It also flagged
-    // this very writer's own `[exec → cmd — ok]` header punctuation.
-    //
-    // Real binary shows up as C0 control bytes and U+FFFD replacement
-    // characters after a lossy decode; legitimate text does not.
-    let noise = trimmed
-        .chars()
-        .take(200)
-        .filter(|c| (c.is_control() && !c.is_whitespace()) || *c == '\u{FFFD}')
-        .count();
-    if noise > 40 {
-        return true;
-    }
-    // Heartbeat chatter is the machinery talking to itself — not an observation.
-    trimmed.starts_with("HEARTBEAT_OK")
 }
 
 /// Faults that mean the local runner's STATE is bad, not that the request
@@ -2540,7 +2620,7 @@ impl StepRunner for AgentStepRunner {
                 attempt_request
                     .prompt
                     .push_str(&transient_retry_note(attempt + 1, fault));
-                if let Some(line) = self.last_side_effect_line() {
+                if let Some(line) = self.carried_side_effects_line() {
                     attempt_request.prompt.push_str(&line);
                 }
             }
@@ -2626,23 +2706,47 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
-    /// The re-anchor's one concrete line: the last side-effecting tool call
-    /// this turn, read from the P22 Tier 4 liveness ledger.
+    /// The re-anchor's concrete half: the side-effecting calls the
+    /// INTERRUPTED ATTEMPT made, read from the P22 Tier 4 liveness ledger and
+    /// bounded by a share of this model's live input budget.
     ///
-    /// Gated on `turn_side_effects` rather than on the mark's existence,
-    /// because the mark outlives the turn while the counter is reset by
-    /// `begin_turn`: with a zero count, any mark present belongs to an
-    /// EARLIER turn, and naming it would invent a history this step never
-    /// had. `None` on runs with no liveness handle (task-run manager, tests),
-    /// where the general re-anchor stands alone.
-    fn last_side_effect_line(&self) -> Option<String> {
+    /// No counter gate is needed to keep an earlier turn's history from being
+    /// claimed as this attempt's work: the ledger clears the list at every
+    /// step boundary, and a step boundary is stamped on entry to every
+    /// attempt, so an empty list means this attempt changed nothing. `None`
+    /// on runs with no liveness handle (task-run manager, tests), where the
+    /// general re-anchor stands alone.
+    fn carried_side_effects_line(&self) -> Option<String> {
         let live = self.chat_sink.as_ref()?.liveness.as_ref()?;
-        let snapshot = live.snapshot();
-        if snapshot.turn_side_effects == 0 {
+        let marks = live.attempt_side_effects();
+        if marks.is_empty() {
             return None;
         }
-        let mark = snapshot.last_side_effect?;
-        Some(last_side_effect_note(&mark.name, mark.secs_ago))
+        let budget = carried_side_effect_budget_bytes(self.live_hard_input_limit());
+        // The pointer at the stored outputs is only honest when this run has a
+        // memory service writing them — `memory_sink` is the same gate.
+        Some(carried_side_effect_note(&marks, budget, self.memory.is_some()))
+    }
+
+    /// This runner's live hard input limit, in tokens.
+    ///
+    /// Computed exactly as [`nanna_agent::AgentContext`] computes the limit
+    /// the request is actually judged against (`configure_for_model_with_output`):
+    /// model info from the cache-or-universal-floor — already clamped to the
+    /// live `num_ctx` latch, so a mid-run VRAM demotion is reflected — paired
+    /// with this runner's own output reservation. Deriving it a second way
+    /// would let the budget and the window it is a share of disagree.
+    ///
+    /// The lookup takes the prefix-stripped name for the same reason
+    /// [`Self::try_run_step`] strips it before building the agent: the model
+    /// info cache is written under the id the provider was asked about, so a
+    /// `provider/model` spelling misses every entry and silently falls back to
+    /// the universal floor.
+    fn live_hard_input_limit(&self) -> usize {
+        let model = LlmRouter::strip_model_prefix(&self.agent_config.model);
+        let info = nanna_llm::model_info_from_cache_or_unknown(&model, "");
+        let reserve = info.effective_output_budget(self.agent_config.max_tokens as usize);
+        info.hard_input_limit_for(reserve)
     }
 
     /// Seed the step's FRESH context with what this scope has already proven —
@@ -2784,52 +2888,32 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if is_low_signal_memory(&memory.content) {
+                // Filter, importance and route all live in `memory_adapter` —
+                // ONE copy, shared with the interactive-chat sink in
+                // `agent_service.rs`. This path only decides what to log.
+                let category = memory.category.clone();
+                let bytes = memory.content.len();
+                match crate::memory_adapter::store_extracted_memory(
+                    &service,
+                    memory,
+                    workspace_id,
+                )
+                .await
+                {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
                     // shortfall was invisible until someone counted by hand.
                     // A dropped memory is a fact about the run, not a detail.
-                    tracing::info!(
-                        category = %memory.category,
-                        bytes = memory.content.len(),
+                    Ok(None) => tracing::info!(
+                        category = %category,
+                        bytes,
                         "dropping low-signal memory (machine noise)"
-                    );
-                    return;
-                }
-                let mut metadata = memory.tags.unwrap_or_default();
-                metadata.insert("category".to_string(), memory.category.clone());
-                metadata.insert(
-                    "fact_type".to_string(),
-                    memory.provenance.as_str().to_string(),
-                );
-                // A tool result is raw episodic material — worth keeping, but
-                // it must not outrank a stated preference when recall ranks.
-                let importance: f32 = match memory.category.as_str() {
-                    "tool_result" => 1.5,
-                    "preference" | "identity" => 4.0,
-                    "fact" | "insight" => 3.5,
-                    _ => 3.0,
-                };
-                let stored = match &workspace_id {
-                    Some(ws) => {
-                        service
-                            .remember_scoped(
-                                &memory.content,
-                                metadata,
-                                importance,
-                                Some(ws.clone()),
-                            )
-                            .await
+                    ),
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to store tool result in memory");
                     }
-                    None => {
-                        service
-                            .remember_with_importance(&memory.content, metadata, importance)
-                            .await
-                    }
-                };
-                if let Err(e) = stored {
-                    tracing::warn!(error = %e, "failed to store tool result in memory");
                 }
             })
         }))
@@ -2926,8 +3010,8 @@ impl AgentStepRunner {
         // Show the work as it happens: the step's text, thinking, and tool
         // activity stream through the same events a plain chat turn uses,
         // and fill the registered run buffers for recovery/persistence.
-        let (on_text, on_thinking, on_tool_start, on_tool_end) = match &self.chat_sink {
-            None => (None, None, None, None),
+        let (on_text, on_thinking, on_tool_start, on_tool_end, on_usage) = match &self.chat_sink {
+            None => (None, None, None, None, None),
             Some(sink) => {
                 let text_sink = sink.clone();
                 let think_sink = sink.clone();
@@ -2957,6 +3041,7 @@ impl AgentStepRunner {
                         as Box<
                             dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync,
                         >),
+                    Some(sink.usage_callback()),
                 )
             }
         };
@@ -2993,6 +3078,12 @@ impl AgentStepRunner {
             on_thinking,
             on_tool_start,
             on_tool_end,
+            // The live context gauge. This path never set `on_usage`, so the
+            // ONLY emitter of `ContextUsage` sat in the retired in-service
+            // chat path: every client's meter read 0 of 0 for the whole run
+            // while the daemon recomputed the real figures on every request
+            // (59 of 59 captured run-state snapshots, 56 of them mid-run).
+            on_usage,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
             // Capability transitions (provider benched, writes queued) reach
@@ -4054,6 +4145,7 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         items_completed_unverified: 0,
         items_revived: 0,
         abandoned_unmet: Vec::new(),
+        abandoned_unverifiable: Vec::new(),
         items_regressed_reopened: 0,
         items_already_satisfied: 0,
         items_abandoned: 0,
@@ -4086,6 +4178,17 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
     folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
     folded.acceptance_unknown = segments.iter().map(|r| r.acceptance_unknown).sum();
+    // The naming lists concat too, or a run that abandoned work in an earlier
+    // segment reports a count with nothing behind it — the same "a number with
+    // no names" gap this list was added to close.
+    folded.abandoned_unmet = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unmet.iter().cloned())
+        .collect();
+    folded.abandoned_unverifiable = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unverifiable.iter().cloned())
+        .collect();
     // Union by id, newest verdict wins — same rule as the chat harness fold.
     folded.verified_outcomes = Vec::new();
     for segment in segments {
@@ -4646,6 +4749,7 @@ mod tests {
             items_completed_unverified: 0,
             items_revived: 0,
             abandoned_unmet: Vec::new(),
+            abandoned_unverifiable: Vec::new(),
             items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: 0,
@@ -5964,6 +6068,41 @@ mod tests {
         ));
     }
 
+    /// The context gauge, end to end from the sink's side: every LLM request
+    /// reports its prompt size against the window the loop enforced, and that
+    /// pair leaves the daemon as a `ContextUsage` event. Without this callback
+    /// the harness chat path emitted none at all, so every client's meter read
+    /// 0 of 0 for the whole run while the daemon knew the real numbers.
+    #[tokio::test]
+    async fn every_request_reports_its_context_usage() {
+        let sink = chat_sink(external_run_handle());
+        let mut events = sink.event_tx.subscribe();
+
+        let on_usage = sink.usage_callback();
+        on_usage(12_400, 640, 27_904);
+
+        match events.try_recv().expect("a usage event was broadcast") {
+            Event::ContextUsage { session_id, used, window } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(used, 12_400, "used is the request's prompt size");
+                assert_eq!(window, 27_904, "window is the loop's enforced input bound");
+            }
+            other => panic!("expected ContextUsage, got {other:?}"),
+        }
+
+        // The denominator follows a mid-run demotion rather than latching:
+        // a meter measured against a window the model no longer has is a
+        // wrong reading, not a stale one.
+        on_usage(3_900, 120, 4_608);
+        match events.try_recv().expect("the second request reports too") {
+            Event::ContextUsage { used, window, .. } => {
+                assert_eq!(used, 3_900);
+                assert_eq!(window, 4_608);
+            }
+            other => panic!("expected ContextUsage, got {other:?}"),
+        }
+    }
+
     /// "It should feel like the chat did before": a one-task plan is a
     /// conversation-shaped turn and is announced not at all. Items that join
     /// later (interjection, replan) ARE announced — as a timeline Step, the
@@ -6707,9 +6846,21 @@ mod wedged_runner_tests {
 #[cfg(test)]
 mod retry_note_tests {
     use super::{
-        control_char_transport_note, last_side_effect_note, ollama_generation_parse_error,
-        transient_fault_kind, transient_retry_note,
+        carried_side_effect_budget_bytes, carried_side_effect_note, control_char_transport_note,
+        ollama_generation_parse_error, transient_fault_kind, transient_retry_note,
     };
+    use crate::liveness::ToolMarkSnapshot;
+
+    /// The marks the ledger hands over, newest first.
+    fn marks(count: usize) -> Vec<ToolMarkSnapshot> {
+        (0..count)
+            .map(|i| ToolMarkSnapshot {
+                name: if i % 2 == 0 { "write_file" } else { "exec" }.to_string(),
+                at: "2026-08-20T10:00:00.000Z".to_string(),
+                secs_ago: i as u64,
+            })
+            .collect()
+    }
 
     /// The three Go-JSON parse sites Ollama reports when the model emits a raw
     /// control character inside a tool-call string argument, each wrapped in
@@ -6846,14 +6997,104 @@ mod retry_note_tests {
         );
     }
 
-    /// The ledger line points the re-anchor at one artifact instead of a
-    /// general warning.
+    /// The carried list points the re-anchor at what the lost attempt did —
+    /// every call, newest first — and at where the full record still lives.
+    /// A general warning is not actionable; "you already wrote three files,
+    /// and their outputs are in memory" is.
     #[test]
-    fn the_ledger_line_names_the_call_and_its_age() {
-        let line = last_side_effect_note("write_file", 12);
-        assert!(line.contains("write_file"));
-        assert!(line.contains("12s ago"));
-        assert!(line.contains("read the file it touched"));
+    fn the_carried_list_names_the_calls_and_where_their_outputs_are() {
+        let note = carried_side_effect_note(&marks(3), carried_side_effect_budget_bytes(27_904), true);
+        assert!(note.contains("3 side-effecting tool calls"), "{note}");
+        assert!(note.contains("- write_file (0s ago)"), "{note}");
+        assert!(note.contains("- exec (1s ago)"), "{note}");
+        assert!(note.contains("- write_file (2s ago)"), "{note}");
+        assert!(note.contains("on disk"), "{note}");
+        assert!(
+            note.contains("readable out of"),
+            "the pointer to the stored record is the half that makes re-reading \
+             cheaper than rewriting: {note}"
+        );
+        // Only the tool the request actually ships may be named.
+        assert!(note.contains("discover_tools"), "{note}");
+        assert!(!note.contains("recall("), "{note}");
+        assert!(!note.contains("read_file("), "{note}");
+
+        // Singular reads as singular — a model that is told "1 calls" is
+        // being told the note was generated, not observed.
+        let one = carried_side_effect_note(&marks(1), carried_side_effect_budget_bytes(27_904), true);
+        assert!(one.contains("1 side-effecting tool call before"), "{one}");
+
+        assert!(carried_side_effect_note(&[], 2_000, true).is_empty());
+
+        // A run with no memory service never stored those outputs, so the
+        // note must not send the model looking for them — it keeps the half
+        // that is still true (the artifact on disk).
+        let no_store =
+            carried_side_effect_note(&marks(3), carried_side_effect_budget_bytes(27_904), false);
+        assert!(no_store.contains("- write_file (0s ago)"), "{no_store}");
+        assert!(!no_store.contains("discover_tools"), "{no_store}");
+        assert!(!no_store.contains("your memory"), "{no_store}");
+        assert!(no_store.contains("read the artifact back off disk"), "{no_store}");
+    }
+
+    /// The bound is the window's share, not the attempt's call count. The
+    /// aborted attempt that motivated this made 104 side-effecting calls;
+    /// rendered in full that is ~13% of a small model's input budget, so the
+    /// re-anchor would displace the work it exists to protect.
+    #[test]
+    fn the_carried_list_is_bounded_by_the_window_not_by_the_call_count() {
+        let small_window = 27_904; // the universal floor's hard input limit
+        let note = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(small_window), true);
+
+        // Every call is still ACCOUNTED for, in the count and in the tail
+        // line — bounded is not the same as silently truncated.
+        assert!(note.contains("104 side-effecting tool calls"), "{note}");
+        assert!(note.contains("earlier call"), "{note}");
+        assert!(
+            note.matches("\n- ").count() < 104,
+            "the whole list must not be rendered: {note}"
+        );
+
+        // The measured share: at ~4 chars per token, the note is a couple of
+        // percent of what this model can read, against the 13% observed.
+        let input_budget_chars = small_window * 4;
+        assert!(
+            note.len() * 100 / input_budget_chars <= 3,
+            "note is {} bytes of a {input_budget_chars}-char input budget",
+            note.len()
+        );
+
+        // And the share is a share: a wider window buys more of the list, a
+        // demoted one buys less. Same input, different budgets.
+        let wide = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(small_window * 8), true);
+        let demoted = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(2_304), true);
+        assert!(wide.matches("\n- ").count() > note.matches("\n- ").count());
+        assert!(demoted.matches("\n- ").count() < note.matches("\n- ").count());
+        // Even at the smallest window the announcement survives: the model
+        // must never be left thinking the attempt did nothing.
+        assert!(demoted.contains("104 side-effecting tool calls"), "{demoted}");
+        assert!(demoted.contains("discover_tools"), "{demoted}");
+    }
+
+    /// The budget is the harness's own one-screenful carry-forward, expressed
+    /// as a share of the window it was sized against — so it tracks the live
+    /// window instead of going stale beside it.
+    #[test]
+    fn the_budget_is_the_step_tails_share_of_the_live_window() {
+        let floor = nanna_llm::unknown_model_info("", "").hard_input_limit();
+        assert_eq!(
+            carried_side_effect_budget_bytes(floor),
+            nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES,
+            "at the window the step tail was sized against, the budget IS the step tail"
+        );
+        assert_eq!(
+            carried_side_effect_budget_bytes(floor * 2),
+            nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES * 2,
+            "the share is constant, so the budget scales with the window"
+        );
+        assert!(carried_side_effect_budget_bytes(floor / 4) < carried_side_effect_budget_bytes(floor));
+        // A degenerate window must not panic or hand out an unbounded budget.
+        assert_eq!(carried_side_effect_budget_bytes(0), 0);
     }
 }
 
@@ -7003,6 +7244,7 @@ mod workspace_reference_tests {
             contributing: None,
             // A 1000-line roadmap — far past what a 16k window can spare.
             roadmap: Some("- [ ] migrate a file off lucide-vue-next\n".repeat(1_000)),
+            git: None,
         };
 
         let mut ctx = AgentContext::new("t");

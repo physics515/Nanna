@@ -128,6 +128,28 @@ pub enum DaemonEvent {
     ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64>, #[serde(default)] data: Option<serde_json::Value> },
     Error { code: String, message: String, #[serde(default)] session_id: Option<String> },
     ContextUsage { session_id: String, used: u64, window: u64 },
+    /// Low-frequency beat while a chat turn is in flight (~30s, the cadence
+    /// the daemon derives from its silence budgets). It carries what the turn
+    /// is waiting on and for how long, which is the only thing that tells a
+    /// working turn apart from a wedged one from outside the daemon.
+    ///
+    /// The daemon has emitted these since P22 Tier 4; this enum had no variant
+    /// for them, so every beat fell out of the event parse and was logged as
+    /// "Unknown message format" instead of reaching the GUI.
+    ///
+    /// `quiet_s`, `step_index` and `last_tool` are absent on a beat that has
+    /// nothing to report yet (no output observed, no plan item, no tool run),
+    /// so they are optional here exactly as they are on the wire.
+    LivenessBeat {
+        session_id: String,
+        elapsed_s: u64,
+        phase: String,
+        awaiting: String,
+        #[serde(default)] quiet_s: Option<u64>,
+        #[serde(default)] step_index: Option<usize>,
+        #[serde(default)] last_tool: Option<String>,
+        beat: u64,
+    },
     Connected { client_id: String },
     Disconnected { client_id: String },
     TaskRunStarted { scope: String, #[serde(default)] scope_id: Option<String>, goal: String },
@@ -140,6 +162,19 @@ pub enum DaemonEvent {
     /// The daemon's config was mutated and committed. Payload-free by design:
     /// each view re-fetches the slice it renders.
     ConfigChanged,
+    /// A well-formed daemon event this build has no variant for.
+    ///
+    /// The daemon and the GUI ship separately, so the daemon's event set is
+    /// routinely ahead of this enum. Without a catch-all, one unknown `event`
+    /// value made the WHOLE message fail to parse, and it was then reported as
+    /// "Unknown message format" — indistinguishable from a corrupt frame. That
+    /// is how the liveness beat stayed invisible for its entire life.
+    ///
+    /// This catches an unrecognised `event` VALUE only: a message with no
+    /// `event` field at all still fails the parse and is still reported, so a
+    /// genuinely malformed frame is not quietly swallowed.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Pending request waiting for response
@@ -1416,5 +1451,89 @@ impl DaemonClient {
             state: *self.state.read().await,
             daemon_url: self.config.url.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon's own wire shape for a beat, taken from
+    /// `nanna_daemon::protocol::Event::LivenessBeat`. Optional members are
+    /// omitted by `skip_serializing_if`, so the beat that arrives before any
+    /// tool has run looks like this.
+    const BEAT_MINIMAL: &str = r#"{
+        "event": "liveness_beat",
+        "session_id": "s-1",
+        "elapsed_s": 91,
+        "phase": "streaming",
+        "awaiting": "model output (ollama/qwen3.5:9b): last token 41s ago",
+        "beat": 3
+    }"#;
+
+    /// Before this variant existed the whole message failed to parse and was
+    /// logged as "Unknown message format", so the GUI never saw a single beat.
+    #[test]
+    fn liveness_beat_deserializes() {
+        let event: DaemonEvent = serde_json::from_str(BEAT_MINIMAL).expect("beat must parse");
+        match event {
+            DaemonEvent::LivenessBeat {
+                session_id, elapsed_s, phase, awaiting, quiet_s, step_index, last_tool, beat,
+            } => {
+                assert_eq!(session_id, "s-1");
+                assert_eq!(elapsed_s, 91);
+                assert_eq!(phase, "streaming");
+                assert!(awaiting.contains("last token 41s ago"));
+                // Absent on the wire means "not reported", not zero.
+                assert_eq!(quiet_s, None);
+                assert_eq!(step_index, None);
+                assert_eq!(last_tool, None);
+                assert_eq!(beat, 3);
+            }
+            other => panic!("expected LivenessBeat, got {other:?}"),
+        }
+    }
+
+    /// A fuller beat carries the quiet time the badge renders.
+    #[test]
+    fn liveness_beat_keeps_the_optional_members_when_present() {
+        let json = r#"{
+            "event": "liveness_beat",
+            "session_id": "s-2",
+            "elapsed_s": 600,
+            "phase": "tool",
+            "awaiting": "tool exec",
+            "quiet_s": 305,
+            "step_index": 4,
+            "last_tool": "exec",
+            "beat": 20
+        }"#;
+        match serde_json::from_str::<DaemonEvent>(json).expect("beat must parse") {
+            DaemonEvent::LivenessBeat { quiet_s, step_index, last_tool, .. } => {
+                assert_eq!(quiet_s, Some(305));
+                assert_eq!(step_index, Some(4));
+                assert_eq!(last_tool.as_deref(), Some("exec"));
+            }
+            other => panic!("expected LivenessBeat, got {other:?}"),
+        }
+    }
+
+    /// The daemon ships events ahead of the GUI. An event this build has no
+    /// variant for must stop the message from being reported as malformed —
+    /// that conflation is what hid the beat.
+    #[test]
+    fn an_unknown_event_parses_instead_of_failing() {
+        let json = r#"{"event": "some_event_from_a_newer_daemon", "whatever": 1}"#;
+        assert!(matches!(
+            serde_json::from_str::<DaemonEvent>(json),
+            Ok(DaemonEvent::Unknown)
+        ));
+    }
+
+    /// ...but a frame that is not an event at all still fails, so a genuinely
+    /// malformed message keeps being reported rather than swallowed.
+    #[test]
+    fn a_message_without_an_event_tag_still_fails_to_parse() {
+        assert!(serde_json::from_str::<DaemonEvent>(r#"{"nonsense": true}"#).is_err());
     }
 }

@@ -15,6 +15,30 @@ const DEDUP_MIN_SIZE: usize = 4_000; // Lowered since CDC handles small chunks w
 /// Threshold for considering content "mostly duplicate" (0.0-1.0)
 const DEDUP_THRESHOLD: f32 = 0.7;
 
+/// Placeholder assistant turn that keeps user/assistant alternation after the
+/// injected preamble. Named because [`AgentContext::preamble_tokens`] must
+/// charge for it — it is part of what the request carries.
+const PREAMBLE_ACK: &str = "I understand the previous context. How can I help you continue?";
+
+/// Opening of the banner [`AgentContext::compress_older_tool_results`] writes
+/// over a shrunken tool result. A later pass matches on it so compression
+/// never re-compresses its own ~380-char explanation, which shrinks nothing
+/// and re-frames a note as if it were data.
+const COMPRESSED_RESULT_BANNER: &str = "[COMPRESSED SUMMARY of an older tool result";
+
+/// Worst-case length of the notice [`AgentContext::elide_preamble_to_fit`]
+/// writes, used to reserve room for it inside the preamble budget. The only
+/// variable part is the digits of the elided-char count, so a template with a
+/// generous count is an exact reserve in practice.
+const ELISION_NOTICE_TEMPLATE: &str =
+    "[999999999 chars of this summary were elided to make room for the live request. \
+     WHY: the summary had grown past the space the conversation itself needs. \
+     Everything it described already happened and SUCCEEDED — files on disk are the \
+     ground truth.]\n";
+
+/// Marker separating the surviving head and tail of an elided summary.
+const ELISION_MARKER: &str = "\n[...elided...]\n";
+
 /// Calculate deduplication coverage: fraction of chunks whose hashes are already known.
 fn dedup_coverage(content: &str, known_hashes: &HashSet<u64>) -> f32 {
     let chunks = Chunk::split_on_boundaries(content);
@@ -251,7 +275,13 @@ impl ContextSummarizationConfig {
     }
 }
 
-/// Compressed context summary
+/// Compressed context summary — the RETURN of [`AgentContext::compress`],
+/// reporting what one pass did. It is not a stored copy of the summary text:
+/// the only text that reaches a request is [`AgentContext::consolidated_summary`],
+/// and a second copy of it used to be kept in a `summaries` vector that
+/// [`AgentContext::estimate_tokens`] charged to the budget while no request
+/// ever carried it (measured live: 4,767 estimated tokens against a 12,288
+/// hard limit with one message left, ~4,200 of them a vector no model sees).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSummary {
     /// The compressed summary text
@@ -291,9 +321,6 @@ pub struct AgentContext {
     pub metadata: HashMap<String, String>,
     /// Maximum number of messages to keep
     pub max_messages: usize,
-    /// Compressed summaries of older context
-    #[serde(default)]
-    pub summaries: Vec<ContextSummary>,
     /// Maximum tokens before compression triggers
     #[serde(default = "default_compression_threshold")]
     pub compression_threshold: usize,
@@ -358,6 +385,19 @@ pub struct AgentContext {
     /// since it's already represented in the consolidated_summary.
     #[serde(default)]
     summarized_content_hashes: HashSet<u64>,
+    /// Index of the message carrying the LIVE request — the thing the user
+    /// actually asked for this turn. Provenance, not a guess: neither index 0
+    /// nor `role == "user"` identifies it, because the loop pushes synthetic
+    /// user-role notices (nudges, wrap-up instructions, loss announcements)
+    /// and because a cut can shift the request off index 0. Set by
+    /// [`Self::pin_live_request`] right after the request message is pushed;
+    /// `None` falls back to index 0, which is what every cut path used to
+    /// half-assume.
+    ///
+    /// Every removal path in this file maintains it, so it stays pointing at
+    /// the same message no matter how much history is cut away.
+    #[serde(default)]
+    pinned_request: Option<usize>,
 }
 
 fn default_include_memory() -> bool {
@@ -380,7 +420,6 @@ impl AgentContext {
             messages: Vec::new(),
             metadata: HashMap::new(),
             max_messages: 100,
-            summaries: Vec::new(),
             compression_threshold: default_compression_threshold(),
             hard_limit: default_hard_limit(),
             current_model: None,
@@ -396,6 +435,41 @@ impl AgentContext {
             growth: ContextGrowthTracker::default(),
             pending_loss_notices: Vec::new(),
             summarized_content_hashes: HashSet::new(),
+            pinned_request: None,
+        }
+    }
+
+    /// Mark the message just pushed as the one carrying the live request.
+    ///
+    /// Call this immediately after adding the user's turn. Every cut path in
+    /// this file then routes around it: the request the model is answering
+    /// must survive compression, or the run continues against a question it
+    /// can no longer read.
+    pub fn pin_live_request(&mut self) {
+        self.pinned_request = self.messages.len().checked_sub(1);
+    }
+
+    /// Index of the pinned live request, clamped into range.
+    ///
+    /// Falls back to index 0 — the original request when nothing has been
+    /// pinned explicitly, which is what `drop_oldest` and `compress` already
+    /// assumed and what the other cut paths did not.
+    #[must_use]
+    pub fn pinned_index(&self) -> usize {
+        if self.messages.is_empty() {
+            return 0;
+        }
+        self.pinned_request
+            .unwrap_or(0)
+            .min(self.messages.len() - 1)
+    }
+
+    /// Shift the pin after `removed` messages were taken from positions
+    /// strictly before it. Removal paths call this instead of touching the
+    /// field, so the pin cannot silently drift onto a different message.
+    fn shift_pin_after_removal(&mut self, removed_before_pin: usize) {
+        if let Some(idx) = self.pinned_request {
+            self.pinned_request = Some(idx.saturating_sub(removed_before_pin));
         }
     }
 
@@ -419,9 +493,7 @@ impl AgentContext {
             messages.push(AnthropicMessage::user_text(preamble));
 
             // Add a placeholder assistant acknowledgment to maintain user/assistant alternation
-            messages.push(AnthropicMessage::assistant_text(
-                "I understand the previous context. How can I help you continue?",
-            ));
+            messages.push(AnthropicMessage::assistant_text(PREAMBLE_ACK));
 
             // Then add deduplicated current messages
             messages.extend(deduped_messages);
@@ -432,7 +504,79 @@ impl AgentContext {
         };
 
         // Sanitize: remove empty text blocks and ensure every message has content
-        Self::sanitize_messages(raw)
+        Self::sanitize_messages(Self::repair_orphan_tool_results(raw))
+    }
+
+    /// Rewrite `tool_result` blocks whose `tool_use` is no longer in the
+    /// request into plain text, keeping the output verbatim.
+    ///
+    /// Every cut in this file removes a PREFIX of the history, so the only
+    /// orphan reachable is a leading result whose call was cut away with the
+    /// messages before it — a one-message bound, not an open-ended snap. The
+    /// local server tolerates it; every other provider rejects the whole
+    /// request, which turns a compression event into a hard API failure.
+    ///
+    /// Repair rather than arithmetic, and repair rather than assertion: a
+    /// `debug_assert!` here would panic inside a spawned turn, which is the
+    /// documented silent-wedge signature. The wording follows the eviction
+    /// house style ("[superseded by later call — N chars removed]") so the
+    /// model reads a bookkeeping note, not damaged data.
+    fn repair_orphan_tool_results(mut messages: Vec<AnthropicMessage>) -> Vec<AnthropicMessage> {
+        // One forward pass: a result is an orphan exactly when no earlier
+        // block in this request issued its id.
+        let orphan_positions: Vec<(usize, usize)> = {
+            let mut seen_tool_use: HashSet<&str> = HashSet::new();
+            let mut orphans = Vec::new();
+            for (msg_idx, msg) in messages.iter().enumerate() {
+                for (block_idx, block) in msg.content.iter().enumerate() {
+                    match block {
+                        ContentBlock::ToolUse { id, .. } => {
+                            seen_tool_use.insert(id.as_str());
+                        }
+                        ContentBlock::ToolResult { tool_use_id, .. }
+                            if !seen_tool_use.contains(tool_use_id.as_str()) =>
+                        {
+                            orphans.push((msg_idx, block_idx));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            orphans
+        };
+        if orphan_positions.is_empty() {
+            return messages;
+        }
+
+        let repaired = orphan_positions.len();
+        for (msg_idx, block_idx) in orphan_positions {
+            let Some(block) = messages
+                .get_mut(msg_idx)
+                .and_then(|m| m.content.get_mut(block_idx))
+            else {
+                continue;
+            };
+            let ContentBlock::ToolResult { content, is_error, .. } = &*block else {
+                continue;
+            };
+            let verdict = if is_error.unwrap_or(false) {
+                "FAILED"
+            } else {
+                "SUCCEEDED"
+            };
+            let text = format!(
+                "[Result of an earlier tool call whose request was compressed out of this \
+                 context — the call itself {verdict} and its output is preserved verbatim \
+                 below ({} chars).]\n{content}",
+                content.len()
+            );
+            *block = ContentBlock::Text { text };
+        }
+        debug!(
+            repaired,
+            "Repaired tool results whose call was compressed away"
+        );
+        messages
     }
 
     /// The injected first-message preamble: the consolidated summary and/or
@@ -710,28 +854,243 @@ impl AgentContext {
         deduped
     }
 
-    /// Estimate tokens for messages that will be sent to API (includes summary).
+    /// Tokens the injected preamble adds to a request: the consolidated
+    /// summary, the distilled-facts slot, the verified-outcomes slot, all
+    /// their framing, and the assistant acknowledgement that keeps
+    /// user/assistant alternation.
     ///
-    /// Uses a conservative ratio of ~3.2 chars per token (instead of 4) because
-    /// code-heavy content, JSON, and tool calls tokenize at a higher ratio.
-    /// Over-estimating is safer than under-estimating (summarize early > 400 error).
-    pub fn estimate_request_tokens(&self) -> usize {
-        let summary_tokens = self
-            .consolidated_summary
-            .as_ref()
-            .map(|s| estimate_token_count(s.len()) + 100) // framing overhead
-            .unwrap_or(0);
-        // The distilled-facts and verified-outcomes slots ride in the same
-        // injected preamble — unbudgeted tokens would overflow the window.
-        let distilled_tokens = self
-            .distilled_facts
-            .as_ref()
-            .map_or(0, |s| estimate_token_count(s.len()) + 10);
-        let verified_tokens = self
-            .verified_outcomes_block()
-            .map_or(0, |b| estimate_token_count(b.len()));
+    /// Measured from the text [`Self::context_preamble`] actually produces
+    /// rather than re-derived from the parts, so the number cannot drift away
+    /// from what gets sent when the framing changes. Compression's levers
+    /// touch only the message list, so this is the part of the request the
+    /// tiers must budget AROUND, not the part they can shrink — see
+    /// [`Self::message_hard_limit`].
+    #[must_use]
+    pub fn preamble_tokens(&self) -> usize {
+        self.context_preamble().map_or(0, |preamble| {
+            estimate_tokens(&preamble) + estimate_tokens(PREAMBLE_ACK)
+        })
+    }
 
-        summary_tokens + distilled_tokens + verified_tokens + self.estimate_tokens()
+    /// Estimate tokens for the request that will actually be sent: the
+    /// messages plus the injected preamble, and nothing else. Both halves use
+    /// `nanna-llm`'s family-aware estimator, which leans conservative —
+    /// over-estimating summarizes early, under-estimating earns a 400.
+    #[must_use]
+    pub fn estimate_request_tokens(&self) -> usize {
+        self.preamble_tokens() + self.estimate_tokens()
+    }
+
+    /// Room left for MESSAGES under `limit` once the preamble is paid for.
+    ///
+    /// The tiers gate on message tokens against a threshold with the preamble
+    /// deducted, rather than on request tokens against the raw threshold. The
+    /// two are the same inequality, but this form is the one that stays
+    /// ordered: `compression_threshold − P ≤ hard_limit − P` for every P, so
+    /// the gentle rung can never become unreachable while the aggressive one
+    /// fires. Gating on different quantities is what made 94 of 166 observed
+    /// aggressive firings happen in states where the gentler rung's predicate
+    /// was structurally false.
+    #[must_use]
+    fn message_budget(&self, limit: usize) -> usize {
+        limit.saturating_sub(self.preamble_tokens())
+    }
+
+    /// Message-side budget at the compression threshold.
+    #[must_use]
+    pub fn message_compression_threshold(&self) -> usize {
+        self.message_budget(self.compression_threshold)
+    }
+
+    /// Message-side budget at the hard input limit.
+    #[must_use]
+    pub fn message_hard_limit(&self) -> usize {
+        self.message_budget(self.hard_limit)
+    }
+
+    /// The largest preamble this context can afford to carry.
+    ///
+    /// Derived from two measured quantities, not a chosen fraction: the
+    /// pinned request ([`Self::step_frame_tokens`]) is irreducible and must
+    /// always fit, and one interval of new material is what the run's own
+    /// growth tracker says the next step will add. Below that room the next
+    /// iteration provably cannot fit, so the preamble — the only part of the
+    /// request compression never touches — is what has to give.
+    ///
+    /// Before any growth has been measured the interval term is 0 and the
+    /// bound degrades to "the request and the preamble must fit together",
+    /// which is the same statement with no interval budget to spend.
+    #[must_use]
+    pub fn preamble_room_target(&self) -> usize {
+        // The system prompt is charged by `estimate_tokens`, so it has to be
+        // deducted here too or the target does not satisfy the predicate it
+        // exists to satisfy. Omitting it left the request at roughly
+        // `hard_limit + system - growth` after a "successful" elision, so
+        // whenever the system prompt outweighs measured growth — routine here,
+        // where it carries workspace context and tool guidance — the caller
+        // fell straight through to deleting messages anyway, which is the
+        // outcome eliding the preamble exists to avoid.
+        self.hard_limit.saturating_sub(
+            estimate_tokens(&self.system_prompt)
+                + self.step_frame_tokens()
+                + self.growth.max_observed_growth,
+        )
+    }
+
+    /// Whether the preamble has ratcheted past the room the messages need.
+    #[must_use]
+    pub fn preamble_starved(&self) -> bool {
+        self.preamble_tokens() > self.preamble_room_target()
+    }
+
+    /// Char budget for `tokens` under the densest family the estimator can
+    /// classify text as, so a budget spent in chars can never measure back
+    /// above the token budget it came from. Reuses `nanna-llm`'s own ratio
+    /// rather than restating one.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn chars_for_tokens(tokens: usize) -> usize {
+        (tokens as f32 * nanna_llm::CHARS_PER_TOKEN_CODE) as usize
+    }
+
+    /// Shrink `consolidated_summary` without an LLM so the preamble fits
+    /// [`Self::preamble_room_target`]. Returns whether anything changed.
+    ///
+    /// Head-and-tail elision in the eviction house style: the opening states
+    /// what happened and how much went, so a suddenly-shorter summary reads
+    /// as bookkeeping rather than as evidence that work was lost. This is the
+    /// no-model path — [`Self::compact_preamble`] re-summarizes properly when
+    /// a summarizer is configured.
+    fn elide_preamble_to_fit(&mut self) -> bool {
+        if !self.preamble_starved() {
+            return false;
+        }
+        let Some(summary) = self.consolidated_summary.clone() else {
+            return false;
+        };
+        // What the preamble costs apart from the summary — framing, the
+        // distilled note, the never-compressed verified-outcomes slot, and
+        // the acknowledgement — measured exactly rather than re-derived.
+        let overhead = self
+            .preamble_tokens()
+            .saturating_sub(estimate_tokens(&summary));
+        let allowed_tokens = self.preamble_room_target().saturating_sub(overhead);
+        let allowed_chars = Self::chars_for_tokens(allowed_tokens);
+        if summary.len() <= allowed_chars {
+            return false;
+        }
+
+        // The notice and the elision marker are part of the budget: what they
+        // cost comes out of the summary text, never out of the room reserved
+        // for messages. Reserving the template's own length is exact up to
+        // the digits of the count.
+        let notice_reserve = ELISION_NOTICE_TEMPLATE.len() + ELISION_MARKER.len();
+        let body_chars = allowed_chars.saturating_sub(notice_reserve);
+        let half = body_chars / 2;
+        let head_end = summary.floor_char_boundary(half.min(summary.len()));
+        let tail_start = {
+            let want = summary.len().saturating_sub(half);
+            (want..=summary.len())
+                .find(|&i| summary.is_char_boundary(i))
+                .unwrap_or(summary.len())
+        };
+        let head = &summary[..head_end];
+        let tail = if tail_start > head_end {
+            &summary[tail_start..]
+        } else {
+            ""
+        };
+        let elided = summary.len() - head.len() - tail.len();
+        let notice = format!(
+            "[{elided} chars of this summary were elided to make room for the live \
+             request. WHY: the summary had grown past the space the conversation \
+             itself needs. Everything it described already happened and SUCCEEDED — \
+             files on disk are the ground truth.]\n"
+        );
+        let replacement = format!("{notice}{head}{ELISION_MARKER}{tail}");
+        // Never report an elision that made the preamble BIGGER. When the room
+        // left is smaller than the notice itself, head and tail both collapse
+        // to nothing and the "elided" summary is just the notice — which can
+        // be longer than the summary it replaced. `elide_by_lines` guards
+        // exactly this; this path had no equivalent and would return true
+        // while growing the thing it was asked to shrink.
+        if replacement.len() >= summary.len() {
+            return false;
+        }
+        self.consolidated_summary = Some(replacement);
+        info!(
+            original_chars = summary.len(),
+            elided_chars = elided,
+            preamble_tokens = self.preamble_tokens(),
+            preamble_room_target = self.preamble_room_target(),
+            "Elided the consolidated summary to keep room for the live request"
+        );
+        true
+    }
+
+    /// Re-summarize `consolidated_summary` when the preamble has crowded out
+    /// the room the messages need.
+    ///
+    /// This is the reduction path the preamble previously had none of: it
+    /// only ever grew, so every message-side lever eventually ran out of
+    /// anything to give. Falls back to [`Self::elide_preamble_to_fit`] when
+    /// no summarizer will produce a smaller summary — a summary of a summary
+    /// that does not shrink is not worth the round-trip. Returns whether the
+    /// preamble got smaller.
+    async fn compact_preamble(&mut self, config: &ContextSummarizationConfig) -> bool {
+        if !self.preamble_starved() {
+            return false;
+        }
+        let Some(summary) = self.consolidated_summary.clone() else {
+            return false;
+        };
+        if config.model_priority.is_empty() {
+            return self.elide_preamble_to_fit();
+        }
+
+        // Cut points at line ends so the chunker can read the WHOLE summary
+        // in summarizer-sized pieces instead of truncating its tail away. A
+        // summary with no interior line break cannot be chunked, and handing
+        // an unchunkable blob to a small summarizer is how a "summary" ends up
+        // describing only its own first few percent — elide that instead.
+        let mut covered_ends: Vec<usize> = summary
+            .char_indices()
+            .filter(|&(_, c)| c == '\n')
+            .map(|(i, c)| i + c.len_utf8())
+            .collect();
+        if covered_ends.last() != Some(&summary.len()) {
+            covered_ends.push(summary.len());
+        }
+        if covered_ends.len() < 2 {
+            return self.elide_preamble_to_fit();
+        }
+
+        match Self::summarize_content_with_fallback(&summary, &covered_ends, config).await {
+            Ok((condensed, _)) if condensed.len() < summary.len() => {
+                self.consolidated_summary = Some(format!(
+                    "[This summary has itself been re-condensed to make room for current \
+                     work. Earlier wording is gone; nothing it described was undone.]\n{condensed}"
+                ));
+                info!(
+                    original_chars = summary.len(),
+                    condensed_chars = condensed.len(),
+                    preamble_tokens = self.preamble_tokens(),
+                    preamble_room_target = self.preamble_room_target(),
+                    "Re-summarized the consolidated summary to keep room for messages"
+                );
+                // A condensed summary that is still too big falls through to
+                // elision rather than back to message destruction.
+                self.elide_preamble_to_fit();
+                true
+            }
+            Ok(_) => {
+                debug!("Re-summarization did not shrink the preamble, eliding instead");
+                self.elide_preamble_to_fit()
+            }
+            Err(e) => {
+                warn!(error = %e, "Preamble re-summarization failed, eliding instead");
+                self.elide_preamble_to_fit()
+            }
+        }
     }
 
     /// Set the system prompt.
@@ -1024,24 +1383,22 @@ impl AgentContext {
             ContextIsolation::Full => {
                 ctx.system_prompt = self.system_prompt.clone();
                 ctx.messages = self.messages.clone();
-                ctx.summaries = self.summaries.clone();
+                ctx.consolidated_summary = self.consolidated_summary.clone();
+                ctx.distilled_facts = self.distilled_facts.clone();
                 ctx.verified_outcomes = self.verified_outcomes.clone();
+                ctx.pinned_request = self.pinned_request;
             }
             ContextIsolation::SystemOnly => {
                 ctx.system_prompt = self.system_prompt.clone();
             }
             ContextIsolation::Summary => {
                 ctx.system_prompt = self.system_prompt.clone();
-                // Add summaries as context in system prompt
-                if !self.summaries.is_empty() {
-                    let summary_text: String = self.summaries
-                        .iter()
-                        .map(|s| s.summary.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+                // The compressed history lives in `consolidated_summary` —
+                // the one copy any request ever carries.
+                if let Some(ref summary) = self.consolidated_summary {
                     ctx.system_prompt = format!(
-                        "{}\n\n## Previous Context Summary\n{}",
-                        ctx.system_prompt, summary_text
+                        "{}\n\n## Previous Context Summary\n{summary}",
+                        ctx.system_prompt
                     );
                 }
             }
@@ -1070,69 +1427,95 @@ impl AgentContext {
         self.trim_if_needed();
     }
 
-    /// Estimate token count using a conservative heuristic.
+    /// Estimate token count of the MESSAGE side of a request: the system
+    /// prompt plus the message list. This is the quantity compression can
+    /// actually change, which is why it is the quantity every tier gates on
+    /// (against a preamble-deducted threshold — see [`Self::message_budget`]).
     ///
-    /// Uses ~3.2 chars per token (via [`estimate_token_count`]) instead of the
-    /// commonly cited 4, because code, JSON, and tool calls tokenize at a higher
-    /// ratio. Over-estimating triggers earlier compression, which is much better
-    /// than hitting a 400 context_length_exceeded error mid-run.
+    /// Leans conservative on purpose: over-estimating triggers earlier
+    /// compression, which is much better than hitting a 400
+    /// context_length_exceeded error mid-run.
     #[must_use]
     pub fn estimate_tokens(&self) -> usize {
         // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
         let system_tokens = estimate_tokens(&self.system_prompt);
-        let summary_tokens: usize = self.summaries.iter().map(|s| estimate_tokens(&s.summary)).sum();
         let message_tokens: usize = self.messages.iter().map(estimate_message_tokens).sum();
 
-        system_tokens + summary_tokens + message_tokens
+        system_tokens + message_tokens
     }
 
-    /// Estimated tokens of the step frame: the FIRST user message (the
-    /// original request / harness step prompt). [`Self::truncate_to_limit`]
-    /// always preserves it, so it is an irreducible part of every request this
+    /// Estimated tokens of the step frame: the pinned message carrying the
+    /// live request (the original request / harness step prompt). Every cut
+    /// path preserves it, so it is an irreducible part of every request this
     /// context will ever produce — the context-floor derivation counts it.
     #[must_use]
     pub fn step_frame_tokens(&self) -> usize {
-        self.messages.first().map_or(0, estimate_message_tokens)
+        self.messages
+            .get(self.pinned_index())
+            .map_or(0, estimate_message_tokens)
     }
 
-    /// Check if compression is needed based on token count
+    /// Check if compression is needed: message tokens against the
+    /// compression threshold with the preamble already deducted.
     #[must_use]
     pub fn needs_compression(&self) -> bool {
-        self.estimate_tokens() > self.compression_threshold
+        self.estimate_tokens() > self.message_compression_threshold()
     }
 
-    /// Check if context exceeds hard limit (must truncate before API call)
+    /// Check if the context exceeds the hard limit (must truncate before the
+    /// API call): message tokens against the hard limit with the preamble
+    /// already deducted.
     ///
-    /// This checks the full request tokens (including consolidated summary)
-    /// since that's what will actually be sent to the API.
+    /// Same inequality as request-tokens-versus-hard-limit, expressed so it
+    /// is ordered against [`Self::needs_compression`] by construction — see
+    /// [`Self::message_budget`].
     #[must_use]
     pub fn exceeds_hard_limit(&self) -> bool {
-        self.estimate_request_tokens() > self.hard_limit
+        self.estimate_tokens() > self.message_hard_limit()
     }
 
     /// Truncate oldest messages to get under the hard limit.
     ///
     /// This is a last-resort measure when compression isn't enough or isn't possible.
-    /// Always keeps the first user message (the original request) and the most recent
-    /// messages to avoid losing the user's intent.
+    /// Always keeps the pinned live request (see [`Self::pin_live_request`])
+    /// and the most recent messages, so the model never ends up answering a
+    /// question that is no longer in the request.
     /// Returns the number of messages removed.
     pub fn truncate_to_limit(&mut self) -> usize {
         let mut removed = 0;
 
-        // Keep at least 2 messages (first user message + most recent)
-        // Remove from index 1 (after the first message) to preserve the original request
+        // Before destroying any message: shrink the part of the request
+        // compression cannot otherwise touch. A preamble that has ratcheted
+        // past the room the messages need is the reason truncation was
+        // reached at all (observed: 1,182 → 21,209 chars in one 22-minute
+        // stretch, 54% of the window), and eliding it costs a re-worded
+        // summary rather than real history.
+        if self.exceeds_hard_limit() {
+            self.elide_preamble_to_fit();
+        }
+
+        // Drop the OLDEST removable message, never the pinned live request,
+        // while more than the pinned message and one live tail remain.
         while self.exceeds_hard_limit() && self.messages.len() > 2 {
-            self.messages.remove(1);
+            let Some(victim) = self.oldest_removable(1) else {
+                break;
+            };
+            self.remove_message(victim);
             removed += 1;
         }
 
-        // If still over limit with only 2 messages, fall back to removing the first
+        // Still over: give up the tail too, but never the request itself.
         while self.exceeds_hard_limit() && self.messages.len() > 1 {
-            self.messages.remove(0);
+            let Some(victim) = self.oldest_removable(0) else {
+                break;
+            };
+            self.remove_message(victim);
             removed += 1;
         }
 
-        // If still over limit with just 1 message, truncate large content blocks
+        // Whatever survives — the pinned request at minimum — is shrunk in
+        // place. Dropping the request instead would trade message loss for a
+        // model answering a question it can no longer read.
         if self.exceeds_hard_limit() && !self.messages.is_empty() {
             self.truncate_large_content_blocks();
         }
@@ -1141,8 +1524,12 @@ impl AgentContext {
             info!(
                 removed_messages = removed,
                 remaining_messages = self.messages.len(),
-                estimated_tokens = self.estimate_tokens(),
+                request_tokens = self.estimate_request_tokens(),
+                message_tokens = self.estimate_tokens(),
+                preamble_tokens = self.preamble_tokens(),
+                message_budget = self.message_hard_limit(),
                 hard_limit = self.hard_limit,
+                still_over_limit = self.exceeds_hard_limit(),
                 "Truncated context to fit within hard limit"
             );
         }
@@ -1150,26 +1537,70 @@ impl AgentContext {
         removed
     }
 
-    /// Truncate individual content blocks that are too large
+    /// Index of the oldest message that may be removed: the first one that is
+    /// neither the pinned live request nor inside the `keep_tail` most recent
+    /// messages. `None` means nothing is removable.
+    fn oldest_removable(&self, keep_tail: usize) -> Option<usize> {
+        let pinned = self.pinned_index();
+        let cutoff = self.messages.len().saturating_sub(keep_tail);
+        (0..cutoff).find(|&i| i != pinned)
+    }
+
+    /// Remove one message and keep the pin pointing at the same message.
+    fn remove_message(&mut self, index: usize) {
+        if index >= self.messages.len() {
+            return;
+        }
+        self.messages.remove(index);
+        if let Some(pinned) = self.pinned_request {
+            if index < pinned {
+                self.pinned_request = Some(pinned - 1);
+            }
+        }
+    }
+
+    /// Truncate individual content blocks that are too large.
+    ///
+    /// The budget is the room the request actually has for messages — the
+    /// hard limit minus the preamble it will carry, minus the system prompt —
+    /// shared equally by the oversized blocks, rather than a fixed
+    /// 10,000-token deduction that bore no relation to either.
     fn truncate_large_content_blocks(&mut self) {
-        // Target: leave room for output tokens
-        let target_tokens = self.hard_limit.saturating_sub(10_000);
-        let max_block_chars = (target_tokens * 4).max(100); // ~4 chars per token, floor at 100
+        let budget_chars = Self::chars_for_tokens(
+            self.message_hard_limit()
+                .saturating_sub(estimate_tokens(&self.system_prompt)),
+        );
+        // Floor at 100 chars: below that the truncation marker is longer than
+        // what it replaces and truncation stops buying anything.
+        const MIN_BLOCK_CHARS: usize = 100;
+        let oversized = self
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content.len() > MIN_BLOCK_CHARS,
+                ContentBlock::Text { text } => text.len() > MIN_BLOCK_CHARS,
+                _ => false,
+            })
+            .count()
+            .max(1);
+        let max_block_chars = (budget_chars / oversized).max(MIN_BLOCK_CHARS);
 
         for msg in &mut self.messages {
             for block in &mut msg.content {
                 match block {
                     ContentBlock::ToolResult { content, .. } => {
                         if content.len() > max_block_chars {
+                            let original_len = content.len();
                             let end = content.floor_char_boundary(max_block_chars.min(content.len()));
                             let truncated = &content[..end];
                             *content = format!(
                                 "{}\n\n[... truncated {} chars to fit context limit ...]",
                                 truncated,
-                                content.len() - truncated.len()
+                                original_len - truncated.len()
                             );
                             info!(
-                                original_len = content.len(),
+                                original_len,
                                 truncated_to = max_block_chars,
                                 "Truncated large tool result"
                             );
@@ -1177,12 +1608,13 @@ impl AgentContext {
                     }
                     ContentBlock::Text { text } => {
                         if text.len() > max_block_chars {
+                            let original_len = text.len();
                             let end = text.floor_char_boundary(max_block_chars.min(text.len()));
                             let truncated = &text[..end];
                             *text = format!(
                                 "{}\n\n[... truncated {} chars to fit context limit ...]",
                                 truncated,
-                                text.len() - truncated.len()
+                                original_len - truncated.len()
                             );
                         }
                     }
@@ -1213,7 +1645,10 @@ impl AgentContext {
         // Try compression first if over threshold
         if self.needs_compression() && self.messages.len() > 10 {
             info!(
-                estimated_tokens = self.estimate_tokens(),
+                request_tokens = self.estimate_request_tokens(),
+                message_tokens = self.estimate_tokens(),
+                preamble_tokens = self.preamble_tokens(),
+                message_budget = self.message_compression_threshold(),
                 compression_threshold = self.compression_threshold,
                 "Context exceeds compression threshold, compressing"
             );
@@ -1277,13 +1712,35 @@ impl AgentContext {
         while over_target(self) && iterations < config.max_iterations {
             iterations += 1;
 
-            let current_tokens = self.estimate_tokens();
+            // Report the quantity the predicate actually tested: the message
+            // side against a preamble-deducted budget, with the parts beside
+            // it. Printing the message estimate against the raw limit made
+            // 149 of 166 warnings announce a number BELOW the limit they
+            // claimed was exceeded.
+            let message_budget = match target {
+                SummarizationTarget::CompressionThreshold => {
+                    self.message_compression_threshold()
+                }
+                SummarizationTarget::HardLimit => self.message_hard_limit(),
+            };
             info!(
                 iteration = iterations,
-                current_tokens = current_tokens,
+                request_tokens = self.estimate_request_tokens(),
+                message_tokens = self.estimate_tokens(),
+                preamble_tokens = self.preamble_tokens(),
+                message_budget,
                 hard_limit = self.hard_limit,
                 "Context exceeds limit, summarizing"
             );
+
+            // The preamble is the one part of the request no message-side
+            // lever can reach, and it only ever grows. When it has taken the
+            // room the messages need, shrink IT — refusing here rather than
+            // letting the pass fall through to destroying real history.
+            let preamble_shrunk = self.compact_preamble(config).await;
+            if preamble_shrunk && !over_target(self) {
+                break;
+            }
 
             // Find content to summarize (oldest messages first, keeping most recent)
             let (content_to_summarize, covered_ends) =
@@ -1335,20 +1792,43 @@ impl AgentContext {
                         break;
                     }
 
+                    let before = self.estimate_request_tokens();
+                    let removed = self.replace_with_summary(covered_messages, &summary);
+                    let after = self.estimate_request_tokens();
+
+                    if removed == 0 {
+                        // Everything the summarizer read is pinned or inside
+                        // the reserved tail. Another pass would extract the
+                        // same content and reach the same verdict, so say so
+                        // and stop rather than logging a completion the exit
+                        // condition never tested.
+                        warn!(
+                            covered_messages,
+                            "summarized content is all pinned or reserved; \
+                             nothing could be replaced"
+                        );
+                        self.push_summarization_failure_notice(
+                            0,
+                            "the summarized messages were all pinned or reserved",
+                        );
+                        break;
+                    }
+
                     info!(
                         extracted_len = content_to_summarize.len(),
                         summarized_len = consumed,
                         covered_messages,
+                        removed_messages = removed,
                         summary_len = summary.len(),
+                        request_tokens_before = before,
+                        request_tokens_after = after,
+                        request_tokens_saved = before.saturating_sub(after),
                         compression = format!(
                             "{:.1}x",
                             consumed as f64 / summary.len().max(1) as f64
                         ),
                         "Content summarized successfully"
                     );
-
-                    // Replace the summarized content with the summary
-                    self.replace_with_summary(covered_messages, &summary);
                 }
                 Err(e) => {
                     warn!(error = %e, "All summarization models failed, truncating");
@@ -1389,6 +1869,13 @@ impl AgentContext {
     /// what actually got summarized is a PREFIX of this content — not all of
     /// it, and not a whole number of messages unless someone checks. Knowing
     /// where each message ended lets the caller drop exactly the covered ones.
+    ///
+    /// The pinned live request is skipped: it is never removable, so
+    /// summarizing it would spend the summarizer's window on text that stays
+    /// in the request anyway — and would restate the live question in the
+    /// past tense beside itself. `covered_ends[i]` therefore indexes the i-th
+    /// REMOVABLE message, which is exactly what [`Self::replace_with_summary`]
+    /// removes.
     fn extract_content_for_summarization(&self, max_chars: usize) -> (String, Vec<usize>) {
         let mut content = String::new();
         let mut chars_collected = 0;
@@ -1401,7 +1888,11 @@ impl AgentContext {
             return (String::new(), covered_ends); // Not enough messages to summarize
         };
 
-        for msg in messages_to_consider {
+        let pinned = self.pinned_index();
+        for (idx, msg) in messages_to_consider.iter().enumerate() {
+            if idx == pinned {
+                continue;
+            }
             for block in &msg.content {
                 let block_text = match block {
                     ContentBlock::Text { text } => text.clone(),
@@ -1725,17 +2216,28 @@ impl AgentContext {
     /// of the removed history was never summarized at all. It vanished, and
     /// the compression ratio logged against the pre-truncation length made it
     /// look like a triumph.
-    fn replace_with_summary(&mut self, covered_messages: usize, summary: &str) {
-        // Never take the last 2 (live user query + in-flight response), and
-        // never take more than the summarizer actually read.
+    ///
+    /// Returns the number of messages actually removed, so a pass that
+    /// removed nothing is reported as removing nothing instead of logging a
+    /// completion the exit condition never tested.
+    fn replace_with_summary(&mut self, covered_messages: usize, summary: &str) -> usize {
+        // Never take the last 2 (live user query + in-flight response), never
+        // take the pinned live request, and never take more than the
+        // summarizer actually read. `covered_messages` counts REMOVABLE
+        // messages, matching what extraction walked.
         let keep_count = 2.min(self.messages.len());
-        let removable = self.messages.len().saturating_sub(keep_count);
-        let remove_count = covered_messages.min(removable);
+        let cutoff = self.messages.len().saturating_sub(keep_count);
+        let pinned = self.pinned_index();
+        let victims: Vec<usize> = (0..cutoff)
+            .filter(|&i| i != pinned)
+            .take(covered_messages)
+            .collect();
+        let remove_count = victims.len();
 
         if remove_count > 0 {
             // Use CDC to hash content blocks from messages being removed
             let mut new_chunk_hashes = 0;
-            for msg in &self.messages[..remove_count] {
+            for msg in victims.iter().filter_map(|&i| self.messages.get(i)) {
                 for block in &msg.content {
                     let text = match block {
                         ContentBlock::Text { text } => text,
@@ -1773,52 +2275,53 @@ impl AgentContext {
 
             self.consolidated_summary = Some(new_consolidated.clone());
 
-            // Also store in summaries for history tracking
-            self.summaries.push(ContextSummary {
-                summary: summary.to_string(),
-                messages_compressed: remove_count,
-                tokens_saved: self.estimate_tokens(), // Approximate
-                created_at: chrono_timestamp(),
-            });
-
-            // Remove the old messages
-            self.messages.drain(0..remove_count);
+            // Remove the summarized messages, highest index first so the
+            // earlier positions stay valid.
+            for &idx in victims.iter().rev() {
+                self.remove_message(idx);
+            }
 
             info!(
                 removed_messages = remove_count,
                 remaining_messages = self.messages.len(),
                 consolidated_summary_len = new_consolidated.len(),
+                request_tokens = self.estimate_request_tokens(),
+                message_tokens = self.estimate_tokens(),
+                preamble_tokens = self.preamble_tokens(),
+                message_budget = self.message_hard_limit(),
                 new_chunk_hashes = new_chunk_hashes,
                 total_chunk_hashes = self.summarized_content_hashes.len(),
                 "Updated consolidated summary with CDC deduplication"
             );
         }
+
+        remove_count
     }
 
     /// Drop oldest messages (no LLM required) as a fallback compression strategy.
     ///
-    /// Keeps the first user message (original request) and the most recent
-    /// `keep_recent` messages, dropping everything in between.
+    /// Keeps the pinned live request and the most recent `keep_recent`
+    /// messages, dropping everything in between.
     /// Adds a note to `consolidated_summary` about what was dropped.
     /// Returns the number of messages dropped.
     pub fn drop_oldest(&mut self, keep_recent: usize) -> usize {
-        // +1 for the pinned first message
+        // +1 for the pinned live request
         if self.messages.len() <= keep_recent + 1 {
             return 0;
         }
 
-        // Preserve first message (the original user request) by only dropping from index 1+
-        let droppable = &self.messages[1..]; // everything after the first message
-
-        let drop_count = if droppable.len() > keep_recent {
-            droppable.len() - keep_recent
-        } else {
+        // Everything except the pinned live request and the recent tail.
+        let pinned = self.pinned_index();
+        let cutoff = self.messages.len().saturating_sub(keep_recent);
+        let victims: Vec<usize> = (0..cutoff).filter(|&i| i != pinned).collect();
+        let drop_count = victims.len();
+        if drop_count == 0 {
             return 0;
-        };
+        }
 
-        // Build a brief summary of what's being dropped (from index 1..1+drop_count)
+        // Build a brief summary of what's being dropped
         let mut dropped_summary_parts = Vec::new();
-        for msg in &self.messages[1..1 + drop_count] {
+        for msg in victims.iter().filter_map(|&i| self.messages.get(i)) {
             let role = &msg.role;
             for block in &msg.content {
                 match block {
@@ -1860,13 +2363,19 @@ impl AgentContext {
         };
         self.consolidated_summary = Some(new_summary);
 
-        // Actually remove (from index 1, preserving the pinned first message)
-        self.messages.drain(1..1 + drop_count);
+        // Actually remove, highest index first so earlier positions stay
+        // valid; the pinned live request is not in the victim list.
+        for &idx in victims.iter().rev() {
+            self.remove_message(idx);
+        }
 
         info!(
             dropped = drop_count,
             remaining = self.messages.len(),
-            estimated_tokens = self.estimate_tokens(),
+            request_tokens = self.estimate_request_tokens(),
+            message_tokens = self.estimate_tokens(),
+            preamble_tokens = self.preamble_tokens(),
+            message_budget = self.message_hard_limit(),
             "Dropped oldest messages (no-LLM fallback)"
         );
 
@@ -1878,7 +2387,8 @@ impl AgentContext {
     /// Walks messages older than `keep_recent`, scores each large
     /// [`ContentBlock::ToolResult`] with the summarization-model priority list
     /// via `compress_with`, and rewrites the block in place when compression
-    /// actually shrinks content. Pinned first message is never touched.
+    /// actually shrinks content. The pinned live request is never touched,
+    /// and neither is a slot an earlier pass already compressed.
     /// Returns the number of tool results rewritten.
     pub async fn compress_older_tool_results<F, Fut>(
         &mut self,
@@ -1893,23 +2403,33 @@ impl AgentContext {
         if self.messages.len() <= keep_recent + 1 {
             return 0;
         }
-        // Preserve index 0 (pinned original request) and the most recent `keep_recent`.
+        // Preserve the pinned live request and the most recent `keep_recent`.
         let end = self.messages.len().saturating_sub(keep_recent);
         if end <= 1 {
             return 0;
         }
+        let pinned = self.pinned_index();
 
         // Collect candidates first so we can drop the exclusive borrow before any await.
         let mut candidates: Vec<(usize, usize, String)> = Vec::new();
-        for (msg_idx, msg) in self.messages[1..end].iter().enumerate() {
-            let absolute = msg_idx + 1;
+        for (msg_idx, msg) in self.messages[..end].iter().enumerate() {
+            if msg_idx == pinned {
+                continue;
+            }
             for (block_idx, block) in msg.content.iter().enumerate() {
                 if let ContentBlock::ToolResult { content, is_error, .. } = block {
                     if is_error.unwrap_or(false) {
                         continue; // keep errors verbatim
                     }
+                    // A slot this pass already compressed carries its own
+                    // banner. Re-compressing it shrinks nothing (the banner
+                    // is ~380 chars of explanation) and re-frames a note as
+                    // if it were the tool's output.
+                    if content.starts_with(COMPRESSED_RESULT_BANNER) {
+                        continue;
+                    }
                     if content.len() >= min_chars {
-                        candidates.push((absolute, block_idx, content.clone()));
+                        candidates.push((msg_idx, block_idx, content.clone()));
                     }
                 }
             }
@@ -1937,7 +2457,7 @@ impl AgentContext {
                     // itself is context savings; one that doesn't is a
                     // hallucination seed.
                     *slot = format!(
-                        "[COMPRESSED SUMMARY of an older tool result ({original_len} chars \
+                        "{COMPRESSED_RESULT_BANNER} ({original_len} chars \
                          original). WHY: your context window is limited, and this older \
                          result was shortened to make room for current work — the tool call \
                          itself SUCCEEDED in full. The wording below is lossy shorthand, NOT \
@@ -1958,7 +2478,10 @@ impl AgentContext {
         if compressed_count > 0 {
             info!(
                 compressed = compressed_count,
-                estimated_tokens = self.estimate_tokens(),
+                request_tokens = self.estimate_request_tokens(),
+                message_tokens = self.estimate_tokens(),
+                preamble_tokens = self.preamble_tokens(),
+                message_budget = self.message_hard_limit(),
                 "LLMLingua selective older-context compression complete"
             );
         }
@@ -1988,14 +2511,16 @@ impl AgentContext {
         }
 
         // Split messages into old (to compress) and recent (to keep).
-        // Always preserve the first message (original user request) — start compressing from index 1.
+        // The pinned live request is never compressed away.
         let split_point = self.messages.len() - keep_recent;
-        let compress_start = 1.min(split_point); // skip index 0 (pinned first message)
-        let old_messages = &self.messages[compress_start..split_point];
+        let pinned = self.pinned_index();
+        let old_indices: Vec<usize> = (0..split_point).filter(|&i| i != pinned).collect();
+        let old_messages: Vec<&AnthropicMessage> =
+            old_indices.iter().filter_map(|&i| self.messages.get(i)).collect();
 
         // Build a text representation of old messages
         let mut conversation_text = String::new();
-        for msg in old_messages {
+        for msg in &old_messages {
             let role = &msg.role;
             for block in &msg.content {
                 match block {
@@ -2077,36 +2602,48 @@ Provide a concise summary (2-4 paragraphs max):"#,
             created_at: chrono_timestamp(),
         };
 
-        // Store summary and remove old compressed messages (preserve first message)
-        self.summaries.push(summary.clone());
-        let mut kept = vec![self.messages[0].clone()]; // pin first message
+        // Remove the compressed messages, keeping the pinned live request.
+        // The summary text goes to the ONE slot a request carries — a second
+        // stored copy would be charged to the budget and never sent.
+        let removed_before_pin = old_indices.iter().filter(|&&i| i < pinned).count();
+        let mut kept: Vec<AnthropicMessage> = self.messages[..split_point]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i == pinned)
+            .map(|(_, m)| m.clone())
+            .collect();
         kept.extend(self.messages.split_off(split_point));
         self.messages = kept;
+        self.shift_pin_after_removal(removed_before_pin);
+        self.consolidated_summary = Some(match self.consolidated_summary.take() {
+            Some(existing) => format!(
+                "{existing}\n\n---\n\n[Additional context from {} more messages:]\n{}",
+                summary.messages_compressed, summary.summary
+            ),
+            None => summary.summary.clone(),
+        });
 
         Ok(summary)
     }
 
-    /// Get combined context including summaries for building prompts
+    /// Get the compressed-history preface for building prompts.
     #[must_use]
     pub fn get_full_context(&self) -> String {
-        let mut context = String::new();
-
-        // Add summaries first (older context)
-        if !self.summaries.is_empty() {
-            context.push_str("## Previous Conversation Summary\n");
-            for summary in &self.summaries {
-                context.push_str(&summary.summary);
-                context.push_str("\n\n");
-            }
-            context.push_str("---\n\n## Current Conversation\n");
-        }
-
-        context
+        let Some(ref summary) = self.consolidated_summary else {
+            return String::new();
+        };
+        format!("## Previous Conversation Summary\n{summary}\n\n---\n\n## Current Conversation\n")
     }
 
+    /// Enforce `max_messages` by dropping the oldest — never the pinned live
+    /// request. A message-count cap that can delete the question being
+    /// answered is not a cap, it is a different failure.
     fn trim_if_needed(&mut self) {
         while self.messages.len() > self.max_messages {
-            self.messages.remove(0);
+            let Some(victim) = self.oldest_removable(0) else {
+                break;
+            };
+            self.remove_message(victim);
         }
     }
 }
@@ -2152,17 +2689,25 @@ mod tests {
             ctx.messages.push(AnthropicMessage::user_text(format!("message {i}")));
         }
 
-        // Everything except the reserved last two is offered up...
+        // Everything except the reserved last two and the pinned request is
+        // offered up...
         let (content, covered_ends) = ctx.extract_content_for_summarization(usize::MAX);
-        assert_eq!(covered_ends.len(), 8, "10 messages, last 2 always reserved");
+        assert_eq!(
+            covered_ends.len(),
+            7,
+            "10 messages, last 2 reserved, the pinned request never offered"
+        );
         assert!(!content.is_empty());
 
-        // ...but suppose the summarizer's window only reached message 3.
+        // ...but suppose the summarizer's window only reached the third of them.
         let consumed = covered_ends[2];
         let covered = covered_ends.iter().take_while(|&&e| e <= consumed).count();
         assert_eq!(covered, 3);
 
-        ctx.replace_with_summary(covered, "summary of the first three");
+        assert_eq!(
+            ctx.replace_with_summary(covered, "summary of the first three"),
+            3
+        );
         assert_eq!(
             ctx.messages.len(),
             7,
@@ -2171,9 +2716,16 @@ mod tests {
         assert!(
             ctx.messages.iter().any(|m| m.content.iter().any(|b| matches!(
                 b,
-                ContentBlock::Text { text } if text.contains("message 3")
+                ContentBlock::Text { text } if text.contains("message 4")
             ))),
             "an unsummarized message must not be deleted"
+        );
+        assert!(
+            ctx.messages.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == "message 0"
+            ))),
+            "the pinned request is never summarized away"
         );
     }
 
@@ -2700,6 +3252,29 @@ mod tests {
         assert_eq!(ctx.growth.max_observed_growth, 0);
     }
 
+    /// Contexts stored while the never-sent `summaries` vector still existed
+    /// must still load — the field is simply ignored now.
+    #[test]
+    fn contexts_stored_with_the_old_summaries_vector_still_load() {
+        let json = serde_json::json!({
+            "session_id": "s1",
+            "system_prompt": "",
+            "messages": [],
+            "metadata": {},
+            "max_messages": 100,
+            "summaries": [{
+                "summary": "an old stored summary",
+                "messages_compressed": 4,
+                "tokens_saved": 100,
+                "created_at": 1_700_000_000i64,
+            }],
+        });
+        let ctx: AgentContext =
+            serde_json::from_value(json).expect("pre-P24 contexts must load");
+        assert!(ctx.consolidated_summary.is_none());
+        assert_eq!(ctx.estimate_request_tokens(), 0, "nothing to send, nothing charged");
+    }
+
     // -----------------------------------------------------------------
     // P22 Tier 2 — failed summarization announces itself
     // -----------------------------------------------------------------
@@ -2783,6 +3358,290 @@ mod tests {
         assert!(
             !summary.contains('—'),
             "a char the limit splits is dropped, never half-copied"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P24.6 — the window is budgeted for what the request actually carries
+    // -----------------------------------------------------------------
+
+    /// Concatenated text of the request this context would send.
+    fn assembled_request_text(ctx: &AgentContext) -> String {
+        ctx.messages_for_request()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The double charge: summarization pushed its output into a `summaries`
+    /// vector as well as `consolidated_summary`, and `estimate_tokens` charged
+    /// that vector while no request ever carried it. Measured live: 4,767
+    /// estimated tokens against a 12,288 hard limit with one message left,
+    /// ~4,200 of them text no model ever sees — which is what forced the
+    /// observed truncations.
+    #[test]
+    fn the_estimate_only_charges_text_the_request_carries() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        for i in 0..4 {
+            ctx.messages
+                .push(AnthropicMessage::assistant_text(format!("turn {i}")));
+        }
+        let summary = "a summary sentence about earlier work. ".repeat(100);
+        assert_eq!(ctx.replace_with_summary(2, &summary), 2);
+
+        let sent = assembled_request_text(&ctx);
+        assert!(
+            sent.contains(summary.trim()),
+            "the one copy of the summary is the copy that is sent"
+        );
+        assert!(
+            ctx.estimate_request_tokens() <= estimate_tokens(&sent) + 32,
+            "the estimate ({}) must not exceed what the request carries ({})",
+            ctx.estimate_request_tokens(),
+            estimate_tokens(&sent)
+        );
+    }
+
+    /// The inverted gates: the gentle rung measured the MESSAGE side against
+    /// the raw threshold while the aggressive rung measured the REQUEST side
+    /// against the hard limit, so a grown preamble could put the context over
+    /// the aggressive rung in a state where the gentle rung's predicate was
+    /// structurally false — 94 of 166 observed aggressive firings.
+    #[test]
+    fn the_aggressive_tier_never_fires_while_the_gentle_one_is_structurally_quiet() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.compression_threshold = 2_000;
+        ctx.hard_limit = 3_000;
+        ctx.messages
+            .push(AnthropicMessage::user_text("the request"));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("x".repeat(6_000)));
+        // A preamble that has taken most of the window all by itself.
+        ctx.consolidated_summary = Some("s".repeat(7_000));
+
+        // The state that used to invert the ladder: the messages alone are
+        // under the RAW compression threshold, so gating them against it
+        // said "quiet" — while the request as a whole was over the hard limit.
+        assert!(
+            ctx.estimate_tokens() < ctx.compression_threshold,
+            "the message side alone stays under the raw threshold ({} vs {})",
+            ctx.estimate_tokens(),
+            ctx.compression_threshold
+        );
+        assert!(ctx.exceeds_hard_limit(), "the aggressive rung fires here");
+        assert!(
+            ctx.needs_compression(),
+            "the gentler rung cannot be unreachable while the aggressive one fires"
+        );
+        assert!(
+            ctx.message_compression_threshold() <= ctx.message_hard_limit(),
+            "the rungs are ordered by construction for every preamble size"
+        );
+    }
+
+    /// The preamble had no reduction path: it only ever grew (1,182 → 21,209
+    /// chars in one 22-minute stretch, 54% of the window), so every
+    /// message-side lever eventually had nothing left to give and truncation
+    /// deleted the request itself. Refusal now routes through the preamble.
+    #[test]
+    fn a_ratcheted_preamble_gives_before_the_conversation_does() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.hard_limit = 3_000;
+        ctx.compression_threshold = 2_000;
+        ctx.messages
+            .push(AnthropicMessage::user_text("fix the failing test"));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("working on it"));
+        // One measured interval of growth: 500 tokens.
+        ctx.growth.rebaseline(100);
+        ctx.growth.observe(600);
+        ctx.consolidated_summary = Some("earlier summary. ".repeat(1_000));
+
+        assert!(ctx.preamble_starved());
+        let before = ctx.messages.len();
+        assert_eq!(
+            ctx.truncate_to_limit(),
+            0,
+            "the preamble gives, not the conversation"
+        );
+        assert_eq!(ctx.messages.len(), before);
+        let summary = ctx.consolidated_summary.as_deref().expect("summary kept");
+        assert!(summary.contains("elided to make room"), "{summary}");
+        assert!(summary.contains("SUCCEEDED"), "the elision announces itself");
+        assert!(
+            !ctx.exceeds_hard_limit(),
+            "eliding the preamble is what brings the request under the limit"
+        );
+    }
+
+    /// One pin rule. `drop_oldest` and `compress` honoured a pin on index 0;
+    /// `truncate_to_limit`'s second loop, `replace_with_summary`'s drain, and
+    /// `trim_if_needed` did not — while four comments asserted the pin was
+    /// universal. The message carrying the live request survives every path.
+    #[test]
+    fn the_live_request_survives_every_cut_path() {
+        const REQUEST: &str = "THE LIVE REQUEST: fix the failing test";
+        fn still_there(ctx: &AgentContext) -> bool {
+            ctx.messages.iter().any(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains(REQUEST)),
+                )
+            })
+        }
+
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..6 {
+            ctx.messages
+                .push(AnthropicMessage::assistant_text(format!("old turn {i}")));
+        }
+        ctx.messages.push(AnthropicMessage::user_text(REQUEST));
+        ctx.pin_live_request();
+        for i in 0..6 {
+            ctx.messages
+                .push(AnthropicMessage::assistant_text(format!("later turn {i}")));
+        }
+
+        ctx.replace_with_summary(4, "a summary of early work");
+        assert!(still_there(&ctx), "summarization replacement dropped it");
+        ctx.drop_oldest(2);
+        assert!(still_there(&ctx), "the no-LLM drop dropped it");
+        ctx.max_messages = 2;
+        ctx.add_assistant_message("one more turn");
+        assert!(still_there(&ctx), "the message-count cap dropped it");
+        ctx.hard_limit = 40;
+        ctx.truncate_to_limit();
+        assert!(still_there(&ctx), "hard-limit truncation dropped it");
+        assert_eq!(
+            ctx.pinned_index(),
+            ctx.messages
+                .iter()
+                .position(|m| m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains(REQUEST))
+                ))
+                .expect("present"),
+            "the pin follows the message it names through every cut"
+        );
+    }
+
+    /// Every cut removes a prefix, so the reachable orphan is a leading
+    /// `tool_result` whose `tool_use` went with the messages before it. The
+    /// local server tolerates it; every other provider rejects the whole
+    /// request. Repair keeps the output and drops only the block type.
+    #[test]
+    fn a_tool_result_whose_call_was_cut_is_repaired_not_sent_as_an_orphan() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::tool_result(
+            "toolu_1",
+            "the output that survived",
+            false,
+        ));
+        ctx.messages
+            .push(AnthropicMessage::assistant_text("continuing"));
+
+        let request = ctx.messages_for_request();
+        assert!(
+            !request
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+            "an orphaned tool_result fails the whole request on every non-local provider"
+        );
+        let text = assembled_request_text(&ctx);
+        assert!(
+            text.contains("the output that survived"),
+            "the output itself is kept verbatim: {text}"
+        );
+        assert!(text.contains("compressed out of this context"), "{text}");
+    }
+
+    /// A matched pair is left exactly as it is — repair must not fire on
+    /// healthy history.
+    #[test]
+    fn a_matched_tool_pair_is_left_alone() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::tool_use(
+            "toolu_1",
+            "read_file",
+            serde_json::json!({"path": "a.txt"}),
+        ));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("toolu_1", "contents", false));
+
+        let request = ctx.messages_for_request();
+        assert!(
+            request
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+            "a call that is still present keeps its result a tool_result"
+        );
+    }
+
+    /// Zero reduction is reported as zero reduction: a pass whose covered
+    /// messages are all pinned or reserved must not report a completion the
+    /// exit condition never tested.
+    #[test]
+    fn a_pass_that_replaced_nothing_reports_replacing_nothing() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        ctx.pin_live_request();
+        ctx.messages.push(AnthropicMessage::assistant_text("tail"));
+
+        assert_eq!(ctx.replace_with_summary(3, "a summary"), 0);
+        assert_eq!(ctx.messages.len(), 2);
+        assert!(
+            ctx.consolidated_summary.is_none(),
+            "no summary is recorded for a pass that replaced nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P24.15 — a compressed slot is not compressed again
+    // -----------------------------------------------------------------
+
+    /// The banner is ~380 chars of explanation. Re-compressing a slot that
+    /// already carries one shrinks nothing and re-frames a bookkeeping note
+    /// as if it were the tool's output — and it spends a round-trip to do it.
+    #[tokio::test]
+    async fn an_already_compressed_result_is_not_compressed_again() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("t1", "x".repeat(2_000), false));
+        for i in 0..3 {
+            ctx.messages
+                .push(AnthropicMessage::assistant_text(format!("recent {i}")));
+        }
+
+        let calls = std::cell::Cell::new(0usize);
+        let shrink = |content: String| {
+            calls.set(calls.get() + 1);
+            async move { Some(format!("summary of {} chars", content.len())) }
+        };
+
+        assert_eq!(ctx.compress_older_tool_results(2, 100, shrink).await, 1);
+        assert_eq!(calls.get(), 1);
+
+        let shrink_again = |content: String| {
+            calls.set(calls.get() + 1);
+            async move { Some(format!("summary of {} chars", content.len())) }
+        };
+        assert_eq!(
+            ctx.compress_older_tool_results(2, 100, shrink_again).await,
+            0,
+            "a pass must not re-compress its own banner"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "and must not spend a round-trip discovering that"
         );
     }
 }

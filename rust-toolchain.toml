@@ -12,13 +12,24 @@
 #   while a cached rlib existed, so "the pin built fine yesterday" proves nothing after
 #   any bump that dirties turso_core.
 #
-# This channel (rustc 1.99.0-nightly, commit 11177f223) builds `cargo build --release
-# -p nanna-daemon` green — verified cold-ish in 15m06s on 2026-08-14 — with no tokio ICE
-# and no turso depth overflow.
+# This channel (rustc 1.100.0-nightly, commit bff8e12ff) builds `cargo build --release
+# -p nanna-daemon` green — verified in 20m08s on 2026-08-27, from a cold target dir —
+# with no tokio ICE and no turso depth overflow.
+#
+# Future-incompatible warnings under this channel, and what they are NOT:
+# - `attribute-derive-macro 0.10.5` — "trailing semicolon in macro used in expression
+#   position" (rust#79813). It is FIVE levels down a rustpython chain
+#   (rustpython-pylib → …-codegen → …-ruff_python_ast → get-size2 → get-size-derive2 →
+#   attribute-derive), so there is nothing to fix at this end and no version of ours to
+#   bump. A warning, not an error; recorded so a future run does not mistake it for new
+#   breakage in our own code.
+# - The previous pin's `recursion_depth_exceeding_limit` (rust#159228) is already
+#   answered by `#![recursion_limit = "256"]` on the daemon crate roots.
 #
 # On each dependency-freshness pass: try the current nightly with a full
 # `cargo build --release -p nanna-daemon`; if green, move this pin (and the mirrored
-# `toolchain:` inputs in .github/workflows/{budget-gate,test-compile}.yml) forward to it.
+# `toolchain:` inputs in .github/workflows/{budget-gate,release-check,test-compile}.yml —
+# release-check was missing from this list until 2026-08-26) forward to it.
 [toolchain]
-channel = "nightly-2026-08-03"
+channel = "nightly-2026-08-27"
 components = ["rustfmt", "clippy"]

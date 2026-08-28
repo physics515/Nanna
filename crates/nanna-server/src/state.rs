@@ -36,9 +36,16 @@ pub struct AppState {
     pub llm: Arc<LlmClient>,
     pub tools: Arc<ToolRegistry>,
     pub agents: Arc<RwLock<HashMap<String, Arc<RwLock<Agent>>>>>,
+    /// Shared secret the generic webhook requires (`server.webhook_secret`).
     pub webhook_secret: Option<String>,
     pub discord_public_key: Option<String>,
     pub slack_signing_secret: Option<String>,
+    /// Secret token given to Telegram's `setWebhook`, echoed on every POST as
+    /// `X-Telegram-Bot-Api-Secret-Token`. The only origin proof that route has.
+    pub telegram_webhook_secret: Option<String>,
+    /// Shared secret the signal-cli-rest-api bridge must present. That bridge
+    /// does not sign its callbacks, so this is the strongest proof available.
+    pub signal_webhook_secret: Option<String>,
     pub default_model: String,
     /// Telegram channel for proactive sends
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -64,6 +71,8 @@ pub struct AppStateBuilder {
     webhook_secret: Option<String>,
     discord_public_key: Option<String>,
     slack_signing_secret: Option<String>,
+    telegram_webhook_secret: Option<String>,
+    signal_webhook_secret: Option<String>,
     default_model: String,
     telegram_token: Option<String>,
     discord_bot_token: Option<String>,
@@ -90,9 +99,11 @@ impl AppStateBuilder {
             embed: None,
             tools: None,
             webhook_secret: None,
+            telegram_webhook_secret: None,
+            signal_webhook_secret: None,
             discord_public_key: None,
             slack_signing_secret: None,
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-5".to_string(),
             telegram_token: None,
             discord_bot_token: None,
             discord_app_id: None,
@@ -163,6 +174,22 @@ impl AppStateBuilder {
     #[must_use]
     pub fn slack_signing_secret(mut self, secret: Option<String>) -> Self {
         self.slack_signing_secret = secret;
+        self
+    }
+
+    /// Set the Telegram `setWebhook` secret token. Without it the Telegram
+    /// webhook refuses to serve.
+    #[must_use]
+    pub fn telegram_webhook_secret(mut self, secret: Option<String>) -> Self {
+        self.telegram_webhook_secret = secret;
+        self
+    }
+
+    /// Set the shared secret the Signal bridge must present. Without it the
+    /// Signal webhook refuses to serve.
+    #[must_use]
+    pub fn signal_webhook_secret(mut self, secret: Option<String>) -> Self {
+        self.signal_webhook_secret = secret;
         self
     }
 
@@ -284,6 +311,8 @@ impl AppStateBuilder {
             tools: self.tools.expect("tools required"),
             agents: Arc::new(RwLock::new(HashMap::new())),
             webhook_secret: self.webhook_secret,
+            telegram_webhook_secret: self.telegram_webhook_secret,
+            signal_webhook_secret: self.signal_webhook_secret,
             discord_public_key: self.discord_public_key,
             slack_signing_secret: self.slack_signing_secret,
             default_model: self.default_model,

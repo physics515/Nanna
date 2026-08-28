@@ -149,8 +149,16 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Verify Slack signature if signing secret is configured
-    if let Some(ref signing_secret) = state.slack_signing_secret {
+    // Fail closed: without the signing secret every POST here is anonymous.
+    let Some(signing_secret) =
+        crate::webhooks::auth::configured(state.slack_signing_secret.as_ref())
+    else {
+        return Err(crate::webhooks::auth::refuse_unconfigured(
+            "Slack",
+            "channels.slack.signing_secret",
+        ));
+    };
+    {
         let signature = headers
             .get("X-Slack-Signature")
             .and_then(|v| v.to_str().ok())
@@ -173,8 +181,6 @@ pub async fn handle(
         }
 
         debug!("Slack signature verified successfully");
-    } else {
-        warn!("Slack signing secret not configured - skipping signature verification");
     }
 
     // Parse the body
@@ -294,8 +300,17 @@ pub async fn _handle_slash_command(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SlackResponse>, StatusCode> {
-    // Verify signature
-    if let Some(ref signing_secret) = state.slack_signing_secret {
+    // Verify signature. Fail closed, same as the events endpoint — a slash
+    // command runs the agent just as an event does.
+    let Some(signing_secret) =
+        crate::webhooks::auth::configured(state.slack_signing_secret.as_ref())
+    else {
+        return Err(crate::webhooks::auth::refuse_unconfigured(
+            "Slack",
+            "channels.slack.signing_secret",
+        ));
+    };
+    {
         let signature = headers
             .get("X-Slack-Signature")
             .and_then(|v| v.to_str().ok())

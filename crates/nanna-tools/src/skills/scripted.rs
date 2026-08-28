@@ -75,6 +75,13 @@ impl ScriptedToolWrapper {
             tool.timeout_ms = timeout_secs * 1000;
         }
 
+        // The script engine identifies a tool by `ScriptedTool::name`, which
+        // `from_file` can only derive from the file stem — and every skill's
+        // entry point is `tool.ts`, so its logs named nearly every tool `tool`.
+        // The manifest carries the name the model and the user actually call,
+        // and this is the first point where both are known, so bind it here.
+        tool.name = manifest.name.clone();
+
         info!(name = %manifest.name, path = ?path, "Loaded scripted tool");
 
         Ok(Self {
@@ -88,13 +95,17 @@ impl ScriptedToolWrapper {
 
     /// Create from source code directly
     pub fn from_source(name: impl Into<String>, source: impl Into<String>) -> Result<Self, ToolError> {
-        let tool = ScriptedTool::new(name, source);
+        let mut tool = ScriptedTool::new(name, source);
 
         let manifest = extract_manifest(&tool.source).ok_or_else(|| {
             ToolError::InvalidParams(
                 "Script must export default with name and description".to_string()
             )
         })?;
+
+        // Same reason as `from_file`: the caller's label is for the caller, the
+        // manifest name is what everything downstream calls this tool.
+        tool.name = manifest.name.clone();
 
         Ok(Self {
             tool,
@@ -373,6 +384,50 @@ mod tests {
 
         assert_eq!(def.name, "greet");
         assert_eq!(def.description, "Greet someone");
+    }
+
+    #[tokio::test]
+    async fn from_file_names_the_tool_from_its_manifest() {
+        // Every skill's entry point is `tool.ts`, so the file stem the engine
+        // used to log under carried no information at all — one literal `tool`
+        // for nearly every line. The declared name must reach the engine.
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("weather");
+        std::fs::create_dir_all(&skill).unwrap();
+        let path = skill.join("tool.ts");
+        std::fs::write(
+            &path,
+            r#"
+            export default {
+                name: "weather_report",
+                description: "Report the weather",
+                execute() { return "sunny"; }
+            }
+        "#,
+        )
+        .unwrap();
+
+        let wrapper = ScriptedToolWrapper::from_file(&path).await.unwrap();
+        assert_eq!(
+            wrapper.tool.name, "weather_report",
+            "the engine must see the declared name, not the file stem"
+        );
+    }
+
+    #[test]
+    fn from_source_names_the_tool_from_its_manifest() {
+        // The caller's label is just a label; the manifest name is the one the
+        // model calls and the one worth logging.
+        let source = r#"
+            export default {
+                name: "discover_tools",
+                description: "Find tools",
+                execute() { return "[]"; }
+            }
+        "#;
+
+        let wrapper = ScriptedToolWrapper::from_source("some-load-label", source).unwrap();
+        assert_eq!(wrapper.tool.name, "discover_tools");
     }
 
     #[test]

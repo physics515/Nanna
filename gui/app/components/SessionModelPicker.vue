@@ -2,7 +2,6 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { ChevronDown } from 'lucide-vue-next'
 import { modelDisplayName } from '~/lib/modelSpecs'
 import { useSessionState } from '~/composables/useSessionState'
 import { useToast } from '~/composables/useToast'
@@ -153,138 +152,59 @@ onMounted(async () => {
 onUnmounted(() => {
   if (unlistenConfig) unlistenConfig()
 })
+
+/** What the pill's trigger reads: the pin's short name, or the default. */
+const selectLabel = computed(() =>
+  chatModel.value ? modelDisplayName(chatModel.value) : 'Default',
+)
+
+/**
+ * The model this chat's next reply actually resolves against: the pin, or
+ * the head of the priority list. Shown as the full spec — which provider
+ * serves the reply is exactly what the tag is for.
+ */
+const effectiveModel = computed(() => chatModel.value ?? globalDefault.value)
 </script>
 
 <template>
   <div
-    class="chat-model-pill"
-    :class="{ 'chat-model-pill--pinned': isPinned, 'chat-model-pill--pending': isPendingNextTurn }"
+    class="chat-model-pill flex min-w-0 shrink items-center gap-4"
     :title="pillTitle"
   >
-    <span v-if="isPinned" class="chat-model-pill__dot" aria-hidden="true" />
-    <select
-      class="chat-model-pill__select"
-      aria-label="Model for this chat"
-      :value="selectValue"
-      @change="onSelect"
+    <!-- Pin picker: the nui purple pill wrapping the native select.
+         Amber while a mid-turn change waits for the running reply to end. -->
+    <div
+      class="relative flex h-10 w-64 shrink-0 items-center gap-2.5 overflow-clip rounded-lg px-4"
+      :class="isPendingNextTurn ? 'bg-nui-yellow' : 'bg-nui-accent'"
     >
-      <option :value="FOLLOW_GLOBAL">Default (global)</option>
-      <option v-for="option in options" :key="option.spec" :value="option.spec">
-        {{ option.label }}
-      </option>
-    </select>
-    <!-- Reads as text, not decoration: the reply on screen came from the model
-         this chat had when the turn started, and the pick applies after it. -->
-    <span v-if="isPendingNextTurn" class="chat-model-pill__pending">next turn</span>
-    <ChevronDown class="chat-model-pill__chevron" aria-hidden="true" />
+      <span v-if="isPinned" class="h-2 w-2 shrink-0 rounded-full" :class="isPendingNextTurn ? 'bg-nui-bg' : 'bg-nui-fg'" aria-hidden="true" />
+      <p class="min-w-0 flex-1 truncate text-xs leading-normal" :class="isPendingNextTurn ? 'text-nui-bg' : 'text-nui-fg'">
+        {{ selectLabel }}
+      </p>
+      <!-- Reads as text, not decoration: the reply on screen came from the model
+           this chat had when the turn started, and the pick applies after it. -->
+      <span v-if="isPendingNextTurn" class="chat-model-pill__pending whitespace-nowrap text-xs font-semibold text-nui-bg">next turn</span>
+      <NuiIcon name="chevron-down" :size="16" :class="isPendingNextTurn ? 'text-nui-bg' : 'text-nui-fg'" />
+      <select
+        class="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+        aria-label="Model for this chat"
+        :value="selectValue"
+        @change="onSelect"
+      >
+        <option :value="FOLLOW_GLOBAL">Default (global)</option>
+        <option v-for="option in options" :key="option.spec" :value="option.spec">
+          {{ option.label }}
+        </option>
+      </select>
+    </div>
+
+    <!-- The model the next reply actually resolves against (pin or global head). -->
+    <NuiTag
+      v-if="effectiveModel"
+      :label="effectiveModel"
+      color="info"
+      class="min-w-0 shrink"
+    />
   </div>
 </template>
 
-<style scoped>
-/* Sits beside ModelStatusBadge, so it wears the same glass slab. */
-.chat-model-pill {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border-radius: 9999px;
-  padding: 4px 8px 4px 10px;
-  font-size: 12px;
-  font-weight: 500;
-  background: rgba(30, 41, 59, 0.30);
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  border-left: 1px solid rgba(255, 255, 255, 0.04);
-  border-bottom: 1.5px solid rgba(71, 85, 105, 0.18);
-  border-right: 1px solid rgba(71, 85, 105, 0.10);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
-    0 1.5px 1px -0.5px rgba(0, 0, 0, 0.18),
-    0 3px 8px -3px rgba(0, 0, 0, 0.12);
-  transition: box-shadow 0.2s ease, border-color 0.2s ease;
-}
-.chat-model-pill:hover {
-  border-top-color: rgba(255, 255, 255, 0.10);
-  border-left-color: rgba(255, 255, 255, 0.07);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
-    0 2px 4px -1px rgba(0, 0, 0, 0.20),
-    0 4px 12px -4px rgba(0, 0, 0, 0.15);
-}
-
-/* A pinned chat is the exception, and reads as one. */
-.chat-model-pill--pinned {
-  border-color: rgba(139, 92, 246, 0.30);
-  background: rgba(139, 92, 246, 0.12);
-}
-
-.chat-model-pill__dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #a78bfa;
-  flex-shrink: 0;
-}
-
-.chat-model-pill__select {
-  appearance: none;
-  -webkit-appearance: none;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.95);
-  font: inherit;
-  cursor: pointer;
-  padding: 0 14px 0 0;
-  max-width: 140px;
-  text-overflow: ellipsis;
-}
-.chat-model-pill--pinned .chat-model-pill__select {
-  color: #ddd6fe;
-}
-.chat-model-pill__select:focus-visible {
-  outline: 1px solid rgba(139, 92, 246, 0.6);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-/* The dropdown itself is drawn by the OS, which does not inherit the pill. */
-.chat-model-pill__select option {
-  background: #0f172a;
-  color: #e2e8f0;
-}
-
-/* A change that has not reached the running turn yet. Amber, not violet: it
-   is the same "this is not what you are looking at" note the fallback badge
-   wears, and the pill must not read as settled while it isn't. */
-.chat-model-pill--pending {
-  border-color: rgba(251, 191, 36, 0.30);
-  background: rgba(251, 191, 36, 0.10);
-  /* Room for the tag AND the absolutely-positioned chevron beside it. */
-  padding-right: 20px;
-}
-.chat-model-pill--pending .chat-model-pill__dot {
-  background: #fbbf24;
-}
-.chat-model-pill--pending .chat-model-pill__select {
-  color: #fde68a;
-  padding-right: 0;
-}
-
-.chat-model-pill__pending {
-  flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  color: #fbbf24;
-  white-space: nowrap;
-}
-
-.chat-model-pill__chevron {
-  position: absolute;
-  right: 6px;
-  width: 10px;
-  height: 10px;
-  pointer-events: none;
-  color: rgba(148, 163, 184, 0.7);
-}
-</style>

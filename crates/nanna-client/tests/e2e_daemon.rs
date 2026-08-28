@@ -1,3 +1,12 @@
+// An integration test is its OWN crate root, so the crate-level attribute the
+// six library roots carry does not reach it. This target drives a real daemon,
+// so proving its futures are `Send` walks the same
+// MemoryService -> VectorStore -> CosineSimilaritySearch -> wgpu graph that is
+// deeper than the default limit of 128, and nightly-2026-08-25 makes that the
+// future-incompatible `recursion_depth_exceeding_limit` warning (rust#159228)
+// which is scheduled to become a hard error. Solver depth only.
+#![recursion_limit = "256"]
+
 //! End-to-end daemon tests: start a real daemon, attach a real client over the
 //! WebSocket IPC, and drive it the way the GUI/CLI do.
 //!
@@ -34,7 +43,75 @@ fn free_port() -> u16 {
 struct TestDaemon {
     port: u16,
     _data_dir: tempfile::TempDir,
-    handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+/// Absolute ceiling on the readiness wait.
+///
+/// This is **not** the assertion — [`wait_until_ready`] decides success and
+/// failure by watching the daemon task, not the clock. This only stops a daemon
+/// that has genuinely wedged (deadlocked mid-boot, never binding and never
+/// returning) from hanging CI until the job is killed.
+///
+/// It is therefore sized to be unreachable by scheduling: boot is subsecond in
+/// practice, and two minutes is ~100× that. The previous 10 s *was* the
+/// assertion, and on a machine running the whole workspace's test binaries at
+/// once it fired on a healthy daemon — observed 2026-08-24, all 4 tests failing
+/// a full `cargo test --workspace` and passing 4/4 in 1.54 s alone.
+const READY_HANG_CEILING: Duration = Duration::from_secs(120);
+
+/// How often to re-probe the port while waiting.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait until the daemon's IPC port accepts a connection.
+///
+/// **Watches the daemon, not the clock.** The task is the ground truth: if it
+/// finishes before the port opens, the daemon failed or panicked, and that is
+/// knowable *immediately* and reported with the actual cause — no waiting out a
+/// deadline to conclude something we already knew, and no "within Ns" message
+/// that blames time for a crash.
+///
+/// Distinguishing the two mattered enough to restructure for: a daemon that died
+/// and a daemon that is merely descheduled look identical to a bare timeout, and
+/// collapsing them is what made this suite fail on healthy code under load while
+/// giving a useless message when the code was genuinely broken.
+async fn wait_until_ready(port: u16, handle: &mut tokio::task::JoinHandle<Result<(), String>>) {
+    let started = std::time::Instant::now();
+
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        // Ground truth: the task ended without ever binding the port.
+        if handle.is_finished() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    panic!("daemon on port {port} returned cleanly without ever listening")
+                }
+                Ok(Err(e)) => panic!("daemon on port {port} failed to run: {e}"),
+                Err(join) if join.is_panic() => {
+                    // Resume the panic so the original message and location
+                    // survive, instead of being flattened into "task panicked".
+                    std::panic::resume_unwind(join.into_panic());
+                }
+                Err(join) => panic!("daemon task on port {port} ended: {join}"),
+            }
+        }
+
+        assert!(
+            started.elapsed() < READY_HANG_CEILING,
+            "daemon on port {port} is still running but never bound after {:?} — \
+             this is the hang ceiling, not a latency assertion, so treat it as a \
+             wedged daemon rather than a slow one",
+            READY_HANG_CEILING
+        );
+
+        tokio::time::sleep(READY_POLL_INTERVAL).await;
+    }
 }
 
 impl TestDaemon {
@@ -46,7 +123,7 @@ impl TestDaemon {
         let port = free_port();
         let dir_path = data_dir.path().to_path_buf();
 
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             let mut server = DaemonBuilder::new()
                 .with_host("127.0.0.1")
                 .with_port(port)
@@ -60,45 +137,35 @@ impl TestDaemon {
                 .with_log_level("warn")
                 .build()
                 .await;
-            // A daemon that fails to run makes `wait_until_ready` time out with a
-            // clear message; there is nothing useful to unwrap to here.
-            let _ = server.run().await;
+            // Returning the error rather than discarding it is what lets
+            // `wait_until_ready` say *why* a daemon never came up.
+            server.run().await.map_err(|e| e.to_string())
         });
 
-        let daemon = Self { port, _data_dir: data_dir, handle };
-        daemon.wait_until_ready().await;
-        daemon
+        wait_until_ready(port, &mut handle).await;
+        Self { port, _data_dir: data_dir, handle }
     }
 
     fn url(&self) -> String {
         format!("ws://127.0.0.1:{}", self.port)
     }
 
-    /// Poll the IPC port until it accepts a TCP connection.
-    ///
-    /// Bounded: boot is subsecond in practice, so 10s means something is broken and the
-    /// test should say so rather than hang the suite.
-    async fn wait_until_ready(&self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("daemon did not start listening on port {} within 10s", self.port);
-    }
-
     /// Connect a client with reconnect disabled.
     ///
     /// The reconnect test drives reconnection explicitly; leaving the automatic
     /// machinery on would make it unclear which path a passing assertion exercised.
+    /// These two timeouts are scaffolding for the same reason as
+    /// [`READY_HANG_CEILING`]: nothing here asserts how *fast* the daemon
+    /// answers, only that it answers correctly. They exist so a wedged daemon
+    /// fails the test instead of hanging it, and they are sized to be
+    /// unreachable by scheduling delay on a saturated machine — a local
+    /// round-trip over loopback to an in-process daemon is sub-millisecond.
     async fn connect_client(&self) -> Client {
         Client::connect(ClientConfig {
             url: self.url(),
             auto_reconnect: false,
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(10),
+            connect_timeout: READY_HANG_CEILING,
+            request_timeout: READY_HANG_CEILING,
             ..Default::default()
         })
         .await

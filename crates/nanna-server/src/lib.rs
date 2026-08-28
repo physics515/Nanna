@@ -1,5 +1,12 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
+// Raised for the same reason as `nanna-daemon`'s: proving a future or closure
+// is `Send` walks into wgpu's `Global`/`Hub`/`Registry` graph by way of
+// `CosineSimilaritySearch`, which is deeper than the default limit of 128.
+// nightly-2026-08-25 turned that overflow into the future-incompatible
+// `recursion_depth_exceeding_limit` warning (rust#159228), which is scheduled
+// to become a hard error. Solver depth only — no behaviour, no codegen change.
+#![recursion_limit = "256"]
 
 //! HTTP server for Nanna
 //!
