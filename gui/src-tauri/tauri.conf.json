@@ -63,7 +63,8 @@
       },
       "nsis": {
         "startMenuFolder": "Nanna",
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh"
       }
     },
     "macOS": {
