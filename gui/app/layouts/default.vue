@@ -1,5 +1,10 @@
 <template>
-  <div class="nui-root flex h-screen flex-col overflow-hidden text-xs leading-normal">
+  <!-- The design's 32px window radius, drawn by the shell on a transparent
+       window. Dropped while maximized — a maximized window has no corners. -->
+  <div
+    class="nui-root flex h-screen flex-col overflow-hidden text-xs leading-normal"
+    :class="!isMaximized && 'rounded-[32px]'"
+  >
     <div class="flex min-h-0 w-full flex-1 items-start gap-4">
       <!-- ═══ Main menu rail ═══ -->
       <NuiMainMenu
@@ -243,6 +248,10 @@ const currentTab = ref<Tab>({ type: 'global' })
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 let unlistenCloseRequested: UnlistenFn | null = null
+let unlistenResized: UnlistenFn | null = null
+
+/** Tracked so the shell can drop its corner radius while maximized. */
+const isMaximized = ref(false)
 let unlistenSessionsCleared: UnlistenFn | null = null
 let unlistenSessionRenamed: UnlistenFn | null = null
 let unlistenWorkspacesChanged: UnlistenFn | null = null
@@ -527,6 +536,12 @@ onMounted(async () => {
     event.preventDefault()
     await handleClose()
   })
+  try {
+    isMaximized.value = await appWindow.isMaximized()
+    unlistenResized = await appWindow.onResized(async () => {
+      try { isMaximized.value = await appWindow.isMaximized() } catch { /* browser dev */ }
+    })
+  } catch { /* browser dev — no Tauri window */ }
 
   await loadCloseMode()
   await checkPermission()
@@ -535,6 +550,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenTrayNewChat?.()
   unlistenCloseRequested?.()
+  unlistenResized?.()
   unlistenSessionsCleared?.()
   unlistenSessionRenamed?.()
   unlistenWorkspacesChanged?.()
