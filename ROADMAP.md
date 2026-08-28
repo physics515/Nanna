@@ -2545,6 +2545,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             `webhooks/discord.rs` already notes it in a comment; recorded here so a future run does not
             re-derive it. Interaction webhooks never carry `MESSAGE_REACTION_ADD`, so the
             `link_message_to_session` call Discord makes today can never be consumed.
+      *(2026-08-28, follow-on)* **The other half of the attribution path had the same defect, in a
+      quieter form.** `message_session_map` is what turns a reaction back into a session, and its
+      cap read `map.keys().take(MAX_ENTRIES / 2)` — `HashMap` iteration order, so it discarded
+      **5000 arbitrary links at once**. The message a person was about to react to was exactly as
+      likely to be dropped as one from an hour earlier, which makes the cap smaller without making
+      it more useful. Worse, nothing expired: a link from last week sat there forever pointing at a
+      session whose memories had aged out of the ten-minute window long ago, so the map grew with
+      uptime rather than with traffic.
+      Links now carry their timestamp (`LinkedSession`) and prune by the **same**
+      `FEEDBACK_ATTRIBUTION_WINDOW` the memories use — which is exactly right rather than merely
+      convenient: both are stamped inside one turn, so a link older than the window can only ever
+      resolve to memories that have already expired, and dropping it loses nothing a reaction could
+      have used. The 10 000-link cap survives as a burst backstop, but it now evicts the **oldest**
+      link, one at a time. 2 tests, including one that proves a recent link is not collateral damage
+      when the cap fires.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
       - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
             Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17, corrected off-by-one

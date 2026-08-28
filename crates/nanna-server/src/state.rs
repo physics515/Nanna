@@ -115,6 +115,72 @@ async fn track_memory_in(
     );
 }
 
+/// A message linked to the session whose memories a reaction would credit.
+///
+/// Carries the link time because the map has to be prunable: a bare
+/// `message_id -> session_id` cannot tell a link made a minute ago from one
+/// made last week, which is why the old cap had to evict blindly.
+#[derive(Debug, Clone)]
+pub struct LinkedSession {
+    pub session_id: String,
+    pub linked_at: Instant,
+}
+
+/// Backstop on how many message links are held at once.
+///
+/// As with the memory map, the attribution window is the real bound and this
+/// only covers a burst inside one window. At roughly 128 bytes per link that
+/// is about 1.3 MB — the same order as the memory side, and bounded rather
+/// than open-ended.
+const MAX_LINKED_MESSAGES: usize = 10_000;
+
+/// Link `message_id` to `session_id` so a later reaction can find the right
+/// memories, keeping the map bounded.
+async fn link_message_in(
+    links: &RwLock<HashMap<String, LinkedSession>>,
+    message_id: &str,
+    session_id: &str,
+) {
+    debug_assert!(!message_id.is_empty(), "a link needs a message id");
+    debug_assert!(!session_id.is_empty(), "a link needs a session id");
+
+    let mut links = links.write().await;
+
+    // The same window the memories live in, and for the same reason: both are
+    // stamped inside one turn, so a link older than the window can only ever
+    // resolve to memories that have already expired. Pruning by it loses
+    // nothing a reaction could have used, and it bounds the map by traffic in
+    // a window instead of by uptime.
+    links.retain(|_, link| link.linked_at.elapsed() < FEEDBACK_ATTRIBUTION_WINDOW);
+
+    links.insert(
+        message_id.to_string(),
+        LinkedSession {
+            session_id: session_id.to_string(),
+            linked_at: Instant::now(),
+        },
+    );
+
+    // Backstop for a burst inside one window, evicting the OLDEST link. The
+    // previous cap dropped half the map at once by HashMap iteration order, so
+    // the message a user was about to react to was exactly as likely to be
+    // discarded as one from an hour earlier — a cap that made the map smaller
+    // without making it more useful.
+    while links.len() > MAX_LINKED_MESSAGES {
+        let oldest = links
+            .iter()
+            .min_by_key(|(_, link)| link.linked_at)
+            .map(|(id, _)| id.clone());
+        let Some(oldest) = oldest else { break };
+        links.remove(&oldest);
+    }
+
+    assert!(
+        links.len() <= MAX_LINKED_MESSAGES,
+        "the message-link map must stay bounded"
+    );
+}
+
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
@@ -142,8 +208,8 @@ pub struct AppState {
     pub dreaming: Option<Arc<DreamingRuntime>>,
     /// Scheduler for periodic tasks (heartbeats, consolidation)
     pub scheduler: Option<Arc<RwLock<Scheduler>>>,
-    /// Map message IDs to session IDs for reaction-based feedback
-    pub message_session_map: Arc<RwLock<HashMap<String, String>>>,
+    /// Map message IDs to the session a reaction on them should credit.
+    pub message_session_map: Arc<RwLock<HashMap<String, LinkedSession>>>,
     /// Track recent memory IDs per session (for feedback attribution)
     pub session_recent_memories: Arc<RwLock<HashMap<String, Vec<RecentMemory>>>>,
 }
@@ -693,7 +759,7 @@ impl AppState {
         // Look up the session ID for this message
         let session_id = {
             let map = self.message_session_map.read().await;
-            map.get(message_id).cloned()
+            map.get(message_id).map(|link| link.session_id.clone())
         };
 
         let Some(session_id) = session_id else {
@@ -746,17 +812,7 @@ impl AppState {
 
     /// Associate a message ID with a session for feedback tracking.
     pub async fn link_message_to_session(&self, message_id: &str, session_id: &str) {
-        let mut map = self.message_session_map.write().await;
-        map.insert(message_id.to_string(), session_id.to_string());
-        
-        // Prune old entries if map gets too large
-        const MAX_ENTRIES: usize = 10000;
-        if map.len() > MAX_ENTRIES {
-            let to_remove: Vec<_> = map.keys().take(MAX_ENTRIES / 2).cloned().collect();
-            for key in to_remove {
-                map.remove(&key);
-            }
-        }
+        link_message_in(&self.message_session_map, message_id, session_id).await;
     }
 
     /// Track a memory ID for a session (for feedback attribution).
@@ -854,6 +910,77 @@ mod tests {
                 .map(std::vec::Vec::len)
                 .unwrap_or_default(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_is_dropped_on_write() {
+        let links = RwLock::new(HashMap::new());
+        {
+            let mut map = links.write().await;
+            let stale_at = Instant::now()
+                .checked_sub(FEEDBACK_ATTRIBUTION_WINDOW + Duration::from_secs(1))
+                .expect("the window is small enough to subtract");
+            map.insert(
+                "old-message".to_string(),
+                LinkedSession {
+                    session_id: "old-session".to_string(),
+                    linked_at: stale_at,
+                },
+            );
+        }
+
+        link_message_in(&links, "new-message", "new-session").await;
+
+        let map = links.read().await;
+        assert!(
+            !map.contains_key("old-message"),
+            "a link that can only resolve to expired memories must be dropped"
+        );
+        assert_eq!(
+            map.get("new-message").map(|l| l.session_id.as_str()),
+            Some("new-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backstop_evicts_the_oldest_link_not_an_arbitrary_one() {
+        let links = RwLock::new(HashMap::new());
+        // Fill past the cap with links whose ages increase, all inside the
+        // attribution window so the retain cannot be what does the work.
+        {
+            let mut map = links.write().await;
+            let now = Instant::now();
+            for i in 0..MAX_LINKED_MESSAGES {
+                let age = Duration::from_millis((MAX_LINKED_MESSAGES - i) as u64);
+                map.insert(
+                    format!("message-{i}"),
+                    LinkedSession {
+                        session_id: format!("session-{i}"),
+                        linked_at: now.checked_sub(age).expect("recent enough"),
+                    },
+                );
+            }
+            assert_eq!(map.len(), MAX_LINKED_MESSAGES);
+        }
+
+        link_message_in(&links, "message-newest", "session-newest").await;
+
+        let map = links.read().await;
+        assert!(map.len() <= MAX_LINKED_MESSAGES, "cap held: {}", map.len());
+        assert!(
+            map.contains_key("message-newest"),
+            "the link just made must survive its own insertion"
+        );
+        // The old prune took HALF the map in HashMap order; this one takes the
+        // single oldest link, which is `message-0`.
+        assert!(
+            !map.contains_key("message-0"),
+            "the oldest link is the one that should go"
+        );
+        assert!(
+            map.contains_key(&format!("message-{}", MAX_LINKED_MESSAGES - 1)),
+            "a recent link must not be collateral damage"
         );
     }
 }
