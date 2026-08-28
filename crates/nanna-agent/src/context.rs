@@ -1230,10 +1230,10 @@ impl AgentContext {
     /// prompt says nothing about a working directory and the workspace slice
     /// carries only file *contents*, so the only way to learn the path is to
     /// run `pwd` and reverse-engineer it. Observed live 2026-07-26: a model
-    /// did exactly that, then addressed files as `<workspace-leaf>/minidb`
-    /// — relative to a directory that already WAS the workspace — and spent
-    /// an hour editing a shadow copy one directory deeper while the tests
-    /// measured the real file.
+    /// did exactly that, then addressed its files as `<workspace-leaf>/<file>`
+    /// — relative to a directory that already WAS the workspace — and spent an
+    /// hour editing a shadow copy one directory deeper, while everything that
+    /// read those files kept reading the originals.
     ///
     /// So: state the directory, and state that bare relative paths land in
     /// it. The tools accept absolute paths too (and repair a redundantly
@@ -1255,11 +1255,27 @@ impl AgentContext {
         } else {
             "`exec` runs POSIX sh."
         };
+        // Showing the WRONG shape is what makes the rule land, but the
+        // example has to come from this session rather than from a fixed
+        // vocabulary: any filename baked in here is a word the model reads on
+        // every turn of every project, including the projects that contain no
+        // such file. The directory's own leaf is the exact token the recorded
+        // failure prefixed, it is already in hand, and the sentence it forms
+        // is true wherever the preamble renders. A root with no leaf to quote
+        // (a filesystem or drive root) gets the rule without the illustration
+        // rather than an invented stand-in.
+        let prefix_note = match root.file_name().and_then(std::ffi::OsStr::to_str) {
+            Some(leaf) => format!(
+                " A path beginning `{leaf}/` therefore lands under `{leaf}/{leaf}/`, \
+                 one directory deeper than the file you mean."
+            ),
+            None => String::new(),
+        };
         Some(format!(
             "# Working directory\n\nYou are working in `{}`.\n\nRelative paths in \
-             tool calls resolve against this directory, so use `./minidb` or \
-             `tests/test_01.sh` — do NOT prefix them with the directory's own name. \
-             Absolute paths are accepted as well.\n\n{shell_note}",
+             tool calls resolve against this directory, so address files by their \
+             path INSIDE it — do NOT prefix them with the directory's own \
+             name.{prefix_note} Absolute paths are accepted as well.\n\n{shell_note}",
             root.display()
         ))
     }
@@ -2876,17 +2892,17 @@ mod tests {
     fn the_model_is_told_its_working_directory() {
         // Live 2026-07-26: nothing in the prompt said where the agent was
         // working, so the model learned the path from a `pwd` it happened to
-        // run, then addressed files as "<ws-leaf>/minidb" — one directory too
-        // deep — and edited a shadow copy for an hour while the acceptance
-        // tests read the real file.
+        // run, then addressed files as "<ws-leaf>/<file>" — one directory too
+        // deep — and edited a shadow copy for an hour while every reader of
+        // those files went on reading the originals.
         let mut ctx = AgentContext::new("s");
         ctx.system_prompt = "BASE".to_string();
-        ctx.workspace_root = Some(std::path::PathBuf::from("/tmp/bench-ws"));
+        ctx.workspace_root = Some(std::path::PathBuf::from("/tmp/some-ws"));
 
         let effective = ctx.effective_system_prompt();
         assert!(effective.starts_with("BASE"), "identity still leads");
         assert!(
-            effective.contains("bench-ws"),
+            effective.contains("some-ws"),
             "the working directory must appear in the prompt: {effective}"
         );
         assert!(
@@ -2898,6 +2914,61 @@ mod tests {
         let mut global = AgentContext::new("s");
         global.system_prompt = "BASE".to_string();
         assert_eq!(global.effective_system_prompt(), "BASE");
+    }
+
+    /// The preamble ships on EVERY turn of EVERY project, so whatever it
+    /// teaches from has to belong to the session. It used to teach from two
+    /// filenames borrowed from one project's fixtures, which made it wrong
+    /// vocabulary everywhere else and a standing hint in the one place the
+    /// files existed. The illustration is now derived from the working
+    /// directory the caller supplied, so it cannot drift back into naming
+    /// someone else's files.
+    #[test]
+    fn the_workdir_preamble_illustrates_with_the_sessions_own_directory() {
+        let mut ctx = AgentContext::new("s");
+        ctx.workspace_root = Some(std::path::PathBuf::from("/home/u/some-project"));
+        let pre = ctx
+            .workdir_preamble()
+            .expect("a workspace root yields a preamble");
+
+        // The artifact names of the ladder benchmark. The preamble has no way
+        // to know whether the user's project holds any such file, so it must
+        // never speak them.
+        for borrowed in ["minidb", "test_01", "tests/test"] {
+            assert!(
+                !pre.contains(borrowed),
+                "the preamble must not name `{borrowed}`: {pre}"
+            );
+        }
+
+        // The lesson, the derived illustration, and the shell contract all
+        // survive: those are the parts that are true in any project.
+        assert!(
+            pre.contains("some-project"),
+            "the directory itself is named: {pre}"
+        );
+        assert!(
+            pre.contains("do NOT prefix"),
+            "the re-prefixing rule survives: {pre}"
+        );
+        assert!(
+            pre.contains("`some-project/`"),
+            "the wrong shape is shown using the session's own leaf: {pre}"
+        );
+        assert!(
+            pre.contains("exec` runs POSIX"),
+            "the shell contract survives: {pre}"
+        );
+
+        // A root with no leaf to quote states the rule and drops the
+        // illustration rather than inventing a stand-in for it.
+        let mut rootless = AgentContext::new("s");
+        rootless.workspace_root = Some(std::path::PathBuf::from("/"));
+        let pre = rootless
+            .workdir_preamble()
+            .expect("a root directory is still a workspace root");
+        assert!(pre.contains("do NOT prefix"), "{pre}");
+        assert!(!pre.contains("therefore resolves to"), "{pre}");
     }
 
     #[test]
@@ -3145,7 +3216,7 @@ mod tests {
     #[test]
     fn verified_outcomes_survive_every_compression_path() {
         let mut ctx = AgentContext::new("s1");
-        ctx.record_verified_outcome("./minidb mset a 1", "exit 0");
+        ctx.record_verified_outcome("./build.sh --release", "exit 0");
         ctx.record_verified_outcome("sh tests/test_7.sh", "exit 0");
         for i in 0..30 {
             ctx.messages.push(AnthropicMessage::user_text(format!(
@@ -3170,7 +3241,7 @@ mod tests {
             panic!("preamble must be a text block");
         };
         assert!(text.contains("<verified_outcomes>"));
-        assert!(text.contains("./minidb mset a 1"));
+        assert!(text.contains("./build.sh --release"));
         assert!(text.contains("sh tests/test_7.sh"));
     }
 
@@ -3185,7 +3256,7 @@ mod tests {
             ctx.messages
                 .push(AnthropicMessage::user_text(format!("message {i}")));
         }
-        ctx.replace_with_summary(4, "tests 1-10 verified passing; minidb built");
+        ctx.replace_with_summary(4, "tests 1-10 verified passing; the CLI builds");
         let before = ctx.consolidated_summary.clone().expect("summary exists");
 
         ctx.set_distilled_facts("current_state: reading files");

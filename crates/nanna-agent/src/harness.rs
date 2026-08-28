@@ -1642,9 +1642,10 @@ fn stable_prefix(goal: &str) -> String {
            actually happened, including failures — a wrong result reported honestly is worth \
            more than a confident guess.\n\
          - ONE artifact per job: change the real file in place. Do not build a parallel copy \
-           (`thing.sh` beside `thing`, `thing_v2`, `thing.new`) — whatever reads the real file \
-           keeps reading it, so work in a copy scores zero no matter how good it is. This \
-           applies to shell redirects too, not just the file tools.\n\
+           (`thing_v2`, `thing.new`, `thing.backup`) — whatever reads the real file keeps \
+           reading the original, so work in a copy never reaches the person who asked for \
+           it. This applies to shell redirects too, not just the file tools.
+\
          - Never mark work done yourself: the harness verifies the task's done-condition \
            and records completion.\n\n"
     )
