@@ -5439,6 +5439,48 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      all 12 packages, `vue 3.5.41 → 3.5.42`, `happy-dom 20.11.6 → 20.11.8`; `vue-tsc --noEmit` clean,
      **237 vitest green**. `typescript@7.0.2` attempted and reverted for the third time — the exact
      failure and the upstream tracking issue are recorded on the deferred item above.
+   - *(2026-08-28 sweep)* `cargo update` -> 6 compatible bumps (`chacha20 0.10.2`,
+     `cpufeatures 0.3.1`, `flate2 1.1.10`, `libredox 0.1.21`, `twox-hash 2.1.4`, `wide 1.7.0`).
+     `cargo upgrade --incompatible` offered four; **two applied green, both compiled unchanged** —
+     **`wide 1.6 -> 1.7`** (workspace root, consumed by `nanna-simd`) and **`deno_core 0.410 ->
+     0.411`** (`nanna-scripting`, which pulled `deno_ops 0.287`, `deno_v8 0.3`, `serde_v8 0.320`).
+     Both manifests hand-edited rather than run through `cargo-upgrade`, per its documented CRLF
+     churn. The other two were **re-verified against the registry this run, not assumed**:
+     `rten 0.24 -> 0.25` still blocked (`cargo info ocrs` -> still **0.12.2**, still `rten ^0.24`)
+     and `criterion 0.8 -> "0.7"` still the downgrade trap (`cargo info criterion` -> **0.8.2**,
+     which the lock already holds).
+     **Correction to the 2026-08-26 claim that the `malachite-bigint` pin "stopped being a per-run
+     step".** It did not, and the reasoning behind it was wrong. `pymath 0.2.0` requires
+     `malachite-bigint = "0"` — *any* 0.x — so `cargo update` always takes the newest; this run it
+     took **0.11.0** while `rustpython-common` stayed on 0.9.2. The `=0.9.2` req added to
+     `crates/nanna-scripting/Cargo.toml` binds only **our own edge** and never constrained `pymath`,
+     so it cannot prevent the split — it is worth keeping as documentation of the constraint, but it
+     is not the gate. Re-pinned with `cargo update -p malachite-bigint@0.11.0 --precise 0.9.2`.
+     **What actually held the line is the test**, which reported the split in 0.00s instead of ~20
+     minutes into a release build — the outcome that item was written for.
+     **The guard's own remedy was stale, though, and is now derived rather than written down.**
+     `dep_version_unification.rs` printed `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`;
+     against this run's graph that command errors out, because 0.10.0 is not in it — a fix message
+     that does not work is worse than none, since it costs a cycle to discover. `Remedy` is now an
+     enum: `PinBackTo(keep)` builds one exact command **per stray version actually observed** (and
+     asserts the keep-version is still in the graph, so a vanished pin target is re-decided rather
+     than re-pinned), `Manual(text)` carries the `rten`/`rten-tensor` cases where the fix is a
+     manifest change and no command exists. +2 unit tests over `Remedy::describe`; 5/5 green.
+     **Verified in a CLEAN target dir, and that is the headline, not a footnote** — the first pass
+     reported 1697 passing tests and then died in `nanna-agent`'s doctests on an `E0514` from a
+     neighbouring project's toolchain (see the `CARGO_TARGET_DIR` item below, now ticked and landed
+     in the routine's guardrails). Re-run cold under a worktree-specific target dir: workspace
+     (excl. `nanna-gui`) `--all-targets` build green, **1703 tests pass / 0 fail / 12 ignored,
+     doctests included**, and `cargo build --release -p nanna-daemon --locked` green. Toolchain
+     stays on `nightly-2026-08-27`; that release build is the evidence the pin still holds.
+     Frontend: `pnpm outdated` showed four in-range bumps and the one known blocker. Applied green —
+     `@lucide/vue 1.35.0`, `vue-router 5.3.0`, `@vue/test-utils 2.5.0`, `happy-dom 20.11.12`
+     (`vue-tsc --noEmit` clean, **238/238 vitest**, `pnpm build` green). `typescript 7.0.2` **not
+     attempted** this run: the failure and its upstream tracking issue are recorded on the deferred
+     item above and nothing has moved, so a fourth identical attempt would be ceremony.
+     *Gotcha worth recording:* `pnpm install` failed once with `ERR_PNPM_EPERM` renaming
+     `monaco-editor_tmp_*` into place on Windows; an immediate identical re-run succeeded. Treat a
+     single EPERM rename as flaky-retry-once, not as a corrupt store.
    - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
      aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
      others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
@@ -5527,12 +5569,29 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            the workspace's cached artifacts mid-run for a probe that could not then be finished and
            verified. **Next run should do this first**, before any other cargo work, so the cache
            eviction is paid once at the start rather than stranding an increment.
-           - [ ] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
+           - [x] *(2026-08-24)* **Consider pinning `CARGO_TARGET_DIR` per worktree for nightly runs.**
                  The shared target dir is a standing tax: two toolchains and several worktrees contend
                  for one lock, so builds serialise behind unrelated projects (observed this run: a
                  4-minute incremental build took 12, and a 22-minute release build was mostly waiting).
                  It is also the hazard already recorded for benchmarks — a binary in the shared
                  `release/` may have been produced by another worktree.
+                 *(2026-08-28 — no longer a "consider": it corrupted a gate, and the routine now
+                 requires the pin.)* The tax was the smaller half. On this run
+                 `cargo test --workspace --exclude nanna-gui` reported **1697 passed / 0 failed** and
+                 then died compiling `nanna-agent`'s doctests with **`E0514: found crate
+                 `unicode_ident` compiled by an incompatible version of rustc`** — the shared
+                 `D:\Development\Cargo Target` held an rmeta built by **nightly `787af2b8c`
+                 (2026-08-25)** while this workspace pins **`bff8e12ff` (2026-08-26)**, because a
+                 neighbouring project had built it there under its own toolchain. Nothing in this
+                 repo was wrong; the gate was. That is the real cost — not slow builds, but a run
+                 unable to distinguish a genuine failure from a contaminated one, which makes every
+                 number it reports unearned. Re-run under a worktree-specific `CARGO_TARGET_DIR`:
+                 cold build green, **1703 tests pass / 0 fail / 12 ignored with doctests included**.
+                 Landed as a hard guardrail in `.claude/skills/daily-dev/SKILL.md` (export it before
+                 the FIRST cargo command, on every invocation — shell state does not survive between
+                 tool calls) rather than as a repo-level `.cargo/config.toml`: the shared dir is the
+                 operator's deliberate choice for their own work, so this is the routine's concern,
+                 not the repo's. Cost is one cold build (~10 min debug, ~24 min release).
      - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
