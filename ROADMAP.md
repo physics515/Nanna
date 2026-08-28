@@ -2506,6 +2506,45 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       tests (mixed-direction flood → all 36 signals counted, fixed 16-byte accumulator, exact −5.2 aggregate
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
+      *(2026-08-28)* **The thumbs half is now real — and it was worse than unwired: it was wired to
+      the wrong answer.** Slack `reaction_added` events already reached
+      `AppState::record_message_feedback`, so this path has been live in `nanna serve` all along.
+      What it did with them: `is_positive_reaction` matched **substrings** and **fell through to
+      `true`**. Two consequences, both read off the shipped code. (1) *Any* unrecognised emoji counted
+      as praise — a pizza on an answer applied `MemoryFeedback::Helpful` (+0.3 FSRS boost) to **every**
+      memory the session had stored in the last ten minutes. Silence is the honest response to an emoji
+      nobody assigned a meaning to, and a `bool` return had nowhere to put it. (2) Substring matching
+      inverted real signals: `broken_heart` contains `heart`, so a broken heart **promoted**. Replaced
+      by `classify_reaction() -> ReactionFeedback::{Positive, Negative, NotFeedback}`, exact-matching a
+      canonical name after stripping Slack's `::skin-tone-N` modifier (documented 2..=6 — a
+      `thumbsup::skin-tone-6` previously matched nothing and fell through to the default). 5 tests,
+      including both inversions and a disjoint/lowercase check across the two tables.
+      **And the accumulator behind it was unbounded.** `session_recent_memories` had *two* write paths
+      — `track_memory_for_session`, capped at 50 per session, and an inline copy inside the
+      memory-extraction callback with **no cap at all** — and the callback is the one that actually
+      runs, so the cap lived on the path nothing called. The ten-minute recency filter ran only inside
+      `record_message_feedback`, i.e. only if somebody reacted, which on the common path never happens:
+      a daemon nobody thumbs-ups grew that map for the lifetime of the process. Now one write path
+      (`track_memory_in`) that prunes by the attribution window **on write** — the principled bound,
+      since an entry past the window can never be read by anything — dropping sessions left empty, with
+      a stated 256-session backstop (about 1.3 MB ceiling) for a burst inside one window. Also stopped
+      `record_message_feedback` from `entry().or_default()`-ing an empty vector for every session it
+      merely asked about. 3 tests; 30 `nanna-server` lib + 7 fail-closed tests green.
+      Still open here: **corrections and tool-success/failure**, which is where the
+      `UsedSuccessfully`/`CausedError` variants finally get fed — reactions only ever produce
+      Helpful/Unhelpful.
+      - [ ] *(2026-08-28)* **Telegram could feed the same loop; today it cannot see reactions.**
+            `crates/nanna-channels/src/listeners/telegram.rs:87` requests
+            `allowed_updates = ["message","edited_message"]`, and Telegram delivers
+            `message_reaction` **only** to bots that name it explicitly in `allowed_updates` *and* are
+            an administrator in the chat (reactions set by bots are never delivered at all). Wiring it
+            means handling `MessageReactionUpdated` — an old/new reaction **list diff**, not a single
+            emoji — and mapping Telegram's emoji onto the same classifier. Source:
+            [Bot API, MessageReactionUpdated](https://core.telegram.org/bots/api#messagereactionupdated).
+      - [ ] *(2026-08-28)* **Discord reactions need the Gateway, which this repo does not run.**
+            `webhooks/discord.rs` already notes it in a comment; recorded here so a future run does not
+            re-derive it. Interaction webhooks never carry `MESSAGE_REACTION_ADD`, so the
+            `link_message_to_session` call Discord makes today can never be consumed.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
       - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
             Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17, corrected off-by-one

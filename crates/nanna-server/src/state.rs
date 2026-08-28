@@ -28,6 +28,93 @@ impl RecentMemory {
     }
 }
 
+/// How long a stored memory stays attributable to a reaction.
+///
+/// A reaction arriving later than this cannot honestly be about that memory, so
+/// an entry past the window is unusable by construction. That is what makes it
+/// the *primary* bound on the attribution map rather than a cap picked for
+/// tidiness: pruning by it drops only entries nothing could ever read.
+const FEEDBACK_ATTRIBUTION_WINDOW: Duration = Duration::from_secs(600);
+
+/// Ceiling on memories tracked per session.
+///
+/// Feedback is applied to every recent memory of a session at once, so this is
+/// also the blast radius of a single reaction.
+const MAX_MEMORIES_PER_SESSION: usize = 50;
+
+/// Backstop on how many sessions are tracked at once.
+///
+/// The window prune is the real bound; this only covers a burst of sessions
+/// inside one window. At 50 entries of roughly 100 bytes, the whole map is
+/// capped near 1.3 MB — the point being that it is capped at all, where before
+/// a long-running daemon grew it for the lifetime of the process.
+const MAX_TRACKED_SESSIONS: usize = 256;
+
+/// Record `memory_id` against `session_id` for later feedback attribution,
+/// keeping the map bounded in both dimensions.
+///
+/// This is the single write path into `session_recent_memories`. There used to
+/// be two — this one and an inline copy inside the memory-extraction callback
+/// that applied no cap at all — so whether the bound held depended on which
+/// caller you were, and the common path was the uncapped one.
+async fn track_memory_in(
+    tracked: &RwLock<HashMap<String, Vec<RecentMemory>>>,
+    session_id: &str,
+    memory_id: &str,
+) {
+    debug_assert!(!session_id.is_empty(), "a memory belongs to some session");
+    debug_assert!(!memory_id.is_empty(), "a tracked memory needs an id");
+
+    let mut sessions = tracked.write().await;
+
+    // Primary bound: drop what the attribution window already made unusable,
+    // and with it any session left holding nothing. Doing this on write rather
+    // than only when someone reacts is what keeps the map finite on the far
+    // commoner path where no reaction ever arrives.
+    sessions.retain(|_, memories| {
+        memories.retain(|memory| memory.is_recent(FEEDBACK_ATTRIBUTION_WINDOW));
+        !memories.is_empty()
+    });
+
+    // Backstop for a burst of sessions inside one window: evict whichever
+    // tracked session has been quiet longest, since its entries expire first.
+    if !sessions.contains_key(session_id) && sessions.len() >= MAX_TRACKED_SESSIONS {
+        let stalest = sessions
+            .iter()
+            .filter_map(|(id, memories)| {
+                memories
+                    .iter()
+                    .map(|memory| memory.stored_at)
+                    .max()
+                    .map(|newest| (id.clone(), newest))
+            })
+            .min_by_key(|(_, newest)| *newest)
+            .map(|(id, _)| id);
+        if let Some(id) = stalest {
+            sessions.remove(&id);
+        }
+    }
+
+    let memories = sessions.entry(session_id.to_string()).or_default();
+    memories.push(RecentMemory {
+        memory_id: memory_id.to_string(),
+        stored_at: Instant::now(),
+    });
+    if memories.len() > MAX_MEMORIES_PER_SESSION {
+        let excess = memories.len() - MAX_MEMORIES_PER_SESSION;
+        memories.drain(0..excess);
+    }
+
+    assert!(
+        memories.len() <= MAX_MEMORIES_PER_SESSION,
+        "per-session feedback tracking must stay bounded"
+    );
+    assert!(
+        sessions.len() <= MAX_TRACKED_SESSIONS,
+        "the feedback attribution map must stay bounded"
+    );
+}
+
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
@@ -441,13 +528,8 @@ impl AppState {
                                 id
                             );
                             
-                            // Track this memory for feedback attribution
-                            let mut sessions = recent_memories.write().await;
-                            let memories = sessions.entry(session).or_default();
-                            memories.push(RecentMemory {
-                                memory_id: id,
-                                stored_at: Instant::now(),
-                            });
+                            // One write path, so the bound holds for every caller.
+                            track_memory_in(&recent_memories, &session, &id).await;
                         }
                         Err(e) => {
                             tracing::warn!("Failed to store extracted memory: {}", e);
@@ -626,13 +708,15 @@ impl AppState {
         // Get recent memories for this session
         let recent_memories = {
             let mut sessions = self.session_recent_memories.write().await;
-            let memories = sessions.entry(session_id.clone()).or_default();
-            
-            // Filter to only recent memories (within 10 minutes)
-            let max_age = Duration::from_secs(600);
-            memories.retain(|m| m.is_recent(max_age));
-            
-            memories.clone()
+            // Ask, do not insert: looking up a session that never stored a
+            // memory used to leave an empty entry behind for good.
+            match sessions.get_mut(&session_id) {
+                Some(memories) => {
+                    memories.retain(|m| m.is_recent(FEEDBACK_ATTRIBUTION_WINDOW));
+                    memories.clone()
+                }
+                None => Vec::new(),
+            }
         };
 
         if recent_memories.is_empty() {
@@ -677,19 +761,7 @@ impl AppState {
 
     /// Track a memory ID for a session (for feedback attribution).
     pub async fn track_memory_for_session(&self, session_id: &str, memory_id: &str) {
-        let mut sessions = self.session_recent_memories.write().await;
-        let memories = sessions.entry(session_id.to_string()).or_default();
-        
-        memories.push(RecentMemory {
-            memory_id: memory_id.to_string(),
-            stored_at: Instant::now(),
-        });
-
-        // Keep only the last N memories per session
-        const MAX_PER_SESSION: usize = 50;
-        if memories.len() > MAX_PER_SESSION {
-            memories.drain(0..memories.len() - MAX_PER_SESSION);
-        }
+        track_memory_in(&self.session_recent_memories, session_id, memory_id).await;
     }
 }
 
@@ -698,3 +770,90 @@ const DEFAULT_SYSTEM_PROMPT: &str = r"You are Nanna — moon god of the digital 
 You have tools at your disposal. Use them when needed.
 
 Be helpful. Be competent. Don't waste words.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_map() -> RwLock<HashMap<String, Vec<RecentMemory>>> {
+        RwLock::new(HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn tracking_is_bounded_per_session() {
+        let tracked = empty_map();
+        // Well past the cap: the uncapped inline path this replaces would have
+        // kept every one of these for the life of the process.
+        for i in 0..(MAX_MEMORIES_PER_SESSION * 3) {
+            track_memory_in(&tracked, "session-a", &format!("mem-{i}")).await;
+        }
+
+        let sessions = tracked.read().await;
+        let memories = sessions.get("session-a").expect("session is tracked");
+        assert_eq!(memories.len(), MAX_MEMORIES_PER_SESSION);
+        // The cap keeps the newest, which are the ones a reaction can be about.
+        let newest = format!("mem-{}", MAX_MEMORIES_PER_SESSION * 3 - 1);
+        assert!(
+            memories.iter().any(|m| m.memory_id == newest),
+            "the most recent memory must survive the cap"
+        );
+        assert!(
+            !memories.iter().any(|m| m.memory_id == "mem-0"),
+            "the oldest memory must have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_is_bounded_across_sessions() {
+        let tracked = empty_map();
+        for i in 0..(MAX_TRACKED_SESSIONS + 40) {
+            track_memory_in(&tracked, &format!("session-{i}"), "mem").await;
+        }
+
+        let sessions = tracked.read().await;
+        assert!(
+            sessions.len() <= MAX_TRACKED_SESSIONS,
+            "tracked {} sessions, cap is {MAX_TRACKED_SESSIONS}",
+            sessions.len()
+        );
+        assert!(
+            sessions.contains_key(&format!("session-{}", MAX_TRACKED_SESSIONS + 39)),
+            "the newest session must be the one that is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_past_the_attribution_window_are_dropped_on_write() {
+        let tracked = empty_map();
+        {
+            let mut sessions = tracked.write().await;
+            let stale_at = Instant::now()
+                .checked_sub(FEEDBACK_ATTRIBUTION_WINDOW + Duration::from_secs(1))
+                .expect("the window is small enough to subtract");
+            sessions.insert(
+                "old-session".to_string(),
+                vec![RecentMemory {
+                    memory_id: "stale".to_string(),
+                    stored_at: stale_at,
+                }],
+            );
+        }
+
+        // A write for an unrelated session is enough to collect the stale one:
+        // the prune does not wait for a reaction that may never come.
+        track_memory_in(&tracked, "new-session", "fresh").await;
+
+        let sessions = tracked.read().await;
+        assert!(
+            !sessions.contains_key("old-session"),
+            "a session holding only expired entries must be removed entirely"
+        );
+        assert_eq!(
+            sessions
+                .get("new-session")
+                .map(std::vec::Vec::len)
+                .unwrap_or_default(),
+            1
+        );
+    }
+}
