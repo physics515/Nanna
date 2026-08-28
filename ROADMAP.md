@@ -5675,7 +5675,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
                  the FIRST cargo command, on every invocation — shell state does not survive between
                  tool calls) rather than as a repo-level `.cargo/config.toml`: the shared dir is the
                  operator's deliberate choice for their own work, so this is the routine's concern,
-                 not the repo's. Cost is one cold build (~10 min debug, ~24 min release).
+                 not the repo's. Cost is one cold build (~10 min debug, ~16-23 min release).
+                 *(same day, a correction to where it goes)* The first attempt put it in a
+                 **sibling** directory, `D:\Development\Cargo Target-nightly`. That does not
+                 survive on this machine: the whole ~30 GB tree vanished minutes after the final
+                 release build finished, taking the freshly-built `nanna-daemon.exe` with it — the
+                 builds had already been observed green so no result was lost, but the real-binary
+                 smoke run had to be rebuilt for. The machine already has a convention and it is a
+                 **subdirectory of the shared dir**: `Cargo Target\{nanna-nightly,
+                 mummu-nightly-*, wt-*, *-routine}` are all already there. Use
+                 `Cargo Target\<worktree-name>`; the skill now says so explicitly.
      - [x] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
            a release-only codegen break, so a toolchain or dependency bump can pass every green check
            and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
