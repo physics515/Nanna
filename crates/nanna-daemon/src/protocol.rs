@@ -300,6 +300,19 @@ pub enum SessionAction {
         id: String,
         model: Option<String>,
     },
+    /// Set or clear the user-selected extra tools for a session.
+    ///
+    /// Strictly additive: the turn unions these into whatever active set it
+    /// would have built anyway (core tools, `discover_tools` paging, per-task
+    /// scopes all unchanged). An empty — or absent — `tools` is the clear,
+    /// restoring byte-identical default behavior. Names are stored verbatim;
+    /// an unknown name costs nothing (the registry simply has nothing to
+    /// activate for it), so the only refusal here is an unknown `id`.
+    SetTools {
+        id: String,
+        #[serde(default)]
+        tools: Vec<String>,
+    },
 
     // --- Sub-Agent Sessions (#72) ---
     /// Spawn a sub-agent session

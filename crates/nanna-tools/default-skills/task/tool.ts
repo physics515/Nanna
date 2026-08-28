@@ -1,22 +1,22 @@
 export default {
-  name: "task",
+  name: "sub_agent",
   requires: ["agent.spawn"],
-  version: "0.1.0",
+  version: "0.2.0",
   timeout: 86400,
-  description: "Delegate a sub-task to a separate agent. The sub-agent runs independently with its own context and tools, then returns the result. Useful for complex tasks that benefit from isolated execution.",
+  description: "Spawn a Sub-Agent — an ordinary chat you own that runs the same chat/harness path as a normal turn, then returns its reply. Use to delegate isolated work (research, file analysis, a self-contained sub-problem) without filling your own context. Search keywords: sub-agent, subagent, delegate, spawn, task, worker, child chat. The sub-agent cannot see your conversation; give it a self-contained prompt. On failure it reports a named error instead of looping empty. Alias: task.",
   parameters: {
     type: "object",
     properties: {
-      prompt: { type: "string", description: "The task description / prompt for the sub-agent" },
-      description: { type: "string", description: "Short label for logging. Default: 'sub-task'" },
-      max_iterations: { type: "integer", description: "Optional hard cap on iterations. Omit for no limit (sub-agent will be nudged to wrap up progressively). Only set this if you want a strict cutoff." }
+      prompt: { type: "string", description: "Self-contained prompt for the sub-agent chat. Include everything it needs; it cannot see your history." },
+      description: { type: "string", description: "Short label for logging. Default: 'sub-agent'" },
+      max_iterations: { type: "integer", description: "Optional hard cap on iterations. Omit for no limit (the chat is nudged to wrap up progressively). Only set this if you want a strict cutoff." }
     },
     required: ["prompt"]
   },
   execute: function(input) {
     var params = {
       prompt: input.prompt,
-      description: input.description || "sub-task"
+      description: input.description || "sub-agent"
     };
     // Only pass max_iterations if explicitly set — otherwise let the sub-agent
     // run until done, with progressive nudges to wrap up.

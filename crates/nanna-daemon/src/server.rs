@@ -53,6 +53,13 @@ struct AgentSpawnerImpl {
     workspace_context: Option<String>,
     /// Shared model stats tracker (sub-agents contribute to the same stats)
     stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Model fallback chain for sub-agents, in priority order — resolved via
+    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
+    /// sub-agent list already means "the main chat list". Never empty.
+    sub_agent_models: Vec<String>,
+    /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
+    /// chats on that plane — same `run_chat_turn` path as a user turn.
+    control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
 }
 
 #[async_trait]
@@ -63,8 +70,6 @@ impl AgentSpawner for AgentSpawnerImpl {
         description: &str,
         max_iterations: Option<usize>,
     ) -> Result<SpawnResult, String> {
-        use nanna_agent::{Agent, AgentContext, RunOptions};
-
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
         // One live read for the whole spawn: the model list, the chat model
@@ -88,9 +93,16 @@ impl AgentSpawner for AgentSpawnerImpl {
             sub_agent_models.clone()
         };
 
+        let control = self.control.read().await.clone();
+        let Some(control) = control else {
+            return Err(
+                "Sub-agent chat path is not bound yet (control plane not ready).".to_string(),
+            );
+        };
+
         let mut last_error = String::new();
         for (attempt, model_spec) in candidates.iter().enumerate() {
-            let Some(llm_client) = self.router.client_for_model(model_spec) else {
+            if self.router.client_for_model(model_spec).is_none() {
                 last_error = format!(
                     "No provider available for model '{}'. Available providers: {:?}",
                     model_spec,
@@ -98,75 +110,61 @@ impl AgentSpawner for AgentSpawnerImpl {
                 );
                 warn!(model = %model_spec, "Sub-agent model has no provider — trying next");
                 continue;
-            };
-
-            // Fresh isolated context per attempt: a failed candidate must not
-            // leak partial state into the next one.
-            let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
-                .with_system_prompt(&self.system_prompt);
-            if let Some(ref ws_root) = self.workspace_root {
-                context.workspace_root = Some(ws_root.clone());
             }
-            if let Some(ref ws_ctx) = self.workspace_context {
-                context.workspace_context = Some(ws_ctx.clone());
-            }
-
-            // Configure agent — sub-agents are full agents, no artificial iteration cap
-            let mut config = base_config.clone();
-            config.model_routing = self.sub_agent_routing.clone();
-            config.routing_first_turn_primary = true;
-            config.max_iterations = max_iterations;
-            let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
-            // Strip provider prefix from model name for the actual API call
-            config.model = LlmRouter::strip_model_prefix(model_spec);
 
             if attempt > 0 {
                 info!(model = %model_spec, attempt, "Sub-agent model attempt");
             }
 
-            let mut agent =
-                Agent::new(config, llm_client, self.tools.clone()).with_context(context);
+            let session = control
+                .sessions
+                .create(Some(format!("sub-agent: {description}")))
+                .await;
+            let session_id = session.id.clone();
+            info!(
+                description,
+                session_id = %session_id,
+                model = %model_spec,
+                attempt = attempt + 1,
+                of = candidates.len(),
+                max_iterations = ?max_iterations,
+                "Starting sub-agent as a managed chat"
+            );
 
-            // Share model stats tracker with sub-agents
-            if let Some(ref tracker) = self.stats {
-                agent = agent.with_stats(tracker.clone());
-            }
-
-            let options = RunOptions {
-                max_iterations,
-                is_sub_agent: true,
-                all_tools_active: true,
-                ..Default::default()
-            };
-
-            // Run without timeout — agent stops when done or cancelled
-            match agent.run(prompt, options).await {
-                Ok(result) => {
+            match control.run_chat_turn(&session_id, prompt).await {
+                Ok(_) => {
+                    control.chat_runs.wait_until_idle(&session_id).await;
+                    let text = last_assistant_text(&control.sessions, &session_id).await;
+                    if text.trim().is_empty() {
+                        last_error = format!(
+                            "Sub-agent on '{model_spec}' finished with no output (session {session_id})"
+                        );
+                        warn!(model = %model_spec, session_id = %session_id, "{last_error}");
+                        continue;
+                    }
                     info!(
-                        description = description,
-                        model = %model_display,
-                        iterations = result.iterations,
-                        tool_calls = result.tool_calls.len(),
-                        input_tokens = result.input_tokens,
-                        output_tokens = result.output_tokens,
-                        "Sub-agent completed"
+                        description,
+                        session_id = %session_id,
+                        model = %model_spec,
+                        "Sub-agent chat completed"
                     );
                     return Ok(SpawnResult {
-                        text: result.text,
-                        iterations: result.iterations,
-                        tool_calls: result.tool_calls.len(),
-                        input_tokens: result.input_tokens,
-                        output_tokens: result.output_tokens,
-                        model: model_display,
+                        text,
+                        iterations: 0,
+                        tool_calls: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        model: model_spec.clone(),
                     });
                 }
                 Err(e) => {
-                    last_error = format!("Sub-agent error on '{model_display}': {e}");
+                    last_error = format!("Sub-agent chat failed on '{model_spec}': {e}");
                     warn!(
-                        model = %model_display,
+                        model = %model_spec,
+                        session_id = %session_id,
                         error = %e,
                         remaining = candidates.len() - attempt - 1,
-                        "Sub-agent model failed — falling back"
+                        "Sub-agent chat failed — falling back"
                     );
                 }
             }
@@ -179,6 +177,19 @@ impl AgentSpawner for AgentSpawnerImpl {
             last_error
         ))
     }
+}
+
+async fn last_assistant_text(sessions: &SessionManager, session_id: &str) -> String {
+    let Some(session) = sessions.get(session_id).await else {
+        return String::new();
+    };
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::session::MessageRole::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Concrete implementation of ParentChannel that lives in the daemon.
@@ -1752,6 +1763,9 @@ pub struct DaemonServer {
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
     _control: Arc<ControlPlane>,
+    /// Late-bound handle to the control plane for consumers created
+    /// before it exists (filled in run(), read by the agent service).
+    control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -1902,6 +1916,7 @@ impl DaemonServer {
             _brave_api_key: brave_api_key,
             sessions,
             _control: control,
+            control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             ipc,
             persistence,
             shutdown_tx,
@@ -2804,6 +2819,7 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server
         let mut request_rx =
@@ -3829,6 +3845,8 @@ impl DaemonServer {
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
+                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
+                    control: self.control_slot.clone(),
                 }))
             } else {
                 None
@@ -3864,6 +3882,10 @@ impl DaemonServer {
         tools.register_alias("glob", "list_dir").await;
         tools.register_alias("Glob", "list_dir").await;
         tools.register_alias("ls", "list_dir").await;
+        tools.register_alias("task", "sub_agent").await;
+        tools.register_alias("Task", "sub_agent").await;
+        tools.register_alias("sub-agent", "sub_agent").await;
+        tools.register_alias("Sub-Agent", "sub_agent").await;
 
         {
             let tool_count = tools.definitions().await.len();

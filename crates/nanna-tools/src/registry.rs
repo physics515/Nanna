@@ -956,6 +956,10 @@ const DIALECT_SYNONYMS: &[(&str, &str)] = &[
     ("run_shell_command", "exec"),
     ("execute", "exec"),
     ("execute_command", "exec"),
+    // sub-agent (legacy name + hyphenated display form)
+    ("task", "sub_agent"),
+    ("sub-agent", "sub_agent"),
+    ("subagent", "sub_agent"),
 ];
 
 /// Look up the canonical target for a dialect synonym (`name` must already be

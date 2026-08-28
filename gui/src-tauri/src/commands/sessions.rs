@@ -43,6 +43,8 @@ pub async fn create_session(
         // A session created this instant cannot carry a pin: `set_model` is the
         // only thing that writes one, and it needs the id this call returns.
         chat_model: None,
+        // Same for tool picks: `set_tools` is the only writer.
+        chat_tools: Vec::new(),
     })
 }
 
@@ -80,6 +82,18 @@ pub async fn list_sessions(
                         // Absent (not null) on an unpinned session — the daemon's
                         // `SessionSummary` skips the key when there is no pin.
                         chat_model: s.get("chat_model").and_then(|v| v.as_str()).map(String::from),
+                        // Absent when no tools were manually picked (the daemon
+                        // skips the key on an empty selection).
+                        chat_tools: s
+                            .get("chat_tools")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|t| t.as_str())
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -239,6 +253,27 @@ pub async fn set_session_model(
     // comes back in the body, not as a transport error. Swallowing it here
     // would leave the picker showing a model that cannot answer a single turn,
     // so it is raised as an `Err` for the caller to surface and revert.
+    if result.get("error").is_some() {
+        return Err(result["message"].as_str().unwrap_or("Unknown error").to_string());
+    }
+    Ok(())
+}
+
+/// Set or clear the user-selected extra tools for a session.
+///
+/// Additive by contract: the daemon unions these into whatever active set the
+/// turn would have built anyway. An empty list clears the selection and
+/// restores byte-identical default tool behavior.
+#[tauri::command]
+pub async fn set_session_tools(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let result = state_guard.backend.session_set_tools(&session_id, tools).await?;
+    // The only daemon-side refusal is an unknown session; surface it rather
+    // than leaving the picker showing a selection that was never recorded.
     if result.get("error").is_some() {
         return Err(result["message"].as_str().unwrap_or("Unknown error").to_string());
     }

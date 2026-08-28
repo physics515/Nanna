@@ -106,6 +106,11 @@ pub struct SessionInfo {
     /// The pin is durable, so the header pill and the sidebar chip must read it
     /// from the listing — after a reload nothing else remembers the pick.
     pub chat_model: Option<String>,
+    /// Tools the user manually added to this chat's context (empty = none).
+    /// Durable on the session for the same reason as `chat_model`: after a
+    /// reload the listing is the only thing that remembers the picks.
+    #[serde(default)]
+    pub chat_tools: Vec<String>,
 }
 
 /// Application config for frontend
