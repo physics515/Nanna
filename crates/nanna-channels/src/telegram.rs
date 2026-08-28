@@ -463,8 +463,8 @@ pub struct TelegramUser {
 
 #[async_trait]
 impl Channel for TelegramChannel {
-    fn provider(&self) -> &str {
-        "telegram"
+    fn provider(&self) -> String {
+        "telegram".to_string()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {

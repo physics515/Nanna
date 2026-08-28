@@ -464,8 +464,8 @@ mod tests {
 
     #[async_trait]
     impl Channel for RecordingChannel {
-        fn provider(&self) -> &str {
-            self.name
+        fn provider(&self) -> String {
+            self.name.to_string()
         }
         fn capabilities(&self) -> ChannelCapabilities {
             ChannelCapabilities {
