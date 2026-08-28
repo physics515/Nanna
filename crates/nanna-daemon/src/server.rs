@@ -36,27 +36,14 @@ use std::path::PathBuf;
 /// due scheduled work — never reading instruction files off disk.
 const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. Review your current state, and if nothing needs attention, reply HEARTBEAT_OK.";
 
-/// Concrete implementation of AgentSpawner that lives in the daemon
-/// where it can create Agent instances with isolated context.
+/// Concrete implementation of AgentSpawner that lives in the daemon. Runs
+/// each sub-agent as a managed chat on the daemon ControlPlane.
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
-    tools: Arc<ToolRegistry>,
     /// Read at spawn, never at construction: a sub-agent must run on the
     /// model and summarization list the user has NOW, not the ones the daemon
-    /// booted with. `model_routing`/`routing_first_turn_primary` stay pinned
-    /// below because they are this spawner's own sub-agent policy, not user
-    /// config.
+    /// booted with.
     agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
-    sub_agent_routing: Vec<nanna_agent::ModelTier>,
-    system_prompt: String,
-    workspace_root: Option<PathBuf>,
-    workspace_context: Option<String>,
-    /// Shared model stats tracker (sub-agents contribute to the same stats)
-    stats: Option<nanna_agent::ModelStatsTracker>,
-    /// Model fallback chain for sub-agents, in priority order — resolved via
-    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
-    /// sub-agent list already means "the main chat list". Never empty.
-    sub_agent_models: Vec<String>,
     /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
     /// chats on that plane — same `run_chat_turn` path as a user turn.
     control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
@@ -3801,9 +3788,10 @@ impl DaemonServer {
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
         // One shared model-stats tracker for the whole daemon: the main agent
-        // (AgentService) and every sub-agent (AgentSpawnerImpl) record into it,
-        // and the control plane makes it canonical (persists it + feeds the
-        // router). Cloning shares state (Arc<RwLock<_>> inside).
+        // (AgentService) and every sub-agent (managed chats on the control
+        // plane) record into it, and the control plane makes it canonical
+        // (persists it + feeds the router). Cloning shares state
+        // (Arc<RwLock<_>> inside).
         let model_stats = nanna_agent::ModelStatsTracker::new();
 
         // Build script services and load all tools from disk
@@ -3818,34 +3806,11 @@ impl DaemonServer {
                 .available_providers()
                 .is_empty()
             {
-                // Build model routing for sub-agents from the priority list.
-                // Cheapest model (last in priority) handles Simple tasks,
-                // most capable (first) handles Complex. This gives sub-agents
-                // intelligent per-iteration routing while the main agent always
-                // uses the primary model.
-                let sub_agent_routing = build_sub_agent_routing(&self.config.agent.model_priority);
-                if !sub_agent_routing.is_empty() {
-                    info!(
-                        "Sub-agent routing: {:?}",
-                        sub_agent_routing
-                            .iter()
-                            .map(|t| format!("{}:{:?}", t.model, t.tier))
-                            .collect::<Vec<_>>()
-                    );
-                }
-
                 Some(Arc::new(AgentSpawnerImpl {
                     router: router.clone(),
-                    tools: tools.clone(),
                     // The live config, not a snapshot of it — see
                     // `AgentSpawnerImpl::agent_config_src`.
                     agent_config_src: Arc::clone(&shared_agent_config),
-                    sub_agent_routing,
-                    system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
-                    workspace_root: None,
-                    workspace_context: None,
-                    stats: Some(model_stats.clone()),
-                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
                     control: self.control_slot.clone(),
                 }))
             } else {
@@ -4460,42 +4425,6 @@ impl Default for DaemonBuilder {
 /// Fields that exist in `nanna_config` but not in the daemon-local type are
 /// silently dropped — the local type only covers what `ChannelManager` actually
 /// needs at runtime.
-/// Build model routing tiers for sub-agents from the model priority list.
-///
-/// Given a priority list like ["claude-opus-4-6", "openrouter/free", "ollama/qwen3.5:9b"],
-/// assigns tiers so the cheapest model (last) handles Simple tasks, the most capable
-/// (first) handles Complex, and everything in between gets Medium.
-///
-/// With 1 model: no routing (always use that model).
-/// With 2 models: first=Complex, second=Simple.
-/// With 3+: first=Complex, last=Simple, middle=Medium.
-fn build_sub_agent_routing(model_priority: &[String]) -> Vec<nanna_agent::ModelTier> {
-    use nanna_agent::{ModelTier, TaskComplexity};
-
-    if model_priority.len() <= 1 {
-        return vec![]; // No routing with a single model
-    }
-
-    let mut tiers = Vec::new();
-
-    // Reversed: cheapest first (routing picks the first model whose tier >= complexity)
-    for (i, model) in model_priority.iter().enumerate().rev() {
-        let tier = if i == 0 {
-            TaskComplexity::Complex // Most capable
-        } else if i == model_priority.len() - 1 {
-            TaskComplexity::Simple // Cheapest
-        } else {
-            TaskComplexity::Medium
-        };
-        tiers.push(ModelTier {
-            model: model.clone(),
-            tier,
-        });
-    }
-
-    tiers
-}
-
 fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsConfig {
     use crate::channels::{
         DiscordConfig as DaemonDiscord, SlackConfig as DaemonSlack,
