@@ -358,10 +358,31 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else
+            # --target pins the NEW tag to the commit that was actually built.
+            # Without it `gh release create` creates the tag on the repository's
+            # DEFAULT branch, whatever ref the build ran from — so a release
+            # dispatched with `--ref <branch>` shipped branch binaries under a
+            # tag pointing at master. Observed on v0.3.11-beta.20: the installer
+            # was Nanna_0.3.11_x64-setup.exe while the tag resolved to a master
+            # commit whose Cargo.toml still said 0.3.10. Checking out the tag
+            # gave you none of the code in the release.
             gh release create "$TAG" $PRERELEASE \
+              --target "$GITHUB_SHA" \
               --title "Nanna $TAG" \
               --notes-file RELEASE_NOTES.md \
               "${files[@]}"
+
+            # Assert the tag landed where we asked. A release whose tag does not
+            # resolve to the built commit is unreproducible, and the failure is
+            # silent — the assets are right, so nothing looks wrong until
+            # someone checks out the tag.
+            TAGGED=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
+            if [ "$TAGGED" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG resolves to $TAGGED but this build ran on $GITHUB_SHA."
+              echo "::error::The published assets would not match the tagged source."
+              exit 1
+            fi
+            echo "tag guard OK: $TAG -> $GITHUB_SHA"
           fi
 
       # The updater manifest is NOT written automatically. It needs the real
