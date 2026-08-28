@@ -51,6 +51,13 @@ pub struct ToolStats {
     pub success_count: u64,
     /// Failed invocations
     pub failure_count: u64,
+    /// Invocations the harness answered with a breaker replay instead of
+    /// dispatching (repeat-failure / zero-information / discovery-pause
+    /// short-circuits). Their own outcome, NOT failures: the tool never ran,
+    /// so counting them as `failure_count` made healthy tools look broken
+    /// (P22 Tier 4 — an lfm leg's stats showed a wall of `success=0` rows
+    /// that were all harness replays, not tool faults).
+    pub short_circuit_count: u64,
     /// Recent latencies in milliseconds (ring buffer, last N)
     pub latencies_ms: Vec<u64>,
     /// Recent output sizes in bytes/chars (ring buffer, last N)
@@ -86,6 +93,12 @@ pub struct SessionStats {
 pub struct ToolObservation {
     pub tool_name: String,
     pub success: bool,
+    /// The harness short-circuited this call (breaker replay) — it was never
+    /// dispatched. Recorded as its own outcome so success/failure rates keep
+    /// describing the tool, not the harness. When set, `success`, `error`,
+    /// `duration_ms`, and `output_size` describe the replay, not an
+    /// execution, and are not folded into the execution statistics.
+    pub short_circuited: bool,
     pub duration_ms: u64,
     pub output_size: usize,
     /// Error message (if any)
@@ -101,6 +114,11 @@ pub struct ToolStatsSummary {
     pub call_count: u64,
     pub success_count: u64,
     pub failure_count: u64,
+    /// Harness short-circuits (breaker replays) — see [`ToolStats::short_circuit_count`].
+    #[serde(default)]
+    pub short_circuit_count: u64,
+    /// Success rate over EXECUTED calls (`success + failure`) — short-circuits
+    /// are excluded because the tool never ran.
     pub success_rate: f64,
     pub avg_latency_ms: u64,
     pub p50_latency_ms: u64,
@@ -161,6 +179,24 @@ impl ToolStatsTracker {
 
         stats.call_count += 1;
         stats.last_called = Some(now_epoch_ms());
+
+        // A short-circuited call never dispatched: it gets its own outcome
+        // counter and contributes NO execution samples — a 0 ms replay in the
+        // latency ring or a replay notice counted as a failure would describe
+        // the harness, not the tool.
+        if obs.short_circuited {
+            stats.short_circuit_count += 1;
+            if let Some(ref sid) = obs.session_id {
+                let session = inner.sessions.entry(sid.clone())
+                    .or_insert_with(|| SessionStats::new(sid));
+                session.tool_calls += 1;
+            }
+            debug!(
+                tool = %obs.tool_name,
+                "📊 Tool stats recorded (short-circuited — breaker replay, not executed)"
+            );
+            return;
+        }
 
         if obs.success {
             stats.success_count += 1;
@@ -259,13 +295,19 @@ impl ToolStatsTracker {
 
         let total_calls: u64 = all_summaries.iter().map(|s| s.call_count).sum();
         let total_success: u64 = all_summaries.iter().map(|s| s.success_count).sum();
+        // Executed = success + failure; short-circuits never dispatched and
+        // must not dilute the global success rate.
+        let total_executed: u64 = all_summaries
+            .iter()
+            .map(|s| s.success_count + s.failure_count)
+            .sum();
 
         // Overall average latency (weighted by call count)
         let weighted_latency: u64 = all_summaries.iter()
             .map(|s| s.avg_latency_ms * s.call_count)
             .sum();
         let avg_latency_ms = if total_calls > 0 { weighted_latency / total_calls } else { 0 };
-        let success_rate = if total_calls > 0 { total_success as f64 / total_calls as f64 } else { 1.0 };
+        let success_rate = if total_executed > 0 { total_success as f64 / total_executed as f64 } else { 1.0 };
 
         // Top 5 slowest by P95
         let mut slowest = all_summaries.clone();
@@ -419,6 +461,7 @@ impl ToolStats {
             call_count: 0,
             success_count: 0,
             failure_count: 0,
+            short_circuit_count: 0,
             latencies_ms: Vec::with_capacity(MAX_LATENCY_SAMPLES),
             output_sizes: Vec::with_capacity(MAX_OUTPUT_SAMPLES),
             last_called: None,
@@ -427,8 +470,11 @@ impl ToolStats {
     }
 
     fn summary(&self) -> ToolStatsSummary {
-        let success_rate = if self.call_count > 0 {
-            self.success_count as f64 / self.call_count as f64
+        // Rate over EXECUTED calls only: short-circuits never dispatched, so
+        // they can neither succeed nor fail.
+        let executed = self.success_count + self.failure_count;
+        let success_rate = if executed > 0 {
+            self.success_count as f64 / executed as f64
         } else {
             1.0
         };
@@ -455,6 +501,7 @@ impl ToolStats {
             call_count: self.call_count,
             success_count: self.success_count,
             failure_count: self.failure_count,
+            short_circuit_count: self.short_circuit_count,
             success_rate,
             avg_latency_ms,
             p50_latency_ms: percentile(&self.latencies_ms, 50),
@@ -553,6 +600,7 @@ mod tests {
         t1.record(ToolObservation {
             tool_name: "read_file".into(),
             success: true,
+            short_circuited: false,
             duration_ms: 12,
             output_size: 100,
             error: None,
@@ -562,6 +610,7 @@ mod tests {
         t1.record(ToolObservation {
             tool_name: "exec".into(),
             success: false,
+            short_circuited: false,
             duration_ms: 5,
             output_size: 0,
             error: Some("boom".into()),
@@ -584,5 +633,60 @@ mod tests {
         let t = ToolStatsTracker::new();
         t.import_json(&json!({"tools": 5})).await;
         assert!(t.summaries().await.is_empty());
+    }
+
+    /// P22 Tier 4: a breaker replay is its own outcome — not a failure, and
+    /// not an execution sample. An lfm leg whose identical calls were
+    /// short-circuited for hours must not read as a 0% success rate.
+    #[tokio::test]
+    async fn short_circuits_are_their_own_outcome_not_failures() {
+        let t = ToolStatsTracker::new();
+        t.record(ToolObservation {
+            tool_name: "list_dir".into(),
+            success: true,
+            short_circuited: false,
+            duration_ms: 40,
+            output_size: 100,
+            error: None,
+            session_id: None,
+        })
+        .await;
+        for _ in 0..3 {
+            t.record(ToolObservation {
+                tool_name: "list_dir".into(),
+                success: false, // the replay notice is a `success: false` result…
+                short_circuited: true, // …but the outcome is short_circuited
+                duration_ms: 0,
+                output_size: 500,
+                error: Some("[ZERO-INFORMATION BREAKER] …".into()),
+                session_id: None,
+            })
+            .await;
+        }
+
+        let s = t.summary("list_dir").await.expect("stats recorded");
+        assert_eq!(s.call_count, 4, "every call the model made is counted");
+        assert_eq!(s.short_circuit_count, 3);
+        assert_eq!(s.failure_count, 0, "replays are not tool failures");
+        assert_eq!(s.success_count, 1);
+        assert!(
+            (s.success_rate - 1.0).abs() < f64::EPSILON,
+            "success rate covers executed calls only, got {}",
+            s.success_rate
+        );
+        assert!(
+            s.top_errors.is_empty(),
+            "a replay notice is not a tool error: {:?}",
+            s.top_errors
+        );
+        // Latency percentiles describe executions — the single real 40 ms
+        // call, not three 0 ms replays.
+        assert_eq!(s.p50_latency_ms, 40);
+
+        let g = t.global_stats().await;
+        assert!(
+            (g.success_rate - 1.0).abs() < f64::EPSILON,
+            "global success rate must not be diluted by replays"
+        );
     }
 }

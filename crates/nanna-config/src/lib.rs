@@ -119,7 +119,7 @@ pub struct LlmConfig {
     /// GitHub token for GitHub Models
     pub github_token: Option<String>,
     /// Model priority list for fallback (first working model is used)
-    /// Format: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
+    /// Format: ["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]
     pub model_priority: Vec<String>,
     /// Anthropic OAuth access token (alternative to API key)
     pub anthropic_oauth_token: Option<String>,
@@ -136,7 +136,7 @@ pub struct LlmConfig {
     /// Model routing priority for cost optimization.
     /// Format: ["model:tier", ...] where tier is simple|medium|complex.
     /// Cheapest models first. Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
@@ -198,7 +198,11 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            // A DATED id is a pinned snapshot with a retirement date, and this
+            // one was already retired: a daemon booted with no configured
+            // model_priority sent every scheduled heartbeat to a 404 (observed
+            // live 2026-08-27). Undated ids are the current-generation aliases.
+            model: "claude-sonnet-5".to_string(),
             api_key: None,
             base_url: None,
             max_tokens: 8192,
@@ -322,6 +326,15 @@ pub struct TelegramConfig {
     pub bot_token: String,
     pub webhook_url: Option<String>,
     pub allowed_users: Option<Vec<i64>>,
+    /// Secret token passed to Telegram's `setWebhook` and echoed back on every
+    /// inbound POST as `X-Telegram-Bot-Api-Secret-Token`.
+    ///
+    /// This is the ONLY origin proof the Telegram webhook has: the route is a
+    /// fixed path with no bot token in it, so without this value anyone who can
+    /// reach the port can drive the agent. The endpoint refuses to serve until
+    /// it is set.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +353,15 @@ pub struct SlackConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalConfig {
+    /// Shared secret the signal-cli-rest-api bridge must present on every
+    /// inbound webhook, as `Authorization: Bearer <secret>` or
+    /// `X-Webhook-Secret: <secret>`.
+    ///
+    /// signal-cli-rest-api does not sign its callbacks, so a shared secret is
+    /// the strongest proof available on this path. Without it the endpoint
+    /// cannot tell the bridge from any other caller and refuses to serve.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
     /// Phone number registered with Signal (e.g., "+1234567890")
     pub phone_number: String,
     /// URL of signal-cli-rest-api instance
@@ -382,6 +404,22 @@ pub struct ToolsConfig {
     /// Directory containing tool scripts (default: {data_dir}/tools/)
     /// Can be overridden with NANNA_TOOLS_DIR environment variable
     pub tools_dir: Option<PathBuf>,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    ///
+    /// On by default: the daemon runs unattended, and "what did it do while I
+    /// was asleep" has no other answer — the aggregate counters live only on the
+    /// agent-loop path, and the per-call `debug!` lines are off at the default
+    /// level. The trail is size-capped with one generation of rollover, so
+    /// leaving it on cannot grow without bound.
+    pub audit_log: bool,
+    /// Include a bounded preview of tool *arguments* in the audit trail.
+    ///
+    /// Off by default, and deliberately separate from [`Self::audit_log`]:
+    /// arguments carry secrets (an API key in a request, the body of a file
+    /// being written), and the trail is durable plaintext that outlives the run
+    /// that produced it. Key *names* are always recorded, which answers most
+    /// audit questions without creating a secret sink.
+    pub audit_log_values: bool,
 }
 
 impl Default for ToolsConfig {
@@ -394,6 +432,8 @@ impl Default for ToolsConfig {
             brave_api_key: None,
             use_script_tools: true,
             tools_dir: None,
+            audit_log: true,
+            audit_log_values: false,
         }
     }
 }
@@ -706,15 +746,58 @@ impl Config {
         fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
     }
 
+    /// Environment variable that redirects config resolution to an explicit file.
+    ///
+    /// Exists because there was previously **no way to run Nanna against a
+    /// config it does not own**. `--data-dir` isolates the database but not the
+    /// settings, and the settings path is resolved through `directories`, which
+    /// on Windows reads the known-folder API — so `%APPDATA%` cannot redirect it
+    /// either. Any boot-time behaviour that depends on configuration (which
+    /// providers resolve, whether embeddings are enabled at all) was therefore
+    /// only reachable by editing the operator's real `config.toml`, which an
+    /// unattended run must never do. One variable, honoured in the single place
+    /// every consumer already funnels through, makes those paths testable
+    /// without touching anything the operator owns.
+    pub const CONFIG_PATH_ENV: &'static str = "NANNA_CONFIG_PATH";
+
     /// Get default config path.
+    ///
+    /// [`Self::CONFIG_PATH_ENV`] wins when it is set to a non-empty value. The
+    /// override is deliberately taken BEFORE the legacy migration: a caller
+    /// naming an explicit file is not asking for the `bot/clawd/Nanna` tree to
+    /// be copied into the canonical one as a side effect, and a test harness
+    /// least of all.
+    ///
+    /// A path is returned whether or not it exists — the same contract the
+    /// unset case has always had, since [`Self::load`] treats a missing file as
+    /// "use defaults" rather than as an error. Whitespace-only is treated as
+    /// unset, so an empty variable in a shell profile cannot silently redirect
+    /// every consumer to `""`.
     ///
     /// # Errors
     ///
     /// Returns `ConfigError::NoDirFound` if the system config directory cannot be determined.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+        if let Some(path) = Self::config_path_override() {
+            info!("Config path overridden by {}: {path:?}", Self::CONFIG_PATH_ENV);
+            return Ok(path);
+        }
         Self::migrate_legacy_config_if_needed();
         let dirs = project_dirs().ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.config_dir().join("config.toml"))
+    }
+
+    /// The explicit config path, if one is set and meaningful.
+    ///
+    /// Pure apart from the environment read, so the trimming policy is testable
+    /// on its own: see [`config_path_override_ignores_blank`].
+    fn config_path_override() -> Option<PathBuf> {
+        let raw = std::env::var(Self::CONFIG_PATH_ENV).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(trimmed))
     }
 
     /// Get default data directory.
@@ -797,6 +880,7 @@ impl Config {
                 bot_token: token,
                 webhook_url: std::env::var("TELEGRAM_WEBHOOK_URL").ok(),
                 allowed_users: None,
+                webhook_secret: std::env::var("TELEGRAM_WEBHOOK_SECRET").ok(),
             });
         }
 
@@ -1035,5 +1119,101 @@ streaming_enabled = true
             !cfg.contains("clawd"),
             "canonical path must not use legacy clawd slug: {cfg}"
         );
+    }
+
+    /// The whole point of the override: an explicit path wins over the
+    /// known-folder location, so a harness can run against a config the
+    /// operator does not own.
+    ///
+    /// These three share one `#[test]` deliberately. `std::env` is process-wide
+    /// and Rust runs tests in threads, so splitting them would let a sibling
+    /// observe this variable mid-mutation — the classic env-var test flake.
+    #[test]
+    fn config_path_override_wins_and_ignores_blank() {
+        // Save and restore: this variable is process-global, and leaking it
+        // would redirect every later test in this binary.
+        let restore = std::env::var(Config::CONFIG_PATH_ENV).ok();
+
+        // SAFETY: single-threaded section of this test; the variable is
+        // restored before returning.
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "") };
+        let blank = Config::default_config_path().expect("blank must fall through, not fail");
+        assert!(
+            blank.ends_with("config.toml"),
+            "an empty override must be treated as unset, not as a path of \"\": {blank:?}"
+        );
+
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "   ") };
+        let spaces = Config::default_config_path().expect("whitespace must fall through");
+        assert_eq!(
+            spaces, blank,
+            "whitespace-only must resolve identically to unset"
+        );
+
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, "D:/somewhere/custom.toml") };
+        let overridden = Config::default_config_path().expect("an explicit path must resolve");
+        assert_eq!(
+            overridden,
+            PathBuf::from("D:/somewhere/custom.toml"),
+            "an explicit override must be returned verbatim"
+        );
+        assert_ne!(
+            overridden, blank,
+            "the override must not collapse to the known-folder path"
+        );
+
+        match restore {
+            Some(prev) => unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, prev) },
+            None => unsafe { std::env::remove_var(Config::CONFIG_PATH_ENV) },
+        }
+    }
+
+    /// The shipped default model must not be a DATED snapshot id.
+    ///
+    /// Anthropic publishes two shapes: an undated family alias
+    /// (`claude-sonnet-5`) that tracks the live model, and a dated snapshot
+    /// (`claude-sonnet-4-20250514`) pinned to one release — which is retired on
+    /// a schedule. A dated default therefore has an expiry date built in, and
+    /// this one had already passed it: a daemon booted with no configured
+    /// `model_priority` sent every scheduled heartbeat to a `404 not_found_error`
+    /// (observed on a real boot, 2026-08-27). Nothing failed loudly, because a
+    /// heartbeat failure is logged and swallowed.
+    ///
+    /// Pinning a snapshot is a legitimate choice for a USER to make in their own
+    /// config; it is not a legitimate default for the product to ship.
+    #[test]
+    fn the_default_model_is_not_a_dated_snapshot() {
+        let default_model = LlmConfig::default().model;
+        assert!(
+            !default_model.is_empty(),
+            "a default model must exist — the empty string reaches the router as a bare name"
+        );
+        assert!(
+            !has_date_suffix(&default_model),
+            "default model `{default_model}` is a dated snapshot, which will be retired and              turn every unconfigured boot's heartbeat into a 404. Use the undated family alias."
+        );
+    }
+
+    /// `-YYYYMMDD` at the end of a model id, which is how Anthropic spells a
+    /// pinned snapshot. Written as a scan rather than a regex so the guard
+    /// carries no dependency of its own.
+    fn has_date_suffix(model: &str) -> bool {
+        let Some((_, tail)) = model.rsplit_once('-') else {
+            return false;
+        };
+        tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    #[test]
+    fn date_suffix_detection_reads_both_shapes() {
+        assert!(has_date_suffix("claude-sonnet-4-20250514"));
+        assert!(has_date_suffix("claude-3-5-haiku-20241022"));
+        assert!(!has_date_suffix("claude-sonnet-5"));
+        assert!(!has_date_suffix("claude-haiku-4-5"));
+        // Negative space: a trailing number that is not a date must not trip it,
+        // and neither must a local model whose tag contains a colon.
+        assert!(!has_date_suffix("claude-opus-4-1"));
+        assert!(!has_date_suffix("ollama/qwen3:14b"));
+        assert!(!has_date_suffix("nodashes"));
     }
 }

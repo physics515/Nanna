@@ -204,7 +204,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { ExternalLink, ArrowRight, ArrowLeft, Zap, Save } from 'lucide-vue-next'
+import { ExternalLink, ArrowRight, ArrowLeft, Zap, Save } from '@lucide/vue'
 
 interface ChannelStatus {
   name: string

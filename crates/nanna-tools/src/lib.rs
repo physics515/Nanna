@@ -13,6 +13,7 @@
 //!
 //! See [`skills`] module for details.
 
+mod audit;
 mod builtin;
 mod output;
 mod policy;
@@ -21,10 +22,15 @@ mod schema;
 pub mod search;
 pub mod skills;
 
+pub use audit::{
+    AUDIT_FILE_BYTES_MAX, AUDIT_KEY_BYTES_MAX, AUDIT_PARAM_KEYS_MAX, AUDIT_PREVIEW_BYTES_MAX,
+    JsonlAuditSink, SharedAuditSink, ToolAuditConfig, ToolAuditOutcome, ToolAuditRecord,
+    ToolAuditSink, TracingAuditSink,
+};
 pub use builtin::*;
 pub use output::{format_tool_output, schemas as output_schemas, wants_json_output};
 pub use policy::{DenyReason, ToolPolicy};
-pub use registry::ToolRegistry;
+pub use registry::{ToolRegistry, dialect_synonym};
 pub use search::{SearchDoc, ToolSearchHit};
 pub use schema::{ParameterType, ToolDefinition, ToolParameter, ToolResult};
 pub use skills::{DiscoveredSkill, SkillSource, discover_skills, load_skill, load_skills_from_dir};

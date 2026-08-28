@@ -88,7 +88,7 @@ import { computed } from 'vue'
 import { 
   Bot, Loader2, Wrench, CheckCircle, XCircle, Clock, 
   Pause, Sparkles, X
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 interface AgentInfo {
   id: string

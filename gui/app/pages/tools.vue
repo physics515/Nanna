@@ -342,7 +342,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import {
   Plus, RefreshCw, Loader2, FileCode2, Wrench, Play, Save, Trash2, X
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 const { isOnline } = useBackend()
 const toast = useToast()
@@ -576,7 +576,19 @@ async function refreshTools() {
 }
 
 async function selectTool(tool: Tool) {
-  if (hasChanges.value && !confirm('Discard unsaved changes?')) return
+  // `confirm` here is the app's composable, not `window.confirm`: it takes
+  // options and returns a Promise. Called with a bare string and un-awaited,
+  // `!confirm(...)` was `!Promise` — always false — so this guard never
+  // prompted and never blocked, and unsaved edits were dropped silently.
+  if (hasChanges.value) {
+    const discard = await confirm({
+      title: 'Discard changes?',
+      message: 'This tool has unsaved changes. Switching away will discard them.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (!discard) return
+  }
 
   selectedTool.value = tool
   creating.value = false

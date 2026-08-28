@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { AlertCircle, AlertTriangle, Info, CheckCircle, Copy, Check, Trash2, CheckCheck, X } from 'lucide-vue-next'
+import { AlertCircle, AlertTriangle, Info, CheckCircle, Copy, Check, Trash2, CheckCheck, X } from '@lucide/vue'
 import type { NotificationType, AppNotification } from '~/composables/useNotificationCenter'
 
 const {

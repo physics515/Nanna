@@ -1,6 +1,6 @@
 [package]
 name = "nanna"
-version = "0.3.5"
+version = "0.3.11"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
 repository = "https://github.com/physics515/Nanna"
@@ -52,6 +52,7 @@ members = [
     "crates/nanna-storage",
     "crates/nanna-browser",
     "crates/nanna-mcp",
+    "crates/nanna-proc",
     "crates/nanna-scripting",
     "crates/nanna-workspace",
     "crates/nanna-daemon",
@@ -61,7 +62,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.11"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -75,7 +76,7 @@ tokio = { version = "1.53", features = ["full"] }
 wgpu = "30"
 
 # SIMD - using portable_simd (nightly) or wide for stable
-wide = "1.5"
+wide = "1.6"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -117,7 +118,7 @@ half = "2.7"  # f16 support
 axum = { version = "0.8", features = ["macros"] }
 
 # Utilities
-uuid = { version = "1.24", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 

@@ -1,0 +1,137 @@
+name: "macOS DMG Build & Notarize"
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build"
+        required: true
+        type: string
+
+env:
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
+  APPLE_ID: ${{ secrets.APPLE_ID }}
+  APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+jobs:
+  build-universal:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build for x86_64
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build for aarch64
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create Universal binary
+        run: |
+          lipo -create \
+            target/x86_64-apple-darwin/release/nanna \
+            target/aarch64-apple-darwin/release/nanna \
+            -output target/universal/release/nanna
+
+      - name: Build daemon for x86_64
+        run: cargo build --release --target x86_64-apple-darwin --package nanna-daemon
+
+      - name: Build daemon for aarch64
+        run: cargo build --release --target aarch64-apple-darwin --package nanna-daemon
+
+      - name: Create Universal daemon
+        run: |
+          lipo -create \
+            target/x86_64-apple-darwin/release/nanna-daemon \
+            target/aarch64-apple-darwin/release/nanna-daemon \
+            -output target/universal/release/nanna-daemon
+
+      - name: Create app bundle
+        run: |
+          mkdir -p build/Nanna.app/Contents/MacOS
+          cp target/universal/release/nanna build/Nanna.app/Contents/MacOS/nanna
+          cp target/universal/release/nanna-daemon build/Nanna.app/Contents/MacOS/nanna-daemon
+
+      - name: Create DMG
+        run: |
+          mkdir -p build/Nanna.app/Contents/Resources
+          # Create a simple HTML page for the app
+          cat > build/Nanna.app/Contents/Resources/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Nanna</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.physics515.nanna</string>
+            <key>CFBundleVersion</key>
+            <string>${{ env.VERSION }}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ env.VERSION }}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>nanna</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign app with Developer ID
+        run: |
+          # Sign the binary
+          codesign --force --deep --sign "Developer ID Application: physics515 (YOUR_TEAM_ID)" \
+            --options runtime \
+            build/Nanna.app/Contents/MacOS/nanna
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "Nanna" -srcfolder build -ov -format UDZO Nanna_${{ env.VERSION }}.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanna-macos-dmg
+          path: Nanna_${{ env.VERSION }}.dmg
+
+  notarize:
+    needs: build-universal
+    runs-on: macos-14
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: nanna-macos-dmg
+          path: .
+
+      - name: Notarize
+        run: |
+          xcrun notarytool store-credentials "nanna-notary" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
+
+          xcrun notarytool submit Nanna_${{ env.VERSION }}.dmg \
+            --keychain-profile "nanna-notary" \
+            --wait
+
+      - name: Staple
+        run: |
+          xcrun stapler staple Nanna_${{ env.VERSION }}.dmg
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Nanna_${{ env.VERSION }}.dmg
+          draft: false
+          prerelease: false

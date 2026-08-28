@@ -44,7 +44,7 @@ mod tests;
 
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
-    sessions: Arc<SessionManager>,
+    pub(crate) sessions: Arc<SessionManager>,
     agent: Option<Arc<AgentService>>,
     memory: Option<Arc<MemoryService>>,
     tools: Option<Arc<ToolRegistry>>,
@@ -103,12 +103,21 @@ pub struct ControlPlane {
     /// Live long-horizon chat runs and their interjection intake (P18).
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
-    chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    pub(crate) chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    /// Per-session liveness ledgers (P22): current phase, last tool, last
+    /// side-effecting call, stop state — stamped by the chat sink, read by
+    /// the liveness beat and the `session.liveness` verb.
+    liveness: Arc<crate::liveness::LivenessRegistry>,
     /// Daemon shutdown signal, so `SystemAction::Shutdown` can actually stop
     /// the daemon (clients like the GUI prefer a graceful IPC stop over a
     /// hard kill). `None` in minimal test constructions — the handler then
     /// reports the request as unsupported instead of pretending to stop.
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Capability-transition notices (P22 Tier 4), shared with the daemon's
+    /// provider plumbing; every step runner this plane builds delivers
+    /// pending transitions once, in the model's next tool result. `None` in
+    /// minimal test constructions.
+    degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 impl ControlPlane {
@@ -142,7 +151,9 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -200,7 +211,9 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -260,7 +273,9 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -269,6 +284,15 @@ impl ControlPlane {
     #[must_use]
     pub fn with_shutdown(mut self, tx: tokio::sync::broadcast::Sender<()>) -> Self {
         self.shutdown_tx = Some(tx);
+        self
+    }
+
+    /// Share the capability-transition ledger (P22 Tier 4) with every step
+    /// runner this plane builds. Must be the SAME `Arc` the provider plumbing
+    /// records into — a second ledger would announce nothing.
+    #[must_use]
+    pub fn with_degradations(mut self, ledger: Arc<nanna_agent::DegradationLedger>) -> Self {
+        self.degradations = Some(ledger);
         self
     }
 
@@ -352,6 +376,13 @@ impl ControlPlane {
     /// Set the log buffer for serving daemon logs
     pub fn with_log_buffer(mut self, buffer: LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
+        self
+    }
+
+    /// Share a run registry created by the caller — the daemon's dream gate
+    /// holds the same handle, so "a mission is live" is one fact, not two.
+    pub fn with_chat_runs(mut self, runs: Arc<chat_harness::ChatRunRegistry>) -> Self {
+        self.chat_runs = runs;
         self
     }
 
@@ -531,8 +562,13 @@ impl ControlPlane {
     // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
 
-    /// Handle an action and return a response
-    pub async fn handle(&self, client_id: &str, action: Action) -> Value {
+    /// Handle an action and return a response.
+    ///
+    /// `Arc` receiver: the chat path spawns its heavy turn preparation
+    /// (recall, workspace context, memory writes) onto a task that outlives
+    /// this request, so the delivery ack can return in milliseconds (P22) —
+    /// that task needs an owned handle to the control plane.
+    pub async fn handle(self: &Arc<Self>, client_id: &str, action: Action) -> Value {
         match action {
             Action::Chat(chat) => {
                 // A chat request is the daemon doing real work — stamp the

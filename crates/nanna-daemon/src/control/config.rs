@@ -28,6 +28,18 @@ impl ControlPlane {
         );
     }
 
+    /// Tell every connected client the config changed.
+    ///
+    /// Carries no payload — see [`Event::ConfigChanged`]. Fired once per
+    /// COMMITTED mutation (the in-memory config was replaced and the router
+    /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
+    /// error only means nobody is subscribed.
+    fn notify_config_changed(&self) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(Event::ConfigChanged);
+        }
+    }
+
     // =========================================================================
     // Config Handlers
     // =========================================================================
@@ -130,18 +142,14 @@ impl ControlPlane {
                             }
                         }
 
-                        // Propagate LLM config changes to agent service
+                        // Propagate LLM config changes to agent service.
+                        // Whole-`[llm]` push, not just the model fields: a
+                        // `set` of e.g. `llm.summarization_priority` used to
+                        // land on disk and in `self.config` while the running
+                        // agent kept summarizing on the boot-time model.
                         if path.starts_with("llm.") {
                             if let Some(ref agent) = self.agent {
-                                let model = if config.llm.model_priority.is_empty() {
-                                    Some(config.llm.model.clone())
-                                } else {
-                                    config.llm.model_priority.first().cloned()
-                                };
-                                agent.update_config(
-                                    model,
-                                    Some(config.llm.model_priority.clone()),
-                                ).await;
+                                agent.apply_llm_config(&config.llm).await;
                             }
                         }
 
@@ -152,6 +160,7 @@ impl ControlPlane {
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
                         self.apply_scheduler_settings(&snapshot).await;
+                        self.notify_config_changed();
 
                         json!({ "status": "updated", "path": path })
                     }
@@ -176,21 +185,14 @@ impl ControlPlane {
 
                     // Propagate to agent service
                     if let Some(ref agent) = self.agent {
-                        let model = if config.llm.model_priority.is_empty() {
-                            Some(config.llm.model.clone())
-                        } else {
-                            config.llm.model_priority.first().cloned()
-                        };
-                        agent.update_config(
-                            model,
-                            Some(config.llm.model_priority.clone()),
-                        ).await;
+                        agent.apply_llm_config(&config.llm).await;
                     }
 
                     let snapshot = config.clone();
                     drop(config);
                     self.rebuild_llm_providers(&snapshot).await;
                     self.apply_scheduler_settings(&snapshot).await;
+                    self.notify_config_changed();
 
                     json!({ "status": "reset" })
                 }
@@ -204,15 +206,7 @@ impl ControlPlane {
 
                         // Propagate to agent service
                         if let Some(ref agent) = self.agent {
-                            let model = if config.llm.model_priority.is_empty() {
-                                Some(config.llm.model.clone())
-                            } else {
-                                config.llm.model_priority.first().cloned()
-                            };
-                            agent.update_config(
-                                model,
-                                Some(config.llm.model_priority.clone()),
-                            ).await;
+                            agent.apply_llm_config(&config.llm).await;
                         }
 
                         // This is the reload the GUI triggers after saving a
@@ -225,6 +219,7 @@ impl ControlPlane {
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
                         self.apply_scheduler_settings(&snapshot).await;
+                        self.notify_config_changed();
 
                         json!({ "status": "reloaded" })
                     }
@@ -258,10 +253,17 @@ impl ControlPlane {
                         
                         info!("Config imported");
 
+                        // Import replaces the whole config, `[llm]` included —
+                        // it propagates for the same reason set/reset/reload do.
+                        if let Some(ref agent) = self.agent {
+                            agent.apply_llm_config(&config.llm).await;
+                        }
+
                         let snapshot = config.clone();
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
                         self.apply_scheduler_settings(&snapshot).await;
+                        self.notify_config_changed();
 
                         json!({ "status": "imported" })
                     }

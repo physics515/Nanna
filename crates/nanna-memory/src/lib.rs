@@ -1,5 +1,12 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
+// Raised for the same reason as `nanna-daemon`'s: proving a future or closure
+// is `Send` walks into wgpu's `Global`/`Hub`/`Registry` graph by way of
+// `CosineSimilaritySearch`, which is deeper than the default limit of 128.
+// nightly-2026-08-25 turned that overflow into the future-incompatible
+// `recursion_depth_exceeding_limit` warning (rust#159228), which is scheduled
+// to become a hard error. Solver depth only — no behaviour, no codegen change.
+#![recursion_limit = "256"]
 
 //! Memory and embedding system for Nanna
 //!
@@ -25,6 +32,7 @@ pub use consolidation::{
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
     create_consolidated_entry, composite_cluster_score,
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
+    is_verbatim_pinned, FACT_TYPE_METADATA_KEY,
 };
 pub use dreaming::{
     dream_trigger, DreamOutcome, DreamTrigger, DreamingConfig, DreamingService, DreamingStats,
@@ -34,6 +42,10 @@ pub use fsrs::{
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
     power_law_retrievability,
 };
+// The decay exponent's published value and the range a fitted one may take.
+// Exported because `FsrsParameters::w20` is public and its doc names them: a
+// caller overriding the exponent needs the same bounds the default is held to.
+pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
     MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
     MemoryStats, MemoryListEntry, ConsolidationBands,
@@ -110,6 +122,49 @@ pub struct MemoryStoreHealth {
     pub corrupt_rows: usize,
     pub loaded: usize,
     pub expected: usize,
+}
+
+/// What a search could actually COMPARE, measured during the scan it describes.
+///
+/// An empty result set has three causes and they are not interchangeable:
+/// nothing matched, the rows exist but carry no vector the query can be scored
+/// against, or the query itself is the wrong width for the store's binding and
+/// nothing was scanned at all. Reported as "No memories found" they are
+/// indistinguishable — a total blackout reads as an honest miss, and the reader
+/// stops looking.
+///
+/// Measured in the scan rather than read from a rebind-time counter, because a
+/// snapshot taken when the binding changed goes stale the moment the backfill
+/// starts draining. The width predicate is already evaluated per row by the
+/// store's `cosine_or_stale`, so counting it costs nothing and is exact at
+/// answer time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchCoverage {
+    /// Entries in the store when the scan ran.
+    pub total: usize,
+    /// Entries whose stored vector had the query's width — the only ones a
+    /// cosine can score. The remainder are queued for backfill (empty vector)
+    /// or still bound to a superseded model's width.
+    pub comparable: usize,
+    /// False when the QUERY's width disagrees with the store's binding, in
+    /// which case no row was scanned: every memory is unreachable, not absent.
+    pub query_width_matches: bool,
+}
+
+impl SearchCoverage {
+    /// Entries the scan could not score. Never a "no match" — a row that was
+    /// not compared was not consulted.
+    #[must_use]
+    pub fn unsearchable(&self) -> usize {
+        self.total.saturating_sub(self.comparable)
+    }
+
+    /// Whether every entry in the store was actually scored, so an empty
+    /// result really does mean "nothing matched".
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.query_width_matches && self.unsearchable() == 0
+    }
 }
 
 #[async_trait]
@@ -703,8 +758,32 @@ impl VectorStore {
     }
 
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
+        self.search_with_coverage(query_embedding, top_k).await.0
+    }
+
+    /// [`search`](Self::search), plus what the scan could actually compare.
+    ///
+    /// Same ranking, same results — the extra return is measured inside the
+    /// scan that produced them, so a caller can tell an empty answer that means
+    /// "nothing matched" from one that means "nothing was searchable". See
+    /// [`SearchCoverage`].
+    pub async fn search_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
         if query_embedding.len() != self.config.get_dimension() {
-            return Vec::new();
+            // Nothing was scanned. The store is not empty of matches, it is
+            // unreachable at this width — say which.
+            let total = self.entries.read().await.len();
+            return (
+                Vec::new(),
+                SearchCoverage {
+                    total,
+                    comparable: 0,
+                    query_width_matches: false,
+                },
+            );
         }
 
         // Normalize query
@@ -715,8 +794,28 @@ impl VectorStore {
         let entry_count = entries.len();
 
         if entry_count == 0 {
-            return Vec::new();
+            return (
+                Vec::new(),
+                SearchCoverage {
+                    total: 0,
+                    comparable: 0,
+                    query_width_matches: true,
+                },
+            );
         }
+
+        // Exact at answer time: the same width predicate `cosine_or_stale`
+        // applies row by row, counted once here rather than inferred from a
+        // rebind-time snapshot that the backfill invalidates as it drains.
+        let comparable = entries
+            .iter()
+            .filter(|e| e.embedding.len() == query.len())
+            .count();
+        let coverage = SearchCoverage {
+            total: entry_count,
+            comparable,
+            query_width_matches: true,
+        };
 
         // Benchmark-calibrated threshold: GPU only wins with persistent buffers or
         // very large vector counts. With per-search buffer upload, the ~750us fixed
@@ -786,7 +885,7 @@ impl VectorStore {
             .map(|(idx, sim)| (entries[idx].clone(), sim))
             .collect();
         drop(entries);
-        scored
+        (scored, coverage)
     }
 
     /// Search for similar memories with workspace scope filtering.
@@ -800,8 +899,26 @@ impl VectorStore {
         top_k: usize,
         workspace_id: Option<&str>,
     ) -> Vec<(MemoryEntry, f32)> {
-        let all_results = self.search(query_embedding, top_k * 3).await; // Get more to filter
-        
+        self.search_scoped_with_coverage(query_embedding, top_k, workspace_id)
+            .await
+            .0
+    }
+
+    /// [`search_scoped`](Self::search_scoped), plus what the scan could compare.
+    ///
+    /// The coverage describes the SCAN, which is unscoped — a memory the
+    /// workspace filter then drops was still searched. That is the number the
+    /// caller needs: it separates "your query matched nothing" from "most of
+    /// the store could not be consulted".
+    pub async fn search_scoped_with_coverage(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        workspace_id: Option<&str>,
+    ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        // Get more to filter
+        let (all_results, coverage) = self.search_with_coverage(query_embedding, top_k * 3).await;
+
         let filtered: Vec<(MemoryEntry, f32)> = match workspace_id {
             // Workspace scope: global + this workspace only
             Some(ws_id) => all_results
@@ -814,8 +931,8 @@ impl VectorStore {
             // Global scope: all memories
             None => all_results.into_iter().take(top_k).collect(),
         };
-        
-        filtered
+
+        (filtered, coverage)
     }
 
     /// Get entry by ID
@@ -993,9 +1110,42 @@ impl VectorStore {
         &self,
         id: &str,
         content: &str,
-        mut embedding: Vec<f32>,
+        embedding: Vec<f32>,
         model: Option<&str>,
     ) -> Result<(), MemoryError> {
+        self.update_content_and_embedding_if(id, None, content, embedding, model)
+            .await
+            .map(|applied| {
+                debug_assert!(applied, "an unguarded rewrite always applies");
+            })
+    }
+
+    /// [`Self::update_content_and_embedding`] guarded by a compare-and-swap on
+    /// the entry's CURRENT content. Returns `Ok(false)` — touching nothing —
+    /// when `expected_content` is `Some` and the entry's live content differs.
+    ///
+    /// This is the primitive that makes a dream-cycle rewrite safe against a
+    /// concurrent live write. The dream paths (dedup fold, expansion) decide
+    /// what to write from a SNAPSHOT taken seconds earlier — long enough for a
+    /// `remember` on the same memory to have folded new content in — and an
+    /// unguarded rewrite would replace that fresh content with a merge of the
+    /// stale snapshot: a silent lost update. The check runs INSIDE the entries
+    /// write lock, the same critical section as the mutation, so there is no
+    /// window between verify and write. On `false` the caller skips its fold
+    /// (the pair is simply re-examined by the next cycle — lossless), never
+    /// retries blindly.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::update_content_and_embedding`].
+    pub async fn update_content_and_embedding_if(
+        &self,
+        id: &str,
+        expected_content: Option<&str>,
+        content: &str,
+        mut embedding: Vec<f32>,
+        model: Option<&str>,
+    ) -> Result<bool, MemoryError> {
         debug_assert!(!id.is_empty(), "memory id must not be empty");
         debug_assert!(!content.is_empty(), "merged content must not be empty");
         if !embedding.is_empty() && embedding.len() != self.config.get_dimension() {
@@ -1014,6 +1164,11 @@ impl VectorStore {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        if let Some(expected) = expected_content {
+            if entry.content != expected {
+                return Ok(false);
+            }
+        }
         entry.content = content.to_string();
         entry.embeddings.clear();
         if embedding.is_empty() {
@@ -1059,7 +1214,75 @@ impl VectorStore {
         .await;
 
         debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
-        Ok(())
+        Ok(true)
+    }
+
+    /// Remove entries whose content STILL MATCHES the snapshot the caller
+    /// folded from, in one batch. `pairs` is `(id, expected_content)`.
+    ///
+    /// The destructive half of a dream fold: the survivor was rewritten to
+    /// contain each source's text, and then the sources are removed. But
+    /// removal decided from a snapshot is only safe while the source is
+    /// unchanged — a live `remember` may have folded NEW content into a
+    /// source between the snapshot and this batch, and unconditionally
+    /// removing it would delete text that exists nowhere else. A changed
+    /// source is simply kept (skipped), which leaves a transient
+    /// near-duplicate for the next cycle to re-fold — lossless, like every
+    /// other fold fallback.
+    ///
+    /// Returns the number of entries actually removed. Persistence is one
+    /// batched call for the removed set, matching [`Self::remove_many`].
+    pub async fn remove_many_matching(&self, pairs: &[(&str, &str)]) -> usize {
+        if pairs.is_empty() {
+            return 0;
+        }
+        let expected: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+
+        // Decide and remove inside ONE write-lock critical section, so no
+        // write can land between the content check and the removal.
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        let mut removed_ids: Vec<String> = Vec::with_capacity(pairs.len());
+        entries.retain(|e| {
+            let matches = expected
+                .get(e.id.as_str())
+                .is_some_and(|want| e.content == **want);
+            if matches {
+                removed_ids.push(e.id.clone());
+            }
+            !matches
+        });
+        let removed = before - entries.len();
+        drop(entries);
+
+        debug_assert_eq!(removed, removed_ids.len(), "one id per removed entry");
+        debug_assert!(removed <= pairs.len(), "cannot remove more than requested");
+
+        if removed < pairs.len() {
+            debug!(
+                requested = pairs.len(),
+                removed,
+                "matched removal skipped concurrently-rewritten entries; they \
+                 stay live for the next cycle"
+            );
+        }
+
+        // Write-through: one batched persistence call for the whole set.
+        if let Some(ref db) = self.db {
+            if !removed_ids.is_empty() {
+                let id_refs: Vec<&str> = removed_ids.iter().map(String::as_str).collect();
+                if let Err(e) = db.remove_entries(&id_refs).await {
+                    warn!(
+                        "Failed to batch-remove {} memory entries from persistence: {}",
+                        id_refs.len(),
+                        e
+                    );
+                    // Non-fatal
+                }
+            }
+        }
+
+        removed
     }
 
     /// Get all entries (for consolidation)
@@ -2210,6 +2433,66 @@ mod tests {
         );
     }
 
+    /// An empty answer must be able to say WHY. The three states are not
+    /// interchangeable: nothing matched, N of M rows carry no vector this query
+    /// can be scored against, and the query width does not match the binding at
+    /// all — the last one is a total blackout, and reported as "no memories
+    /// found" it reads as an honest miss.
+    ///
+    /// Measured in the scan, not from a rebind-time snapshot: the backfill
+    /// drains continuously, so any counter taken when the binding changed is
+    /// stale by the time a question is asked.
+    #[tokio::test]
+    async fn search_reports_what_it_could_actually_compare() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        let good = MemoryEntry {
+            embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..entry_dim8("good")
+        };
+        store.add(good).await.unwrap();
+        let mut queued = entry_dim8("queued");
+        queued.embedding = Vec::new();
+        store.add(queued).await.unwrap();
+        let mut stale = entry_dim8("stale");
+        stale.embedding = Vec::new();
+        store.add(stale).await.unwrap();
+
+        let (_, coverage) = store
+            .search_with_coverage(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .await;
+        assert_eq!(coverage.total, 3);
+        assert_eq!(coverage.comparable, 1, "only the embedded row was scored");
+        assert_eq!(coverage.unsearchable(), 2);
+        assert!(coverage.query_width_matches);
+        assert!(
+            !coverage.is_complete(),
+            "an empty answer from this scan would not mean 'nothing matched'"
+        );
+
+        // The blackout: the query is the wrong width for the binding, so the
+        // scan never ran. Every memory is unreachable, not absent.
+        let (results, coverage) = store.search_with_coverage(&[1.0, 0.0], 10).await;
+        assert!(results.is_empty());
+        assert!(!coverage.query_width_matches);
+        assert_eq!(coverage.total, 3, "the store is not empty — it is unreachable");
+        assert_eq!(coverage.comparable, 0);
+
+        // And a store that could be read whole says so, so a genuine miss is
+        // still reportable as a genuine miss.
+        let searchable = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        searchable.add(entry_dim8("only")).await.unwrap();
+        let (_, coverage) = searchable.search_with_coverage(&[0.0; 8], 10).await;
+        assert!(coverage.is_complete());
+    }
+
     /// Rewriting content invalidates every previously computed vector, so the
     /// bucket map must reset to just the producing model's — a later rebind
     /// must never resurrect a vector for text that no longer exists.
@@ -2249,5 +2532,103 @@ mod tests {
         assert!(queued.embedding.is_empty(), "queued for backfill");
         assert!(queued.embeddings.is_empty());
         assert_eq!(queued.embedding_model, None);
+    }
+
+    /// The compare-and-swap half of the fold-vs-live-write fix: a guarded
+    /// rewrite whose expectation went stale must decline and touch nothing —
+    /// applying a merge computed from a stale snapshot is a silent lost
+    /// update (the dream-cycle vs `remember` interleave, 2026-08-10 class).
+    #[tokio::test]
+    async fn guarded_rewrite_declines_when_the_content_moved() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        store.add(entry_dim8("m")).await.unwrap();
+        let snapshot = store.get("m").await.unwrap().content;
+
+        // A concurrent writer moves the content…
+        store
+            .update_content_and_embedding("m", "the live write", vec![1.0; 8], Some("prov:a"))
+            .await
+            .unwrap();
+
+        // …so a rewrite guarded by the OLD snapshot must decline whole.
+        let applied = store
+            .update_content_and_embedding_if(
+                "m",
+                Some(snapshot.as_str()),
+                "a merge of the stale snapshot",
+                vec![0.5; 8],
+                Some("prov:a"),
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "a stale expectation must decline the swap");
+        let live = store.get("m").await.unwrap();
+        assert_eq!(
+            live.content, "the live write",
+            "a declined swap must leave the live write intact"
+        );
+        assert_eq!(
+            live.embedding_model.as_deref(),
+            Some("prov:a"),
+            "a declined swap must not touch the binding either"
+        );
+
+        // A fresh expectation applies normally.
+        let applied = store
+            .update_content_and_embedding_if(
+                "m",
+                Some("the live write"),
+                "a merge of the live content",
+                vec![0.25; 8],
+                Some("prov:a"),
+            )
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            store.get("m").await.unwrap().content,
+            "a merge of the live content"
+        );
+    }
+
+    /// The matched-removal half: removal authorized against a snapshot must
+    /// only delete entries whose content is STILL that snapshot. A source a
+    /// live write rewrote after the fold decision keeps its fresh content.
+    #[tokio::test]
+    async fn matched_removal_keeps_a_rewritten_entry() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        store.add(entry_dim8("stale")).await.unwrap();
+        store.add(entry_dim8("moved")).await.unwrap();
+        let stale_snapshot = store.get("stale").await.unwrap().content;
+        let moved_snapshot = store.get("moved").await.unwrap().content;
+
+        // "moved" is rewritten between the fold decision and the batch removal.
+        store
+            .update_content_and_embedding("moved", "fresh content the fold never saw", vec![1.0; 8], None)
+            .await
+            .unwrap();
+
+        let removed = store
+            .remove_many_matching(&[
+                ("stale", stale_snapshot.as_str()),
+                ("moved", moved_snapshot.as_str()),
+            ])
+            .await;
+
+        assert_eq!(removed, 1, "only the unchanged entry may be removed");
+        assert!(store.get("stale").await.is_none(), "the unchanged source is folded away");
+        let kept = store.get("moved").await.expect("the rewritten source must survive");
+        assert_eq!(kept.content, "fresh content the fold never saw");
+
+        // Negative space: an empty batch is a no-op.
+        assert_eq!(store.remove_many_matching(&[]).await, 0);
     }
 }

@@ -1,4 +1,14 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// The auto-trait solver proves `DaemonServer::run`'s scheduler closure is
+// `Send` by walking the whole state tuple, and that walk descends through
+// `MemoryService` -> `VectorStore` -> `CosineSimilaritySearch` -> wgpu's
+// `Global`/`Hub`/`Registry` graph, which is deeper than the default limit of
+// 128. nightly-2026-08-25 turned the resulting overflow into the
+// future-incompatible `recursion_depth_exceeding_limit` warning (rust#159228)
+// — it is scheduled to become a hard error, so the limit is raised here rather
+// than left to break a future toolchain bump. This costs solver depth only;
+// it changes no behaviour and no generated code.
+#![recursion_limit = "256"]
 
 //! Nanna Daemon - Main entry point
 //!
@@ -241,33 +251,45 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         
         // Setup signal handlers
         let shutdown_tx = daemon.shutdown_handle();
-        
+        // Record the signal in the terminal reason file BEFORE requesting the
+        // drain: if the process is killed mid-drain the record says `signal`,
+        // and if the drain completes it is overwritten with `clean_shutdown`.
+        // Either way the file never reads `running` for a signal-initiated
+        // death. (No-op until the daemon arms the file at startup, so a
+        // duplicate instance Ctrl-C'd while losing the PID race cannot
+        // clobber the live daemon's record.)
+        let exit_reason = daemon.exit_reason_handle();
+
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
             let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
-            
+
             let shutdown = shutdown_tx.clone();
             tokio::spawn(async move {
-                tokio::select! {
+                let name = tokio::select! {
                     _ = sigterm.recv() => {
                         info!("Received SIGTERM");
+                        "SIGTERM"
                     }
                     _ = sigint.recv() => {
                         info!("Received SIGINT");
+                        "SIGINT"
                     }
-                }
+                };
+                exit_reason.record_exit("signal", Some(name));
                 let _ = shutdown.send(());
             });
         }
-        
+
         #[cfg(windows)]
         {
             let shutdown = shutdown_tx.clone();
             tokio::spawn(async move {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Received Ctrl+C");
+                exit_reason.record_exit("signal", Some("ctrl_c"));
                 let _ = shutdown.send(());
             });
         }

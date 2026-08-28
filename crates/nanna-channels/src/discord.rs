@@ -524,8 +524,8 @@ pub struct DiscordChannelInfo {
 
 #[async_trait]
 impl Channel for DiscordChannel {
-    fn provider(&self) -> &str {
-        "discord"
+    fn provider(&self) -> String {
+        "discord".to_string()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {

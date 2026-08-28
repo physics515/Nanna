@@ -3,6 +3,7 @@
 //! Exposes controlled Nanna functionality to JavaScript code.
 
 use crate::{Result, ScriptError, tool::ToolPermissions};
+use nanna_proc::{ChildJob, kill_process_tree};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -94,6 +95,29 @@ fn classify_windows_command(trimmed: &str) -> WinShell {
         WinShell::PowerShell
     } else {
         WinShell::Bash
+    }
+}
+
+/// Strip the outer quotes off a `python -c` payload when it has a matching pair.
+///
+/// `rest` is whatever followed `-c`, already trimmed. The length guard is the
+/// whole point: a lone quote — `python -c "`, the unterminated one-liner a model
+/// emits routinely — satisfies BOTH `starts_with` and `ends_with` on the SAME
+/// character, so the bare `&rest[1..rest.len() - 1]` was the inverted range
+/// `[1..0]`, and that panic unwound out of the daemon instead of letting python
+/// answer for a malformed command. Below two characters there is no pair to
+/// strip, so the payload passes through as written.
+#[cfg(windows)]
+fn strip_outer_quotes(rest: &str) -> &str {
+    let quoted = rest.len() >= 2
+        && ((rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('\'') && rest.ends_with('\'')));
+    if quoted {
+        // Both bounds land on the ASCII quotes themselves, so they stay char
+        // boundaries however multi-byte the code between them is.
+        &rest[1..rest.len() - 1]
+    } else {
+        rest
     }
 }
 
@@ -375,36 +399,52 @@ pub fn default_exec_timeout_secs(command: &str) -> u64 {
     }
 }
 
-/// Kill a process and its descendants, best-effort.
+/// One incremental read from a live child pipe into `sink`. Returns `true`
+/// once that pipe is finished — EOF, an unreadable pipe, or no pipe at all.
 ///
-/// On Windows this shells out to `taskkill /T /F`, which walks the tree from
-/// `pid` — necessary because killing only the shell we spawned would leave a
-/// grandchild (`cargo`, `git`) running and holding a workspace/build lock. On
-/// Unix the child is its own process-group leader (`process_group(0)` at
-/// spawn), so signalling the *negative* pid reaps the shell and every
-/// descendant in one call — `kill_on_drop` alone only reached the direct
-/// child and left grandchildren running.
-async fn kill_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+/// `read_buf` appends to `sink` and grows it itself, so the in-flight buffering
+/// is exactly what `wait_with_output` did: no cap is imposed here and none is
+/// needed — the exec deadline bounds the time, and the tool-result
+/// summarize/truncate routing bounds the size. It is also cancel-safe, so the
+/// deadline branch winning a `select!` race cannot swallow bytes that had
+/// already been read.
+async fn read_chunk<R>(reader: Option<&mut R>, sink: &mut Vec<u8>) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    match reader {
+        Some(reader) => !matches!(reader.read_buf(sink).await, Ok(n) if n > 0),
+        None => true,
     }
-    #[cfg(not(windows))]
-    {
-        // pid is a fresh process-group id from the kernel: it fits i32, and a
-        // failed signal (group already gone) is exactly the no-op we want.
-        #[allow(clippy::cast_possible_wrap)]
-        let pgid = -(pid as i32);
-        // SAFETY: kill(2) with a negative pgid signals a process group we
-        // created; `process_group(0)` at spawn put the child in its own
-        // group, so this can never reach our own.
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
+}
+
+/// Collect whatever a killed command's pipe can hand over WITHOUT waiting.
+///
+/// Called only after the tree has been reaped, to pick up the last bytes it
+/// wrote: on Windows the in-flight read completes on the blocking pool while
+/// `taskkill` runs, on Unix the bytes simply sit in the pipe. The `ready`
+/// branch ends the loop at the first read that would block, so this never
+/// waits for a byte that has not already arrived — a writer that somehow
+/// survived BOTH the tree walk and the Job Object cannot turn "killed at the
+/// deadline" into a hang, which is why the drain is not joined to EOF here.
+async fn drain_ready<R>(reader: Option<&mut R>, sink: &mut Vec<u8>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(reader) = reader else {
+        return;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            res = reader.read_buf(sink) => {
+                if !matches!(res, Ok(n) if n > 0) {
+                    return;
+                }
+            }
+            () = std::future::ready(()) => return,
         }
     }
 }
@@ -483,6 +523,21 @@ impl NannaBridge {
             }
         }
         
+        // An MSYS drive path the shell itself printed (`/d/Development/x`).
+        //
+        // On Windows such a path HAS a root but no drive prefix, so it reports
+        // `is_relative()` and the branch below joins it onto the workspace —
+        // turning `/d/Development/x` into `<drive-of-workdir>\d\Development\x`.
+        // Reads of a real file then answer "does not exist" while writes create
+        // a phantom tree and report success, so the same string addresses two
+        // different filesystems depending on which tool receives it. Git Bash
+        // is the shell here, so every path `exec` prints comes back in this
+        // shape and is routinely handed straight to a file tool.
+        #[cfg(windows)]
+        if let Some(native) = Self::msys_drive_path(path) {
+            return native;
+        }
+
         let p = Path::new(path);
         if p.is_relative() && !path.is_empty() {
             // Resolve relative to the active workspace working directory. The
@@ -500,6 +555,43 @@ impl NannaBridge {
             }
         }
         p.to_path_buf()
+    }
+
+    /// Translate an MSYS drive path (`/d/Development/x`, or `/d:/Development/x`)
+    /// into the native `D:\Development\x` form.
+    ///
+    /// Literal-first, the same precedence [`Self::repair_redundant_prefix`]
+    /// uses: a genuine single-letter directory at the root of the current drive
+    /// stays addressable, so this only rewrites when the literal path does not
+    /// exist and the native one does. `/d` alone is left alone — a drive path
+    /// needs something after the drive to name.
+    #[cfg(windows)]
+    fn msys_drive_path(path: &str) -> Option<PathBuf> {
+        let rest = path.strip_prefix('/')?;
+        let mut chars = rest.chars();
+        let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+        // Accept both `/d/...` and the `/d:/...` form some tools emit.
+        let tail = match chars.next()? {
+            ':' => rest.get(3..)?,
+            '/' => rest.get(2..)?,
+            _ => return None,
+        };
+        if tail.is_empty() {
+            return None;
+        }
+
+        // A real `/d/...` on this filesystem wins, exactly as a real nested
+        // directory wins over prefix repair.
+        if Path::new(path).exists() {
+            return None;
+        }
+
+        let native = PathBuf::from(format!(
+            "{}:\\{}",
+            drive.to_ascii_uppercase(),
+            tail.replace('/', "\\")
+        ));
+        native.exists().then_some(native)
     }
 
     /// Repair a relative path that redundantly repeats the tail of the working
@@ -668,13 +760,7 @@ impl NannaBridge {
                     ("python", trimmed.strip_prefix("python -c").unwrap_or("").trim())
                 };
                 // Strip outer quotes if present
-                let code = if (rest.starts_with('"') && rest.ends_with('"'))
-                    || (rest.starts_with('\'') && rest.ends_with('\''))
-                {
-                    &rest[1..rest.len() - 1]
-                } else {
-                    rest
-                };
+                let code = strip_outer_quotes(rest);
                 let mut c = tokio::process::Command::new(exe);
                 c.args(["-c", code]);
                 c
@@ -732,7 +818,8 @@ impl NannaBridge {
         let timeout = timeout_secs.unwrap_or_else(|| default_exec_timeout_secs(command));
 
         // Reap our direct child if this future is dropped (e.g. the outer script
-        // engine deadline fires) — a backstop for the explicit tree-kill below.
+        // engine deadline fires). The per-child Job Object below widens this
+        // backstop to the whole subtree on Windows.
         cmd.kill_on_drop(true);
 
         // Isolate the child from OUR process group.
@@ -763,38 +850,124 @@ impl NannaBridge {
             cmd.process_group(0);
         }
 
-        let child = cmd
+        // Wall clock for the result's `elapsed_ms`. Started before the spawn so
+        // it measures what the command actually cost the caller, and reported on
+        // BOTH exits — a run that finished and a run that was killed are then
+        // directly comparable.
+        let started = std::time::Instant::now();
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
         // Capture the pid *before* the wait future consumes the child, so a timeout
         // can kill the whole process tree rooted here (not just the shell).
         let pid = child.id();
-        let wait = child.wait_with_output();
+        // Windows: put the child in its OWN kill-on-close Job Object before it
+        // can fork. The taskkill walk below only reaches descendants of a pid
+        // it can still see — `foo &` leaves a grandchild holding our pipes
+        // after the shell died, invisible to the walk (2026-08-08: such a
+        // survivor pinned a blocking-pool pipe read and hung teardown 25+
+        // min). Job membership is inherited, so terminating the job reaps the
+        // whole subtree regardless; dropping this guard (future cancelled)
+        // does the same. Unix needs none of this: the process group IS the
+        // subtree, dead shell or not.
+        let mut job = ChildJob::assign(&child);
+
+        // Drain the pipes ourselves instead of `wait_with_output()`. The
+        // buffering is identical — the reads grow these two vectors exactly as
+        // `wait_with_output` grew its own, no cap is introduced (the deadline
+        // is still the time bound, and the tool-result summarize/truncate
+        // routing is still the size bound) — but the bytes accumulate in OUR
+        // hands. `wait_with_output` owns its buffers *inside* the future and
+        // drops them when the deadline cancels it, which is why every overrun
+        // used to reach the model as "nothing ran" while its side effects sat
+        // on disk.
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let mut out_done = out_pipe.is_none();
+        let mut err_done = err_pipe.is_none();
+        let mut stdout_bytes: Vec<u8> = Vec::new();
+        let mut stderr_bytes: Vec<u8> = Vec::new();
+        let wait = child.wait();
         tokio::pin!(wait);
-        let output = tokio::select! {
-            res = &mut wait => res
-                .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?,
-            () = tokio::time::sleep(std::time::Duration::from_secs(timeout)) => {
-                // Overran the deadline. Kill the entire tree — the shell *and* any
-                // long-running grandchild like cargo/git — so it can't outlive the
-                // tool call and hold a workspace/build lock (the failure mode that
-                // deadlocked repeated exec calls against each other). Do this while
-                // `wait` still owns the child, so the pid is still live.
-                if let Some(pid) = pid {
-                    kill_process_tree(pid).await;
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout));
+        tokio::pin!(deadline);
+        let mut status = None;
+
+        // "Completed" means exactly what `wait_with_output` meant: the child
+        // exited AND both pipes hit EOF. A backgrounded grandchild still
+        // holding our write handles therefore still runs the deadline out —
+        // that is the `foo &` shape the tree-kill and the Job Object exist for.
+        let exit = loop {
+            if out_done && err_done && status.is_some() {
+                break status;
+            }
+            tokio::select! {
+                done = read_chunk(out_pipe.as_mut(), &mut stdout_bytes), if !out_done => {
+                    out_done = done;
                 }
-                return Err(ScriptError::Timeout(timeout * 1000));
+                done = read_chunk(err_pipe.as_mut(), &mut stderr_bytes), if !err_done => {
+                    err_done = done;
+                }
+                res = &mut wait, if status.is_none() => {
+                    status = Some(res.map_err(|e| {
+                        ScriptError::Bridge(format!("Failed to execute command: {e}"))
+                    })?);
+                }
+                () = &mut deadline => break None,
             }
         };
 
-        let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&output.stdout));
-        let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&output.stderr));
+        let Some(exit_status) = exit else {
+            // Overran the deadline. Kill the entire tree — the shell *and* any
+            // long-running grandchild like cargo/git — so it can't outlive the
+            // tool call and hold a workspace/build lock (the failure mode that
+            // deadlocked repeated exec calls against each other). Walk first
+            // while `wait` still owns the child (covers a live tree, including
+            // anything spawned before the job assignment landed), then
+            // terminate the job to sweep descendants the walk can't see.
+            if let Some(pid) = pid {
+                kill_process_tree(pid).await;
+            }
+            if let Some(job) = job.take() {
+                job.terminate();
+            }
+            // Then tell the truth. This used to return `Err(Timeout)`, which the
+            // exec tool rendered as "Nothing ran" — so the model retried a
+            // command that HAD run, re-doing side effects already on disk. The
+            // kill is unchanged; only the report is honest now: a result that
+            // says it was killed, how long it lived, and what it printed first.
+            // Tool errors return, they never throw.
+            drain_ready(out_pipe.as_mut(), &mut stdout_bytes).await;
+            drain_ready(err_pipe.as_mut(), &mut stderr_bytes).await;
+            return Ok(ExecResponse {
+                success: false,
+                code: None,
+                stdout: strip_ansi_escapes(&String::from_utf8_lossy(&stdout_bytes)),
+                stderr: strip_ansi_escapes(&String::from_utf8_lossy(&stderr_bytes)),
+                timed_out: true,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        };
+
+        // Completed: pipes EOF'd, shell exited. Anything still running is a
+        // deliberately detached background process (output redirected — e.g. a
+        // server the agent started on purpose). Spare it; the daemon-wide Job
+        // Object still bounds it.
+        if let Some(job) = job.take() {
+            job.disarm();
+        }
+
+        let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&stdout_bytes));
+        let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&stderr_bytes));
 
         Ok(ExecResponse {
-            success: output.status.success(),
-            code: output.status.code(),
+            success: exit_status.success(),
+            code: exit_status.code(),
             stdout,
             stderr,
+            timed_out: false,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
 
@@ -931,9 +1104,19 @@ impl NannaBridge {
             }
         }
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| ScriptError::Bridge(format!("Failed to write '{}': {e}", path.display())))
+        // Name the cause machine-readably. The OS message alone is localized
+        // prose ("Access is denied." / "Permission denied"), so a caller that
+        // wants to tell a NON-RETRYABLE failure (a write-protected file) from a
+        // transient one (Interrupted, WouldBlock, a sharing violation) has
+        // nothing stable to match on. `io::ErrorKind`'s Debug name is stable
+        // and locale-independent; the OS message still follows it verbatim.
+        tokio::fs::write(&path, content).await.map_err(|e| {
+            ScriptError::Bridge(format!(
+                "Failed to write '{}' (kind={:?}): {e}",
+                path.display(),
+                e.kind()
+            ))
+        })
     }
 
     /// Log a message
@@ -1107,6 +1290,15 @@ pub struct ExecResponse {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// The command overran its deadline and was killed. `stdout`/`stderr` then
+    /// carry what it had already printed: it RAN, and whatever side effects it
+    /// reached are on disk — disk is truth. Never true for a command that
+    /// finished on its own, and never true for a command that failed to start
+    /// (that is still an `Err`, because then genuinely nothing ran).
+    pub timed_out: bool,
+    /// Wall-clock milliseconds the command was alive. Measured on both exits,
+    /// so a killed command can say how long it ran before the deadline.
+    pub elapsed_ms: u64,
 }
 
 /// Fetch request options
@@ -1226,78 +1418,45 @@ fn strip_ansi_escapes(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The invariant: a path the SHELL prints must name the same file when it
+    /// is handed back to a file tool. Git Bash prints `/d/...`, and that used
+    /// to be treated as relative and joined onto the workspace, so a read of a
+    /// real file answered "does not exist" while a write conjured a shadow tree
+    /// under `<workdir>\d\...` and reported success.
+    #[cfg(windows)]
+    #[test]
+    fn an_msys_drive_path_from_the_shell_resolves_to_the_real_file() {
+        let dir = std::env::temp_dir().join("nanna-msys-path-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("real.txt");
+        std::fs::write(&file, b"x").expect("write probe file");
+
+        // Exactly what `pwd`/`realpath` hand back for this file.
+        let native = file.to_string_lossy().replace('\\', "/");
+        let msys = format!("/{}{}", &native[..1].to_lowercase(), &native[2..]);
+
+        let workdir = std::path::PathBuf::from("D:/Development/some-workspace");
+        let resolved = NannaBridge::resolve_path_with_workdir(&msys, Some(&workdir));
+
+        assert_eq!(
+            resolved, file,
+            "the shell-printed path {msys} must resolve back to the file it names,              not be joined onto the workspace"
+        );
+
+        std::fs::remove_file(&file).ok();
+    }
+
     // ---------------------------------------------------------------------
-    // Tree-kill: the timeout path must reap the shell AND its grandchildren
-    // (the failure mode was a wedged workload holding a workspace/build lock
-    // across exec calls; on daemon death the leaked children accumulated —
-    // 89 powershell.exe counted 2026-08-01).
+    // Tree-kill: the timeout path must reap the shell AND its grandchildren.
+    // The walk itself (`kill_process_tree`) and its unit tests live in
+    // nanna-proc; what belongs here is the exec-level contract — including
+    // the shape the walk alone cannot cover.
     // ---------------------------------------------------------------------
 
-    /// Reap bound: SIGKILL / taskkill is near-instant; 5s is a generous
-    /// ceiling for a loaded CI machine, polled at 50ms.
+    /// Reap bound: taskkill / `TerminateJobObject` is near-instant; 5s is a
+    /// generous ceiling for a loaded CI machine, polled at 50ms.
     #[allow(dead_code)] // used by the platform-specific test below
     const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Grandchild-startup bound: powershell/sh must write its child's pid
-    /// file well within this; dominated by powershell cold-start on Windows.
-    #[allow(dead_code)]
-    const SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn kill_process_tree_reaps_shell_and_grandchild() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("grandchild.pid");
-
-        // PowerShell parent spawns a detached ping sleeper (grandchild),
-        // records its Windows pid, then sleeps — same shape as an exec'd
-        // build command that forks a worker.
-        let script = format!(
-            "$p = Start-Process -WindowStyle Hidden -PassThru cmd.exe -ArgumentList '/C','ping -n 60 127.0.0.1 >nul'; \
-             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
-            pid_file.display()
-        );
-        // Same isolation flag the exec path uses.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let mut cmd = tokio::process::Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        let mut child = cmd.spawn().expect("spawn powershell parent");
-        let pid = child.id().expect("pid of live child");
-
-        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
-        let grandchild_pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file)
-                && let Ok(gc) = text.trim().parse::<u32>()
-            {
-                break gc;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild never reported its pid"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        };
-
-        kill_process_tree(pid).await;
-
-        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
-        loop {
-            let shell_dead = child.try_wait().expect("try_wait").is_some();
-            let grandchild_dead = !windows_pid_alive(grandchild_pid).await;
-            if shell_dead && grandchild_dead {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "tree survived kill_process_tree (shell_dead={shell_dead}, grandchild_dead={grandchild_dead})"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
 
     /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks
     /// use Win32 directly (see nanna-daemon health.rs for why).
@@ -1310,59 +1469,75 @@ mod tests {
             .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_process_tree_reaps_process_group() {
+    /// REGRESSION (2026-08-08, ministral endurance teardown hang): `foo &` —
+    /// the shell exits immediately, the backgrounded grandchild inherits our
+    /// stdout/stderr write handles, the pipe drains never see EOF, and
+    /// the timeout fires with the shell already DEAD. The parent-walk
+    /// tree-kill (`taskkill /T` from the dead pid) finds nothing, so pre-fix
+    /// the grandchild survived holding the pipe — and because tokio
+    /// child-pipe reads on Windows are synchronous reads on the blocking
+    /// pool, it pinned a blocking thread until process exit (25+ min hung
+    /// teardown). The per-child Job Object must reap the grandchild anyway,
+    /// EOFing the pipe so those reads complete and runtime shutdown is
+    /// prompt.
+    #[cfg(windows)]
+    #[test]
+    fn exec_timeout_reaps_detached_grandchild_and_frees_pipe_reads() {
+        if git_bash_path().is_none() {
+            eprintln!(
+                "skipping exec_timeout_reaps_detached_grandchild_and_frees_pipe_reads: Git Bash not installed"
+            );
+            return;
+        }
+        // A dedicated runtime so the test can measure its teardown — the
+        // production symptom was Runtime::drop joining the pinned read.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("grandchild.pid");
+        // Bash-native forward slashes: this path never goes through the
+        // model-facing drive normalization (that rewrites `D:\x` shapes).
+        let pid_path = pid_file.display().to_string().replace('\\', "/");
+        // Git Bash `$!` is an MSYS pid; /proc/<msys-pid>/winpid maps it to
+        // the real Windows pid so tasklist can probe it.
+        let command =
+            format!("ping -n 60 127.0.0.1 & cat /proc/$!/winpid > '{pid_path}'; exit 0");
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "sleep 60 & echo $! > '{}'; sleep 60",
-            pid_file.display()
-        ));
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        // Same isolation the exec path uses — and what gives us a pgid to kill.
-        cmd.process_group(0);
-        let mut child = cmd.spawn().expect("spawn sh parent");
-        let pid = child.id().expect("pid of live child");
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
 
-        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
-        let grandchild_pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file)
-                && let Ok(gc) = text.trim().parse::<i32>()
-            {
-                break gc;
+        let res = rt.block_on(bridge.exec_with_timeout(&command, None, Some(2)));
+        assert!(
+            res.as_ref().is_ok_and(|r| r.timed_out),
+            "held pipes must force the deadline kill, got {res:?}"
+        );
+
+        // The shell wrote the pid file before exiting, well inside the 2s
+        // deadline — readable by the time the call returns.
+        let text = std::fs::read_to_string(&pid_file).expect("grandchild pid file");
+        let grandchild_pid: u32 = text.trim().parse().expect("windows pid");
+
+        rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
+            while windows_pid_alive(grandchild_pid).await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "detached grandchild survived the exec timeout"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild never reported its pid"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
+        });
 
-        kill_process_tree(pid).await;
-
-        // Reap the shell (a zombie would still answer kill(pid, 0)).
-        let status = child.wait().await.expect("wait");
-        assert!(!status.success(), "shell must have died by signal");
-
-        // The grandchild reparents to init and is reaped there; poll bounded.
-        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
-        loop {
-            // SAFETY: signal 0 probes existence only.
-            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
-            if !alive {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild survived process-group kill"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        // With the grandchild dead the inherited pipe EOF'd and the blocking
+        // reads finished, so teardown is prompt. Pre-fix this join waited out
+        // the sleeper's full 60s.
+        let teardown = std::time::Instant::now();
+        drop(rt);
+        assert!(
+            teardown.elapsed() < REAP_DEADLINE,
+            "runtime teardown pinned by a leaked pipe read: {:?}",
+            teardown.elapsed()
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1582,6 +1757,30 @@ mod tests {
         }
     }
 
+    /// REGRESSION (`python -c "`): an unterminated one-liner leaves `rest` as a
+    /// single quote character, which satisfies BOTH halves of the outer-quote
+    /// test — so the strip evaluated `&rest[1..0]`, an inverted range, and the
+    /// panic took the whole daemon down over one malformed command. A payload
+    /// with no real pair to strip must pass through and let python report it.
+    #[cfg(windows)]
+    #[test]
+    fn lone_quote_python_payload_survives_the_outer_quote_strip() {
+        for (input, want) in [
+            ("\"", "\""),                      // the crash shape: one char, both ends
+            ("'", "'"),
+            ("", ""),
+            ("\"\"", ""),                      // an empty but genuine pair still unwraps
+            ("\"print(1)\"", "print(1)"),
+            ("'print(1)'", "print(1)"),
+            ("print(1)", "print(1)"),          // unquoted payloads are untouched
+            ("\"—\"", "—"),                    // em dash: 3 bytes, right against both bounds
+            ("\"print('—')\"", "print('—')"),
+            ("\"mismatched'", "\"mismatched'"), // no pair, so nothing is stripped
+        ] {
+            assert_eq!(strip_outer_quotes(input), want, "input: {input}");
+        }
+    }
+
     #[test]
     fn test_permission_check() {
         let bridge = NannaBridge::new(
@@ -1647,9 +1846,10 @@ mod tests {
         }
     }
 
-    /// A command that overruns its (explicit) timeout must return `Timeout`
-    /// promptly — not run to completion. Regression guard for the exec timeout
-    /// actually being honored and the select-based deadline firing.
+    /// A command that overruns its (explicit) timeout must be killed promptly —
+    /// not run to completion — and must say so in the RESULT, not by throwing.
+    /// Regression guard for the exec timeout actually being honored and the
+    /// select-based deadline firing.
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_times_out_and_returns_promptly() {
@@ -1661,7 +1861,7 @@ mod tests {
         let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        assert!(res.as_ref().is_ok_and(|r| r.timed_out), "got {res:?}");
         // Must fire near the 1s deadline, well before the 10s sleep would end.
         assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
     }
@@ -1682,8 +1882,109 @@ mod tests {
         let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        assert!(res.as_ref().is_ok_and(|r| r.timed_out), "got {res:?}");
         assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// REGRESSION (P23): an overrun used to return `Err(Timeout)`, which the
+    /// exec tool rendered to the model as "Nothing ran" — so the model retried
+    /// a command that HAD run, re-doing side effects already on disk. The kill
+    /// is unchanged; the report must now carry the truth: it was killed, it
+    /// lived this long, and this is what it printed before it died.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_timeout_carries_partial_output_and_elapsed() {
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let res = bridge
+            .exec_with_timeout("echo partial_before_deadline; sleep 10", None, Some(1))
+            .await
+            .expect("a deadline kill must RETURN a result, never throw");
+
+        assert!(res.timed_out, "the result must admit the kill: {res:?}");
+        assert!(!res.success, "a killed command did not succeed: {res:?}");
+        assert!(res.code.is_none(), "there is no exit status: {res:?}");
+        assert!(
+            res.stdout.contains("partial_before_deadline"),
+            "the output it managed to print must survive: {res:?}"
+        );
+        assert!(res.elapsed_ms > 0, "elapsed must be real: {res:?}");
+
+        // The completed path is untouched: no kill, no timed_out flag.
+        let done = bridge
+            .exec_with_timeout("echo finished_cleanly", None, Some(20))
+            .await
+            .expect("a completed command still returns Ok");
+        assert!(!done.timed_out, "nothing killed this one: {done:?}");
+        assert!(done.success, "{done:?}");
+        assert!(done.stdout.contains("finished_cleanly"), "{done:?}");
+    }
+
+    /// Same contract on Windows, routed through Git Bash (skipped if absent).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exec_timeout_carries_partial_output_and_elapsed() {
+        if git_bash_path().is_none() {
+            eprintln!(
+                "skipping exec_timeout_carries_partial_output_and_elapsed: Git Bash not installed"
+            );
+            return;
+        }
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let res = bridge
+            .exec_with_timeout("echo partial_before_deadline; sleep 10", None, Some(1))
+            .await
+            .expect("a deadline kill must RETURN a result, never throw");
+
+        assert!(res.timed_out, "the result must admit the kill: {res:?}");
+        assert!(!res.success, "a killed command did not succeed: {res:?}");
+        assert!(res.code.is_none(), "there is no exit status: {res:?}");
+        assert!(
+            res.stdout.contains("partial_before_deadline"),
+            "the output it managed to print must survive: {res:?}"
+        );
+        assert!(res.elapsed_ms > 0, "elapsed must be real: {res:?}");
+
+        // The completed path is untouched: no kill, no timed_out flag.
+        let done = bridge
+            .exec_with_timeout("echo finished_cleanly", None, Some(20))
+            .await
+            .expect("a completed command still returns Ok");
+        assert!(!done.timed_out, "nothing killed this one: {done:?}");
+        assert!(done.success, "{done:?}");
+        assert!(done.stdout.contains("finished_cleanly"), "{done:?}");
+    }
+
+    /// A write that fails must name the cause in a form a caller can MATCH on:
+    /// the OS message is localized prose, the `io::ErrorKind` name is not. The
+    /// tool layer keys its "this is not retryable" copy off that name.
+    #[tokio::test]
+    async fn write_failure_names_the_error_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = NannaBridge::new(ToolPermissions::none().with_write([dir.path()]));
+
+        // Writing a directory AS A FILE is the portable way to provoke a real
+        // `io::Error` through the same path a permission failure takes (the
+        // kind itself differs per platform, which is exactly why the assertion
+        // is on the shape, not on one kind).
+        let err = bridge
+            .write_file(&dir.path().to_string_lossy(), "x")
+            .await
+            .expect_err("writing a directory as a file must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("(kind="),
+            "the failure must name the io::ErrorKind: {msg}"
+        );
+        assert!(
+            msg.contains(&*dir.path().to_string_lossy()),
+            "the failure must still name the path: {msg}"
+        );
     }
 
     /// End-to-end: a POSIX/bash command with a pipe + `tail` (which used to fail in

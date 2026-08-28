@@ -39,14 +39,14 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
-    EmotionalContext, ExtractedMemory, MemoryCallback,
+    DegradationLedger, EmotionalContext, ExtractedMemory, MemoryCallback,
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RepeatLedger,
     RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
-    TASK_ANCHOR_MAX_BYTES, TaskComplexity,
+    TASK_ANCHOR_MAX_BYTES, TOOL_RESULT_CATEGORY, TaskComplexity,
     ThinkingCallback, ThinkingMode, ToolCallRecord,
-    budget_warning_message, claim_nudge_message, min_viable_num_ctx, narration_nudge_message,
-    repetition_nudge_message, thinking_spiral_nudge_message, tool_loop_nudge_message,
-    wrapup_nudge_due, wrapup_nudge_message,
+    budget_warning_message, claim_nudge_message, is_work_evidence_tool, min_viable_num_ctx,
+    narration_nudge_message, repetition_nudge_message, thinking_spiral_nudge_message,
+    tool_loop_nudge_message, wrapup_nudge_due, wrapup_nudge_message,
 };
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
@@ -88,6 +88,32 @@ pub enum AgentError {
     ContextTooLong,
     #[error("Agent stopped")]
     Stopped,
+    /// The in-flight LLM stream produced no event at all for longer than the
+    /// transport could possibly stay silent. The HTTP client already declares
+    /// its silence tolerance (`nanna_llm::STREAM_READ_TIMEOUT_SECS` between
+    /// chunks), so on any truly dead socket that timeout fires first and takes
+    /// the normal error path. Reaching a multiple of it means the transport
+    /// believes the stream healthy while nothing arrives — the stream future
+    /// itself is wedged (lost waker, swallowed pipeline stage). Observed
+    /// 2026-08-10: a turn held its session silent for 50+ minutes with zero
+    /// log output. The loop fails LOUDLY instead of hanging forever; the
+    /// step-retry and failure-notice chain announce it to the session.
+    #[error(
+        "stream watchdog: no stream event from {model} for {silent_secs}s — {multiple}× the \
+         transport's declared read timeout ({read_timeout_secs}s), which fires first on any \
+         truly silent socket; the stream future itself is wedged, so the call is abandoned \
+         loudly rather than hanging the turn"
+    )]
+    StreamWatchdog {
+        /// How long the loop waited without a single stream event.
+        silent_secs: u64,
+        /// The transport's declared per-chunk silence tolerance.
+        read_timeout_secs: u64,
+        /// Watchdog multiple of that tolerance (the derivation, not a knob).
+        multiple: u64,
+        /// Model whose stream wedged.
+        model: String,
+    },
     /// The runner's effective context window was demoted below the smallest
     /// prompt this run can possibly send. Compression shrinks HISTORY; it can
     /// never shrink the system prompt, the tool definitions, the step frame,

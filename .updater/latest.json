@@ -1,11 +1,11 @@
 {
-  "version": "0.3.5",
-  "notes": "Public Beta 10 \u2014 decomposition damping merged as the single path: depth-biased task scheduling (doubled small-model endurance output), advisory decomposition notes, parent refocus, and verified-parent hygiene. Experimental levers that measured neutral-or-worse were discarded.",
-  "pub_date": "2026-08-07T19:35:39.000Z",
+  "version": "0.3.10",
+  "notes": "Public Beta 19 - auto-update works again (it could not fire from beta.14 through beta.18, because the app's version never moved). Tool-result ingestion is off the turn's critical path, queued vectors drain at the end of a turn, four frontend majors, toolchain nightly-2026-08-25, and NANNA_CONFIG_PATH.",
+  "pub_date": "2026-08-26T22:15:00.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXZVVTV5ME1nNC9HcGE1NWloRG9MblBVb1RiR2wvT2pqY255MlFXTVkvR3FsTVZYQytZZmd0MjVEYVpTenNBUzIwckNnTXMvZ0tHbnZ5UXFKMzU3VVFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MTMxMjc3CWZpbGU6TmFubmFfMC4zLjVfeDY0LXNldHVwLmV4ZQpWQWpaWHNXckNtSUNSTW5vNjlMZy9BL3daMG9lTmZ0YnhOclZpdjRvRXc2b0pkc0dvVE9xRmlkK0hnQ3RFK0w2L0s2aXNiTlBXcXFpZzFvUWp1R29CQT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.5-beta.10/Nanna_0.3.5_x64-setup.exe"
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.10-beta.19/Nanna_0.3.10_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWovYWxpTW96VVpuK21GY1AyVmRmbFdTL0JxdjRveXg2bDVsVjRUd3pVUFBMZko3R29KaFRpY3J1QjRTRzFTWllqMWltMmw4QjlkS1B4SnhXYnc0M3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NzgyMTMyCWZpbGU6TmFubmFfMC4zLjEwX3g2NC1zZXR1cC5leGUKY2UxRnM4TjNNSDRiSm5HSDRVZ0xFYmNXVENtbTFBRFI5ODdlWHJERzNNbFYxd0pIbzdMZ0RMSlFXL28yUlFjNUdYQUNwZWZZRmdDUGNPRWlvN0wwQ2c9PQo="
     }
   }
 }

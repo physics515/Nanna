@@ -8,7 +8,7 @@ use tokio::fs;
 use tracing::info;
 
 /// Default root AGENTS.md content
-pub const DEFAULT_AGENTS_MD: &str = r#"# AGENTS.md
+pub const DEFAULT_AGENTS_MD: &str = r"# AGENTS.md
 
 This is the project workspace. Treat it that way.
 
@@ -27,9 +27,8 @@ This is the project workspace. Treat it that way.
 ## Make It Yours
 
 Capture build commands, architecture notes, and common pitfalls here so future
-sessions start with that knowledge. Keep it concise — this file is injected into
-every prompt.
-"#;
+    sessions start with that knowledge. Keep it concise — this file is injected into
+every prompt.";
 
 /// A workspace template definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +67,7 @@ impl WorkspaceTemplate {
         let mut files = HashMap::new();
         files.insert(
             AGENTS_FILE.to_string(),
-            r#"# AGENTS.md - Project Workspace
+            "# AGENTS.md - Project Workspace
 
 This is a code project workspace. Focus on:
 - Understanding the codebase before making changes
@@ -92,12 +91,12 @@ so future sessions start with that knowledge.
 
 Capture: build commands, file locations, architecture, common errors/fixes,
 dependencies, testing strategies. Keep it concise — this file is injected into every prompt.
-"#
+"
             .to_string(),
         );
         files.insert(
             ROADMAP_FILE.to_string(),
-            r#"# Roadmap
+            "# Roadmap
 
 > Project plan. Phases, checklists, dated notes.
 
@@ -108,7 +107,7 @@ dependencies, testing strategies. Keep it concise — this file is injected into
 ## Immediate next actions
 
 1. 
-"#
+"
             .to_string(),
         );
 

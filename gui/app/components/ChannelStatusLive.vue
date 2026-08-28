@@ -115,7 +115,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Play, Pause, RefreshCw, Clock, Inbox, AlertTriangle } from 'lucide-vue-next'
+import { Play, Pause, RefreshCw, Clock, Inbox, AlertTriangle } from '@lucide/vue'
 
 interface EnhancedChannelStatus {
   name: string

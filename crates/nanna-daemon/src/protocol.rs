@@ -262,10 +262,56 @@ pub enum SessionAction {
         #[serde(default)]
         light: bool,
     },
+    /// Session-scoped liveness: is this session working, wedged, or finished
+    /// — answered from the daemon's own ledger (current phase, what the turn
+    /// awaits, last step, last tool call, last side-effecting call, stop
+    /// state) instead of a client grepping logs or proxying on log bytes.
+    /// Constant-size response, safe to poll.
+    Liveness { id: String },
     /// Set/change the workspace for a session (None = make global)
     SetWorkspace {
         id: String,
         workspace_id: Option<String>,
+    },
+    /// Set/change the chat model for a session (None = follow the global default).
+    /// Chat only — sub-agent, summarization and embedding models stay global.
+    ///
+    /// `model` is a router spec in the shape `llm.model_priority` already
+    /// holds (`ollama/qwen3:14b`, `openrouter/…`, bare `claude-…`), stored
+    /// verbatim. The daemon does NOT weigh it against the live providers
+    /// here — the only refusal is an unknown `id`, so `ok` means "the pin is
+    /// recorded", never "this model will run". A pin nothing serves is caught
+    /// at the start of the next turn, which fails loudly naming the model and
+    /// saying the pin came from this chat, rather than quietly falling back
+    /// to the global default.
+    ///
+    /// Leaving the check to the turn is the design, not a gap. Acceptance
+    /// here could not be a promise in any case: a provider may go down
+    /// between the click and the next turn, so the turn's lookup is the one
+    /// that has to exist. Running the same router lookup at this boundary as
+    /// well would put one policy in two places, which is exactly how a
+    /// boundary starts refusing pins the turn would have served (and the
+    /// reverse). A client that wants to warn before the user commits should
+    /// ask the router what is live and say so in its own words — it must not
+    /// read a guarantee into this answer.
+    ///
+    /// A null — or absent — `model` is the clear, as it is for `SetWorkspace`.
+    SetModel {
+        id: String,
+        model: Option<String>,
+    },
+    /// Set or clear the user-selected extra tools for a session.
+    ///
+    /// Strictly additive: the turn unions these into whatever active set it
+    /// would have built anyway (core tools, `discover_tools` paging, per-task
+    /// scopes all unchanged). An empty — or absent — `tools` is the clear,
+    /// restoring byte-identical default behavior. Names are stored verbatim;
+    /// an unknown name costs nothing (the registry simply has nothing to
+    /// activate for it), so the only refusal here is an unknown `id`.
+    SetTools {
+        id: String,
+        #[serde(default)]
+        tools: Vec<String>,
     },
 
     // --- Sub-Agent Sessions (#72) ---
@@ -703,6 +749,33 @@ pub enum Event {
         data: Option<Value>,
     },
 
+    /// Low-frequency liveness beat while a chat turn is in flight. Lets any
+    /// watcher — GUI spinner, a script, a bench driver — distinguish "the
+    /// model is thinking" from "the process is gone" without reading logs:
+    /// beats continue while the daemon is alive and the turn is live; beats
+    /// stopping without a `message_end` means wedged or dead. Cadence is
+    /// derived from the silence budgets (`liveness::beat_interval_secs`),
+    /// ~30s today.
+    LivenessBeat {
+        session_id: String,
+        /// Seconds since this turn started.
+        elapsed_s: u64,
+        /// Coarse phase: planning | step_pending | streaming | thinking | tool.
+        phase: String,
+        /// What the turn is waiting on right now, human-readable
+        /// (e.g. "model output (ollama/qwen3.5:9b): last token 41s ago").
+        awaiting: String,
+        /// Seconds since the last observed event in this turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quiet_s: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        /// Monotone beat counter within the turn (gap detection).
+        beat: u64,
+    },
+
     // Session events
     SessionCreated {
         id: String,
@@ -727,6 +800,18 @@ pub enum Event {
     /// Without this a workspace registered after a client connected stayed
     /// invisible to it until restart.
     WorkspacesChanged,
+
+    /// The daemon's configuration was mutated and committed (set / reset /
+    /// reload / import).
+    ///
+    /// Payload-free for the same reason as [`Event::WorkspacesChanged`]: the
+    /// config is shared state, and pushing a diff would make every client
+    /// re-implement the merge. Clients re-fetch whatever slice they render.
+    ///
+    /// One event per committed mutation — the model priority a client shows
+    /// otherwise stays whatever it read at mount, so a change made in another
+    /// window (or by the agent itself) was invisible until restart.
+    ConfigChanged,
 
     // Memory events
     MemoryCreated {
@@ -910,6 +995,60 @@ impl From<ControlAction> for Action {
             ControlAction::Status => Action::System(SystemAction::Status),
             ControlAction::Restart => Action::System(SystemAction::Restart),
             ControlAction::Shutdown => Action::System(SystemAction::Shutdown),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every client hand-writes this envelope as JSON (the GUI's
+    /// `daemon_client.rs`, the CLI, anything on the socket), so the tag
+    /// strings ARE the contract: renaming the variant is a silent
+    /// "unknown action" for all of them and not a compile error anywhere.
+    #[test]
+    fn a_chat_model_pin_arrives_as_the_documented_envelope() {
+        let raw = serde_json::json!({
+            "type": "session",
+            "action": "set_model",
+            "id": "sess-1",
+            "model": "ollama/qwen3:14b",
+        });
+
+        match serde_json::from_value::<Action>(raw).expect("set_model must parse") {
+            Action::Session(SessionAction::SetModel { id, model }) => {
+                assert_eq!(id, "sess-1");
+                // Stored and routed verbatim — the provider prefix is part of
+                // the spec, not decoration to be stripped on the wire.
+                assert_eq!(model.as_deref(), Some("ollama/qwen3:14b"));
+            }
+            other => panic!("expected a session set_model action, got {other:?}"),
+        }
+    }
+
+    /// Un-pinning is `"model": null`, exactly as `set_workspace` un-scopes a
+    /// session with a null `workspace_id` — and an ABSENT key means the same
+    /// thing, because serde's internally-tagged path defaults a missing
+    /// `Option` to `None`. Pinned because that is the entire difference
+    /// between "clear this chat's model" and "I forgot a field": a client
+    /// that drops the key un-pins the chat and is told nothing.
+    #[test]
+    fn a_null_or_absent_model_both_clear_the_pin() {
+        for raw in [
+            serde_json::json!({
+                "type": "session", "action": "set_model", "id": "sess-1", "model": null,
+            }),
+            serde_json::json!({ "type": "session", "action": "set_model", "id": "sess-1" }),
+        ] {
+            let action = serde_json::from_value::<Action>(raw).expect("a clear must parse");
+            assert!(
+                matches!(
+                    action,
+                    Action::Session(SessionAction::SetModel { model: None, .. })
+                ),
+                "no model on the wire is the clear, not a parse error"
+            );
         }
     }
 }

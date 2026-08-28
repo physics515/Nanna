@@ -1,0 +1,36 @@
+# Nanna macOS DMG Installer Configuration
+# This file defines the DMG packaging manifest for the bundled daemon sidecar installer
+
+[installer]
+name = "Nanna"
+version = "0.2.1"
+publisher = "physics515"
+description = "Personal AI presence — local-first, always-on"
+display_name = "Nanna Personal AI"
+
+[paths]
+install_dir = "/Applications/Nanna.app"
+uninstall_dir = "/Library/Application Support/Nanna"
+daemon_path = "/Applications/Nanna.app/Contents/MacOS/nanna-daemon"
+app_path = "/Applications/Nanna.app/Contents/MacOS/nanna"
+
+[components]
+main_app = { path = "nanna", description = "Nanna Application" }
+daemon = { path = "nanna-daemon", description = "Nanna Daemon (background service)" }
+tools = { path = "tools/", description = "Tool scripts" }
+config = { path = "config/", description = "User configuration" }
+
+[features]
+launch_at_login = true
+system_tray = true
+auto_update = true
+
+[daemon_sidecar]
+enabled = true
+auto_start = true
+health_check_interval = "30s"
+reconnect_timeout = "10s"
+
+[uninstall]
+remove_data = false
+preserve_config = true

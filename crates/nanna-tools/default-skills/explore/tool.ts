@@ -1,6 +1,6 @@
 export default {
   name: "explore",
-  version: "0.2.0",
+  version: "0.2.1",
   output: "context",
   description: "Explore a directory and summarize its contents. Provides a quick overview of project structure, file types, and sizes.",
   parameters: {
@@ -69,6 +69,18 @@ export default {
         if (cur.depth === 1) {
           // Root itself is unreadable: structured failure, never a throw
           // (thrown script errors reach the model under scary prefixes).
+          // The commonest cause is a FILE path, whose os error ("The
+          // directory name is invalid", ENOTDIR) teaches nothing — one stat,
+          // on an already-failed call, turns it into the correction. The stat
+          // has its own try so this error path can never itself throw.
+          if (pathIsFile(dirPath)) {
+            return {
+              content: "explore: \"" + dirPath + "\" exists but is a FILE, not a directory — " +
+                "use read_file to see its contents (or search_file to search it). " +
+                "Nothing was explored.",
+              success: false
+            };
+          }
           return {
             content: "explore failed: cannot list \"" + dirPath + "\": " + String(e) +
               ". Check that the path exists, is a directory, and is readable.",
@@ -179,6 +191,19 @@ export default {
     }
 
     return { content: lines.join("\n"), success: true };
+  }
+}
+
+// Is this path a file? Asked only on a path that already failed as a
+// directory, so it costs one metadata call on a path the tool was going to
+// give up on anyway. The stat sits in its OWN try: an error path that throws
+// is worse than the error it was explaining.
+function pathIsFile(path) {
+  try {
+    var st = Nanna.stat(path);
+    return !!(st && st.is_file);
+  } catch (e) {
+    return false;
   }
 }
 

@@ -2,334 +2,239 @@
 
 > *As the moon illuminates what the sun cannot see, so shall I illuminate what you cannot reach.*
 
-A high-performance, always-on **personal AI presence** written in Rust — one that runs **entirely on
-your own machine**. Named for the Sumerian moon god, patron deity of Ur. Nanna runs as a headless
-daemon, thinks with a **small open model on a single consumer GPU**, remembers across time with a
-cognitive (FSRS-6) memory, works **unattended for hours from a single prompt**, reaches you on any
-channel (GUI, CLI, Telegram, Discord, Slack, Signal, WhatsApp), and is extensible with JS/TS tools
-and MCP servers.
+**A personal AI presence that runs entirely on your machine.** Nanna is a calm, capable assistant written in Rust — not a chatbot, but a *presence*. It runs as a headless daemon on your own hardware, thinks with a small open model on a single consumer GPU, remembers across sessions, and reaches you on any channel.
 
-> **Local-first by default.** The local model *is* the agent — it runs the whole loop (reasoning,
-> tools, memory) offline and private, on one GPU. Nanna *can* reach out to cloud APIs
-> (Anthropic / OpenAI / OpenRouter) when it chooses to, but that's optional augmentation, never a
-> requirement. Think *the open-source clawdbot — a Hermes-class agent you actually own.* The native
-> local model runner (built on **Burn**) and the DSP-backed **dreaming** memory that is Nanna's moat
-> are in active development — see [`ROADMAP.md`](ROADMAP.md) **P12 / P13**.
+[![Download for Windows](https://img.shields.io/badge/Download-Windows%20x64-blue?style=for-the-badge&logo=windows)](https://github.com/physics515/Nanna/releases/latest)
+[![Build from Source](https://img.shields.io/badge/Build-from%20Source-green?style=for-the-badge&logo=rust)](https://github.com/physics515/Nanna#building-from-source)
 
-**Status: 🧪 Public Beta** — v0.2.1 · Rust 2024 (rustc 1.85+) · Windows x64 today (macOS/Linux build
-from source, untested this release). See [`ROADMAP.md`](ROADMAP.md) for the full status source of
-truth, and [Releases](https://github.com/physics515/Nanna/releases) for signed installers.
-
-Nanna is not a chatbot. It's a *presence*.
-
-- **Calm over chaos.** No performative enthusiasm.
-- **Competence over narration.** Don't explain. Execute.
-- **Depth over breadth.** Know things well, or admit you don't.
-- **Presence over noise.** The moon doesn't chase you across the sky.
+**Status:** 🧪 Public Beta · v0.2.1 · Windows x64 (macOS/Linux build from source)
 
 ---
 
-## Install (public beta)
+## ⚡ Quick Start (5 Minutes)
 
-1. **Install [Ollama](https://ollama.com)** and pull the tested baseline model:
-   ```bash
-   ollama pull qwen3.5:9b
-   ```
-2. **Download the latest installer** from
-   [**Releases**](https://github.com/physics515/Nanna/releases) — `Nanna_x.y.z_x64-setup.exe`
-   (or the `.msi` if you prefer). Verify against `SHA256SUMS.txt` if you like.
-3. Run it. The binaries are not code-signed yet, so SmartScreen will warn — *More info → Run anyway*.
-4. Launch Nanna. First run seeds the default tool scripts into `%APPDATA%\clawd\Nanna\data\tools`
-   (yours to edit; upgraded automatically on newer releases, your own tools untouched).
-
-From v0.2.1 on the app **updates itself**: it checks for new releases in the background, shows a
-toast + notification when one is published, and installs when you click **Update** in the footer —
-never on its own, so a running mission is never interrupted. Headless users can grab the standalone
-`nanna-daemon.exe` / `nanna.exe` from the same release.
-
-Optional cloud keys (Anthropic / OpenAI / OpenRouter) go in **Settings → Models** — a fully-local
-run needs none.
-
----
-
-## What works today
-
-- **Long-horizon autonomy on a small local model.** Mission mode drives the agent through multi-hour
-  builds from one prompt: auto-continuation with escalating nudges, a healing ladder that absorbs
-  stream faults and provider hiccups, machine-run acceptance checks, a durable task store (crash →
-  resume), convergence breakers, and anti-erosion file guards. On the reference machine (RTX 4070 Ti
-  SUPER, `qwen3.5:9b`) Nanna completed an 11-stage build mission end-to-end in **48.5 minutes**
-  (absorbing 455 transient faults on the way) and has run **4 h 55 m continuously** on a single
-  prompt. Every run reports duration + token spend so models can be benchmarked on identical work.
-- **Headless daemon + pure-client GUI.** Runs as a Windows service / systemd / launchd unit with
-  WebSocket IPC, PID lockfile, and health endpoints; persists sessions to **Turso** (embedded,
-  SQLite-compatible, pure-Rust). The Tauri GUI is a **pure daemon client**: it launches the daemon as a
-  managed sidecar and attaches over IPC with auto-reconnect. The daemon owns *all* state (one agent loop,
-  one memory system, one tool registry, one scheduler) — there is no in-process fallback, so a lost
-  daemon surfaces as a clear disconnected state rather than a silently divergent second backend.
-- **Agentic chat with a chronological run journal.** Streaming responses, tool calling, interleaved
-  thinking, and tiered context compression (summarization, CDC dedup, proactive drop). The GUI renders
-  the run as it happens — thinking, tool calls, faults, and heals in order, with per-call token stamps
-  and a live context-usage meter — and the full journal survives navigation and restarts.
-- **Cognitive memory + dreaming (the moat).** FSRS-6 spaced-repetition memory with semantic recall
-  (recall reinforces via the testing effect), **dreaming** (LLM consolidation that clusters and
-  summarizes memories by cognitive weight), duplicate detection, and importance scoring — persisted to
-  **Turso**. Dreaming folds true restatements **deterministically, with no LLM call** before anything
-  reaches the summarizer, so repeated facts collapse without spending tokens and without being
-  paraphrased ([measured](bench/BASELINE.md#suite-3--dreaming--compression-information-retention):
-  identical 0.90 compression and 1.000 recall retention at **0** summarizer calls on the reference
-  corpus, down from 6). The dreaming system is being made the centerpiece: idle-gated multi-phase
-  cycles + a DSP-backed event timeline where time-series compression *is* the act of forgetting
-  (ROADMAP P13).
-- **LLM routing — local-first, cloud-optional.** Today: Ollama, Anthropic, OpenAI, and OpenRouter with
-  complexity-based routing, health/cooldown tracking, and native prompt caching (50–80% input-token
-  savings). Next: a **native local runner on Burn** (`nanna-infer`) that executes a small open model on
-  one GPU as the default, zero-cost tier, with cloud APIs as opt-in escalation (ROADMAP P12).
-- **Tools & MCP.** Every tool is a filesystem JS/TS skill (39 default skills) run by the Boa engine:
-  files, shell, web fetch/search, code search, vision, tiered OCR (pure-Rust `ocrs` → vision-model
-  fallback), PDF, memory, scheduling. Tools are discovered two-tier (a lean core set + BM25 search
-  over the rest, so small models aren't drowned in schemas), guarded against self-destructive edits
-  (syntax gates, draft parking, an anti-erosion ratchet), and editable at runtime — write your own
-  from the GUI. Plus MCP *server* mode: `nanna mcp serve` publishes the local tool surface over stdio
-  JSON-RPC to any MCP client (Claude Code, editors), honouring the `[tools]` enabled/disabled policy.
-- **Works from your project's own files.** A workspace is any folder; context comes from the repo's
-  standard `README.md` / `AGENTS.md` / `CONTRIBUTING.md` / `ROADMAP.md` — no bespoke scaffolding
-  (persona and user profile live in global config, memory lives in the store).
-- **Five channels.** Telegram, Discord, Slack, Signal, and WhatsApp — a webhook server + unified
-  router receive messages, run them through the agent, and deliver responses back to the origin channel.
-- **Desktop GUI.** Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme): streaming chat with the run
-  timeline, Tiptap + Monaco rich editor, session management, tabbed settings with full config
-  migration, memory browser, channel onboarding wizards, model-stats + tool-stats dashboards, system
-  tray, native notifications, and signed **auto-updates**.
-
----
-
-## Architecture
-
-17 workspace crates today (plus two planned for the local-first pivot, marked `*`) and the Tauri app,
-layered bottom-up by dependency:
-
-```
-nanna/
-├── src/main.rs              # Entry point + CLI (chat / server / daemon)
-├── crates/
-│   ├── nanna-simd/          # SIMD vector ops (AVX-512/AVX2/NEON) — the default fast path
-│   ├── nanna-gpu/           # GPU compute (wgpu) — vector search + DSP/inference kernels
-│   ├── nanna-infer/*        # Burn local model runner (wgpu + ndarray, single-GPU) — planned
-│   ├── nanna-memory/        # Vector store + FSRS-6 cognitive memory + dreaming (the moat)
-│   ├── nanna-timeline/*     # DSP-backed event timeline + compression-as-dreaming — planned
-│   ├── nanna-storage/       # Turso persistence (embedded, SQLite-compatible) — the only DB
-│   ├── nanna-llm/           # Inference routing: local first, cloud APIs optional
-│   ├── nanna-tools/         # Tool system (filesystem JS/TS skills)
-│   ├── nanna-scripting/     # Boa (JS) + Deno (V8/TS) engines; embedded Python
-│   ├── nanna-workspace/     # Workspace detection + standard project-file context
-│   ├── nanna-channels/      # Channel listeners + unified message router
-│   ├── nanna-browser/       # Browser control (CDP / Playwright)
-│   ├── nanna-agent/         # Agent loop, mission harness, multi-agent swarm, context mgmt
-│   ├── nanna-mcp/           # Model Context Protocol client/server
-│   ├── nanna-daemon/        # Headless background service + WebSocket IPC
-│   ├── nanna-client/        # Daemon client library
-│   ├── nanna-server/        # HTTP server + webhooks
-│   ├── nanna-config/        # TOML config + OS-keyring credentials
-│   └── nanna-core/          # Orchestration, scheduler/cron, workspace registry
-└── gui/                     # Tauri 2 backend (src-tauri/) + Nuxt 4 frontend
+### 1. Install Ollama
+Download and install [Ollama](https://ollama.com), then pull the recommended model:
+```bash
+ollama pull qwen3.5:9b
 ```
 
-`*` = planned crate for the local-first direction (not in the tree yet).
+### 2. Download Nanna
+Get the latest installer from [Releases](https://github.com/physics515/Nanna/releases):
+- **Windows:** `Nanna_x.y.z_x64-setup.exe` or `.msi`
 
-**Channels as control-plane clients.** The daemon owns *all* state — sessions, memory, config, tools,
-scheduler, workspace registry, keyring, channel manager. Every channel, the GUI included, reaches it
-over the same WebSocket IPC. A channel's *capabilities* (markdown, tables, embeds, buttons, streaming)
-determine **how** a response renders, never **what** it can access. The GUI is just the richest
-channel — multiple clients (phone + desktop) can attach to one daemon and share state.
+### 3. Run It
+Launch Nanna. On first run, it seeds default tools into `%APPDATA%\nanna\data\tools`.
 
-**Key patterns:**
-- **Agent loop** (`nanna-agent/src/loop_runner.rs`) — message → LLM → execute tools → iterate until done.
-- **Mission harness** (`nanna-agent/src/harness.rs` + the P15 task store) — re-anchoring long runs to
-  durable tasks with canonicalized acceptance checks; done is a *verdict*, not a claim.
-- **Tool registry** (`nanna-tools`) — tools implement a `Tool` trait; all are loaded from the
-  filesystem as JS/TS skills at runtime and bootstrapped from the binary on first run.
-- **Workspace context** (`nanna-workspace`) — detects a project by its standard signals (`.git`,
-  `README.md`, `AGENTS.md`, `Cargo.toml`, …) and injects the standard files into the system prompt.
-- **Adapter pattern** — service traits live in `nanna-tools`; concrete impls (memory, agent spawner)
-  are wired in `nanna-daemon`.
+> **Note:** Binaries are not yet code-signed. Windows SmartScreen will warn — click *More info → Run anyway*.
+
+### 4. (Optional) Add Cloud Keys
+For cloud model access, go to **Settings → Models** and add your API keys:
+- Anthropic, OpenAI, or OpenRouter
+
+A fully local run needs none.
 
 ---
 
-## Performance
+## 📋 System Requirements
 
-- **Local inference on Burn (in development, ROADMAP P12).** `nanna-infer` runs a small open model on
-  your GPU via **wgpu** (Vulkan/DX12/Metal — no CUDA toolchain) with an **ndarray** CPU fallback: one
-  binary, backend chosen at runtime by a cheap GPU probe. Sized for a single 16 GB consumer card
-  (1.5–3B models; opt-in f16 to ~halve VRAM), with an on-device KV cache and streaming decode.
-- **SIMD is the workhorse.** `nanna-simd` runs AVX-512/AVX2 (and NEON on ARM) cosine similarity — a
-  single 768-dim comparison in ~0.1µs, scaling linearly. This is the default path for vector search.
-- **GPU is for scale only.** `nanna-gpu` (wgpu) carries a ~750µs fixed per-dispatch overhead, so it is
-  *slower* than SIMD for small stores (23–52× slower under ~1k vectors). It engages only above
-  `GPU_THRESHOLD = 50,000` vectors, where massive parallelism finally pays off. Benchmark with
-  `cargo bench --bench gpu_vs_simd -p nanna-gpu`.
-- **Zero-copy hot paths** and **fat LTO** release builds (`codegen-units = 1`, `panic = "abort"`, stripped).
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **OS** | Windows 10 x64 | Windows 11 x64 |
+| **RAM** | 8 GB | 16 GB |
+| **GPU** | — | 8+ GB VRAM (for local inference) |
+| **Disk** | 500 MB | 2 GB (with models) |
+| **Runtime** | [Ollama](https://ollama.com) | Ollama + GPU drivers |
 
-**Benchmark-gated.** Because Nanna targets one consumer GPU and a small model, performance is a *gate*,
-not an afterthought: changes ship only when a reproducible benchmark holds or improves the budget, and
-every claim here should link to an artifact. The governing metric is **task success at budget** — how
-much of the agent-eval suite the local model solves within the reference GPU's VRAM ceiling and a p95
-latency target (reference: RTX 4070 Ti SUPER 16 GB). Mission runs are benchmarked end-to-end
-(duration + input/output tokens per run, surfaced in the GUI), so different models can be scored on
-identical missions. See
-[**ROADMAP → Performance & Benchmarking**](ROADMAP.md#performance--benchmarking-governing-concern) for
-the full suite, per-tier budgets, and harness.
+**Other platforms:** macOS and Linux build from source (see [Building from Source](#building-from-source)).
 
 ---
 
-## Model benchmark: long-horizon endurance
+## 📸 Screenshots
 
-How well a **local** model drives the long-horizon harness, measured on the `live_endurance` eval:
-build `minidb`, a POSIX-shell key-value store, against **42 dependency-chained fail-to-pass tests**
-(SWE-bench style — the tests are the spec, and a feature counts only when its acceptance check
-passes). Reference GPU: RTX 4070 Ti SUPER 16 GB; Ollama; 4.5 h wall-clock cap.
+<!-- Screenshots to be added: -->
+<!-- ![Chat Interface](docs/screenshots/chat.png) -->
+<!-- ![Settings Panel](docs/screenshots/settings.png) -->
+<!-- ![Memory Browser](docs/screenshots/memory.png) -->
+<!-- ![Channel Setup](docs/screenshots/channels.png) -->
+<!-- ![Model Selection](docs/screenshots/models.png) -->
 
-Reproduce:
+*Screenshots coming soon — see the GUI in action by downloading the beta.*
+
+---
+
+## Capability Matrix
+
+| Feature | Status | Requires |
+|---------|--------|----------|
+| **Desktop GUI** | ✅ Stable | Windows x64 (macOS/Linux: build from source) |
+| **CLI Chat** | ✅ Stable | Terminal |
+| **Fully Local Inference** | 🚧 In Development | GPU with 8+ GB VRAM (P12 milestone) |
+| **Ollama Backend** | ✅ Stable | [Ollama](https://ollama.com) installed |
+| **Cloud Providers** | ✅ Stable | API key (Anthropic/OpenAI/OpenRouter) |
+| **Telegram Channel** | ✅ Stable | Bot token |
+| **Discord Channel** | ✅ Stable | Bot token |
+| **Slack Channel** | ✅ Stable | App credentials |
+| **Signal Channel** | ✅ Stable | Signal CLI bridge |
+| **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
+| **Cognitive Memory** | ✅ Stable | — |
+| **Tool System (39 tools)** | ✅ Stable | — |
+| **MCP Client** | ✅ Stable | MCP server |
+| **Auto-Update** | ✅ Stable | Internet connection |
+
+---
+
+## What Works Today
+
+- **Long-horizon autonomy** — Mission mode drives multi-hour builds from a single prompt with automatic recovery from failures
+- **Headless daemon + GUI** — Runs as a Windows service with WebSocket IPC; the Tauri GUI attaches as a client
+- **Streaming chat** — Real-time responses with tool calling, thinking visualization, and context compression
+- **Cognitive memory** — FSRS-6 spaced repetition with semantic recall and consolidation ("dreaming"),
+  with drift protection: what you *stated* is kept in your words and never paraphrased away, and a
+  summary is never re-summarized ([measured](bench/BASELINE.md#summarization-drift-content-fidelity-not-recall))
+- **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
+- **39 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools
+- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
+- **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
+- **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
+- **Auto-updates** — Background update checks with user-initiated install
+
+---
+
+## Installation
+
+### Windows
+
+1. Download the installer from [Releases](https://github.com/physics515/Nanna/releases)
+2. Run `Nanna_x.y.z_x64-setup.exe`
+3. Accept the SmartScreen warning (*More info → Run anyway*)
+4. Launch from Start Menu
+
+**Uninstall:**
+1. Settings → Apps → Installed apps → Nanna → Uninstall
+2. Delete `%APPDATA%\nanna\` to remove all data
+
+### macOS
+
+Build from source (see below). After building:
+
+1. Copy `Nanna.app` to `/Applications`
+2. First launch: right-click → Open (bypasses Gatekeeper)
+
+**Uninstall:**
+1. Drag `Nanna.app` to Trash
+2. Delete `~/Library/Application Support/nanna/`
+
+### Linux
+
+Build from source, or use the AppImage/deb from [Releases](https://github.com/physics515/Nanna/releases):
+
+**AppImage:**
+```bash
+chmod +x Nanna_x.y.z_amd64.AppImage
+./Nanna_x.y.z_amd64.AppImage
+```
+
+**Debian/Ubuntu:**
+```bash
+sudo dpkg -i nanna_x.y.z_amd64.deb
+```
+
+**Uninstall:**
+- AppImage: Delete the file
+- deb: `sudo apt remove nanna`
+- Data: Delete `~/.config/nanna/` and `~/.local/share/nanna/`
+
+---
+
+## Troubleshooting
+
+### API Key Invalid
+- Verify the key in **Settings → Models**
+- Check that you're using the correct provider's key format
+- Ensure the key has sufficient credits/quota
+
+### Ollama Not Running
+```bash
+# Check if Ollama is running
+ollama list
+
+# Start Ollama (it runs as a service by default)
+ollama serve
+```
+
+### Daemon Not Responding
+```bash
+# Check if the daemon is running
+nanna daemon status
+
+# Restart the daemon
+nanna daemon restart
+
+# Check the health endpoint
+curl http://127.0.0.1:5148/health
+```
+
+### Port Already in Use
+Default ports: IPC `5149`, Health `5148`
 
 ```bash
-export NANNA_EVAL_MODEL=lfm2.5:latest
-export NANNA_EVAL_HOURS=4.5
-# NANNA_EVAL_LOG (not RUST_LOG) — registry=debug, or successful tool calls are invisible
-export NANNA_EVAL_LOG="warn,nanna_tools::registry=debug"
-cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture live_endurance
+# Find what's using the port (Windows PowerShell)
+Get-NetTCPConnection -LocalPort 5149
+
+# Kill the process or change the port in config
 ```
 
-### Model comparison (v0.3.5-beta.10, 2026-08-08)
+### Windows Defender Warning
+The binaries are not yet code-signed. To run:
+1. Click *More info* on the SmartScreen dialog
+2. Click *Run anyway*
 
-One build (master `914b19f1`), one scheduler, identical conditions per leg: model unloaded at
-launch, fresh store, 4.5 h wall-clock cap, RTX 4070 Ti SUPER 16 GB. Models that fail the 5-task
-smoke gate don't get an endurance leg (ministral-3 ran anyway at the owner's request). Full
-measurement trail: [bench/BASELINE.md](bench/BASELINE.md).
+Or add an exclusion in Windows Security → Virus & threat protection → Exclusions.
 
-| Model | Size | Smoke (5) | Endurance (42) | Wall clock | Notes |
-|---|---|---|---|---|---|
-| **ornith:9b** | 5.6 GB | 5/5 @ 11.0 k tok/item | **37 / 42** | **1.02 h** | **record** — drained the whole plan in an hour at half qwen's token cost; barely decomposed (8 extra items); 0 faults, 0 resumes. July-2026 agentic-coding family, added after lfm failed the gate |
-| qwen3.5:9b | 6.6 GB | 5/5 @ 22.6 k tok/item | **25 / 42** | 2.11 h | exited early with its plan drained: 25 verified + 17 abandoned-with-containment; 0 faults, 0 resumes |
-| gemma4:e4b-it-qat | 6.1 GB | 5/5 @ 22.7 k tok/item | **6 / 42** | 4.50 h (cap) | decomposition churn — 118 items from 42 seeded; high variance (15/42 on near-identical code); 0 faults |
-| ministral-3:8b | 6.0 GB | 4/5 @ 11.8 k tok/item | **2 / 42** | 3.20 h (early stop) | runaway decomposition (256 items from 42 seeded); stopped by the deterministic-failure detector after repeated Ollama mid-response aborts (2 heals first); the smoke miss was an Ollama-side 500, not a wrong call |
-| lfm2.5 | 5.2 GB | **2 / 5** @ 78 k tok/item | — (gate failed) | 124 s (smoke) | up from 0-for-tools in the prior campaign; now abandons cleanly via containment instead of wedging |
+### macOS "App is Damaged" or Blocked
+```bash
+# Remove quarantine attribute
+xattr -cr /Applications/Nanna.app
 
-The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
-early exit — so its qwen 32/42 is not directly comparable to the numbers above.
+# Or right-click → Open on first launch
+```
 
-### Endurance (42 features)
-
-**Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool
-discovery, `num_ctx=16384`, read-only tests, 4-hour snapshot scored from a pristine copy), driven
-through the GUI chat like a real user session:
-
-| Model | Size | Verified at 4 h | Notes |
-|---|---|---|---|
-| qwen3.5:9b | 6.7 GB | **32 / 42** | beat the prior 31/42 reference; wall at test_22; 0 CUDA faults |
-| lfm2.5 | 5.2 GB | **2 / 42** | never passed test_01; read-loop profile (1,129 reads vs 18 edits at 1 h) |
-| gemma4:12b | 7.6 GB | **DNF** | CUDA fault spiral under desktop VRAM pressure; still faults + demotes off 16 k on a quiet card |
-
-Earlier single-run data (pre-series harness): lfm2.5 1/42 · 497 steps · 5.5 M tokens · 19 min.
-
-**Verified** counts only features whose acceptance check passed. Do not read the harness's
-in-flight `done=N` counter as a score — it counts *closed* tasks, and closed includes **cancelled**:
-one lfm2.5 run ended at `done=53` with **0** features verified.
-
-### What the harness fixes bought (lfm2.5, same model, same 42 features)
-
-| | before | after |
-|---|---|---|
-| features verified | 0 / 42 | 1 / 42 |
-| steps | 598 | 497 |
-| tokens | 7.8 M | 5.5 M |
-| task scope (42 seeded) | ballooned to 55 | 48 |
-| run outcome | poisoned itself (`minidb_data` created as a *directory*, breaking every test) | clean finish |
-
-The same fixes on the 5-task smoke suite took lfm2.5 from **3/5 in ~15 min** to **5/5 in 53 s**, at
-**25 k tokens/item** (down from 70 k). The gap between that and 1/42 is the honest headline: these
-models handle well-scoped single-file tasks and hit a wall on incrementally-built programs.
-
-### Reading the results
-
-- **A weak model is a harness test.** Every finding behind the "after" column came from watching a
-  5 GB model fail: unbounded re-decomposition, deletion of its own goals, double-escaped writes, and
-  tool scopes that were secretly cages. See [ROADMAP P20](ROADMAP.md).
-- **Capability is never gated.** `discover_tools` ships on every request, so a model can pull in any
-  tool mid-task — observed live, models reached for `code_search`, `explore` and `edit_file` that
-  were never in their task's scope.
-- **Model-generated code cannot kill the agent.** `exec` children are spawned in their own process
-  group; a script that signals its group no longer takes the daemon with it.
-
----
-
-## Building from source
+### Linux WebKitGTK Missing
+Tauri requires WebKitGTK. Install it:
 
 ```bash
-git clone https://github.com/physics515/Nanna.git
-cd Nanna
+# Debian/Ubuntu
+sudo apt install libwebkit2gtk-4.1-dev
 
-# Build
-cargo build                      # debug
-cargo build --release            # release (fat LTO, stripped)
-cargo build -p nanna-daemon      # single crate
+# Fedora
+sudo dnf install webkit2gtk4.1-devel
 
-# Run
-cargo run -- chat                # interactive CLI
-cargo run -- server              # HTTP server (webhooks)
-cargo run -- daemon start        # background daemon
-
-# Test
-cargo test -p nanna-core         # per-crate (see note)
-
-# Lint & typecheck
-cargo check
-cargo clippy --all-targets       # pedantic + nursery lints
-cd gui && pnpm exec vue-tsc      # typecheck Vue
+# Arch
+sudo pacman -S webkit2gtk-4.1
 ```
 
-```
-         🌙
-        /|\
-       / | \
-      /  |  \
-     /___|___\
-       NANNA
-  Patron deity of Ur.
-  Type 'quit' to exit, 'clear' to reset.
-
-› List the files in this directory
-[✓ list_dir]
-```
-
-### GUI (Tauri + Nuxt)
-
-```bash
-cd gui
-pnpm install
-pnpm run tauri:dev      # development with hot reload
-pnpm run tauri:build    # production build (needs the daemon sidecar; see gui/scripts/build-daemon.js)
-```
-
-All crates enable `clippy::all + pedantic + nursery`. Async uses Tokio. Errors: `thiserror` for
-libraries, `anyhow` for the application. The GUI uses Vue 3 `<script setup>` + Tailwind. Async tests
-use `#[tokio::test]` and skip GPU/network by checking for API keys. Prefer per-crate `cargo test -p`
-over a full `--workspace` run (a known V8 stack-size issue makes the combined run flaky — tracked in
-ROADMAP P11).
+### GPU Not Detected (Local Inference)
+- Ensure GPU drivers are up to date
+- Verify Vulkan support: `vulkaninfo`
+- Check VRAM: local inference needs 8+ GB
+- Fall back to CPU: set `device = "cpu"` in config
 
 ---
 
 ## Configuration
 
-Config lives at `~/.config/nanna/config.toml` (or `%APPDATA%\nanna\` on Windows); the GUI's Settings
-pages write it for you. API keys entered in the GUI are stored in the **OS keyring**, not on disk.
+Config lives at:
+- **Windows:** `%APPDATA%\nanna\config.toml`
+- **macOS:** `~/Library/Application Support/nanna/config.toml`
+- **Linux:** `~/.config/nanna/config.toml`
 
 ```toml
 [general]
 name = "Nanna"
 
 [llm]
-# "local" (the Burn runner) becomes the default, top-priority tier once P12 ships; cloud is opt-in.
-provider = "ollama"             # ollama | anthropic | openai | openrouter | local (P12)
+provider = "ollama"       # ollama | anthropic | openai | openrouter
 model = "qwen3.5:9b"
 
 [server]
@@ -337,52 +242,176 @@ enabled = true
 port = 3000
 ```
 
-Environment variables — **all cloud keys are optional**, used only when the agent escalates to a cloud
-provider (a fully-local run needs none):
+**Environment Variables:**
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Anthropic models (optional — cloud escalation) |
-| `OPENAI_API_KEY` | OpenAI models + embeddings (optional) |
-| `OPENROUTER_API_KEY` | OpenRouter models (optional) |
-| `BRAVE_API_KEY` | Enables the `web_search` tool |
-| `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` | Channel listeners |
-| `NANNA_TOOLS_DIR` | Override the tools directory (development) |
+| `ANTHROPIC_API_KEY` | Anthropic models |
+| `OPENAI_API_KEY` | OpenAI models + embeddings |
+| `OPENROUTER_API_KEY` | OpenRouter models |
+| `BRAVE_API_KEY` | Web search tool |
+| `TELEGRAM_BOT_TOKEN` | Telegram channel |
+| `DISCORD_BOT_TOKEN` | Discord channel |
+| `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
-**Daemon ports:** health HTTP `5148` (`/health`, `/healthz`, `/readyz`, `/status`) · WebSocket IPC `5149`.
+**Ports:** Health HTTP `5148` · WebSocket IPC `5149`
 
----
+`NANNA_CONFIG_PATH` is useful for running a second instance, or for trying a
+configuration without touching the one you use day to day — pair it with the
+daemon's `--data-dir` to isolate the database as well:
 
-## Beta notes & feedback
-
-This is an early public beta of a fast-moving project. Things that will bite:
-
-- **Windows x64 only** for the packaged release; other platforms build from source but are untested.
-- Binaries are **unsigned** (SmartScreen warning is expected).
-- One daemon owns the database at a time; if the GUI can't connect, check for a stale
-  `nanna-daemon.exe`.
-- Mission-mode reliability is tuned against `qwen3.5:9b`; other models work but may need different
-  prompting.
-
-Bugs and ideas → [GitHub Issues](https://github.com/physics515/Nanna/issues). The
-[`ROADMAP.md`](ROADMAP.md) is the living plan — phases, post-mortems, and all.
+```bash
+NANNA_CONFIG_PATH=/tmp/try.toml nanna-daemon --data-dir /tmp/try-data run
+```
 
 ---
 
-## The lore
+## Building from Source
 
-**Nanna** (𒀭𒋀𒆠, also **Sîn**) was the Sumerian god of the moon and patron deity of **Ur** — one of
-humanity's first great cities. The moon doesn't *create* light; it reflects the sun's, transforming it
-into something gentler, something you can look at directly. That's what this is.
+```bash
+git clone https://github.com/physics515/Nanna.git
+cd Nanna
 
-Nanna traveled the night sky in a boat of woven reeds, father of **Inanna** (love and war) and **Utu**
-(the sun, justice). Between passion and clarity sits the moon: calm, constant, present. His temple was
-the great **Ziggurat of Ur** — a terraced tower, each level built upon the last. The crate hierarchy
-mirrors the mythology: the crates are the levels, and the ziggurat stands.
+# Build
+cargo build --release
 
-The people of Ur are dust and their temples are ruins, but they built things that lasted four thousand
-years. Names matter. Metaphors matter. The story you tell yourself about what you're building shapes
-what you build. This isn't a chatbot — it's a digital deity. Act accordingly.
+# Run CLI
+cargo run -- chat
+
+# Run daemon
+cargo run -- daemon start
+```
+
+### GUI (Tauri + Nuxt)
+
+```bash
+cd gui
+pnpm install
+pnpm run tauri:dev      # Development
+pnpm run tauri:build    # Production
+```
+
+**Requirements:**
+- Rust 1.85+ (2024 edition)
+- Node.js 18+
+- pnpm
+
+---
+
+## Privacy & Data
+
+See [PRIVACY.md](PRIVACY.md) for full details.
+
+**Local storage:**
+- Config: `config.toml`
+- Database: `nanna.db` (sessions, memory, tasks)
+- Credentials: OS keyring (encrypted)
+
+**What's sent externally (when configured):**
+- Chat messages → your chosen LLM provider
+- Embeddings → OpenAI (if enabled)
+- Web searches → Brave Search (if enabled)
+- Channel messages → respective platforms
+
+**Fully offline mode:** Use Ollama with no API keys configured.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## Architecture
+
+<details>
+<summary>Click to expand technical details</summary>
+
+17 workspace crates + Tauri app, layered by dependency:
+
+```
+nanna/
+├── src/main.rs              # Entry point + CLI
+├── crates/
+│   ├── nanna-simd/          # SIMD vector ops (AVX-512/AVX2/NEON)
+│   ├── nanna-gpu/           # GPU compute (wgpu)
+│   ├── nanna-memory/        # Vector store + FSRS-6 memory + dreaming
+│   ├── nanna-storage/       # Turso persistence (embedded SQLite-compatible)
+│   ├── nanna-llm/           # Inference routing: local + cloud
+│   ├── nanna-tools/         # Tool system (filesystem JS/TS skills)
+│   ├── nanna-scripting/     # Boa (JS) + Deno (TS) engines
+│   ├── nanna-workspace/     # Workspace detection + context
+│   ├── nanna-channels/      # Channel listeners + router
+│   ├── nanna-browser/       # Browser control (CDP/Playwright)
+│   ├── nanna-agent/         # Agent loop, mission harness, swarm
+│   ├── nanna-mcp/           # Model Context Protocol client/server
+│   ├── nanna-daemon/        # Background service + WebSocket IPC
+│   ├── nanna-client/        # Daemon client library
+│   ├── nanna-server/        # HTTP server + webhooks
+│   ├── nanna-config/        # TOML config + credentials
+│   └── nanna-core/          # Orchestration, scheduler, registry
+└── gui/                     # Tauri 2 + Nuxt 4 frontend
+```
+
+**Key patterns:**
+- **Daemon owns all state** — sessions, memory, config, tools, scheduler
+- **Channels are control-plane clients** — GUI included; capabilities determine rendering, not access
+- **Agent loop** — message → LLM → tools → iterate until done
+- **Mission harness** — durable tasks with acceptance checks
+
+</details>
+
+---
+
+## Performance
+
+<details>
+<summary>Click to expand benchmark details</summary>
+
+- **SIMD is the workhorse** — AVX-512/AVX2 cosine similarity ~0.1µs per 768-dim vector
+- **GPU for scale** — wgpu engages only above 50k vectors
+- **Zero-copy hot paths** — fat LTO release builds
+
+**Local model benchmark (RTX 4070 Ti SUPER 16 GB):**
+
+| Model | Smoke (5 tasks) | Endurance (42 tasks) | Wall Clock |
+|-------|-----------------|----------------------|------------|
+| ornith:9b | 5/5 | 37/42 | 1.02 h |
+| qwen3.5:9b | 5/5 | 25/42 | 2.11 h |
+| gemma4:e4b-it-qat | 5/5 | 6/42 | 4.50 h |
+
+**Long-horizon chat path (4 h per model, 42-test dependency ladder, v0.3.8-beta.13).**
+Missions run through the product's own chat path, not a bespoke harness. *Final* is the
+score at the 4-hour mark — the number that says whether work built early still exists at
+the end.
+
+| Model | Peak | 4 h final | Interjections | vs. previous series (final) |
+|-------|------|-----------|---------------|------------------------------|
+| ornith:latest | **40/42** | **36/42** | 0 | 0/42 → 36/42 |
+| qwen3.5:9b | 26/42 | **26/42** | 0 | 0/42 → 26/42 |
+| gemma4:e4b-it-qat | 11/42 | 5/42 | 0 | 16/42 → 5/42 |
+| lfm2.5 | 0/42 | 0/42 | 2 | 0/42 (capability floor) |
+
+The previous series' two strongest models peaked at 30 and 41 and both ended at **zero** —
+peaks were built, then rewritten away when the run continued past a context boundary.
+Holding the peak was the target of the P23 work, and the top two legs now end at or near
+their peak with no human intervention. ornith's 40 also beats its best headless run (37).
+A fifth leg (ministral-3:8b) is excluded: the daemon hit a genuine panic mid-run, and a
+dead daemon never gets a score.
+
+See [ROADMAP.md](ROADMAP.md) and [bench/BASELINE.md](bench/BASELINE.md) for methodology,
+per-leg trajectories, and the findings queued from this series.
+
+</details>
+
+---
+
+## The Lore
+
+**Nanna** (𒀭𒋀𒆠, also **Sîn**) was the Sumerian god of the moon and patron deity of **Ur** — one of humanity's first great cities. The moon doesn't create light; it reflects the sun's, transforming it into something gentler, something you can look at directly.
+
+The crate hierarchy mirrors the ziggurat of Ur: each level built upon the last.
 
 ---
 
@@ -395,4 +424,4 @@ what you build. This isn't a chatbot — it's a digital deity. Act accordingly.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

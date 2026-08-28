@@ -1,0 +1,402 @@
+name: Release Build & Publish
+
+# Dispatch this to build, sign and publish a release.
+#
+# Windows is the platform that actually ships today: `.updater/latest.json`
+# points at a Windows NSIS setup.exe, and that is what installed clients check.
+# It runs by default. macOS and Linux are OPT-IN (see the inputs) because they
+# have never been produced by this workflow and nothing here has verified them
+# on a real runner — defaulting them on would mean every dispatch fails on an
+# unverified platform and takes the Windows release down with it.
+#
+# SIGNING. `bundle.createUpdaterArtifacts` is true in tauri.conf.json, so the
+# build emits a `.sig` beside each installer and REQUIRES the updater private
+# key. Add these two repository secrets (Settings -> Secrets and variables ->
+# Actions), or the build fails with "A public key has been found, but no
+# private key":
+#
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/nanna-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the passphrase for that key
+#
+# The public half is already committed as `plugins.updater.pubkey` in
+# tauri.conf.json, so the pair must match or clients reject the update.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version WITHOUT the leading v (e.g. 0.3.9-beta.17)"
+        required: true
+      release_type:
+        description: "release or pre-release"
+        required: false
+        default: "pre-release"
+        type: choice
+        options: [pre-release, release]
+      build_macos:
+        description: "Also build macOS (UNVERIFIED — has never produced an artifact)"
+        required: false
+        default: false
+        type: boolean
+      build_linux:
+        description: "Also build Linux (UNVERIFIED — has never produced an artifact)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Windows ──────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins an exact nightly, and rustup honours that
+      # file for every cargo invocation inside the repo. Asking
+      # dtolnay/rust-toolchain for `stable` therefore installed a toolchain
+      # that was never used, while the pinned one was still downloaded
+      # implicitly on first use — `rustup show` just does it explicitly and
+      # up front, so a toolchain problem fails here with a clear message
+      # instead of midway through a build.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      # An auto-update fires only when latest.json advertises a version GREATER
+      # than the one the running app reports, and the app reports whatever
+      # tauri.conf.json was built with. Those two drifted apart and nobody
+      # noticed for four releases: the workspace version was last bumped for
+      # beta.14, so beta.15, beta.16 and beta.18 all shipped as 0.3.9 against a
+      # latest.json also saying 0.3.9 -- every one of them invisible to the
+      # updater, while looking like a perfectly good release.
+      #
+      # This costs five seconds and fails BEFORE the hour-long build, which is
+      # the whole point: the two bugs already hit in this series both surfaced
+      # only after everything expensive had already succeeded.
+      - name: Guard - dispatched version must match the version being built
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT="${{ inputs.version }}"
+          BASE="${INPUT%%-*}"                      # 0.3.10-beta.19 -> 0.3.10
+          CONF=$(node -e "console.log(require('./gui/src-tauri/tauri.conf.json').version)")
+          if [ "$BASE" != "$CONF" ]; then
+            echo "::error::Dispatched version '$INPUT' (base '$BASE') does not match"
+            echo "::error::tauri.conf.json version '$CONF'. The installer would report"
+            echo "::error::'$CONF', so an updater pointed at '$BASE' would loop forever."
+            exit 1
+          fi
+          PUBLISHED=$(node -e "console.log(require('./.updater/latest.json').version)")
+          if [ "$BASE" = "$PUBLISHED" ]; then
+            echo "::error::Version '$BASE' is already what .updater/latest.json advertises."
+            echo "::error::Auto-update compares semver and equal is not greater, so no"
+            echo "::error::installed client would ever see this release. Bump the version."
+            exit 1
+          fi
+          echo "version guard OK: building $CONF, dispatching $INPUT, previous $PUBLISHED"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      # One command builds everything. tauri.conf.json's beforeBuildCommand is
+      # `pnpm build:daemon && pnpm generate`, so this compiles the nanna-daemon
+      # sidecar, generates the Nuxt frontend, builds the Tauri app, produces the
+      # NSIS installer and — because createUpdaterArtifacts is on — signs it.
+      # The previous `cargo tauri build` could not have worked: cargo-tauri was
+      # never installed. The CLI is a devDependency, so pnpm has it.
+      - name: Build and sign (Tauri + daemon sidecar + frontend)
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Collect Windows artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Fail loudly if the bundle is missing rather than publishing an
+          # empty release: a green build that uploaded nothing is the worst
+          # possible outcome here.
+          shopt -s nullglob
+          setup=(target/release/bundle/nsis/*-setup.exe)
+          if [ ${#setup[@]} -eq 0 ]; then
+            echo "::error::No NSIS installer at target/release/bundle/nsis/"
+            ls -R target/release/bundle || true
+            exit 1
+          fi
+          cp "${setup[@]}" dist/
+          sigs=(target/release/bundle/nsis/*-setup.exe.sig)
+          if [ ${#sigs[@]} -eq 0 ]; then
+            echo "::error::Installer built but NOT signed — is TAURI_SIGNING_PRIVATE_KEY set?"
+            exit 1
+          fi
+          cp "${sigs[@]}" dist/
+          cp target/release/nanna-daemon.exe dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: dist/
+          if-no-files-found: error
+
+  # ── macOS (opt-in, unverified) ───────────────────────────────────────────
+  build-macos:
+    if: ${{ inputs.build_macos }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `universal-apple-darwin` is NOT a rustup target and installing it fails
+      # outright — that is one of the two errors that killed the 2026-08-15 run
+      # at 23s. Tauri builds a universal binary by lipo-ing the two real
+      # targets, so those are what must be installed.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      # The hand-rolled `hdiutil create` this replaces was building a DMG from a
+      # directory Tauri had already bundled properly. Tauri emits dmg/app itself
+      # (bundle.targets), so let it.
+      - name: Build and sign
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target universal-apple-darwin
+
+      - name: Collect macOS artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          found=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::No DMG produced"; ls -R target/universal-apple-darwin/release/bundle || true; exit 1
+          fi
+          cp "${found[@]}" dist/
+          cp target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz* dist/ 2>/dev/null || true
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: dist/
+          if-no-files-found: error
+
+  # ── Linux (opt-in, unverified) ───────────────────────────────────────────
+  build-linux:
+    if: ${{ inputs.build_linux }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf file
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      # NO `cache: pnpm` here, deliberately. It resolves the pnpm store path at
+      # post-job time and failed with "Path Validation Error: Path(s) specified
+      # in the action for caching do(es) not exist" -- which fails the whole JOB
+      # from a POST step, after a completely successful 50-minute build. That is
+      # exactly what happened on the first beta.17 dispatch: the app built, the
+      # installer was signed, the artifact uploaded, and then a cache-save that
+      # saves maybe a minute took the release down with it.
+      #
+      # A release build is rare and dominated by cargo compile time, so the
+      # cache buys almost nothing and costs a failure mode that only shows up
+      # after everything expensive has already succeeded.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      # Replaces ~90 lines of hand-rolled dpkg-deb and a "tar.gz named
+      # .AppImage". Both were broken — the deb built from the wrong directory
+      # with its control file outside DEBIAN/, and the AppImage was not an
+      # AppImage — and both duplicated what Tauri already emits from
+      # bundle.targets.
+      - name: Build and sign
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      - name: Collect Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          cp target/release/bundle/deb/*.deb dist/ 2>/dev/null || true
+          cp target/release/bundle/appimage/*.AppImage* dist/ 2>/dev/null || true
+          if [ -z "$(ls -A dist/)" ]; then
+            echo "::error::No Linux bundles produced"; ls -R target/release/bundle || true; exit 1
+          fi
+          cp target/release/nanna-daemon dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: dist/
+          if-no-files-found: error
+
+  # ── Publish ──────────────────────────────────────────────────────────────
+  publish-release:
+    needs: [build-windows, build-macos, build-linux]
+    # `needs` on a skipped job makes the dependent skip too, so the opt-in
+    # platforms must be tolerated explicitly. Windows must still have SUCCEEDED
+    # — `!failure() && !cancelled()` alone would publish an empty release if it
+    # were skipped.
+    if: ${{ always() && needs.build-windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      # TAG was previously assigned inside one `run:` and referenced from
+      # later ones. Each `run` is its own shell, so it was empty everywhere it
+      # was used and every upload targeted the tag "". It goes in the job env.
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release and attach artifacts
+        env:
+          # Needed by EVERY gh call, not just `release create` — the upload
+          # steps used to run unauthenticated.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Flatten: `gh release upload` takes FILES. The old workflow passed
+          # directories, which gh rejects.
+          find artifacts -type f -print0 | xargs -0 -I{} cp {} .
+          shopt -s nullglob
+          # Filter to files that EXIST rather than relying on nullglob, because
+          # nullglob only drops unmatched GLOBS -- a literal name with no
+          # wildcard survives whether or not the file is there. That is exactly
+          # how the first beta.18 publish failed: Linux was skipped, so the bare
+          # `nanna-daemon` (the Linux binary) stayed in the list and gh rejected
+          # the whole upload with "no matches found for `nanna-daemon`" -- after
+          # a 65-minute build that had produced a correctly signed installer.
+          candidates=(*-setup.exe *-setup.exe.sig *.dmg *.deb *.AppImage* *.app.tar.gz* nanna-daemon nanna-daemon.exe)
+          files=()
+          for f in "${candidates[@]}"; do [ -f "$f" ] && files+=("$f"); done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::Nothing to upload"; exit 1
+          fi
+          printf 'attaching: %s\n' "${files[@]}"
+
+          PRERELEASE=""
+          if [ "${{ inputs.release_type }}" = "pre-release" ]; then PRERELEASE="--prerelease"; fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            # --target pins the NEW tag to the commit that was actually built.
+            # Without it `gh release create` creates the tag on the repository's
+            # DEFAULT branch, whatever ref the build ran from — so a release
+            # dispatched with `--ref <branch>` shipped branch binaries under a
+            # tag pointing at master. Observed on v0.3.11-beta.20: the installer
+            # was Nanna_0.3.11_x64-setup.exe while the tag resolved to a master
+            # commit whose Cargo.toml still said 0.3.10. Checking out the tag
+            # gave you none of the code in the release.
+            gh release create "$TAG" $PRERELEASE \
+              --target "$GITHUB_SHA" \
+              --title "Nanna $TAG" \
+              --notes-file RELEASE_NOTES.md \
+              "${files[@]}"
+
+            # Assert the tag landed where we asked. A release whose tag does not
+            # resolve to the built commit is unreproducible, and the failure is
+            # silent — the assets are right, so nothing looks wrong until
+            # someone checks out the tag.
+            TAGGED=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha)
+            if [ "$TAGGED" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG resolves to $TAGGED but this build ran on $GITHUB_SHA."
+              echo "::error::The published assets would not match the tagged source."
+              exit 1
+            fi
+            echo "tag guard OK: $TAG -> $GITHUB_SHA"
+          fi
+
+      # The updater manifest is NOT written automatically. It needs the real
+      # signature emitted next to the installer, so it is printed here for a
+      # human to commit — publishing a release without updating it means
+      # installed clients keep pointing at the previous version.
+      - name: Print .updater/latest.json block to commit
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sig_file=$(ls *-setup.exe.sig 2>/dev/null | head -1 || true)
+          exe_file=$(ls *-setup.exe 2>/dev/null | head -1 || true)
+          if [ -z "$sig_file" ]; then echo "No signature found; skipping."; exit 0; fi
+          echo "::notice::Commit this into .updater/latest.json, then push to master:"
+          printf '"windows-x86_64": {\n  "signature": "%s",\n  "url": "https://github.com/physics515/Nanna/releases/download/%s/%s"\n}\n' \
+            "$(cat "$sig_file")" "$TAG" "$exe_file"

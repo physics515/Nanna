@@ -321,13 +321,33 @@ impl Storage {
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("Session {}", &session.session_id[..8]))
+            .unwrap_or_else(|| {
+                let end = truncate_boundary(&session.session_id, 8);
+                format!("Session {}", &session.session_id[..end])
+            })
     }
 
     /// Update session's workspace
     pub async fn set_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
         self.sessions().update_workspace(session_id, workspace_id).await
     }
+}
+
+/// Byte offset at or below `max_bytes` that a slice can end on.
+///
+/// A session id is whatever the caller stored: `nanna chat --session <ID>` and
+/// `upsert_daemon_session` both take the string verbatim, so a fixed byte index
+/// can land past the end of a short id or inside a multi-byte character, and
+/// `str` indexing panics on either.
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -386,6 +406,45 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    fn sample_session(session_id: &str) -> Session {
+        Session {
+            id: 1,
+            session_id: session_id.into(),
+            channel: "cli".into(),
+            user_id: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            metadata: None,
+            workspace_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn get_session_name_survives_multibyte_session_id() {
+        // `nanna chat --session <ID>` stores the flag verbatim and writes
+        // neither a name nor metadata, so the generated fallback is the only
+        // reachable branch for such a session. Byte 8 of this id lands inside
+        // the em dash (bytes 6..9) — the same cut that killed the daemon.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abcdef—ghij")),
+            "Session abcdef"
+        );
+
+        // The same defect from the other side: an id shorter than the limit
+        // puts the index out of range before boundaries even matter.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("abc")),
+            "Session abc"
+        );
+
+        // An ASCII id still keeps exactly the eight bytes it always did.
+        assert_eq!(
+            Storage::get_session_name(&sample_session("0123456789abcdef")),
+            "Session 01234567"
+        );
     }
 
     fn sample_new_memory(id: &str, content: &str) -> NewMemory {
@@ -614,16 +673,29 @@ impl Storage {
     // =========================================================================
 
     /// Log a single tool call (time-series data for graphs).
+    ///
+    /// `short_circuited` (P22 Tier 4): the harness answered with a breaker
+    /// replay instead of dispatching. The row is still logged (with a
+    /// `[short_circuited]` error marker so it stays distinguishable in the
+    /// time series — the schema has no outcome column), but the hourly
+    /// aggregate counts it as neither success nor failure: the tool never
+    /// ran, and a wall of replays must not read as a broken tool.
     pub async fn log_tool_call(
         &self,
         tool_name: &str,
         success: bool,
+        short_circuited: bool,
         duration_ms: u64,
         output_size: usize,
         error_message: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
+        let logged_error = if short_circuited {
+            "[short_circuited]"
+        } else {
+            error_message.unwrap_or("")
+        };
         conn.execute(
             "INSERT INTO tool_call_log (tool_name, success, duration_ms, output_size, error_message, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -632,13 +704,15 @@ impl Storage {
                 success as i64,
                 duration_ms as i64,
                 output_size as i64,
-                error_message.unwrap_or(""),
+                logged_error,
                 session_id.unwrap_or("")
             ],
         ).await?;
 
         // Also update hourly aggregate
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
+        let success_incr = (success && !short_circuited) as i64;
+        let failure_incr = (!success && !short_circuited) as i64;
         conn.execute(
             "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
@@ -652,8 +726,8 @@ impl Storage {
             turso::params![
                 tool_name,
                 hour,
-                success as i64,
-                (!success) as i64,
+                success_incr,
+                failure_incr,
                 duration_ms as i64
             ],
         ).await?;

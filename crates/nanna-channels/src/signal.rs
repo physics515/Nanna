@@ -403,8 +403,8 @@ impl SignalChannel {
 
 #[async_trait]
 impl Channel for SignalChannel {
-    fn provider(&self) -> &str {
-        "signal"
+    fn provider(&self) -> String {
+        "signal".to_string()
     }
 
     fn capabilities(&self) -> ChannelCapabilities {

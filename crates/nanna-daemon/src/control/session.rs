@@ -100,9 +100,52 @@ impl ControlPlane {
                     json!({ "is_running": false })
                 }
             }
+            SessionAction::Liveness { id } => {
+                // "Working, wedged, or finished" from the daemon's own ledger
+                // (P22) — constant-size, safe to poll, no log greps. A session
+                // no turn has ever touched gets an honest idle default rather
+                // than an error: "never ran" IS its liveness. The pending
+                // count rides along so a poller can also see queued
+                // interjections that no live run is consuming — the 50-minute
+                // wedge signature from 2026-08-10.
+                let snapshot = match self.liveness.get(&id) {
+                    Some(live) => serde_json::to_value(live.snapshot())
+                        .unwrap_or(json!({ "running": false })),
+                    None => json!({
+                        "running": false,
+                        "phase": "idle",
+                        "awaiting": "idle — no turn this daemon lifetime",
+                    }),
+                };
+                let pending = self.chat_runs.pending_for(&id).await.len().await;
+                let mut body = snapshot;
+                if let Some(map) = body.as_object_mut() {
+                    map.insert("session_id".to_string(), json!(id));
+                    map.insert("pending_interjections".to_string(), json!(pending));
+                    map.insert(
+                        "beat_interval_secs".to_string(),
+                        json!(crate::liveness::beat_interval_secs()),
+                    );
+                }
+                body
+            }
             SessionAction::SetWorkspace { id, workspace_id } => {
                 if self.sessions.set_workspace(&id, workspace_id.clone()).await {
                     json!({ "ok": true, "session_id": id, "workspace_id": workspace_id })
+                } else {
+                    json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
+                }
+            }
+            SessionAction::SetModel { id, model } => {
+                if self.sessions.set_chat_model(&id, model.clone()).await {
+                    json!({ "ok": true, "session_id": id, "model": model })
+                } else {
+                    json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
+                }
+            }
+            SessionAction::SetTools { id, tools } => {
+                if self.sessions.set_chat_tools(&id, tools.clone()).await {
+                    json!({ "ok": true, "session_id": id, "tools": tools })
                 } else {
                     json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
                 }
@@ -333,22 +376,33 @@ Your task: {task}")
         let pid = parent_id.clone();
         let task_for_extraction = task.clone();
 
-        // Snapshot the parent's workdir so the sub-agent can restore it.
-        // The shared ToolRegistry has a single workdir that can be overwritten
-        // by concurrent sessions, so we capture it here and re-set it inside
-        // the spawned task to avoid races.
-        let parent_workdir = agent.tools().default_workdir().await;
+        // Inherit the parent's root. Read it AS the parent wherever we know who
+        // that is — outside any run scope this call reads the shared slot,
+        // which names whichever chat wrote it last, not necessarily the session
+        // that spawned us.
+        let parent_workdir = match parent_id {
+            Some(ref parent) => {
+                ToolRegistry::with_run_session(parent.clone(), agent.tools().default_workdir())
+                    .await
+            }
+            None => agent.tools().default_workdir().await,
+        };
 
-        tokio::spawn(async move {
+        // The whole sub-agent run scopes to its own session, carried by its own
+        // future. The snapshot above used to be the workaround for the shared
+        // slot; the scope is the cure, so the run no longer writes that slot at
+        // all and a chat turn starting mid-run cannot steal the binding back.
+        // Boxed for the same reason the scheduled path boxes — the run future
+        // is large and would otherwise sit inline in the spawned task's state
+        // machine.
+        let scope_sid = sid.clone();
+        tokio::spawn(ToolRegistry::with_run_session(scope_sid, Box::pin(async move {
             // Mark as running
             sessions.set_sub_session_state(&sid, SubSessionState::Running).await;
 
-            // Set session ID so tools can scope per-session state
-            agent.tools().set_session_id(Some(sid.clone())).await;
-
-            // Set per-session workdir for the sub-agent from the parent's snapshot.
-            // This avoids races with the global default_workdir which can be
-            // overwritten by concurrent sessions.
+            // Set per-session workdir for the sub-agent from the parent's
+            // snapshot. Explicitly keyed on `sid`, and now inside the scope
+            // that reads it back.
             if let Some(ref wd) = parent_workdir {
                 agent.tools().set_session_workdir(&sid, wd.clone()).await;
             }
@@ -394,7 +448,13 @@ Your task: {task}")
                         let result_text = chat_result.content;
                         let extraction_task = task_for_extraction.clone();
                         let agent_for_extract = agent.clone();
-                        tokio::spawn(async move {
+                        // The extraction is an agent turn of its own, so it
+                        // gets its own scope: without one it would run under
+                        // whatever the shared slot named and file its
+                        // session-scoped tool state against a stranger.
+                        let extract_session = format!("extract-{}", uuid::Uuid::new_v4());
+                        let extract_scope = extract_session.clone();
+                        tokio::spawn(ToolRegistry::with_run_session(extract_scope, Box::pin(async move {
                             let agents_ctx = current_agents.as_deref().unwrap_or("(empty)");
                             let extract_prompt = format!(
                                 "You maintain the project's root AGENTS.md (agent instructions for this repo).\n\
@@ -406,12 +466,7 @@ Your task: {task}")
                                  Keep under 800 characters. No preamble."
                             );
                             match agent_for_extract
-                                .chat(
-                                    &format!("extract-{}", uuid::Uuid::new_v4()),
-                                    &extract_prompt,
-                                    None,
-                                    &[],
-                                )
+                                .chat(&extract_session, &extract_prompt, None, &[])
                                 .await
                             {
                                 Ok(extract_result) => {
@@ -440,7 +495,7 @@ Your task: {task}")
                                     debug!("Knowledge extraction skipped (LLM error): {}", e.message);
                                 }
                             }
-                        });
+                        })));
                     }
                 }
                 Err(e) => {
@@ -463,7 +518,12 @@ Your task: {task}")
                     warn!("Sub-session {} failed", sid);
                 }
             }
-        });
+
+            // The binding outlives nothing: leaving it would grow the map one
+            // permanent entry per sub-agent the daemon ever runs, and a stale
+            // entry now WINS over the global default for that id.
+            agent.tools().clear_session_workdir(&sid).await;
+        })));
 
         json!({
             "status": "spawned",

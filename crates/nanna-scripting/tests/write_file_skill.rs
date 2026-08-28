@@ -9,6 +9,8 @@
 
 #![cfg(feature = "boa")]
 
+mod common;
+
 use nanna_scripting::{ScriptEngine, ScriptedTool, ToolPermissions};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -18,15 +20,47 @@ fn skill_path() -> PathBuf {
         .join("../nanna-tools/default-skills/write_file/tool.ts")
 }
 
+/// The bridge workdir is pinned to the temp dir so the skill's own state
+/// files (`.nanna/write_hiwater.json`, `.nanna/read_marks.json`) resolve
+/// inside the fixture instead of the developer's home directory — reachable,
+/// writable, and thrown away with the tempdir. Without it every run starts
+/// with no read mark and the ratchet never persists, which is neither what
+/// production does nor what these tests mean to exercise.
 async fn run_write(input: Value, dir: &Path) -> Result<Value, String> {
     let tool = ScriptedTool::from_file(skill_path())
         .expect("read write_file tool.ts")
-        .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]));
+        .with_permissions(ToolPermissions::none().with_read([dir]).with_write([dir]))
+        // Scaffolding, not an assertion — see `common::FIXTURE_TIMEOUT_MS`.
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
     ScriptEngine::new()
-        .execute(&tool, input, None, None)
+        .execute_with_workdir(&tool, input, None, None, Some(dir.to_path_buf()))
         .await
         .map(|r| r.value)
         .map_err(|e| e.to_string())
+}
+
+/// Milliseconds since the epoch of a file's mtime, the unit read marks use.
+fn mtime_ms(path: &Path) -> u64 {
+    let modified = std::fs::metadata(path).expect("stat").modified().expect("mtime");
+    u64::try_from(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_millis(),
+    )
+    .expect("mtime fits u64")
+}
+
+/// Seed `.nanna/read_marks.json` directly. With the workdir pinned above, the
+/// skill's canonical key for a file inside the fixture is just its name.
+fn seed_read_mark(dir: &Path, key: &str, at_ms: u64) {
+    let state = dir.join(".nanna");
+    std::fs::create_dir_all(&state).expect("mkdir .nanna");
+    std::fs::write(
+        state.join("read_marks.json"),
+        json!({ key: { "at": at_ms } }).to_string(),
+    )
+    .expect("write read_marks.json");
 }
 
 async fn run_fail(input: Value, dir: &Path) -> String {
@@ -156,6 +190,9 @@ async fn shrink_guard_still_refuses_fragments() {
     let real = dir.path().join("big.txt");
     std::fs::write(&real, "y".repeat(1_000)).unwrap();
     let target = real.to_string_lossy().into_owned();
+    // The session has read the file as it stands now, so the stale-shrink
+    // hold has nothing to say and the 30% floor is what answers.
+    seed_read_mark(dir.path(), "big.txt", mtime_ms(&real));
 
     let err = run_fail(
         json!({ "file_path": target, "content": "fragment" }),
@@ -165,6 +202,88 @@ async fn shrink_guard_still_refuses_fragments() {
     assert!(err.contains("WRITE REFUSED"), "got: {err}");
     assert!(err.contains("NOT modified"), "got: {err}");
     assert_eq!(std::fs::read_to_string(&real).unwrap().len(), 1_000);
+}
+
+/// P22 Tier 3 stale-shrink hold, NEVER-READ branch: no read mark exists at
+/// all. The hold is right — you cannot shrink what you have not seen — but
+/// the reason it states has to be the true one. These replies are read
+/// literally by 9B-class local models, and "the file has CHANGED since you
+/// last read it" sends one hunting for a change that never happened.
+#[tokio::test]
+async fn stale_shrink_hold_echoes_the_current_file() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("notes.txt");
+    let original = "alpha\nbeta\ngamma\n".repeat(50);
+    std::fs::write(&real, &original).unwrap();
+    let target = real.to_string_lossy().into_owned();
+
+    // Well clear of the 30% floor, so the hold is the only thing in play.
+    let merged = "alpha\nbeta\n".repeat(50);
+    let err = run_fail(
+        json!({ "file_path": target.clone(), "content": merged.clone() }),
+        dir.path(),
+    )
+    .await;
+
+    assert!(err.contains("WRITE HELD"), "got: {err}");
+    assert!(
+        err.contains("NEVER read this file in this session"),
+        "must name the real reason: {err}"
+    );
+    assert!(
+        !err.contains("CHANGED since you last read it"),
+        "must not claim a change that never happened: {err}"
+    );
+    assert!(err.contains("gamma"), "the echo must carry the current content: {err}");
+    assert!(
+        err.contains("counts as your read"),
+        "must say the bounce is the read: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+
+    // The echo counted as the read, so the same write lands on the retry.
+    run_write(json!({ "file_path": target, "content": merged.clone() }), dir.path())
+        .await
+        .expect("the retry after the echo must be accepted");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), merged);
+}
+
+/// The other branch of the same hold: a read mark EXISTS but predates the
+/// file's mtime, so the file genuinely moved under the model. Here the
+/// "CHANGED since you last read it" sentence is the true one.
+#[tokio::test]
+async fn stale_shrink_hold_names_the_change_when_the_file_moved_under_us() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("notes.txt");
+    let original = "alpha\nbeta\ngamma\n".repeat(50);
+    std::fs::write(&real, &original).unwrap();
+    let target = real.to_string_lossy().into_owned();
+    // Read ten minutes before the file was last written: seen, then changed.
+    seed_read_mark(dir.path(), "notes.txt", mtime_ms(&real) - 600_000);
+
+    let err = run_fail(
+        json!({ "file_path": target, "content": "alpha\nbeta\n".repeat(50) }),
+        dir.path(),
+    )
+    .await;
+
+    assert!(err.contains("WRITE HELD"), "got: {err}");
+    assert!(
+        err.contains("CHANGED since you last read it"),
+        "must name the real reason: {err}"
+    );
+    assert!(
+        !err.contains("NEVER read this file"),
+        "the session did read it: {err}"
+    );
+    assert!(err.contains("gamma"), "the echo must carry the current content: {err}");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
 }
 
 /// REGRESSION (2026-07-27): a run built `./minidb` to 8/42 acceptance checks

@@ -1,38 +1,37 @@
 <template>
-  <div class="session-item-wrap" @mouseenter="!isActive && meshEnter()" @mouseleave="!isActive && meshLeave()">
+  <div class="group/session relative">
     <button
       type="button"
       @click="$emit('select', session)"
       @contextmenu.prevent="showMenu = true"
-      :class="['session-btn', { active: isActive }]"
+      :class="['session-btn flex w-full flex-col items-start gap-2 border-l border-solid p-4 text-left transition-colors hover:bg-white/5', isActive ? 'border-nui-accent bg-white/5' : 'border-transparent']"
       :aria-current="isActive ? 'true' : undefined"
     >
-      <!-- Splatter mesh (visible when active, hover preview when inactive) -->
-      <span class="session-mesh" :style="{ background: splatterBg, opacity: isActive ? 1 : 0 }" />
-
-      <div class="session-content">
-        <div class="session-row">
-          <span class="session-name">{{ session.name }}</span>
-          <div class="session-actions">
-            <SessionActivityBadge :session-id="session.id" compact />
-          </div>
-        </div>
-        <div class="session-date">{{ formatDate(session.updated_at) }}</div>
+      <div class="flex w-full items-center gap-2">
+        <span class="session-name min-w-0 flex-1 overflow-hidden text-ellipsis break-words text-xs font-semibold leading-normal text-nui-fg line-clamp-2">{{ session.name }}</span>
+        <SessionActivityBadge :session-id="session.id" compact class="shrink-0" />
+      </div>
+      <div class="flex w-full min-w-0 items-center gap-2">
+        <span class="shrink-0 text-xs leading-normal text-nui-muted">{{ formatDate(session.updated_at) }}</span>
+        <!-- The sidebar is where a user notices that one chat runs on a
+             different model. Read-only: the pin is changed in the chat
+             header, and it covers chat replies only. -->
+        <span
+          v-if="pinnedModel"
+          class="session-model min-w-0 truncate text-xs leading-normal text-nui-info"
+          :title="`This chat is pinned to ${pinnedModel}`"
+        >{{ modelDisplayName(pinnedModel) }}</span>
       </div>
     </button>
     <button
       type="button"
       @click.stop="showMenu = !showMenu"
-      class="session-menu-btn"
+      class="session-menu-btn absolute right-1 top-3 z-[2] p-2 text-nui-muted opacity-0 transition-opacity hover:text-nui-fg focus-visible:opacity-100 group-hover/session:opacity-100"
       aria-label="Session menu"
       title="Session menu"
       :aria-expanded="showMenu ? 'true' : 'false'"
     >
-      <svg viewBox="0 0 4 16" fill="currentColor" style="width: 4px; height: 12px;" aria-hidden="true">
-        <circle cx="2" cy="2" r="1.5" />
-        <circle cx="2" cy="8" r="1.5" />
-        <circle cx="2" cy="14" r="1.5" />
-      </svg>
+      <NuiIcon name="overflow-menu" :size="16" />
     </button>
 
     <!-- Context Menu -->
@@ -40,31 +39,30 @@
       <div
         v-if="showMenu"
         v-click-outside="() => showMenu = false"
-        class="session-context-menu"
+        class="absolute right-0 top-full z-50 w-36 overflow-hidden border border-solid border-nui-muted/40 bg-nui-bg p-1"
       >
-        <button @click="startRename" class="ctx-item">Rename</button>
-        <button @click="confirmDelete" class="ctx-item ctx-danger">Delete</button>
+        <button @click="startRename" class="ctx-item block w-full px-2.5 py-1.5 text-left text-xs text-nui-fg transition-colors hover:bg-white/5">Rename</button>
+        <button @click="confirmDelete" class="ctx-item ctx-danger block w-full px-2.5 py-1.5 text-left text-xs text-nui-pink transition-colors hover:bg-nui-pink/10">Delete</button>
       </div>
     </Transition>
 
     <!-- Rename Modal -->
     <Teleport to="body">
       <Transition name="modal">
-        <div v-if="isRenaming" class="rename-overlay">
-          <div class="rename-dialog">
-            <h3 style="font-size: 1rem; font-weight: 600; color: #e2e8f0; margin-bottom: 1rem;">Rename Session</h3>
+        <div v-if="isRenaming" class="rename-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div class="rename-dialog w-96 border border-solid border-nui-muted/40 bg-nui-bg p-6 font-nui">
+            <h3 class="mb-4 text-sm font-semibold leading-normal text-nui-fg">Rename Session</h3>
             <input
               v-model="newName"
               ref="renameInput"
               @keydown.enter="saveRename"
               @keydown.escape="isRenaming = false"
-              class="input"
+              class="mb-4 w-full border border-solid border-nui-muted/40 bg-transparent p-2 text-xs leading-normal text-nui-fg outline-none placeholder:text-nui-muted focus:border-nui-accent"
               placeholder="Session name"
-              style="margin-bottom: 1rem;"
             />
-            <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
-              <button @click="isRenaming = false" class="btn-ghost">Cancel</button>
-              <button @click="saveRename" class="btn-primary" :disabled="!newName.trim()">Save</button>
+            <div class="flex justify-end gap-2">
+              <button @click="isRenaming = false" class="px-4 py-2 text-xs text-nui-muted transition-colors hover:text-nui-fg">Cancel</button>
+              <button @click="saveRename" class="rounded-lg bg-nui-accent px-4 py-2 text-xs text-nui-fg transition-opacity disabled:opacity-50" :disabled="!newName.trim()">Save</button>
             </div>
           </div>
         </div>
@@ -74,11 +72,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, watch } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { modelDisplayName } from '~/lib/modelSpecs'
+import { knownChatModel } from '~/composables/useSessionState'
 import { useConfirm } from '~/composables/useConfirm'
-import { useSplatter } from '~/composables/useSplatter'
-
 const { confirm } = useConfirm()
 
 interface SessionInfo {
@@ -89,6 +87,8 @@ interface SessionInfo {
   message_count: number
   workspace_id: string | null
   workspace_name: string | null
+  /** Model this chat is pinned to; absent/null = the global `[llm]` default. */
+  chat_model?: string | null
 }
 
 const props = defineProps<{
@@ -102,18 +102,16 @@ const emit = defineEmits<{
   (e: 'renamed', session: SessionInfo): void
 }>()
 
-// Splatter for active state — violet/indigo palette
-const { splatterBg, onEnter: meshEnter, onLeave: meshLeave } = useSplatter({
-  colors: ['139,92,246', '129,140,248', '99,102,241'],
-  opacityRanges: [[0.15, 0.25], [0.12, 0.2], [0.08, 0.15]],
-  sizes: ['65%', '60%', '50%'],
+/**
+ * The pin to show. `session` comes from the layout's list, which is only
+ * reloaded at mount, on `sessions-cleared`, and on a workspace-tab change — so
+ * on its own it goes on claiming a pin the header has since removed. Where
+ * this window has its own answer for the chat, that one is newer and wins.
+ */
+const pinnedModel = computed(() => {
+  const known = knownChatModel(props.session.id)
+  return known === undefined ? (props.session.chat_model ?? null) : known
 })
-
-// Keep splatter animating while active
-watch(() => props.isActive, (active) => {
-  if (active) meshEnter()
-  else meshLeave()
-}, { immediate: true })
 
 const showMenu = ref(false)
 const isRenaming = ref(false)
@@ -147,8 +145,8 @@ async function confirmDelete() {
   const confirmed = await confirm({
     title: 'Delete Session',
     message: `Delete "${props.session.name}"? This cannot be undone.`,
-    confirmText: 'Delete',
-    destructive: true
+    confirmLabel: 'Delete',
+    danger: true
   })
   if (!confirmed) return
   try {
@@ -188,169 +186,6 @@ const vClickOutside = {
 </script>
 
 <style scoped>
-.session-item-wrap {
-  position: relative;
-}
-.session-item-wrap:hover .session-menu-btn,
-.session-item-wrap:focus-within .session-menu-btn,
-.session-btn.active + .session-menu-btn {
-  opacity: 1;
-}
-
-.session-btn {
-  position: relative;
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  overflow: hidden;
-  isolation: isolate;
-  transition: color 0.15s;
-}
-
-/* Splatter mesh layer */
-.session-mesh {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  border-radius: inherit;
-  transition: opacity 0.25s ease;
-  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch' result='noise'/%3E%3CfeColorMatrix type='saturate' values='0' in='noise' result='gray'/%3E%3CfeColorMatrix type='matrix' in='gray' values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 1 0 0 0 0' result='a'/%3E%3CfeComponentTransfer in='a'%3E%3CfeFuncA type='linear' slope='0.9' intercept='0.05'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch' result='noise'/%3E%3CfeColorMatrix type='saturate' values='0' in='noise' result='gray'/%3E%3CfeColorMatrix type='matrix' in='gray' values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 1 0 0 0 0' result='a'/%3E%3CfeComponentTransfer in='a'%3E%3CfeFuncA type='linear' slope='0.9' intercept='0.05'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  -webkit-mask-size: 200px 200px;
-  mask-size: 200px 200px;
-}
-
-/* Hover: show mesh faintly */
-.session-btn:hover .session-mesh {
-  opacity: 0.4 !important;
-}
-.session-btn.active .session-mesh {
-  opacity: 1 !important;
-}
-
-.session-content {
-  position: relative;
-  z-index: 1;
-}
-
-.session-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.session-name {
-  font-size: 0.8rem;
-  color: rgba(196, 205, 214, 0.7);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-.session-btn.active .session-name {
-  color: #e2e8f0;
-  font-weight: 500;
-}
-
-.session-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.session-menu-btn {
-  position: absolute;
-  top: 10px;
-  right: 8px;
-  z-index: 2;
-  opacity: 0;
-  padding: 4px 6px;
-  border-radius: 4px;
-  border: none;
-  background: transparent;
-  color: rgba(196, 205, 214, 0.5);
-  cursor: pointer;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
-}
-.session-btn:hover .session-menu-btn {
-  opacity: 1;
-}
-.session-menu-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: #e2e8f0;
-}
-
-.session-date {
-  font-size: 0.65rem;
-  color: #64748b;
-  margin-top: 2px;
-}
-.session-btn.active .session-date {
-  color: rgba(139, 92, 246, 0.6);
-}
-
-/* Context menu */
-.session-context-menu {
-  position: absolute;
-  right: 0;
-  top: 100%;
-  width: 140px;
-  background: rgba(15, 23, 42, 0.72);
-  backdrop-filter: blur(28px) saturate(150%);
-  -webkit-backdrop-filter: blur(28px) saturate(150%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  z-index: 50;
-  overflow: hidden;
-  padding: 4px;
-}
-.ctx-item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 6px 10px;
-  border: none;
-  background: transparent;
-  color: #e2e8f0;
-  font-size: 0.8rem;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background 0.1s;
-}
-.ctx-item:hover { background: rgba(255, 255, 255, 0.06); }
-.ctx-danger { color: #fb7185; }
-.ctx-danger:hover { background: rgba(251, 113, 133, 0.1); }
-
-/* Rename overlay */
-.rename-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-}
-.rename-dialog {
-  background: rgba(15, 23, 42, 0.72);
-  backdrop-filter: blur(28px) saturate(150%);
-  -webkit-backdrop-filter: blur(28px) saturate(150%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  padding: 1.5rem;
-  width: 360px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-}
-
 /* Transitions */
 .menu-enter-active, .menu-leave-active { transition: all 0.15s ease; }
 .menu-enter-from, .menu-leave-to { opacity: 0; transform: scale(0.95); }

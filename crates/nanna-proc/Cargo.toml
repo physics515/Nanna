@@ -1,0 +1,27 @@
+[package]
+name = "nanna-proc"
+version.workspace = true
+edition.workspace = true
+description = "Child-process lifetime containment: tree kills and kill-on-close Job Objects"
+
+[dependencies]
+# kill_process_tree shells out to `taskkill` (Windows) and the ChildJob guard
+# takes &tokio::process::Child; both callers (exec tool, acceptance runner)
+# are tokio-native.
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Win32_System_JobObjects + Win32_Security: kill-on-close Job Objects (the
+# SECURITY_ATTRIBUTES parameter type of CreateJobObjectW lives in
+# Win32_Security even though we always pass null).
+# Win32_System_Threading: GetCurrentProcess for daemon self-adoption.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
+
+# Process-group kill for tree-kill timeouts: kill(-pgid, SIGKILL) reaps the
+# shell AND its descendants, which kill_on_drop alone cannot.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

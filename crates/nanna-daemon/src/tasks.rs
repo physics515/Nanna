@@ -19,6 +19,7 @@ use crate::protocol::Event;
 use nanna_agent::harness::{
     AcceptanceCheck, Interjector, LongHorizonConfig, LongHorizonReport, LongHorizonRunner,
     StepOutcome, StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
+    touched_path_of,
 };
 use nanna_agent::planner::{Plan, build_plan_prompt, plan_or_fallback};
 use nanna_agent::CancelToken;
@@ -522,13 +523,19 @@ pub fn build_task_services(
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
                     let parent_id = opt_i64(&params, "parent_id")?;
-                    let (scope, scope_id, parent_sort) = if let Some(parent_id) = parent_id {
-                        let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
-                        (parent.scope, parent.scope_id, Some(parent.sort_order))
-                    } else {
-                        let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                        (scope, scope_id, None)
-                    };
+                    let (scope, scope_id, parent_sort, parent_acceptance) =
+                        if let Some(parent_id) = parent_id {
+                            let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
+                            (
+                                parent.scope,
+                                parent.scope_id,
+                                Some(parent.sort_order),
+                                parent.acceptance,
+                            )
+                        } else {
+                            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                            (scope, scope_id, None, None)
+                        };
                     let title = opt_string(&params, "title")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "title is required".to_string())?;
@@ -556,6 +563,11 @@ pub fn build_task_services(
                         return Ok(json!({
                             "task": task_to_json(&existing),
                             "deduplicated": true,
+                            // Consistent with the closed-this-turn guard so
+                            // callers have ONE flag for "nothing was created"
+                            // — the todo skill suppresses its "Added task"
+                            // confirmation on exactly this field.
+                            "created": false,
                             "note": format!(
                                 "Task #{} \"{}\" already exists and is still open — reusing it \
                                  instead of creating a duplicate. Work on it rather than \
@@ -646,7 +658,18 @@ pub fn build_task_services(
                         due_at: opt_string(&params, "due_at"),
                         recurrence: opt_string(&params, "recurrence"),
                         depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
-                        acceptance: canonical_acceptance(&params)?,
+                        // Acceptance inheritance: a subtask that declares no
+                        // check of its own answers to its parent's — the same
+                        // write-time principle as scope inheritance. Without
+                        // it, self-created children are self-graded: closing
+                        // them looks like progress to model and scheduler
+                        // alike while the parent's real check fails
+                        // byte-identically (observed 2026-08-07/08: 97 items
+                        // marked done against 6 features actually verified —
+                        // the whole gap was acceptance-less scaffolding).
+                        // "Done is a verdict" only binds where a verdict
+                        // exists; this gives every child one by default.
+                        acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
                         assignee: opt_string(&params, "assignee"),
                         sort_order,
                     };
@@ -1099,16 +1122,22 @@ pub fn build_task_services(
 // ---------------------------------------------------------------------------
 
 /// The P15 store as the harness's task source, scoped to one run.
+///
+/// It carries no `workdir`. It used to, for "where ancestor acceptance checks
+/// run during promotion" — but the ancestor-promotion experiment was cut as
+/// benchmark-shaped (see the note on [`Self::complete`]: it converted the eval
+/// metric directly and would almost never fire in a chat workflow). The field
+/// outlived the feature, was never read, and was always `None`, so it was a
+/// standing invitation to "finish wiring it" — which the no-benchmark-shaped-
+/// levers rule forbids. Removed 2026-08-26; per-call acceptance checks still
+/// take their own `workdir` from `tasks.done {workdir?}`, which is a different
+/// and live mechanism.
 pub struct TursoTaskSource {
     storage: Arc<Storage>,
     scope: String,
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Where ancestor acceptance checks run during promotion. `None` disables
-    /// promotion entirely — a check executed in the wrong directory would
-    /// verify against the wrong tree, which is worse than not promoting.
-    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1126,7 +1155,6 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
-            workdir: None,
         }
     }
 
@@ -1279,7 +1307,13 @@ impl TaskSource for TursoTaskSource {
         // mechanism — the ancestor-promotion experiment that auto-probed and
         // auto-scored parent checks was cut as benchmark-shaped (it converted
         // the eval metric directly and would almost never fire in a chat
-        // workflow, where tasks rarely carry machine checks). This is pure
+        // workflow, where tasks rarely carry machine checks). Its last residue
+        // was a `workdir: Option<PathBuf>` on this struct, hard-coded to `None`
+        // by the only constructor and read by nothing — a dead-code warning
+        // whose doc comment nonetheless read as though promotion existed and
+        // was merely switched off. Removed; if promotion is ever wanted back it
+        // needs a deliberate design, not a field waiting to be filled in. This
+        // is pure
         // coherence: a parent proven done with scaffolding still open is a
         // contradictory state, and working those children is spending steps on
         // a goal that no longer exists.
@@ -1332,6 +1366,34 @@ impl TaskSource for TursoTaskSource {
         Ok(())
     }
 
+    async fn reopen(&self, id: i64, reason: &str) -> Result<(), String> {
+        // The environment's verdict changed after the item closed (a
+        // verified completion regressed, or an abandoned item's check now
+        // passes) — the store records what is true NOW. Same patch door as
+        // every other status change, so scope/cascade invariants hold.
+        let repo = self.storage.tasks();
+        repo.update(
+            id,
+            TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            },
+            Some(&self.actor),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        repo.log_activity(
+            id,
+            Some(&self.actor),
+            "reopened",
+            Some(json!({ "reason": reason })),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        self.emit(id, "reopened", json!({ "reason": reason }));
+        Ok(())
+    }
+
     /// Open children of `id` in this scope — the runner's evidence that a
     /// replan step actually decomposed something. Counted from the scope's
     /// open list rather than a dedicated query because that is the same view
@@ -1360,6 +1422,15 @@ pub struct AgentStepRunner {
     /// than once per step — the runner is one object for the whole run, while
     /// each step gets a fresh `RunState`.
     pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Tools the user manually added to this chat's context (per-session
+    /// selection, stored on the session and threaded through `ChatTurnPrep`).
+    ///
+    /// Strictly additive: unioned into every step's active set AFTER the core
+    /// set and BEFORE run-discovered tools, deduplicated. Empty = no manual
+    /// selection, which leaves the active set byte-identical to the
+    /// pre-feature behavior (core + discovered only). Unknown names cost
+    /// nothing — the registry simply has nothing to activate for them.
+    pub user_selected_tools: Vec<String>,
     /// The sibling breakers' repeat-call ledger for THIS run.
     ///
     /// Shared across steps for exactly the reason `discovered_tools` above
@@ -1412,6 +1483,10 @@ pub struct AgentStepRunner {
     /// runners) share one counter, so the two faults that prove a repeat do
     /// not have to land on the same runner object.
     pub gpu_fault_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Capability-transition notices (P22 Tier 4), shared with the daemon's
+    /// provider plumbing. Each pending transition reaches the model once, in
+    /// the next tool result — see [`nanna_agent::DegradationLedger`].
+    pub degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -1442,12 +1517,20 @@ pub struct ChatSink {
     /// Shared (not per-clone) state: the finalizer sets it after seeding,
     /// and the step runner's clone must see it.
     pub quiet_item: Arc<std::sync::Mutex<Option<i64>>>,
+    /// Session liveness ledger (P22): every sink event also stamps the
+    /// per-session ledger the liveness beat and `session.liveness` verb read,
+    /// so "working, wedged, or finished" is answerable without log greps.
+    /// `None` on paths that have no beat (task-run manager, tests).
+    pub liveness: Option<Arc<crate::liveness::SessionLiveness>>,
 }
 
 impl ChatSink {
     pub(crate) fn delta(&self, text: &str) {
         if text.is_empty() {
             return;
+        }
+        if let Some(live) = &self.liveness {
+            live.on_stream_delta(text.len());
         }
         let _ = self.event_tx.send(Event::MessageDelta {
             session_id: self.session_id.clone(),
@@ -1461,9 +1544,10 @@ impl ChatSink {
                 acc.push_str(text);
             }
             // The journal lock is std::sync and infallible by design (see
-            // ActiveChat::timeline) — merge into the trailing Text item so a
-            // token stream stays one item, not thousands.
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            // `agent_service::timeline_lock`, which both writers share) — merge
+            // into the trailing Text item so a token stream stays one item, not
+            // thousands.
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
                 content.push_str(text);
             } else {
@@ -1479,6 +1563,9 @@ impl ChatSink {
         if text.is_empty() {
             return;
         }
+        if let Some(live) = &self.liveness {
+            live.on_thinking(text.len());
+        }
         let _ = self.event_tx.send(Event::ThinkingDelta {
             session_id: self.session_id.clone(),
             delta: text.to_string(),
@@ -1487,7 +1574,7 @@ impl ChatSink {
             if let Ok(mut acc) = run.accumulated_thinking.try_write() {
                 acc.push_str(text);
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
             {
                 content.push_str(text);
@@ -1501,6 +1588,9 @@ impl ChatSink {
     }
 
     fn tool_start(&self, call_id: &str, name: &str, input: &Value, model: Option<&str>) {
+        if let Some(live) = &self.liveness {
+            live.on_tool_start(name);
+        }
         let _ = self.event_tx.send(Event::ToolStart {
             session_id: self.session_id.clone(),
             call_id: call_id.to_string(),
@@ -1518,9 +1608,7 @@ impl ChatSink {
                     started_at: chrono::Utc::now(),
                 });
             }
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -1530,19 +1618,43 @@ impl ChatSink {
                     duration_ms: None,
                     tokens: None,
                     total_tokens: None,
+                    // Back-filled with the rest of the outcome in `tool_end`.
+                    short_circuited: None,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
         }
     }
 
-    fn tool_end(&self, call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64) {
+    fn tool_end(
+        &self,
+        call_id: &str,
+        name: &str,
+        output: &str,
+        success: bool,
+        duration_ms: u64,
+        data: Option<&Value>,
+    ) {
+        // P22 Tier 4: a breaker replay carries a machine-readable marker in
+        // its structured data — recorded as its own outcome so a wall of
+        // short-circuits never reads as tool failures in the stats.
+        let short_circuited = data
+            .and_then(|d| d.get("short_circuited"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(live) = &self.liveness {
+            // A short-circuited replay did NOT run the tool: it must not
+            // count as side-effect evidence in the liveness ledger, or a
+            // wall of replays would read as "the world changed" to the
+            // repeat-completion escalation.
+            live.on_tool_end(name, success && !short_circuited);
+        }
         let _ = self.event_tx.send(Event::ToolEnd {
             session_id: self.session_id.clone(),
             call_id: call_id.to_string(),
             output: output.to_string(),
             success,
             duration_ms,
-            data: None,
+            data: data.cloned(),
         });
         if let Some(run) = &self.run {
             if let Ok(mut active) = run.active_tool_calls.try_write() {
@@ -1557,11 +1669,12 @@ impl ChatSink {
                     duration_ms,
                 });
             }
-            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
             if let Some(crate::session::TimelineItem::Tool {
                 output: slot_output,
                 success: slot_success,
                 duration_ms: slot_duration,
+                short_circuited: slot_short_circuited,
                 ..
             }) = journal
                 .iter_mut()
@@ -1571,15 +1684,22 @@ impl ChatSink {
                 *slot_output = Some(output.to_string());
                 *slot_success = Some(success);
                 *slot_duration = Some(duration_ms);
+                // Stats, the liveness ledger and the live event already
+                // distinguish a replay from a failure; the run record is the
+                // last consumer that did not, which is why a timeline
+                // rebuilt after a remount showed steering as tool errors.
+                *slot_short_circuited = Some(short_circuited);
             }
         }
         if let Some(stats) = &self.tool_stats {
             let observation = nanna_agent::ToolObservation {
                 tool_name: name.to_string(),
                 success,
+                short_circuited,
                 duration_ms,
                 output_size: output.len(),
-                error: (!success).then(|| output.to_string()),
+                // A replay notice is harness steering, not a tool error.
+                error: (!success && !short_circuited).then(|| output.to_string()),
                 session_id: Some(self.session_id.clone()),
             };
             let stats = stats.clone();
@@ -1592,6 +1712,7 @@ impl ChatSink {
                         .log_tool_call(
                             &observation.tool_name,
                             observation.success,
+                            observation.short_circuited,
                             observation.duration_ms,
                             observation.output_size,
                             observation.error.as_deref(),
@@ -1607,12 +1728,50 @@ impl ChatSink {
         }
     }
 
+    /// The per-request usage callback — the daemon's only live context-usage
+    /// signal, and the reason a client can show "23k of 27k" instead of a bare
+    /// spinner.
+    ///
+    /// `window` is the agent loop's OWN enforced input bound at the moment of
+    /// the request (`AgentContext::hard_limit`), so used-vs-window is measured
+    /// against the limit that request was actually judged against — a mid-run
+    /// `num_ctx` demotion moves the denominator with it.
+    ///
+    /// Only the event is filled here. The run-scoped token totals the retired
+    /// in-service path also accumulated (`run_input_tokens` /
+    /// `run_output_tokens`, served in `RunStateSnapshot`) live on
+    /// `ActiveChat`, and `ExternalRunHandle` — this path's only handle on that
+    /// state — does not expose them; when it does, they belong here beside the
+    /// event.
+    fn usage_callback(&self) -> Box<dyn Fn(u32, u32, u64) + Send + Sync> {
+        let event_tx = self.event_tx.clone();
+        let session_id = self.session_id.clone();
+        Box::new(move |input: u32, _output: u32, window: u64| {
+            let _ = event_tx.send(Event::ContextUsage {
+                session_id: session_id.clone(),
+                used: u64::from(input),
+                window,
+            });
+        })
+    }
+
     /// Announce which item the run is starting, so the transcript reads as
     /// work-in-progress rather than a wall of unattributed text.
     /// The label is read back out of the step prompt (`build_step_prompt`
     /// writes `Task #id: title`); if that line is ever absent the header
     /// degrades to the bare item id rather than failing.
     fn step_header(&self, request: &StepRequest) {
+        // The liveness ledger tracks EVERY step, including banner-free quiet
+        // items — a wedge inside a conversation-shaped turn must still be
+        // visible to the beat and the `session.liveness` verb.
+        if let Some(live) = &self.liveness {
+            let kind = match request.step_kind {
+                nanna_agent::harness::StepKind::Plan => "planning",
+                nanna_agent::harness::StepKind::Verify => "verifying",
+                nanna_agent::harness::StepKind::Execute => "working",
+            };
+            live.on_step(request.step_index, kind, &request.item_title);
+        }
         // Conversation-shaped turns (one-task plans) stay banner-free so the
         // transcript feels like chat — see the `quiet_item` field.
         if self
@@ -1644,9 +1803,7 @@ impl ChatSink {
             item_id: request.item_id,
         });
         if let Some(run) = &self.run {
-            run.timeline
-                .lock()
-                .expect("timeline lock poisoned")
+            crate::agent_service::timeline_lock(&run.timeline)
                 .push(crate::session::TimelineItem::Step {
                     phase: kind.to_string(),
                     label,
@@ -1675,14 +1832,19 @@ const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 /// Transient provider faults worth retrying in place: 5xx (including the
 /// synthesized 502 for aborted Ollama generations), client timeouts and
 /// connection failures ("error sending request" is reqwest's send-phase
-/// failure), and mid-stream drops ("Stream error:"). Shared by the step
-/// runner and the chat path — both heal with the same ladder.
+/// failure), mid-stream drops ("Stream error:"), and stream-watchdog trips
+/// (`AgentError::StreamWatchdog` — the stream FUTURE wedged while the
+/// transport thought it healthy; a fresh request builds a fresh future, so
+/// the ladder's retry-plus-runner-reset is exactly the right medicine, and a
+/// persistent wedge still surfaces through the circuit breaker). Shared by
+/// the step runner and the chat path — both heal with the same ladder.
 pub(crate) fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
         || message.contains("connection")
         || message.contains("error sending request")
         || message.contains("Stream error:")
+        || message.contains("stream watchdog:")
 }
 
 /// Forensics: append the exact prompt of an empty-completion step to a temp
@@ -1740,6 +1902,156 @@ const NO_PROGRESS_NUDGE: &str = "\n\n[SYSTEM: your previous attempt at this step
      Either CALL A TOOL now (that is how work happens), or, if the step is genuinely already \
      satisfied, reply with one short sentence saying so.]";
 
+/// A short, constant-size label for the fault a retry is healing.
+///
+/// The classified KIND, never the raw message: an error body carries provider
+/// JSON, stream tails and byte counts, and pasting that into a prompt spends
+/// window on noise the model cannot act on. Every arm reuses a classifier the
+/// ladder already consults, so the label and the healing action can never
+/// disagree.
+pub(crate) fn transient_fault_kind(message: &str) -> &'static str {
+    if gpu_memory_error(message) {
+        "the model ran out of GPU memory"
+    } else if ollama_generation_parse_error(message).is_some() {
+        "the provider could not parse the tool call"
+    } else if message.contains("No NDJSON line was ever parsed") {
+        "the provider's stream died before any output"
+    } else if wedged_runner_error(message) {
+        "the provider's runner wedged mid-generation"
+    } else if message.contains("stream watchdog:") {
+        "the stream stalled and the watchdog cut it"
+    } else if message.contains("timed out") {
+        "the request timed out"
+    } else {
+        "a provider transport fault"
+    }
+}
+
+/// Appended to a step prompt when the SAME step is retried after a transient
+/// provider fault interrupted it mid-flight.
+///
+/// A retry re-enters the step with a FRESH context — that is the re-anchor,
+/// and it is what makes retries cheap. But the fresh context is also a lie by
+/// omission: the interrupted attempt may already have called tools, and those
+/// calls RAN. Their effects are on disk while the conversation the model can
+/// see shows none of them, so a model that reads its own context as ground
+/// truth concludes the file is untouched and rewrites it from scratch —
+/// destroying the work the interrupted attempt did. Observed as the
+/// abandonment/truncation chain: peak content early, a shrunken file at the
+/// end.
+///
+/// Replaying the partial transcript is not the fix and is not attempted:
+/// [`StepAttemptError`] is lossy by design (the ladder keeps the classified
+/// message and the wedge fingerprint, nothing else), and a half transcript
+/// re-fed as history is exactly the corrupted state the re-anchor exists to
+/// escape. Naming the situation costs a fixed handful of sentences instead.
+///
+/// What the retry carries BESIDE this warning is [`carried_side_effect_note`]:
+/// the calls that actually landed, surfaced from the liveness ledger. That is
+/// a record of what changed on disk, not a half transcript posing as history,
+/// so it does not reopen the state this note exists to escape.
+pub(crate) fn transient_retry_note(attempt: usize, fault: &str) -> String {
+    format!(
+        "\n\n[SYSTEM: this same step was interrupted mid-flight by a provider fault (attempt \
+         {attempt}; fault: {fault}) and is being retried. Tool calls the interrupted attempt had \
+         already made DID execute — their effects are on disk even though this conversation does \
+         not show them. Continue the step, do not restart it: re-read the working artifact before \
+         any whole-file write; a rewrite that drops existing functions is destruction, not \
+         progress.]"
+    )
+}
+
+/// Byte budget for the carried side-effect list, as a share of the model's
+/// LIVE hard input limit.
+///
+/// Derived, not chosen. The harness has already decided how many bytes of a
+/// step prompt may be spent re-stating work the model cannot see: one
+/// screenful — [`nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES`], the slice
+/// of the previous step's output it feeds forward — and that number was sized
+/// against the universal window floor ([`nanna_llm::UNKNOWN_CONTEXT_WINDOW`]).
+/// Read as a SHARE rather than as a constant, it is 2000 bytes of that floor's
+/// hard input limit, ~1.8% of the input budget once bytes are converted at the
+/// usual ~4 chars/token. Scaling by the live hard limit holds the share fixed
+/// while the window moves: a `num_ctx`-demoted model pays the demoted window's
+/// worth, a large window may afford more.
+///
+/// A share is the bound precisely because "however many calls the attempt
+/// made" is not one: 104 side-effecting calls were observed in a single
+/// aborted attempt, which rendered in full is ~13% of everything a small model
+/// can read — a re-anchor large enough to displace the work it re-anchors.
+pub(crate) fn carried_side_effect_budget_bytes(hard_input_limit_tokens: usize) -> usize {
+    let floor_hard_limit = nanna_llm::unknown_model_info("", "").hard_input_limit();
+    nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES.saturating_mul(hard_input_limit_tokens)
+        / floor_hard_limit.max(1)
+}
+
+/// The interrupted attempt's side-effecting calls, newest first, plus the
+/// pointer saying where their full inputs and outputs still are.
+///
+/// This is the concrete half of the re-anchor. [`transient_retry_note`] can
+/// only say that tool calls "DID execute"; a warning with no subject is not
+/// something a model can act on, and the model's next move after a blind
+/// re-entry is a whole-file rewrite. The calls are SURFACED from the P22
+/// Tier 4 [`crate::liveness::SessionLiveness`] ledger, which recorded them as
+/// they ran — nothing here is reconstructed, and no partial transcript is
+/// replayed.
+///
+/// The shape follows the harness's own bounded synthesis
+/// (`loop_runner::step_activity_digest`): newest calls first, cut at the
+/// budget, and the calls that did not fit announced as a count rather than
+/// dropped in silence. The announcement itself always ships — a budget too
+/// small for even one line must still leave the model knowing the attempt
+/// acted, which is the whole fact it is otherwise missing.
+///
+/// It names only `discover_tools`, the one tool every request ships. A prompt
+/// that names a tool whose schema was never sent is how malformed acceptance
+/// checks went from 3.1% to 53-66% (see [`CORE_TOOLS`]).
+///
+/// `outputs_recallable` is whether this run HAS a memory service writing tool
+/// results (`memory_sink`). Without one, `loop_runner` keeps results in
+/// context instead of storing them, so pointing the model at a store that was
+/// never written is a promise the run cannot keep — the note then says only
+/// what remains true.
+pub(crate) fn carried_side_effect_note(
+    marks: &[crate::liveness::ToolMarkSnapshot],
+    budget_bytes: usize,
+    outputs_recallable: bool,
+) -> String {
+    if marks.is_empty() {
+        return String::new();
+    }
+    let head = format!(
+        "\n[SYSTEM: that attempt made {} side-effecting tool call{} before it was cut, newest \
+         first — each one ran, and whatever it changed is already on disk:",
+        marks.len(),
+        if marks.len() == 1 { "" } else { "s" }
+    );
+    let tail = if outputs_recallable {
+        "\nMost of what those calls produced was stored as it ran and may be readable out of \
+         your memory — reach the memory tools with discover_tools. Do not rely on it: read the \
+         artifact back off disk rather than assuming what a file now holds.]"
+    } else {
+        "\nWhat those calls produced is not in this conversation any more — read the artifact \
+         back off disk before you write over it rather than assuming what it holds.]"
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = head.len() + tail.len();
+    for (idx, mark) in marks.iter().enumerate() {
+        let line = format!("\n- {} ({}s ago)", mark.name, mark.secs_ago);
+        if used + line.len() > budget_bytes {
+            let omitted = marks.len() - idx;
+            lines.push(format!(
+                "\n- …and {omitted} earlier call{}",
+                if omitted == 1 { "" } else { "s" }
+            ));
+            break;
+        }
+        used += line.len();
+        lines.push(line);
+    }
+    format!("{head}{}{tail}", lines.concat())
+}
+
 /// The only tool definitions shipped with a step. Everything else is reached
 /// through `discover_tools`.
 ///
@@ -1790,50 +2102,33 @@ const NO_PROGRESS_NUDGE: &str = "\n\n[SYSTEM: your previous attempt at this step
 /// the prompt, not to widen this list.
 const CORE_TOOLS: &[&str] = &["discover_tools"];
 
-/// Content not worth a memory: machine noise rather than an observation.
+/// The one place a step's starting active-tool set is assembled: the default
+/// set (core + tools discovered so far this run, exactly as before), with the
+/// user's manual per-chat selections APPENDED.
 ///
-/// Deliberately narrow, and narrower than it used to be. This filter also
-/// matched six "failure shapes" — `"Error:"`, `"Command failed"` and friends —
-/// with `content.contains(s)` across the WHOLE body, not just the prefix.
-/// Upstream, `loop_runner` rewrites every unsuccessful tool result to
-/// `format!("Error: {…}")`, so the combination discarded **100% of failed tool
-/// calls**: 704 of them in one 2-hour run, with not a single ingest line in the
-/// whole day's log containing `FAILED`.
-///
-/// That is backwards. What went wrong is exactly what an agent must remember —
-/// an agent that cannot recall its own failures repeats them, which is what a
-/// long-horizon run looks like when it stalls. The substring form also ate
-/// SUCCESSFUL calls whose output merely mentioned an error: `cat ./minidb`
-/// stored nothing, twice, because the script contains its own error strings.
-/// The agent could not remember reading its own source.
-///
-/// Failure is now carried structurally instead — the episodic writer stamps
-/// `[tool → target — FAILED]` into the content and an `outcome` tag beside it —
-/// so it can be filtered at RECALL time by anyone who wants only successes,
-/// without being unwritable in the first place.
-fn is_low_signal_memory(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if trimmed.is_empty() {
-        return true;
+/// The contract this function exists to make testable:
+/// - **Empty selection = unchanged.** With no user selections the result is
+///   byte-identical to the pre-feature computation — core first, then
+///   discovered — so default behavior (core tools, `discover_tools` paging,
+///   per-task scopes) cannot drift.
+/// - **Selections only ever ADD.** A user pick already present in the default
+///   set is not duplicated; nothing is ever removed or reordered by a pick.
+fn merge_active_tools(
+    core: &[&str],
+    discovered: &std::collections::HashSet<String>,
+    user_selected: &[String],
+) -> Vec<String> {
+    let mut active: Vec<String> = core
+        .iter()
+        .map(|t| (*t).to_string())
+        .chain(discovered.iter().cloned())
+        .collect();
+    for tool in user_selected {
+        if !active.iter().any(|t| t == tool) {
+            active.push(tool.clone());
+        }
     }
-    // Binary/garbled output. Judged by CONTROL characters and decode failures,
-    // not by "not ASCII" — the old test counted every non-ASCII char as noise,
-    // so 40 box-drawing characters in `tree` output, or any text in a
-    // non-Latin script, was classified as binary and deleted. It also flagged
-    // this very writer's own `[exec → cmd — ok]` header punctuation.
-    //
-    // Real binary shows up as C0 control bytes and U+FFFD replacement
-    // characters after a lossy decode; legitimate text does not.
-    let noise = trimmed
-        .chars()
-        .take(200)
-        .filter(|c| (c.is_control() && !c.is_whitespace()) || *c == '\u{FFFD}')
-        .count();
-    if noise > 40 {
-        return true;
-    }
-    // Heartbeat chatter is the machinery talking to itself — not an observation.
-    trimmed.starts_with("HEARTBEAT_OK")
+    active
 }
 
 /// Faults that mean the local runner's STATE is bad, not that the request
@@ -1845,8 +2140,124 @@ fn is_low_signal_memory(content: &str) -> bool {
 /// - "same token": the repetition watch caught a decoder emitting one token
 ///   forever. Both were surfacing as "no done=true" stream aborts before the
 ///   watch existed, and both come from the same degraded-runner condition.
+/// - "aborted generation mid-response": the server closed a generation with
+///   done=false. Observed live 2026-08-08 (ministral-3:8b endurance): five
+///   abort clusters ended all three run segments while this classifier
+///   stayed silent — and both segment-boundary heals (the same runner reset
+///   this gate arms) restored service instantly, one segment then running
+///   104 productive minutes. The retry backoff ladder alone can never heal
+///   it: only the model unload clears the runner state.
+/// - Ollama-side tool-call parse 500s ("invalid character ... in string
+///   literal" and Go-JSON kin): each is an aborted generation server-side,
+///   and in the same run parse-500 storms directly preceded every done=false
+///   cluster — accumulated aborts degrade the runner until no stream
+///   finishes. A single one is often sampling luck (the plain retry stays
+///   first); the reset arms only under the existing attempt>=2 repeat rule.
+/// - "No NDJSON line was ever parsed": the stream hit EOF having produced
+///   ZERO bytes of body and ZERO parsed lines, with nothing left in the
+///   residual buffer — the dead-stream shape, emitted by `nanna-llm` only in
+///   exactly that case. Observed 2026-08-15: 116 of 160 in-window step
+///   retries carried it while this classifier stayed silent, so the ladder
+///   re-asked a dead runner three times per step; the reset armed only when
+///   the sibling "aborted generation mid-response" shape finally arrived at
+///   11:48:43, after 9 blind retries, and healed it at once.
+///
+/// The bytes>0 variants of that same stream-end error ("Last line before the
+/// cut: …", "N unparsed bytes remained") deliberately stay OUT. A stream that
+/// produced output before dying is ambiguous with a generation-slot
+/// contention cancel (`agent_service` drops the loser's stream), and a reset
+/// there unloads a runner that was working on someone else's turn.
 fn wedged_runner_error(message: &str) -> bool {
-    message.contains("empty completion") || message.contains("same token")
+    message.contains("empty completion")
+        || message.contains("same token")
+        || message.contains("aborted generation mid-response")
+        || message.contains("No NDJSON line was ever parsed")
+        || (message.contains("invalid character ") && message.contains(" in string literal"))
+        || message.contains(" in string escape code")
+        || message.contains("after object key:value pair")
+}
+
+/// The character an Ollama tool-call parse abort names, when the body is one.
+///
+/// Same last-line-fingerprint style as `provider_unknown_tool_name`
+/// (nanna-agent's loop_runner): the provider's own error body is the signal,
+/// read out of whatever transport prefixes wrap it (`API error: 500 - {…}`).
+/// Ollama's Go JSON decoder rejects the model's generated tool call before it
+/// ever reaches the registry and names the offending byte — `invalid
+/// character '\t' in string literal`, `… in string escape code`, `… after
+/// object key:value pair`. The model emitted a RAW control character inside a
+/// tool-call string argument, which no JSON parser accepts; retrying the same
+/// request unchanged reproduces it, because the fault is in how the model
+/// encodes, not in the transport.
+///
+/// Deliberately narrow in both directions. It requires the `invalid character
+/// '<c>'` prefix AND one of the three parse sites, so an arbitrary 500 body
+/// cannot arm a correction. And it explicitly refuses the dead-stream /
+/// aborted-generation classes, whose bodies can quote the MODEL's own text
+/// back in a tail: those faults belong to the runner reset, and a correction
+/// aimed at the model would be advice about someone else's failure.
+fn ollama_generation_parse_error(message: &str) -> Option<String> {
+    if message.contains("Ollama stream ended without completion")
+        || message.contains("aborted generation mid-response")
+        || message.contains("empty completion")
+    {
+        return None;
+    }
+    let (_, rest) = message.split_once("invalid character '")?;
+    let (character, tail) = rest.split_once('\'')?;
+    if character.is_empty() {
+        return None;
+    }
+    let names_a_parse_site = tail.starts_with(" in string literal")
+        || tail.starts_with(" in string escape code")
+        || tail.starts_with(" after object key:value pair");
+    names_a_parse_site.then(|| character.to_string())
+}
+
+/// Appended to a step prompt after the provider refused to parse the model's
+/// tool call because of a raw control character in a string argument.
+///
+/// The transport wall this heals is invisible from the model's side: the call
+/// never reached the registry, so no tool result comes back to learn from,
+/// and the plain retry re-generates the same encoding. So the note says what
+/// was rejected, names the character the provider named, and gives the two
+/// routes that actually work — JSON escapes for the argument, or `exec` when
+/// the FILE genuinely needs literal control bytes. It rides the existing
+/// `STEP_LLM_RETRIES` ladder: no extra attempt is bought, the attempt that
+/// was already going to happen just carries the correction.
+fn control_char_transport_note(character: &str) -> String {
+    format!(
+        "\n\n[SYSTEM: the provider REJECTED the tool call you were generating — its JSON \
+         parser hit an invalid character ({character}) inside a string argument, so that call \
+         never reached the tools and nothing from it ran. A raw control character cannot \
+         travel inside a tool-call argument. Two legal routes: (1) ESCAPE it in the JSON — \
+         write \\t for a tab and \\n for a newline inside the string argument, and the tool \
+         receives the real character; or (2) when the file content genuinely needs literal \
+         control bytes, call exec and let the shell produce them (printf 'a\\tb' > file, or a \
+         quoted heredoc: cat <<'EOF' > file). Re-issue the call one of those two ways.]"
+    )
+}
+
+/// Record whether a control-character correction healed the attempt it rode
+/// on, so the correction rate is auditable from the log — the same
+/// accountability the unserved-tool heal keeps for its own retries.
+///
+/// `still_failing` carries the message when the attempt failed again, and is
+/// `None` when it succeeded.
+fn log_parse_heal_outcome(attempt: usize, character: &str, still_failing: Option<&str>) {
+    match still_failing {
+        None => tracing::info!(
+            attempt,
+            character,
+            "control-character encoding correction healed the step"
+        ),
+        Some(error) => tracing::warn!(
+            attempt,
+            character,
+            error,
+            "control-character encoding correction did not heal the step"
+        ),
+    }
 }
 
 /// What one repetition abort looked like, kept so the next one can be
@@ -2073,6 +2484,14 @@ impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
         let mut last_err = String::new();
         let mut nudge_pending = false;
+        // Set once a transient fault has interrupted THIS step, and holds the
+        // classified kind of the newest one. Every later attempt of the step
+        // carries the re-anchor: the effects of the interrupted attempt stay
+        // on disk for the rest of the step, so the warning stays true.
+        let mut transient_fault: Option<&'static str> = None;
+        // The character the provider named when it refused to parse a tool
+        // call, carried into the next attempt's prompt as a correction.
+        let mut parse_fault_char: Option<String> = None;
         // The wedge the last attempt aborted on, and the one the runner
         // produced before it — the pair `wedge_reset_due` judges.
         let mut cur_wedge: Option<WedgeFingerprint> = None;
@@ -2187,13 +2606,32 @@ impl StepRunner for AgentStepRunner {
             // there is no partial transcript worth salvaging. After a
             // no-progress attempt the prompt carries a nudge, so the retry is
             // never a verbatim repeat of the request that just stalled.
-            let attempt_request = if nudge_pending {
-                let mut nudged = request.clone();
-                nudged.prompt.push_str(NO_PROGRESS_NUDGE);
-                nudged
-            } else {
-                request.clone()
-            };
+            //
+            // The same site carries the other two corrections, for the same
+            // reason and at the same cost: a re-anchor when a provider fault
+            // interrupted this step mid-flight (its tool effects are on disk
+            // and the fresh context cannot show them), and the encoding
+            // correction when the provider refused to parse a tool call.
+            let mut attempt_request = request.clone();
+            if nudge_pending {
+                attempt_request.prompt.push_str(NO_PROGRESS_NUDGE);
+            }
+            if let Some(fault) = transient_fault {
+                attempt_request
+                    .prompt
+                    .push_str(&transient_retry_note(attempt + 1, fault));
+                if let Some(line) = self.carried_side_effects_line() {
+                    attempt_request.prompt.push_str(&line);
+                }
+            }
+            // The correction riding on THIS attempt, so its outcome can be
+            // logged the way the unserved-tool heal logs its own.
+            let heal_in_flight = parse_fault_char.clone();
+            if let Some(character) = heal_in_flight.as_deref() {
+                attempt_request
+                    .prompt
+                    .push_str(&control_char_transport_note(character));
+            }
             // Each attempt is judged on its own: only a repetition abort
             // refills these, so an interleaved network blip cannot leave a
             // stale pair behind for the next wedge to match against.
@@ -2218,7 +2656,12 @@ impl StepRunner for AgentStepRunner {
                     last_err =
                         "no-progress step (reasoning only: no tool call, no answer)".to_string();
                 }
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    if let Some(character) = heal_in_flight.as_deref() {
+                        log_parse_heal_outcome(attempt, character, None);
+                    }
+                    return Ok(outcome);
+                }
                 Err(e) if is_transient_llm_error(&e.message) => {
                     // Remember this wedge so the NEXT one can be recognised
                     // as the same fault. `record_wedge` hands back what it
@@ -2228,9 +2671,34 @@ impl StepRunner for AgentStepRunner {
                         prev_wedge = record_wedge(&self.agent_config.model, wedge.clone());
                         cur_wedge = Some(wedge);
                     }
+                    // The step is being retried after a fault that may have
+                    // executed tool calls this attempt's context will never
+                    // show — the next attempt says so out loud.
+                    transient_fault = Some(transient_fault_kind(&e.message));
+                    // A named-character parse refusal is a fault in how the
+                    // model ENCODED the call, so the next attempt carries the
+                    // correction as well as the re-anchor.
+                    if let Some(character) = ollama_generation_parse_error(&e.message) {
+                        tracing::warn!(
+                            attempt,
+                            character = %character,
+                            error = %e.message,
+                            "provider refused to parse a tool call over a raw control \
+                             character — retrying with the encoding correction"
+                        );
+                        parse_fault_char = Some(character);
+                    }
                     last_err = e.message;
                 }
-                Err(e) => return Err(e.message),
+                Err(e) => {
+                    if let Some(character) = heal_in_flight.as_deref() {
+                        log_parse_heal_outcome(attempt, character, Some(&e.message));
+                    }
+                    return Err(e.message);
+                }
+            }
+            if let Some(character) = heal_in_flight.as_deref() {
+                log_parse_heal_outcome(attempt, character, Some(&last_err));
             }
         }
         Err(last_err)
@@ -2238,6 +2706,117 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// The re-anchor's concrete half: the side-effecting calls the
+    /// INTERRUPTED ATTEMPT made, read from the P22 Tier 4 liveness ledger and
+    /// bounded by a share of this model's live input budget.
+    ///
+    /// No counter gate is needed to keep an earlier turn's history from being
+    /// claimed as this attempt's work: the ledger clears the list at every
+    /// step boundary, and a step boundary is stamped on entry to every
+    /// attempt, so an empty list means this attempt changed nothing. `None`
+    /// on runs with no liveness handle (task-run manager, tests), where the
+    /// general re-anchor stands alone.
+    fn carried_side_effects_line(&self) -> Option<String> {
+        let live = self.chat_sink.as_ref()?.liveness.as_ref()?;
+        let marks = live.attempt_side_effects();
+        if marks.is_empty() {
+            return None;
+        }
+        let budget = carried_side_effect_budget_bytes(self.live_hard_input_limit());
+        // The pointer at the stored outputs is only honest when this run has a
+        // memory service writing them — `memory_sink` is the same gate.
+        Some(carried_side_effect_note(&marks, budget, self.memory.is_some()))
+    }
+
+    /// This runner's live hard input limit, in tokens.
+    ///
+    /// Computed exactly as [`nanna_agent::AgentContext`] computes the limit
+    /// the request is actually judged against (`configure_for_model_with_output`):
+    /// model info from the cache-or-universal-floor — already clamped to the
+    /// live `num_ctx` latch, so a mid-run VRAM demotion is reflected — paired
+    /// with this runner's own output reservation. Deriving it a second way
+    /// would let the budget and the window it is a share of disagree.
+    ///
+    /// The lookup takes the prefix-stripped name for the same reason
+    /// [`Self::try_run_step`] strips it before building the agent: the model
+    /// info cache is written under the id the provider was asked about, so a
+    /// `provider/model` spelling misses every entry and silently falls back to
+    /// the universal floor.
+    fn live_hard_input_limit(&self) -> usize {
+        let model = LlmRouter::strip_model_prefix(&self.agent_config.model);
+        let info = nanna_llm::model_info_from_cache_or_unknown(&model, "");
+        let reserve = info.effective_output_budget(self.agent_config.max_tokens as usize);
+        info.hard_input_limit_for(reserve)
+    }
+
+    /// Seed the step's FRESH context with what this scope has already proven —
+    /// the do-not-regress digest, in the never-compressed slot.
+    ///
+    /// Why here and not only in the planner: verified state must reach the
+    /// model that EDITS. Each step gets a brand-new `AgentContext`, so
+    /// everything the previous step proved is gone by construction; and inside
+    /// a step, every summarization/distillation pass can collapse ordinary
+    /// history. `verified_outcomes` is the one slot proven to survive every
+    /// compression path (P22 Tier 2), so the digest is seeded there and carry
+    /// is session-scoped by PERSISTENCE — the store — rather than by keeping a
+    /// long-lived context alive.
+    ///
+    /// Source is the same store read the turn-start `established_work_context`
+    /// block uses (`established_rows`), which is newest-completion-first and
+    /// already bounded by that module's `ESTABLISHED_MAX` — so the bound is
+    /// reused, not re-declared. Collapse-to-×N and the monotone timestamp rule
+    /// are the slot's own (`record_verified_outcome_at`).
+    ///
+    /// Chat scope is (`session`, session_id), which is exactly the scope the
+    /// chat harness seeds and reads. Background task runs have no chat sink and
+    /// therefore no session to read — they keep today's behavior.
+    async fn seed_verified_outcomes(&self, context: &mut nanna_agent::AgentContext) {
+        let Some(sink) = &self.chat_sink else {
+            return;
+        };
+        let Some(storage) = &sink.storage else {
+            return;
+        };
+        let rows = crate::control::chat_harness::established_rows(
+            storage,
+            "session",
+            Some(&sink.session_id),
+        )
+        .await;
+        for row in &rows {
+            // Only VERIFIED completions are facts proven by execution; an
+            // unverified close is a claim, and the slot's whole contract is
+            // that everything in it was run.
+            let Some(verdict) = &row.verdict else {
+                continue;
+            };
+            // The subject a model can act on: the command the check runs when
+            // there is one, the item otherwise.
+            let subject = row
+                .acceptance
+                .as_ref()
+                .and_then(|value| {
+                    nanna_agent::harness::AcceptanceCheck::from_json(value).ok()
+                })
+                .and_then(|check| check.self_check_command().map(str::to_string))
+                .unwrap_or_else(|| format!("#{} {}", row.id, row.title));
+            // The store's own completion time, never "now": a fact verified in
+            // an earlier turn must not claim to have been verified this step.
+            let verified_at = chrono::DateTime::parse_from_rfc3339(&row.when)
+                .map(|t| t.timestamp())
+                .unwrap_or_default();
+            context.record_verified_outcome_at(subject, verdict.clone(), verified_at);
+        }
+        if !rows.is_empty() {
+            tracing::debug!(
+                seeded = context.verified_outcomes.len(),
+                rows = rows.len(),
+                "seeded the step context's never-compressed verified-outcome slot from \
+                 the scope's stored verdicts"
+            );
+        }
+    }
+
     /// Put the step's own output — its answer, and each reasoning block — into
     /// memory, in the same `[kind → subject]` shape the episodic tool writer
     /// uses, so answers, thoughts and actions all read alike on recall.
@@ -2309,52 +2888,32 @@ impl AgentStepRunner {
             let service = service.clone();
             let workspace_id = workspace_id.clone();
             Box::pin(async move {
-                if is_low_signal_memory(&memory.content) {
+                // Filter, importance and route all live in `memory_adapter` —
+                // ONE copy, shared with the interactive-chat sink in
+                // `agent_service.rs`. This path only decides what to log.
+                let category = memory.category.clone();
+                let bytes = memory.content.len();
+                match crate::memory_adapter::store_extracted_memory(
+                    &service,
+                    memory,
+                    workspace_id,
+                )
+                .await
+                {
                     // INFO, not DEBUG. The daemon runs at INFO, so the old
                     // debug! meant 704 discarded writes left no operator-visible
                     // trace at all in a run whose store held 90 rows — the
                     // shortfall was invisible until someone counted by hand.
                     // A dropped memory is a fact about the run, not a detail.
-                    tracing::info!(
-                        category = %memory.category,
-                        bytes = memory.content.len(),
+                    Ok(None) => tracing::info!(
+                        category = %category,
+                        bytes,
                         "dropping low-signal memory (machine noise)"
-                    );
-                    return;
-                }
-                let mut metadata = memory.tags.unwrap_or_default();
-                metadata.insert("category".to_string(), memory.category.clone());
-                metadata.insert(
-                    "fact_type".to_string(),
-                    memory.provenance.as_str().to_string(),
-                );
-                // A tool result is raw episodic material — worth keeping, but
-                // it must not outrank a stated preference when recall ranks.
-                let importance: f32 = match memory.category.as_str() {
-                    "tool_result" => 1.5,
-                    "preference" | "identity" => 4.0,
-                    "fact" | "insight" => 3.5,
-                    _ => 3.0,
-                };
-                let stored = match &workspace_id {
-                    Some(ws) => {
-                        service
-                            .remember_scoped(
-                                &memory.content,
-                                metadata,
-                                importance,
-                                Some(ws.clone()),
-                            )
-                            .await
+                    ),
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to store tool result in memory");
                     }
-                    None => {
-                        service
-                            .remember_with_importance(&memory.content, metadata, importance)
-                            .await
-                    }
-                };
-                if let Err(e) = stored {
-                    tracing::warn!(error = %e, "failed to store tool result in memory");
                 }
             })
         }))
@@ -2397,6 +2956,7 @@ impl AgentStepRunner {
         if let Some(ws_ctx) = &self.workspace_context {
             context.workspace_context = Some(ws_ctx.clone());
         }
+        self.seed_verified_outcomes(&mut context).await;
 
         let mut config = self.agent_config.clone();
         // Execution/verification wants determinism (pass^k reliability on a
@@ -2443,19 +3003,15 @@ impl AgentStepRunner {
         // which is what the design said all along.
         let active: Vec<String> = {
             let discovered = self.discovered_tools.read().await;
-            CORE_TOOLS
-                .iter()
-                .map(|t| (*t).to_string())
-                .chain(discovered.iter().cloned())
-                .collect()
+            merge_active_tools(CORE_TOOLS, &discovered, &self.user_selected_tools)
         };
         let restrict_to_active = true;
 
         // Show the work as it happens: the step's text, thinking, and tool
         // activity stream through the same events a plain chat turn uses,
         // and fill the registered run buffers for recovery/persistence.
-        let (on_text, on_thinking, on_tool_start, on_tool_end) = match &self.chat_sink {
-            None => (None, None, None, None),
+        let (on_text, on_thinking, on_tool_start, on_tool_end, on_usage) = match &self.chat_sink {
+            None => (None, None, None, None, None),
             Some(sink) => {
                 let text_sink = sink.clone();
                 let think_sink = sink.clone();
@@ -2478,13 +3034,14 @@ impl AgentStepRunner {
                               output: &str,
                               success: bool,
                               duration_ms: u64,
-                              _data: Option<&Value>| {
-                            end_sink.tool_end(call_id, name, output, success, duration_ms);
+                              data: Option<&Value>| {
+                            end_sink.tool_end(call_id, name, output, success, duration_ms, data);
                         },
                     )
                         as Box<
                             dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync,
                         >),
+                    Some(sink.usage_callback()),
                 )
             }
         };
@@ -2521,8 +3078,17 @@ impl AgentStepRunner {
             on_thinking,
             on_tool_start,
             on_tool_end,
+            // The live context gauge. This path never set `on_usage`, so the
+            // ONLY emitter of `ContextUsage` sat in the retired in-service
+            // chat path: every client's meter read 0 of 0 for the whole run
+            // while the daemon recomputed the real figures on every request
+            // (59 of 59 captured run-state snapshots, 56 of them mid-run).
+            on_usage,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
+            // Capability transitions (provider benched, writes queued) reach
+            // the model once, in its next tool result.
+            degradations: self.degradations.clone(),
             ..Default::default()
         };
 
@@ -2563,14 +3129,29 @@ impl AgentStepRunner {
                 name: record.name.clone(),
                 input_digest: digest(&record.input.to_string()),
                 output_digest: digest(&record.output),
+                success: record.success,
             })
             .collect();
+
+        // Paths the step's write/edit calls targeted, for the harness's
+        // mid-run sweep: a write that lands on a file some verified item's
+        // acceptance references triggers an immediate re-check of that item.
+        let mut touched_paths: Vec<String> = Vec::new();
+        for record in &result.tool_calls {
+            if let Some(path) = touched_path_of(&record.name, &record.input) {
+                if !touched_paths.contains(&path) {
+                    touched_paths.push(path);
+                }
+            }
+        }
 
         Ok(StepOutcome {
             text: result.text,
             input_tokens: u64::from(result.input_tokens),
             output_tokens: u64::from(result.output_tokens),
             tool_calls,
+            touched_paths,
+            degenerate_loop: result.degenerate_loop,
         })
     }
 }
@@ -2624,53 +3205,76 @@ impl AgentPlanner {
         if cancel.is_some_and(CancelToken::is_cancelled) {
             return Plan::single(goal);
         }
-        let request = StepRequest {
-            // Planning is not attached to an item yet; the store assigns ids
-            // when the plan is seeded.
-            item_id: 0,
-            step_index: 0,
-            step_kind: nanna_agent::harness::StepKind::Plan,
-            item_title: "Planning".to_string(),
-            prompt: build_plan_prompt(goal, context),
-            tool_scope: Vec::new(),
-            token_budget: None,
-            max_iterations: Some(PLAN_ITERATIONS),
-            max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
-            // Threaded so the in-step LLM call aborts on Stop too.
-            cancel: cancel.cloned(),
-        };
+        // Two attempts, not one: even with tool definitions stripped from
+        // Plan steps, a local model can emit an empty completion on the
+        // single planning iteration, and one silent fallback here cost a
+        // whole mission (observed 2026-08-08: every plan degraded to the
+        // fallback monolith and the turn died dry at 13/42). The retry is
+        // bounded to one — a planner that answers empty twice is not going
+        // to speak on the third ask, and the fallback keeps the turn alive.
+        for attempt in 0..2 {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Plan::single(goal);
+            }
+            let request = StepRequest {
+                // Planning is not attached to an item yet; the store assigns
+                // ids when the plan is seeded.
+                item_id: 0,
+                step_index: 0,
+                step_kind: nanna_agent::harness::StepKind::Plan,
+                item_title: "Planning".to_string(),
+                prompt: build_plan_prompt(goal, context),
+                tool_scope: Vec::new(),
+                token_budget: None,
+                max_iterations: Some(PLAN_ITERATIONS),
+                max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
+                // Threaded so the in-step LLM call aborts on Stop too.
+                cancel: cancel.cloned(),
+            };
 
-        let planning = tokio::time::timeout(
-            std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
-            self.runner.run_step(request),
-        );
-        let outcome = if let Some(token) = cancel {
-            tokio::select! {
-                biased;
-                outcome = planning => outcome,
-                () = token.cancelled() => {
-                    tracing::info!("planning cancelled — degrading to the single-task plan");
+            let planning = tokio::time::timeout(
+                std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
+                self.runner.run_step(request),
+            );
+            let outcome = if let Some(token) = cancel {
+                tokio::select! {
+                    biased;
+                    outcome = planning => outcome,
+                    () = token.cancelled() => {
+                        tracing::info!("planning cancelled — degrading to the single-task plan");
+                        return Plan::single(goal);
+                    }
+                }
+            } else {
+                planning.await
+            };
+
+            match outcome {
+                Ok(Ok(step)) => {
+                    if step.text.trim().is_empty() && attempt == 0 {
+                        tracing::warn!(
+                            "planner answered with empty text — retrying the planning call once"
+                        );
+                        continue;
+                    }
+                    return plan_or_fallback(goal, &step.text);
+                }
+                Ok(Err(message)) => {
+                    tracing::warn!(%message, "planner failed - falling back to a single-task plan");
+                    return Plan::single(goal);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = PLAN_TIMEOUT_SECS,
+                        "planner timed out - falling back to a single-task plan"
+                    );
                     return Plan::single(goal);
                 }
             }
-        } else {
-            planning.await
-        };
-
-        match outcome {
-            Ok(Ok(step)) => plan_or_fallback(goal, &step.text),
-            Ok(Err(message)) => {
-                tracing::warn!(%message, "planner failed - falling back to a single-task plan");
-                Plan::single(goal)
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = PLAN_TIMEOUT_SECS,
-                    "planner timed out - falling back to a single-task plan"
-                );
-                Plan::single(goal)
-            }
         }
+        // Unreachable in practice (attempt 1 always returns), but the loop
+        // shape cannot prove it: both attempts empty degrades to fallback.
+        Plan::single(goal)
     }
 }
 
@@ -3360,14 +3964,28 @@ pub(crate) fn ollama_local_base() -> String {
     normalize_ollama_base(&raw)
 }
 
-/// Restart the local Ollama server: kill `ollama.exe` only (the tray
-/// supervisor respawns it) and wait for the API to come back.
+/// Restart the local Ollama server: tree-kill the server process AND its
+/// per-model runner children (the tray supervisor respawns the server), then
+/// wait for the API to come back.
 ///
 /// This is the cure for the sticky degraded-runner state (every generation
 /// aborted with `done:false`; model unloads do not clear it — verified live).
 /// Callers gate it: bouncing a shared local service is an operator decision.
 /// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
 /// most once per [`OLLAMA_RESTART_COOLDOWN_SECS`] process-wide.
+///
+/// REGRESSION (2026-08-09): the kill must take the whole runner tree, not
+/// just the server. This function originally ran `taskkill /F /IM
+/// ollama.exe`, which on Windows kills only the parent — each loaded model's
+/// `llama-server.exe` runner child (~6 GB VRAM for an 8B model) survived as
+/// an orphan that the respawned server cannot see, because `ollama ps`
+/// reports the new server's own runners, not what is actually on the card.
+/// Verified live: four orphans (parents dead) held ~12.5 GB of a 16 GB card,
+/// the num_ctx sizing probe honestly latched 4096 from the 1.5 GB that
+/// remained — below the ~4.2k min-viable floor — and two endurance attempts
+/// died in minutes on below-floor stops. Each restart heal leaks one runner
+/// per loaded model, so repeated heals (e.g. the 2026-08-08 ministral leg's
+/// two) starve the card cumulatively while looking like successful cures.
 pub async fn restart_ollama_server() -> bool {
     // Normalization maps bind-all addresses to loopback, so after it a
     // genuinely remote host is the only thing that won't look local.
@@ -3407,14 +4025,30 @@ pub async fn restart_ollama_server() -> bool {
     // Every model's runner dies with the server, so every fingerprint
     // describing one is now stale.
     forget_all_wedges();
+    // `/T` takes runners still parented to a live server; the follow-up
+    // image-name sweep takes orphans from EARLIER parent-only kills (this
+    // function pre-fix, or an external restart). The sweep cannot hit a live
+    // server's runner: with every `ollama.exe` dead, any surviving
+    // `llama-server.exe` is by definition an orphan, and the tray's respawned
+    // server loads models lazily so it has none of its own yet.
     #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "ollama.exe"])
-        .output();
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/IM", "ollama.exe"])
+            .output();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "llama-server.exe"])
+            .output();
+    }
     #[cfg(not(windows))]
-    let _ = std::process::Command::new("pkill")
-        .args(["-x", "ollama"])
-        .output();
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "ollama"])
+            .output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "llama-server"])
+            .output();
+    }
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let up = reqwest::Client::new()
@@ -3509,6 +4143,10 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         steps_taken: 0,
         items_completed: 0,
         items_completed_unverified: 0,
+        items_revived: 0,
+        abandoned_unmet: Vec::new(),
+        abandoned_unverifiable: Vec::new(),
+        items_regressed_reopened: 0,
         items_already_satisfied: 0,
         items_abandoned: 0,
         last_runner_error: None,
@@ -3519,6 +4157,8 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         wall_clock_secs: 0,
         tokens_per_completed_item: None,
         interjected_items: 0,
+        verified_outcomes: Vec::new(),
+        acceptance_unknown: 0,
     });
     folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
     folded.tool_calls = segments.iter().map(|r| r.tool_calls).sum();
@@ -3526,6 +4166,9 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
     folded.items_completed_unverified =
         segments.iter().map(|r| r.items_completed_unverified).sum();
+    folded.items_revived = segments.iter().map(|r| r.items_revived).sum();
+    folded.items_regressed_reopened =
+        segments.iter().map(|r| r.items_regressed_reopened).sum();
     folded.items_already_satisfied = segments.iter().map(|r| r.items_already_satisfied).sum();
     folded.items_abandoned = segments.iter().map(|r| r.items_abandoned).sum();
     folded.replans = segments.iter().map(|r| r.replans).sum();
@@ -3534,6 +4177,26 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.output_tokens = segments.iter().map(|r| r.output_tokens).sum();
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
     folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
+    folded.acceptance_unknown = segments.iter().map(|r| r.acceptance_unknown).sum();
+    // The naming lists concat too, or a run that abandoned work in an earlier
+    // segment reports a count with nothing behind it — the same "a number with
+    // no names" gap this list was added to close.
+    folded.abandoned_unmet = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unmet.iter().cloned())
+        .collect();
+    folded.abandoned_unverifiable = segments
+        .iter()
+        .flat_map(|r| r.abandoned_unverifiable.iter().cloned())
+        .collect();
+    // Union by id, newest verdict wins — same rule as the chat harness fold.
+    folded.verified_outcomes = Vec::new();
+    for segment in segments {
+        for v in &segment.verified_outcomes {
+            folded.verified_outcomes.retain(|p: &nanna_agent::harness::VerifiedOutcome| p.id != v.id);
+            folded.verified_outcomes.push(v.clone());
+        }
+    }
     // Like the stop reason, the newest recorded error is the one that
     // describes where the run ended up.
     folded.last_runner_error = segments
@@ -3566,8 +4229,11 @@ mod tests {
                     name: format!("tool_{i}"),
                     input_digest: String::new(),
                     output_digest: String::new(),
+                    success: true,
                 })
                 .collect(),
+            touched_paths: Vec::new(),
+            degenerate_loop: false,
         }
     }
 
@@ -4055,6 +4721,11 @@ mod tests {
             "API error: 502 - Ollama stream ended without completion (no done=true)"
         ));
         assert!(is_transient_llm_error("request timed out"));
+        // P22 stream watchdog: a wedged stream future gets a fresh request
+        // through the same ladder (persistent wedges still hit the breaker).
+        assert!(is_transient_llm_error(
+            "step error: stream watchdog: no stream event from ollama/x for 240s"
+        ));
         // Non-transient failures must fall through to the next model.
         assert!(!is_transient_llm_error("API error: 401 - invalid api key"));
         assert!(!is_transient_llm_error("API error: 400 - context length exceeded"));
@@ -4068,12 +4739,18 @@ mod tests {
         stop: StopReason,
     ) -> LongHorizonReport {
         LongHorizonReport {
+            verified_outcomes: Vec::new(),
+            acceptance_unknown: 0,
             tool_calls: 0,
             side_effect_tool_calls: 0,
             stop,
             steps_taken: steps,
             items_completed: completed,
             items_completed_unverified: 0,
+            items_revived: 0,
+            abandoned_unmet: Vec::new(),
+            abandoned_unverifiable: Vec::new(),
+            items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: 0,
             last_runner_error: None,
@@ -5281,6 +5958,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 tool_calls: Vec::new(),
+                touched_paths: Vec::new(),
+                degenerate_loop: false,
             })
         }
     }
@@ -5322,6 +6001,7 @@ mod tests {
             run: Some(run),
             tool_stats: None,
             storage: None,
+            liveness: None,
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -5339,7 +6019,7 @@ mod tests {
         sink.delta("running ls ");
         sink.thinking("what files exist?");
         sink.tool_start("c1", "exec", &json!({"cmd": "ls"}), None);
-        sink.tool_end("c1", "exec", "file.txt", true, 12);
+        sink.tool_end("c1", "exec", "file.txt", true, 12, None);
         sink.delta("done");
 
         // What get_run_state serves after navigating away and back:
@@ -5386,6 +6066,41 @@ mod tests {
             &journal[3],
             crate::session::TimelineItem::Text { content, .. } if content == "done"
         ));
+    }
+
+    /// The context gauge, end to end from the sink's side: every LLM request
+    /// reports its prompt size against the window the loop enforced, and that
+    /// pair leaves the daemon as a `ContextUsage` event. Without this callback
+    /// the harness chat path emitted none at all, so every client's meter read
+    /// 0 of 0 for the whole run while the daemon knew the real numbers.
+    #[tokio::test]
+    async fn every_request_reports_its_context_usage() {
+        let sink = chat_sink(external_run_handle());
+        let mut events = sink.event_tx.subscribe();
+
+        let on_usage = sink.usage_callback();
+        on_usage(12_400, 640, 27_904);
+
+        match events.try_recv().expect("a usage event was broadcast") {
+            Event::ContextUsage { session_id, used, window } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(used, 12_400, "used is the request's prompt size");
+                assert_eq!(window, 27_904, "window is the loop's enforced input bound");
+            }
+            other => panic!("expected ContextUsage, got {other:?}"),
+        }
+
+        // The denominator follows a mid-run demotion rather than latching:
+        // a meter measured against a window the model no longer has is a
+        // wrong reading, not a stale one.
+        on_usage(3_900, 120, 4_608);
+        match events.try_recv().expect("the second request reports too") {
+            Event::ContextUsage { used, window, .. } => {
+                assert_eq!(used, 3_900);
+                assert_eq!(window, 4_608);
+            }
+            other => panic!("expected ContextUsage, got {other:?}"),
+        }
     }
 
     /// "It should feel like the chat did before": a one-task plan is a
@@ -5451,7 +6166,7 @@ mod tests {
         let mut sink = chat_sink(external_run_handle());
         sink.tool_stats = Some(stats.clone());
 
-        sink.tool_end("c1", "exec", "ok", true, 5);
+        sink.tool_end("c1", "exec", "ok", true, 5, None);
 
         for _ in 0..200 {
             if stats.export_json().await.to_string().contains("exec") {
@@ -5460,6 +6175,37 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("tool call was never recorded to stats");
+    }
+
+    /// P22 Tier 4: a breaker replay (marked `short_circuited` in the tool
+    /// result's structured data) is recorded as its own outcome, never as a
+    /// tool failure — hours of replays must not read as a broken tool.
+    #[tokio::test]
+    async fn short_circuited_replays_are_not_recorded_as_failures() {
+        let stats = nanna_agent::ToolStatsTracker::new();
+        let mut sink = chat_sink(external_run_handle());
+        sink.tool_stats = Some(stats.clone());
+
+        let marker = serde_json::json!({ "short_circuited": true });
+        sink.tool_end(
+            "c1",
+            "list_dir",
+            "[ZERO-INFORMATION BREAKER] This call was NOT executed. …",
+            false,
+            0,
+            Some(&marker),
+        );
+
+        for _ in 0..200 {
+            if let Some(s) = stats.summary("list_dir").await {
+                assert_eq!(s.short_circuit_count, 1);
+                assert_eq!(s.failure_count, 0, "a replay is not a tool failure");
+                assert!(s.top_errors.is_empty(), "the notice is not a tool error");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("short-circuited call was never recorded to stats");
     }
 }
 
@@ -5912,6 +6658,83 @@ mod wedged_runner_tests {
         ));
     }
 
+    /// REGRESSION (2026-08-08, ministral-3:8b endurance): five clusters of
+    /// done=false stream aborts ended all three run segments without one
+    /// mid-step reset — the classifier did not know the message, while the
+    /// segment-boundary resets healed the runner instantly each time. The
+    /// tool-call parse 500s that preceded every cluster are the same
+    /// degraded-runner evidence, one aborted generation at a time.
+    #[test]
+    fn abort_and_parse_wedge_shapes_trigger_a_reset() {
+        assert!(wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama aborted generation mid-response (done=false)"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '\\t' in string literal\"}"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '$' in string escape code\"}"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '.' after object key:value pair\"}"
+        ));
+        // Ordinary provider errors stay out of the wedge path: a 404, a
+        // refused connection, or a plain timeout heals by retry/backoff,
+        // not by unloading the model.
+        assert!(!wedged_runner_error("API error: 404 - model not found"));
+        assert!(!wedged_runner_error("connection refused"));
+        assert!(!wedged_runner_error("request timed out after 120s"));
+    }
+
+    /// The dead-stream message as it actually arrives: EOF at 0 bytes and 0
+    /// NDJSON lines, nothing left in the residual buffer.
+    const DEAD_STREAM: &str = "step error: LLM error: API error: 502 - Ollama stream ended \
+         without completion (no done=true) after 0 bytes / 0 NDJSON lines — nothing was left \
+         unparsed (the stream simply stopped). No NDJSON line was ever parsed.";
+
+    /// REGRESSION (2026-08-15 leg): 116 of 160 in-window step retries died on
+    /// a stream that produced NOTHING, and the classifier stayed silent — so
+    /// the ladder re-asked a dead runner three times per step. The reset
+    /// armed only when the sibling "aborted generation mid-response" shape
+    /// finally arrived at 11:48:43, after 9 blind retries, and healed it at
+    /// once. A stream that never emitted a line is the runner's state, not
+    /// the request's luck.
+    #[test]
+    fn a_zero_byte_dead_stream_triggers_a_reset() {
+        assert!(wedged_runner_error(DEAD_STREAM));
+    }
+
+    /// The counter-case that keeps the reset honest. A stream that DID
+    /// produce output before dying is ambiguous with a generation-slot
+    /// contention cancel (`agent_service` drops the loser's stream), and
+    /// unloading the model there punishes a runner that was working fine.
+    /// Both bytes>0 variants of the same error must stay out.
+    #[test]
+    fn a_stream_that_produced_bytes_never_resets() {
+        assert!(!wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 2780 bytes / 14 NDJSON lines — nothing was left unparsed \
+             (the stream simply stopped). Last line before the cut: {\"message\":{\"content\":\"x\"}}"
+        ));
+        assert!(!wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 4096 bytes / 9 NDJSON lines — 412 unparsed bytes remained, \
+             ending: {\"message\":{\"content\":\"the"
+        ));
+    }
+
+    /// The dead stream carries no fingerprint, so it rides the existing
+    /// repeat rule exactly as "empty completion" does: the first retry stays
+    /// free, the reset arms from the second.
+    #[test]
+    fn the_dead_stream_rides_the_existing_repeat_ladder() {
+        assert_eq!(wedge_reset_due(1, DEAD_STREAM, None, None), None);
+        assert_eq!(
+            wedge_reset_due(2, DEAD_STREAM, None, None),
+            Some(WedgeReset::Repeated)
+        );
+    }
+
     use super::{wedge_reset_due, WedgeFingerprint, WedgeReset};
 
     /// The wedge message as it actually arrives, so the tests below exercise
@@ -6021,6 +6844,261 @@ mod wedged_runner_tests {
 }
 
 #[cfg(test)]
+mod retry_note_tests {
+    use super::{
+        carried_side_effect_budget_bytes, carried_side_effect_note, control_char_transport_note,
+        ollama_generation_parse_error, transient_fault_kind, transient_retry_note,
+    };
+    use crate::liveness::ToolMarkSnapshot;
+
+    /// The marks the ledger hands over, newest first.
+    fn marks(count: usize) -> Vec<ToolMarkSnapshot> {
+        (0..count)
+            .map(|i| ToolMarkSnapshot {
+                name: if i % 2 == 0 { "write_file" } else { "exec" }.to_string(),
+                at: "2026-08-20T10:00:00.000Z".to_string(),
+                secs_ago: i as u64,
+            })
+            .collect()
+    }
+
+    /// The three Go-JSON parse sites Ollama reports when the model emits a raw
+    /// control character inside a tool-call string argument, each wrapped in
+    /// the transport prefixes the message actually arrives with.
+    #[test]
+    fn each_parse_site_yields_the_offending_character() {
+        assert_eq!(
+            ollama_generation_parse_error(
+                "step error: LLM error: API error: 500 - {\"error\":\"invalid character \
+                 '\\t' in string literal\"}"
+            )
+            .as_deref(),
+            Some("\\t")
+        );
+        assert_eq!(
+            ollama_generation_parse_error(
+                "API error: 500 - {\"error\":\"invalid character '$' in string escape code\"}"
+            )
+            .as_deref(),
+            Some("$")
+        );
+        assert_eq!(
+            ollama_generation_parse_error(
+                "API error: 500 - {\"error\":\"invalid character '.' after object key:value \
+                 pair\"}"
+            )
+            .as_deref(),
+            Some(".")
+        );
+    }
+
+    /// The correction is aimed at the MODEL's encoding, so it must never fire
+    /// for the dead-stream / aborted-generation classes, which are the
+    /// runner's state and heal by reset. The last case is the one that needs
+    /// the explicit exclusion: a stream-end body can quote the model's own
+    /// text back in its tail.
+    #[test]
+    fn the_reset_owned_classes_never_arm_a_correction() {
+        for msg in [
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 0 bytes / 0 NDJSON lines — nothing was left unparsed (the \
+             stream simply stopped). No NDJSON line was ever parsed.",
+            "step error: LLM error: API error: 502 - Ollama aborted generation mid-response \
+             (done=false)",
+            "empty completion (no text, no tool calls, ~0 tokens) from provider",
+            "step error: LLM error: API error: 502 - Ollama stream ended without completion \
+             (no done=true) after 900 bytes / 3 NDJSON lines — nothing was left unparsed (the \
+             stream simply stopped). Last line before the cut: invalid character '\\t' in \
+             string literal",
+        ] {
+            assert!(
+                ollama_generation_parse_error(msg).is_none(),
+                "must not arm an encoding correction for: {msg}"
+            );
+        }
+    }
+
+    /// A body that names no character, or names one at no parse site, is a
+    /// different fault — the correction would be advice about nothing.
+    #[test]
+    fn unrelated_errors_arm_nothing() {
+        assert!(ollama_generation_parse_error("API error: 500 - internal").is_none());
+        assert!(ollama_generation_parse_error("API error: 404 - model not found").is_none());
+        assert!(ollama_generation_parse_error(
+            "API error: 500 - {\"error\":\"invalid character 'x' looking for beginning of value\"}"
+        )
+        .is_none());
+    }
+
+    /// The correction has to be actionable: name what was rejected, the
+    /// character the provider named, and both legal routes.
+    #[test]
+    fn the_correction_names_the_character_and_both_routes() {
+        let note = control_char_transport_note("\\t");
+        assert!(note.contains("REJECTED"));
+        assert!(
+            note.contains("(\\t)"),
+            "the character the provider named must appear, not just the generic advice: {note}"
+        );
+        assert!(note.contains("ESCAPE"));
+        assert!(note.contains("printf"));
+        assert!(note.contains("heredoc"));
+    }
+
+    /// The re-anchor's whole job: say that the interrupted attempt's tool
+    /// effects are real and on disk, and forbid the rewrite-from-scratch that
+    /// a fresh context invites.
+    #[test]
+    fn the_re_anchor_states_the_effects_and_forbids_the_restart() {
+        let note = transient_retry_note(2, "the request timed out");
+        assert!(note.contains("attempt 2"));
+        assert!(note.contains("the request timed out"));
+        assert!(note.contains("DID execute"));
+        assert!(note.contains("on disk"));
+        assert!(note.contains("do not restart it"));
+        assert!(note.contains("re-read"));
+    }
+
+    /// Every fault label comes from a classifier the ladder already consults,
+    /// so the sentence the model reads and the action the ladder takes cannot
+    /// disagree.
+    #[test]
+    fn fault_kinds_come_from_the_ladders_own_classifiers() {
+        assert_eq!(
+            transient_fault_kind("CUDA error: an illegal memory access was encountered"),
+            "the model ran out of GPU memory"
+        );
+        assert_eq!(
+            transient_fault_kind(
+                "API error: 500 - {\"error\":\"invalid character '\\t' in string literal\"}"
+            ),
+            "the provider could not parse the tool call"
+        );
+        assert_eq!(
+            transient_fault_kind(
+                "API error: 502 - Ollama stream ended without completion (no done=true) after \
+                 0 bytes / 0 NDJSON lines — nothing was left unparsed (the stream simply \
+                 stopped). No NDJSON line was ever parsed."
+            ),
+            "the provider's stream died before any output"
+        );
+        assert_eq!(
+            transient_fault_kind("API error: 502 - Ollama aborted generation mid-response"),
+            "the provider's runner wedged mid-generation"
+        );
+        assert_eq!(
+            transient_fault_kind("stream watchdog: no event for 240s"),
+            "the stream stalled and the watchdog cut it"
+        );
+        assert_eq!(transient_fault_kind("request timed out"), "the request timed out");
+        assert_eq!(
+            transient_fault_kind("error sending request for url (http://127.0.0.1:11434)"),
+            "a provider transport fault"
+        );
+    }
+
+    /// The carried list points the re-anchor at what the lost attempt did —
+    /// every call, newest first — and at where the full record still lives.
+    /// A general warning is not actionable; "you already wrote three files,
+    /// and their outputs are in memory" is.
+    #[test]
+    fn the_carried_list_names_the_calls_and_where_their_outputs_are() {
+        let note = carried_side_effect_note(&marks(3), carried_side_effect_budget_bytes(27_904), true);
+        assert!(note.contains("3 side-effecting tool calls"), "{note}");
+        assert!(note.contains("- write_file (0s ago)"), "{note}");
+        assert!(note.contains("- exec (1s ago)"), "{note}");
+        assert!(note.contains("- write_file (2s ago)"), "{note}");
+        assert!(note.contains("on disk"), "{note}");
+        assert!(
+            note.contains("readable out of"),
+            "the pointer to the stored record is the half that makes re-reading \
+             cheaper than rewriting: {note}"
+        );
+        // Only the tool the request actually ships may be named.
+        assert!(note.contains("discover_tools"), "{note}");
+        assert!(!note.contains("recall("), "{note}");
+        assert!(!note.contains("read_file("), "{note}");
+
+        // Singular reads as singular — a model that is told "1 calls" is
+        // being told the note was generated, not observed.
+        let one = carried_side_effect_note(&marks(1), carried_side_effect_budget_bytes(27_904), true);
+        assert!(one.contains("1 side-effecting tool call before"), "{one}");
+
+        assert!(carried_side_effect_note(&[], 2_000, true).is_empty());
+
+        // A run with no memory service never stored those outputs, so the
+        // note must not send the model looking for them — it keeps the half
+        // that is still true (the artifact on disk).
+        let no_store =
+            carried_side_effect_note(&marks(3), carried_side_effect_budget_bytes(27_904), false);
+        assert!(no_store.contains("- write_file (0s ago)"), "{no_store}");
+        assert!(!no_store.contains("discover_tools"), "{no_store}");
+        assert!(!no_store.contains("your memory"), "{no_store}");
+        assert!(no_store.contains("read the artifact back off disk"), "{no_store}");
+    }
+
+    /// The bound is the window's share, not the attempt's call count. The
+    /// aborted attempt that motivated this made 104 side-effecting calls;
+    /// rendered in full that is ~13% of a small model's input budget, so the
+    /// re-anchor would displace the work it exists to protect.
+    #[test]
+    fn the_carried_list_is_bounded_by_the_window_not_by_the_call_count() {
+        let small_window = 27_904; // the universal floor's hard input limit
+        let note = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(small_window), true);
+
+        // Every call is still ACCOUNTED for, in the count and in the tail
+        // line — bounded is not the same as silently truncated.
+        assert!(note.contains("104 side-effecting tool calls"), "{note}");
+        assert!(note.contains("earlier call"), "{note}");
+        assert!(
+            note.matches("\n- ").count() < 104,
+            "the whole list must not be rendered: {note}"
+        );
+
+        // The measured share: at ~4 chars per token, the note is a couple of
+        // percent of what this model can read, against the 13% observed.
+        let input_budget_chars = small_window * 4;
+        assert!(
+            note.len() * 100 / input_budget_chars <= 3,
+            "note is {} bytes of a {input_budget_chars}-char input budget",
+            note.len()
+        );
+
+        // And the share is a share: a wider window buys more of the list, a
+        // demoted one buys less. Same input, different budgets.
+        let wide = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(small_window * 8), true);
+        let demoted = carried_side_effect_note(&marks(104), carried_side_effect_budget_bytes(2_304), true);
+        assert!(wide.matches("\n- ").count() > note.matches("\n- ").count());
+        assert!(demoted.matches("\n- ").count() < note.matches("\n- ").count());
+        // Even at the smallest window the announcement survives: the model
+        // must never be left thinking the attempt did nothing.
+        assert!(demoted.contains("104 side-effecting tool calls"), "{demoted}");
+        assert!(demoted.contains("discover_tools"), "{demoted}");
+    }
+
+    /// The budget is the harness's own one-screenful carry-forward, expressed
+    /// as a share of the window it was sized against — so it tracks the live
+    /// window instead of going stale beside it.
+    #[test]
+    fn the_budget_is_the_step_tails_share_of_the_live_window() {
+        let floor = nanna_llm::unknown_model_info("", "").hard_input_limit();
+        assert_eq!(
+            carried_side_effect_budget_bytes(floor),
+            nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES,
+            "at the window the step tail was sized against, the budget IS the step tail"
+        );
+        assert_eq!(
+            carried_side_effect_budget_bytes(floor * 2),
+            nanna_agent::harness::STEP_RESULT_TAIL_MAX_BYTES * 2,
+            "the share is constant, so the budget scales with the window"
+        );
+        assert!(carried_side_effect_budget_bytes(floor / 4) < carried_side_effect_budget_bytes(floor));
+        // A degenerate window must not panic or hand out an unbounded budget.
+        assert_eq!(carried_side_effect_budget_bytes(0), 0);
+    }
+}
+
+#[cfg(test)]
 mod core_tool_gating_tests {
     use super::CORE_TOOLS;
 
@@ -6070,6 +7148,76 @@ mod core_tool_gating_tests {
 }
 
 #[cfg(test)]
+mod merge_active_tools_tests {
+    use super::{merge_active_tools, CORE_TOOLS};
+    use std::collections::HashSet;
+
+    fn discovered(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// THE compatibility assertion: with no user selection the merge is
+    /// byte-identical to the pre-feature computation (core first, then
+    /// discovered) — default tool behavior cannot drift.
+    #[test]
+    fn empty_selection_is_unchanged() {
+        let disc = discovered(&["exec", "read_file"]);
+        let legacy: Vec<String> = CORE_TOOLS
+            .iter()
+            .map(|t| (*t).to_string())
+            .chain(disc.iter().cloned())
+            .collect();
+        assert_eq!(
+            merge_active_tools(CORE_TOOLS, &disc, &[]),
+            legacy,
+            "no picks must mean the exact same active set as before the feature"
+        );
+    }
+
+    /// User picks are unioned in — appended after the default set.
+    #[test]
+    fn selection_adds_tools() {
+        let disc = discovered(&["exec"]);
+        let picks = vec!["web_search".to_string(), "read_pdf".to_string()];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert!(active.contains(&"web_search".to_string()));
+        assert!(active.contains(&"read_pdf".to_string()));
+        // And the defaults are all still there — picks only ever ADD.
+        assert!(active.contains(&"discover_tools".to_string()));
+        assert!(active.contains(&"exec".to_string()));
+    }
+
+    /// A pick already in the default set is not duplicated — selecting a core
+    /// or already-discovered tool is a no-op, never a reorder or removal.
+    #[test]
+    fn duplicate_picks_are_not_doubled() {
+        let disc = discovered(&["exec"]);
+        let picks = vec![
+            "discover_tools".to_string(), // core
+            "exec".to_string(),           // discovered
+            "exec".to_string(),           // repeated pick
+            "todo".to_string(),           // genuinely new
+        ];
+        let active = merge_active_tools(CORE_TOOLS, &disc, &picks);
+        assert_eq!(
+            active.iter().filter(|t| *t == "discover_tools").count(),
+            1,
+            "picking a core tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "exec").count(),
+            1,
+            "picking a discovered tool must not duplicate it"
+        );
+        assert_eq!(
+            active.iter().filter(|t| *t == "todo").count(),
+            1,
+            "a repeated pick lands once"
+        );
+    }
+}
+
+#[cfg(test)]
 mod workspace_reference_tests {
     use nanna_agent::harness::{build_step_prompt, TaskStep};
     use nanna_agent::AgentContext;
@@ -6096,6 +7244,7 @@ mod workspace_reference_tests {
             contributing: None,
             // A 1000-line roadmap — far past what a 16k window can spare.
             roadmap: Some("- [ ] migrate a file off lucide-vue-next\n".repeat(1_000)),
+            git: None,
         };
 
         let mut ctx = AgentContext::new("t");
@@ -6137,7 +7286,7 @@ mod workspace_reference_tests {
             tool_scope: Vec::new(),
             notes_tail: Vec::new(),
         };
-        let user_message = build_step_prompt(goal, &step, None, "budget: fresh");
+        let user_message = build_step_prompt(goal, &step, None, None, "budget: fresh");
         let assembled = format!("{system}\n\n{user_message}");
         let reference_at = assembled
             .find("# Project Context (background reference)")

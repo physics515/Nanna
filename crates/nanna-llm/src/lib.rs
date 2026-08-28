@@ -14,7 +14,10 @@ pub mod oauth;
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
 pub mod heal;
-pub use heal::{count_balanced_top_level_objects, heal_json, heal_json_as, heal_tool_args};
+pub use heal::{
+    count_balanced_top_level_objects, escape_bare_controls_in_strings, heal_json, heal_json_as,
+    heal_tool_args,
+};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
@@ -452,6 +455,21 @@ pub const NUM_CTX_CEILING: u32 = 32_768;
 /// call sites that have no agent state to measure.
 pub const DEFAULT_MIN_VIABLE_NUM_CTX: u32 = 4_608;
 
+/// The provider clients' declared silence tolerance: how long a stream may go
+/// without delivering a single byte before the transport itself calls it dead
+/// (`reqwest`'s `read_timeout` on both the remote and the Ollama client — see
+/// `build_http_client` / `build_ollama_http_client`). This is deliberately the
+/// ONLY time bound on a stream: there is no total-request deadline, because a
+/// healthy long generation never pauses between chunks for anywhere near this
+/// long, while it routinely exceeds any total cap.
+///
+/// Public so watchers can DERIVE their cadence from the declared bound instead
+/// of inventing a second constant that drifts: the agent loop's stream
+/// watchdog fires at a multiple of this (transport must get first claim on a
+/// truly silent socket), and the daemon's liveness beat at a fraction of it
+/// (several beats must land inside any legal silence window).
+pub const STREAM_READ_TIMEOUT_SECS: u64 = 120;
+
 /// Conservative model info when the provider has not (yet) told us limits.
 ///
 /// Supports tools optimistically — capability misses are softer than overrunning
@@ -655,6 +673,28 @@ impl LlmError {
             || matches!(self, LlmError::Api { status: 429, .. })
     }
 
+    /// An input-level rejection: this request's INPUT was too long for the
+    /// model, stated deterministically by the provider ("input length N
+    /// exceeds model maximum M", 400/413/422-shaped).
+    ///
+    /// The distinction is load-bearing for callers that bench providers on
+    /// deterministic errors: a provider that rejected one oversized input is
+    /// perfectly healthy for every other call, so this class must never bench
+    /// it — the CALLER owns the fault, and the fix is to shrink the input,
+    /// not to wait out a cooldown. (Observed 2026-08-10: one over-long input
+    /// classified as a provider fault benched the only local embedder for
+    /// 240s while a mission was trying to write memories through it.)
+    #[must_use]
+    pub fn is_input_overflow(&self) -> bool {
+        match self {
+            Self::Api {
+                status: 400 | 413 | 422,
+                message,
+            } => input_overflow_limits(message).is_some(),
+            _ => false,
+        }
+    }
+
     /// Check if this error should trigger a fallback to another model
     #[must_use]
     pub fn should_fallback(&self) -> bool {
@@ -754,6 +794,50 @@ impl LlmError {
             .or(from_retry_after)
             .filter(|secs| *secs > 0 && *secs <= MAX_PLAUSIBLE_WAIT_SECS)
     }
+}
+
+/// Parse "(input) length N exceeds (model) maximum M" out of a provider error
+/// body, returning `(sent, limit)` in the provider's own unit (tokens).
+///
+/// Deliberately liberal about the words between the numbers — Ollama says
+/// "input length exceeds maximum context length", OpenAI-compatible servers
+/// vary the nouns — and strict about the shape: the message must carry the
+/// overflow vocabulary AND two integers where a larger one is followed by a
+/// smaller one. The pair is found as the first adjacent *descending* pair in
+/// order of appearance, which steps over version fragments in model names
+/// ("v1.5" yields the ascending 1, 5) and lands on `sent > limit` every time
+/// the provider states both.
+fn input_overflow_limits(message: &str) -> Option<(usize, usize)> {
+    let lowered = message.to_lowercase();
+    let overflow_shape = lowered.contains("exceed")
+        && (lowered.contains("length") || lowered.contains("token"))
+        && (lowered.contains("maximum") || lowered.contains("context") || lowered.contains("limit"));
+    if !overflow_shape {
+        return None;
+    }
+
+    let mut numbers: Vec<usize> = Vec::new();
+    let mut digits = String::new();
+    for c in lowered.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            if let Ok(n) = digits.parse() {
+                numbers.push(n);
+            }
+            digits.clear();
+        }
+    }
+    if !digits.is_empty()
+        && let Ok(n) = digits.parse()
+    {
+        numbers.push(n);
+    }
+
+    numbers
+        .windows(2)
+        .find(|pair| pair[0] > pair[1] && pair[1] >= 1)
+        .map(|pair| (pair[0], pair[1]))
 }
 
 // =============================================================================
@@ -1157,7 +1241,7 @@ pub struct CompletionRequest {
 impl Default for CompletionRequest {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             messages: Vec::new(),
             anthropic_messages: Vec::new(),
             max_tokens: Some(4096),
@@ -1827,7 +1911,7 @@ impl LlmClient {
     /// default to a 10-minute total for the same reason.
     fn build_http_client() -> Client {
         Client::builder()
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new())
@@ -1891,7 +1975,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// so it would have had no effect on the thing it was written to fix.)
     ///
     /// Source order: what the caller explicitly asked for, then the live
-    /// latch, then min(env pin, probed/nominal size) at latch initialization.
+    /// latch, then the env pin outright (falling back to the probed/nominal
+    /// size only when no pin is set) at latch initialization.
     fn resolve_num_ctx(model: &str, explicit: Option<u32>) -> u32 {
         if let Some(explicit) = explicit {
             return explicit;
@@ -1899,43 +1984,36 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         if let Some(latched) = Self::latched_num_ctx(model) {
             return latched;
         }
-        // Explicit beats computed — downward. `NANNA_OLLAMA_NUM_CTX` is set by
-        // someone who measured THIS machine with THIS model;
-        // `fit_context_to_free_vram` has only inferred a size from free bytes.
-        // Letting the heuristic promote past the operator's number was a
-        // silent override of a deliberate setting, and it was expensive: the
-        // same model on the same mission scored 31/42 at the operator's 16384
-        // and 8/42 once the heuristic promoted it to 32768. Fitting in VRAM is
-        // necessary, not sufficient — a 9B model given twice the window does
-        // not use it well, it loses the thread and rewrites work it had passing.
+        // Explicit beats computed — in BOTH directions. `NANNA_OLLAMA_NUM_CTX`
+        // is set by someone who measured THIS machine with THIS model;
+        // `fit_context_to_free_vram` has only inferred a size from a SNAPSHOT
+        // of free bytes. Both override directions have now been paid for:
+        // the heuristic promoting past the operator's number cost a mission
+        // (31/42 at the pinned 16384 vs 8/42 at the promoted 32768 — a 9B
+        // model given twice the window loses the thread), and the heuristic
+        // DEMOTING below it cost another (2026-08-09: a summarization burst
+        // held the card while the model's first request sized, the min(env,
+        // sized) start latched 4096 for the daemon's lifetime, and every
+        // later mission request inherited the poisoned latch on an
+        // otherwise-idle card).
         //
-        // So the pin is a ceiling on the STARTING latch, not a disable of the
-        // machinery around it: the start is min(env, sized), which lets the
-        // env shrink the start (a probed 16384 that faults under sustained
-        // mission KV load starts stable at a pinned 8192) but never grow it
-        // past what the probe — or the nominal fallback when the card cannot
-        // be measured — says this machine supports. And a pin that is still
-        // too large faults under load and gets walked down by
-        // `demote_context` (the caller demotes on the second fault of a run —
-        // one fault at a sane pin is usually a transient blip, healed by a
-        // runner reset alone): demotion below the pin keeps working because
-        // the latch, not the env, is consulted once it exists.
-        let sized = Self::fit_context_to_free_vram(model).unwrap_or(16_384);
+        // A transient probe must not override a durable measurement in
+        // either direction. A pin that is genuinely too large for the card
+        // still faults under load and gets walked down by `demote_context`
+        // (the caller demotes on the second fault of a run): the safety net
+        // for an over-pin is the fault ladder, not the snapshot.
         let start = match Self::env_num_ctx() {
             Some(pinned) => {
-                let start = pinned.min(sized);
                 tracing::info!(
                     model = %model,
-                    pinned = start,
-                    requested = pinned,
-                    sized,
+                    pinned,
                     source = "env",
                     "NANNA_OLLAMA_NUM_CTX pins the starting num_ctx latch; \
                      demote_context can still walk it lower on GPU faults"
                 );
-                start
+                pinned
             }
-            None => sized,
+            None => Self::fit_context_to_free_vram(model).unwrap_or(16_384),
         };
         Self::latch_num_ctx(model, start);
         start
@@ -2064,6 +2142,13 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Some(next)
     }
 
+    /// Floor of the VRAM-fitted context: below this a run is not worth
+    /// starting; above it, diminishing returns for an agent whose steps
+    /// rarely exceed a few thousand tokens. Shared between the fit
+    /// arithmetic (its clamp floor) and the sizing probe's starved-card
+    /// check, which keys on "the fit was forced all the way down here".
+    const MIN_FIT_CTX: u32 = 4_096;
+
     /// Largest context that fits in the VRAM free *right now*, or `None` when
     /// the GPU cannot be queried (no NVIDIA tooling, or a non-CUDA backend) —
     /// in which case the caller falls back to a fixed size.
@@ -2079,12 +2164,37 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let free_bytes = Self::nvidia_free_vram_bytes()? as f64;
         let weights_bytes = Self::ollama_model_size_bytes(model)? as f64;
         let (ours_resident, others_resident) = Self::ollama_resident_vram(model);
-        Some(Self::fit_context_for_budget(
+        let fitted = Self::fit_context_for_budget(
             free_bytes,
             weights_bytes,
             ours_resident as f64,
             others_resident as f64,
-        ))
+        );
+        // Floor-fit on an EMPTY server is the orphaned-runner signature, so
+        // name it instead of latching quietly. `ollama ps` reports the
+        // server's own children, not what is on the card: a runner orphaned
+        // by a parent-only server kill (see the regression note on
+        // `nanna-daemon`'s `restart_ollama_server`) keeps its ~weights-worth
+        // of VRAM while being invisible here. Observed live 2026-08-09: four
+        // orphans held 12.5 of 16 GB, `ollama ps` was empty, and this probe
+        // honestly latched a below-floor 4096 that killed two endurance
+        // attempts. A card that cannot fit more than the floor while Ollama
+        // holds NOTHING is either starved by invisible consumers or too small
+        // for the model — both are worth a loud line before the latch sticks.
+        if fitted == Self::MIN_FIT_CTX && ours_resident + others_resident == 0 {
+            tracing::warn!(
+                model,
+                free_mib = (free_bytes / (1024.0 * 1024.0)) as u64,
+                weights_mib = (weights_bytes / (1024.0 * 1024.0)) as u64,
+                "num_ctx sized at the floor while `ollama ps` shows nothing \
+                 resident — something invisible to Ollama is holding the \
+                 card. Known cause: llama-server runner processes orphaned by \
+                 a parent-only Ollama restart. Check `nvidia-smi` for \
+                 llama-server/ollama processes and kill them; this size \
+                 latches for the process lifetime"
+            );
+        }
+        Some(fitted)
     }
 
     /// VRAM currently held by `model` and, separately, by every OTHER model the
@@ -2163,10 +2273,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         /// without slack is how the first request picks a size the tenth
         /// request cannot honour.
         const SLACK: f64 = 1.2 * 1024.0 * 1024.0 * 1024.0;
-        /// Below this a run is not worth starting; above it, diminishing
-        /// returns for an agent whose steps rarely exceed a few thousand
-        /// tokens.
-        const MIN_CTX: u32 = 4_096;
         const MAX_CTX: u32 = 32_768;
 
         // Add back what THIS model already holds before subtracting what it
@@ -2184,7 +2290,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let reserve = others_resident.max(EMBEDDER_RESERVE) + SLACK;
         let usable = effective_free - weights_bytes - reserve;
         if usable <= 0.0 {
-            return MIN_CTX;
+            return Self::MIN_FIT_CTX;
         }
         let raw = (usable / BYTES_PER_CTX_TOKEN) as u64;
 
@@ -2203,8 +2309,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .iter()
             .copied()
             .find(|b| u64::from(*b) <= raw)
-            .unwrap_or(MIN_CTX);
-        fitted.clamp(MIN_CTX, MAX_CTX)
+            .unwrap_or(Self::MIN_FIT_CTX);
+        fitted.clamp(Self::MIN_FIT_CTX, MAX_CTX)
     }
 
     /// Free VRAM in bytes, via `nvidia-smi`. `None` on any non-NVIDIA or
@@ -2271,7 +2377,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     fn build_ollama_http_client() -> Client {
         Client::builder()
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(0)
             .build()
@@ -3800,13 +3906,22 @@ impl EmbeddingClient {
     /// Create `Ollama` embedding client (local, no API key needed)
     pub fn ollama(base_url: impl Into<String>) -> Self {
         Self {
-            http: Client::builder()
-                .timeout(std::time::Duration::from_secs(60)) // Ollama can be slower
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            // The exact client the 2026-08-02 chat-stream fix built — SHARED,
+            // not mirrored, so the two Ollama paths cannot drift apart again:
+            // a read stall deadline instead of a whole-request one (a cold
+            // embedding model can take most of a minute to load, but "no
+            // bytes for 120s" is a dead connection), a connect timeout, and
+            // no idle pooling — a pooled loopback socket Windows quietly
+            // reset is a hang on the next request, and reconnecting to
+            // loopback costs nothing.
+            http: LlmClient::build_ollama_http_client(),
             provider: EmbeddingProvider::Ollama,
             api_key: String::new(),
-            base_url: base_url.into(),
+            // The same IPv4 pin as the chat path: "localhost" resolves to
+            // ::1 first on Windows, and v6 loopback is where streams were
+            // observed cut mid-transfer. The 2026-08-10 embed storm ran over
+            // ::1 while every healthy component used 127.0.0.1.
+            base_url: LlmClient::normalize_ollama_url(base_url.into()),
             model: "nomic-embed-text".to_string(), // Good default for Ollama
         }
     }
@@ -3826,7 +3941,12 @@ impl EmbeddingClient {
     /// Override the base URL (e.g. for OpenRouter-compatible embedding endpoints).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base_url = match self.provider {
+            // Keep the v4 loopback pin even when the URL arrives after
+            // construction — same rationale as [`Self::ollama`].
+            EmbeddingProvider::Ollama => LlmClient::normalize_ollama_url(url.into()),
+            EmbeddingProvider::OpenAI => url.into(),
+        };
         self
     }
 
@@ -3984,16 +4104,46 @@ impl EmbeddingClient {
 
     /// Get embedding for a single text.
     ///
+    /// A deterministic input-overflow rejection ("input length N exceeds
+    /// model maximum M") is healed HERE, not surfaced: the text is cut to the
+    /// proportional prefix that fits M and retried. This embeds the longest
+    /// prefix the model accepts — the same prefix semantics every backend
+    /// applies silently when it truncates (see [`Self::context_window`]) —
+    /// where returning the error let a fallback router bench a perfectly
+    /// healthy provider for 240s over the caller's own oversized input
+    /// (observed 2026-08-10). The stored memory keeps its full text either
+    /// way; only the vector is built from the prefix.
+    ///
     /// # Errors
     ///
     /// Returns `LlmError::Api` if the API returns an error or no embedding is returned.
     /// Returns `LlmError::Network` if the request fails.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, LlmError> {
-        let mut results = self.embed(&[text]).await?;
-        results.pop().ok_or_else(|| LlmError::Api {
-            status: 500,
-            message: "No embedding returned".to_string(),
-        })
+        let mut shrunk: Option<String> = None;
+        loop {
+            let attempt = shrunk.as_deref().unwrap_or(text);
+            let err = match self.embed(&[attempt]).await {
+                Ok(mut results) => {
+                    return results.pop().ok_or_else(|| LlmError::Api {
+                        status: 500,
+                        message: "No embedding returned".to_string(),
+                    });
+                }
+                Err(e) => e,
+            };
+            // No retry cap, and none needed: each pass keeps strictly fewer
+            // chars than the last (limit < sent), so the walk terminates —
+            // geometrically, in practice in one or two passes.
+            let Some(shorter) = shrink_to_input_limit(&err, attempt) else {
+                return Err(err);
+            };
+            debug!(
+                from_chars = attempt.chars().count(),
+                to_chars = shorter.chars().count(),
+                "embedding input exceeded the model's window — retrying with the fitting prefix"
+            );
+            shrunk = Some(shorter);
+        }
     }
 
     /// The maximum sequence length this embedding model accepts, in tokens.
@@ -4031,6 +4181,34 @@ impl EmbeddingClient {
         let show: OllamaShowResponse = response.json().await.ok()?;
         gguf_metadata_usize(&show.model_info?, "context_length")
     }
+}
+
+/// The strictly-shorter prefix of `text` that should fit the limit named by an
+/// input-overflow error, or `None` when `err` is not that fault or no shorter
+/// prefix exists.
+///
+/// The provider reports its unit (tokens); the cut happens in chars. The
+/// proportional cut `limit/sent` maps one to the other well enough because the
+/// caller LOOPS: a residual overflow produces a fresh, smaller report, the
+/// char count strictly decreases every pass, and the walk terminates without
+/// needing a retry cap.
+fn shrink_to_input_limit(err: &LlmError, text: &str) -> Option<String> {
+    if !err.is_input_overflow() {
+        return None;
+    }
+    let LlmError::Api { message, .. } = err else {
+        return None;
+    };
+    let (sent, limit) = input_overflow_limits(message)?;
+    debug_assert!(sent > limit, "input_overflow_limits guarantees sent > limit");
+    let total_chars = text.chars().count();
+    let target_chars = total_chars.saturating_mul(limit) / sent;
+    if target_chars == 0 || target_chars >= total_chars {
+        // Nothing left to cut (or the ratio math degenerated) — this fault
+        // cannot be healed by shrinking, so let the caller surface the error.
+        return None;
+    }
+    Some(text.chars().take(target_chars).collect())
 }
 
 // ============================================================================
@@ -6352,17 +6530,23 @@ mod tests {
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
 
-    /// The pin is min(env, sized) in BOTH directions. Fake model names are
-    /// absent from Ollama's tags, so the VRAM probe abstains and sizing lands
-    /// on the nominal 16384 deterministically on any machine — which makes
-    /// both sides of the min observable without mocking the card.
+    /// The pin IS the starting latch, in both directions. The probe is a
+    /// snapshot of free bytes and must not override a durable operator
+    /// measurement either way: promotion past the pin cost a mission
+    /// (31/42→8/42 at 32768), and demotion below it cost another
+    /// (2026-08-09: a summarization burst held the card while the first
+    /// request sized, min(env, sized) latched 4096 for the daemon's
+    /// lifetime, and every later request inherited the poisoned latch on an
+    /// idle card). A genuinely oversized pin is walked down by the fault
+    /// ladder, not by the snapshot. Fake model names are absent from
+    /// Ollama's tags, so the VRAM probe abstains deterministically here.
     #[test]
-    fn the_env_pin_is_a_ceiling_on_the_starting_latch_in_both_directions() {
+    fn the_env_pin_is_the_starting_latch_in_both_directions() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut request = request_with_tool_history(serde_json::json!({}));
         request.context_limit = None;
 
-        // Shrink: a pin below what sizing would pick IS the starting latch.
+        // Below nominal: the pin is the starting latch.
         // SAFETY: edition 2024 requires this; env_lock serialises the
         // env-touching tests, and nothing else reads this key.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
@@ -6374,11 +6558,11 @@ mod tests {
             "the pin must be LATCHED as the start, not re-derived per request"
         );
 
-        // Never grow: a pin above what sizing supports starts at the sized
-        // value — the env cannot inflate the window past the machine.
+        // Above nominal: the pin still wins — the snapshot cannot demote a
+        // durable measurement; only the GPU fault ladder can.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "32768") };
-        request.model = "test-env-pin-cannot-grow:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 16_384);
+        request.model = "test-env-pin-wins-upward:1b".to_string();
+        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 32_768);
 
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
@@ -7612,5 +7796,251 @@ mod gemma_sentinel_tests {
             state.required_wait(now, Duration::from_secs(3)),
             Duration::from_secs(1)
         );
+    }
+}
+
+#[cfg(test)]
+mod input_overflow_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ------------------------------------------------------------------
+    // Classification: only the overflow shape, on input-fault statuses
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn overflow_limits_parse_the_ollama_message() {
+        let parsed =
+            input_overflow_limits("input length 1234 exceeds maximum context length 512");
+        assert_eq!(parsed, Some((1234, 512)), "sent and limit, in that order");
+    }
+
+    /// Version digits inside a model name must not be mistaken for the pair —
+    /// the pair is the first adjacent DESCENDING pair, and "v1.5" ascends.
+    #[test]
+    fn overflow_limits_step_over_model_version_digits() {
+        let parsed = input_overflow_limits(
+            "model 'nomic-embed-text-v1.5': input length 8000 exceeds the maximum of 2048 tokens",
+        );
+        assert_eq!(parsed, Some((8000, 2048)));
+    }
+
+    #[test]
+    fn overflow_limits_reject_other_vocabulary_and_shapes() {
+        // Right words, no numbers.
+        assert_eq!(
+            input_overflow_limits("input length exceeds maximum context length"),
+            None
+        );
+        // Numbers, wrong vocabulary — a quota message is not an input fault.
+        assert_eq!(
+            input_overflow_limits("quota of 200 requests used, 50 remaining"),
+            None
+        );
+        // Ascending numbers only — nothing states sent > limit.
+        assert_eq!(
+            input_overflow_limits("length 10 exceeds nothing; maximum is 512"),
+            None
+        );
+    }
+
+    #[test]
+    fn input_overflow_is_scoped_to_input_fault_statuses() {
+        let message = "input length 1000 exceeds maximum context length 500".to_string();
+        for status in [400_u16, 413, 422] {
+            let e = LlmError::Api {
+                status,
+                message: message.clone(),
+            };
+            assert!(e.is_input_overflow(), "{status} with the shape classifies");
+        }
+        // A 500 with the same words is a provider fault; benching stays correct.
+        assert!(
+            !LlmError::Api {
+                status: 500,
+                message: message.clone()
+            }
+            .is_input_overflow()
+        );
+        // Rate limits never classify as input overflow, whatever they say.
+        assert!(
+            !LlmError::RateLimit {
+                message,
+                retry_after: None
+            }
+            .is_input_overflow()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Shrinking: strictly shorter, proportional, refuses the degenerate
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn shrink_cuts_proportionally_and_strictly_shorter() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 100 exceeds maximum context length 50".into(),
+        };
+        let text = "x".repeat(200);
+        let cut = shrink_to_input_limit(&err, &text).expect("a healable overflow shrinks");
+        assert_eq!(cut.chars().count(), 100, "200 chars x 50/100 = 100");
+        assert!(
+            cut.chars().count() < text.chars().count(),
+            "strictly shorter - termination"
+        );
+    }
+
+    #[test]
+    fn shrink_refuses_when_nothing_is_left_to_cut() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 1000 exceeds maximum context length 1".into(),
+        };
+        // 1 char x 1/1000 floors to zero — unhealable, surface the error.
+        assert_eq!(shrink_to_input_limit(&err, "x"), None);
+        // Not the fault at all → untouched.
+        let other = LlmError::Api {
+            status: 500,
+            message: "boom".into(),
+        };
+        assert_eq!(shrink_to_input_limit(&other, "some text"), None);
+    }
+
+    #[test]
+    fn shrink_respects_char_boundaries() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 4 exceeds maximum context length 2".into(),
+        };
+        // Multi-byte chars: a byte-indexed cut would panic or split a char.
+        let cut = shrink_to_input_limit(&err, "éééé").expect("shrinks");
+        assert_eq!(cut, "éé");
+    }
+
+    // ------------------------------------------------------------------
+    // The healing loop, end to end against a live socket
+    // ------------------------------------------------------------------
+
+    /// Serve scripted (status, body) responses in order, then repeat the last
+    /// one; `Connection: close` makes the accept count the request count.
+    async fn spawn_scripted_server(
+        script: Vec<(u16, String)>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<usize>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let body_lens = Arc::new(Mutex::new(Vec::new()));
+        let counter = hits.clone();
+        let lens = body_lens.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0_u8; 65536];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                lens.lock().expect("lens lock").push(read);
+                let (status, body) = script
+                    .get(n)
+                    .unwrap_or_else(|| script.last().expect("script is non-empty"));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits, body_lens)
+    }
+
+    /// The incident's fix: one overflow report, one shrink, one clean retry —
+    /// the caller gets a vector and the provider never looks unhealthy.
+    #[tokio::test]
+    async fn embed_one_shrinks_and_retries_after_an_overflow_report() {
+        let (url, hits, body_lens) = spawn_scripted_server(vec![
+            (
+                422,
+                r#"{"error":{"message":"input length 100 exceeds maximum context length 50"}}"#
+                    .to_string(),
+            ),
+            (200, r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#.to_string()),
+        ])
+        .await;
+        let client = EmbeddingClient::openai("test-key")
+            .with_model("test-embed")
+            .with_base_url(&url);
+
+        let text = "word ".repeat(100);
+        let vector = client.embed_one(&text).await.expect("healed by shrinking");
+        assert_eq!(vector.len(), 3, "the retry's vector comes through");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one shrink retry");
+        let lens = body_lens.lock().expect("lens lock");
+        assert!(
+            lens[1] < lens[0],
+            "the retry carried a strictly smaller request ({} then {})",
+            lens[0],
+            lens[1]
+        );
+    }
+
+    /// A provider that keeps reporting overflow whatever we send: the strict
+    /// shrink guarantees termination — the loop bottoms out and surfaces the
+    /// error instead of spinning forever.
+    #[tokio::test]
+    async fn embed_one_terminates_against_a_provider_that_always_overflows() {
+        let (url, hits, _lens) = spawn_scripted_server(vec![(
+            422,
+            r#"{"error":{"message":"input length 100 exceeds maximum context length 50"}}"#
+                .to_string(),
+        )])
+        .await;
+        let client = EmbeddingClient::openai("test-key")
+            .with_model("test-embed")
+            .with_base_url(&url);
+
+        let text = "x".repeat(64);
+        let err = client
+            .embed_one(&text)
+            .await
+            .expect_err("an unhealable overflow surfaces");
+        assert!(
+            err.is_input_overflow(),
+            "the surfaced error keeps its class: {err}"
+        );
+        // Halving 64 chars bottoms out in ~7 passes; the point is that the
+        // count is small and finite, not any particular number.
+        let n = hits.load(Ordering::SeqCst);
+        assert!((2..=8).contains(&n), "strictly-shrinking retries, got {n}");
+    }
+
+    // ------------------------------------------------------------------
+    // The 2026-08-02 treatment applied to the embedding client
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ollama_embedding_client_pins_v4_loopback() {
+        let client = EmbeddingClient::ollama("http://localhost:11434");
+        assert_eq!(client.base_url, "http://127.0.0.1:11434");
+        // The pin survives a post-construction URL override…
+        let client = client.with_base_url("http://localhost:9999");
+        assert_eq!(client.base_url, "http://127.0.0.1:9999");
+        // …and remote hosts pass through untouched.
+        let client = EmbeddingClient::ollama("http://gpu-box:11434");
+        assert_eq!(client.base_url, "http://gpu-box:11434");
+    }
+
+    #[test]
+    fn openai_embedding_client_urls_are_not_rewritten() {
+        // "localhost" in an OpenAI-compatible URL is someone's proxy, not our
+        // Ollama — the pin is an Ollama-path decision only.
+        let client = EmbeddingClient::openai("k").with_base_url("http://localhost:8080");
+        assert_eq!(client.base_url, "http://localhost:8080");
     }
 }

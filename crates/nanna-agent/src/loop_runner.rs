@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Core tools always sent to the LLM. Everything else is discoverable via `discover_tools`.
@@ -78,6 +78,27 @@ fn pressure_tier_active_tools() -> HashSet<String> {
     PRESSURE_TIER_WORK_TOOLS.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// The tool name a provider refused to look up, parsed from its error body.
+///
+/// Some local templates validate tool names against the request's `tools`
+/// array and fail the WHOLE exchange when a name is missing. Observed live
+/// (2026-08-08, ministral-3:8b): Ollama's Mistral-family parser rejects a
+/// GENERATED call to an unserved tool with HTTP 500 and the body
+/// `{"error":"tool 'exec' not found"}` — the call never reaches the
+/// registry, so the normal unknown-tool guidance ("use discover_tools")
+/// can never fire, and re-sending the identical request dies identically.
+/// qwen/gemma parsers pass unknown names through to the registry instead,
+/// which is why only some models trip this.
+///
+/// Matches the provider's `tool '<name>' not found` shape anywhere in the
+/// rendered error (the message arrives wrapped in transport prefixes like
+/// `API error: 500 - {...}`).
+fn provider_unknown_tool_name(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("tool '")?;
+    let (name, tail) = rest.split_once('\'')?;
+    (!name.is_empty() && tail.trim_start().starts_with("not found")).then_some(name)
+}
+
 /// The smallest output reserve (in tokens) a step can do real work in — the
 /// floor of [`window_scaled_output_reserve`].
 ///
@@ -120,6 +141,14 @@ const MIN_OUTPUT_RESERVE_TOKENS: usize = (nanna_memory::MEMORY_CHUNK_MAX_CHARS *
 /// Callers feed the result through
 /// [`nanna_llm::ModelInfo::effective_output_budget`], which additionally caps
 /// at the provider's `max_output_tokens` and half the window.
+/// The characters-per-token ratio this codebase estimates with, used wherever a
+/// token budget has to be compared against a byte or character length.
+///
+/// Not a tuning knob — it is the same 4:1 the context estimator uses, named
+/// here so a budget expressed in tokens and a length expressed in characters
+/// are converted in one place instead of by a literal at each site.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
 fn window_scaled_output_reserve(window: usize, requested_max_tokens: usize) -> usize {
     // lo ≤ hi holds by construction: min(MIN, requested) ≤ requested. A
     // caller asking for less than the derived minimum gets what it asked for
@@ -403,7 +432,7 @@ pub struct AgentConfig {
     /// When enabled, the agent classifies each iteration's complexity and routes
     /// to the cheapest model capable of handling it.
     /// Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
     pub model_routing: Vec<ModelTier>,
     /// Whether to always use the primary model for the first iteration
     /// (user-facing response quality). Default: true.
@@ -463,7 +492,7 @@ pub enum TaskComplexity {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: None,
@@ -518,6 +547,105 @@ pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sy
 /// just made, and `context_window` the enforced context bound — together
 /// they are the live "context in use" signal.
 pub type UsageCallback = Box<dyn Fn(u32, u32, u64) + Send + Sync>;
+
+/// One-shot capability-transition notices for the model (P22 Tier 4).
+///
+/// When a capability degrades UNDER a run — the embedding provider stops
+/// answering and memory writes start landing vectorless, say — the model has
+/// no way to know unless something tells it, and telling it on every tool
+/// call turns one fact into wallpaper it learns to ignore. This ledger is the
+/// middle path the roadmap asks for: producers (the daemon's provider
+/// plumbing) record state transitions as they observe them; the agent loop
+/// delivers each transition ONCE, appended to the next tool result, and then
+/// stays quiet until the state changes again.
+///
+/// The message contract follows the truncation-artifact rule ("summaries must
+/// announce themselves"): WHAT is off, WHY, that the operation itself still
+/// SUCCEEDED, and what is now the source of truth.
+///
+/// Both sides touch the ledger for microseconds and never across an await, so
+/// a `std::sync::Mutex` is the right lock. Bounds: at most one pending
+/// message per capability key — a capability that flaps a hundred times
+/// between two tool calls still delivers ONE line, its latest state, because
+/// the model only ever needs the current truth (the log keeps the flaps).
+#[derive(Debug, Default)]
+pub struct DegradationLedger {
+    inner: std::sync::Mutex<DegradationState>,
+}
+
+#[derive(Debug, Default)]
+struct DegradationState {
+    /// capability → the state the model was last TOLD about. Missing keys are
+    /// implicitly "healthy", so reporting a healthy capability at boot
+    /// announces nothing.
+    announced: std::collections::HashMap<String, String>,
+    /// capability → (current state, the transition message not yet delivered).
+    pending: std::collections::HashMap<String, (String, String)>,
+}
+
+/// The implicit baseline state: capabilities are presumed working until a
+/// producer says otherwise, so the first "healthy" report is not news.
+const DEGRADATION_BASELINE: &str = "healthy";
+
+impl DegradationLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `capability` is now in `state`, with the message to show
+    /// the model if this is genuinely news.
+    ///
+    /// News means: `state` differs from what was last ANNOUNCED for this key.
+    /// A repeat of the announced state is dropped (stay quiet until it
+    /// changes); a flap that returns to the announced state before delivery
+    /// CANCELS the pending message (net-zero transition — the model never
+    /// needed to know); a second distinct transition before delivery replaces
+    /// the pending message (latest state wins).
+    pub fn set(&self, capability: &str, state: &str, message: impl Into<String>) {
+        // A poisoned ledger (a panic under the lock elsewhere) must not take
+        // the agent loop down over a notice — the state map stays coherent
+        // because every mutation below is a single insert/remove.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let announced = inner
+            .announced
+            .get(capability)
+            .map_or(DEGRADATION_BASELINE, String::as_str);
+        if announced == state {
+            inner.pending.remove(capability);
+        } else {
+            inner
+                .pending
+                .insert(capability.to_string(), (state.to_string(), message.into()));
+        }
+    }
+
+    /// The undelivered transition messages, oldest key order unspecified —
+    /// delivering marks their states as announced. Returns `None` when there
+    /// is nothing to say, which is the steady state.
+    pub fn drain(&self) -> Option<String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut inner.pending);
+        let mut messages: Vec<String> = Vec::with_capacity(pending.len());
+        for (capability, (state, message)) in pending {
+            inner.announced.insert(capability, state);
+            messages.push(message);
+        }
+        drop(inner);
+        // Deterministic order for tests and for the reader.
+        messages.sort();
+        Some(messages.join("\n"))
+    }
+}
 
 /// Options for running the agent
 #[derive(Default)]
@@ -620,6 +748,10 @@ pub struct RunOptions {
     /// times per step (see [`RepeatLedger`]). `None` — a plain, single-step
     /// run — makes its own, which is exactly the previous behavior.
     pub repeat_ledger: Option<SharedRepeatLedger>,
+    /// Capability-transition notices to deliver with tool results — see
+    /// [`DegradationLedger`]. Shared with the daemon's provider plumbing
+    /// (the producers); `None` — no producers — costs nothing.
+    pub degradations: Option<std::sync::Arc<DegradationLedger>>,
 }
 
 /// What kind of work a harness-driven step is doing (P14).
@@ -668,8 +800,16 @@ pub struct AgentResponse {
     ///
     /// Returned so a CALLER that drives many runs — the long-horizon harness
     /// drives one per step — can carry activation forward. Without it every
-    /// step starts blind and re-pays discovery out of its 8-iteration budget.
+    /// step starts blind and re-pays discovery.
     pub active_tools: Vec<String>,
+    /// The run ended in a degenerate generation loop with ZERO tool calls:
+    /// a narration/repetition/thinking-spiral detector fired, its one-shot
+    /// recovery nudge did not change the behavior, and the run exited having
+    /// never acted. Carried out-of-band so the harness can route the step to
+    /// its steering ladder instead of the fruitless budget (P22: those
+    /// aborts were charged like genuine no-ops and burned items' lives).
+    #[serde(default)]
+    pub degenerate_loop: bool,
 }
 
 /// Reasoning content from thinking mode
@@ -714,6 +854,44 @@ pub struct ToolCallRecord {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    /// The bytes landed but the file no longer parses. Separate from `success`
+    /// on purpose — see [`structure_broken`].
+    pub structure_broken: bool,
+}
+
+/// The text a [`ToolCallRecord`] should carry for a finished call.
+///
+/// `ToolResult::error` moves a failure's message out of `content`, so reading
+/// `content` alone records that a call failed and nothing about HOW. Two guards
+/// read this text — the repeat detector and the novelty check — and both were
+/// comparing empty strings for every failure.
+fn record_output(result: &nanna_tools::ToolResult) -> String {
+    if result.content.is_empty() {
+        result.error.clone().unwrap_or_default()
+    } else {
+        result.content.clone()
+    }
+}
+
+/// True only when a write tool actually RAN the file's parser and it failed.
+///
+/// The write family reports `success` as "the bytes landed", which is what the
+/// world-epoch bump and the failure counters need it to mean. But a write that
+/// lands and breaks the file is not landed WORK, and every consumer reading
+/// only the flag recorded it as such.
+///
+/// Absent, unrun and fail-open verdicts deliberately answer false. `sh -n`
+/// cries wolf on valid bash where `/bin/sh` is dash, and a false "broken" would
+/// suppress completion and drain the item's budget — strictly worse than the
+/// silence it replaces.
+fn structure_broken(result: &nanna_tools::ToolResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|d| d.get("structure"))
+        .and_then(|s| s.get("parses"))
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|parses| !parses)
 }
 
 /// Internal result from LLM call
@@ -832,6 +1010,137 @@ const REPEAT_FAILURE_BREAKER_AFTER: usize = 3;
 /// arguments (e.g. a cursor or attempt counter) or use a different mechanism.
 const ZERO_INFO_BREAKER_AFTER: usize = 3;
 
+/// Consecutive tool-calling iterations with ZERO new information before a
+/// harness step stops spinning and its reserved wrap-up iteration engages.
+///
+/// This replaces the fixed `step_iterations: 8` cap, which cut steps by the
+/// clock instead of by their yield (P22: 99 truncations in one leg, 88 with
+/// a tool call in flight, 84 ending with under 200 chars of text — each then
+/// charged as "fruitless", including the step that wrote the leg's all-time
+/// peak). A step in flow — every iteration surfacing a novel result, a
+/// mutation, or new text — now runs as long as the run's wall-clock and
+/// token budgets allow; a step that has stopped yielding ends promptly.
+///
+/// Derivation — the same 2 + 1 ladder as the sibling breakers, one level up:
+/// two zero-information iterations are what arms the in-step steering
+/// (loop nudge at 2 identical results, claim nudge one rung above), and the
+/// third is the one full post-nudge attempt every rung on the ladder grants.
+/// An iteration that is still zero-information after all of that has nothing
+/// left to spend its budget on but the wrap-up report.
+pub const STEP_EXHAUSTION_AFTER: usize = ZERO_INFO_BREAKER_AFTER;
+
+/// Fold one iteration's yield into the run's information ledger; returns
+/// whether ANYTHING was new. The three currencies mirror the P22 definition
+/// of progress exhaustion ("no novel tool result, no mutation, no new
+/// text"):
+///
+/// - a SUCCESSFUL tool result identifies by name + input + full output, so a
+///   mutation (whose result confirms new bytes written) and a read that
+///   surfaced new content both count, while the byte-identical repeat the
+///   zero-information breaker fields does not;
+/// - a FAILED tool result identifies by name + input + its first non-empty
+///   line (the same normalization as the harness's `failure_signature`) — a
+///   NEW error teaches the model something, but a breaker notice re-counting
+///   the same failure must not mint fresh "information" every repeat;
+/// - assistant text identifies by its trimmed whole — a model saying
+///   something it has not said before is information, verbatim re-narration
+///   is not.
+fn iteration_produced_information(
+    seen: &mut HashSet<u64>,
+    new_records: &[ToolCallRecord],
+    iteration_text: &str,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut novel = false;
+    for record in new_records {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        record.name.hash(&mut hasher);
+        record.input.to_string().hash(&mut hasher);
+        record.success.hash(&mut hasher);
+        if record.success {
+            record.output.hash(&mut hasher);
+        } else {
+            let first_line = record
+                .output
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let normalized: String =
+                first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+            normalized.hash(&mut hasher);
+        }
+        novel |= seen.insert(hasher.finish());
+    }
+    let text = iteration_text.trim();
+    if !text.is_empty() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        novel |= seen.insert(hasher.finish());
+    }
+    novel
+}
+
+/// The reserved final iteration's instruction: tools are off, the report is
+/// due. Injected as a user-role message (the PR #145 out-of-band pattern) so
+/// the model's ANSWER to it — not the instruction — becomes the step's final
+/// text. Exists so no step ever ends `final_text_len=0`: the cross-step
+/// carryover is only what the model says, so a silent step contributes
+/// nothing to what the next step knows (P22: 79 of 108 capped steps ended
+/// with zero final text, and the claim nudge kept firing on the last
+/// iteration with no iteration left to answer it).
+pub fn step_wrapup_message(task_anchor: Option<&str>, reason: &str) -> String {
+    format!(
+        "{}Tool use for this step is over ({reason}). Reply in plain text NOW — this is \
+         your report to the next step, which starts with a fresh context and knows only \
+         what you write here:\n\
+         1. What you did: files touched, commands run.\n\
+         2. What is VERIFIED: each command whose result you saw, and what it proved.\n\
+         3. What remains, and what is blocking it.\n\
+         If the task's done-condition is met, also write TASK COMPLETE on its own line. \
+         Do not call tools. Do not describe planned work as if it were done.",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Mechanical last-resort step report, synthesized from the tool record when
+/// even the reserved wrap-up iteration produced no text (model emitted
+/// nothing, or the wrap-up call itself failed). Honest and announced — the
+/// next step must never receive silence. Bounded to the same one-screenful
+/// budget the harness feeds forward
+/// ([`crate::harness::STEP_RESULT_TAIL_MAX_BYTES`]), newest calls kept.
+pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
+    const HEADER: &str =
+        "[step report synthesized from the tool record — the model emitted no final text]";
+    if records.is_empty() {
+        return "[step ended with no tool calls and no final text]".to_string();
+    }
+    let budget = crate::harness::STEP_RESULT_TAIL_MAX_BYTES;
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = HEADER.len();
+    for record in records.iter().rev() {
+        let flat: String = record.output.split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = format!(
+            "- {} {} ({})",
+            record.name,
+            match (record.success, record.structure_broken) {
+                (false, _) => "FAILED",
+                (true, true) => "ok — DOES NOT PARSE",
+                (true, false) => "ok",
+            },
+            preview_snippet(&flat, 80),
+        );
+        if used + line.len() + 1 > budget {
+            lines.push(format!("- …and {} earlier calls", records.len() - lines.len()));
+            break;
+        }
+        used += line.len() + 1;
+        lines.push(line);
+    }
+    lines.reverse();
+    format!("{HEADER}\n{}", lines.join("\n"))
+}
+
 /// Byte bound on the text replayed inside a breaker notice — the last error
 /// (repeat-failure breaker) or the last identical result (zero-information
 /// breaker).
@@ -839,11 +1148,24 @@ const ZERO_INFO_BREAKER_AFTER: usize = 3;
 /// Derivation: the notice is re-injected into context on EVERY
 /// short-circuited call, and the full text already reached the model each of
 /// the K times the call actually ran — the replay is a reminder, not the
-/// primary delivery. 2000 bytes is the floor of the dynamic
-/// `context_result_threshold` (`(max_tokens * 2).clamp(2000, 32000)`): the
-/// largest size guaranteed to reach context untouched for every model size,
-/// so the notice itself can never trip the summarization or compression
-/// machinery.
+/// primary delivery. So it must be small enough to reach context untouched,
+/// or the reminder itself trips the summarization it is warning about.
+///
+/// The bound is a quarter of the smallest input budget this loop will run at,
+/// expressed in bytes. The dynamic `context_result_threshold` is
+/// `(hard_limit / 4) * CHARS_PER_TOKEN_ESTIMATE` — a quarter of the live input
+/// window — and `min_viable_num_ctx` is the floor below which the loop fails
+/// loudly rather than running truncated (`ContextBelowFloor`), so a window
+/// small enough to stub this notice is a window the step already refused.
+///
+/// **This derivation was stale and is restated, not re-derived.** It used to
+/// read "2000 bytes is the floor of the dynamic `context_result_threshold`
+/// (`(max_tokens * 2).clamp(2000, 32000)`)" — the boot-frozen `max_tokens`
+/// formula P24.10 was raised about and which `:6882` replaced with the live
+/// input budget. There is no `clamp` and no floor of 2000 any more. The value
+/// is unchanged because the constraint it encodes is unchanged; only the
+/// sentence explaining it was describing code that no longer exists, which is
+/// exactly how the original defect stayed invisible for as long as it did.
 const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
 /// Byte bound on the task-anchor rendered at the head of every injected
@@ -928,6 +1250,14 @@ fn resolve_task_anchor(explicit: Option<&str>, message: &str) -> Option<String> 
 /// ran in between is irrelevant. Only a DIFFERENT outcome for the SAME key
 /// resets — which is the alternation that genuinely means progress
 /// (fail→ok→fail on one shape), not the alternation between two tools.
+///
+/// **A changed world grants a probe, not a reset.** Streak counts survive
+/// world changes; what the epoch gate ([`last_execution_epoch`]
+/// [`RepeatLedger::epoch`]) suspends is only the SHORT-CIRCUIT decision:
+/// after a successful side-effectful call, an at-threshold shape executes
+/// once more, because its evidence ("cannot succeed" / "byte-identical")
+/// predates the mutation. Same outcome again → short-circuiting resumes at
+/// once; different outcome → the ordinary reset rules above apply.
 #[derive(Debug, Clone, Default)]
 struct RepeatCallState {
     /// Consecutive failures of this exact call shape (cleared by any success).
@@ -959,6 +1289,14 @@ struct RepeatCallState {
     /// Full byte length of the last successful result, so the notice can
     /// announce when the replayed excerpt is a cut.
     last_success_len: usize,
+    /// World epoch ([`RepeatLedger::epoch`]) at this shape's last REAL
+    /// execution. The breakers only short-circuit while this equals the
+    /// current epoch: once any successful side-effectful call has changed
+    /// the world, every at-threshold shape is granted exactly one probe
+    /// execution — its premise ("repeating cannot succeed" / "byte-identical
+    /// result") is no longer evidenced. The probe's own outcome re-records
+    /// the epoch, so an unchanged world resumes short-circuiting immediately.
+    last_execution_epoch: u64,
 }
 
 /// The sibling breakers' bookkeeping, shared by every step of one harness run.
@@ -994,6 +1332,26 @@ struct RepeatCallState {
 #[derive(Debug, Default)]
 pub struct RepeatLedger {
     inner: tokio::sync::RwLock<HashMap<String, RepeatCallState>>,
+    /// Per-file structural-verdict streaks, keyed by
+    /// [`canonical_verdict_path`]. Not keyed on the call, deliberately: N
+    /// DIFFERENT edits that each leave the byte-identical parse error are
+    /// invisible to every guard above, because each call differs. Bounded by
+    /// the files the run mutates, which is bounded by its tool calls — the
+    /// same argument that bounds `inner`.
+    structural: tokio::sync::RwLock<HashMap<String, StructuralVerdictStreak>>,
+    /// Name-level zero-information streaks, keyed by lowercased tool name.
+    /// Bounded by the registered-tool population.
+    name_outcomes: tokio::sync::RwLock<HashMap<String, NameOutcomeStreak>>,
+    /// World epoch: how many successful side-effectful calls
+    /// ([`is_work_evidence_tool`]) this run has observed. Streak decisions
+    /// are gated on it (see [`RepeatCallState::last_execution_epoch`]):
+    /// observed live (2026-08-08 comparison logs), the run-long ledger's
+    /// pre-dispatch short-circuit otherwise DENIES the edit→retest and
+    /// edit→reread loops that are the correct response to a failure — qwen
+    /// was refused re-running a test 184 times after editing the file under
+    /// test, and all four models were refused re-reading files they had just
+    /// edited, forcing blind rewrites from stale context.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl RepeatLedger {
@@ -1018,13 +1376,501 @@ impl RepeatLedger {
     async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
+
+    /// The current world epoch. Relaxed ordering is sufficient: the value
+    /// only ever moves forward, and a decision made one bump stale merely
+    /// short-circuits a call that would have been granted a probe on the
+    /// very next attempt.
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that a successful side-effectful call changed the world.
+    fn bump_epoch(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fold one write tool's structural verdict into the streak for the file
+    /// it touched. Returns the streak length the FIRST time it reaches
+    /// [`STRUCTURAL_REPEAT_ESCALATE_AFTER`], and `None` every other time — the
+    /// sentence escalates once per break, not once per edit.
+    ///
+    /// **Deliberately not epoch-gated.** Every sibling guard here suspends
+    /// itself after a successful side-effectful call, on the premise that the
+    /// world has changed and the streak's evidence is stale. That premise is
+    /// exactly inverted for this streak: the mutations that bump the epoch ARE
+    /// the evidence it counts. Twenty-five successful edits leaving the same
+    /// parse error is not twenty-five stale observations, it is one fact
+    /// observed twenty-five times.
+    ///
+    /// A verdict that the file parses clears the streak: the edits worked.
+    /// Record that a call mutated `path`, whether or not it produced a
+    /// structural verdict.
+    ///
+    /// This is the half the streak counter cannot supply. A verdict only exists
+    /// where a checker applies and actually ran, so between the last passing
+    /// check and the next failing one there can be mutations nothing observed —
+    /// and those are exactly the ones worth naming, because the model has no
+    /// other way to know they are in the span.
+    ///
+    /// The names are bounded by [`REGRESSION_SPAN_NAME_BUDGET_BYTES`]; the
+    /// COUNT never is, so a span too long to list still reports its true size.
+    async fn record_mutation(&self, path: &str, tool: &str, summary: &str) {
+        debug_assert!(!path.is_empty(), "a mutation must name the file it changed");
+        debug_assert!(!tool.is_empty(), "a mutation must name the tool that made it");
+
+        let line = if summary.is_empty() {
+            format!("`{tool}`")
+        } else {
+            format!("`{tool}` ({summary})")
+        };
+
+        // The guard is released before the postcondition is checked: an assert
+        // is not a reason to hold a write lock over the whole ledger.
+        let mut streaks = self.structural.write().await;
+        let entry = streaks.entry(canonical_verdict_path(path)).or_default();
+        entry.span.total_count = entry.span.total_count.saturating_add(1);
+        let used: usize = entry.span.named.iter().map(String::len).sum();
+        if used.saturating_add(line.len()) <= REGRESSION_SPAN_NAME_BUDGET_BYTES {
+            entry.span.named.push(line);
+        }
+        let named_count = entry.span.named.len();
+        let total_count = entry.span.total_count;
+        drop(streaks);
+
+        debug_assert!(
+            u32::try_from(named_count).unwrap_or(u32::MAX) <= total_count,
+            "more names retained than mutations counted"
+        );
+    }
+
+    async fn record_structural_verdict(
+        &self,
+        path: &str,
+        parses: bool,
+        signature: &str,
+    ) -> StructuralVerdictOutcome {
+        let mut streaks = self.structural.write().await;
+        let entry = streaks.entry(canonical_verdict_path(path)).or_default();
+        if parses {
+            // A pass is the new baseline: the streak dies, the span it would
+            // have been attributed to is closed, and the next break is a fresh
+            // edge that may be announced again.
+            *entry = StructuralVerdictStreak {
+                seen_passing: true,
+                ..StructuralVerdictStreak::default()
+            };
+            return StructuralVerdictOutcome::default();
+        }
+        if entry.signature == signature {
+            entry.count += 1;
+        } else {
+            // A DIFFERENT break restarts the count: the edits are moving,
+            // even if they are not done.
+            entry.signature = signature.to_string();
+            entry.count = 1;
+            entry.escalated = false;
+        }
+
+        // Said once per pass→fail edge, and only for a file this run has
+        // actually seen parse. The span is kept, not cleared: a file that stays
+        // broken keeps accumulating, and a later pass is what closes it.
+        let regression = if entry.seen_passing && !entry.regression_announced {
+            entry.regression_announced = true;
+            Some(entry.span.clone())
+        } else {
+            None
+        };
+
+        let repeat_edits = if entry.count >= STRUCTURAL_REPEAT_ESCALATE_AFTER && !entry.escalated {
+            entry.escalated = true;
+            Some(entry.count)
+        } else {
+            None
+        };
+
+        StructuralVerdictOutcome {
+            repeat_edits,
+            regression,
+        }
+    }
+
+    /// Fold one executed call's OUTCOME into the streak for its tool name.
+    /// Returns the streak length the first time it reaches
+    /// [`ZERO_INFO_NAME_STREAK_AFTER`], and `None` otherwise.
+    ///
+    /// The streak is over the RESULT, never the arguments — that is the whole
+    /// point, and the same shape as the discovery guard, which is name-level
+    /// for the same reason. Short-circuited calls must not be folded in (they
+    /// never ran), which is why the caller sits inside the `!short_circuited`
+    /// arm.
+    ///
+    /// A call whose key repeats the previous one leaves the streak alone
+    /// entirely — neither extending nor resetting it. That case is the sibling
+    /// breakers' ([`repeat_call_key`] is theirs), and counting it here would
+    /// mean two guards saying the same thing one call apart. What is left is
+    /// exactly what nothing else can see: the same outcome under a new
+    /// spelling.
+    async fn record_name_outcome(
+        &self,
+        name: &str,
+        key: &str,
+        signature: u64,
+    ) -> Option<usize> {
+        let mut streaks = self.name_outcomes.write().await;
+        let entry = streaks.entry(name.to_lowercase()).or_default();
+        if entry.last_key.as_deref() == Some(key) {
+            return None;
+        }
+        entry.last_key = Some(key.to_string());
+        if entry.signature == Some(signature) {
+            entry.count += 1;
+        } else {
+            entry.signature = Some(signature);
+            entry.count = 1;
+            entry.escalated = false;
+        }
+        if entry.count >= ZERO_INFO_NAME_STREAK_AFTER && !entry.escalated {
+            entry.escalated = true;
+            Some(entry.count)
+        } else {
+            None
+        }
+    }
+}
+
+/// The mutations that landed on one file between the last time it parsed and
+/// the failure being reported, newest last.
+///
+/// `named` is bounded by [`REGRESSION_SPAN_NAME_BUDGET_BYTES`] while
+/// `total_count` always counts every mutation, so a span too long to list still
+/// reports its true size instead of silently shrinking. Same shape as the
+/// carried-side-effect note: name what fits, count what does not.
+#[derive(Debug, Default, Clone)]
+struct RegressionSpan {
+    named: Vec<String>,
+    total_count: u32,
+}
+
+/// What one structural verdict is worth saying about, if anything.
+///
+/// Two independent findings, because they answer different questions: the
+/// streak says *this fix is not working*, the regression says *this used to
+/// work and something between then and now broke it*. A file can be in both
+/// states at once and neither should suppress the other.
+#[derive(Debug, Default)]
+struct StructuralVerdictOutcome {
+    /// The streak length, the first time a repeated identical break reaches
+    /// [`STRUCTURAL_REPEAT_ESCALATE_AFTER`].
+    repeat_edits: Option<usize>,
+    /// What landed across a pass→fail edge, said once per edge.
+    regression: Option<RegressionSpan>,
+}
+
+/// How many bytes of mutation names one regression sentence may carry.
+///
+/// Not a cap on the span — the span's true length is always reported. This
+/// bounds only the LIST, so an attribution sentence cannot itself become the
+/// thing that crowds a small model's window. Sized to the same order as the
+/// other in-context notices in this file: a couple of lines.
+const REGRESSION_SPAN_NAME_BUDGET_BYTES: usize = 320;
+
+/// How many consecutive mutations of one file have left the same normalized
+/// parse error, and whether the escalation has already been said.
+#[derive(Debug, Default)]
+struct StructuralVerdictStreak {
+    signature: String,
+    count: usize,
+    escalated: bool,
+    /// Has this path been observed PARSING at least once this run? Only then
+    /// is a later failure a regression; a file that has never parsed is not
+    /// something that broke, it is something not finished yet, and accusing
+    /// the model of breaking it would be false.
+    seen_passing: bool,
+    /// What has been mutated since that last pass — the span a regression is
+    /// attributed to. Cleared on a pass and after the attribution is said.
+    span: RegressionSpan,
+    /// Whether the pass→fail edge has already been announced. One sentence per
+    /// edge: repeating it every step would turn attribution into nagging.
+    regression_announced: bool,
+}
+
+/// How many consecutive calls to one tool NAME have returned the same
+/// normalized outcome, whatever their arguments said.
+#[derive(Debug, Default)]
+struct NameOutcomeStreak {
+    signature: Option<u64>,
+    /// The previous call's [`repeat_call_key`], so a byte-identical repeat can
+    /// be left to the sibling breakers that already own it.
+    last_key: Option<String>,
+    count: usize,
+    escalated: bool,
+}
+
+/// One canonical spelling of a mutated file path, so two renderings of the
+/// same file share a streak.
+///
+/// `<file>` and `./<file>` are the same file, and one break rendered both ways
+/// split a 22-long streak into 5 and 17 — the streak that mattered never
+/// reached the rung. Mirrors the normalization the `exec` skill's write guard
+/// already applies to redirect targets (`default-skills/exec/tool.ts`):
+/// backslashes to slashes, doubled slashes collapsed, leading `./` dropped,
+/// lowercased.
+fn canonical_verdict_path(raw: &str) -> String {
+    let mut path = raw.replace('\\', "/");
+    while path.contains("//") {
+        path = path.replace("//", "/");
+    }
+    let mut trimmed = path.as_str();
+    while let Some(rest) = trimmed.strip_prefix("./") {
+        trimmed = rest;
+    }
+    trimmed.to_lowercase()
+}
+
+/// The identity of a parse error, independent of WHERE it was reported.
+///
+/// Two things vary between two renderings of one unchanged break and must not
+/// split the streak: the location prefix (`sh -n` prints `<file>: line 42:`,
+/// `node --check` prints `<file>:42`) and every number in the message — the
+/// line number drifts as edits above it add lines, and `JSON.parse` reports a
+/// byte position that drifts with every character typed anywhere earlier in
+/// the file. Everything that identifies the error — the parser's token, the
+/// echoed source line — is left alone.
+fn structural_verdict_signature(detail: &str) -> String {
+    // One line, single-spaced. Checkers wrap differently across platforms and
+    // the skill has already flattened newlines to spaces on the way here.
+    let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Drop a leading location token — one whose last colon is followed by
+    // nothing (`./minidb:`, `minidb:`) or by a line number (`file.js:12`).
+    // Recognised by that shape rather than by looking like a path, because a
+    // shell checker echoes the path exactly as the caller spelled it and a
+    // bare filename with no extension is a perfectly ordinary spelling.
+    let body = flat
+        .split_once(' ')
+        .filter(|(first, _)| {
+            first.rsplit_once(':').is_some_and(|(_, after)| {
+                after.is_empty() || after.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+        .map_or(flat.as_str(), |(_, rest)| rest);
+    let mut out = String::with_capacity(body.len());
+    let mut in_digits = false;
+    for ch in body.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The structural verdict a write tool attached to its result, if a checker
+/// actually ran: (does the file parse, what the parser said).
+fn structural_verdict(result: &nanna_tools::ToolResult) -> Option<(bool, String)> {
+    let structure = result.data.as_ref()?.get("structure")?;
+    let parses = structure.get("parses")?.as_bool()?;
+    let detail = structure
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((parses, detail))
+}
+
+/// The file a call mutated, as the call named it.
+fn mutated_path(input: &Value) -> Option<&str> {
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str)
+}
+
+/// Paraphrase-proof identity of one call's OUTCOME: what came back, never
+/// what was asked.
+///
+/// A success identifies by its whole whitespace-normalized content — two
+/// differently-worded commands that print the same thing produced the same
+/// information, which is the point. A failure identifies by its first
+/// non-empty line, the normalization the harness's own `failure_signature`
+/// already uses, with digit runs masked: a killed command's line carries the
+/// elapsed time it ran for, so byte identity would never match across two
+/// attempts at the same hang.
+fn name_outcome_signature(record: &ToolCallRecord) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    record.success.hash(&mut hasher);
+    if record.success {
+        normalize_call_text(&record.output).hash(&mut hasher);
+    } else {
+        let first_line = record
+            .output
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default();
+        let normalized: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut masked = String::with_capacity(normalized.len());
+        let mut in_digits = false;
+        for ch in normalized.chars() {
+            if ch.is_ascii_digit() {
+                if !in_digits {
+                    masked.push('#');
+                    in_digits = true;
+                }
+            } else {
+                in_digits = false;
+                masked.push(ch);
+            }
+        }
+        masked.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Fold one executed write-family call into the structural ledger and return
+/// whatever the ledger has to SAY about it, ready to append to the result.
+///
+/// Extracted rather than inlined at the call site: the caller is already far
+/// past any reasonable function length, and this is a self-contained
+/// record-then-report step over one call's outcome.
+///
+/// Order is load-bearing. The mutation is recorded BEFORE the verdict is read,
+/// so the call carrying a failing verdict is inside its own attribution span —
+/// it is the most likely culprit and must not be the one name missing. And the
+/// regression sentence comes before the repeat-streak sentence, because *what
+/// changed* is the question that precedes *your fix is not working*.
+async fn structural_notices_for_call(
+    ledger: &RepeatLedger,
+    name: &str,
+    input: &Value,
+    result: &nanna_tools::ToolResult,
+) -> String {
+    let Some(path) = mutated_path(input) else {
+        return String::new();
+    };
+
+    if is_claim_write_family(name) && result.success {
+        ledger.record_mutation(path, name, "").await;
+    }
+
+    let Some((parses, detail)) = structural_verdict(result) else {
+        return String::new();
+    };
+    let verdict = ledger
+        .record_structural_verdict(path, parses, &structural_verdict_signature(&detail))
+        .await;
+
+    let mut notices = String::new();
+    if let Some(span) = verdict.regression {
+        warn!(
+            tool = %name,
+            path = %path,
+            mutations = span.total_count,
+            "🧨 Structural regression — {} parsed earlier this run and does not now; naming \
+             the {} mutation(s) in between",
+            path,
+            span.total_count
+        );
+        notices.push_str(&structural_regression_notice(path, &detail, &span));
+    }
+    if let Some(edits) = verdict.repeat_edits {
+        warn!(
+            tool = %name,
+            path = %path,
+            edits,
+            "🧱 Same structural break across {} consecutive edits — escalating past the static \
+             fix-that-line sentence",
+            edits
+        );
+        notices.push_str(&structural_repeat_escalation(path, edits, &detail));
+    }
+    notices
+}
+
+/// The escalated structural sentence, said once when N different edits have
+/// each left the same break.
+///
+/// The static sentence the write skill appends every time ("Fix that line with
+/// another edit_file.") is correct advice for the FIRST occurrence and
+/// actively misleading by the twenty-fifth, because the reported line is where
+/// the parser gave up — for an unclosed quote, bracket or heredoc that is
+/// after the real mistake, so "fix that line" sends the model to the wrong
+/// line forever. Information, never a gate: the edit landed and the file is on
+/// Regression attribution: this file parsed before, and does not now.
+///
+/// The streak sentence above answers "your fix is not working". This answers
+/// the question that comes first and was never asked for the model: *what
+/// changed between the last time this was fine and now?* The interesting span
+/// is more than one call — a mutation whose checker did not apply, or whose
+/// check was not run, leaves a gap the streak counter cannot see, and the model
+/// is left re-reading the file that broke rather than the edit that broke it.
+fn structural_regression_notice(path: &str, detail: &str, span: &RegressionSpan) -> String {
+    let listed = if span.named.is_empty() {
+        String::new()
+    } else {
+        format!(" Since then: {}.", span.named.join(", "))
+    };
+    let unlisted = span.total_count.saturating_sub(
+        u32::try_from(span.named.len()).unwrap_or(u32::MAX),
+    );
+    let omitted = if unlisted > 0 {
+        format!(" ({unlisted} earlier one(s) not listed.)")
+    } else {
+        String::new()
+    };
+    format!(
+        "\n\n[REGRESSION — {path} PARSED the last time it was checked this run, and does not \
+         now ({detail}). {} mutation(s) landed in between.{listed}{omitted} The break came in \
+         one of those, not from wherever the parser reported it — read what those calls \
+         changed rather than the line number, and if one of them was a whole-file rewrite, \
+         compare against {path}.__prev__ before editing further.]",
+        span.total_count
+    )
+}
+
+// disk exactly as sent.
+fn structural_repeat_escalation(path: &str, edits: usize, detail: &str) -> String {
+    format!(
+        "\n\n[SAME BREAK, {edits} EDITS RUNNING — {edits} different edits to {path} in a row \
+         have each left the identical parse error ({detail}). The edits are landing; the fix \
+         is not. The reported line is where the parser GAVE UP, which for an unclosed quote, \
+         bracket, parenthesis or heredoc is after the real mistake — so editing that line \
+         again will not find it. Read the file around it and fix the construct that OPENS, or \
+         rewrite the whole block in one write, instead of sending another edit of this shape.]"
+    )
+}
+
+/// The name-level zero-information sentence, said once per streak.
+///
+/// A sentence rather than a short-circuit, deliberately. The discovery guard
+/// can refuse a call outright because a discovery that activates zero new
+/// tools is provably useless; nothing that general is provable here, and the
+/// owner rule is that capability is never gated. The cost of being wrong is
+/// one advisory line.
+fn name_zero_info_notice(name: &str, streak: usize) -> String {
+    format!(
+        "\n\n[NO NEW INFORMATION — the last {streak} `{name}` calls in a row each came back \
+         with the same thing, even though you worded them differently each time. The wording \
+         is not what is stopping you, so the next rewording will return this too. Change WHAT \
+         you are asking for, or find it another way — if something is hanging or printing \
+         nothing, look at it from a different angle (read the file, run a smaller piece, check \
+         whether it started at all) rather than launching it again.]"
+    )
 }
 
 /// A [`RepeatLedger`] handle shared across the steps of one run.
 pub type SharedRepeatLedger = Arc<RepeatLedger>;
 
-/// Canonical repetition key for a tool call: name + canonicalized input JSON.
-/// Shared by both sibling breakers ([`RepeatCallState`]).
+/// Canonical repetition key for a tool call: name + canonicalized,
+/// whitespace-normalized input JSON. Shared by both sibling breakers
+/// ([`RepeatCallState`]).
 ///
 /// Object keys are sorted recursively because JSON object member order
 /// carries no meaning — `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same call
@@ -1032,8 +1878,61 @@ pub type SharedRepeatLedger = Arc<RepeatLedger>;
 /// meaningful. The unit separator (U+001F) joins name and input; it cannot
 /// appear in a tool name, so no (name, input) pair can collide with a
 /// differently-split one.
+///
+/// String values are whitespace-normalized ([`normalize_call_text`]) so that
+/// re-spelling an argument is not a fresh call shape — the byte-identity
+/// match was evaded live by ~20 trivial respellings of one shell command in
+/// five minutes, each opening a new ledger entry so no streak ever built. The
+/// one exemption is the artifact fields ([`is_artifact_field`]), whose
+/// whitespace is content rather than spelling.
+///
+/// Epoch semantics are untouched: this changes only WHICH calls share an
+/// entry, never when an entry may short-circuit — a successful
+/// side-effectful call still bumps the world epoch and frees every shape for
+/// one probe ([`RepeatCallState::last_execution_epoch`]).
 fn repeat_call_key(name: &str, input: &Value) -> String {
-    format!("{name}\u{1f}{}", canonical_json(input))
+    format!("{name}\u{1f}{}", canonical_json(input, true))
+}
+
+/// Whitespace-normalize one tool-input string for the repetition key.
+///
+/// Line structure is preserved (a newline IS a command separator in every
+/// shell), while runs of blanks collapse to one, each line is trimmed, and
+/// blank lines drop out. That is not a heuristic about model behavior: POSIX
+/// shells treat any run of blanks as a single token separator and an empty
+/// line as a no-op, so `ls   -la ` and `ls -la` are the same command to the
+/// thing that runs them — and therefore the same no-information action when
+/// repeated. Two genuinely different command lists still differ, because
+/// their line structure and tokens differ.
+fn normalize_call_text(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Input fields whose string value is FILE CONTENT rather than a spelling of
+/// a call — the one exemption from the repetition key's whitespace
+/// normalization.
+///
+/// `content` is the payload `write_file`/`file_buffer` land on disk;
+/// `old_string`/`new_string` (and their `_str` dialect spellings) are the
+/// exact text `edit_file` matches and substitutes. Whitespace there is
+/// meaning, not spelling: re-indenting a body writes a different file, and an
+/// edit needle with different leading spaces matches different text — in a
+/// whitespace-structured language, all of it. Merging those into one shape
+/// could let the breaker refuse a genuinely new world change, which is the
+/// one mistake this machinery must never make.
+///
+/// Keyed by field NAME, not by tool name, because the same field means the
+/// same thing wherever it appears (a memory body is content too) and because
+/// erring toward MORE distinct shapes only ever costs one extra execution.
+fn is_artifact_field(key: &str) -> bool {
+    matches!(
+        key,
+        "content" | "old_string" | "new_string" | "old_str" | "new_str"
+    )
 }
 
 /// Hash a tool result's content bytes for the zero-information breaker's
@@ -1056,7 +1955,13 @@ fn result_content_hash(content: &str) -> u64 {
 /// is a feature-flag accident — `preserve_order` flips it to insertion order.
 /// The breaker key must not change meaning if a transitive dependency enables
 /// that flag, so ordering is enforced here explicitly.
-fn canonical_json(v: &Value) -> String {
+///
+/// `normalize` whitespace-normalizes string scalars ([`normalize_call_text`])
+/// — the repetition key's form, so a respelled argument is the same shape —
+/// except under an artifact field ([`is_artifact_field`]), whose whole
+/// subtree is serialized verbatim because nothing inside an artifact is a
+/// spelling.
+fn canonical_json(v: &Value, normalize: bool) -> String {
     match v {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
@@ -1064,19 +1969,22 @@ fn canonical_json(v: &Value) -> String {
             let members: Vec<String> = keys
                 .into_iter()
                 .map(|k| {
-                    format!(
-                        "{}:{}",
-                        Value::String(k.clone()),
-                        canonical_json(&map[k.as_str()])
-                    )
+                    let member = &map[k.as_str()];
+                    let rendered =
+                        canonical_json(member, normalize && !is_artifact_field(k.as_str()));
+                    format!("{}:{}", Value::String(k.clone()), rendered)
                 })
                 .collect();
             format!("{{{}}}", members.join(","))
         }
         Value::Array(items) => {
-            let members: Vec<String> = items.iter().map(canonical_json).collect();
+            let members: Vec<String> = items
+                .iter()
+                .map(|item| canonical_json(item, normalize))
+                .collect();
             format!("[{}]", members.join(","))
         }
+        Value::String(s) if normalize => Value::String(normalize_call_text(s)).to_string(),
         other => other.to_string(),
     }
 }
@@ -1111,13 +2019,16 @@ fn repeat_failure_breaker_notice(
         last_error.to_string()
     };
     format!(
-        "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
-         arguments already failed {failures} times in a row in this run; the last error \
+        "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these \
+         arguments (re-spacing or re-indenting them is the same call, not a new one) \
+         already failed {failures} times in a row in this run; the last error \
          was: {replay}\n\
-         Repeating the identical call cannot succeed, so this exact call is disabled for \
-         the rest of this run — it now fails instantly instead of re-running a known \
-         failure. Change the arguments or use a different tool: `{name}` itself still \
-         works, and any call with different arguments executes normally.\n\
+         Repeating the identical call cannot succeed while nothing has changed, so this \
+         exact call is paused — it now fails instantly instead of re-running a known \
+         failure. It re-runs once after any successful write/edit/exec changes the \
+         world (fix the cause, then retry). Otherwise change the arguments or use a \
+         different tool: `{name}` itself still works, and any call with different \
+         arguments executes normally.\n\
          {STEERING_CONTINUATION}",
         header = anchor_header(task_anchor)
     )
@@ -1160,16 +2071,18 @@ fn zero_info_breaker_notice(
         excerpt.to_string()
     };
     format!(
-        "{header}[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these exact \
-         arguments already succeeded {repeats} times in a row in this run with a \
+        "{header}[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these \
+         arguments (re-spacing or re-indenting them is the same call, not a new one) \
+         already succeeded {repeats} times in a row in this run with a \
          byte-identical result every time — repeating it yields zero new information. \
          The result is UNCHANGED; if you were polling for a change, this unchanged result \
          IS your answer, delivered without re-running the call. The result you already \
          have:\n{replay}\n\
          Act on the result you already have, change the arguments (e.g. a cursor, offset, \
-         or different target), or use a different tool; this exact call is paused for the \
-         rest of this run unless its arguments change. `{name}` itself still works, and \
-         any call with different arguments executes normally.\n\
+         or different target), or use a different tool; this exact call is paused until \
+         its arguments change or a successful write/edit/exec changes the world (then it \
+         re-runs once). `{name}` itself still works, and any call with different \
+         arguments executes normally.\n\
          {STEERING_CONTINUATION}",
         header = anchor_header(task_anchor)
     )
@@ -1204,6 +2117,36 @@ fn zero_info_breaker_notice(
 /// ([`is_unknown_tool_error`]) — the one signal discovery could genuinely
 /// help with.
 const ZERO_DELTA_DISCOVERY_BREAKER_AFTER: usize = 3;
+
+/// Consecutive mutations of ONE file whose structural verdict comes back with
+/// the same normalized parse error before the static "fix that line" sentence
+/// escalates.
+///
+/// Derivation: the same rung as every sibling guard
+/// ([`REPEAT_FAILURE_BREAKER_AFTER`], [`ZERO_INFO_BREAKER_AFTER`],
+/// [`ZERO_DELTA_DISCOVERY_BREAKER_AFTER`]) — 2 to establish that a repeat is
+/// happening at all, plus the one full post-nudge attempt the ladder always
+/// grants. Not a new number.
+///
+/// Observed live: 25 consecutive SUCCESSFUL edits produced the same failing
+/// verdict for 12m44s, each one receiving the identical static sentence "Fix
+/// that line with another edit_file." Every existing guard was blind to it,
+/// because each edit is a different call — different arguments, therefore a
+/// different ledger key — and each edit is also a successful side-effectful
+/// call, so it bumped the world epoch and re-armed everything else.
+const STRUCTURAL_REPEAT_ESCALATE_AFTER: usize = 3;
+
+/// Consecutive calls to ONE tool NAME whose results carried no new information
+/// before the model is told that rewording is not changing the outcome.
+///
+/// The same rung again, and the same reason the discovery guard is name-level
+/// rather than shape-level: the per-shape breakers key on argument bytes, so a
+/// model that rewords a failing command — adding `2>&1`, a pipe, a `cd`
+/// prefix, a different timeout — opens a fresh ledger entry every time and no
+/// streak ever builds. Observed live: fifteen successive attempts at one
+/// hanging script under nine distinct command strings returned no usable
+/// output and nothing noticed.
+const ZERO_INFO_NAME_STREAK_AFTER: usize = 3;
 
 /// Marker prefix of the registry's unknown-tool resolution error
 /// (`ToolRegistry::execute` — `"Tool not found: {name}. Use discover_tools
@@ -1282,6 +2225,12 @@ fn discovery_pause_notice(
 /// 1. **Repeated intent phrases**: The model keeps saying "let me X" without doing X.
 /// 2. **Phantom completion**: The model claims to have read/written/verified files
 ///    without any tool calls — it hallucinated the entire workflow.
+///
+/// The failure's STRUCTURAL form — tool calls written as JSON in prose,
+/// which no phrase list can see — is handled by the P22 Tier 4 machinery
+/// below ([`scan_prose_dialect`] and the salvage branch in the run loop,
+/// which executes what the model meant instead of only scolding; and
+/// [`text_streams_prose_tool_calls`] at the streaming checkpoints).
 fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     let lower = text.to_lowercase();
 
@@ -1465,6 +2414,485 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     }
 
     false
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// P22 Tier 4 — the prose tool-call dialect (structural arm + salvage +
+// self-authored-result fences).
+//
+// The narration detector above is phrase-based; its structural sibling below
+// catches the failure's OTHER form, observed live 2026-08-12 (lfm leg,
+// 4-hour wedge): 379 of 429 text items were tool calls written as JSON in
+// prose (384 `"action":` strings, 300 of them to the non-existent
+// `list_files`), plus 28 orphan `</TOOL_CALL>` closers and 2 fabricated
+// `"result": {…}` blocks the model then believed for four hours. No phrase
+// list can see that — the evidence is structural: a step that emitted ZERO
+// structured tool calls whose text contains a balanced, call-shaped JSON
+// object (or tool-call fence tokens). And detection alone is a scold; the
+// counter-lever is SALVAGE: parse the call the model meant, resolve it
+// through the registry (exact → case → dialect synonym → fuzzy, the same
+// path a real call takes), execute it, and teach the correct dialect — while
+// fencing any result object the model authored itself so an invention can
+// never become its world.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Chat-template control markers that belong in a model's tool-call channel,
+/// never in its prose. Matched case-insensitively; ANY occurrence in a
+/// zero-structured-call step is dialect leakage (an orphan closer with no
+/// parseable call still proves the model tried to call a tool).
+const TOOL_CALL_FENCE_TOKENS: &[&str] = &[
+    "<tool_call>",
+    "</tool_call>",
+    "<|tool_call_start|>",
+    "<|tool_call_end|>",
+    "<|tool_call|>",
+    "[tool_calls]",
+];
+
+/// Count tool-call fence tokens in `text` (case-insensitive).
+fn tool_call_fence_token_count(text: &str) -> usize {
+    let lower = text.to_lowercase();
+    TOOL_CALL_FENCE_TOKENS
+        .iter()
+        .map(|t| lower.matches(t).count())
+        .sum()
+}
+
+/// Nesting budget for re-scanning the interior of an unparseable brace span.
+/// Derived from serde_json's own default recursion limit (128), not chosen:
+/// an object nested deeper than serde parses cannot yield a `Value`, so
+/// scanning deeper cannot find one.
+const JSON_SCAN_DEPTH_MAX: usize = 128;
+
+/// Collect every balanced `{…}` region of `text` that parses as a JSON
+/// object, outermost first, as `(start, end, parsed)` with absolute byte
+/// offsets (`base`-adjusted).
+///
+/// One string- and escape-aware pass finds the MAXIMAL (depth-zero) brace
+/// spans; each is parsed once, so parse cost is linear in the text (maximal
+/// spans are disjoint). A span that fails to parse — prose braces, broken
+/// JSON — has its interior re-scanned so clean objects inside survive, and a
+/// dangling opener (which would otherwise swallow the tail of the text) is
+/// skipped past the same way. Both re-scans strictly shrink the region and
+/// are bounded by [`JSON_SCAN_DEPTH_MAX`].
+///
+/// Quotes only toggle string state INSIDE a brace region: prose apostrophes
+/// and quotes outside any braces must not swallow later objects.
+fn collect_json_objects(
+    text: &str,
+    base: usize,
+    depth_budget: usize,
+    out: &mut Vec<(usize, usize, Value)>,
+) {
+    let bytes = text.as_bytes();
+    let mut rescan: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if depth > 0 => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &text[start..=i];
+                    match parse_object_span_lenient(slice) {
+                        Some(v) => out.push((base + start, base + i + 1, v)),
+                        None => rescan.push((start + 1, i)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // A dangling opener would swallow the rest of the text; scan past it so
+    // real objects later on are still found.
+    if depth > 0 && start + 1 < text.len() {
+        rescan.push((start + 1, text.len()));
+    }
+    if depth_budget > 0 {
+        for (s, e) in rescan {
+            collect_json_objects(&text[s..e], base + s, depth_budget - 1, out);
+        }
+    }
+}
+
+/// Parse a candidate brace span as a JSON object: strict first, then — if the
+/// span carries bare control characters inside its string literals — one
+/// escaped retry ([`nanna_llm::escape_bare_controls_in_strings`]). Local
+/// models writing TSV content emit a literal 0x09 where the spec wants `\t`;
+/// the escape is lossless (the re-parsed string holds the exact original
+/// character), so the salvaged call is still what the model wrote. Span
+/// offsets always refer to the ORIGINAL text — only the parsed value comes
+/// from the escaped copy.
+fn parse_object_span_lenient(slice: &str) -> Option<Value> {
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(slice) {
+        return Some(v);
+    }
+    match nanna_llm::escape_bare_controls_in_strings(slice)
+        .and_then(|escaped| serde_json::from_str::<Value>(&escaped).ok())
+    {
+        Some(v @ Value::Object(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Keys whose string value names the tool in a call-shaped object. These are
+/// strong signals on their own: prose JSON does not say `"action": "ls"`.
+const PROSE_CALL_NAME_KEYS: &[&str] = &["tool_name", "tool", "action", "function"];
+
+/// Keys that carry an explicit argument payload in a call-shaped object.
+const PROSE_CALL_PARAM_KEYS: &[&str] = &["arguments", "parameters", "params", "args", "input"];
+
+/// Keys stripped when the LOOSE keys of a call object are its arguments
+/// (`{"action": "list_files", "path": "."}`): call-frame metadata and
+/// self-authored outcome fields are not arguments.
+const PROSE_CALL_FRAME_KEYS: &[&str] = &["type", "id", "result", "output", "stdout", "status"];
+
+/// Whether a string is plausibly a tool identifier. `"action": "The user
+/// wants a file list"` is prose, not a call — an identifier is short, starts
+/// with a letter, and has no spaces.
+fn looks_like_tool_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Recover the argument object for a recognized call shape. `name_key` is
+/// the key that carried the tool name (excluded from loose-key collection).
+///
+/// `Some(object)`: usable arguments. `None`: the shape declared explicit
+/// arguments that cannot be recovered losslessly (e.g. a non-JSON
+/// `"arguments"` string) — such a call is surfaced, never guessed at.
+fn prose_call_params(map: &serde_json::Map<String, Value>, name_key: &str) -> Option<Value> {
+    for key in PROSE_CALL_PARAM_KEYS {
+        match map.get(*key) {
+            None => {}
+            Some(Value::Object(args)) => return Some(Value::Object(args.clone())),
+            // Stringified arguments (OpenAI dialect): only a string that
+            // parses back to a JSON object is usable. Bare in-string control
+            // characters (a literal tab in TSV content, arriving here after
+            // one decode) get the same lossless escaped retry as the outer
+            // span — recovering the exact characters the model wrote is
+            // within the never-guess rule.
+            Some(Value::String(s)) => {
+                let parsed = serde_json::from_str::<Value>(s).ok().or_else(|| {
+                    nanna_llm::escape_bare_controls_in_strings(s)
+                        .and_then(|escaped| serde_json::from_str::<Value>(&escaped).ok())
+                });
+                return match parsed {
+                    Some(Value::Object(args)) => Some(Value::Object(args)),
+                    _ => None,
+                };
+            }
+            Some(_) => return None,
+        }
+    }
+    // No explicit argument key: the loose keys ARE the arguments, minus the
+    // name key and call-frame/self-authored-outcome fields.
+    let loose: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != name_key && !PROSE_CALL_FRAME_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some(Value::Object(loose))
+}
+
+/// Recognize a call-shaped JSON object: `(written_name, arguments)`.
+///
+/// Shapes, in precedence order:
+/// 1. OpenAI envelope — `{"function": {"name": …, "arguments": …}}`;
+/// 2. strong name keys — `{"action"|"tool"|"tool_name"|"function": "x", …}`
+///    with either an explicit argument key or loose keys as arguments;
+/// 3. weak `name` key — `{"name": "x", …}` counts ONLY alongside an explicit
+///    argument key (`{"name": "Nanna", "role": "agent"}` is prose, not a
+///    call).
+fn prose_call_from_map(
+    map: &serde_json::Map<String, Value>,
+) -> Option<(String, Option<Value>)> {
+    if let Some(Value::Object(inner)) = map.get("function") {
+        if let Some(Value::String(name)) = inner.get("name") {
+            if looks_like_tool_name(name) {
+                return Some((name.clone(), prose_call_params(inner, "name")));
+            }
+        }
+    }
+    for key in PROSE_CALL_NAME_KEYS {
+        if let Some(Value::String(name)) = map.get(*key) {
+            if looks_like_tool_name(name) {
+                return Some((name.clone(), prose_call_params(map, key)));
+            }
+        }
+    }
+    if let Some(Value::String(name)) = map.get("name") {
+        if looks_like_tool_name(name)
+            && PROSE_CALL_PARAM_KEYS.iter().any(|k| map.contains_key(*k))
+        {
+            return Some((name.clone(), prose_call_params(map, "name")));
+        }
+    }
+    None
+}
+
+/// A tool call the model wrote as prose JSON instead of emitting structurally.
+#[derive(Debug, Clone)]
+struct ProseToolCall {
+    /// The tool name exactly as the model wrote it.
+    written_name: String,
+    /// Arguments; `None` when the shape was call-like but its arguments were
+    /// unusable — surfaced, never guessed (owner rule: lossless salvage).
+    params: Option<Value>,
+    /// Raw text of the maximal JSON span the call was found in — provenance
+    /// for the quotation check (a call copied verbatim from a real tool
+    /// output or the user's own text is quotation, not intent).
+    span_raw: String,
+}
+
+/// Walk a parsed JSON tree collecting call-shaped objects at any depth
+/// (`{"steps": [{"action": "read_file", …}]}` still counts — the model wrote
+/// what it wants done). Recursion is bounded by the parse itself
+/// (serde_json's recursion limit).
+fn collect_prose_calls(value: &Value, span_raw: &str, out: &mut Vec<ProseToolCall>) {
+    match value {
+        Value::Object(map) => {
+            if let Some((written_name, params)) = prose_call_from_map(map) {
+                out.push(ProseToolCall {
+                    written_name,
+                    params,
+                    span_raw: span_raw.to_string(),
+                });
+                // A recognized call's interior is its arguments — a nested
+                // `"action"` inside them is data, not a second call.
+                return;
+            }
+            for v in map.values() {
+                collect_prose_calls(v, span_raw, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_prose_calls(v, span_raw, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys that mark an object as a self-authored RESULT: the model wrote what
+/// only a tool execution can produce.
+const SELF_AUTHORED_RESULT_KEYS: &[&str] = &["result", "output", "stdout"];
+
+/// Whether a parsed JSON tree carries a result-shaped object at any depth.
+fn value_contains_result_shape(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.iter().any(|(k, v)| {
+                SELF_AUTHORED_RESULT_KEYS.contains(&k.as_str()) && !v.is_null()
+            }) || map.values().any(value_contains_result_shape)
+        }
+        Value::Array(arr) => arr.iter().any(value_contains_result_shape),
+        _ => false,
+    }
+}
+
+/// Everything one structural pass over a step's text yields.
+struct ProseDialectScan {
+    /// Call-shaped objects, in text order.
+    calls: Vec<ProseToolCall>,
+    /// Maximal JSON spans whose tree carries a result-shaped object.
+    result_spans: Vec<(usize, usize)>,
+    /// Tool-call fence tokens seen.
+    fence_tokens: usize,
+}
+
+impl ProseDialectScan {
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty() && self.result_spans.is_empty() && self.fence_tokens == 0
+    }
+}
+
+/// Structural scan of a zero-structured-call step's text.
+fn scan_prose_dialect(text: &str) -> ProseDialectScan {
+    let mut objects = Vec::new();
+    collect_json_objects(text, 0, JSON_SCAN_DEPTH_MAX, &mut objects);
+    let mut calls = Vec::new();
+    let mut result_spans = Vec::new();
+    for (start, end, value) in &objects {
+        let raw = &text[*start..*end];
+        collect_prose_calls(value, raw, &mut calls);
+        if value_contains_result_shape(value) {
+            result_spans.push((*start, *end));
+        }
+    }
+    result_spans.sort_unstable();
+    ProseDialectScan {
+        calls,
+        result_spans,
+        fence_tokens: tool_call_fence_token_count(text),
+    }
+}
+
+/// Streaming-checkpoint variant of the structural arm, deliberately more
+/// conservative than the post-step scan: mid-stream, a single call-shaped
+/// object might be a quoted example ahead of a legitimate structured call
+/// still to come, and the provenance corpus is not consulted. TWO distinct
+/// written calls (or two fence tokens) with zero structured calls so far is
+/// the observed wedge signature — the lfm leg streamed hundreds per turn —
+/// and aborting there saves the rest of the doomed stream; the post-step
+/// salvage then executes what the model meant.
+fn text_streams_prose_tool_calls(text: &str) -> bool {
+    if tool_call_fence_token_count(text) >= 2 {
+        return true;
+    }
+    let scan = scan_prose_dialect(text);
+    let distinct: HashSet<String> = scan
+        .calls
+        .iter()
+        .map(|c| {
+            format!(
+                "{}\u{1}{}",
+                c.written_name.to_lowercase(),
+                c.params.as_ref().map(ToString::to_string).unwrap_or_default()
+            )
+        })
+        .collect();
+    distinct.len() >= 2
+}
+
+/// The fence stamped after every self-authored result-shaped object in a
+/// zero-tool-call step, so a fabrication cannot enter history as the model's
+/// world. Wording per the P22 spec: WHAT this is (the model's own text), WHY
+/// it cannot be trusted (no tool ran), and the honest state (unknown).
+pub const SELF_AUTHORED_RESULT_FENCE: &str =
+    "[you wrote this yourself — no tool ran; the real listing is unknown]";
+
+/// Stamp [`SELF_AUTHORED_RESULT_FENCE`] after each of `spans` (sorted,
+/// disjoint byte ranges of `text`). Insertion-only — every byte of the
+/// model's text survives (lossless; the fence ANNOTATES, it never redacts).
+fn fence_self_authored_results(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut fenced = String::with_capacity(
+        text.len() + spans.len() * (SELF_AUTHORED_RESULT_FENCE.len() + 2),
+    );
+    let mut cursor = 0usize;
+    for &(_, end) in spans {
+        if end <= cursor || end > text.len() {
+            continue;
+        }
+        fenced.push_str(&text[cursor..end]);
+        fenced.push('\n');
+        fenced.push_str(SELF_AUTHORED_RESULT_FENCE);
+        fenced.push('\n');
+        cursor = end;
+    }
+    fenced.push_str(&text[cursor..]);
+    fenced
+}
+
+/// Collapse whitespace runs so provenance checks survive re-wrapping.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whitespace-normalized corpus of text the model did NOT invent this run:
+/// real tool outputs and user-authored messages. The model's own prior
+/// assistant turns are deliberately excluded — its inventions must never
+/// vouch for themselves (round N's fabrication would otherwise legitimize
+/// round N+1's copy of it).
+struct PriorMaterial {
+    normalized: Vec<String>,
+}
+
+impl PriorMaterial {
+    /// Whether `raw` appears verbatim (modulo whitespace) in prior material —
+    /// quotation, not invention.
+    fn contains(&self, raw: &str) -> bool {
+        let needle = normalize_ws(raw);
+        if needle.is_empty() {
+            return false;
+        }
+        self.normalized.iter().any(|h| h.contains(&needle))
+    }
+}
+
+/// Render the prose-call notice: what the harness executed on the model's
+/// behalf (salvage), what could not be resolved (with the nearest real
+/// tools), and the dialect lesson. Announces itself per project rule — WHAT
+/// happened, WHY nothing the model wrote ran by itself, WHAT was done, and
+/// WHAT to do instead. Task-anchored like every injected steering text.
+fn prose_call_salvage_notice(
+    task_anchor: Option<&str>,
+    executed: &[(String, String)],
+    unresolved: &[(String, String)],
+    fence_tokens: usize,
+) -> String {
+    let mut body = String::new();
+    if executed.is_empty() {
+        body.push_str(
+            "[PROSE TOOL CALLS — NOT EXECUTED] Your last message wrote tool calls as \
+             JSON text (or tool-call tags) instead of emitting real tool calls. Text \
+             is NEVER executed: nothing you described ran, and any result or file \
+             listing you wrote yourself is invented, not real.",
+        );
+    } else {
+        body.push_str(
+            "[PROSE TOOL CALLS SALVAGED] Your last message wrote tool calls as JSON \
+             text instead of emitting real tool calls — text is NEVER executed, so \
+             none of them would have run. The harness parsed and executed them for \
+             you this once: ",
+        );
+        let ran: Vec<String> = executed
+            .iter()
+            .map(|(written, resolved)| {
+                if written.eq_ignore_ascii_case(resolved) {
+                    format!("`{resolved}`")
+                } else {
+                    format!("`{written}` → ran as `{resolved}`")
+                }
+            })
+            .collect();
+        body.push_str(&ran.join(", "));
+        body.push_str(
+            ". Their REAL results are in the tool results above — trust those over \
+             anything you wrote yourself.",
+        );
+    }
+    for (written, guidance) in unresolved {
+        body.push_str(&format!(" `{written}` {guidance}."));
+    }
+    if fence_tokens > 0 && executed.is_empty() && unresolved.is_empty() {
+        body.push_str(
+            " Your message contained tool-call fence tokens with no parseable call \
+             inside them.",
+        );
+    }
+    body.push_str(
+        " From now on, emit every call through the tool-call mechanism with the \
+         exact tool name — never write JSON calls, results, or tool tags in your \
+         text.",
+    );
+    format!(
+        "{header}{body} {STEERING_CONTINUATION}",
+        header = anchor_header(task_anchor)
+    )
 }
 
 /// Mission mode: consecutive auto-continuation rounds with ZERO tool calls
@@ -1798,6 +3226,34 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
 /// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// Upper bound on one progressive-distillation summarizer call.
+///
+/// Healthy distillations complete in 1–4 s (measured live, 2026-08-10 log:
+/// every one of 138 successful rounds). The bound is ~30× that headroom for a
+/// summarizer sharing the GPU with the chat model and a dream cycle — while
+/// still guaranteeing the STEP survives a call that never returns. The wedge
+/// this encodes: distillation is the only inline network call on the step's
+/// critical path that had no bound, and the 2026-08-10 run stalled exactly at
+/// the iteration its first distillation fired.
+const DISTILLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// First `max_bytes` of `text`, cut on a char boundary, `...`-suffixed when cut.
+///
+/// The cut MUST walk back to a boundary: byte `max_bytes` can land inside a
+/// multi-byte character, and a raw `&text[..max_bytes]` there panics. This
+/// runs on model-written text (which freely mixes em-dashes, arrows, emoji)
+/// inside a fire-and-forget task, where a panic is a silent permanent wedge —
+/// the 2026-08-10 incident shape. Same walk-back the `remember` path uses for
+/// its 30 000-byte cap.
+fn preview_snippet(text: &str, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let end = text.floor_char_boundary(max_bytes);
+        format!("{}...", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
 #[must_use]
 pub fn claim_nudge_message(task_anchor: Option<&str>) -> String {
     format!(
@@ -1805,6 +3261,50 @@ pub fn claim_nudge_message(task_anchor: Option<&str>) -> String {
          If the task's goal is met, STOP calling tools and reply now: state your \
          final answer and end with TASK COMPLETE on its own line. Only continue \
          with tools if something specific is missing — name it first. \
+         {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Width at which a tool call is NAMED back to the model inside a steering
+/// text — its command, path, or the first line of what it printed.
+///
+/// Not a new number: it is the width the run's own memory records already use
+/// for their `target` tag (the identification of what a call acted on), and
+/// it is applied here for the same reason. The excerpt IDENTIFIES the call;
+/// it does not reproduce it. The full input and the full output already
+/// reached the model when the call ran and are still in the transcript, so a
+/// wider excerpt would replay data the model has instead of pointing at the
+/// thing it must look at. Cut char-safely by [`preview_snippet`].
+const CALL_IDENTIFICATION_WIDTH: usize = 120;
+
+/// The evidence-anchored fork of [`claim_nudge_message`], rendered when the
+/// step's NEWEST side-effectful call reported failure.
+///
+/// Why the fork exists: the unconditional text opens "You have already
+/// executed successful write/exec work this step" — true of the step as a
+/// whole, and false of the last thing that actually happened. Handed to a
+/// model whose most recent command exited non-zero, it reads as permission
+/// to claim completion over a standing failure. The rung's JOB is unchanged
+/// (prompt a verdict so the abandon ladder stays reachable) and so is its
+/// cadence — only the premise is corrected, and it is never suppressed.
+///
+/// `subject` names the failing call and `verdict` is its exit status when one
+/// definitely parsed, else the first line of its output — both at
+/// [`CALL_IDENTIFICATION_WIDTH`]. Neither is decided by pattern-matching the
+/// output text: a verdict is read from the execution's own exit status, never
+/// grepped out of what the command printed (a run's own test output can say
+/// anything, and a fabricated verdict here would be worse than none).
+#[must_use]
+pub fn claim_nudge_failure_message(
+    task_anchor: Option<&str>,
+    subject: &str,
+    verdict: &str,
+) -> String {
+    format!(
+        "{}Your most recent side-effecting command reported failure: {subject} → {verdict}. \
+         Claim TASK COMPLETE only if that failure is now fixed AND a newer run re-verified \
+         it; otherwise name the specific remaining gap and address it. \
          {STEERING_CONTINUATION}",
         anchor_header(task_anchor)
     )
@@ -2530,7 +4030,23 @@ impl Agent {
 
             state.iterations += 1;
             if let Some(max) = max_iterations {
-                if state.iterations > max {
+                if state.iterations > max
+                    && !state.wrap_up_engaged
+                    && state.final_text.trim().is_empty()
+                    && !state.tool_records.is_empty()
+                {
+                    // Reserve ONE tools-off iteration past the cap instead of
+                    // returning silence: the run did real work and never got
+                    // to say so, and a silent step contributes nothing to
+                    // what the next step (or the user) knows. The engaged
+                    // flag makes this branch unreachable a second time.
+                    self.engage_wrap_up(
+                        &mut state,
+                        "the step's iteration budget is spent",
+                        true,
+                    )
+                    .await;
+                } else if state.iterations > max {
                     // Extract memories before bailing — don't lose a long run's knowledge
                     if options.auto_extract_memories {
                         if let Some(ref on_memory) = options.on_memory {
@@ -2547,6 +4063,9 @@ impl Agent {
                         final_text_len = state.final_text.len(),
                         "Agent hit max iterations limit, returning truncated response"
                     );
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
                     return Ok(state.into_response(true));
                 }
             }
@@ -2724,22 +4243,41 @@ impl Agent {
                 let estimated = ctx.estimate_tokens();
                 let compression_threshold = ctx.compression_threshold;
                 let hard_limit = ctx.hard_limit;
-                let proactive_threshold = compression_threshold * 40 / 100; // ~64K for 160K threshold
+                // Measured headroom: growth since the previous ladder pass,
+                // max'd over the run ([`crate::context::ContextGrowthTracker`]).
+                // The Tier-1 trigger derives from it instead of a fixed
+                // 40%-of-threshold tuned for 200k windows — on a 16384-token
+                // window that constant fired 80× at 4423 tokens with ~3.7k
+                // tokens of real headroom still free.
+                let growth_since_last = ctx.growth.observe(estimated);
 
-                // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold.
-                // Prefer selective older-tool-result compression (LLMLingua via the
-                // summarization-model settings) before dropping messages wholesale.
-                // Keep at least 20 recent messages so the agent retains working context.
-                if state.iterations > 1
-                    && state.iterations % 5 == 0
-                    && estimated > proactive_threshold
-                    && estimated <= compression_threshold
-                {
+                // Tier 1 (proactive): fire only when the run's own measured
+                // growth says the NEXT interval could cross the compression
+                // threshold. Prefer selective older-tool-result compression
+                // (LLMLingua via the summarization-model settings) before
+                // dropping messages wholesale. Keep at least 20 recent
+                // messages so the agent retains working context.
+                // Against the MESSAGE-side budget, the same quantity Tier 2
+                // now gates on. Both rungs used the raw threshold before, so
+                // their bands were disjoint by construction; leaving this one
+                // raw while Tier 2 deducts the preamble opens a band
+                // (`CT - preamble < estimated <= CT`) where BOTH fire in the
+                // same pass — dropping messages and then summarizing them —
+                // which destroys more history per pass than doing neither.
+                // That band is non-empty whenever a preamble exists, which is
+                // every chat carrying verified work.
+                if crate::context::proactive_compression_due(
+                    estimated,
+                    ctx.growth.max_observed_growth,
+                    ctx.message_compression_threshold(),
+                ) {
                     info!(
                         estimated_tokens = estimated,
-                        proactive_threshold = proactive_threshold,
+                        max_observed_growth = ctx.growth.max_observed_growth,
+                        growth_since_last = growth_since_last,
+                        compression_threshold = compression_threshold,
                         tier = "proactive",
-                        "Tier 1: proactive compression triggered"
+                        "Tier 1: proactive compression triggered (measured headroom)"
                     );
 
                     let compressed_results =
@@ -2751,6 +4289,12 @@ impl Agent {
                             info!(
                                 dropped_messages = dropped,
                                 "Tier 1 compression complete (drop fallback)"
+                            );
+                            ctx.push_summarization_failure_notice(
+                                dropped,
+                                "proactive compression found no tool results \
+                                 to shrink, and measured growth says the next \
+                                 step could overflow the context window",
                             );
                         }
                     } else {
@@ -2795,7 +4339,11 @@ impl Agent {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tier 2 summarization failed, dropping oldest");
-                                ctx.drop_oldest(16);
+                                let dropped = ctx.drop_oldest(16);
+                                ctx.push_summarization_failure_notice(
+                                    dropped,
+                                    &format!("summarization failed ({e})"),
+                                );
                             }
                         }
                     } else {
@@ -2805,7 +4353,11 @@ impl Agent {
                             tier = "standard",
                             "Tier 2: no summarization models, dropping oldest"
                         );
-                        ctx.drop_oldest(16);
+                        let dropped = ctx.drop_oldest(16);
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured",
+                        );
                     }
                 }
 
@@ -2844,7 +4396,14 @@ impl Agent {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tier 3 summarization failed, truncating");
-                                ctx.truncate_to_limit();
+                                let dropped = ctx.truncate_to_limit();
+                                ctx.push_summarization_failure_notice(
+                                    dropped,
+                                    &format!(
+                                        "summarization failed at the hard \
+                                         input limit ({e})"
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -2854,7 +4413,12 @@ impl Agent {
                             tier = "hard_cap",
                             "Tier 3: hard limit exceeded, truncating"
                         );
-                        ctx.truncate_to_limit();
+                        let dropped = ctx.truncate_to_limit();
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured and the \
+                             context exceeded the hard input limit",
+                        );
                     }
                 }
             }
@@ -2875,6 +4439,22 @@ impl Agent {
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(AnthropicMessage::user_text(&note));
             }
+            // Loss announcements composed inside the ladder (summarization
+            // failures, un-summarized drops) land AFTER it for the same
+            // reason as the notes above: compression must never drop its own
+            // announcement. Then re-baseline the growth tracker so the next
+            // ladder entry measures only NEW material — the model response
+            // and tool results of one interval — never compression's effect
+            // or these notices.
+            {
+                let mut ctx = self.context.write().await;
+                let notices = ctx.take_pending_loss_notices();
+                for notice in notices {
+                    ctx.messages.push(AnthropicMessage::user_text(&notice));
+                }
+                let post_ladder = ctx.estimate_tokens();
+                ctx.growth.rebaseline(post_ladder);
+            }
 
             // Model routing: classify complexity and pick cheapest capable model
             let routed_model = self.route_model(&state, options.step_kind).await;
@@ -2887,6 +4467,23 @@ impl Agent {
                     options.restrict_to_active_tools && !options.all_tools_active,
                 )
                 .await;
+            // A planning step asks for one JSON answer and may not act:
+            // advertising tools invites the model to spend its single
+            // planning iteration on a tool call instead of the plan.
+            // Observed live 2026-08-08 (ornith, GUI mission): EVERY chat
+            // plan and continuation replan burned its one iteration on
+            // discover_tools, degraded to the fallback single task, and the
+            // turn died "dry" at 13/42 six minutes in. No tools sent means
+            // the only possible answer is the plan itself.
+            if matches!(options.step_kind, Some(crate::harness::StepKind::Plan)) {
+                request.tools = None;
+            }
+            // The reserved wrap-up iteration is text-only by construction:
+            // with no definitions served, the model cannot spend its final
+            // say on another tool call.
+            if state.wrap_up_engaged {
+                request.tools = None;
+            }
             if let Some(ref routed) = routed_model {
                 // Strip provider prefix for the API request model field
                 // but keep the full spec for client routing
@@ -3081,6 +4678,54 @@ impl Agent {
                 }
             }
 
+            // Heal a provider-side unserved-tool rejection: the model reached
+            // for a tool by name (it knows the canonical names from the system
+            // prompt) without discovering it first, and the provider validated
+            // that name against the request's `tools` array and failed the
+            // whole exchange — see [`provider_unknown_tool_name`]. The tool
+            // exists and the model asked for it, so the heal performs the same
+            // activation `discover_tools` would have, triggered by the
+            // provider's own signal, and re-sends. Bounded by construction,
+            // not by a cap: a retry happens only when the named tool NEWLY
+            // resolves to something this request was not already serving, and
+            // the registry is finite, so each pass strictly grows the served
+            // set and the chain cannot cycle.
+            while let Err(ref e) = result {
+                let msg = e.to_string();
+                let Some(wanted) = provider_unknown_tool_name(&msg) else {
+                    break;
+                };
+                let Some((canonical, _)) = self.tools.resolve_tool(wanted).await else {
+                    // Nothing registered under that name — not healable by
+                    // serving a definition; let the normal error path run.
+                    break;
+                };
+                // Serve it under both the name the model reached for and its
+                // canonical resolution (an unregistered alias serves nothing
+                // and costs nothing). Non-short-circuiting `|`: both inserts
+                // must run so a repeat of either name reads as already-served.
+                let newly_served = state.active_tools.insert(canonical.clone())
+                    | state.active_tools.insert(wanted.to_string());
+                if !newly_served {
+                    // Already serving it — same message, different fault.
+                    break;
+                }
+                warn!(
+                    tool = %wanted,
+                    canonical = %canonical,
+                    error = %msg,
+                    "Provider rejected a call to an unserved tool — activating \
+                     it and retrying the request"
+                );
+                request.tools = self
+                    .request_tool_defs(
+                        &state.active_tools,
+                        options.restrict_to_active_tools && !options.all_tools_active,
+                    )
+                    .await;
+                result = self.call_llm(&request, &options, &mut state).await;
+            }
+
             // Handle context_length_exceeded: emergency truncate and retry once
             let result = match result {
                 Err(ref e) if Self::is_context_length_error(&e.to_string()) => {
@@ -3114,7 +4759,23 @@ impl Agent {
                 other => other,
             };
 
-            let result = result?;
+            // The reserved wrap-up iteration must not turn a report into an
+            // error: if its one LLM call fails, synthesize the report from
+            // the tool record and end the step the way it was going to end.
+            let mut result = match result {
+                Err(e) if state.wrap_up_engaged => {
+                    warn!(
+                        error = %e,
+                        "wrap-up iteration failed — synthesizing the step report"
+                    );
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
+                    let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+                }
+                other => other?,
+            };
 
             // Record model statistics
             let actual_model = request.model.clone();
@@ -3225,6 +4886,192 @@ impl Agent {
                 }
             }
 
+            // ── P22 Tier 4: prose tool-call dialect ──
+            // A step with ZERO structured tool calls whose text contains
+            // call-shaped JSON or tool-call fence tokens is the narration
+            // failure in structural form. Analyzed BEFORE the response is
+            // stored so (a) self-authored result objects are fenced before
+            // they can enter history as the model's world, and (b) the calls
+            // the model MEANT are synthesized into the assistant turn as real
+            // tool_use blocks — history then demonstrates the correct dialect
+            // (and stays pair-complete once the salvage branch below stores
+            // their tool results). Skipped when the step attempted structured
+            // calls that merely failed to parse (`error_tool_results`): that
+            // is a different fault with its own feedback path.
+            let mut salvaged_uses: Vec<(String, String, Value)> = Vec::new();
+            let mut salvage_executed: Vec<(String, String)> = Vec::new();
+            let mut salvage_unresolved: Vec<(String, String)> = Vec::new();
+            let mut salvage_fence_tokens = 0usize;
+            if result.tool_uses.is_empty()
+                && result.error_tool_results.is_empty()
+                && !result.text.is_empty()
+            {
+                let scan = scan_prose_dialect(&result.text);
+                if !scan.is_empty() {
+                    salvage_fence_tokens = scan.fence_tokens;
+                    // Provenance corpus: text the model did NOT invent this
+                    // run — real tool outputs and user-authored messages. A
+                    // call or result object found verbatim there is quotation
+                    // (e.g. summarizing a config it just read), not intent or
+                    // fabrication, and is left entirely alone.
+                    let prior = {
+                        let ctx = self.context.read().await;
+                        let mut normalized: Vec<String> = state
+                            .tool_records
+                            .iter()
+                            .map(|r| normalize_ws(&r.output))
+                            .collect();
+                        for msg in &ctx.messages {
+                            if msg.role != "user" {
+                                continue;
+                            }
+                            for block in &msg.content {
+                                match block {
+                                    ContentBlock::Text { text } => {
+                                        normalized.push(normalize_ws(text));
+                                    }
+                                    ContentBlock::ToolResult { content, .. } => {
+                                        normalized.push(normalize_ws(content));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        PriorMaterial { normalized }
+                    };
+
+                    // Fence self-authored results: a result-shaped object with
+                    // no provenance is the model writing its own world (the
+                    // lfm leg believed its invented directory listing for four
+                    // hours). Insertion-only annotation, applied before any
+                    // store so every copy in history carries it.
+                    let fabricated: Vec<(usize, usize)> = scan
+                        .result_spans
+                        .iter()
+                        .filter(|(s, e)| !prior.contains(&result.text[*s..*e]))
+                        .copied()
+                        .collect();
+                    if !fabricated.is_empty() {
+                        warn!(
+                            count = fabricated.len(),
+                            iteration = state.iterations,
+                            "🧯 Self-authored result object(s) in a zero-tool-call \
+                             step — fencing before they enter history"
+                        );
+                        result.text =
+                            fence_self_authored_results(&result.text, &fabricated);
+                        for block in &mut result.content_blocks {
+                            if let ContentBlock::Text { text } = block {
+                                let block_scan = scan_prose_dialect(text);
+                                let block_fabricated: Vec<(usize, usize)> = block_scan
+                                    .result_spans
+                                    .iter()
+                                    .filter(|(s, e)| !prior.contains(&text[*s..*e]))
+                                    .copied()
+                                    .collect();
+                                if !block_fabricated.is_empty() {
+                                    *text = fence_self_authored_results(
+                                        text,
+                                        &block_fabricated,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Salvage: resolve each distinct written call through the
+                    // registry — exact → case-insensitive → dialect synonym →
+                    // fuzzy, the same path a real call takes — and synthesize
+                    // the structured calls the model meant. Lossless by rule:
+                    // unusable arguments or an unresolvable name are surfaced
+                    // in the notice, never guessed at.
+                    let mut seen_calls: HashSet<String> = HashSet::new();
+                    let mut seen_unresolved: HashSet<String> = HashSet::new();
+                    for call in &scan.calls {
+                        if prior.contains(&call.span_raw) {
+                            continue;
+                        }
+                        let Some(params) = call.params.clone() else {
+                            if seen_unresolved.insert(call.written_name.to_lowercase()) {
+                                salvage_unresolved.push((
+                                    call.written_name.clone(),
+                                    "was recognized but its arguments could not be \
+                                     recovered — re-issue it as a real tool call with \
+                                     explicit arguments"
+                                        .to_string(),
+                                ));
+                            }
+                            continue;
+                        };
+                        // Byte-identical repeats within one step collapse to
+                        // one execution: the same call in the same instant
+                        // cannot yield different information (the lfm leg
+                        // wrote the same `list_files` 300 times).
+                        let key = format!(
+                            "{}\u{1}{}",
+                            call.written_name.to_lowercase(),
+                            params
+                        );
+                        if !seen_calls.insert(key) {
+                            continue;
+                        }
+                        match self.tools.resolve_tool(&call.written_name).await {
+                            Some((resolved, _)) => {
+                                let id = format!(
+                                    "salvage-{}-{}",
+                                    state.iterations,
+                                    salvaged_uses.len()
+                                );
+                                salvage_executed
+                                    .push((call.written_name.clone(), resolved.clone()));
+                                salvaged_uses.push((id, resolved, params));
+                            }
+                            None => {
+                                if seen_unresolved
+                                    .insert(call.written_name.to_lowercase())
+                                {
+                                    let hits = self
+                                        .tools
+                                        .search_tools(&call.written_name, 3)
+                                        .await;
+                                    let guidance = if hits.is_empty() {
+                                        "matches no real tool — call `discover_tools` \
+                                         to find the right one"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "matches no real tool — closest real \
+                                             tools: {}",
+                                            hits.iter()
+                                                .map(|h| h.name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
+                                    };
+                                    salvage_unresolved
+                                        .push((call.written_name.clone(), guidance));
+                                }
+                            }
+                        }
+                    }
+                    if !salvaged_uses.is_empty() {
+                        info!(
+                            count = salvaged_uses.len(),
+                            iteration = state.iterations,
+                            "🛟 Prose tool call(s) salvaged — synthesizing the \
+                             structured calls the model meant"
+                        );
+                        for (id, name, input) in &salvaged_uses {
+                            result.content_blocks.push(ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
             // Store assistant response
             self.store_assistant_response(&result.content_blocks).await;
 
@@ -3245,8 +5092,15 @@ impl Agent {
                 return self.finish_cancelled(state, &options).await;
             }
 
-            // If no tool calls, check for narration loop before exiting
-            if result.tool_uses.is_empty() {
+            // If no tool calls, check for narration loop before exiting.
+            // A round whose structured calls ALL had malformed JSON
+            // (`tool_uses` empty but `error_tool_results` present) is NOT
+            // tool-free: it falls through to the tool path below so the
+            // synthesized error results get stored paired with the assistant
+            // turn's placeholder tool_use blocks. Exiting here dropped them —
+            // the model never learned its call was unparseable, and the
+            // stored turn kept tool_use blocks with no tool_result.
+            if result.tool_uses.is_empty() && result.error_tool_results.is_empty() {
                 // This round is over regardless of which path below it takes —
                 // normal exit, or one of the continuation `continue`s (mission
                 // stall, narration, repetition). Close its reasoning block here
@@ -3254,6 +5108,136 @@ impl Agent {
                 // detector, which measures it as "this block", trips on the
                 // concatenated volume of several unrelated rounds.
                 state.finalize_reasoning_block(None);
+                // The wrap-up iteration's answer IS the step's report — no
+                // detector, prod, nudge, or salvage may spend iterations
+                // that no longer exist (tools were off; call-shaped prose in
+                // the report is quotation, not intent). Guarantee the report
+                // is never silence.
+                if state.wrap_up_engaged {
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
+                    if options.track_uncertainty {
+                        state.confidence = self.analyze_confidence(&state.final_text).await;
+                    }
+                    if options.auto_extract_memories {
+                        if let Some(ref on_memory) = options.on_memory {
+                            if let Ok(memories) = self.extract_memories().await {
+                                for memory in memories {
+                                    on_memory(memory).await;
+                                }
+                            }
+                        }
+                    }
+                    let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+                }
+
+                // P22 Tier 4 cross-turn honesty bookkeeping: a zero-call
+                // round whose text is byte-identical to the previous
+                // zero-call round did nothing between them. Tracked here —
+                // before any continuation branch — so every zero-call round
+                // counts; any real tool execution resets the streak (the
+                // reset lives on the tool path below). Consumed at the
+                // normal exit, where the reply says so plainly.
+                let reply_hash = result_content_hash(&state.final_text);
+                if !state.final_text.is_empty()
+                    && state.last_zero_call_reply_hash == Some(reply_hash)
+                {
+                    state.identical_zero_call_replies += 1;
+                } else {
+                    state.identical_zero_call_replies = 0;
+                    state.last_zero_call_reply_hash = Some(reply_hash);
+                }
+
+                // P22 Tier 4 salvage: the structured calls synthesized from
+                // the model's prose run through the NORMAL pipeline —
+                // breakers, ledger, stats, records, memory, UI chips — so a
+                // salvaged call is a real call in every way (identical spam
+                // hits the zero-info breaker exactly like structured spam
+                // would). The corrective notice then teaches the dialect.
+                if !salvaged_uses.is_empty() {
+                    let records_before = state.tool_records.len();
+                    let tool_results = self
+                        .execute_tools(
+                            &salvaged_uses,
+                            &mut state,
+                            &options,
+                            routed_model.as_deref(),
+                        )
+                        .await;
+                    self.store_tool_results(tool_results).await;
+                    let notice = prose_call_salvage_notice(
+                        state.task_anchor.as_deref(),
+                        &salvage_executed,
+                        &salvage_unresolved,
+                        salvage_fence_tokens,
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(AnthropicMessage::user_text(notice));
+                    }
+                    // A salvage round that SUCCEEDED at something advanced
+                    // the run — same bookkeeping as the structured-call
+                    // path, then straight back to the model with the real
+                    // results. A round of nothing but breaker replays and
+                    // failures added no information, so it falls THROUGH to
+                    // the stall/repetition machinery below instead — salvage
+                    // must never become an unbounded grind lane that bypasses
+                    // the bounds the structured path answers to.
+                    let advanced = state.tool_records[records_before..]
+                        .iter()
+                        .any(|r| r.success);
+                    warn!(
+                        executed = salvage_executed.len(),
+                        unresolved = salvage_unresolved.len(),
+                        advanced,
+                        iteration = state.iterations,
+                        "🛟 Prose tool calls executed via salvage — dialect \
+                         notice injected"
+                    );
+                    if advanced {
+                        state.mission_stall_rounds = 0;
+                        state.mission_verified_since_claim = true;
+                        state.identical_zero_call_replies = 0;
+                        state.last_zero_call_reply_hash = None;
+                        continue;
+                    }
+                }
+
+                // Structural evidence with nothing executable (unresolvable
+                // names, unusable arguments, or orphan fence tokens): the
+                // corrective notice replaces the generic narration scold —
+                // same one-shot rung on the ladder (re-armed per mission
+                // round), naming the nearest real tools instead of scolding
+                // blind. Gated on the salvage branch NOT having run — a
+                // salvage round that fell through already injected this
+                // notice and must reach the stall machinery below.
+                if salvaged_uses.is_empty()
+                    && (!salvage_unresolved.is_empty() || salvage_fence_tokens > 0)
+                    && !state.narration_nudged
+                {
+                    state.narration_nudged = true;
+                    warn!(
+                        unresolved = salvage_unresolved.len(),
+                        fence_tokens = salvage_fence_tokens,
+                        iteration = state.iterations,
+                        "🔄 Prose tool calls with nothing salvageable — \
+                         corrective notice injected"
+                    );
+                    let notice = prose_call_salvage_notice(
+                        state.task_anchor.as_deref(),
+                        &salvage_executed,
+                        &salvage_unresolved,
+                        salvage_fence_tokens,
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(AnthropicMessage::user_text(notice));
+                    }
+                    continue;
+                }
+
                 // Detect narration loop: model talked about using tools but never called them
                 let has_tool_history = !state.tool_records.is_empty();
                 if detect_narration_loop(&state.final_text, has_tool_history)
@@ -3266,10 +5250,9 @@ impl Agent {
                     );
                     state.narration_nudged = true;
 
-                    // Store the broken response so the model sees what it did
-                    self.store_assistant_response(&result.content_blocks).await;
-
-                    // Inject a user-role nudge to break the pattern
+                    // The broken response is already in context (stored
+                    // unconditionally above) — inject only the user-role
+                    // nudge after it to break the pattern
                     let nudge = AnthropicMessage::user_text(narration_nudge_message(
                         state.task_anchor.as_deref(),
                     ));
@@ -3292,9 +5275,8 @@ impl Agent {
                     );
                     state.repetition_nudged = true;
 
-                    // Store the broken response so the model sees what it did
-                    self.store_assistant_response(&result.content_blocks).await;
-
+                    // The broken response is already in context (stored
+                    // unconditionally above); only the nudge is added here
                     let nudge = AnthropicMessage::user_text(repetition_nudge_message(
                         state.task_anchor.as_deref(),
                     ));
@@ -3386,10 +5368,9 @@ impl Agent {
                     state.repetition_nudged = false;
                     state.thinking_spiral_nudged = false;
 
-                    // Keep the model's partial answer in context so it builds
-                    // on its own progress instead of restarting.
-                    self.store_assistant_response(&result.content_blocks).await;
-
+                    // The model's partial answer is already in context (stored
+                    // unconditionally above), so it builds on its own progress
+                    // instead of restarting.
                     let prod = if claim_unverified {
                         mission_verify_message()
                     } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
@@ -3460,6 +5441,24 @@ impl Agent {
                     );
                 }
 
+                // P22 Tier 4 cross-turn honesty: consecutive rounds that
+                // ended byte-identical with zero structured tool calls did
+                // nothing between them — the reply must say so plainly
+                // instead of presenting the repetition as fresh work.
+                if state.identical_zero_call_replies >= 1 {
+                    let n = state.identical_zero_call_replies + 1;
+                    warn!(
+                        identical_rounds = n,
+                        "🪞 Run ended on identical zero-tool-call rounds — \
+                         appending the honesty note to the reply"
+                    );
+                    state.final_text.push_str(&format!(
+                        "\n\n[{n} consecutive replies in this run were identical and \
+                         emitted zero tool calls — nothing new was done between them, \
+                         and no tool has verified the claims above.]"
+                    ));
+                }
+
                 // Normal exit: no tool calls and not a narration loop
                 // Analyze uncertainty if enabled
                 if options.track_uncertainty {
@@ -3484,18 +5483,48 @@ impl Agent {
                 return Ok(state.into_response(false));
             }
 
+            // Tools are off on the wrap-up iteration; a model that emits
+            // call-shaped output anyway (some providers echo tool JSON as
+            // content) gets its report synthesized rather than executed —
+            // the step is over.
+            if state.wrap_up_engaged {
+                warn!(
+                    attempted_calls = result.tool_uses.len(),
+                    "wrap-up iteration attempted tool calls — ending the step with a \
+                     synthesized report instead"
+                );
+                if state.final_text.trim().is_empty() {
+                    state.final_text = step_activity_digest(&state.tool_records);
+                }
+                let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+            }
+
             // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
-            if !result.tool_uses.is_empty() {
+            if result.tool_uses.is_empty() {
+                // Only the all-calls-malformed round reaches here without
+                // tool_uses (the genuinely tool-free round exited or continued
+                // above). Close its reasoning block, but leave the mission
+                // stall counter alone — an unparseable call is not verified
+                // work.
+                state.finalize_reasoning_block(None);
+            } else {
                 let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
                 state.finalize_reasoning_block(first_tool);
                 // Real tool activity resets the mission stall counter — the
                 // bound is on grinding, never on productive work. It also
-                // marks a pending completion claim as verified-in-progress.
+                // marks a pending completion claim as verified-in-progress,
+                // and restarts the identical-zero-call-reply honesty streak
+                // (work happened, so the next identical reply is not "still
+                // nothing").
                 state.mission_stall_rounds = 0;
                 state.mission_verified_since_claim = true;
+                state.identical_zero_call_replies = 0;
+                state.last_zero_call_reply_hash = None;
             }
 
             // Execute tools and continue loop
+            let records_before = state.tool_records.len();
             let mut tool_results = self
                 .execute_tools(
                     &result.tool_uses,
@@ -3528,6 +5557,42 @@ impl Agent {
                         cap
                     );
                     return Ok(state.into_response(true));
+                }
+            }
+
+            // Progress exhaustion (P22) — the step-level rung of the same
+            // ladder, harness steps only: fold this iteration's yield into
+            // the information ledger; STEP_EXHAUSTION_AFTER consecutive
+            // tool-calling iterations that taught the run NOTHING end the
+            // step through the reserved wrap-up instead of spinning until an
+            // arbitrary count cuts it mid-flight. Mission mode is excluded —
+            // its continuation machinery owns those bounds.
+            if options.step_kind.is_some() && !options.mission_mode {
+                // `final_text` is this iteration's text when the model spoke
+                // (assigned above) and a previous iteration's — hence already
+                // in the ledger, correctly non-novel — when it did not.
+                let novel = {
+                    let (seen, records, text) = (
+                        &mut state.seen_information,
+                        &state.tool_records[records_before..],
+                        state.final_text.clone(),
+                    );
+                    iteration_produced_information(seen, records, &text)
+                };
+                if novel {
+                    state.no_information_iterations = 0;
+                } else {
+                    state.no_information_iterations += 1;
+                    if state.no_information_iterations >= STEP_EXHAUSTION_AFTER {
+                        let reason = format!(
+                            "the last {} iterations produced no new information",
+                            state.no_information_iterations
+                        );
+                        self.engage_wrap_up(&mut state, &reason, false).await;
+                        // Straight to the wrap-up call — the steering rungs
+                        // below spend iterations that no longer exist.
+                        continue;
+                    }
                 }
             }
 
@@ -3597,10 +5662,16 @@ impl Agent {
     }
 
     /// Direct completion-claim rung — the rung above the tool-loop nudge on
-    /// the escalation ladder. Injects [`claim_nudge_message`] when ALL of:
+    /// the escalation ladder. Injects [`claim_nudge_message`] (or its
+    /// evidence-anchored fork, below) when ALL of:
     ///
-    /// - (a) this run holds at least one SUCCESSFUL side-effectful tool call
-    ///   ([`is_work_evidence_tool`]) — evidence the step's real work happened;
+    /// - (a) this step holds a VERDICT that real work landed
+    ///   ([`claim_evidence_armed`] — a successful write/edit, or an exec that
+    ///   flipped a definite non-zero exit to exit 0). Deliberately NOT the
+    ///   shared [`is_work_evidence_tool`] name test the rungs above use: a
+    ///   stream of successful `ls` calls is not evidence that anything was
+    ///   done, and prompting a completion claim on it teaches exactly the
+    ///   wrong lesson;
     /// - (b) the tool-loop nudge already fired this step and got its full
     ///   post-nudge attempt (call-site ordering guarantees the attempt);
     /// - (c) the model is still issuing tool calls (the call site is the
@@ -3632,13 +5703,9 @@ impl Agent {
         if crate::harness::step_claims_completion(&state.final_text) {
             return false;
         }
-        // (a) — no successful side-effectful work yet means the grind is not
-        // a claim failure; the loop nudge and breakers own that case.
-        if !state
-            .tool_records
-            .iter()
-            .any(|r| r.success && is_work_evidence_tool(&r.name))
-        {
+        // (a) — no verdict that work landed means the grind is not a claim
+        // failure; the loop nudge and breakers own that case.
+        if !claim_evidence_armed(&state.tool_records) {
             return false;
         }
         match state.claim_nudge_count {
@@ -3655,16 +5722,49 @@ impl Agent {
         }
         state.claim_nudge_count += 1;
         state.claim_nudge_iteration = state.iterations;
+        // Which instruction: the newest side-effectful record decides. When
+        // it FAILED, the unconditional "you have already executed successful
+        // work" opening is contrary to the last thing that happened, so the
+        // instruction carries that failure instead of talking over it. The
+        // rung fires either way — the fork rephrases, it never suppresses.
+        let latest_failure = newest_work_evidence_failure(&state.tool_records);
         warn!(
             iteration = state.iterations,
             claim_nudges = state.claim_nudge_count,
-            "🏁 Successful work but no completion claim — injecting claim instruction"
+            latest_side_effect_failed = latest_failure.is_some(),
+            "🏁 Work evidence but no completion claim — injecting claim instruction"
         );
-        let nudge =
-            AnthropicMessage::user_text(claim_nudge_message(state.task_anchor.as_deref()));
+        let text = match latest_failure {
+            Some((subject, verdict)) => claim_nudge_failure_message(
+                state.task_anchor.as_deref(),
+                &subject,
+                &verdict,
+            ),
+            None => claim_nudge_message(state.task_anchor.as_deref()),
+        };
+        let nudge = AnthropicMessage::user_text(text);
         let mut ctx = self.context.write().await;
         ctx.messages.push(nudge);
         true
+    }
+
+    /// Engage the reserved tools-off wrap-up iteration: inject the report
+    /// instruction and mark the run so the next request carries no tool
+    /// definitions and its text ends the step. `truncated` records WHY the
+    /// step is ending (hard budget vs progress exhaustion) for the response's
+    /// `truncated` flag.
+    async fn engage_wrap_up(&self, state: &mut RunState, reason: &str, truncated: bool) {
+        state.wrap_up_engaged = true;
+        state.wrap_up_truncated = truncated;
+        warn!(
+            iteration = state.iterations,
+            reason,
+            tool_calls = state.tool_records.len(),
+            "⛳ Reserved wrap-up iteration — tools off, step report due"
+        );
+        let message = step_wrapup_message(state.task_anchor.as_deref(), reason);
+        let mut ctx = self.context.write().await;
+        ctx.messages.push(AnthropicMessage::user_text(&message));
     }
 
     async fn add_user_message_with_budget(&self, message: &str, options: &RunOptions) {
@@ -3872,6 +5972,23 @@ impl Agent {
         // finalized tool calls) must not fire recovery on a healthy later round.
         state.thinking_spiral_detected = false;
 
+        // Stream watchdog. The bound is DERIVED, not chosen: the transport
+        // already declares its silence tolerance (`STREAM_READ_TIMEOUT_SECS`
+        // of quiet between chunks kills the connection with an error), so on
+        // any truly silent socket the transport fires first and the error
+        // takes the normal retry path below. A wait of 2× that bound can
+        // therefore only be reached when the transport still believes the
+        // stream healthy while no event arrives — a wedged future (lost
+        // waker, swallowed pipeline stage), the class that held a session
+        // silent for 50+ minutes on 2026-08-10 with zero log output. 2 is
+        // the smallest multiple that cannot race the transport's own timer.
+        // The timeout is re-armed on every event: it bounds SILENCE, never
+        // total stream length, mirroring the transport's own semantics.
+        const STREAM_WATCHDOG_MULTIPLE: u64 = 2;
+        let watchdog = std::time::Duration::from_secs(
+            nanna_llm::STREAM_READ_TIMEOUT_SECS * STREAM_WATCHDOG_MULTIPLE,
+        );
+
         loop {
             // Race the stream read against cancellation. A poll at batch
             // arrival alone is not enough: a model deep in a silent
@@ -3879,6 +5996,7 @@ impl Agent {
             // arrives to carry the check — the request stayed live for
             // minutes after Stop (observed 2026-07-31). Breaking here
             // drops `stream`, which closes the in-flight HTTP response.
+            let next = tokio::time::timeout(watchdog, stream.next());
             let event = if let Some(token) = cancel {
                 tokio::select! {
                     biased;
@@ -3888,10 +6006,30 @@ impl Agent {
                         // already accumulated survive in the partial result.
                         break;
                     }
-                    event = stream.next() => event,
+                    event = next => event,
                 }
             } else {
-                stream.next().await
+                next.await
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(_elapsed) => {
+                    let silent_secs = watchdog.as_secs();
+                    error!(
+                        model = %request.model,
+                        silent_secs,
+                        read_timeout_secs = nanna_llm::STREAM_READ_TIMEOUT_SECS,
+                        "⏱️ STREAM WATCHDOG: no token, no block, no error for {silent_secs}s — \
+                         the transport's own read timeout never fired, so the stream future is \
+                         wedged; abandoning the call loudly instead of hanging the turn"
+                    );
+                    return Err(AgentError::StreamWatchdog {
+                        silent_secs,
+                        read_timeout_secs: nanna_llm::STREAM_READ_TIMEOUT_SECS,
+                        multiple: STREAM_WATCHDOG_MULTIPLE,
+                        model: request.model.clone(),
+                    });
+                }
             };
             let Some(event) = event else { break };
             match event? {
@@ -3922,6 +6060,24 @@ impl Agent {
                                 "🔁 Repetitive output detected in streaming response — aborting stream"
                             );
                             let notice = "\n\n[I got stuck repeating myself. Let me stop and take a different approach.]";
+                            on_text(notice);
+                            asm.text.push_str(notice);
+                            break;
+                        }
+                        // P22 Tier 4 structural arm at the checkpoint: the
+                        // model is streaming tool calls as TEXT (the lfm leg
+                        // streamed hundreds per turn) — the rest of the
+                        // stream is doomed, so stop paying for it. The main
+                        // loop's salvage then executes what it meant.
+                        if asm.tool_uses.is_empty()
+                            && text_streams_prose_tool_calls(&asm.text)
+                        {
+                            warn!(
+                                text_len = asm.text.len(),
+                                "🛟 Prose tool calls detected in streaming response — \
+                                 aborting stream for salvage"
+                            );
+                            let notice = "\n\n[I wrote tool calls as text instead of executing them. Stopping to run them properly.]";
                             on_text(notice);
                             asm.text.push_str(notice);
                             break;
@@ -4084,6 +6240,15 @@ impl Agent {
     ///
     /// The LLM already generated the content, so keeping it in stored context is pure waste.
     /// Replaces the `content` field with a size placeholder.
+    ///
+    /// The placeholder is deliberately OUTCOME-NEUTRAL. This runs while the
+    /// call is still only a request — the tool has not executed — so it cannot
+    /// know whether the bytes landed. It used to assert they had, and that
+    /// text is stored in the assistant's own turn, so on every later turn the
+    /// model re-read "all N bytes were written successfully and are intact on
+    /// disk" immediately beside a tool result reading "WRITE HELD — nothing
+    /// was written". The result is the record of what happened; this is only
+    /// the record of what was asked for, and it now says so.
     fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
         blocks.iter().map(|block| {
             match block {
@@ -4097,7 +6262,7 @@ impl Agent {
                             );
                             obj.insert(
                                 "content".to_string(),
-                                Value::String(format!("[content omitted here ONLY because your context window is limited — all {size} bytes were written successfully and are intact on disk; read_file to see them]")),
+                                Value::String(format!("[content omitted here ONLY because your context window is limited — {size} bytes were sent to this tool; the tool result below is the authoritative record of what happened on disk]")),
                             );
                         }
                     }
@@ -4223,6 +6388,16 @@ impl Agent {
                 }
                 let key = repeat_call_key(name, input);
                 ledger.get(&key).and_then(|entry| {
+                    // World-epoch gate: a streak only justifies a short-circuit
+                    // while the world is as the streak observed it. After any
+                    // successful side-effectful call (epoch bump), the shape
+                    // gets one probe execution — the probe's bookkeeping
+                    // re-records the epoch, so an unchanged outcome resumes
+                    // short-circuiting on the next attempt. Edit→retest and
+                    // edit→reread are exactly this path.
+                    if entry.last_execution_epoch != state.repeat_calls.current_epoch() {
+                        return None;
+                    }
                     if entry.failure_count >= REPEAT_FAILURE_BREAKER_AFTER {
                         warn!(
                             tool = %name,
@@ -4277,10 +6452,17 @@ impl Agent {
                     // structured notice is RETURNED instantly (never thrown);
                     // the tool is not dispatched at all — zero seconds spent.
                     if let Some(notice) = breaker_notice {
+                        let mut result = ToolResult::error(notice);
+                        // Machine-readable outcome marker: stats sinks (the
+                        // daemon's on_tool_end recorder) read this to log
+                        // `short_circuited` instead of a tool failure — a
+                        // replay describes the harness, not the tool.
+                        result.data =
+                            Some(serde_json::json!({ "short_circuited": true }));
                         let response = ToolResponse {
                             id: call.id.clone(),
                             name: name.clone(),
-                            result: ToolResult::error(notice),
+                            result,
                             // Context: the notice must reach the model
                             // verbatim, never stubbed behind a memory handle.
                             output_target: OutputTarget::Context,
@@ -4360,9 +6542,10 @@ impl Agent {
                 debug!(tool = %name, duration_ms, "Tool completed");
             }
 
-            // Record tool stats
+            // Record tool stats. A short-circuited call gets its own outcome:
+            // the breaker replay is harness behavior, not a tool failure.
             if let Some(ref tracker) = self.tool_stats {
-                let error_msg = if !response.result.success {
+                let error_msg = if !response.result.success && !short_circuited {
                     response.result.error.clone()
                 } else {
                     None
@@ -4371,6 +6554,7 @@ impl Agent {
                     .record(crate::tool_stats::ToolObservation {
                         tool_name: name.clone(),
                         success: response.result.success,
+                        short_circuited,
                         duration_ms,
                         output_size: response.result.content.len(),
                         error: error_msg,
@@ -4462,7 +6646,14 @@ impl Agent {
                 state.zero_delta_discovery_streak = 0;
             }
 
-            // Strip write content from stored tool call record (same as context blocks)
+            // Strip write content from stored tool call record (same as context
+            // blocks), but report the outcome the call ACTUALLY had.
+            //
+            // This placeholder is what the persisted record and the GUI's Input
+            // pane show. It used to assert the bytes had landed whatever
+            // happened, so a card marked failed displayed an Input claiming
+            // success — and the write guards refuse writes routinely, which is
+            // the whole point of them. A refusal is not a write.
             let stored_input = if is_write_tool(&name) {
                 let mut input = input.clone();
                 if let Some(obj) = input.as_object_mut() {
@@ -4470,9 +6661,20 @@ impl Agent {
                         let size = content_val
                             .as_str()
                             .map_or_else(|| content_val.to_string().len(), str::len);
+                        let fate = if response.result.success {
+                            format!("{size} bytes were written to disk")
+                        } else {
+                            // Covers both a guard refusing the write and a
+                            // breaker short-circuiting it before dispatch: in
+                            // neither case did the bytes land, and the result
+                            // itself says which.
+                            format!(
+                                "{size} bytes were NOT written — the tool result below says why"
+                            )
+                        };
                         obj.insert(
                             "content".to_string(),
-                            Value::String(format!("[content omitted from context — {size} bytes were written successfully to disk]")),
+                            Value::String(format!("[content omitted from context — {fate}]")),
                         );
                     }
                 }
@@ -4481,13 +6683,31 @@ impl Agent {
                 input.clone()
             };
 
+            // Read before anything moves out of the result: the memory tag
+            // below needs the same fact.
+            let struct_broken = structure_broken(&response.result);
             state.tool_records.push(ToolCallRecord {
                 id: id.clone(),
                 name: name.clone(),
                 input: stored_input,
-                output: response.result.content.clone(),
+                // A failing tool puts its message in `error` and leaves
+                // `content` empty, so building the record from `content` alone
+                // stored the NAME of what happened and none of the substance.
+                // The model saw the text; the loop's own memory of the turn did
+                // not, and two guards read this field:
+                //   - the repeat detector compares consecutive outputs, so a
+                //     command that failed two DIFFERENT ways compared equal on
+                //     "" and the user was told the result was identical;
+                //   - the novelty check hashes a failure's first line, so it
+                //     always hashed "" and a CHANGING error never counted as
+                //     progress — draining the step budget through exactly the
+                //     debugging loop the budget exists to fund.
+                // Unprefixed on purpose: an `Error: ` prefix defeats the
+                // exit-code parse downstream.
+                output: record_output(&response.result),
                 success: response.result.success,
                 duration_ms,
+                structure_broken: struct_broken,
             });
 
             // Sibling-breaker bookkeeping. A short-circuited call never ran,
@@ -4501,9 +6721,19 @@ impl Agent {
             // whose OWN outcome alternates is making some kind of progress and
             // trips neither breaker.
             if !short_circuited {
+                // A successful side-effectful call moves the world forward
+                // BEFORE this call's own bookkeeping records an epoch: the
+                // mutating shape itself stores the post-bump epoch (identical
+                // write spam still breaks), while every OTHER at-threshold
+                // shape now predates the bump and earns one probe.
+                if response.result.success && is_work_evidence_tool(&name) {
+                    state.repeat_calls.bump_epoch();
+                }
                 let key = repeat_call_key(&name, &input);
+                let current_epoch = state.repeat_calls.current_epoch();
                 let mut ledger = state.repeat_calls.write().await;
                 let entry = ledger.entry(key).or_default();
+                entry.last_execution_epoch = current_epoch;
                 if response.result.success {
                     entry.failure_count = 0;
                     entry.last_error.clear();
@@ -4547,6 +6777,89 @@ impl Agent {
                 drop(ledger);
             }
 
+            // Two guards the argument-keyed bookkeeping above cannot see, both
+            // keyed on what came BACK rather than on what was sent. Only
+            // executed calls count: a short-circuited call produced a replay of
+            // something the model already had, and folding replays in would let
+            // a breaker manufacture its own streak.
+            let mut result_notices = String::new();
+            if !short_circuited {
+                // Record-then-report over this call's structural outcome —
+                // see `structural_notices_for_call` for why the order inside
+                // it is load-bearing.
+                result_notices.push_str(
+                    &structural_notices_for_call(
+                        &state.repeat_calls,
+                        &name,
+                        &input,
+                        &response.result,
+                    )
+                    .await,
+                );
+
+                // Rewording a call that keeps returning the same thing. The
+                // per-shape streaks never build, because every rewording opens
+                // a fresh key — which is exactly what the model is doing.
+                //
+                // The write and memory families are excluded because their
+                // result text is a RECEIPT, not the information: what a
+                // `write_file` or a `remember` produced is on disk or in the
+                // store, and three receipts reading alike says nothing about
+                // whether the run is making progress. Everything that reports
+                // rather than mutates — `exec` above all, the tool the hanging
+                // script was launched with fifteen times — is covered.
+                // FAILURES only. The motivating evidence is entirely failing
+                // calls — one hanging script relaunched under nine different
+                // command strings — and folding successes in produces a false
+                // accusation on ordinary progressing work: three DIFFERENT
+                // successful commands that each print nothing (`mkdir -p`,
+                // `touch`, `git add`) all return the same empty output, and the
+                // model was told it had "worded them differently" to no effect.
+                // Restricting to failures keeps the whole motivating case and
+                // removes that.
+                if !is_claim_write_family(&name)
+                    && !is_memory_tool(&name)
+                    && let Some(record) = state.tool_records.last()
+                    && !record.success
+                {
+                    let signature = name_outcome_signature(record);
+                    if let Some(streak) = state
+                        .repeat_calls
+                        .record_name_outcome(&name, &repeat_call_key(&name, &input), signature)
+                        .await
+                    {
+                        warn!(
+                            tool = %name,
+                            streak,
+                            "🔁 {} consecutive `{}` calls returned the same outcome across \
+                             different arguments — telling the model rewording is not the fix",
+                            streak,
+                            name
+                        );
+                        result_notices.push_str(&name_zero_info_notice(&name, streak));
+                    }
+                }
+            }
+
+            // A completed exec is a fact proven by execution: the command ran
+            // to a definite exit status at a known time. Record it in the
+            // context's never-compressed slot so no later summarization pass
+            // can collapse the record of what was proven — the P22 chain's
+            // final link was exactly that collapse, followed by a rewrite
+            // over ten just-verified commands.
+            if !short_circuited {
+                if let Some((subject, outcome)) = exec_verified_outcome(
+                    &name,
+                    &input,
+                    response.result.success,
+                    &response.result.content,
+                    response.result.error.as_deref(),
+                ) {
+                    let mut ctx = self.context.write().await;
+                    ctx.record_verified_outcome(subject, outcome);
+                }
+            }
+
             let result_content = if response.result.success {
                 response.result.content
             } else {
@@ -4560,11 +6873,28 @@ impl Agent {
             };
 
             let output_target = response.output_target;
-            // Dynamic threshold: 0 = auto-scale based on max_tokens (proxy for model size)
-            // ~4 chars per token, use 2x max_tokens as threshold (generous for large models)
-            // Floor: 2000 chars, Cap: 32000 chars
+            // Auto (0) scales with the model's INPUT budget, which is what a
+            // tool result competes for.
+            //
+            // It used to scale with `max_tokens` — the requested OUTPUT budget
+            // — and `max_tokens` carries a hardcoded default that boot
+            // deliberately does not take from config, so the "dynamic"
+            // threshold was the constant 16,384 chars for every model. On a
+            // 1M-window model that is 0.4% of the window, and a whole-file read
+            // above it came back as 600 head chars and 400 tail chars.
+            //
+            // `hard_limit` is the live enforced input bound, so this also
+            // rebinds when the window is demoted on a GPU fault — the old
+            // value never moved.
+            //
+            // The fraction is the one already in the tree: the output reserve
+            // takes a quarter of the window (`window_scaled_output_reserve`),
+            // and one tool result should not claim more of the input than that.
+            // A quarter of N tokens is N chars at the ~4 chars/token this
+            // codebase estimates with.
             let threshold = if self.config.context_result_threshold == 0 {
-                (self.config.max_tokens as usize * 2).clamp(2000, 32000)
+                let input_budget_tokens = { self.context.read().await.hard_limit };
+                (input_budget_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
             } else {
                 self.config.context_result_threshold
             };
@@ -4587,14 +6917,30 @@ impl Agent {
             // some collision at ~77k records, which one long run can approach;
             // 48 bits pushes that to ~20M.
             let source_id = Uuid::new_v4().to_string().replace('-', "")[..12].to_string();
+            // (rows written, rows this result became). The stub below promises
+            // a chunk count, and it used to ESTIMATE one by dividing the raw
+            // byte length — which the collapse below now deliberately makes
+            // wrong, and which a cancelled ingest makes wrong anyway. Carry the
+            // real numbers instead so the promise matches what the handle will
+            // actually reassemble.
+            let mut ingested: Option<(usize, usize)> = None;
             if !is_memory_tool(&name) {
                 if let Some(ref on_memory) = options.on_memory {
-                    let chunks = if result_content.len() > nanna_memory::MEMORY_CHUNK_MAX_CHARS {
-                        semantic_chunk(&result_content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15)
+                    // Run-length-collapse BEFORE chunking. Chunk count is
+                    // driven by bytes and each chunk costs an embedding
+                    // round-trip, a vector search and an insert — so a result
+                    // that is one line repeated buys N rows' worth of cost for
+                    // one line's worth of information. Lossless and reversible,
+                    // so the stub's "nothing was lost" and the `source_id`
+                    // reassembly path both stay true.
+                    let ingest_content = collapse_repeated_lines(&result_content);
+                    let chunks = if ingest_content.len() > nanna_memory::MEMORY_CHUNK_MAX_CHARS {
+                        semantic_chunk(&ingest_content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15)
                     } else {
-                        vec![(0, result_content.clone())]
+                        vec![(0, ingest_content.to_string())]
                     };
                     let total_chunks = chunks.len();
+                    ingested = Some((total_chunks, total_chunks));
 
                     // What the call WAS, so the episode is retrievable by its
                     // subject and not just by words in its output. A bare output
@@ -4607,10 +6953,42 @@ impl Agent {
                         .or_else(|| input.get("command"))
                         .or_else(|| input.get("query"))
                         .and_then(|v| v.as_str())
-                        .map(|s| s.chars().take(120).collect::<String>());
-                    let outcome = if response.result.success { "ok" } else { "FAILED" };
+                        .map(|s| {
+                            s.chars().take(CALL_IDENTIFICATION_WIDTH).collect::<String>()
+                        });
+                    // A third outcome, because there are three. An edit that
+                    // lands and breaks the file used to be tagged "ok", so the
+                    // session's own record of the destroying event said it
+                    // succeeded.
+                    let outcome = if !response.result.success {
+                        "FAILED"
+                    } else if struct_broken {
+                        "ok — DOES NOT PARSE"
+                    } else {
+                        "ok"
+                    };
 
                     for (idx, chunk_content) in &chunks {
+                        // Stop means stop, including the writing. Each chunk is
+                        // an embedding round-trip against the same local model
+                        // server that serves generation, so a big result keeps a
+                        // stopped session busy long after the user gave up on it
+                        // — observed live: still ingesting 34 minutes after the
+                        // stop had cancelled the session. Checked between whole
+                        // rows, so nothing is half-written: what already landed
+                        // stays, and the count carried forward says how much.
+                        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                            warn!(
+                                tool = %name,
+                                stored = *idx,
+                                total = total_chunks,
+                                "🛑 Cancelled mid-ingest — stopped after {} of {} memory chunks",
+                                idx,
+                                total_chunks
+                            );
+                            ingested = Some((*idx, total_chunks));
+                            break;
+                        }
                         let mut tags = HashMap::new();
                         tags.insert("tool".to_string(), name.clone());
                         tags.insert("source_id".to_string(), source_id.clone());
@@ -4625,7 +7003,7 @@ impl Agent {
                                 Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
                                 None => format!("[{name} — {outcome}] {chunk_content}"),
                             },
-                            category: "tool_result".to_string(),
+                            category: TOOL_RESULT_CATEGORY.to_string(),
                             // A tool result is always agent-observed, never a user statement.
                             provenance: MemoryProvenance::Observed,
                             tags: Some(tags),
@@ -4755,8 +7133,23 @@ impl Agent {
                         // similarity query rediscovers it.
                         format!("{result_content}\n[memory:{source_id}]")
                     } else if options.on_memory.is_some() && result_content.len() > threshold {
-                        let chunk_count =
-                            (result_content.len() / nanna_memory::MEMORY_CHUNK_MAX_CHARS).max(1);
+                        // The rows this result ACTUALLY became, not an estimate
+                        // from its raw length: run-length collapse means a
+                        // repetitive result is far fewer rows than its size
+                        // suggests, and a cancelled ingest is fewer still.
+                        let (chunk_count, chunks_planned) = ingested.unwrap_or((1, 1));
+                        // Say that a result was stubbed and against what bound.
+                        // The Context arm logs its compression; this arm logged
+                        // nothing at all, which is why a threshold frozen at a
+                        // constant for every model went unmeasured for months.
+                        info!(
+                            tool = name,
+                            original_len = result_content.len(),
+                            threshold,
+                            "🗃️ Stubbed tool output to a memory handle ({} chars > {} threshold)",
+                            result_content.len(),
+                            threshold
+                        );
                         let digest = extractive_summary(&result_content);
                         // The stub is a HANDLE, not a hint. It names the id
                         // that `recall` resolves, so retrieval is addressed
@@ -4766,21 +7159,42 @@ impl Agent {
                         // words. Says SUCCEEDED and "nothing was lost" up
                         // front: an unexplained stub reads as corruption and
                         // sends models into recovery spirals.
+                        // The one case where "stored whole" is not true: a stop
+                        // cut the ingest short. Say so rather than promise a
+                        // handle that resolves to a fraction of the result.
+                        let storage = if chunk_count < chunks_planned {
+                            format!(
+                                "was being stored in memory when the run was CANCELLED, so only \
+                                 {chunk_count} of {chunks_planned} chunk(s) landed and the rest \
+                                 is not recallable"
+                            )
+                        } else {
+                            format!("was stored whole in memory as {chunk_count} chunk(s); \
+                                     nothing was lost")
+                        };
                         format!(
                             "{digest}\n\n[SUMMARY ONLY — the above is the head and tail of a \
-                             {} -char result from '{}', which SUCCEEDED and was stored whole in \
-                             memory as {} chunk(s); nothing was lost. The middle is not shown \
-                             here. recall(\"{}\") returns the full text; add offset/limit to \
-                             page through it.]",
+                             {} -char result from '{}', which SUCCEEDED and {}. The middle is \
+                             not shown here. recall(\"{}\") returns the full text; add \
+                             offset/limit to page through it.]",
                             result_content.len(),
                             name,
-                            chunk_count,
+                            storage,
                             source_id
                         )
                     } else {
                         result_content
                     }
                 }
+            };
+
+            // The outcome-keyed notices ride the result they describe, the way
+            // the write skill's own STRUCTURE sentence does — appended, not
+            // injected as a separate turn, and never a gate on the call.
+            let final_content = if result_notices.is_empty() {
+                final_content
+            } else {
+                format!("{final_content}{result_notices}")
             };
 
             // Ensure tool result content is never empty (Anthropic rejects empty text blocks)
@@ -4799,6 +7213,20 @@ impl Agent {
                     Some(true)
                 },
             });
+        }
+
+        // Capability transitions ride the NEXT tool result after they happen
+        // (P22 Tier 4): once, attached to work the model is already reading,
+        // then silence until the state changes again. Drained only when there
+        // is a result to attach to — a drain with nowhere to deliver would
+        // silently eat the notice.
+        if let Some(ledger) = options.degradations.as_deref()
+            && let Some(first) = tool_results.first_mut()
+            && let Some(notice) = ledger.drain()
+            && let ContentBlock::ToolResult { content, .. } = first
+        {
+            content.push_str("\n\n");
+            content.push_str(&notice);
         }
 
         tool_results
@@ -5043,6 +7471,16 @@ impl Agent {
 
     /// Run progressive context distillation: produce a structured rolling summary
     /// of recent conversation and evict old tool results that have been referenced.
+    ///
+    /// This runs INLINE on the step's critical path (every
+    /// `distillation_interval` iterations), so it is held to two liveness
+    /// rules the 2026-08-10 wedge paid for: the preview builder must not
+    /// panic on model-written text ([`preview_snippet`] — a raw `&text[..200]`
+    /// here killed the turn's fire-and-forget task silently), and the
+    /// summarizer call is bounded by [`DISTILLATION_TIMEOUT`] because an
+    /// unbounded inline network call wedges the whole step if it never
+    /// returns. Distillation is an optimization; skipping a round is always
+    /// acceptable, stalling the step never is.
     async fn run_progressive_distillation(&self) {
         if self.config.summarization_priority.is_empty() {
             return;
@@ -5074,21 +7512,10 @@ impl Agent {
                     .iter()
                     .take(3)
                     .map(|b| match b {
-                        ContentBlock::Text { text } => {
-                            if text.len() > 200 {
-                                format!("{}...", &text[..200])
-                            } else {
-                                text.clone()
-                            }
-                        }
+                        ContentBlock::Text { text } => preview_snippet(text, 200),
                         ContentBlock::ToolUse { name, .. } => format!("[tool_use: {name}]"),
                         ContentBlock::ToolResult { content, .. } => {
-                            if content.len() > 100 {
-                                let end = content.floor_char_boundary(100);
-                                format!("[result: {}...]", &content[..end])
-                            } else {
-                                format!("[result: {content}]")
-                            }
+                            format!("[result: {}]", preview_snippet(content, 100))
                         }
                         _ => "[...]".to_string(),
                     })
@@ -5119,8 +7546,13 @@ impl Agent {
             cache_control: None,
         };
 
-        match client.complete_anthropic(&request).await {
-            Ok(response) => {
+        let completion = tokio::time::timeout(
+            DISTILLATION_TIMEOUT,
+            client.complete_anthropic(&request),
+        )
+        .await;
+        match completion {
+            Ok(Ok(response)) => {
                 let facts: String = response
                     .content
                     .iter()
@@ -5134,16 +7566,31 @@ impl Agent {
                     .collect();
                 if !facts.is_empty() {
                     let mut ctx = self.context.write().await;
-                    // Update consolidated summary with latest facts
-                    ctx.consolidated_summary = Some(format!("[DISTILLED FACTS]\n{facts}"));
+                    // Rolling replace of the distilled-facts slot ONLY. This
+                    // used to overwrite `consolidated_summary` wholesale,
+                    // which destroyed every earlier summarization product —
+                    // including the record of verified-passing work — with
+                    // ≤512 tokens about the last ten messages (observed live
+                    // 2026-08-10: 2571→934 chars right before a from-scratch
+                    // rewrite over passing work).
+                    ctx.set_distilled_facts(facts.as_str());
                     info!(
                         facts_len = facts.len(),
                         "🧬 Progressive distillation complete"
                     );
                 }
             }
-            Err(e) => {
-                debug!(error = %e, "Progressive distillation failed");
+            // warn, not debug: a failure here is rare (at most once per
+            // distillation interval) and a silent one is exactly how the
+            // 2026-08-10 wedge stayed undiagnosable for 50 minutes.
+            Ok(Err(e)) => {
+                warn!(error = %e, "Progressive distillation failed — skipping this round");
+            }
+            Err(_elapsed) => {
+                warn!(
+                    timeout_secs = DISTILLATION_TIMEOUT.as_secs(),
+                    "Progressive distillation timed out — skipping this round"
+                );
             }
         }
     }
@@ -5481,14 +7928,15 @@ impl Agent {
         }
     }
 
-    async fn build_request_with_thinking(
+    /// The tool definitions a request should carry for this active set — the
+    /// names → definitions → dedup path shared by `build_request_with_thinking`
+    /// and the unserved-tool heal, which rebuilds ONLY the tools of an
+    /// already-built request after a mid-step activation.
+    async fn request_tool_defs(
         &self,
-        thinking_override: Option<ThinkingMode>,
         active_tools: &HashSet<String>,
         restrict_to_active: bool,
-    ) -> AnthropicRequest {
-        let ctx = self.context.read().await;
-
+    ) -> Option<Vec<LlmToolDef>> {
         let names = tool_names_for_request(active_tools, restrict_to_active);
 
         let tool_defs = self.tools.definitions_for_names(&names).await;
@@ -5505,6 +7953,18 @@ impl Agent {
                 input_schema: t.to_anthropic_format()["input_schema"].clone(),
             })
             .collect();
+        (!tools.is_empty()).then_some(tools)
+    }
+
+    async fn build_request_with_thinking(
+        &self,
+        thinking_override: Option<ThinkingMode>,
+        active_tools: &HashSet<String>,
+        restrict_to_active: bool,
+    ) -> AnthropicRequest {
+        let tools = self.request_tool_defs(active_tools, restrict_to_active).await;
+
+        let ctx = self.context.read().await;
 
         // Get effective system prompt (includes workspace context if set)
         let system_prompt = ctx.effective_system_prompt();
@@ -5621,7 +8081,7 @@ impl Agent {
             } else {
                 Some(system_prompt)
             },
-            tools: if tools.is_empty() { None } else { Some(tools) },
+            tools,
             stream: None,
             thinking,
             cache_control,
@@ -5937,9 +8397,14 @@ impl Agent {
                         memories.extend(filter_extracted_memories(parsed));
                     }
                     None => {
+                        // This branch is reached precisely when the model wrote prose
+                        // instead of JSON, so the preview is arbitrary model-written
+                        // text: `.min(200)` clamps the length but not the boundary, and
+                        // a raw slice there panics on the first em-dash the model emits.
+                        let end = truncate_boundary(json_str, 200);
                         warn!(
                             "Memory extraction JSON parse failed after healing — raw response: {}",
-                            &json_str[..json_str.len().min(200)]
+                            &json_str[..end]
                         );
                     }
                 }
@@ -6036,6 +8501,15 @@ impl MemoryProvenance {
         }
     }
 }
+
+/// The `category` every tool-result memory carries.
+///
+/// A constant rather than two string literals because the two ends are in
+/// different crates: this file stamps it, and the daemon's memory sink routes
+/// on it to keep a tool result's vector off the turn's critical path. Two
+/// privately-duplicated policies drifting apart is precisely how the two memory
+/// filters ended up disagreeing (see `memory_adapter::is_low_signal_memory`).
+pub const TOOL_RESULT_CATEGORY: &str = "tool_result";
 
 /// A memory extracted from conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6209,6 +8683,32 @@ struct RunState {
     /// in prose that never matches the completion contract — and the stall
     /// counter resets every round. This counter bounds THAT loop.
     mission_repeat_rounds: usize,
+    /// Everything this run has learned, as digests: successful tool results
+    /// (name + input + output), failure identities (name + input + first
+    /// line), and per-iteration assistant text. The step-exhaustion rule
+    /// reads novelty against this set — see
+    /// [`iteration_produced_information`].
+    seen_information: HashSet<u64>,
+    /// Consecutive tool-calling iterations that added NOTHING to
+    /// `seen_information`. At [`STEP_EXHAUSTION_AFTER`] the step stops
+    /// spinning and the reserved wrap-up iteration is engaged.
+    no_information_iterations: usize,
+    /// The reserved tools-off wrap-up iteration is in flight: the next LLM
+    /// call carries no tool definitions and its text ends the run.
+    wrap_up_engaged: bool,
+    /// Whether the wrap-up was engaged by a hard budget (report `truncated =
+    /// true`, the historical meaning) rather than by progress exhaustion
+    /// (`false` — the step ENDED; nothing was cut mid-flight).
+    wrap_up_truncated: bool,
+    /// P22 Tier 4 cross-turn honesty: hash of the last zero-structured-call
+    /// round's text. Identical consecutive zero-call rounds increment the
+    /// streak below; any executed tool work clears both.
+    last_zero_call_reply_hash: Option<u64>,
+    /// Consecutive zero-structured-call rounds whose text was byte-identical
+    /// to the previous one. `>= 1` at run end means the reply repeated with
+    /// nothing done between — the exit path appends a plain honesty note so
+    /// the repetition is never presented as fresh work.
+    identical_zero_call_replies: usize,
 }
 
 impl RunState {
@@ -6248,6 +8748,12 @@ impl RunState {
             mission_verified_since_claim: false,
             mission_last_digest: String::new(),
             mission_repeat_rounds: 0,
+            seen_information: HashSet::new(),
+            no_information_iterations: 0,
+            wrap_up_engaged: false,
+            wrap_up_truncated: false,
+            last_zero_call_reply_hash: None,
+            identical_zero_call_replies: 0,
         }
     }
 
@@ -6270,6 +8776,13 @@ impl RunState {
         // `reasoning.content` only when `blocks` is empty, so it did not
         // recover it either. Idempotent: a no-op when the buffer is empty.
         self.finalize_reasoning_block(None);
+        // A degenerate exit: a generation-loop detector fired, its nudge did
+        // not recover the model, and the run never called a tool. Reported
+        // out-of-band so the harness can steer instead of charging.
+        let degenerate_loop = (self.narration_nudged
+            || self.repetition_nudged
+            || self.thinking_spiral_nudged)
+            && self.tool_records.is_empty();
         let reasoning = if self.reasoning_content.is_empty() && self.reasoning_blocks.is_empty() {
             None
         } else {
@@ -6294,8 +8807,87 @@ impl RunState {
             cumulative_input_tokens: u64::from(self.input_tokens),
             cumulative_output_tokens: u64::from(self.output_tokens),
             model_stats: self.model_stats,
+            degenerate_loop,
         }
     }
+}
+
+/// Run-length-collapse identical consecutive lines, keeping the line once and
+/// naming how many times in a row it occurred.
+///
+/// Memory ingestion costs an embedding round-trip, a vector search and an
+/// insert PER CHUNK, and chunking is driven by BYTES — so a command whose
+/// output is one line repeated is charged for information it does not carry.
+/// Observed live: three tool results became 100,016 memory rows, the loop made
+/// zero model decisions for 189 of that session's 246 minutes, and one of them
+/// was still writing 34 minutes after the user's stop had cancelled it. The
+/// bound here is the only principled one available — cost becomes proportional
+/// to what the output SAYS rather than to how long it is — and text with
+/// nothing repeated comes back untouched.
+///
+/// **Lossless and reversible.** The marker names the exact repeat count, so
+/// the original can be reconstructed line for line. That is what keeps the
+/// stub's "stored whole in memory … nothing was lost" promise honest, and
+/// leaves the `source_id` reassembly path (the daemon's `assemble_handle_content`)
+/// telling the truth. A cap that dropped repeats instead would make both a lie.
+///
+/// A run is collapsed only when doing so is strictly SHORTER than leaving it
+/// alone — the marker costs more than two repeats of a short line. That
+/// comparison IS the threshold; no repeat count is chosen by hand, and this
+/// can never grow the text it is protecting.
+fn collapse_repeated_lines(text: &str) -> std::borrow::Cow<'_, str> {
+    // Borrowed on the common path: text with no collapsible run allocates
+    // nothing, and the buffer is only created at the first real collapse.
+    let mut out: Option<String> = None;
+    // `split_inclusive` keeps each line's own terminator, so the pieces
+    // concatenate back to exactly `text` and byte offsets stay exact.
+    let mut lines = text.split_inclusive('\n').peekable();
+    let mut consumed = 0usize;
+    while let Some(line) = lines.next() {
+        let start = consumed;
+        consumed += line.len();
+        let mut repeats = 1usize;
+        while lines.next_if(|next| *next == line).is_some() {
+            consumed += line.len();
+            repeats += 1;
+        }
+        let marker = if repeats > 1 {
+            repeat_marker(repeats)
+        } else {
+            String::new()
+        };
+        // Keep the run verbatim when collapsing it would not shrink it.
+        if repeats == 1 || line.len() + marker.len() >= consumed - start {
+            if let Some(buf) = out.as_mut() {
+                buf.push_str(&text[start..consumed]);
+            }
+            continue;
+        }
+        let buf = out.get_or_insert_with(|| {
+            let mut s = String::with_capacity(start + line.len() + marker.len());
+            s.push_str(&text[..start]);
+            s
+        });
+        // The run's line carries its own terminator: only the final line of
+        // the text can lack one, and a final line has no successor to repeat.
+        buf.push_str(line);
+        buf.push_str(&marker);
+    }
+    out.map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
+/// The line that stands in for a collapsed run.
+///
+/// Announces itself (project rule: every truncation artifact says WHAT and WHY
+/// and that nothing failed) and carries the exact count, which is what makes
+/// the collapse reversible rather than a silent trim.
+fn repeat_marker(repeats: usize) -> String {
+    format!(
+        "[REPEATED ×{repeats} — the line above occurred {repeats} times in a row here with \
+         nothing between them, and {} identical copies were collapsed so this result costs \
+         memory in proportion to what it says. Nothing was lost.]\n",
+        repeats - 1
+    )
 }
 
 /// Chunk text into pieces of ~`target_chars` with `overlap_pct` overlap, snapping to line boundaries.
@@ -6422,11 +9014,24 @@ fn is_write_tool(name: &str) -> bool {
 /// succeed forever without changing anything outside the context window,
 /// so they are never claim evidence.
 ///
-/// Crate-visible because the harness asks the same question one rung up: a
-/// continuation round that made no work-evidence call changed nothing in the
-/// world, which is the structural half of the mission's convergence signal.
-/// One classification, two rungs — a second list would drift.
-pub(crate) fn is_work_evidence_tool(name: &str) -> bool {
+/// Public because the rungs above ask a DIFFERENT question with the same
+/// classification: the harness one rung up (a continuation round that made no
+/// work-evidence call changed nothing in the world) and the daemon's
+/// session-liveness ledger above that ("when did this session last change the
+/// world?", the wedged-vs-working discriminator). Both are name-level
+/// questions about whether the session is capable of touching the world at
+/// all, and both are deliberately generous: their cheap mistake is believing
+/// a `ls` was work — a session that is merely reading is still alive, still
+/// worth waiting on, and nothing is claimed on its behalf.
+///
+/// The completion-claim rung in this file is the ASYMMETRIC case and no
+/// longer uses this predicate: see [`claim_evidence_armed`]. Its cheap
+/// mistake runs the other way — a read-only success there invites a
+/// completion claim over work that never happened — so it demands a verdict
+/// (a successful write/edit, or an exec that flipped a definite non-zero exit
+/// to exit 0), not a tool name. Same classification for the generous
+/// questions, a stricter one for the question that ends a step.
+pub fn is_work_evidence_tool(name: &str) -> bool {
     is_write_tool(name)
         || matches!(
             name,
@@ -6434,9 +9039,322 @@ pub(crate) fn is_work_evidence_tool(name: &str) -> bool {
         )
 }
 
+/// The write family as the completion-claim rung counts it: every file-writing
+/// tool ([`is_write_tool`]) plus the in-place editor. A SUCCESSFUL call here
+/// is a verdict on its own — the tool reports success only after the bytes
+/// landed, and the skill-side ratchet/hiwater machinery has already judged
+/// the write — so no exit-status reasoning is needed for this arm.
+fn is_claim_write_family(name: &str) -> bool {
+    is_write_tool(name) || matches!(name, "edit_file" | "edit" | "Edit")
+}
+
+/// The completion-claim rung's own evidence predicate: has this step produced
+/// a VERDICT that real work landed?
+///
+/// Armed by either:
+/// - a successful write/edit-family call ([`is_claim_write_family`]) — the
+///   world changed and the tool said so; or
+/// - an exec-family success whose command previously recorded a DEFINITE
+///   non-zero exit this step and now records exit 0 — the fail→pass flip.
+///   That flip IS the verdict: something that provably did not work provably
+///   works now.
+///
+/// A read-only exec success never arms it. `ls`, `cat`, `git status` and
+/// their kin exit 0 forever without changing anything, and the shared
+/// [`is_work_evidence_tool`] name test cannot tell them from a `chmod` — one
+/// observed window fired the claim instruction 40 times on a stream of
+/// successful listings, teaching a model to claim completion over work it had
+/// never done. The rare under-fire (a single side-effectful exec that
+/// succeeds first try, never having failed) is the cheap mistake here: the
+/// step still ends through the wrap-up and abandon ladders, which this rung
+/// only exists to reach FASTER.
+///
+/// Verdicts come from [`exec_verified_outcome`] — the execution's own exit
+/// status — never from pattern-matching output text. Shapes are keyed by
+/// (tool name, whitespace-normalized command) so that re-spelling the command
+/// between the failing and passing run still reads as one flip, the same
+/// normalization the repetition breakers key on ([`normalize_call_text`]).
+///
+/// Per-step by construction: `state.tool_records` is the step's own record
+/// list, so a failure from an earlier step cannot arm a later one.
+fn claim_evidence_armed(records: &[ToolCallRecord]) -> bool {
+    let mut failed_shapes: HashSet<String> = HashSet::new();
+    for record in records {
+        if record.success && is_claim_write_family(&record.name) {
+            return true;
+        }
+        // Records hold the result CONTENT, not the error field, so only the
+        // content-prefixed exit status parses here — the conservative half of
+        // the existing definite-exit-status rule, which under-fires rather
+        // than inventing a verdict.
+        let Some((command, verdict)) = exec_verified_outcome(
+            &record.name,
+            &record.input,
+            record.success,
+            &record.output,
+            None,
+        ) else {
+            continue;
+        };
+        let shape = format!("{}\u{1f}{}", record.name, normalize_call_text(&command));
+        if record.success {
+            if failed_shapes.remove(&shape) {
+                return true;
+            }
+        } else if verdict != "exit 0" {
+            failed_shapes.insert(shape);
+        }
+    }
+    false
+}
+
+/// The newest side-effectful record when it FAILED, rendered as (subject,
+/// verdict) for [`claim_nudge_failure_message`] — `None` when the newest one
+/// succeeded (the unconditional instruction stands) or when the step has no
+/// side-effectful record at all.
+///
+/// Classification is the shared name test ([`is_work_evidence_tool`]) plus
+/// the record's own success flag: this decides only how the instruction is
+/// WORDED, so the generous name set is the right one — an `ls` that failed is
+/// still the newest contrary evidence worth naming. Whether the rung fires at
+/// all is [`claim_evidence_armed`]'s stricter question.
+///
+/// The subject is the call's own identification field (command, then the
+/// path fields), first line only, at [`CALL_IDENTIFICATION_WIDTH`]; the
+/// verdict is the parsed exit status when one is definite, else the first
+/// non-blank line of the output. No output-text pattern matching decides
+/// anything — the text is quoted, never interpreted.
+fn newest_work_evidence_failure(records: &[ToolCallRecord]) -> Option<(String, String)> {
+    let newest = records
+        .iter()
+        .rev()
+        .find(|r| is_work_evidence_tool(&r.name))?;
+    if newest.success {
+        return None;
+    }
+    let subject = newest
+        .input
+        .get("command")
+        .or_else(|| newest.input.get("file_path"))
+        .or_else(|| newest.input.get("path"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+        .map_or_else(
+            || format!("`{}`", newest.name),
+            |line| preview_snippet(line.trim(), CALL_IDENTIFICATION_WIDTH),
+        );
+    let verdict = exec_verified_outcome(
+        &newest.name,
+        &newest.input,
+        newest.success,
+        &newest.output,
+        None,
+    )
+    .map_or_else(
+        || {
+            newest
+                .output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map_or_else(
+                    || "reported failure with no output".to_string(),
+                    |line| preview_snippet(line.trim(), CALL_IDENTIFICATION_WIDTH),
+                )
+        },
+        |(_, verdict)| verdict,
+    );
+    Some((subject, verdict))
+}
+
+/// Extract the (command, verdict) pair a completed exec-family call proved,
+/// destined for the context's never-compressed verified-outcomes slot.
+///
+/// An outcome requires a DEFINITE exit status: success means exit 0 (both
+/// the builtin exec and the exec skill return success only then); a failure
+/// is recorded only when an exit code is present in the result's own
+/// prefix. A spawn failure, timeout, or refusal produced no verdict and
+/// records nothing — a fabricated verdict in a slot the model is told to
+/// trust absolutely would be worse than a missing one.
+fn exec_verified_outcome(
+    tool_name: &str,
+    input: &Value,
+    success: bool,
+    content: &str,
+    error: Option<&str>,
+) -> Option<(String, String)> {
+    if !matches!(tool_name, "exec" | "bash" | "Bash") {
+        return None;
+    }
+    let command = input.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    if success {
+        return Some((command.to_string(), "exit 0".to_string()));
+    }
+    // The two shapes a real exit status arrives in: the exec skill prefixes
+    // the CONTENT with "Command failed (exit code N)"; the builtin puts
+    // "Command failed with exit code: Some(N)" in the error field. Anything
+    // else (stderr text, bridge errors) carries no verdict. Matched as
+    // prefixes only, so a command whose own OUTPUT mentions exit codes can
+    // never fabricate a verdict.
+    let code = error
+        .and_then(parse_exit_code_prefix)
+        .or_else(|| content.lines().next().and_then(parse_exit_code_prefix))?;
+    Some((command.to_string(), format!("exit {code}")))
+}
+
+/// Parse the exit code out of an exec failure prefix ("Command failed
+/// (exit code 2)" / "Command failed with exit code: Some(2)"). Returns
+/// `None` for any other text — including "Some(None)"-shaped kills, where
+/// the process died without an exit status.
+fn parse_exit_code_prefix(text: &str) -> Option<i64> {
+    let rest = text
+        .strip_prefix("Command failed (exit code ")
+        .or_else(|| text.strip_prefix("Command failed with exit code: Some("))?;
+    let digits_len = rest
+        .char_indices()
+        .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '-'))
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    rest[..digits_len].parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write that lands and breaks the file is not landed work. The guardrail
+    /// matters as much as the finding: only a verdict that actually RAN and
+    /// failed counts, because a false "broken" would suppress completion and
+    /// drain the item's budget.
+    #[test]
+    fn only_a_real_failing_verdict_reads_as_broken() {
+        let with = |data: Option<serde_json::Value>| nanna_tools::ToolResult {
+            success: true,
+            content: "Edited ./x".to_string(),
+            error: None,
+            data,
+        };
+
+        assert!(
+            structure_broken(&with(Some(
+                serde_json::json!({ "structure": { "parses": false, "tool": "sh -n" } })
+            ))),
+            "a checker ran and the file does not parse"
+        );
+        assert!(
+            !structure_broken(&with(Some(
+                serde_json::json!({ "structure": { "parses": true, "tool": "sh -n" } })
+            ))),
+            "a checker ran and the file parses"
+        );
+        assert!(
+            !structure_broken(&with(None)),
+            "no checker applies to this file type — silence is not a break"
+        );
+        assert!(
+            !structure_broken(&with(Some(serde_json::json!({ "other": 1 })))),
+            "an unrun or fail-open verdict must never read as broken"
+        );
+    }
+
+    /// The wiring: a failing tool's message must reach the record. This is the
+    /// half that was broken — the consumer below always worked, it was just
+    /// being handed "" every time.
+    #[test]
+    fn a_failed_tools_message_reaches_the_record() {
+        let failed = nanna_tools::ToolResult {
+            success: false,
+            content: String::new(),
+            error: Some("error: unresolved import `foo`".to_string()),
+            data: None,
+        };
+        assert_eq!(
+            record_output(&failed),
+            "error: unresolved import `foo`",
+            "a failure's text lives in `error`; reading `content` alone records              that something failed and nothing about what"
+        );
+        assert!(
+            !record_output(&failed).starts_with("Error: "),
+            "unprefixed — an added prefix defeats the exit-code parse downstream"
+        );
+
+        let ok = nanna_tools::ToolResult {
+            success: true,
+            content: "built in 3s".to_string(),
+            error: None,
+            data: None,
+        };
+        assert_eq!(record_output(&ok), "built in 3s", "success is unchanged");
+    }
+
+    /// Two DIFFERENT failures must read as two different results. A failing
+    /// tool's message lives in `error`, not `content`, so a record built from
+    /// `content` alone made every failure hash and compare as the empty string
+    /// — the novelty check then scored a changing error as "no new
+    /// information" and spent the step budget on the debugging loop it exists
+    /// to fund.
+    #[test]
+    fn a_changing_failure_counts_as_new_information() {
+        let failing = |msg: &str| ToolCallRecord {
+            id: "t".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "command": "cargo build" }),
+            output: msg.to_string(),
+            success: false,
+            duration_ms: 1,
+            structure_broken: false,
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            iteration_produced_information(&mut seen, &[failing("error: missing semicolon")], ""),
+            "the first failure is new"
+        );
+        assert!(
+            iteration_produced_information(&mut seen, &[failing("error: unresolved import")], ""),
+            "a DIFFERENT error is new information — the world changed"
+        );
+        assert!(
+            !iteration_produced_information(&mut seen, &[failing("error: unresolved import")], ""),
+            "the SAME error twice is not"
+        );
+    }
+
+    /// The request the model made is not evidence the write landed. This block
+    /// is stored in the assistant's own turn and re-read on every later turn,
+    /// so asserting success here contradicted the tool result sitting beside
+    /// it whenever a guard refused the write.
+    #[test]
+    fn a_stored_write_request_does_not_claim_the_bytes_landed() {
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({ "file_path": "./x", "content": "hello" }),
+        }];
+
+        let stripped = Agent::strip_write_content_from_blocks(&blocks);
+        let ContentBlock::ToolUse { input, .. } = &stripped[0] else {
+            panic!("the block must stay a tool_use");
+        };
+        let placeholder = input["content"].as_str().expect("content is replaced");
+
+        assert!(
+            placeholder.contains("5 bytes were sent to this tool"),
+            "it should say what was ASKED for: {placeholder}"
+        );
+        assert!(
+            !placeholder.contains("written successfully"),
+            "nothing has executed yet, so it must not claim a write: {placeholder}"
+        );
+        assert!(
+            !placeholder.contains("intact on disk"),
+            "and it must not send the model to read bytes that may never have              landed: {placeholder}"
+        );
+    }
 
     #[test]
     fn mission_complete_is_line_anchored() {
@@ -6480,6 +9398,51 @@ mod tests {
         for core in CORE_TOOL_NAMES {
             assert!(empty.contains(*core), "empty scope keeps the core set");
         }
+    }
+
+    /// The heal keys off the provider's exact error shape, wrapped in every
+    /// transport prefix the loop actually sees. Live string from the
+    /// 2026-08-08 ministral-3:8b smoke run, where task #5 was abandoned on
+    /// this loop.
+    #[test]
+    fn provider_unknown_tool_name_parses_the_live_failure_string() {
+        assert_eq!(
+            provider_unknown_tool_name(
+                r#"API error: 500 - {"error":"tool 'exec' not found"}"#
+            ),
+            Some("exec")
+        );
+        // The loop-level rendering carries the AgentError prefix too.
+        assert_eq!(
+            provider_unknown_tool_name(
+                r#"LLM error: API error: 500 - {"error":"tool 'web_search' not found"}"#
+            ),
+            Some("web_search")
+        );
+    }
+
+    /// Anything that is not the provider's tool-lookup failure must fall
+    /// through to the normal error paths — a mis-triggered heal would spend a
+    /// generation on a doomed retry.
+    #[test]
+    fn provider_unknown_tool_name_ignores_other_errors() {
+        assert_eq!(provider_unknown_tool_name("API error: 500 - internal"), None);
+        // The registry's own unknown-tool guidance is a tool RESULT, not a
+        // provider rejection — different shape, and must not match.
+        assert_eq!(
+            provider_unknown_tool_name(
+                "Tool not found: zzz. Use discover_tools to see available tools."
+            ),
+            None
+        );
+        // Quoted name with no lookup-failure tail.
+        assert_eq!(
+            provider_unknown_tool_name("tool 'exec' timed out after 30s"),
+            None
+        );
+        // Empty name is not a name.
+        assert_eq!(provider_unknown_tool_name("tool '' not found"), None);
+        assert_eq!(provider_unknown_tool_name(""), None);
     }
 
     #[test]
@@ -6594,6 +9557,7 @@ mod tests {
                 },
                 success: i != 9,
                 duration_ms: 1,
+                structure_broken: false,
             });
         }
         let digest = mission_tool_digest(&records);
@@ -6679,6 +9643,7 @@ mod tests {
             output: output.to_string(),
             success: true,
             duration_ms: 1,
+            structure_broken: false,
         }
     }
 
@@ -6976,6 +9941,52 @@ mod tests {
     }
 
     #[test]
+    fn literal_tab_in_streamed_args_heals_to_real_tab() {
+        // A local model emitting TSV content writes a bare 0x09 inside the
+        // JSON string (spec-invalid). The lenient heal escapes it losslessly;
+        // the finalized input must hold the REAL tab, not the two chars `\t`.
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("write_file".into()));
+        asm.on_tool_delta(1, "{\"path\":\"db.tsv\",\"content\":\"key\tvalue\"}");
+        asm.on_block_stop(1);
+
+        assert!(asm.error_tool_results.is_empty(), "must heal, not error");
+        assert_eq!(asm.tool_uses.len(), 1);
+        assert_eq!(
+            asm.tool_uses[0].2,
+            serde_json::json!({"path":"db.tsv","content":"key\tvalue"})
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_tab_tool_call_reaches_disk_as_real_tab() {
+        // Pipeline end-to-end: streamed args with a bare tab → healed input →
+        // real write_file execution → the file holds a real 0x09.
+        use nanna_tools::Tool as _;
+
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("write_file".into()));
+        asm.on_tool_delta(1, "{\"path\":\"mini.tsv\",\"content\":\"key\tvalue\nk2\tv2\"}");
+        asm.on_block_stop(1);
+        let input = asm.tool_uses[0].2.clone();
+
+        let params: std::collections::HashMap<String, Value> = input
+            .as_object()
+            .expect("healed args are an object")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = nanna_tools::WriteFileTool::new()
+            .with_base_dir(dir.path().to_string_lossy().to_string());
+        tool.execute(params).await.expect("write_file succeeds");
+
+        let written = std::fs::read_to_string(dir.path().join("mini.tsv")).expect("file exists");
+        assert_eq!(written, "key\tvalue\nk2\tv2");
+        assert!(written.as_bytes().contains(&0x09), "a REAL tab byte, not `\\t`");
+    }
+
+    #[test]
     fn malformed_args_produce_synthetic_error_result() {
         let mut asm = StreamBlockAssembler::default();
         asm.on_block_start(1, "tool_use".into(), Some("call_x".into()), Some("foo".into()));
@@ -7053,6 +10064,745 @@ mod tests {
         // The reply the user sees is still the whole turn.
         assert_eq!(asm.text, "first. second.");
     }
+}
+
+#[cfg(test)]
+mod preview_snippet_tests {
+    use super::preview_snippet;
+
+    #[test]
+    fn short_text_is_returned_whole() {
+        assert_eq!(preview_snippet("hello", 200), "hello");
+        // Exactly at the bound is not "over" — no ellipsis.
+        let exact = "x".repeat(200);
+        assert_eq!(preview_snippet(&exact, 200), exact);
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_cut_does_not_panic() {
+        // The 2026-08-10 wedge: byte 200 lands inside a multi-byte character.
+        // 199 ASCII bytes, then an em-dash (3 bytes, occupying 199..202) —
+        // the raw `&text[..200]` slice this replaces panicked here and killed
+        // the turn's fire-and-forget task silently.
+        let text = format!("{}—and the rest of the model's sentence", "a".repeat(199));
+        let cut = preview_snippet(&text, 200);
+        assert!(cut.ends_with("..."), "an over-long text must be marked cut");
+        let kept = cut.strip_suffix("...").expect("suffix just asserted");
+        assert!(text.starts_with(kept), "the preview must be a prefix");
+        assert_eq!(kept, "a".repeat(199), "the straddled char is walked back over");
+    }
+
+    #[test]
+    fn emoji_heavy_text_stays_a_prefix_at_every_cut() {
+        // Sweep every cut point across a multibyte-dense string: no panic and
+        // always a char-boundary prefix. (4-byte emoji make every misaligned
+        // byte offset an invalid boundary, so this covers the whole class.)
+        let text = "🌀🧬🏁🔂".repeat(20);
+        for max in 0..text.len() + 2 {
+            let cut = preview_snippet(&text, max);
+            let kept = cut.strip_suffix("...").unwrap_or(&cut);
+            assert!(text.starts_with(kept));
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncate_boundary_tests {
+    use super::truncate_boundary;
+
+    #[test]
+    fn text_shorter_than_the_bound_is_kept_whole() {
+        assert_eq!(truncate_boundary("hello", 200), 5);
+        // Exactly at the bound is not "over" — there is nothing to walk back over.
+        let exact = "x".repeat(200);
+        assert_eq!(truncate_boundary(&exact, 200), 200);
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_cut_does_not_panic() {
+        // The production crash shape: a preview of model-written text cut at a
+        // fixed 200 bytes, where byte 200 lands inside an em-dash (199..202).
+        // `.min(200)` clamped the LENGTH but not the boundary, so the raw slice
+        // panicked — and because this runs on the daemon's path, it killed the
+        // whole process rather than just the turn.
+        let raw = format!("{}—and the rest of the model's prose", "a".repeat(199));
+        let end = truncate_boundary(&raw, 200);
+        assert_eq!(end, 199, "the cut walks back over the straddled char");
+        assert_eq!(
+            &raw[..end],
+            "a".repeat(199),
+            "the preview stays a valid prefix"
+        );
+    }
+
+    #[test]
+    fn every_cut_point_in_multibyte_dense_text_is_a_valid_boundary() {
+        // 4-byte emoji make every misaligned offset an invalid boundary, so
+        // sweeping the whole range covers the class instead of one instance.
+        let text = "🌀🧬🏁🔂".repeat(20);
+        for max in 0..text.len() + 2 {
+            let end = truncate_boundary(&text, max);
+            assert!(text.is_char_boundary(end), "cut at {max} must be a boundary");
+            assert!(end <= max.min(text.len()), "the cut never exceeds the bound");
+        }
+    }
+}
+
+#[cfg(test)]
+mod degradation_ledger_tests {
+    use super::DegradationLedger;
+
+    /// The contract: a transition is delivered once, then silence until the
+    /// state changes again — repeats of a delivered state are not news.
+    #[test]
+    fn a_transition_is_announced_once_then_quiet() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "embeddings are down");
+        assert_eq!(ledger.drain().as_deref(), Some("embeddings are down"));
+        // Same state re-reported (every subsequent failing embed) — quiet.
+        ledger.set("memory-embeddings", "degraded", "embeddings are still down");
+        assert_eq!(ledger.drain(), None, "a delivered state does not repeat");
+        // The state CHANGES — that is news again.
+        ledger.set("memory-embeddings", "healthy", "embeddings restored");
+        assert_eq!(ledger.drain().as_deref(), Some("embeddings restored"));
+    }
+
+    /// Capabilities are presumed healthy at boot: reporting the baseline is
+    /// not a transition, so the first tool result of a healthy session
+    /// carries no notice at all.
+    #[test]
+    fn the_healthy_baseline_is_not_news() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "healthy", "all fine");
+        assert_eq!(ledger.drain(), None, "healthy at boot is the presumption");
+    }
+
+    /// A flap that lands back on the announced state before delivery is a
+    /// net-zero transition: the model never needed to know, so the pending
+    /// notice is cancelled rather than delivered stale.
+    #[test]
+    fn a_net_zero_flap_cancels_the_pending_notice() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "down");
+        ledger.set("memory-embeddings", "healthy", "back up");
+        assert_eq!(
+            ledger.drain(),
+            None,
+            "degraded-and-recovered between two tool calls is not news"
+        );
+    }
+
+    /// Distinct capabilities travel independently and one drain delivers
+    /// both, deterministically ordered.
+    #[test]
+    fn capabilities_are_independent() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "b: embeddings down");
+        ledger.set("memory-writes", "degraded", "a: writes queued");
+        assert_eq!(
+            ledger.drain().as_deref(),
+            Some("a: writes queued\nb: embeddings down"),
+            "both pending notices deliver in one drain, sorted"
+        );
+        assert_eq!(ledger.drain(), None, "a drain empties the ledger");
+    }
+}
+
+#[cfg(test)]
+mod repeated_line_collapse_tests {
+    use super::{collapse_repeated_lines, semantic_chunk};
+
+    /// The whole point: chunk count is driven by bytes, and one repeated line
+    /// is bytes without information. Three tool results became 100,016 memory
+    /// rows this way, each row costing an embedding round-trip on the turn's
+    /// critical path.
+    #[test]
+    fn a_degenerate_repetition_collapses_to_a_handful_of_chunks() {
+        let degenerate = "Error: connection refused\n".repeat(100_000);
+        let before = semantic_chunk(&degenerate, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15).len();
+        let collapsed = collapse_repeated_lines(&degenerate);
+        let after = semantic_chunk(&collapsed, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15).len();
+
+        assert!(before > 800, "the unguarded chunk count was {before}");
+        assert_eq!(after, 1, "collapsed to {after} chunks, expected one");
+        assert!(collapsed.contains("Error: connection refused"));
+        assert!(collapsed.contains("100000"), "the count must be recoverable: {collapsed}");
+    }
+
+    /// Lossless and reversible is what lets the stub keep promising "stored
+    /// whole in memory, nothing was lost": the count is in the text, so the
+    /// original can be reconstructed line for line.
+    #[test]
+    fn the_collapse_is_reversible() {
+        let original = format!("head\n{}tail\n", "same line here\n".repeat(500));
+        let collapsed = collapse_repeated_lines(&original);
+        let marker_prefix = "[REPEATED ×";
+
+        let mut rebuilt = String::new();
+        for line in collapsed.lines() {
+            if let Some(rest) = line.strip_prefix(marker_prefix) {
+                let count: usize = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.trim_end_matches(" —").parse().ok())
+                    .expect("the marker carries its count");
+                // The line itself was already emitted once.
+                for _ in 1..count {
+                    rebuilt.push_str("same line here\n");
+                }
+            } else {
+                rebuilt.push_str(line);
+                rebuilt.push('\n');
+            }
+        }
+        assert_eq!(rebuilt, original);
+    }
+
+    /// A run only collapses when collapsing SHRINKS it — that comparison is
+    /// the threshold, so no short repeat is ever inflated by a marker longer
+    /// than the text it replaces.
+    #[test]
+    fn a_short_run_is_never_inflated() {
+        let short = "ok\nok\n";
+        assert_eq!(collapse_repeated_lines(short), short);
+        let nothing_repeated = "alpha\nbeta\ngamma\n";
+        assert_eq!(collapse_repeated_lines(nothing_repeated), nothing_repeated);
+        // Borrowed, not rebuilt, when there is nothing to do.
+        assert!(matches!(
+            collapse_repeated_lines(nothing_repeated),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// Only CONSECUTIVE identity collapses. An alternating pattern carries
+    /// information in its order and must survive untouched.
+    #[test]
+    fn alternating_lines_are_left_alone() {
+        let alternating = "a\nb\n".repeat(1_000);
+        assert_eq!(collapse_repeated_lines(&alternating), alternating);
+    }
+
+    /// Tool output is arbitrary text; a run at the very end has no trailing
+    /// newline, and slicing must stay on char boundaries.
+    #[test]
+    fn multibyte_and_unterminated_runs_survive() {
+        let text = format!("start — ok\n{}", "…repeated line…\n".repeat(400));
+        let collapsed = collapse_repeated_lines(&text);
+        assert!(collapsed.contains("start — ok"));
+        assert!(collapsed.contains("…repeated line…"));
+
+        // The final line of a text has no terminator and no successor, so it
+        // can never be part of a run — it must survive verbatim.
+        let unterminated = format!("{}dangling tail", "repeat me\n".repeat(500));
+        let collapsed = collapse_repeated_lines(&unterminated);
+        assert!(collapsed.contains("[REPEATED ×500"), "got: {collapsed}");
+        assert!(collapsed.ends_with("dangling tail"));
+    }
+}
+
+#[cfg(test)]
+mod outcome_keyed_guard_tests {
+    use super::*;
+
+    /// The line number drifts as edits add lines above the break, and the two
+    /// checkers spell the location differently. Neither may split the streak.
+    #[test]
+    fn a_drifting_line_number_does_not_change_the_signature() {
+        let at_42 = "./minidb: line 42: syntax error near unexpected token `}'";
+        let at_57 = "minidb: line 57: syntax error near unexpected token `}'";
+        assert_eq!(
+            structural_verdict_signature(at_42),
+            structural_verdict_signature(at_57)
+        );
+        // A DIFFERENT break is a different signature — the streak restarts.
+        let other = "./minidb: line 42: syntax error near unexpected token `fi'";
+        assert_ne!(
+            structural_verdict_signature(at_42),
+            structural_verdict_signature(other)
+        );
+    }
+
+    /// `<file>` and `./<file>` are one file; rendering them as two split a
+    /// 22-long streak into 5 and 17 and the rung was never reached.
+    #[test]
+    fn path_spellings_share_one_streak() {
+        assert_eq!(canonical_verdict_path("./src/Main.rs"), canonical_verdict_path("src/main.rs"));
+        assert_eq!(canonical_verdict_path("src\\a\\b.rs"), canonical_verdict_path("src/a//b.rs"));
+    }
+
+    /// The escalation fires on the third identical verdict and says it ONCE,
+    /// however many more edits follow.
+    #[tokio::test]
+    async fn the_same_break_escalates_once_at_the_rung() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("x.sh: line 3: unexpected EOF while looking for `\"'");
+
+        assert_eq!(
+            ledger.record_structural_verdict("./x.sh", false, &sig).await.repeat_edits,
+            None
+        );
+        assert_eq!(
+            ledger.record_structural_verdict("x.sh", false, &sig).await.repeat_edits,
+            None
+        );
+        assert_eq!(
+            ledger.record_structural_verdict("X.SH", false, &sig).await.repeat_edits,
+            Some(STRUCTURAL_REPEAT_ESCALATE_AFTER),
+            "three spellings of one path are one streak"
+        );
+        assert_eq!(
+            ledger.record_structural_verdict("x.sh", false, &sig).await.repeat_edits,
+            None,
+            "the sentence escalates once, not once per edit"
+        );
+    }
+
+    /// The mutations that bump the world epoch ARE this streak's evidence, so
+    /// it must not inherit the epoch gate every sibling guard uses. Each edit
+    /// below is a successful side-effectful call.
+    #[tokio::test]
+    async fn the_structural_streak_survives_epoch_bumps() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("a.json: Unexpected token } at position 412");
+        for _ in 0..2 {
+            ledger.bump_epoch();
+            assert_eq!(
+                ledger.record_structural_verdict("a.json", false, &sig).await.repeat_edits,
+                None
+            );
+        }
+        ledger.bump_epoch();
+        assert_eq!(
+            ledger.record_structural_verdict("a.json", false, &sig).await.repeat_edits,
+            Some(STRUCTURAL_REPEAT_ESCALATE_AFTER)
+        );
+    }
+
+    /// A file that parses again clears the streak: the edits worked.
+    #[tokio::test]
+    async fn a_passing_verdict_clears_the_streak() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("a.sh: line 1: oops");
+        ledger.record_structural_verdict("a.sh", false, &sig).await;
+        ledger.record_structural_verdict("a.sh", false, &sig).await;
+        ledger.record_structural_verdict("a.sh", true, "").await;
+        assert_eq!(
+            ledger.record_structural_verdict("a.sh", false, &sig).await.repeat_edits,
+            None,
+            "the streak restarted at one after the file parsed"
+        );
+    }
+
+
+    /// A file that has NEVER parsed is not something that broke. Accusing the
+    /// model of regressing a file it is still writing would be false, and the
+    /// sentence would fire on every half-finished script.
+    #[tokio::test]
+    async fn a_file_that_never_parsed_is_never_called_a_regression() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("new.sh: line 4: syntax error near `fi'");
+        ledger.record_mutation("new.sh", "write_file", "").await;
+
+        let verdict = ledger.record_structural_verdict("new.sh", false, &sig).await;
+
+        assert!(verdict.regression.is_none());
+    }
+
+    /// The whole point: the span crosses calls no checker saw. Two of these
+    /// three mutations produce no verdict at all, and they are exactly the ones
+    /// the model has no other way to learn are implicated.
+    #[tokio::test]
+    async fn a_regression_names_every_mutation_since_the_file_last_parsed() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("a.sh: line 9: unexpected end of file");
+
+        ledger.record_mutation("a.sh", "write_file", "").await;
+        ledger.record_structural_verdict("a.sh", true, "").await;
+
+        // Three mutations; only the last one carries a verdict.
+        ledger.record_mutation("./a.sh", "edit_file", "").await;
+        ledger.record_mutation("A.SH", "exec", "").await;
+        ledger.record_mutation("a.sh", "write_file", "").await;
+        let verdict = ledger.record_structural_verdict("a.sh", false, &sig).await;
+
+        let span = verdict.regression.expect("a file that parsed, and now does not");
+        assert_eq!(span.total_count, 3, "all three spellings are one file");
+        assert_eq!(span.named.len(), 3);
+        assert!(span.named.iter().any(|m| m.contains("edit_file")));
+        assert!(span.named.iter().any(|m| m.contains("exec")));
+
+        let notice = structural_regression_notice("a.sh", "line 9", &span);
+        assert!(notice.contains("3 mutation(s) landed in between"), "{notice}");
+        assert!(notice.contains("edit_file"), "{notice}");
+        assert!(notice.contains("__prev__"), "{notice}");
+    }
+
+    /// Said once per edge. A file that stays broken keeps accumulating the span
+    /// but must not repeat the accusation every step — that turns attribution
+    /// into nagging, and the model stops reading it.
+    #[tokio::test]
+    async fn a_regression_is_announced_once_per_edge_and_re_arms_after_a_pass() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("b.sh: line 2: oops");
+        ledger.record_structural_verdict("b.sh", true, "").await;
+
+        ledger.record_mutation("b.sh", "edit_file", "").await;
+        assert!(
+            ledger.record_structural_verdict("b.sh", false, &sig).await.regression.is_some(),
+            "the edge is announced"
+        );
+        ledger.record_mutation("b.sh", "edit_file", "").await;
+        assert!(
+            ledger.record_structural_verdict("b.sh", false, &sig).await.regression.is_none(),
+            "and not again while it stays broken"
+        );
+
+        // A pass closes the edge; the next break is a new one.
+        ledger.record_structural_verdict("b.sh", true, "").await;
+        ledger.record_mutation("b.sh", "write_file", "").await;
+        let reopened = ledger.record_structural_verdict("b.sh", false, &sig).await;
+        let span = reopened.regression.expect("a fresh edge");
+        assert_eq!(span.total_count, 1, "a pass closes the span it would attribute");
+    }
+
+    /// The name list is bounded; the COUNT never is. A span too long to print
+    /// must still report its true size, or the bound would quietly turn a
+    /// 40-mutation span into a 6-mutation claim.
+    #[tokio::test]
+    async fn a_long_span_reports_its_true_size_and_says_what_it_omitted() {
+        let ledger = RepeatLedger::new();
+        let sig = structural_verdict_signature("c.sh: line 1: oops");
+        ledger.record_structural_verdict("c.sh", true, "").await;
+        for _ in 0..200 {
+            ledger.record_mutation("c.sh", "edit_file", "").await;
+        }
+
+        let span = ledger
+            .record_structural_verdict("c.sh", false, &sig)
+            .await
+            .regression
+            .expect("a regression");
+
+        assert_eq!(span.total_count, 200);
+        assert!(span.named.len() < 200, "the list is bounded");
+        let named_bytes: usize = span.named.iter().map(String::len).sum();
+        assert!(
+            named_bytes <= REGRESSION_SPAN_NAME_BUDGET_BYTES,
+            "{named_bytes} bytes of names"
+        );
+        let notice = structural_regression_notice("c.sh", "line 1", &span);
+        assert!(notice.contains("200 mutation(s)"), "{notice}");
+        assert!(notice.contains("not listed"), "{notice}");
+    }
+
+    fn failed_record(name: &str, input: Value, output: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "id".to_string(),
+            name: name.to_string(),
+            input,
+            output: output.to_string(),
+            success: false,
+            duration_ms: 0,
+            structure_broken: false,
+        }
+    }
+
+    /// Nine distinct command strings, one hanging script, fifteen attempts and
+    /// nothing noticed: every rewording opened a fresh per-shape key. The
+    /// name-level streak keys on the RESULT, so the rewording is irrelevant —
+    /// and the killed command's elapsed time, the only part of its message
+    /// that moves, must not defeat it either.
+    #[tokio::test]
+    async fn rewording_a_hanging_command_still_builds_a_streak() {
+        let ledger = RepeatLedger::new();
+        let attempts = [
+            ("sh ./run.sh", "TIMED OUT — ran for 30.1s, killed at the 30s deadline"),
+            ("sh ./run.sh 2>&1", "TIMED OUT — ran for 30.4s, killed at the 30s deadline"),
+            ("cd . && sh ./run.sh", "TIMED OUT — ran for 29.8s, killed at the 30s deadline"),
+        ];
+        let mut fired = None;
+        for (command, output) in attempts {
+            let input = serde_json::json!({ "command": command });
+            let record = failed_record("exec", input.clone(), output);
+            fired = ledger
+                .record_name_outcome(
+                    "exec",
+                    &repeat_call_key("exec", &input),
+                    name_outcome_signature(&record),
+                )
+                .await;
+        }
+        assert_eq!(fired, Some(ZERO_INFO_NAME_STREAK_AFTER));
+
+        // And the per-shape ledger, which keys on argument bytes, saw three
+        // unrelated calls — which is exactly why this guard exists.
+        let keys: HashSet<String> = attempts
+            .iter()
+            .map(|(command, _)| repeat_call_key("exec", &serde_json::json!({ "command": command })))
+            .collect();
+        assert_eq!(keys.len(), 3);
+    }
+
+    /// A genuinely different result restarts the streak — a call that learns
+    /// something is never told it is going in circles.
+    #[tokio::test]
+    async fn a_different_outcome_restarts_the_name_streak() {
+        let ledger = RepeatLedger::new();
+        let boom = |command: &str| {
+            failed_record("exec", serde_json::json!({ "command": command }), "boom")
+        };
+        for command in ["a", "b"] {
+            let record = boom(command);
+            ledger
+                .record_name_outcome(
+                    "exec",
+                    &repeat_call_key("exec", &record.input),
+                    name_outcome_signature(&record),
+                )
+                .await;
+        }
+        let novel = failed_record("exec", serde_json::json!({ "command": "c" }), "other error");
+        ledger
+            .record_name_outcome(
+                "exec",
+                &repeat_call_key("exec", &novel.input),
+                name_outcome_signature(&novel),
+            )
+            .await;
+        let back = boom("d");
+        assert_eq!(
+            ledger
+                .record_name_outcome(
+                    "exec",
+                    &repeat_call_key("exec", &back.input),
+                    name_outcome_signature(&back)
+                )
+                .await,
+            None,
+            "the streak restarted when the outcome changed"
+        );
+    }
+
+    /// A byte-identical repeat belongs to the sibling breakers, which
+    /// short-circuit it outright. Counting it here too would mean two guards
+    /// saying the same thing one call apart.
+    #[tokio::test]
+    async fn an_identical_repeat_is_left_to_the_sibling_breakers() {
+        let ledger = RepeatLedger::new();
+        let record = failed_record("exec", serde_json::json!({ "command": "a" }), "boom");
+        let key = repeat_call_key("exec", &record.input);
+        for _ in 0..10 {
+            assert_eq!(
+                ledger
+                    .record_name_outcome("exec", &key, name_outcome_signature(&record))
+                    .await,
+                None
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_ingest_tests {
+    use super::*;
+    use crate::cancel::CancelToken;
+    use nanna_tools::{Tool, ToolDefinition, ToolError};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Returns whatever it was built with, so a test can shape the exact
+    /// result the ingest path has to deal with.
+    struct CannedTool {
+        name: String,
+        content: String,
+        data: Option<Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CannedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "canned result".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            let mut result = ToolResult::success(self.content.clone());
+            if let Some(ref data) = self.data {
+                result = result.with_data(data.clone());
+            }
+            Ok(result)
+        }
+    }
+
+    async fn agent_with(tool: CannedTool) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(tool).await;
+        // The result threshold is pinned wide so nothing here reaches the
+        // compression/summarization path — those want a live model, and this
+        // test is about the memory write, not about what context gets.
+        let config = AgentConfig {
+            context_result_threshold: 10_000_000,
+            ..AgentConfig::default()
+        };
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(config, llm, tools)
+    }
+
+    /// One line repeated is the shape that turned three tool results into
+    /// 100,016 memory rows, each row an embedding round-trip on the turn's
+    /// critical path. It must cost one.
+    #[tokio::test]
+    async fn a_repetitive_result_becomes_one_memory_row() {
+        let agent = agent_with(CannedTool {
+            name: "noisy".to_string(),
+            content: "Error: connection refused\n".repeat(5_000),
+            data: None,
+        })
+        .await;
+        let written = Arc::new(AtomicUsize::new(0));
+        let stored = Arc::new(Mutex::new(String::new()));
+
+        let mut options = RunOptions::default();
+        options.on_memory = Some({
+            let written = Arc::clone(&written);
+            let stored = Arc::clone(&stored);
+            Box::new(move |memory: ExtractedMemory| {
+                written.fetch_add(1, Ordering::SeqCst);
+                stored.lock().unwrap().push_str(&memory.content);
+                Box::pin(async {})
+            })
+        });
+
+        let mut state = RunState::new();
+        let uses = vec![(
+            Uuid::new_v4().to_string(),
+            "noisy".to_string(),
+            serde_json::json!({}),
+        )];
+        agent.execute_tools(&uses, &mut state, &options, None).await;
+
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            1,
+            "130 KB of one repeated line must not buy 40-odd embedding round-trips"
+        );
+        let stored = stored.lock().unwrap().clone();
+        assert!(stored.contains("Error: connection refused"), "the line survives");
+        assert!(
+            stored.contains("[REPEATED ×5000"),
+            "the count must be stored so the collapse stays reversible: {stored}"
+        );
+    }
+
+    /// Stop must stop the writing too. Before this, a cancelled session was
+    /// observed still ingesting 34 minutes later.
+    #[tokio::test]
+    async fn cancelling_mid_ingest_stops_the_writes() {
+        // Distinct lines, so the collapse cannot merge them and the result is
+        // genuinely many chunks.
+        let content: String = (0..3_000).map(|i| format!("distinct line {i}\n")).collect();
+        let agent = agent_with(CannedTool {
+            name: "chatty".to_string(),
+            content: content.clone(),
+            data: None,
+        })
+        .await;
+        assert!(
+            semantic_chunk(&content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15).len() > 5,
+            "the fixture must have several chunks to stop part-way through"
+        );
+
+        let cancel = CancelToken::new();
+        let written = Arc::new(AtomicUsize::new(0));
+        let mut options = RunOptions::default();
+        options.cancel = Some(cancel.clone());
+        options.on_memory = Some({
+            let written = Arc::clone(&written);
+            let cancel = cancel.clone();
+            Box::new(move |_memory: ExtractedMemory| {
+                // The user presses Stop while the first chunk is being written.
+                written.fetch_add(1, Ordering::SeqCst);
+                cancel.cancel();
+                Box::pin(async {})
+            })
+        });
+
+        let mut state = RunState::new();
+        let uses = vec![(
+            Uuid::new_v4().to_string(),
+            "chatty".to_string(),
+            serde_json::json!({}),
+        )];
+        agent.execute_tools(&uses, &mut state, &options, None).await;
+
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            1,
+            "the chunk loop kept writing after the run was cancelled"
+        );
+    }
+
+    /// N different edits leaving the identical break is invisible to every
+    /// argument-keyed guard, and each edit bumps the world epoch — the very
+    /// event that re-arms the others. The escalation must survive that, and
+    /// must be said once.
+    #[tokio::test]
+    async fn the_same_break_across_different_edits_escalates_once() {
+        let agent = agent_with(CannedTool {
+            name: "edit_file".to_string(),
+            content: "Edited x.sh: replaced 1 occurrence(s).".to_string(),
+            data: Some(serde_json::json!({
+                "structure": {
+                    "parses": false,
+                    "tool": "sh -n",
+                    "detail": "./x.sh: line 12: syntax error near unexpected token `}'"
+                }
+            })),
+        })
+        .await;
+
+        let mut state = RunState::new();
+        let mut seen = Vec::new();
+        for attempt in 0..4 {
+            let uses = vec![(
+                Uuid::new_v4().to_string(),
+                "edit_file".to_string(),
+                serde_json::json!({
+                    "file_path": if attempt % 2 == 0 { "./x.sh" } else { "x.sh" },
+                    "old_string": format!("needle {attempt}"),
+                    "new_string": format!("thread {attempt}"),
+                }),
+            )];
+            let blocks = agent
+                .execute_tools(&uses, &mut state, &RunOptions::default(), None)
+                .await;
+            let ContentBlock::ToolResult { content, .. } = &blocks[0] else {
+                panic!("expected a tool result");
+            };
+            seen.push(content.clone());
+        }
+
+        assert!(!seen[0].contains("SAME BREAK"), "one break is not a pattern");
+        assert!(!seen[1].contains("SAME BREAK"), "two is the nudge rung, not this one");
+        assert!(
+            seen[2].contains("SAME BREAK, 3 EDITS RUNNING"),
+            "the third identical verdict must escalate: {}",
+            seen[2]
+        );
+        assert!(
+            !seen[3].contains("SAME BREAK"),
+            "said once, not once per edit: {}",
+            seen[3]
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -7157,7 +10907,10 @@ mod repeat_failure_breaker_tests {
         let v = serde_json::json!({"b": [2, 1], "a": {"z": true, "y": null}});
         // Objects sort recursively (member order carries no meaning); arrays
         // keep their order (it does).
-        assert_eq!(canonical_json(&v), r#"{"a":{"y":null,"z":true},"b":[2,1]}"#);
+        assert_eq!(
+            canonical_json(&v, false),
+            r#"{"a":{"y":null,"z":true},"b":[2,1]}"#
+        );
         // The key carries the tool name, unambiguously separated.
         assert_eq!(
             repeat_call_key("explore", &serde_json::json!({})),
@@ -7167,6 +10920,113 @@ mod repeat_failure_breaker_tests {
             repeat_call_key("explore", &serde_json::json!({"path": "a"})),
             repeat_call_key("explore", &serde_json::json!({"path": "b"})),
             "different arguments are different keys"
+        );
+    }
+
+    /// The zero-information breaker matched inputs by BYTE identity, and a
+    /// live run evaded it for five minutes with ~20 trivially varied
+    /// spellings of one command — every respelling opened a fresh ledger
+    /// entry, so no streak ever built while the run learned nothing. Spelling
+    /// is not identity: the shell collapses blank runs itself.
+    #[test]
+    fn respelling_a_command_is_the_same_call_shape() {
+        let plain = repeat_call_key("exec", &serde_json::json!({"command": "ls -la src"}));
+        for respelling in [
+            "ls  -la   src",
+            "  ls -la src  ",
+            "ls -la src\n",
+            "\n\nls -la src\n\n",
+            "ls\t-la\tsrc",
+        ] {
+            assert_eq!(
+                repeat_call_key("exec", &serde_json::json!({"command": respelling})),
+                plain,
+                "{respelling:?} is the same command to the shell that runs it"
+            );
+        }
+
+        // A genuinely different command stays a different shape — the
+        // normalization collapses blanks, never tokens or line structure.
+        for different in [
+            "ls -la tests",
+            "ls -l src",
+            "ls -la src --color",
+            "ls -la\nsrc",
+        ] {
+            assert_ne!(
+                repeat_call_key("exec", &serde_json::json!({"command": different})),
+                plain,
+                "{different:?} is a different action and must keep its own entry"
+            );
+        }
+
+        // Other fields normalize too (a respelled query is the same search),
+        // and the tool name still separates the shapes.
+        assert_eq!(
+            repeat_call_key("explore", &serde_json::json!({"query": "find  the  parser"})),
+            repeat_call_key("explore", &serde_json::json!({"query": "find the parser"}))
+        );
+        assert_ne!(
+            repeat_call_key("exec", &serde_json::json!({"command": "ls -la src"})),
+            repeat_call_key("bash", &serde_json::json!({"command": "ls -la src"}))
+        );
+    }
+
+    /// The one exemption: in an artifact field the string IS the content, so
+    /// its whitespace is meaning, not spelling — two writes that differ only
+    /// in indentation write two different files, and an edit needle with
+    /// different leading spaces matches different text. Merging those could
+    /// let the breaker refuse a genuinely new world change.
+    #[test]
+    fn artifact_field_whitespace_is_content_not_a_spelling() {
+        let tight = serde_json::json!({
+            "file_path": "src/main.rs",
+            "content": "fn main() {\nprintln!(\"hi\");\n}"
+        });
+        let indented = serde_json::json!({
+            "file_path": "src/main.rs",
+            "content": "fn main() {\n    println!(\"hi\");\n}"
+        });
+        assert_ne!(
+            repeat_call_key("write_file", &tight),
+            repeat_call_key("write_file", &indented),
+            "re-indenting a file is a different write, not a respelling"
+        );
+
+        // An edit's needle and replacement are content too — in a
+        // whitespace-structured language the indentation IS the match.
+        let flush_edit = serde_json::json!({
+            "file_path": "app.py",
+            "old_string": "return x",
+            "new_string": "return y"
+        });
+        let nested_edit = serde_json::json!({
+            "file_path": "app.py",
+            "old_string": "    return x",
+            "new_string": "    return y"
+        });
+        assert_ne!(
+            repeat_call_key("edit_file", &flush_edit),
+            repeat_call_key("edit_file", &nested_edit)
+        );
+
+        // The call's OTHER fields still normalize — the exemption is the
+        // artifact, not the whole call.
+        assert_eq!(
+            repeat_call_key(
+                "write_file",
+                &serde_json::json!({"file_path": " src/main.rs ", "content": "a b"})
+            ),
+            repeat_call_key(
+                "write_file",
+                &serde_json::json!({"file_path": "src/main.rs", "content": "a b"})
+            )
+        );
+        // The exemption is keyed by field name, not tool name: a memory body
+        // is content wherever it is written.
+        assert_ne!(
+            repeat_call_key("remember", &serde_json::json!({"content": "a  b"})),
+            repeat_call_key("remember", &serde_json::json!({"content": "a b"}))
         );
     }
 
@@ -7659,7 +11519,10 @@ mod repeat_failure_breaker_tests {
         assert!(notice.contains("NOT executed"));
         assert!(notice.contains("3 times"));
         assert!(notice.contains("timeout after 30s"));
-        assert!(notice.contains("disabled for the rest of this run"));
+        // The pause is honest about its own scope: not permanent — a world
+        // change (successful write/edit/exec) re-arms one probe.
+        assert!(notice.contains("paused"));
+        assert!(notice.contains("changes the world"));
         assert!(notice.contains("different tool"));
 
         // A huge error is replayed bounded, and the cut announces itself.
@@ -7892,8 +11755,10 @@ mod zero_info_breaker_tests {
         assert!(notice.contains("UNCHANGED"));
         assert!(notice.contains(result), "replays the result: {notice}");
         assert!(notice.contains("Act on the result you already have"));
-        assert!(notice.contains("paused for the rest of this run"));
-        assert!(notice.contains("unless its arguments change"));
+        // Honest scope: paused until the arguments change or the world does.
+        assert!(notice.contains("paused until"));
+        assert!(notice.contains("its arguments change"));
+        assert!(notice.contains("changes the world"));
         assert!(notice.contains("different tool"));
 
         // A cut excerpt announces itself and never claims the operation
@@ -7903,6 +11768,155 @@ mod zero_info_breaker_tests {
             zero_info_breaker_notice(None, "explore", 3, &excerpt, BREAKER_REPLAY_MAX_BYTES * 3);
         assert!(bounded.contains("truncated for replay"));
         assert!(bounded.contains("SUCCEEDED"));
+    }
+
+    /// Always-succeeding mock registered under the name `exec` so the real
+    /// [`is_work_evidence_tool`] classification treats it as side-effectful:
+    /// each success bumps the world epoch exactly like a live shell call.
+    struct WorldTool;
+
+    #[async_trait::async_trait]
+    impl Tool for WorldTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "exec".to_string(),
+                description: "test stand-in for the shell".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::success("world changed"))
+        }
+    }
+
+    /// Like [`steady_agent`] but with the mutating `exec` stand-in alongside,
+    /// for the world-epoch probe tests.
+    async fn steady_world_agent(
+        executions: Arc<AtomicUsize>,
+        output: Arc<StdMutex<String>>,
+        fail: Arc<AtomicBool>,
+    ) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(SteadyTool {
+            executions,
+            output,
+            fail,
+        })
+        .await;
+        tools.register(WorldTool).await;
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    /// Dispatch one call to an arbitrary registered tool through the real
+    /// tool path.
+    async fn run_named(agent: &Agent, state: &mut RunState, name: &str, input: Value) {
+        let uses = vec![(Uuid::new_v4().to_string(), name.to_string(), input)];
+        let blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_world_change_re_arms_one_probe_for_a_failing_shape() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("unused".to_string()));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent =
+            steady_world_agent(Arc::clone(&executions), output, Arc::clone(&fail)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Arm the failure breaker: K real failures, then a short-circuit.
+        for _ in 0..REPEAT_FAILURE_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+        }
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER,
+            "at-threshold shape short-circuits while the world is unchanged"
+        );
+
+        // A successful side-effectful call moves the world: the failing
+        // shape earns exactly one probe — edit→retest must never be denied.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "the world changed, so the shape executes once as a probe"
+        );
+
+        // The probe failed again and nothing else changed the world:
+        // short-circuiting resumes immediately.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "an unchanged world resumes the short-circuit after the probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_world_change_re_arms_one_probe_for_a_zero_info_shape() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("same bytes".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent =
+            steady_world_agent(Arc::clone(&executions), Arc::clone(&output), fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Arm the zero-information breaker: K identical successes, then a
+        // short-circuit.
+        for _ in 0..ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+        }
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER,
+            "at-threshold shape short-circuits while the world is unchanged"
+        );
+
+        // A successful side-effectful call moves the world: the read earns
+        // one probe — edit→reread must never be denied, because the bytes it
+        // would observe may genuinely have changed.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 1,
+            "the world changed, so the read executes once as a probe"
+        );
+
+        // Identical bytes again with no further world change: paused again.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 1,
+            "an identical probe result resumes the short-circuit"
+        );
+
+        // A world change AND changed bytes: the probe observes the new
+        // result, which restarts the identity streak — the shape then runs
+        // freely until it re-earns the threshold.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        *output.lock().unwrap() = "new bytes".to_string();
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 3,
+            "a changed result restarts the streak and the shape runs freely"
+        );
     }
 
     #[tokio::test]
@@ -8560,6 +12574,23 @@ mod claim_nudge_tests {
             output: "ok".to_string(),
             success,
             duration_ms: 1,
+            structure_broken: false,
+        }
+    }
+
+    /// An exec-family record in the shape the loop actually stores: a
+    /// `ToolCallRecord` carries the result CONTENT, not the error field, so
+    /// the skill's "Command failed (exit code N)" prefix is the definite exit
+    /// status a record can prove.
+    fn exec_record(command: &str, output: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({ "command": command }),
+            output: output.to_string(),
+            success,
+            duration_ms: 1,
+            structure_broken: false,
         }
     }
 
@@ -8614,6 +12645,86 @@ mod claim_nudge_tests {
         ] {
             assert!(!is_work_evidence_tool(name), "{name} must NOT count as work evidence");
         }
+    }
+
+    /// P22 Tier 2: a verified outcome requires a DEFINITE exit status — the
+    /// slot the model is told to trust absolutely must never hold a
+    /// fabricated verdict, so spawn failures, timeouts, and refusals record
+    /// nothing.
+    #[test]
+    fn exec_outcomes_require_a_definite_exit_status() {
+        let input = serde_json::json!({"command": "sh tests/test_1.sh"});
+        // Success means exit 0 on both exec implementations.
+        assert_eq!(
+            exec_verified_outcome("exec", &input, true, "all ok", None),
+            Some(("sh tests/test_1.sh".to_string(), "exit 0".to_string()))
+        );
+        // Skill-shaped failure: the exit code prefixes the content.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "Command failed (exit code 2)\nboom",
+                None
+            ),
+            Some(("sh tests/test_1.sh".to_string(), "exit 2".to_string()))
+        );
+        // Builtin-shaped failure: the exit code lives in the error field.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("Command failed with exit code: Some(3)")
+            ),
+            Some(("sh tests/test_1.sh".to_string(), "exit 3".to_string()))
+        );
+        // No exit status (bridge failure / timeout / refusal): no verdict.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("exec could not start the command (os error 267)")
+            ),
+            None
+        );
+        // Killed without an exit status is not a verdict either.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("Command failed with exit code: None")
+            ),
+            None
+        );
+        // A command whose own OUTPUT mentions exit codes cannot fabricate a
+        // verdict — only the known failure prefixes parse.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "stdout says: Command failed (exit code 9) somewhere",
+                Some("stderr text")
+            ),
+            None
+        );
+        // Not an exec-family tool.
+        assert_eq!(
+            exec_verified_outcome("read_file", &input, true, "", None),
+            None
+        );
+        // No command in the input: nothing to assert.
+        assert_eq!(
+            exec_verified_outcome("exec", &serde_json::json!({}), true, "", None),
+            None
+        );
     }
 
     #[test]
@@ -8757,6 +12868,203 @@ mod claim_nudge_tests {
             })
             .count();
         assert_eq!(injected, CLAIM_NUDGES_MAX);
+    }
+
+    /// Read-only churn is not work. The shared name test
+    /// ([`is_work_evidence_tool`]) cannot tell `ls` from `chmod` — it only
+    /// sees `exec` succeeding — and one observed window fired the claim
+    /// instruction 40 times over a stream of listings, teaching the model to
+    /// claim completion over work it had never done. Replayed against the
+    /// rung's own predicate, that window arms nothing.
+    #[tokio::test]
+    async fn read_only_exec_churn_never_arms_the_claim_rung() {
+        let churn = vec![
+            exec_record("ls -la", "src tests", true),
+            exec_record("cat README.md", "# nanna", true),
+            exec_record("git status", "nothing to commit", true),
+            // …including the respellings that evade a byte-identity match.
+            exec_record("ls  -la", "src tests", true),
+        ];
+        assert!(!claim_evidence_armed(&churn));
+
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = churn;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+        assert_eq!(state.claim_nudge_count, 0);
+    }
+
+    /// The exec arm's verdict is the fail→pass flip: a command that provably
+    /// did not work provably works now.
+    #[tokio::test]
+    async fn a_fail_then_pass_flip_arms_the_claim_rung() {
+        // Still failing: nothing has been shown to work.
+        let mut records = vec![exec_record(
+            "chmod +x scripts/run.sh",
+            "Command failed (exit code 1)\nchmod: cannot access 'scripts/run.sh'",
+            false,
+        )];
+        assert!(!claim_evidence_armed(&records));
+
+        // Read-only successes in between are still not evidence.
+        records.push(exec_record("ls scripts", "run.sh", true));
+        assert!(!claim_evidence_armed(&records));
+
+        // The same command passing IS the verdict — and a respelling of it is
+        // the same command, so the flip survives re-typing.
+        records.push(exec_record("chmod  +x   scripts/run.sh", "", true));
+        assert!(claim_evidence_armed(&records));
+
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = records;
+        assert!(a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // A DIFFERENT command exiting 0 is not the flip: what failed is still
+        // failing, so the rung stays out of it.
+        let unrelated = vec![
+            exec_record(
+                "chmod +x scripts/run.sh",
+                "Command failed (exit code 1)\ndenied",
+                false,
+            ),
+            exec_record("chmod +x scripts/other.sh", "", true),
+        ];
+        assert!(!claim_evidence_armed(&unrelated));
+    }
+
+    /// The write arm needs no exit-status reasoning: these tools report
+    /// success only once the bytes landed, and the skill-side ratchet has
+    /// already judged the write.
+    #[test]
+    fn a_successful_write_or_edit_is_a_verdict_on_its_own() {
+        for name in ["write_file", "file_buffer", "create_tool", "edit_file", "Edit"] {
+            assert!(claim_evidence_armed(&[record(name, true)]), "{name} armed");
+            assert!(
+                !claim_evidence_armed(&[record(name, false)]),
+                "{name} FAILED is not evidence"
+            );
+        }
+        // Reads never arm it, however many succeed.
+        assert!(!claim_evidence_armed(&[
+            record("read_file", true),
+            record("explore", true)
+        ]));
+    }
+
+    /// The instruction must not talk over the last thing that happened: when
+    /// the newest side-effecting call FAILED, the unconditional "you have
+    /// already executed successful work" opening reads as permission to claim
+    /// completion over a standing failure.
+    #[tokio::test]
+    async fn the_instruction_carries_the_newest_contrary_evidence() {
+        let a = agent();
+        let mut state = eligible_state();
+        // Work DID land this step (the write in `eligible_state`), and then
+        // the newest side-effecting command failed with a definite status.
+        state.tool_records.push(exec_record(
+            "sh tests/test_3.sh",
+            "Command failed (exit code 2)\n3 assertions failed",
+            false,
+        ));
+        assert!(a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+        // The fork rephrases the rung; it never suppresses it.
+        assert_eq!(state.claim_nudge_count, 1);
+
+        let ctx = a.context.read().await;
+        let last =
+            serde_json::to_string(ctx.messages.last().expect("injected message")).unwrap();
+        assert!(
+            last.contains("most recent side-effecting command reported failure"),
+            "got: {last}"
+        );
+        assert!(last.contains("sh tests/test_3.sh"), "names it: {last}");
+        assert!(last.contains("exit 2"), "carries the verdict: {last}");
+        assert!(
+            last.contains("Claim TASK COMPLETE only if that failure is now fixed"),
+            "got: {last}"
+        );
+    }
+
+    /// Classification is the exit status the execution itself reported, never
+    /// a scan of what the command printed — a passing run whose output
+    /// mentions failures must never be reported as a failure.
+    #[test]
+    fn the_evidence_anchor_never_greps_the_output_for_a_verdict() {
+        let definite = vec![exec_record(
+            "cargo test",
+            "Command failed (exit code 101)\ntest result: FAILED. 2 passed; 1 failed",
+            false,
+        )];
+        assert_eq!(
+            newest_work_evidence_failure(&definite),
+            Some(("cargo test".to_string(), "exit 101".to_string()))
+        );
+
+        // No definite status anywhere: the first non-blank output line is
+        // QUOTED, not interpreted.
+        let indefinite = vec![exec_record("cargo test", "\nkilled at the deadline", false)];
+        assert_eq!(
+            newest_work_evidence_failure(&indefinite),
+            Some(("cargo test".to_string(), "killed at the deadline".to_string()))
+        );
+
+        // A newest record that succeeded leaves the unconditional text alone…
+        let recovered = vec![
+            exec_record("cargo test", "Command failed (exit code 101)\nboom", false),
+            exec_record("cargo test", "ok", true),
+        ];
+        assert_eq!(newest_work_evidence_failure(&recovered), None);
+        // …and so does a step with no side-effectful record at all.
+        assert_eq!(
+            newest_work_evidence_failure(&[record("read_file", true)]),
+            None
+        );
+
+        // Non-exec side effects identify themselves by their path field, and
+        // their failure text is quoted the same way.
+        let write_failure = vec![ToolCallRecord {
+            id: "t".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({"file_path": "src/main.rs", "content": "fn main() {}"}),
+            output: "read-only file system".to_string(),
+            success: false,
+            duration_ms: 1,
+            structure_broken: false,
+        }];
+        assert_eq!(
+            newest_work_evidence_failure(&write_failure),
+            Some((
+                "src/main.rs".to_string(),
+                "read-only file system".to_string()
+            ))
+        );
+    }
+
+    /// The excerpt IDENTIFIES the failing call; it never reproduces it (the
+    /// full input and output are already in the transcript).
+    #[test]
+    fn the_evidence_excerpt_identifies_and_never_reproduces() {
+        let long = format!("sh {}.sh", "a".repeat(CALL_IDENTIFICATION_WIDTH * 2));
+        let records = vec![exec_record(
+            &long,
+            "Command failed (exit code 1)\nnope",
+            false,
+        )];
+        let (subject, verdict) = newest_work_evidence_failure(&records).expect("a failure");
+        assert!(
+            subject.len() <= CALL_IDENTIFICATION_WIDTH + 3,
+            "bounded, got {} bytes",
+            subject.len()
+        );
+        assert!(subject.ends_with("..."), "the cut announces itself: {subject}");
+        assert_eq!(verdict, "exit 1");
+
+        // Multi-byte text cuts on a char boundary — the 2026-08-10 wedge
+        // shape was a raw byte slice through model-written text.
+        let unicode = "é".repeat(CALL_IDENTIFICATION_WIDTH);
+        let records = vec![exec_record(&unicode, "", false)];
+        let _ = newest_work_evidence_failure(&records);
     }
 
     #[tokio::test]
@@ -9120,6 +13428,295 @@ mod discovery_pause_tests {
 /// task-anchor header when step context exists, each closes with the
 /// explicit continuation command, and none contains greeting-bait phrasing.
 #[cfg(test)]
+mod prose_dialect_tests {
+    use super::*;
+
+    fn calls(text: &str) -> Vec<ProseToolCall> {
+        scan_prose_dialect(text).calls
+    }
+
+    // ── structural arm: call-shaped objects ──
+
+    #[test]
+    fn action_shape_with_loose_keys_extracts_name_and_arguments() {
+        // The observed lfm dialect: 384 `"action":` strings in one leg.
+        let text = r#"I will list the directory now: {"action": "list_files", "path": "."}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "list_files");
+        assert_eq!(
+            found[0].params,
+            Some(serde_json::json!({ "path": "." })),
+            "loose keys are the arguments, minus the name key"
+        );
+    }
+
+    #[test]
+    fn tool_and_tool_name_shapes_extract() {
+        for key in ["tool", "tool_name"] {
+            let text = format!(r#"{{"{key}": "read_file", "params": {{"path": "a.txt"}}}}"#);
+            let found = calls(&text);
+            assert_eq!(found.len(), 1, "`{key}` shape must extract");
+            assert_eq!(found[0].written_name, "read_file");
+            assert_eq!(found[0].params, Some(serde_json::json!({ "path": "a.txt" })));
+        }
+    }
+
+    #[test]
+    fn openai_envelope_with_stringified_arguments_extracts() {
+        let text = r#"{"type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"x.rs\"}"}}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "read_file");
+        assert_eq!(found[0].params, Some(serde_json::json!({ "path": "x.rs" })));
+    }
+
+    #[test]
+    fn unusable_arguments_surface_as_none_never_guessed() {
+        // A stringified argument payload that is not JSON: the call is
+        // recognized but its arguments are NOT invented (lossless rule).
+        let text = r#"{"tool": "exec", "arguments": "just run ls for me"}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "exec");
+        assert_eq!(found[0].params, None);
+    }
+
+    #[test]
+    fn nested_calls_inside_arrays_extract() {
+        let text = r#"My plan: {"steps": [{"action": "read_file", "path": "a"}, {"action": "exec", "command": "ls"}]}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].written_name, "read_file");
+        assert_eq!(found[1].written_name, "exec");
+    }
+
+    #[test]
+    fn a_clean_object_inside_broken_json_is_still_found() {
+        // The maximal span fails to parse; the interior re-scan recovers the
+        // clean call inside it.
+        let text = r#"{oops broken {"action": "list_files", "path": "."} trailing"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "list_files");
+    }
+
+    // ── bare control characters in call arguments ──
+    // Observed 2026-08-14 (ornith UI leg): the model reasoned "write_file
+    // doesn't support tab characters" and routed around it — the belief a
+    // model learns when its literal-0x09 JSON (spec-invalid) kills the call.
+
+    #[test]
+    fn literal_tab_in_a_string_value_still_salvages() {
+        let text =
+            "Writing now: {\"action\": \"write_file\", \"path\": \"db.tsv\", \"content\": \"key\tvalue\"}";
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "write_file");
+        assert_eq!(
+            found[0].params,
+            Some(serde_json::json!({ "path": "db.tsv", "content": "key\tvalue" })),
+            "the salvaged argument must hold the REAL tab the model wrote"
+        );
+    }
+
+    #[test]
+    fn literal_tab_in_stringified_arguments_still_salvages() {
+        // Both decode layers at once: a bare tab inside the OUTER envelope's
+        // string literal, which after the outer escape+parse lands as a bare
+        // tab inside the INNER stringified-arguments JSON.
+        let text =
+            "{\"function\": {\"name\": \"write_file\", \"arguments\": \"{\\\"content\\\": \\\"k\tv\\\"}\"}}";
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "write_file");
+        assert_eq!(found[0].params, Some(serde_json::json!({ "content": "k\tv" })));
+    }
+
+    #[test]
+    fn malformed_braces_with_tabs_are_still_not_invented() {
+        // Leniency covers exactly the control-character defect; a structurally
+        // broken call stays unsalvageable.
+        let text = "{\"action\": \"write_file\", \"content\": \"k\tv\"";
+        assert!(calls(text).is_empty());
+    }
+
+    // ── negative cases: prose ABOUT tools must not trip ──
+
+    #[test]
+    fn prose_about_tools_without_json_does_not_trip() {
+        let text = "You should call the list_files tool with a path argument. \
+                    The `action` key selects the verb, and the result comes back \
+                    as JSON. Let me explain how tool calls work.";
+        let scan = scan_prose_dialect(text);
+        assert!(scan.calls.is_empty());
+        assert!(scan.result_spans.is_empty());
+        assert_eq!(scan.fence_tokens, 0);
+        assert!(!text_streams_prose_tool_calls(text));
+    }
+
+    #[test]
+    fn json_without_call_shape_does_not_trip() {
+        let text = r#"Config: {"count": 3, "path": ".", "verbose": true}"#;
+        assert!(calls(text).is_empty());
+    }
+
+    #[test]
+    fn name_key_alone_is_prose_not_a_call() {
+        // `{"name": …}` counts only alongside an explicit argument key.
+        let text = r#"{"name": "Nanna", "role": "agent"}"#;
+        assert!(calls(text).is_empty());
+        let with_args = r#"{"name": "list_files", "arguments": {"path": "."}}"#;
+        assert_eq!(calls(with_args).len(), 1);
+    }
+
+    #[test]
+    fn a_sentence_in_the_action_key_is_not_a_tool_name() {
+        let text = r#"{"action": "list the files in the directory"}"#;
+        assert!(calls(text).is_empty());
+    }
+
+    // ── fence tokens ──
+
+    #[test]
+    fn fence_tokens_are_counted_case_insensitively() {
+        // The observed leg: 28 orphan </TOOL_CALL> closers, 2 <|tool_call_end|>.
+        let text = "…</TOOL_CALL> and later <|tool_call_end|> and <tool_call>";
+        assert_eq!(tool_call_fence_token_count(text), 3);
+        assert!(text_streams_prose_tool_calls(text));
+    }
+
+    // ── self-authored results ──
+
+    #[test]
+    fn result_shaped_objects_are_detected_and_null_results_are_not() {
+        let scan = scan_prose_dialect(r#"{"result": {"files": ["minidb", "104k"]}}"#);
+        assert_eq!(scan.result_spans.len(), 1);
+        for benign in [r#"{"result": null}"#, r#"{"code": 3}"#, "no json at all"] {
+            assert!(
+                scan_prose_dialect(benign).result_spans.is_empty(),
+                "{benign} must not read as a self-authored result"
+            );
+        }
+    }
+
+    #[test]
+    fn fencing_is_insertion_only_and_lossless() {
+        let text = r#"Ran it. {"result": {"files": ["minidb"]}} All good."#;
+        let scan = scan_prose_dialect(text);
+        let fenced = fence_self_authored_results(text, &scan.result_spans);
+        assert!(fenced.contains(SELF_AUTHORED_RESULT_FENCE));
+        // The fence lands directly after the fabricated object.
+        assert!(fenced.contains(&format!(
+            "{}\n{}",
+            r#"{"result": {"files": ["minidb"]}}"#,
+            SELF_AUTHORED_RESULT_FENCE
+        )));
+        // Lossless: removing the inserted marker lines reconstructs the
+        // original byte-for-byte.
+        let reconstructed: String = fenced
+            .replace(&format!("\n{SELF_AUTHORED_RESULT_FENCE}\n"), "");
+        assert_eq!(reconstructed, text);
+    }
+
+    // ── provenance (quotation vs invention) ──
+
+    #[test]
+    fn quoted_material_is_recognized_across_rewrapping() {
+        let prior = PriorMaterial {
+            normalized: vec![normalize_ws(
+                "{\"action\": \"deploy\",\n    \"target\": \"prod\"}",
+            )],
+        };
+        // Same object, different whitespace: still quotation.
+        assert!(prior.contains("{\"action\": \"deploy\", \"target\": \"prod\"}"));
+        // A different object is invention.
+        assert!(!prior.contains("{\"action\": \"deploy\", \"target\": \"staging\"}"));
+    }
+
+    // ── streaming checkpoint variant ──
+
+    #[test]
+    fn one_call_shaped_object_does_not_abort_a_stream_but_two_do() {
+        // One object might be a quoted example ahead of a real structured
+        // call — the conservative stream check needs two distinct calls.
+        let one = r#"For example: {"action": "list_files", "path": "."}"#;
+        assert!(!text_streams_prose_tool_calls(one));
+        let two = r#"{"action": "list_files", "path": "."} then
+                     {"action": "read_file", "path": "a.txt"}"#;
+        assert!(text_streams_prose_tool_calls(two));
+        // The SAME call repeated is one distinct call — still below the bar
+        // (the post-step salvage handles it; a stream abort needs stronger
+        // evidence).
+        let same = r#"{"action": "list_files", "path": "."} and again
+                      {"action": "list_files", "path": "."}"#;
+        assert!(!text_streams_prose_tool_calls(same));
+    }
+
+    // ── scanner robustness ──
+
+    #[test]
+    fn prose_quotes_outside_braces_do_not_swallow_later_objects() {
+        let text = r#"It's a "simple" step — {"action": "exec", "command": "ls"}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "exec");
+    }
+
+    #[test]
+    fn a_dangling_opener_does_not_hide_later_objects() {
+        let text = r#"fn main() { loop { … and then {"action": "list_files", "path": "."}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1, "the re-scan must skip past dangling braces");
+        assert_eq!(found[0].written_name, "list_files");
+    }
+
+    #[test]
+    fn frame_and_outcome_keys_are_stripped_from_loose_arguments() {
+        // A call object with an embedded self-authored outcome: the outcome
+        // fields are fabrications, not arguments.
+        let text = r#"{"action": "list_files", "path": ".", "result": {"files": []}, "status": "done"}"#;
+        let scan = scan_prose_dialect(text);
+        assert_eq!(scan.calls.len(), 1);
+        assert_eq!(
+            scan.calls[0].params,
+            Some(serde_json::json!({ "path": "." }))
+        );
+        // …and the same span is ALSO flagged as a self-authored result.
+        assert_eq!(scan.result_spans.len(), 1);
+    }
+
+    // ── the notice ──
+
+    #[test]
+    fn the_salvage_notice_names_the_mapping_and_the_results_location() {
+        let note = prose_call_salvage_notice(
+            None,
+            &[("list_files".to_string(), "list_dir".to_string())],
+            &[(
+                "frobnicate".to_string(),
+                "matches no real tool — closest real tools: exec, read_file".to_string(),
+            )],
+            0,
+        );
+        assert!(note.contains("`list_files` → ran as `list_dir`"), "{note}");
+        assert!(note.contains("REAL results are in the tool results above"), "{note}");
+        assert!(note.contains("`frobnicate` matches no real tool"), "{note}");
+        assert!(note.contains("exec, read_file"), "{note}");
+        assert!(note.ends_with(STEERING_CONTINUATION), "{note}");
+    }
+
+    #[test]
+    fn the_not_executed_notice_says_nothing_ran() {
+        let note = prose_call_salvage_notice(None, &[], &[], 2);
+        assert!(note.contains("NOT EXECUTED"), "{note}");
+        assert!(note.contains("nothing you described ran"), "{note}");
+        assert!(note.contains("fence tokens"), "{note}");
+        assert!(note.ends_with(STEERING_CONTINUATION), "{note}");
+    }
+}
+
+#[cfg(test)]
 mod anchored_steering_tests {
     use super::*;
 
@@ -9157,6 +13754,10 @@ mod anchored_steering_tests {
             ("repetition_nudge", repetition_nudge_message(anchor)),
             ("thinking_spiral_nudge", thinking_spiral_nudge_message(anchor)),
             ("claim_nudge", claim_nudge_message(anchor)),
+            (
+                "claim_nudge_failure",
+                claim_nudge_failure_message(anchor, "sh tests/test_3.sh", "exit 2"),
+            ),
             ("budget_warning", budget_warning_message(800, 1000, anchor)),
             (
                 "wrapup_gentle",
@@ -9193,6 +13794,22 @@ mod anchored_steering_tests {
                     &["code_search".to_string(), "web_fetch".to_string()],
                     anchor,
                 ),
+            ),
+            (
+                "prose_call_salvage",
+                prose_call_salvage_notice(
+                    anchor,
+                    &[("list_files".to_string(), "list_dir".to_string())],
+                    &[(
+                        "frobnicate".to_string(),
+                        "matches no real tool — closest real tools: exec".to_string(),
+                    )],
+                    0,
+                ),
+            ),
+            (
+                "prose_call_not_executed",
+                prose_call_salvage_notice(anchor, &[], &[], 2),
             ),
         ]
     }
@@ -9673,5 +14290,138 @@ mod thinking_always_on_tests {
             raised.thinking.as_ref().and_then(nanna_llm::ThinkingConfig::budget_tokens),
             Some(MIN_THINKING_BUDGET_TOKENS)
         );
+    }
+}
+
+#[cfg(test)]
+mod step_exhaustion_tests {
+    use super::*;
+
+    fn record(name: &str, input: &str, output: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({ "arg": input }),
+            output: output.to_string(),
+            success,
+            duration_ms: 1,
+            structure_broken: false,
+        }
+    }
+
+    /// The exhaustion window is the breakers' own 2 + 1 ladder, one level up
+    /// — never a separately tuned count.
+    #[test]
+    fn exhaustion_window_is_the_breaker_ladder() {
+        assert_eq!(STEP_EXHAUSTION_AFTER, ZERO_INFO_BREAKER_AFTER);
+    }
+
+    #[test]
+    fn successful_results_identify_by_full_output() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v1", true)],
+            "",
+        ));
+        // Byte-identical repeat: nothing new.
+        assert!(!iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v1", true)],
+            "",
+        ));
+        // Same call, NEW output — the world changed; that is information.
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v2", true)],
+            "",
+        ));
+    }
+
+    /// Failures identify by their first line (the harness's
+    /// failure-signature normalization): a breaker notice whose embedded
+    /// counter ticks up must not mint fresh "information" every repeat.
+    #[test]
+    fn failures_identify_by_first_line_only() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: missing brace
+context 1", false)],
+            "",
+        ));
+        assert!(!iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: missing brace
+context 2 (attempt 4)", false)],
+            "",
+        ));
+        // A DIFFERENT failure teaches something.
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: type mismatch
+...", false)],
+            "",
+        ));
+    }
+
+    #[test]
+    fn text_counts_once_and_empty_never_counts() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(&mut seen, &[], "I found the bug."));
+        assert!(!iteration_produced_information(&mut seen, &[], "I found the bug."));
+        assert!(!iteration_produced_information(&mut seen, &[], "   "));
+        assert!(iteration_produced_information(&mut seen, &[], "Now fixing it."));
+    }
+
+    /// The synthesized report announces itself, keeps newest calls, and stays
+    /// inside the harness's one-screenful feed-forward bound.
+    #[test]
+    fn step_activity_digest_is_bounded_and_announces() {
+        assert!(step_activity_digest(&[]).contains("no tool calls"));
+        let records: Vec<ToolCallRecord> = (0..200)
+            .map(|i| record("write_file", &format!("f{i}"), &format!("wrote {i} bytes"), i % 3 != 0))
+            .collect();
+        let digest = step_activity_digest(&records);
+        assert!(digest.starts_with("[step report synthesized"));
+        assert!(digest.contains("write_file"));
+        assert!(digest.contains("FAILED"), "failures must be visible");
+        assert!(digest.contains("earlier calls"), "the cut must announce itself");
+        assert!(
+            digest.len() <= crate::harness::STEP_RESULT_TAIL_MAX_BYTES + 120,
+            "digest must stay one screenful, got {}",
+            digest.len()
+        );
+        // Newest call survives the cut.
+        assert!(digest.contains("wrote 199 bytes"));
+    }
+
+    /// The wrap-up instruction demands the report and forbids more tools —
+    /// and only PROMPTS the completion claim, never asserts it.
+    #[test]
+    fn wrapup_message_states_the_contract() {
+        let msg = step_wrapup_message(Some("build minidb"), "the last 3 iterations produced no new information");
+        assert!(msg.contains("build minidb"), "anchored to the task");
+        assert!(msg.contains("Tool use for this step is over"));
+        assert!(msg.contains("Do not call tools"));
+        assert!(msg.contains("If the task's done-condition is met"));
+        assert!(msg.contains("TASK COMPLETE"));
+    }
+
+    /// A degenerate exit is reported out-of-band on the response — nudge
+    /// fired, zero tool calls — and never when the run acted.
+    #[test]
+    fn degenerate_loop_flag_requires_nudge_and_zero_tools() {
+        let mut state = RunState::new();
+        state.narration_nudged = true;
+        assert!(state.into_response(false).degenerate_loop);
+
+        let mut state = RunState::new();
+        state.narration_nudged = true;
+        state.tool_records.push(record("exec", "x", "ok", true));
+        assert!(!state.into_response(false).degenerate_loop);
+
+        let state = RunState::new();
+        assert!(!state.into_response(false).degenerate_loop);
     }
 }

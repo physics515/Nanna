@@ -108,7 +108,7 @@ export default defineNuxtConfig({
         '@tiptap/vue-3',
         'class-variance-authority',
         'clsx',
-        'lucide-vue-next',
+        '@lucide/vue',
         'marked',
         'monaco-editor',
         'radix-vue',

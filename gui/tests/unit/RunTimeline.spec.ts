@@ -13,19 +13,18 @@ import type { TimelineEntry } from '~/composables/useSessionState'
  */
 
 const stubs = {
-  ThinkingCard: {
-    props: ['content', 'isActive'],
+  NuiThinkingMessage: {
+    props: ['content', 'active'],
     template: '<div data-testid="thinking" />',
   },
-  ToolCallCard: {
+  NuiToolCallMessage: {
     props: ['toolCall', 'status', 'timestamp', 'tokens', 'totalTokens'],
-    template: '<div data-testid="tool" />',
+    template: '<div data-testid="tool" :data-status="status" />',
   },
-  MessageBubble: {
-    props: ['variant'],
+  NuiMessage: {
+    props: ['role', 'accent', 'author'],
     template: '<div data-testid="bubble"><slot /></div>',
   },
-  UiAvatar: { template: '<span />' },
   MarkdownContent: {
     props: ['content'],
     template: '<div data-testid="markdown">{{ content }}</div>',
@@ -112,5 +111,22 @@ describe('RunTimeline', () => {
       tool('write_file'),
     ])
     expect(wrapper.findAll('[data-testid="thinking"]')).toHaveLength(1)
+  })
+
+  /**
+   * A breaker replay reports success=false because the tool never ran and there
+   * is no tool result — but nothing failed. A wall of them rendered as red
+   * failures is what made ordinary harness steering read as breakage.
+   */
+  it('renders a short-circuited replay as steering, not error', () => {
+    const replay = { ...tool('read_file'), success: false, short_circuited: true } as TimelineEntry
+    const wrapper = mountTimeline([replay])
+    expect(wrapper.get('[data-testid="tool"]').attributes('data-status')).toBe('steering')
+  })
+
+  it('still renders a genuine tool failure as an error', () => {
+    const failed = { ...tool('exec'), success: false } as TimelineEntry
+    const wrapper = mountTimeline([failed])
+    expect(wrapper.get('[data-testid="tool"]').attributes('data-status')).toBe('error')
   })
 })

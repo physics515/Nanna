@@ -152,7 +152,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
 import draggable from 'vuedraggable'
-import { GripVertical, X, Plus, Search } from 'lucide-vue-next'
+import { GripVertical, X, Plus, Search } from '@lucide/vue'
 
 export interface ModelOption {
   id: string

@@ -170,7 +170,10 @@ impl ControlPlane {
             WorkspaceAction::Reload { id } => {
                 let mut registry = self.workspaces.write().await;
                 if let Some(ws) = registry.get_mut(&id) {
-                    match ws.load_context().await {
+                    // An explicit user-driven reload of ONE workspace, so it
+                    // takes the git snapshot too — that is what the caller is
+                    // asking to refresh.
+                    match ws.load_context_with_git().await {
                         Ok(()) => {
                             info!("Reloaded workspace context: {}", ws.name);
                             json!({ 

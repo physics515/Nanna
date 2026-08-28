@@ -1,6 +1,6 @@
 export default {
   name: "read_file",
-  version: "0.1.1",
+  version: "0.1.3",
   output: "memory",
   description: "Read a file from the filesystem. Returns the file contents with line numbers. Supports optional offset and limit for reading portions of large files.",
   parameters: {
@@ -29,7 +29,19 @@ export default {
       stat = Nanna.stat(filePath);
     } catch (e) {
       return {
-        content: "read_file: '" + filePath + "' does not exist (or is unreadable). Nothing was read. Check the path with exec `ls`, or create the file first if you meant to write it.",
+        content: "read_file: '" + filePath + "' does not exist (or is unreadable). Nothing was read. Check the path, or create the file first if you meant to write it.",
+        success: false
+      };
+    }
+    // The converse of the listing tools' file-for-directory case, and the
+    // stat that answers it is already in hand — zero extra syscalls. It also
+    // closes a latent uncaught throw: Nanna.readFile on a directory raises
+    // OUTSIDE any try here, so it escaped as an "Execution failed:" prefix,
+    // exactly what lines 17-19 above say must never happen.
+    if (stat.is_dir) {
+      return {
+        content: "read_file: '" + filePath + "' is a DIRECTORY, not a file — use list_dir to " +
+          "see its contents. Nothing was read.",
         success: false
       };
     }
@@ -38,6 +50,57 @@ export default {
     }
 
     var content = Nanna.readFile(filePath);
+
+    // Read-recency mark (P22 Tier 3): record that the session saw this
+    // file's content NOW. write_file/file_buffer consult these marks — a
+    // shrinking whole-file rewrite of a file that CHANGED after its last
+    // recorded read is held once and answered with the current content
+    // (the blind-rewrite guard; design comment in write_file). A partial
+    // read counts: the guard exists to catch zero-read rewrites from a
+    // stale context copy, not to police how much of the file was viewed
+    // (fail-open bias). Key normalization mirrors write_file's canonical
+    // ledger key exactly, or the mark misses. All I/O is best-effort.
+    try {
+      var READMARK_STATE = ".nanna/read_marks.json";
+      var READMARK_MAX_ENTRIES = 200;
+      var normKey = function(path) {
+        var k = path.split("\\").join("/").toLowerCase();
+        while (k.indexOf("./") === 0) k = k.substring(2);
+        while (k.indexOf("//") !== -1) k = k.split("//").join("/");
+        return k;
+      };
+      var markKey = normKey(String(filePath));
+      try {
+        var wd = Nanna.workdir();
+        if (wd) {
+          var w = normKey(String(wd));
+          if (w.charAt(w.length - 1) !== "/") w += "/";
+          if (markKey.indexOf(w) === 0 && markKey.length > w.length) markKey = markKey.substring(w.length);
+        }
+      } catch (eWd) {
+        // No workdir — the raw spelling is the key, as in the ledger.
+      }
+      var marks;
+      try {
+        marks = JSON.parse(Nanna.readFile(READMARK_STATE));
+        if (!marks || typeof marks !== "object" || Array.isArray(marks)) marks = {};
+      } catch (eLd) {
+        marks = {};
+      }
+      marks[markKey] = { at: Date.now() };
+      var mKeys = Object.keys(marks);
+      if (mKeys.length > READMARK_MAX_ENTRIES) {
+        mKeys.sort(function(a, b) {
+          return ((marks[a] && marks[a].at) || 0) - ((marks[b] && marks[b].at) || 0);
+        });
+        var evict = mKeys.length - READMARK_MAX_ENTRIES;
+        for (var ev = 0; ev < evict; ev++) delete marks[mKeys[ev]];
+      }
+      Nanna.writeFile(READMARK_STATE, JSON.stringify(marks));
+    } catch (eMark) {
+      // Marks are an aid to the write guards, never a reason a read fails.
+    }
+
     var lines = content.split("\n");
     var totalLines = lines.length;
 

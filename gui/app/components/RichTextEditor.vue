@@ -13,12 +13,18 @@ import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
-import Link from '@tiptap/extension-link'
+// Link is NOT imported separately any more: Tiptap 3's StarterKit registers
+// `link` itself, so adding it again is a duplicate extension name — Tiptap
+// keeps the first registration and drops the second, which would have silently
+// discarded the `autolink: false` below. It is configured through the kit.
 import TaskList from '@tiptap/extension-task-list'
 import TaskItem from '@tiptap/extension-task-item'
 import Image from '@tiptap/extension-image'
 import Typography from '@tiptap/extension-typography'
 import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
+// Markdown ↔ Tiptap conversion lives in lib/ so the outbound path (the one
+// that decides what the daemon actually receives) is unit-testable.
+import { jsonToMarkdown, markdownToHtml } from '~/lib/tiptapMarkdown'
 
 const props = withDefaults(defineProps<{
   modelValue?: string
@@ -54,12 +60,21 @@ const emit = defineEmits<{
 // ── Build extensions list ──
 function buildExtensions() {
   const exts: any[] = [
-    StarterKit.configure({ codeBlock: false }),
-    MonacoCodeBlock,
-    Link.configure({
-      openOnClick: !props.editable,
-      HTMLAttributes: { class: 'text-nanna-accent hover:underline' },
+    StarterKit.configure({
+      codeBlock: false,
+      link: {
+        openOnClick: !props.editable,
+        // Content integrity: what leaves the composer must be what the user
+        // typed or pasted. Autolink rewrites bare text as it is entered — a
+        // pasted "test_01.sh" came out as "test_[01.sh](http://01.sh)" because
+        // ".sh" is a live TLD, and that corrupted mission text reached the
+        // model. Only the READ-ONLY view (rendering markdown we received) keeps
+        // autolinking, where there is no outbound text to corrupt.
+        autolink: !props.editable,
+        HTMLAttributes: { class: 'text-nanna-accent hover:underline' },
+      },
     }),
+    MonacoCodeBlock,
     Placeholder.configure({
       placeholder: props.placeholder,
       emptyEditorClass: 'is-empty',
@@ -181,201 +196,12 @@ defineExpose({ editor, isEmpty, focus, clear, getContent })
 // ═══════════════════════════════════════════════════════════
 // Markdown ↔ Tiptap conversion
 // ═══════════════════════════════════════════════════════════
+// See ~/lib/tiptapMarkdown — markdownToHtml / jsonToMarkdown are imported
+// above so the outbound conversion can be tested without an editor instance.
 
-function markdownToHtml(md: string): string {
-  if (!md) return ''
-
-  const lines = md.split('\n')
-  const html: string[] = []
-  let i = 0
-
-  while (i < lines.length) {
-    const line = lines[i]
-
-    // Fenced code blocks → MonacoCodeBlock node
-    if (line.startsWith('```')) {
-      const lang = line.slice(3).trim()
-      const codeLines: string[] = []
-      i++
-      while (i < lines.length && !lines[i].startsWith('```')) {
-        codeLines.push(lines[i])
-        i++
-      }
-      i++ // skip closing ```
-      const content = codeLines.join('\n')
-      // MonacoCodeBlock is an atom node — set attrs via data attributes
-      html.push(`<monaco-code-block language="${escAttr(lang)}" content="${escAttr(content)}"></monaco-code-block>`)
-      continue
-    }
-
-    // Headings
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)/)
-    if (headingMatch) {
-      const level = headingMatch[1].length
-      html.push(`<h${level}>${inlineMd(headingMatch[2])}</h${level}>`)
-      i++
-      continue
-    }
-
-    // Blockquote
-    if (line.startsWith('> ')) {
-      const quoteLines: string[] = []
-      while (i < lines.length && lines[i].startsWith('> ')) {
-        quoteLines.push(lines[i].slice(2))
-        i++
-      }
-      html.push(`<blockquote><p>${inlineMd(quoteLines.join('<br>'))}</p></blockquote>`)
-      continue
-    }
-
-    // Task list
-    if (line.match(/^- \[([ x])\]\s/)) {
-      const items: string[] = []
-      while (i < lines.length) {
-        const tm = lines[i].match(/^- \[([ x])\]\s+(.*)/)
-        if (!tm) break
-        const checked = tm[1] === 'x' ? ' data-checked="true"' : ''
-        items.push(`<li data-type="taskItem"${checked}><p>${inlineMd(tm[2])}</p></li>`)
-        i++
-      }
-      html.push(`<ul data-type="taskList">${items.join('')}</ul>`)
-      continue
-    }
-
-    // Unordered list
-    if (line.match(/^[-*]\s+/)) {
-      const items: string[] = []
-      while (i < lines.length && lines[i].match(/^[-*]\s+/)) {
-        items.push(`<li><p>${inlineMd(lines[i].replace(/^[-*]\s+/, ''))}</p></li>`)
-        i++
-      }
-      html.push(`<ul>${items.join('')}</ul>`)
-      continue
-    }
-
-    // Ordered list
-    if (line.match(/^\d+\.\s+/)) {
-      const items: string[] = []
-      while (i < lines.length && lines[i].match(/^\d+\.\s+/)) {
-        items.push(`<li><p>${inlineMd(lines[i].replace(/^\d+\.\s+/, ''))}</p></li>`)
-        i++
-      }
-      html.push(`<ol>${items.join('')}</ol>`)
-      continue
-    }
-
-    // HR
-    if (line.match(/^---+$/)) {
-      html.push('<hr>')
-      i++
-      continue
-    }
-
-    // Image
-    const imgMatch = line.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
-    if (imgMatch) {
-      html.push(`<img src="${escAttr(imgMatch[2])}" alt="${escAttr(imgMatch[1])}" />`)
-      i++
-      continue
-    }
-
-    // Empty line
-    if (!line.trim()) { i++; continue }
-
-    // Paragraph
-    html.push(`<p>${inlineMd(line)}</p>`)
-    i++
-  }
-
-  return html.join('')
-}
-
-function inlineMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/~~(.+?)~~/g, '<s>$1</s>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
-}
-
-function escAttr(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-// ── Tiptap JSON → Markdown ──
 function getMarkdownContent(ed: any): string {
   if (!ed) return ''
   return jsonToMarkdown(ed.getJSON())
-}
-
-function jsonToMarkdown(doc: any): string {
-  if (!doc.content) return ''
-
-  return doc.content.map((node: any) => {
-    switch (node.type) {
-      case 'paragraph':
-        return nodeContentToText(node)
-      case 'heading': {
-        const level = node.attrs?.level || 1
-        return '#'.repeat(level) + ' ' + nodeContentToText(node)
-      }
-      case 'monacoCodeBlock': {
-        const lang = node.attrs?.language || ''
-        const code = node.content?.[0]?.text || node.attrs?.content || ''
-        return '```' + lang + '\n' + code + '\n```'
-      }
-      case 'bulletList':
-        return node.content?.map((item: any) => '- ' + nodeContentToText(item.content?.[0])).join('\n') || ''
-      case 'orderedList':
-        return node.content?.map((item: any, i: number) => `${i + 1}. ` + nodeContentToText(item.content?.[0])).join('\n') || ''
-      case 'taskList':
-        return node.content?.map((item: any) => {
-          const checked = item.attrs?.checked ? 'x' : ' '
-          return `- [${checked}] ` + nodeContentToText(item.content?.[0])
-        }).join('\n') || ''
-      case 'blockquote':
-        return node.content?.map((p: any) => '> ' + nodeContentToText(p)).join('\n') || ''
-      case 'horizontalRule':
-        return '---'
-      case 'image':
-        return `![${node.attrs?.alt || ''}](${node.attrs?.src || ''})`
-      default:
-        return nodeContentToText(node)
-    }
-  }).reduce((acc: string, block: string, i: number, arr: string[]) => {
-    if (i === 0) return block
-    const prev = arr[i - 1]
-    const isCodeBlock = block.startsWith('```')
-    const prevIsCodeBlock = prev.endsWith('```')
-    if (isCodeBlock || prevIsCodeBlock) return acc + '\n' + block
-    return acc + '\n\n' + block
-  }, '').trim()
-}
-
-function nodeContentToText(node: any): string {
-  if (!node?.content) return ''
-  return node.content.map((item: any) => {
-    if (item.type === 'image') {
-      return `![${item.attrs?.alt || ''}](${item.attrs?.src || ''})`
-    }
-    let text = item.text || ''
-    if (item.marks) {
-      for (const mark of item.marks) {
-        switch (mark.type) {
-          case 'bold': text = `**${text}**`; break
-          case 'italic': text = `*${text}*`; break
-          case 'strike': text = `~~${text}~~`; break
-          case 'code': text = '`' + text + '`'; break
-          case 'link': text = `[${text}](${mark.attrs?.href || ''})`; break
-        }
-      }
-    }
-    return text
-  }).join('')
 }
 </script>
 

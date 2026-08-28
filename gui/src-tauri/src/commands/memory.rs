@@ -177,6 +177,24 @@ pub async fn set_dreaming_enabled(
     Ok(())
 }
 
+/// Set whether messages are automatically remembered (persisted to config +
+/// pushed to the daemon).
+#[tauri::command]
+pub async fn set_auto_remember_messages(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.memory.auto_remember_messages = enabled;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {e}"))?;
+    let _ = state_guard
+        .backend
+        .config_set("memory.auto_remember_messages", serde_json::json!(enabled))
+        .await;
+    info!("Auto-remember messages set: {enabled}");
+    Ok(())
+}
+
 /// Set max compression ratio for memory consolidation (persisted to config +
 /// pushed to the daemon).
 #[tauri::command]

@@ -298,6 +298,23 @@ impl ScriptEngine {
         }
     }
 
+    /// The deadline an OUTER supervisor must enforce for one call so that this
+    /// engine's deadline always fires first.
+    ///
+    /// `base_ms` is the tool's configured deadline and `requested_timeout` is
+    /// the call's raw `timeout` input, parsed here by the same rule the engine
+    /// applies to itself, so a supervisor cannot disagree with the engine about
+    /// what was asked for. The answer is the deadline this engine will really
+    /// enforce plus one more [`ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`]: every layer
+    /// sits one handoff above the layer it supervises, which is what makes the
+    /// inner, better-informed message win by construction instead of by luck.
+    /// Only ever longer than `base_ms`, never shorter.
+    #[must_use]
+    pub fn supervising_timeout_ms(base_ms: u64, requested_timeout: Option<&Value>) -> u64 {
+        extend_for_requested(base_ms, requested_timeout_secs(requested_timeout))
+            .saturating_add(ENGINE_TIMEOUT_HANDOFF_MARGIN_MS)
+    }
+
     /// Check which engines are available
     #[must_use]
     pub fn available_engines(&self) -> Vec<EngineKind> {
@@ -326,6 +343,29 @@ impl Default for ScriptEngine {
 /// marshaling), all sub-second, with margin.
 const ENGINE_TIMEOUT_HANDOFF_MARGIN_MS: u64 = 10_000;
 
+/// The command deadline (seconds) a call asks the shell bridge for, if any.
+///
+/// Takes the raw input value so every layer that needs this number parses it by
+/// the same rule: a non-integer or zero `timeout` is no request at all.
+fn requested_timeout_secs(requested: Option<&Value>) -> Option<u64> {
+    requested.and_then(Value::as_u64).filter(|&s| s > 0)
+}
+
+/// Extend `base_ms` to outlive a requested command deadline.
+///
+/// Adds [`ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`] on top of the request. Only ever
+/// extends; a call with no meaningful request keeps `base_ms`. An overflowing
+/// request is treated as no request rather than saturating to eternity.
+fn extend_for_requested(base_ms: u64, requested_secs: Option<u64>) -> u64 {
+    let requested_ms = requested_secs
+        .and_then(|s| s.checked_mul(1000))
+        .map(|ms| ms.saturating_add(ENGINE_TIMEOUT_HANDOFF_MARGIN_MS));
+    match requested_ms {
+        Some(req) => base_ms.max(req),
+        None => base_ms,
+    }
+}
+
 /// Compute the effective script-engine deadline for one execution.
 ///
 /// Extends `base_ms` (the tool's configured deadline) to cover a `timeout`
@@ -333,16 +373,7 @@ const ENGINE_TIMEOUT_HANDOFF_MARGIN_MS: u64 = 10_000;
 /// for a command — plus [`ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`]. Only ever extends;
 /// a tool with no `timeout` input (or a zero/absent one) keeps `base_ms`.
 fn effective_timeout_ms(base_ms: u64, input: &Value) -> u64 {
-    let requested_ms = input
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .filter(|&s| s > 0)
-        .and_then(|s| s.checked_mul(1000))
-        .map(|ms| ms.saturating_add(ENGINE_TIMEOUT_HANDOFF_MARGIN_MS));
-    match requested_ms {
-        Some(req) => base_ms.max(req),
-        None => base_ms,
-    }
+    extend_for_requested(base_ms, requested_timeout_secs(input.get("timeout")))
 }
 
 /// Detect if a script uses features that Boa can't handle.
@@ -395,6 +426,43 @@ mod tests {
         let base = 180_000;
         let input = serde_json::json!({ "timeout": 5 });
         assert_eq!(effective_timeout_ms(base, &input), base);
+    }
+
+    #[test]
+    fn supervising_timeout_outlives_the_engines_own_deadline() {
+        // The registry's backstop must sit strictly above whatever this engine
+        // will enforce, for BOTH shapes of call: one that requests a longer
+        // command deadline, and one that requests nothing at all. The second is
+        // the case that used to lose the race — two nominally equal deadlines,
+        // and the outer one fires while the tool is still writing its answer.
+        let base = 180_000;
+
+        let long = serde_json::json!({ "command": "cargo build", "timeout": 600 });
+        assert!(
+            ScriptEngine::supervising_timeout_ms(base, long.get("timeout"))
+                > effective_timeout_ms(base, &long)
+        );
+
+        let plain = serde_json::json!({ "command": "cargo build" });
+        assert!(
+            ScriptEngine::supervising_timeout_ms(base, plain.get("timeout"))
+                > effective_timeout_ms(base, &plain)
+        );
+    }
+
+    #[test]
+    fn supervising_timeout_never_shortens() {
+        // A small or malformed request must never pull the supervisor below the
+        // tool's configured base.
+        let base = 180_000;
+        for requested in [
+            serde_json::json!(5),
+            serde_json::json!(0),
+            serde_json::json!("soon"),
+        ] {
+            assert!(ScriptEngine::supervising_timeout_ms(base, Some(&requested)) > base);
+        }
+        assert!(ScriptEngine::supervising_timeout_ms(base, None) > base);
     }
 
     #[test]

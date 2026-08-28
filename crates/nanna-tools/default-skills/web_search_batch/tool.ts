@@ -21,7 +21,11 @@ export default {
 
     var apiKey = Nanna.getEnv("BRAVE_API_KEY");
     if (!apiKey) {
-      return "Error: BRAVE_API_KEY not set. Configure it in your environment or nanna config.";
+      // Neither route the old text named is reachable from a tool call: a
+      // child shell cannot mutate the daemon's live process environment, and
+      // the config field has no consumer. Advice that cannot be followed reads
+      // as "try again" and gets retried.
+      return "web_search is unavailable in this session: no BRAVE_API_KEY is set in the daemon's environment. No query was run. Use web_fetch on a known URL, or ask the user to set the key and restart the daemon.";
     }
 
     var sections = [];

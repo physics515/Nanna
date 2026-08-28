@@ -1,6 +1,6 @@
 export default {
   name: "project_structure",
-  version: "0.2.0",
+  version: "0.2.1",
   timeout: 120,
   output: "memory",
   description: "Show the directory tree of a project: names, nesting and file sizes. Reads no file contents, so it reports no line counts - use code_search or read_file for what is inside a file. Noise dirs (node_modules, .git, target, ...) are shown but never descended into.",
@@ -152,7 +152,18 @@ export default {
           // The root itself is unreadable: a structured failure, never a throw.
           // A thrown script error reaches the model under an "Execution
           // failed:" prefix, which reads as breakage rather than as a fixable
-          // call.
+          // call. The commonest cause is a FILE path, whose os error ("The
+          // directory name is invalid", ENOTDIR) teaches nothing — one stat,
+          // on an already-failed call, turns it into the correction, and that
+          // stat has its own try so this error path can never itself throw.
+          if (pathIsFile(rootPath)) {
+            return {
+              content: "project_structure: \"" + rootPath + "\" exists but is a FILE, not a " +
+                "directory — use read_file to see its contents (or search_file to search it). " +
+                "Nothing was walked.",
+              success: false
+            };
+          }
           return {
             content: "project_structure failed: cannot list \"" + rootPath + "\": " + String(e) +
               ". Nothing was walked. Check that the path exists, is a directory, and is " +
@@ -362,6 +373,19 @@ function nodeLabel(node) {
     return node.name + "/" + node.mark;
   }
   return node.name + "  " + formatSize(node.size) + node.mark;
+}
+
+// Is this path a file? Asked only on a path that already failed as a directory,
+// so it costs one metadata call on a path the tool was going to give up on
+// anyway. The stat sits in its OWN try: an error path that throws is worse than
+// the error it was explaining.
+function pathIsFile(path) {
+  try {
+    var st = Nanna.stat(path);
+    return !!(st && st.is_file);
+  } catch (e) {
+    return false;
+  }
 }
 
 // Marks carry a leading space so they concatenate onto a label; the notes quote

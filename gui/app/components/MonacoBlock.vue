@@ -35,7 +35,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
-import { Copy, Check } from 'lucide-vue-next'
+import { Copy, Check } from '@lucide/vue'
 
 const props = withDefaults(defineProps<{
   modelValue?: string

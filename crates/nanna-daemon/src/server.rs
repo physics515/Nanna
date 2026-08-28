@@ -41,7 +41,13 @@ const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
     tools: Arc<ToolRegistry>,
-    agent_config: nanna_agent::AgentConfig,
+    /// Read at spawn, never at construction: a sub-agent must run on the
+    /// model and summarization list the user has NOW, not the ones the daemon
+    /// booted with. `model_routing`/`routing_first_turn_primary` stay pinned
+    /// below because they are this spawner's own sub-agent policy, not user
+    /// config.
+    agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    sub_agent_routing: Vec<nanna_agent::ModelTier>,
     system_prompt: String,
     workspace_root: Option<PathBuf>,
     workspace_context: Option<String>,
@@ -51,6 +57,9 @@ struct AgentSpawnerImpl {
     /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
     /// sub-agent list already means "the main chat list". Never empty.
     sub_agent_models: Vec<String>,
+    /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
+    /// chats on that plane — same `run_chat_turn` path as a user turn.
+    control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
 }
 
 #[async_trait]
@@ -61,23 +70,39 @@ impl AgentSpawner for AgentSpawnerImpl {
         description: &str,
         max_iterations: Option<usize>,
     ) -> Result<SpawnResult, String> {
-        use nanna_agent::{Agent, AgentContext, RunOptions};
-
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
+
+        // One live read for the whole spawn: the model list, the chat model
+        // it falls back to, and the summarization list the sub-agent inherits
+        // all come from the config as it stands right now.
+        let (base_config, sub_agent_models) = {
+            let live = self.agent_config_src.read().await;
+            (
+                crate::agent_service::agent_config_from(&live),
+                live.sub_agent_models.clone(),
+            )
+        };
 
         // Fallback chain: first working model wins. A candidate whose
         // provider is missing is skipped; a candidate whose run fails hands
         // the prompt to the next (a fresh agent — sub-agent runs are
         // idempotent by contract, the parent only consumes the final text).
-        let candidates = if self.sub_agent_models.is_empty() {
-            vec![self.agent_config.model.clone()]
+        let candidates = if sub_agent_models.is_empty() {
+            vec![base_config.model.clone()]
         } else {
-            self.sub_agent_models.clone()
+            sub_agent_models.clone()
+        };
+
+        let control = self.control.read().await.clone();
+        let Some(control) = control else {
+            return Err(
+                "Sub-agent chat path is not bound yet (control plane not ready).".to_string(),
+            );
         };
 
         let mut last_error = String::new();
         for (attempt, model_spec) in candidates.iter().enumerate() {
-            let Some(llm_client) = self.router.client_for_model(model_spec) else {
+            if self.router.client_for_model(model_spec).is_none() {
                 last_error = format!(
                     "No provider available for model '{}'. Available providers: {:?}",
                     model_spec,
@@ -85,73 +110,61 @@ impl AgentSpawner for AgentSpawnerImpl {
                 );
                 warn!(model = %model_spec, "Sub-agent model has no provider — trying next");
                 continue;
-            };
-
-            // Fresh isolated context per attempt: a failed candidate must not
-            // leak partial state into the next one.
-            let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
-                .with_system_prompt(&self.system_prompt);
-            if let Some(ref ws_root) = self.workspace_root {
-                context.workspace_root = Some(ws_root.clone());
             }
-            if let Some(ref ws_ctx) = self.workspace_context {
-                context.workspace_context = Some(ws_ctx.clone());
-            }
-
-            // Configure agent — sub-agents are full agents, no artificial iteration cap
-            let mut config = self.agent_config.clone();
-            config.max_iterations = max_iterations;
-            let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
-            // Strip provider prefix from model name for the actual API call
-            config.model = LlmRouter::strip_model_prefix(model_spec);
 
             if attempt > 0 {
                 info!(model = %model_spec, attempt, "Sub-agent model attempt");
             }
 
-            let mut agent =
-                Agent::new(config, llm_client, self.tools.clone()).with_context(context);
+            let session = control
+                .sessions
+                .create(Some(format!("sub-agent: {description}")))
+                .await;
+            let session_id = session.id.clone();
+            info!(
+                description,
+                session_id = %session_id,
+                model = %model_spec,
+                attempt = attempt + 1,
+                of = candidates.len(),
+                max_iterations = ?max_iterations,
+                "Starting sub-agent as a managed chat"
+            );
 
-            // Share model stats tracker with sub-agents
-            if let Some(ref tracker) = self.stats {
-                agent = agent.with_stats(tracker.clone());
-            }
-
-            let options = RunOptions {
-                max_iterations,
-                is_sub_agent: true,
-                all_tools_active: true,
-                ..Default::default()
-            };
-
-            // Run without timeout — agent stops when done or cancelled
-            match agent.run(prompt, options).await {
-                Ok(result) => {
+            match control.run_chat_turn(&session_id, prompt).await {
+                Ok(_) => {
+                    control.chat_runs.wait_until_idle(&session_id).await;
+                    let text = last_assistant_text(&control.sessions, &session_id).await;
+                    if text.trim().is_empty() {
+                        last_error = format!(
+                            "Sub-agent on '{model_spec}' finished with no output (session {session_id})"
+                        );
+                        warn!(model = %model_spec, session_id = %session_id, "{last_error}");
+                        continue;
+                    }
                     info!(
-                        description = description,
-                        model = %model_display,
-                        iterations = result.iterations,
-                        tool_calls = result.tool_calls.len(),
-                        input_tokens = result.input_tokens,
-                        output_tokens = result.output_tokens,
-                        "Sub-agent completed"
+                        description,
+                        session_id = %session_id,
+                        model = %model_spec,
+                        "Sub-agent chat completed"
                     );
                     return Ok(SpawnResult {
-                        text: result.text,
-                        iterations: result.iterations,
-                        tool_calls: result.tool_calls.len(),
-                        input_tokens: result.input_tokens,
-                        output_tokens: result.output_tokens,
-                        model: model_display,
+                        text,
+                        iterations: 0,
+                        tool_calls: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        model: model_spec.clone(),
                     });
                 }
                 Err(e) => {
-                    last_error = format!("Sub-agent error on '{model_display}': {e}");
+                    last_error = format!("Sub-agent chat failed on '{model_spec}': {e}");
                     warn!(
-                        model = %model_display,
+                        model = %model_spec,
+                        session_id = %session_id,
                         error = %e,
                         remaining = candidates.len() - attempt - 1,
-                        "Sub-agent model failed — falling back"
+                        "Sub-agent chat failed — falling back"
                     );
                 }
             }
@@ -164,6 +177,19 @@ impl AgentSpawner for AgentSpawnerImpl {
             last_error
         ))
     }
+}
+
+async fn last_assistant_text(sessions: &SessionManager, session_id: &str) -> String {
+    let Some(session) = sessions.get(session_id).await else {
+        return String::new();
+    };
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::session::MessageRole::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Concrete implementation of ParentChannel that lives in the daemon.
@@ -313,6 +339,41 @@ use std::time::Duration;
 /// This allows the `session.history` service to return messages for the current session.
 pub type SharedSessionHistory = Arc<tokio::sync::RwLock<Vec<crate::session::SessionMessage>>>;
 
+/// Stamp a `memory.store` call's declared provenance onto its tags.
+///
+/// Until now the service wrote only the caller's `tags`, so a memory saved
+/// through the `remember` TOOL carried no `fact_type` at all — and the drift
+/// pin (`nanna_memory::is_verbatim_pinned`) can only protect what it can
+/// identify, so the memories a user most explicitly asked to keep were the ones
+/// it could never protect. This closes that, without letting the tool
+/// over-claim: the classification is `MemoryProvenance::from_label`, the SAME
+/// rule the extraction path uses, so only an explicit case-insensitive
+/// `"stated"` yields `stated` and everything else — absent, empty, misspelt —
+/// is `observed`.
+///
+/// A caller-supplied `fact_type` in `tags` is respected as the declaration if
+/// no explicit `provenance` field is given, so a script that already stamps the
+/// key keeps working; either way the value is re-classified rather than
+/// trusted verbatim, so `tags: {fact_type: "STATED-ish"}` cannot smuggle a pin.
+fn tags_with_provenance(
+    mut tags: HashMap<String, String>,
+    params: &serde_json::Value,
+) -> HashMap<String, String> {
+    let declared = params
+        .get("provenance")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| tags.get("fact_type").cloned())
+        .unwrap_or_default();
+    let provenance = nanna_agent::MemoryProvenance::from_label(&declared);
+    tags.insert("fact_type".to_string(), provenance.as_str().to_string());
+    debug_assert!(
+        tags.get("fact_type").is_some_and(|f| f == "stated" || f == "observed"),
+        "fact_type is a closed set"
+    );
+    tags
+}
+
 /// Resolve a memory handle — including one whose memory has since been
 /// consolidated away by dreaming.
 ///
@@ -352,17 +413,21 @@ async fn assemble_handle_content(
     let Some(source_id) = entry.metadata.get("source_id") else {
         return entry.content.clone();
     };
+    // `chunk` is `"i/N"`: the position, and the count the stub promised.
+    let mut expected_count = 0_usize;
     let mut chunks: Vec<(usize, String)> = memory
         .list_all()
         .await
         .into_iter()
         .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
         .map(|e| {
-            let idx = e
-                .metadata
-                .get("chunk")
+            let mark = e.metadata.get("chunk");
+            let idx = mark
                 .and_then(|c| c.split('/').next()?.parse::<usize>().ok())
                 .unwrap_or(1);
+            if let Some(total) = mark.and_then(|c| c.split('/').nth(1)?.parse::<usize>().ok()) {
+                expected_count = expected_count.max(total);
+            }
             (idx, e.content)
         })
         .collect();
@@ -370,11 +435,59 @@ async fn assemble_handle_content(
         return entry.content.clone();
     }
     chunks.sort_by_key(|(idx, _)| *idx);
-    chunks
+    let found_count = chunks.len();
+    let assembled = chunks
         .into_iter()
         .map(|(_, content)| content)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // Say so when fewer rows came back than the stub promised. Dreaming
+    // REPLACES clusters, so a result whose chunks have been partly
+    // consolidated away reassembles short — and returning that silently is the
+    // exact failure this function was written to end: a model reading a
+    // fraction of a run and being told nothing was missing reports on what it
+    // saw. `expected_count` is 0 when no row carried an `i/N` mark, which is
+    // not evidence of loss, so that case says nothing.
+    if expected_count > found_count {
+        let missing_count = expected_count - found_count;
+        return format!(
+            "{assembled}\n\n[SYSTEM: {found_count} of {expected_count} stored chunks were \
+             reassembled — {missing_count} are no longer in the store as separate rows, most \
+             likely folded into a consolidated memory by a dream cycle. What is above is \
+             complete for the chunks that remain, and the artifact itself is unaffected: read \
+             it back off disk if you need the whole thing.]"
+        );
+    }
+    assembled
+}
+
+/// The byte range of `content` that one `memory.get` page covers.
+///
+/// Rust panics when a byte index splits a char, and what is stored behind a
+/// handle is tool and model output — an em dash in an `edit_file` error is
+/// what killed the daemon — so both ends walk forward to the next boundary.
+/// Forward, not back, because the walked `start` is handed to the caller as
+/// the page's `offset`: a follow-up read resumes at the byte this one really
+/// began at, and no char is dropped between two pages.
+///
+/// The range is only valid for the string it was computed from. Keeping that
+/// pairing in one function is the point: the offsets were once proven against
+/// the assembled text and then used to index a single chunk of it, which is
+/// both out of bounds and off-boundary.
+fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
+    let total = content.len();
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let mut s = start;
+    while s < total && !content.is_char_boundary(s) {
+        s += 1;
+    }
+    let mut e = end;
+    while e < total && !content.is_char_boundary(e) {
+        e += 1;
+    }
+    (s, e)
 }
 
 async fn resolve_memory_handle(
@@ -510,7 +623,13 @@ fn build_script_services(
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
     turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    summarizer: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    // Router plus the LIVE config the model list is resolved from at call
+    // time. A `Vec<String>` here would be a boot snapshot, and this service
+    // outlives every `config.set` (2026-08-15).
+    summarizer: Option<(
+        Arc<crate::llm_router::LlmRouter>,
+        Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+    )>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -554,6 +673,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -667,6 +791,11 @@ fn build_script_services(
                         .get("importance")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
                     let workspace = ws.read().await.clone();
                     match mem
                         .remember_scoped(&content, tags, importance, workspace)
@@ -742,13 +871,10 @@ fn build_script_services(
                     let content = assemble_handle_content(&mem, &entry).await;
 
                     let total = content.len();
-                    let start = offset.min(total);
-                    let end = start.saturating_add(limit).min(total);
-                    // Never split a UTF-8 char.
-                    let mut s = start;
-                    while s < total && !content.is_char_boundary(s) { s += 1; }
-                    let mut e = end;
-                    while e < total && !content.is_char_boundary(e) { e += 1; }
+                    // Never split a UTF-8 char, and index the same text the
+                    // range was measured against: every field below reports on
+                    // the assembled content, so that is what the page cuts.
+                    let (s, e) = handle_page_range(&content, offset, limit);
 
                     // If the handle forwarded, SAY SO. Silently returning a
                     // consolidated narration where raw output was asked for
@@ -759,7 +885,7 @@ fn build_script_services(
                         && entry.metadata.get("source_id").is_none_or(|s| s != &id);
                     let mut out = json!({
                         "id": entry.id,
-                        "content": &entry.content[s..e],
+                        "content": &content[s..e],
                         "offset": s,
                         "returned": e - s,
                         "total": total,
@@ -844,12 +970,12 @@ fn build_script_services(
     // summarization model chain. The `day_dream` tool is the model-facing
     // half: dreaming already does this on a schedule, and this lets the model
     // ask for it deliberately when it notices related fragments piling up.
-    if let Some((router, models)) = summarizer {
+    if let Some((router, summarizer_config)) = summarizer {
         services.insert(
             "memory.summarize".to_string(),
             Arc::new(move |params: Value| {
                 let router = router.clone();
-                let models = models.clone();
+                let summarizer_config = Arc::clone(&summarizer_config);
                 Box::pin(async move {
                     let texts: Vec<String> = params
                         .get("texts")
@@ -868,6 +994,15 @@ fn build_script_services(
 ---
 
 ");
+                    // Resolved per call: whichever summarization list the
+                    // user has set right now is the one that answers.
+                    let models = {
+                        let live = summarizer_config.read().await;
+                        crate::dream_summarizer::summarization_models(
+                            &live.summarization_priority,
+                            std::slice::from_ref(&live.model),
+                        )
+                    };
                     let summarize =
                         crate::dream_summarizer::summarize_with_failover(router, models);
                     let summary = summarize(joined).await?;
@@ -1024,6 +1159,12 @@ pub struct DaemonConfig {
     /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
     /// tool actually stop executing (previously the list was parsed but ignored).
     pub tool_denylist: Vec<String>,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    /// Mirrors `[tools] audit_log`.
+    pub tool_audit_log: bool,
+    /// Include a bounded preview of tool arguments in that trail.
+    /// Mirrors `[tools] audit_log_values`.
+    pub tool_audit_log_values: bool,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -1168,6 +1309,8 @@ impl Default for DaemonConfig {
             tools_dir: None,
             tool_allowlist: None,
             tool_denylist: Vec::new(),
+            tool_audit_log: true,
+            tool_audit_log_values: false,
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -1201,18 +1344,74 @@ fn scheduled_consolidation_config(
     .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
-/// Fill `model`'s missing embeddings in bounded batches until the store is
-/// complete for it, the provider stalls, or the binding moves on — the service
-/// refuses to fill a bucket that is not the active binding, so a stale drain
-/// exits on its next pass instead of poisoning a dead provider's bucket.
-async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
-    // 64 per pass: small enough that a provider switch mid-drain is noticed
-    // within one batch, large enough to amortize the per-pass pending scan.
-    const BATCH: usize = 64;
+/// One provider request per backfill pass.
+///
+/// Bound justification: the drain's contention discipline is expressed PER
+/// REQUEST — the admission gate must be able to interpose between any two
+/// provider calls, and the repayment window is measured from one call's RTT.
+/// A batch would put a live chat turn behind the whole batch (the 2026-08-10
+/// storm was exactly three 64-entry batches: 201 POSTs in one minute) and
+/// would average the RTT signal the pacing derives its bound from. The cost —
+/// one pending-scan query per entry against local Turso — is microseconds
+/// next to the network round-trip it now paces.
+const DRAIN_STEP: usize = 1;
+
+/// Fill `model`'s missing embeddings until the store is complete for it, the
+/// provider stalls, or the binding moves on — the service refuses to fill a
+/// bucket that is not the active binding, so a stale drain exits on its next
+/// pass instead of poisoning a dead provider's bucket.
+///
+/// Contention discipline (P22 Tier 4; evidence: an embedding rebind fired 201
+/// `POST /api/embed` in one minute while a mission's opening turn queued
+/// behind them):
+///
+/// - **One drain process-wide** (`drain_serial`): the rebind path, the
+///   startup bind, and the dimension-probe correction all spawn drains, and
+///   concurrent drains would multiply the very request rate the pacing below
+///   bounds. Queued drains re-check the binding and no-op fast when stale.
+/// - **The drain yields to a live chat turn**: when the embedding provider is
+///   the local one, every pass first waits until no harness run is live.
+///   Priority, not a quota — it resumes the moment the turn releases, and a
+///   turn arriving mid-pass waits at most one in-flight embed. Remote
+///   embedding providers share nothing with a local generation slot, so they
+///   skip the gate (their writes contend with nobody's GPU).
+/// - **Each request repays its cost**: a pass that consulted the provider is
+///   followed by an idle window equal to the time the provider spent serving
+///   it. That caps the drain at half of the provider's wall-clock in ANY
+///   window, with no fixed rate constant: the bound is derived from the
+///   observed round-trip itself, so a loaded provider answering slowly earns
+///   proportionally longer gaps — the brake tightens exactly when contention
+///   rises, and a fast idle provider drains near full speed. In-flight stays
+///   at one for the same reason: the ceiling is expressed in time, and a
+///   second in-flight request would breach it by construction.
+async fn drain_backfill(
+    mem: &Arc<MemoryService>,
+    model: &str,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    drain_serial: &Arc<tokio::sync::Mutex<()>>,
+) {
+    // "provider:model" is the router's spec shape; the local provider is the
+    // one that shares its single generation slot with chat.
+    let local = model.starts_with("ollama:");
+
     loop {
-        match mem.backfill_embeddings(model, BATCH).await {
+        // The yield happens OUTSIDE `drain_serial`, and this is load-bearing.
+        // Parking on `wait_idle` while holding the one process-wide drain lock
+        // means a drain waiting for a mission to end holds that lock for the
+        // length of the mission — starving every other drain behind it,
+        // including the bounded foreground one ([`drain_queued_vectors`])
+        // whose entire reason to exist is not to wait for that mission. The
+        // lock still serializes the passes, and the repayment sleep still
+        // happens under it, so both invariants above — one drain at a time,
+        // at most half the provider's wall-clock — are unchanged.
+        if local {
+            chat_runs.wait_idle().await;
+        }
+        let _one_drain = drain_serial.lock().await;
+        let pass_started = std::time::Instant::now();
+        match mem.backfill_embeddings(model, DRAIN_STEP).await {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(_) => tokio::time::sleep(pass_started.elapsed()).await,
             Err(e) => {
                 warn!("Backfill for '{model}' halted: {e}");
                 break;
@@ -1229,15 +1428,331 @@ async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
     // backfill would put the embed latency of a whole memory inside the first
     // recall that happened to touch it.
     loop {
-        match mem.backfill_chunks(model, BATCH).await {
+        if local {
+            chat_runs.wait_idle().await;
+        }
+        let _one_drain = drain_serial.lock().await;
+        let pass_started = std::time::Instant::now();
+        match mem.backfill_chunks(model, DRAIN_STEP).await {
             Ok((0, 0)) => break,
-            Ok(_) => {}
+            Ok((embedded, _chunked)) => {
+                // Chunking alone is local CPU — only a pass that actually
+                // consulted the provider owes it an idle window.
+                if embedded > 0 {
+                    tokio::time::sleep(pass_started.elapsed()).await;
+                }
+            }
             Err(e) => {
                 warn!("Chunk backfill for '{model}' halted: {e}");
                 break;
             }
         }
     }
+}
+
+/// Embed the rows a LIVE turn parked, without making them wait for that turn
+/// to end (P24.3 part 3).
+///
+/// Tool-result ingestion no longer embeds inline: a chunk is persisted
+/// immediately and its vector is queued
+/// ([`MemoryService::remember_deferred_vector`]). Something has to pick those
+/// vectors up, and [`drain_backfill`] cannot be it — when the embedder is the
+/// local provider that drain first waits for **no harness run to be live**, so
+/// a row queued *by* a live run would wait for the run that queued it. During
+/// a long autonomous mission that is hours, and for those hours the model is
+/// being handed `recall(...)` handles to rows that similarity search cannot
+/// see.
+///
+/// So this drain skips the yield gate — and pays for that with a bound the
+/// yield gate was standing in for:
+///
+/// - **It may only embed rows this process parked.** The budget comes from
+///   [`MemoryService::take_queued_vector_count`], so an inherited backlog (2167
+///   rows, in the incident that motivated the queue) is NOT swept up at
+///   foreground priority; that is still [`drain_backfill`]'s job at
+///   [`drain_backfill`]'s priority. The exception is sized to the work the live
+///   session created and nothing more.
+/// - **It still repays every request.** Same rule as [`drain_backfill`]: a pass
+///   that consulted the provider is followed by an idle window equal to that
+///   call's RTT, so it can never exceed half the provider's wall-clock, and a
+///   loaded provider answering slowly earns proportionally longer gaps.
+/// - **It still takes `drain_serial`.** One drain's passes at a time,
+///   process-wide, so this cannot multiply the request rate that pacing bounds.
+/// - **Row vectors only.** Chunk vectors stay with [`drain_backfill`], for the
+///   same reason that drain does rows before chunks: without a row vector a
+///   memory is invisible to recall entirely, whereas one with a row vector and
+///   no chunk vectors is merely coarser to retrieve. Coarser can wait for idle;
+///   invisible cannot.
+///
+/// Net against what it replaces: the same embedding work, at half the duty
+/// cycle, off the turn's critical path instead of blocking it.
+async fn drain_queued_vectors(
+    mem: &Arc<MemoryService>,
+    drain_serial: &Arc<tokio::sync::Mutex<()>>,
+) {
+    loop {
+        mem.vector_queue_notified().await;
+        let mut budget_rows = mem.take_queued_vector_count();
+        // A wake with an empty budget is not an error — `Notify` holds one
+        // permit however many parks happened, so a drain that already took the
+        // count can be woken once more with nothing to do.
+        if budget_rows == 0 {
+            continue;
+        }
+        let Some(model) = mem.active_binding().await.0 else {
+            // No binding yet: the rows stay queued and the next binding event's
+            // unconditional drain takes them. Putting the budget back would
+            // spin, since nothing re-notifies.
+            debug!("{budget_rows} queued vectors wait for an embedding binding");
+            continue;
+        };
+        debug!("Draining {budget_rows} queued vectors for '{model}'");
+        while budget_rows > 0 {
+            let step = DRAIN_STEP.min(budget_rows);
+            debug_assert!(step > 0, "a positive budget must yield a positive step");
+            let _one_drain = drain_serial.lock().await;
+            let pass_started = std::time::Instant::now();
+            match mem.backfill_embeddings(&model, step).await {
+                // Nothing left for this model — either the rows landed under a
+                // different binding, or another drain got there first. Either
+                // way the budget is stale, not owed.
+                Ok(0) => break,
+                Ok(embedded) => {
+                    budget_rows = budget_rows.saturating_sub(embedded);
+                    tokio::time::sleep(pass_started.elapsed()).await;
+                }
+                Err(e) => {
+                    warn!("Queued-vector drain for '{model}' halted: {e}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// How this differs from [`drain_queued_vectors`] above, since both end up
+/// draining the same queue and only one of them is obvious:
+///
+/// `drain_queued_vectors` handles what THIS PROCESS deliberately deferred, at
+/// foreground priority, during the turn -- and it is explicitly budgeted so it
+/// will NOT sweep up an inherited backlog. Its own doc says that remainder is
+/// "still `drain_backfill`'s job at `drain_backfill`'s priority".
+///
+/// The catch is that nothing was calling `drain_backfill` at that priority
+/// during a session. Its only triggers are BINDING events -- daemon start,
+/// provider switch, width reprobe -- and an ordinary session has none of them.
+/// So a row parked by a *transient* embedding failure, or a backlog inherited
+/// from a previous run, waited for a restart. That is the gap this closes, and
+/// it is why the two coexist rather than one replacing the other: one drains
+/// the work the turn created, the other drains everything else, at the first
+/// moment no turn is live.
+///
+/// Drain rows that were parked mid-session, at the first moment no turn is live.
+///
+/// [`nanna_memory::MemoryService::store_unembedded`] is durable and honest —
+/// the write lands, the row is reachable by its `source_id` handle, and it is
+/// queued for backfill — but until now the ONLY things that started a drain
+/// were **binding** events: daemon start, a provider switch, a width reprobe.
+/// An ordinary session has none of those. So a row parked by a *transient*
+/// embedding failure stayed unsearchable for the rest of the session, and the
+/// store's own doc comment says exactly that: it "is recovered, not lost — but
+/// the latency is a session, not a moment, and closing that needs a drain
+/// trigger the memory crate does not own". This is that trigger, and it lives
+/// here because the daemon is what owns both the run registry and the drain.
+///
+/// **Bound: one probe per active→idle cycle** — not per write, and not on a
+/// timer. [`ChatRunRegistry::wait_active`] followed by
+/// [`ChatRunRegistry::wait_idle`] is precisely one turn's lifetime, so the
+/// probe rate is bounded above by the *turn* rate, which is bounded by a human
+/// typing. A timer would have had to pick an interval that is either too slow
+/// to matter or a poll; an edge does not.
+///
+/// The probe is what [`drain_backfill`] already costs on a store that is
+/// complete for the bound model, and it is worth stating exactly rather than
+/// as "a query": `entries_missing_model(model, 1)` is an **in-memory** scan of
+/// the entries cache under a read lock — it short-circuits at the first entry
+/// with no bucket for `model`, so it walks the whole cache only in the case
+/// where there is nothing to do — followed by two `LIMIT 1` local Turso
+/// queries (`parents_without_chunks`, `chunks_needing_embedding`). No provider
+/// request is made unless work is actually found. At a 100k-entry store that
+/// is single-digit milliseconds, once per turn.
+///
+/// **Worst case is one turn of latency, not one session.** `wait_active`
+/// registers interest and then reads the flag, so a turn that begins AND ends
+/// inside that window leaves no edge to observe and its rows wait for the next
+/// turn. That is a bounded miss and a deliberate non-fix: the rows are durable
+/// and handle-addressable the whole time, and the alternative — probing before
+/// parking — turns the loop into a spin on an idle daemon, which is the exact
+/// property this shape was chosen to avoid.
+///
+/// **It adds a trigger, never a second rate.** The drain it may start is the
+/// existing [`drain_backfill`], so it inherits the process-wide `drain_serial`
+/// mutex (one drain at a time), the `wait_idle` priority gate (a turn arriving
+/// mid-drain takes the slot back within one in-flight embed) and the
+/// per-request RTT repayment that caps the drain at half the provider's
+/// wall-clock. Starting from an idle edge means the common case is that the
+/// gate is already open and the queue is already empty.
+async fn supervise_idle_backfill(
+    memory: Arc<MemoryService>,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    drain_serial: Arc<tokio::sync::Mutex<()>>,
+) {
+    // Said once, at arm time, because the useful thing to know from a log is
+    // that this exists at all. The drain it starts already announces its own
+    // work ("Backfilled N embeddings"), and a per-turn line for the overwhelming
+    // case -- nothing queued, nothing to do -- would be noise proportional to
+    // conversation length.
+    info!(
+        "Idle-backfill supervisor armed: queued embedding rows now drain at the end of a turn"
+    );
+    loop {
+        // A turn started, then every turn finished. Waiting on `active` FIRST is
+        // what makes this an edge rather than a spin: with only `wait_idle`, an
+        // already-idle daemon would loop as fast as the scheduler allows.
+        chat_runs.wait_active().await;
+        chat_runs.wait_idle().await;
+        // Deliberately NOT asserted here: `!any_active()`. `wait_idle` certifies
+        // that no run was live at the instant it returned -- a PAST instant. A
+        // turn may legally claim the slot again before the next line runs, so
+        // asserting it would fire on ordinary concurrency instead of on a
+        // programmer error, and an assertion that can be false is worse than an
+        // absent one. The property is real but belongs to the registry, where it
+        // can be stated without a race: see the chat_harness test
+        // `one_turn_drives_one_active_then_idle_cycle`. Nothing below needs the
+        // daemon to still be idle -- the drain re-takes the gate itself, once
+        // per provider request.
+
+        // No binding means nothing can be drained INTO a bucket: the drain
+        // refuses to fill a bucket that is not the active binding, so calling it
+        // here would be a no-op with extra steps.
+        let Some(model) = memory.active_embedding_model().await else {
+            continue;
+        };
+        // Two things must hold about a binding before it is worth draining, and
+        // both are far cheaper than the drain they guard, so they are checked
+        // always rather than in debug only. The spec must name something; and
+        // the drain must be able to tell a LOCAL provider from a remote one.
+        // That second test is load-bearing rather than cosmetic --
+        // `drain_backfill` decides whether to yield to a live chat turn by
+        // reading the provider off this spec, so a spec with no provider segment
+        // would silently classify the local embedder as remote and drain
+        // straight through the contention gate that exists to keep it off the
+        // shared generation slot.
+        //
+        // Both are ASSERTIONS rather than branches because both are structural,
+        // not configuration-dependent: the binding string is produced by
+        // `EmbeddingProviderInfo`'s `Display`, which is literally
+        // `write!("{}:{}", name, model)`, and `drain_backfill` already reads the
+        // prefix back off it. Neither can be made false by a config file, so
+        // neither is a failure to handle -- only a way to notice if the shape
+        // this depends on is ever changed somewhere else.
+        assert!(
+            !model.is_empty(),
+            "the active embedding binding must name a model: an empty spec would \
+             drain into an unaddressable bucket"
+        );
+        assert!(
+            model.contains(':'),
+            "the active embedding binding must be a `provider:model` spec (got \
+             {model:?}): `drain_backfill` reads the provider off this string to \
+             decide whether to yield the local generation slot to a live turn"
+        );
+        drain_backfill(&memory, &model, &chat_runs, &drain_serial).await;
+    }
+}
+
+/// Run one scheduled agent prompt (heartbeat / cron), YIELDING the local
+/// provider to a user turn that arrives mid-run (P22 Tier 4).
+///
+/// The evidence for existing at all: at one mission's start the daemon's own
+/// heartbeat held the single local generation slot for 157 seconds while the
+/// turn's planner timed out behind it. The tick-time gate cannot catch that
+/// ordering — the heartbeat was already running when the user typed — so the
+/// run itself must stand aside. Priority, not a quota: the user turn takes
+/// the slot within one abortive cancel, and the yielded work is resumed by
+/// the caller once the turn releases.
+///
+/// Mechanics: the agent run is SPAWNED, then raced against the registry's
+/// became-active edge. Spawning matters — select-dropping the chat future
+/// would skip its cleanup tail and leave the session registered as active
+/// forever; instead, preemption cancels through the same abortive token the
+/// Stop button uses (dropping the in-flight stream immediately) and then
+/// AWAITS the run so it exits through its own tail.
+///
+/// Preemption is armed only when the agent's model is served by the local
+/// single-slot provider: on a cloud provider a heartbeat and a chat coexist,
+/// and cancelling one buys the other nothing.
+///
+/// Returns `None` when the run yielded (the caller owns resumption);
+/// `Some(outcome)` when it finished on its own.
+async fn run_scheduled_prompt_yielding(
+    agent: &Arc<AgentService>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    session_id: &str,
+    payload: &str,
+) -> Option<Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>> {
+    let run_agent = agent.clone();
+    let run_session = session_id.to_string();
+    let run_payload = payload.to_string();
+    let mut run = tokio::spawn(async move {
+        // Session-scoped tools resolve their scope from this task-local
+        // binding; carried by the run's own future so a chat starting during
+        // this run cannot see the scheduled session (and vice versa).
+        // Boxed: the chat future is ~23KB and would otherwise sit inline in
+        // the spawned task's state machine.
+        Box::pin(ToolRegistry::with_run_session(
+            run_session.clone(),
+            run_agent.chat(&run_session, &run_payload, None, &[]),
+        ))
+        .await
+    });
+
+    let local = crate::llm_router::ProviderId::from_model(&agent.agent_config().await.model)
+        == crate::llm_router::ProviderId::Ollama;
+    if !local {
+        return Some(flatten_scheduled_join(run.await));
+    }
+
+    tokio::select! {
+        joined = &mut run => Some(flatten_scheduled_join(joined)),
+        () = chat_runs.wait_active() => {
+            let yielding = std::time::Instant::now();
+            info!(session_id, "Scheduled run yielding the local provider to a live chat turn");
+            // The spawned run may not have registered its cancel token yet
+            // (a turn can claim in the gap between spawn and registration),
+            // and a cancel that lands on nothing would leave this arm
+            // blocked behind the full run. Keep asking until the cancel
+            // lands or the run ends on its own; `yield_now`, not a sleep —
+            // registration is one task-poll away, so this converges in
+            // microseconds and carries no tuned interval.
+            while !agent.cancel(session_id).await && !run.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            // Orderly exit through the run's own cancel tail — never drop it.
+            let _ = run.await;
+            debug!(
+                session_id,
+                yield_secs = yielding.elapsed().as_secs_f64(),
+                "Scheduled run yielded"
+            );
+            None
+        }
+    }
+}
+
+/// A panicked scheduled-run task is an error outcome, not a daemon crash.
+fn flatten_scheduled_join(
+    joined: Result<
+        Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>,
+        tokio::task::JoinError,
+    >,
+) -> Result<crate::agent_service::ChatResult, crate::agent_service::ChatError> {
+    joined.unwrap_or_else(|join_err| {
+        Err(crate::agent_service::ChatError {
+            message: format!("scheduled run task failed: {join_err}"),
+            partial_result: None,
+        })
+    })
 }
 
 /// The main daemon server
@@ -1248,6 +1763,9 @@ pub struct DaemonServer {
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
     _control: Arc<ControlPlane>,
+    /// Late-bound handle to the control plane for consumers created
+    /// before it exists (filled in run(), read by the agent service).
+    control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -1265,6 +1783,10 @@ pub struct DaemonServer {
     /// store WAS repaired and does persist. Surfaced on status so the state is
     /// observable rather than inferred from a log line at boot.
     storage_error: Option<String>,
+    /// Terminal reason file: a durable record of WHY this process stopped, so
+    /// the next boot can tell a clean shutdown from a hard death whose only
+    /// other evidence is a log that simply ends (2026-08-10 ministral leg).
+    exit_reason: crate::exit_reason::ExitReasonFile,
 }
 
 impl DaemonServer {
@@ -1385,6 +1907,8 @@ impl DaemonServer {
             None
         };
 
+        let exit_reason = crate::exit_reason::ExitReasonFile::new(&config.data_dir);
+
         Self {
             config,
             embedding,
@@ -1392,6 +1916,7 @@ impl DaemonServer {
             _brave_api_key: brave_api_key,
             sessions,
             _control: control,
+            control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             ipc,
             persistence,
             shutdown_tx,
@@ -1400,6 +1925,7 @@ impl DaemonServer {
             storage: None,
             memory_recovery: None,
             storage_error: None,
+            exit_reason,
         }
     }
 
@@ -1423,6 +1949,14 @@ impl DaemonServer {
         self.shutdown_tx.clone()
     }
 
+    /// Handle to the terminal reason file, for exit paths that live outside
+    /// `run()` (the signal / ctrl-c handlers in `main`). Clones share the
+    /// armed flag, so recording stays a no-op until `run()` has claimed the
+    /// file by writing its startup marker.
+    pub fn exit_reason_handle(&self) -> crate::exit_reason::ExitReasonFile {
+        self.exit_reason.clone()
+    }
+
     /// Get the IPC server address
     pub fn ipc_address(&self) -> String {
         self.ipc.address()
@@ -1432,6 +1966,37 @@ impl DaemonServer {
     pub async fn run(&mut self) -> Result<(), crate::DaemonError> {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
+
+        // Route every panic through tracing BEFORE doing anything that can
+        // spawn a task. The default hook prints to stderr, which a headless
+        // daemon has nowhere useful to send — so a panicked task died with
+        // ZERO log lines and the wedge it left (2026-08-10: a chat turn's
+        // task panicked and its session went silent for 50+ minutes) was
+        // undiagnosable from the log alone. Chains to the previous hook so
+        // stderr output, where it exists, is preserved.
+        let previous_hook = std::panic::take_hook();
+        let panic_exit_reason = self.exit_reason.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            // File first, log second: with panic=abort (the release profile)
+            // this hook is the last code that runs, and the non-blocking log
+            // writer may never flush — the reason file is the record that
+            // survives. In debug a task panic doesn't kill the process; a
+            // later clean shutdown overwrites this record, so last-writer-
+            // wins keeps the file truthful either way.
+            panic_exit_reason.record_exit("panic", Some(&format!("{payload} at {location}")));
+            tracing::error!(%location, "PANIC: {payload}");
+            previous_hook(info);
+        }));
 
         // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
         // every exec/acceptance process inherits membership, so the OS reaps
@@ -1463,6 +2028,26 @@ impl DaemonServer {
                     warn!("Failed to acquire PID file: {}. Continuing anyway.", e);
                 }
             }
+        }
+
+        // Terminal reason file: report how the PREVIOUS daemon died, then
+        // claim the file for this process. Runs after the PID acquire so a
+        // duplicate instance that loses the race can never touch the live
+        // daemon's record. A previous record still saying `running` is the
+        // unclean-exit verdict — the process died through a path no hook
+        // could see, which is exactly the 2026-08-10 log-just-ends death.
+        {
+            let previous = self.exit_reason.read_previous();
+            if previous.is_unclean() {
+                warn!("Previous exit was UNCLEAN: {}", previous.describe());
+            } else {
+                info!("Previous exit: {}", previous.describe());
+            }
+            self.exit_reason.mark_running();
+            info!(
+                "Exit reason file armed at {:?} — every exit path now records why it fired",
+                self.exit_reason.path()
+            );
         }
 
         // Load sessions from Turso database
@@ -1497,6 +2082,14 @@ impl DaemonServer {
             info!("Created default session: {}", default_session.id);
         }
 
+        // ONE run registry, created before the services so the embedding
+        // drain, the dream gate, the scheduler and the control plane all hold
+        // the same handle: "a mission is live" must be one fact, not two.
+        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+        // ONE capability-transition ledger for the same reason — the provider
+        // plumbing records into the very ledger the step runners drain.
+        let degradations = Arc::new(nanna_agent::DegradationLedger::new());
+
         // Initialize services
         let (
             tools,
@@ -1507,7 +2100,7 @@ impl DaemonServer {
             workspace_id_for_services,
             turn_baselines,
             model_stats,
-        ) = self.init_services().await?;
+        ) = self.init_services(&chat_runs, &degradations).await?;
 
         // Recover any orphaned checkpoints from the database.
         if let Some(ref storage) = self.storage {
@@ -1639,7 +2232,13 @@ impl DaemonServer {
         // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
         // is the cron runner (the GUI scheduler only runs in embedded mode).
         // Loads persisted jobs and runs heartbeat + memory consolidation,
-        // mirroring the GUI's embedded schedule.
+        // mirroring the GUI's embedded schedule. (`chat_runs` was created
+        // before the services above, and is the same handle everywhere.)
+        // In-flight latch: the scheduler tick re-fired consolidation every
+        // 30s while the previous one was still folding (observed 2026-08-10:
+        // a fresh "Consolidation starting" per tick, none finishing) — one
+        // dream at a time.
+        let dream_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scheduler = {
             // These three come from `[scheduler]` in the user's config, not from
             // literals: the GUI's Scheduler tab writes them there and a config
@@ -1700,6 +2299,14 @@ impl DaemonServer {
                 }
             }
 
+            let chat_runs_for_tasks = chat_runs.clone();
+            let dream_in_flight_for_tasks = dream_in_flight.clone();
+            // At most one yielded scheduled run waiting to resume. Not a
+            // quota — a dedup: reality already serializes scheduled runs (a
+            // live one makes every other tick skip), so a second waiter could
+            // only arise from an exotic interleaving, and dropping it costs
+            // one schedule period, which the log names.
+            let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let agent_for_tasks = agent.clone();
             let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
@@ -1713,26 +2320,58 @@ impl DaemonServer {
             // both thresholds), so there is no second copy of the policy here.
             let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
             let activity_for_tasks = activity_clock.clone();
-            // The user's full summarization priority list, not just its head:
-            // the scheduled dream cycle now fails over exactly like the IPC one,
-            // so a single unavailable model no longer kills the nightly cycle.
-            let summarization_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
+            // NOT captured here. The list is read from the live agent config at
+            // the top of each cycle instead: a boot clone survives every
+            // `config.set`, so a user who repointed summarization kept dreaming
+            // on the model they had at startup — the whole class the P23
+            // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
+            // summarizations in the benchmark series ran on the wrong model).
+            // A dream cycle runs minutes-to-hours apart, so one lock read per
+            // cycle costs nothing measurable.
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
                 let dreaming = dreaming_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
-                let summarization_models = summarization_models.clone();
+                let chat_runs = chat_runs_for_tasks.clone();
+                let dream_in_flight = dream_in_flight_for_tasks.clone();
+                let scheduled_resume_parked = scheduled_resume_parked.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
                     let (success, output, error) = match task.name.as_str() {
                         "memory_consolidation" => {
                             if let Some(ref dreaming) = dreaming {
+                                if chat_runs.any_active().await {
+                                    // A live harness run is the opposite of
+                                    // idle, however old the last user message
+                                    // is: dreaming rewrites the very scoped
+                                    // memories the run is using, and doing so
+                                    // mid-step deadlocked a live mission
+                                    // (2026-08-10, 316 tool-result memories
+                                    // folded under a running step).
+                                    (true, Some("Skipped (mission live)".to_string()), None)
+                                } else if dream_in_flight
+                                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    (
+                                        true,
+                                        Some("Skipped (dream already in flight)".to_string()),
+                                        None,
+                                    )
+                                } else {
+                                // Read the summarization list LIVE, once per
+                                // cycle: whatever the user last set is what
+                                // this dream summarizes on. Falls back to the
+                                // chat model exactly as the boot path did.
+                                let live_cfg = agent.agent_config().await;
+                                let summarization_models =
+                                    crate::dream_summarizer::summarization_models(
+                                        &live_cfg.summarization_priority,
+                                        std::slice::from_ref(&live_cfg.model),
+                                    );
+                                let outcome = {
                                 // The idle gate AND the full dream cycle (feedback
                                 // flush -> FSRS testing-effect flush -> consolidate)
                                 // both live in the one `DreamingService`. The daemon
@@ -1758,10 +2397,32 @@ impl DaemonServer {
                                     consolidation_min_remaining,
                                     window_tokens,
                                 );
-                                let summarize = crate::dream_summarizer::summarize_with_failover(
-                                    router.clone(),
-                                    summarization_models.clone(),
-                                );
+                                // The any_active skip above gates the dream's
+                                // START; this gates its MIDDLE (P22 Tier 4): a
+                                // chat turn arriving mid-dream pauses the NEXT
+                                // cluster's summarization until the turn
+                                // releases, instead of contending with it for
+                                // the model. Cluster boundaries are the natural
+                                // yield points — a fold already in flight
+                                // completes (the CAS guards own staleness),
+                                // only new provider work waits. Dreaming is
+                                // idle-time work by definition, so it pauses
+                                // for a live turn whatever provider it
+                                // summarizes on.
+                                let inner_summarize =
+                                    crate::dream_summarizer::summarize_with_failover(
+                                        router.clone(),
+                                        summarization_models.clone(),
+                                    );
+                                let summarize_gate = chat_runs.clone();
+                                let summarize = move |prompt: String| {
+                                    let pending = inner_summarize(prompt);
+                                    let gate = summarize_gate.clone();
+                                    async move {
+                                        gate.wait_idle().await;
+                                        pending.await
+                                    }
+                                };
                                 match dreaming
                                     .dream_if_triggered(idle, &consolidation_config, summarize)
                                     .await
@@ -1805,6 +2466,11 @@ impl DaemonServer {
                                         error!("Scheduled consolidation failed: {e}");
                                         (false, None, Some(e.to_string()))
                                     }
+                                }
+                                };
+                                dream_in_flight
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                outcome
                                 }
                             } else {
                                 (
@@ -1861,24 +2527,21 @@ impl DaemonServer {
                             // vs the 5-min idle threshold, and memory pressure
                             // still overrides, so dreaming is not starved.
                             activity.record();
-                            // Session-scoped tools resolve their scope from the
-                            // registry, not from the prompt: without this every
-                            // `todo` call in a scheduled run failed with
-                            // "session scope requires session_id" (35 logged
-                            // failures, all of them heartbeats). The scope is
-                            // carried by the run's own future rather than
-                            // written into the shared binding — the idle gate
-                            // above stops a scheduled run STARTING during a
-                            // live run, but a chat can still start during THIS
-                            // one, and the two must not see each other's
-                            // session.
-                            let outcome = ToolRegistry::with_run_session(
-                                session_id.clone(),
-                                agent.chat(&session_id, &task.payload, None, &[]),
+                            // Session scoping (the `with_run_session` binding
+                            // that fixed 35 failed `todo` calls) now lives
+                            // inside `run_scheduled_prompt_yielding`, carried
+                            // by the run's own spawned future — a chat that
+                            // starts during this run cannot see the scheduled
+                            // session, nor vice versa.
+                            let outcome = run_scheduled_prompt_yielding(
+                                &agent,
+                                &chat_runs,
+                                &session_id,
+                                &task.payload,
                             )
                             .await;
                             match outcome {
-                                Ok(result) => {
+                                Some(Ok(result)) => {
                                     let heartbeat_ok = task.name == "heartbeat"
                                         && result.content.trim().contains("HEARTBEAT_OK");
                                     if heartbeat_ok {
@@ -1899,9 +2562,131 @@ impl DaemonServer {
                                     }
                                     (true, Some(result.content), None)
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     error!("Scheduled task '{}' failed: {}", task.name, e.message);
                                     (false, None, Some(e.message))
+                                }
+                                None => {
+                                    // The run yielded the local provider to a
+                                    // live chat turn (P22 Tier 4). Resume on
+                                    // release: ONE detached waiter re-runs the
+                                    // prompt when the registry goes idle —
+                                    // promptly, not at the next tick — and if
+                                    // a fresh user turn preempts the resumed
+                                    // run too, it parks again. That loop is
+                                    // bounded by user activity itself, not by
+                                    // a counter: every extra lap requires a
+                                    // new turn to have claimed the provider.
+                                    // The executor returns NOW because the
+                                    // heartbeat arm of the scheduler loop
+                                    // awaits it inline — parking here would
+                                    // stall every other scheduled task for as
+                                    // long as the chat runs.
+                                    if scheduled_resume_parked
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        let resume_agent = agent.clone();
+                                        let resume_runs = chat_runs.clone();
+                                        let resume_activity = activity.clone();
+                                        let resume_parked = scheduled_resume_parked.clone();
+                                        let resume_session = session_id.clone();
+                                        let resume_payload = task.payload.clone();
+                                        let resume_name = task.name.clone();
+                                        tokio::spawn(async move {
+                                            loop {
+                                                resume_runs.wait_idle().await;
+                                                // The release tail unregisters
+                                                // the finished chat BEFORE
+                                                // releasing the registry, so an
+                                                // active run here is a NEW
+                                                // claimant — the slot is taken
+                                                // and the schedule covers the
+                                                // rest.
+                                                if resume_agent.any_run_active().await {
+                                                    debug!(
+                                                        task = %resume_name,
+                                                        "Yielded run superseded — the slot is \
+                                                         taken; the next tick owns the work"
+                                                    );
+                                                    break;
+                                                }
+                                                resume_activity.record();
+                                                match run_scheduled_prompt_yielding(
+                                                    &resume_agent,
+                                                    &resume_runs,
+                                                    &resume_session,
+                                                    &resume_payload,
+                                                )
+                                                .await
+                                                {
+                                                    Some(Ok(result)) => {
+                                                        let heartbeat_ok = resume_name
+                                                            == "heartbeat"
+                                                            && result
+                                                                .content
+                                                                .trim()
+                                                                .contains("HEARTBEAT_OK");
+                                                        if heartbeat_ok {
+                                                            debug!(
+                                                                "Heartbeat (resumed): OK \
+                                                                 (nothing to do)"
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                "Scheduled task '{}' completed \
+                                                                 after yielding: {}",
+                                                                resume_name,
+                                                                result
+                                                                    .content
+                                                                    .chars()
+                                                                    .take(200)
+                                                                    .collect::<String>()
+                                                            );
+                                                        }
+                                                        break;
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        error!(
+                                                            "Scheduled task '{}' failed after \
+                                                             yielding: {}",
+                                                            resume_name, e.message
+                                                        );
+                                                        break;
+                                                    }
+                                                    None => {
+                                                        // Preempted again — user
+                                                        // turns keep priority.
+                                                    }
+                                                }
+                                            }
+                                            resume_parked
+                                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                                        });
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; resuming on release"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    } else {
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; a resume is \
+                                                 already parked, the next tick covers this one"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    }
                                 }
                             }
                             }
@@ -1940,6 +2725,8 @@ impl DaemonServer {
         .with_scheduler(scheduler)
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
+        .with_chat_runs(chat_runs.clone())
+        .with_degradations(degradations.clone())
         .with_shutdown(self.shutdown_tx.clone());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
@@ -2032,6 +2819,7 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server
         let mut request_rx =
@@ -2044,6 +2832,7 @@ impl DaemonServer {
         // Spawn IPC server
         let ipc_server = self.ipc.clone();
         let ipc_shutdown = self.shutdown_tx.clone();
+        let ipc_exit_reason = self.exit_reason.clone();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 // An IPC-less daemon is unreachable (no control plane) but
@@ -2054,6 +2843,12 @@ impl DaemonServer {
                     "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
                     e
                 );
+                // Record the cause before either exit route. If the clean
+                // drain completes it overwrites this with `clean_shutdown`;
+                // if the hard exit below fires, this record is the terminal
+                // one — and process::exit skips every Drop, so nothing else
+                // would have written it.
+                ipc_exit_reason.record_exit("ipc_server_error", Some(&e.to_string()));
                 if ipc_shutdown.send(()).is_err() {
                     // No shutdown listener yet — exit hard rather than linger.
                     std::process::exit(1);
@@ -2387,13 +3182,25 @@ impl DaemonServer {
             pid_file.release();
         }
 
+        // The clean-exit record supersedes the startup `running` marker (and
+        // any earlier cause record, e.g. a survived debug-mode panic or the
+        // signal that initiated this drain — the log carries those details).
+        self.exit_reason.record_exit("clean_shutdown", None);
+
         info!("Daemon stopped");
         Ok(())
     }
 
     /// Initialize all services
+    ///
+    /// `chat_runs` is THE liveness source for background-vs-user contention
+    /// (P22 Tier 4): the embedding drain pauses on it. `degradations` is the
+    /// capability-transition ledger the embed path records into and every
+    /// step runner drains.
     async fn init_services(
         &self,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+        degradations: &Arc<nanna_agent::DegradationLedger>,
     ) -> Result<
         (
             Arc<ToolRegistry>,
@@ -2543,13 +3350,54 @@ impl DaemonServer {
                     let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
                         Arc::new(tokio::sync::OnceCell::new());
                     let mem_cell_for_fn = memory_for_reembed.clone();
+                    // One drain at a time, process-wide — see `drain_backfill`.
+                    let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
+                    let drain_serial_for_fn = drain_serial.clone();
+                    let chat_runs_for_fn = chat_runs.clone();
+                    let ledger_for_fn = degradations.clone();
 
                     let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
                         let router = router_for_fn.clone();
                         let text = text.to_string();
                         let mem_cell = mem_cell_for_fn.clone();
+                        let drain_serial = drain_serial_for_fn.clone();
+                        let chat_runs = chat_runs_for_fn.clone();
+                        let ledger = ledger_for_fn.clone();
                         Box::pin(async move {
-                            let (embedding, switched_to) = router.embed_one(&text).await?;
+                            let attempted = router.embed_one(&text).await;
+
+                            // Capability transitions reach the model once, in
+                            // its next tool result (P22 Tier 4). The seam is
+                            // HERE — the one place every embed outcome passes —
+                            // because "no provider answered" is the moment
+                            // memory writes start landing vectorless, and the
+                            // first success afterwards is the moment they stop.
+                            // The ledger dedups by state, so the steady flow of
+                            // successes (and repeated failures) records nothing.
+                            match &attempted {
+                                Err(reason) => ledger.set(
+                                    "memory-embeddings",
+                                    "degraded",
+                                    format!(
+                                        "[capability notice — memory embeddings DEGRADED: no \
+                                         embedding provider is answering ({reason}). Memory and \
+                                         tool-result writes still SUCCEED and are stored in full — \
+                                         the Turso store remains the source of truth — but new \
+                                         entries are queued for embedding backfill, so semantic \
+                                         recall may miss them until a provider recovers. This \
+                                         notice will not repeat unless the state changes.]"
+                                    ),
+                                ),
+                                Ok(_) => ledger.set(
+                                    "memory-embeddings",
+                                    "healthy",
+                                    "[capability notice — memory embeddings RESTORED: an \
+                                     embedding provider is answering again; queued entries are \
+                                     backfilling and new writes are searchable normally.]",
+                                ),
+                            }
+
+                            let (embedding, switched_to) = attempted?;
 
                             // Provider switched — realign the store BEFORE this
                             // write is allowed to land, so it validates against
@@ -2611,8 +3459,11 @@ impl DaemonServer {
                                 // partway leaves exactly that state.
                                 let _ = missing;
                                 let mem = mem.clone();
+                                let chat_runs = chat_runs.clone();
+                                let drain_serial = drain_serial.clone();
                                 tokio::spawn(async move {
-                                    drain_backfill(&mem, &model).await;
+                                    drain_backfill(&mem, &model, &chat_runs, &drain_serial)
+                                        .await;
                                 });
                             }
 
@@ -2785,6 +3636,8 @@ impl DaemonServer {
                         let bind_model = bind_provider.to_string();
                         let memory_for_bind = memory_arc.clone();
                         let router_for_bind = embed_router.clone();
+                        let chat_runs_for_bind = chat_runs.clone();
+                        let drain_serial_for_bind = drain_serial.clone();
                         tokio::spawn(async move {
                             // The probed (or seeded) dimension and the model's
                             // input window travel WITH the model — the binding
@@ -2805,8 +3658,32 @@ impl DaemonServer {
                             // drains no-op immediately when their queue is
                             // empty, so the unconditional call costs one query
                             // each on a store that is already complete.
-                            drain_backfill(&memory_for_bind, &bind_model).await;
+                            drain_backfill(
+                                &memory_for_bind,
+                                &bind_model,
+                                &chat_runs_for_bind,
+                                &drain_serial_for_bind,
+                            )
+                            .await;
                         });
+                        // One supervisor for the daemon's life: it turns the
+                        // end of every turn into a drain opportunity, which is
+                        // what closes the "parked until the next binding event"
+                        // gap `store_unembedded` documents -- the backlog
+                        // `drain_queued_vectors` is budgeted not to sweep.
+                        // Spawned beside the startup bind because that is where
+                        // the binding, the run registry and the drain mutex are
+                        // all in scope.
+                        let memory_for_supervisor = memory_arc.clone();
+                        let chat_runs_for_supervisor = chat_runs.clone();
+                        let drain_serial_for_supervisor = drain_serial.clone();
+                        tokio::spawn(supervise_idle_backfill(
+                            memory_for_supervisor,
+                            chat_runs_for_supervisor,
+                            drain_serial_for_supervisor,
+                        ));
+                        let chat_runs_for_probe = chat_runs.clone();
+                        let drain_serial_for_probe = drain_serial.clone();
                         tokio::spawn(async move {
                             match memory_for_probe.probe_and_align_dimension().await {
                                 Ok(actual_dim) => {
@@ -2825,7 +3702,13 @@ impl DaemonServer {
                                         if let Some(model) =
                                             memory_for_probe.active_embedding_model().await
                                         {
-                                            drain_backfill(&memory_for_probe, &model).await;
+                                            drain_backfill(
+                                                &memory_for_probe,
+                                                &model,
+                                                &chat_runs_for_probe,
+                                                &drain_serial_for_probe,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -2842,6 +3725,16 @@ impl DaemonServer {
                     // Wire the memory service into the embed_fn's OnceCell
                     // so provider-switch re-embedding can find it
                     let _ = memory_for_reembed.set(memory_arc.clone());
+
+                    // One long-lived worker for the vectors a live turn parks.
+                    // It sleeps on the queue's notify and costs nothing until a
+                    // tool result is ingested; see `drain_queued_vectors` for
+                    // why it is a separate drain and what bounds it.
+                    let memory_for_queue = memory_arc.clone();
+                    let drain_serial_for_queue = drain_serial.clone();
+                    tokio::spawn(async move {
+                        drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
+                    });
 
                     Some(memory_arc)
                 }
@@ -2860,6 +3753,17 @@ impl DaemonServer {
                         "No embedding provider available — memory runs WITHOUT vectors: writes \
                          persist and queue for backfill, recall is unavailable until an \
                          embedding provider is configured"
+                    );
+                    // The model finds out the same way the operator does —
+                    // once, in its first tool result, not on every write.
+                    degradations.set(
+                        "memory-embeddings",
+                        "degraded",
+                        "[capability notice — memory embeddings are OFF: no embedding provider \
+                         is configured. Memory and tool-result writes still SUCCEED and persist \
+                         in full — the Turso store is the source of truth — but they carry no \
+                         vectors, so semantic recall is unavailable until a provider is \
+                         configured. This notice will not repeat unless the state changes.]",
                     );
                     let config = nanna_memory::MemoryServiceConfig::default();
                     let memory_service = if let Some(ref storage) = self.storage {
@@ -2884,6 +3788,14 @@ impl DaemonServer {
             info!("Memory service disabled in config");
             None
         };
+
+        // ONE config for every long-lived collaborator below. The sub-agent
+        // spawner and the script summarizer are constructed BEFORE the agent
+        // service, so the service adopts this same lock (`with_shared_config`)
+        // and a later `config.set` reaches all three at once — the boot-clone
+        // staleness that ran a whole benchmark series on the wrong summarizer
+        // (2026-08-15).
+        let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
 
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -2925,38 +3837,21 @@ impl DaemonServer {
                 Some(Arc::new(AgentSpawnerImpl {
                     router: router.clone(),
                     tools: tools.clone(),
-                    agent_config: nanna_agent::AgentConfig {
-                        model: self.config.agent.model.clone(),
-                        max_tokens: self.config.agent.max_tokens,
-                        temperature: self.config.agent.temperature,
-                        max_iterations: None, // Unlimited — model stops when done
-                        thinking_mode: self.config.agent.thinking_mode,
-                        summarization_priority: self.config.agent.summarization_priority.clone(),
-                        summarization_ollama_url: self
-                            .config
-                            .agent
-                            .summarization_ollama_url
-                            .clone(),
-                        model_routing: sub_agent_routing,
-                        routing_first_turn_primary: true,
-                        openrouter_api_key: self.config.agent.openrouter_api_key.clone(),
-                        openai_api_key: self.config.agent.openai_api_key.clone(),
-                        ..Default::default()
-                    },
+                    // The live config, not a snapshot of it — see
+                    // `AgentSpawnerImpl::agent_config_src`.
+                    agent_config_src: Arc::clone(&shared_agent_config),
+                    sub_agent_routing,
                     system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
                     sub_agent_models: self.config.agent.sub_agent_models.clone(),
+                    control: self.control_slot.clone(),
                 }))
             } else {
                 None
             };
 
-            let summarizer_models = crate::dream_summarizer::summarization_models(
-                &self.config.agent.summarization_priority,
-                std::slice::from_ref(&self.config.agent.model),
-            );
             let services = build_script_services(
                 &memory,
                 spawner_arc,
@@ -2964,7 +3859,7 @@ impl DaemonServer {
                 workspace_id_for_services.clone(),
                 self.storage.clone(),
                 turn_baselines.clone(),
-                Some((router.clone(), summarizer_models)),
+                Some((router.clone(), Arc::clone(&shared_agent_config))),
             );
 
             if let Some(ref dir) = tools_dir {
@@ -2987,6 +3882,10 @@ impl DaemonServer {
         tools.register_alias("glob", "list_dir").await;
         tools.register_alias("Glob", "list_dir").await;
         tools.register_alias("ls", "list_dir").await;
+        tools.register_alias("task", "sub_agent").await;
+        tools.register_alias("Task", "sub_agent").await;
+        tools.register_alias("sub-agent", "sub_agent").await;
+        tools.register_alias("Sub-Agent", "sub_agent").await;
 
         {
             let tool_count = tools.definitions().await.len();
@@ -3039,6 +3938,25 @@ impl DaemonServer {
             tools.set_policy(policy).await;
         }
 
+        // Attach the per-call audit trail. It sits on the registry rather than
+        // on the agent loop deliberately: the loop is only one of the callers
+        // (chat harness, task tool, scheduled runs and the MCP bridge all call
+        // the registry directly), and an audit that saw only one of them would
+        // be worse than none — it would read as a complete account.
+        if self.config.tool_audit_log {
+            let path = self.config.data_dir.join("logs").join("tool-audit.jsonl");
+            let sink = nanna_tools::JsonlAuditSink::new(
+                path.clone(),
+                nanna_tools::ToolAuditConfig {
+                    include_values: self.config.tool_audit_log_values,
+                    ..Default::default()
+                },
+            );
+            tools.set_audit_sink(Some(Arc::new(sink))).await;
+            info!(path = %path.display(), values = self.config.tool_audit_log_values,
+                  "Tool audit trail enabled");
+        }
+
         // Create agent service with multi-provider router
         let event_tx = self.ipc.event_sender();
         let mut agent_service = AgentService::with_data_dir(
@@ -3050,7 +3968,11 @@ impl DaemonServer {
             Some(self.config.data_dir.clone()),
         )
         .with_session_history(session_history)
-        .with_stats(model_stats.clone());
+        .with_stats(model_stats.clone())
+        .with_degradations(degradations.clone())
+        // Adopt the lock the spawner and the script summarizer already hold,
+        // so `config.set` moves all three at once instead of only this one.
+        .with_shared_config(Arc::clone(&shared_agent_config));
         if let Some(ref storage) = self.storage {
             agent_service = agent_service.with_storage(storage.clone());
         }
@@ -3166,12 +4088,16 @@ pub struct DaemonBuilder {
 }
 
 /// Copy the signature-verification secrets from the user's channel config into a
-/// [`WebhookConfig`]. Only providers the user configured are set; each verifier
-/// skips when its secret is `None`, so unset providers keep the previous value.
+/// [`WebhookConfig`]. Only providers the user configured are set, so unset
+/// providers keep the previous value — and a provider that ends up with no
+/// secret serves no webhook at all (`refuse_unconfigured` in `webhook.rs`).
 ///
-/// Telegram is intentionally absent: its `TelegramConfig` carries no webhook
-/// secret (Telegram authenticates via the bot token in the URL), only the bot
-/// token (registered for outbound sends).
+/// Telegram used to be absent here on the reasoning that "Telegram
+/// authenticates via the bot token in the URL". That was wrong about this
+/// implementation: the route is the fixed path `/webhook/telegram` with no
+/// token in it, so nothing was ever verified. `telegram_secret` now carries the
+/// `setWebhook` secret token, which Telegram echoes as
+/// `X-Telegram-Bot-Api-Secret-Token` on every POST.
 fn apply_channel_webhook_secrets(
     webhook: &mut WebhookConfig,
     channels: &nanna_config::ChannelsConfig,
@@ -3188,6 +4114,7 @@ fn apply_channel_webhook_secrets(
     }
     if let Some(ref telegram) = channels.telegram {
         webhook.telegram_token = Some(telegram.bot_token.clone());
+        webhook.telegram_secret = telegram.webhook_secret.clone();
     }
 }
 
@@ -3326,6 +4253,8 @@ impl DaemonBuilder {
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
         builder.config.tool_denylist = config.tools.disabled.clone();
+        builder.config.tool_audit_log = config.tools.audit_log;
+        builder.config.tool_audit_log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -3601,6 +4530,169 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 mod tests {
     use super::*;
 
+
+
+    /// A memory saved through the `remember` TOOL used to carry no `fact_type`
+    /// at all, so the drift pin — which can only protect what it can identify —
+    /// could never protect the memories a user most explicitly asked to keep.
+    #[test]
+    fn a_stated_declaration_pins_the_memory() {
+        let tags = tags_with_provenance(
+            HashMap::new(),
+            &serde_json::json!({"provenance": "stated"}),
+        );
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("stated"));
+        assert!(nanna_memory::is_verbatim_pinned(&tags));
+    }
+
+    /// The conservative default, and the whole reason this is classified rather
+    /// than copied: absence of a declaration is not evidence the user said
+    /// something. Only an explicit, case-insensitive "stated" pins.
+    #[test]
+    fn anything_that_is_not_stated_is_observed() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"provenance": ""}),
+            serde_json::json!({"provenance": "observed"}),
+            serde_json::json!({"provenance": "statedly"}),
+            serde_json::json!({"provenance": "user-said"}),
+        ] {
+            let tags = tags_with_provenance(HashMap::new(), &params);
+            assert_eq!(
+                tags.get("fact_type").map(String::as_str),
+                Some("observed"),
+                "{params}"
+            );
+            assert!(!nanna_memory::is_verbatim_pinned(&tags));
+        }
+    }
+
+    /// A caller that already stamps `fact_type` in its tags keeps working — but
+    /// the value is re-classified, never trusted verbatim, so a near-miss
+    /// spelling cannot smuggle a pin past the rule.
+    #[test]
+    fn a_fact_type_tag_is_reclassified_not_trusted() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "  StAtEd ".to_string());
+        let pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(pinned.get("fact_type").map(String::as_str), Some("stated"));
+
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "STATED-ish".to_string());
+        let not_pinned = tags_with_provenance(tags, &serde_json::json!({}));
+        assert_eq!(not_pinned.get("fact_type").map(String::as_str), Some("observed"));
+    }
+
+    /// An explicit `provenance` field wins over a `fact_type` tag: the field is
+    /// the declaration this call is making, the tag may be inherited metadata.
+    #[test]
+    fn the_explicit_field_wins_over_an_inherited_tag() {
+        let mut tags = HashMap::new();
+        tags.insert("fact_type".to_string(), "stated".to_string());
+        tags.insert("topic".to_string(), "deploys".to_string());
+        let tags = tags_with_provenance(tags, &serde_json::json!({"provenance": "observed"}));
+        assert_eq!(tags.get("fact_type").map(String::as_str), Some("observed"));
+        assert_eq!(
+            tags.get("topic").map(String::as_str),
+            Some("deploys"),
+            "unrelated tags are untouched"
+        );
+    }
+
+    /// Seed one tool result's chunk rows: `stored_count` of a promised
+    /// `promised_count`, all sharing a `source_id`.
+    async fn seeded_chunk_store(
+        stored_count: usize,
+        promised_count: usize,
+    ) -> Arc<nanna_memory::MemoryService> {
+        let service = Arc::new(nanna_memory::MemoryService::new(
+            nanna_memory::MemoryServiceConfig {
+                dimension: 4,
+                ..Default::default()
+            },
+        ));
+        for idx in 1..=stored_count {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("source_id".to_string(), "abc123".to_string());
+            metadata.insert("chunk".to_string(), format!("{idx}/{promised_count}"));
+            service
+                .add_entry(nanna_memory::MemoryEntry {
+                    id: format!("chunk-{idx}"),
+                    content: format!("part {idx}"),
+                    // A distinct unit vector per chunk: the store asserts a
+                    // non-empty embedding on add, and reassembly is keyed on
+                    // metadata, so the direction is irrelevant here.
+                    embedding: vec![1.0, 0.0, 0.0, 0.0],
+                    embedding_model: None,
+                    embeddings: std::collections::HashMap::new(),
+                    metadata,
+                    timestamp: 0,
+                    fsrs: nanna_memory::FsrsState::new(),
+                    workspace_id: None,
+                })
+                .await
+                .expect("seed");
+        }
+        service
+    }
+
+    async fn first_entry(
+        service: &Arc<nanna_memory::MemoryService>,
+    ) -> nanna_memory::MemoryListEntry {
+        service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    /// The whole result is present: the reassembly is exactly the chunks, in
+    /// order, and says nothing extra. An announcement on a complete read would
+    /// be noise, and worse, would teach the model to ignore the real one.
+    #[tokio::test]
+    async fn a_complete_reassembly_announces_nothing() {
+        let service = seeded_chunk_store(3, 3).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert_eq!(assembled, "part 1\npart 2\npart 3");
+        assert!(!assembled.contains("[SYSTEM:"));
+    }
+
+    /// Dreaming REPLACES clusters, so a result whose chunks were partly
+    /// consolidated away reassembles short. Returning that silently is the
+    /// failure this function exists to end: the stub promised the result "was
+    /// stored whole in memory as N chunk(s)", and a model reading a fraction
+    /// while being told nothing is missing reports on what it saw.
+    #[tokio::test]
+    async fn a_short_reassembly_says_how_much_is_missing() {
+        let service = seeded_chunk_store(2, 17).await;
+        let entry = first_entry(&service).await;
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+
+        assert!(assembled.starts_with("part 1\npart 2"), "content still comes first");
+        assert!(assembled.contains("2 of 17 stored chunks"), "{assembled}");
+        assert!(assembled.contains("15 are no longer in the store"), "{assembled}");
+        assert!(
+            assembled.contains("read it back off disk"),
+            "the announcement must point at the thing that IS intact: {assembled}"
+        );
+    }
+
+    /// Negative space: rows with no `i/N` mark carry no promise about a total,
+    /// so there is nothing to be short of. Absence of evidence must not become
+    /// an announcement of loss.
+    #[tokio::test]
+    async fn unmarked_chunks_never_claim_a_shortfall() {
+        let service = seeded_chunk_store(2, 2).await;
+        let mut entry = first_entry(&service).await;
+        entry.metadata.remove("chunk");
+        for stored in service.list_all().await {
+            assert!(stored.metadata.contains_key("source_id"));
+        }
+
+        let assembled = assemble_handle_content(&service, &entry).await;
+        assert!(!assembled.contains("[SYSTEM:"), "{assembled}");
+    }
+
     /// The entry that motivated this: provider `openrouter`, model
     /// `nvidia/nemotron-3-embed-1b:free`. Splitting on the LAST slash would
     /// address model `free` on provider `openrouter/nvidia/nemotron-3-embed-1b`
@@ -3792,6 +4884,50 @@ mod tests {
         assert!(webhook.discord_public_key.is_none());
         assert!(webhook.slack_signing_secret.is_none());
         assert!(webhook.whatsapp_app_secret.is_none());
+    }
+
+    /// The crash: a stored `edit_file` error whose em dash straddled the byte
+    /// at the default 4 000-byte cap. An em dash is three bytes, `&s[..4_000]`
+    /// landed in the middle of it, and the panic took the whole daemon down.
+    #[test]
+    fn a_page_never_splits_a_multi_byte_char_at_the_default_limit() {
+        let content = format!("{}—tail", "a".repeat(3_999));
+        assert!(!content.is_char_boundary(4_000), "the test string must straddle the cap");
+
+        let (s, e) = handle_page_range(&content, 0, 4_000);
+        let page = &content[s..e];
+
+        assert_eq!(s, 0);
+        assert_eq!(e, 4_002, "the em dash is carried whole rather than cut at 4 000");
+        assert!(page.ends_with('—'));
+    }
+
+    /// The range must be usable on the very string it was measured from, at
+    /// any caller-supplied offset and limit — those come straight off the wire
+    /// via `opt_count`. Slicing is the operation that panicked, so slice.
+    #[test]
+    fn a_page_range_indexes_the_string_it_was_measured_from() {
+        let content = "—".repeat(5);
+        for offset in 0..content.len() + 4 {
+            for limit in 0..content.len() + 4 {
+                let (s, e) = handle_page_range(&content, offset, limit);
+                assert!(s <= e && e <= content.len(), "offset {offset} limit {limit}");
+                let _ = &content[s..e];
+            }
+        }
+    }
+
+    /// Paging must not drop a char between reads: the second page starts where
+    /// the first ended, so walking both ends forward has to keep them joinable.
+    #[test]
+    fn consecutive_pages_reassemble_the_whole_content() {
+        let content = format!("{}—{}", "a".repeat(10), "b".repeat(10));
+        let (s1, e1) = handle_page_range(&content, 0, 11);
+        let (s2, e2) = handle_page_range(&content, e1, 100);
+
+        assert_eq!(s1, 0);
+        assert_eq!(s2, e1, "the next page resumes at the byte this one ended on");
+        assert_eq!(format!("{}{}", &content[s1..e1], &content[s2..e2]), content);
     }
 
     #[test]
@@ -4092,5 +5228,96 @@ mod tests {
         assert!(!core.enabled);
         assert!(!core.heartbeat_enabled);
         assert_eq!(core.heartbeat_interval, std::time::Duration::from_secs(600));
+    }
+
+    /// A fake Ollama that answers everything EXCEPT a generation instantly,
+    /// and holds `/api/chat` / `/api/generate` open forever — the shape of a
+    /// generation occupying the single local slot.
+    async fn spawn_stalling_ollama() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0_u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    if head.contains("/api/chat") || head.contains("/api/generate") {
+                        // Hold the slot forever: the test's preemption must be
+                        // what ends this, never a server response.
+                        std::future::pending::<()>().await;
+                    }
+                    let body = "{}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The P22 Tier 4 admission gate, end to end: a scheduled run whose
+    /// generation is parked inside the local provider yields within moments
+    /// of a user turn claiming the registry. Without the gate this test
+    /// cannot pass — the stalled generation never returns on its own, which
+    /// is exactly the 157-second slot squat the forensics measured (there it
+    /// eventually finished; here it provably never would).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_run_yields_the_local_provider_to_a_live_chat_turn() {
+        let base = spawn_stalling_ollama().await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&base));
+        let config = AgentServiceConfig {
+            // The `ollama/` prefix is what arms preemption — from_model
+            // resolves it to the local single-slot provider.
+            model: "ollama/stall-model".to_string(),
+            ..AgentServiceConfig::default()
+        };
+        let (event_tx, _keep_events_alive) =
+            tokio::sync::broadcast::channel::<crate::protocol::Event>(16);
+        let tools = Arc::new(ToolRegistry::new());
+        let agent = Arc::new(AgentService::new(config, router, tools, None, event_tx));
+        let registry = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+
+        let helper_agent = agent.clone();
+        let helper_registry = registry.clone();
+        let helper = tokio::spawn(async move {
+            run_scheduled_prompt_yielding(
+                &helper_agent,
+                &helper_registry,
+                "scheduled-yield-test",
+                "heartbeat check-in",
+            )
+            .await
+        });
+
+        // Let the scheduled run get genuinely in flight (request parked in
+        // the stalled generation), then a user turn arrives. The gate is
+        // correct even if the claim lands earlier — the cancel loop waits
+        // for the run's registration — so this sleep widens coverage, it
+        // does not carry the test.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            registry.try_claim("user-session").await,
+            "the user turn claims the run slot"
+        );
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), helper)
+            .await
+            .expect("the yield completes in moments, never after the stalled generation")
+            .expect("the helper task must not panic");
+        assert!(
+            outcome.is_none(),
+            "a preempted run reports a yield, not a result"
+        );
+        registry.release("user-session").await;
     }
 }

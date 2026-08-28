@@ -13,6 +13,8 @@
 
 #![cfg(feature = "boa")]
 
+mod common;
+
 use nanna_scripting::{ScriptEngine, ScriptedTool, ToolSearchFn};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -66,7 +68,10 @@ fn defs() -> Value {
 /// Execute the real discover_tools tool.ts against `input`, with tool
 /// definitions attached but no tool-search fn (the fallback environment).
 async fn run_discover(input: Value) -> Result<Value, String> {
-    let tool = ScriptedTool::from_file(skill_path()).expect("read discover_tools tool.ts");
+    let tool = ScriptedTool::from_file(skill_path())
+        .expect("read discover_tools tool.ts")
+        // Scaffolding, not an assertion — see `common::FIXTURE_TIMEOUT_MS`.
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
     ScriptEngine::new()
         .execute(&tool, input, Some(defs()), None)
         .await
@@ -101,7 +106,10 @@ async fn ranked_search_path_orders_results_and_filters_core_tools() {
         ])
     });
 
-    let tool = ScriptedTool::from_file(skill_path()).expect("read discover_tools tool.ts");
+    let tool = ScriptedTool::from_file(skill_path())
+        .expect("read discover_tools tool.ts")
+        // Scaffolding, not an assertion — see `common::FIXTURE_TIMEOUT_MS`.
+        .with_timeout(common::FIXTURE_TIMEOUT_MS);
     let result = ScriptEngine::new()
         .execute_full(
             &tool,

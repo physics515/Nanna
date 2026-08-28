@@ -291,11 +291,36 @@ impl Backend {
                         // this client's own active selection is untouched.
                         let _ = app.emit("workspaces-changed", ());
                     }
+                    DaemonEvent::ConfigChanged => {
+                        // Same shape as workspaces-changed: payload-free, each
+                        // view re-fetches the config slice it renders instead
+                        // of showing whatever it read at mount.
+                        let _ = app.emit("config-changed", ());
+                    }
                     DaemonEvent::ContextUsage { session_id, used, window } => {
                         let _ = app.emit("context-usage", serde_json::json!({
                             "session_id": session_id,
                             "used": used,
                             "window": window,
+                        }));
+                    }
+                    DaemonEvent::LivenessBeat {
+                        session_id, elapsed_s, phase, awaiting, quiet_s, step_index, last_tool, beat,
+                    } => {
+                        // Forwarded whole rather than reduced to a spinner
+                        // flag: the badge's job is to say what the turn is
+                        // waiting on, and every field here is part of that
+                        // sentence. Nulls stay null — "not reported" and
+                        // "zero seconds" are different claims.
+                        let _ = app.emit("liveness-beat", serde_json::json!({
+                            "session_id": session_id,
+                            "elapsed_s": elapsed_s,
+                            "phase": phase,
+                            "awaiting": awaiting,
+                            "quiet_s": quiet_s,
+                            "step_index": step_index,
+                            "last_tool": last_tool,
+                            "beat": beat,
                         }));
                     }
                     DaemonEvent::TaskRunStarted { scope, scope_id, goal } => {
@@ -402,6 +427,11 @@ daemon_proxies! {
     session_create_in_workspace(name: Option<&str>, workspace_id: Option<&str>);
     /// Set or clear the workspace for a session
     session_set_workspace(session_id: &str, workspace_id: Option<&str>);
+    /// Set or clear the chat-model pin for a session
+    session_set_model(session_id: &str, model: Option<&str>);
+    /// Set or clear the user-selected extra tools for a session (additive;
+    /// empty = default tool behavior)
+    session_set_tools(session_id: &str, tools: Vec<String>);
     /// Get session history
     session_history(session_id: &str, limit: Option<usize>);
     /// Delete a session
@@ -510,9 +540,19 @@ daemon_proxies! {
     /// Get channel status
     channel_status(id: Option<&str>);
 
-    // --- Task store (read-only view for the chat's checklist) ---
+    // --- Task store operations ---
     /// List tasks in a scope
     task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
+    /// Create a new task
+    task_create(title: &str, scope: &str, session_id: Option<&str>, parent_id: Option<i64>, description: Option<&str>, priority: Option<i64>);
+    /// Update a task with a partial patch
+    task_update(id: i64, patch: Value);
+    /// Mark a task as done
+    task_done(id: i64, workdir: Option<&str>);
+    /// Delete a task and its subtree
+    task_delete(id: i64);
+    /// Reorder a task by updating its priority
+    task_reorder(id: i64, new_priority: i64);
 }
 
 impl Default for Backend {

@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1680" width="1280" height="1680" role="img" aria-label="Nanna chat-path call graph">
+  <title>Nanna chat-path call graph</title>
+  <desc>GUI/IPC send through daemon chat harness, planner, long-horizon runner, agent loop, LLM, and tools. Mapped from source after cargo-callgraph (robinmoussu) could not compile against this 2024-edition workspace (tool pins nightly-2021-02-16).</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#546e7a"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#1a1b26" flood-opacity="0.35"/>
+    </filter>
+    <style>
+      .bg { fill: #1a1b26; }
+      .lane { fill: #1f2335; stroke: #3b4261; stroke-width: 1.5; }
+      .lane-title { fill: #7aa2f7; font: 700 16px "Segoe UI", sans-serif; }
+      .node { fill: #24283b; stroke: #7aa2f7; stroke-width: 1.6; }
+      .node-alt { fill: #24283b; stroke: #9ece6a; stroke-width: 1.6; }
+      .node-llm { fill: #24283b; stroke: #bb9af7; stroke-width: 1.6; }
+      .node-tool { fill: #24283b; stroke: #e0af68; stroke-width: 1.6; }
+      .label { fill: #c0caf5; font: 600 13px "Segoe UI", sans-serif; }
+      .sub { fill: #a9b1d6; font: 11px "Consolas", "Cascadia Mono", monospace; }
+      .edge { stroke: #546e7a; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .note { fill: #565f89; font: 12px "Segoe UI", sans-serif; }
+      .title { fill: #c0caf5; font: 700 22px "Segoe UI", sans-serif; }
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="1680"/>
+  <text class="title" x="40" y="42">Nanna chat path — call graph</text>
+  <text class="note" x="40" y="66">GUI → IPC → daemon harness → planner → LongHorizonRunner → agent loop → LLM / tools</text>
+
+  <!-- lanes -->
+  <rect class="lane" x="40" y="90" width="1200" height="150" rx="10"/>
+  <text class="lane-title" x="56" y="116">1. GUI / Tauri client</text>
+
+  <rect class="lane" x="40" y="260" width="1200" height="210" rx="10"/>
+  <text class="lane-title" x="56" y="286">2. Daemon control plane (IPC)</text>
+
+  <rect class="lane" x="40" y="490" width="1200" height="250" rx="10"/>
+  <text class="lane-title" x="56" y="516">3. Chat harness + planner + task store</text>
+
+  <rect class="lane" x="40" y="760" width="1200" height="250" rx="10"/>
+  <text class="lane-title" x="56" y="786">4. Long-horizon runner + step runner</text>
+
+  <rect class="lane" x="40" y="1030" width="1200" height="280" rx="10"/>
+  <text class="lane-title" x="56" y="1056">5. Agent loop (nanna-agent)</text>
+
+  <rect class="lane" x="40" y="1330" width="580" height="280" rx="10"/>
+  <text class="lane-title" x="56" y="1356">6. LLM (nanna-llm)</text>
+
+  <rect class="lane" x="640" y="1330" width="600" height="280" rx="10"/>
+  <text class="lane-title" x="656" y="1356">7. Tools (nanna-tools)</text>
+
+  <!-- nodes: GUI -->
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="136" width="320" height="72" rx="8"/>
+    <text class="label" x="96" y="164">DaemonClient::chat_send</text>
+    <text class="sub" x="96" y="186">gui/src-tauri/src/daemon_client.rs:750</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="460" y="136" width="340" height="72" rx="8"/>
+    <text class="label" x="476" y="164">WebSocket IPC  Action::Chat</text>
+    <text class="sub" x="476" y="186">ws://127.0.0.1:5149  ChatAction::Send</text>
+  </g>
+
+  <!-- nodes: control -->
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="310" width="340" height="72" rx="8"/>
+    <text class="label" x="96" y="338">ControlPlane::handle_chat</text>
+    <text class="sub" x="96" y="360">nanna-daemon/control/chat.rs:24</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="480" y="310" width="360" height="72" rx="8"/>
+    <text class="label" x="496" y="338">ControlPlane::run_chat_turn</text>
+    <text class="sub" x="496" y="360">nanna-daemon/control/chat_harness.rs:437</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="900" y="310" width="300" height="72" rx="8"/>
+    <text class="label" x="916" y="338">ACK status:started</text>
+    <text class="sub" x="916" y="360">spawned turn + ChatSink events</text>
+  </g>
+
+  <!-- nodes: planner -->
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="540" width="300" height="72" rx="8"/>
+    <text class="label" x="96" y="568">AgentPlanner</text>
+    <text class="sub" x="96" y="590">tasks.rs  build_plan_prompt</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="420" y="540" width="320" height="72" rx="8"/>
+    <text class="label" x="436" y="568">plan_or_fallback</text>
+    <text class="sub" x="436" y="590">nanna-agent/planner.rs:362</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="780" y="540" width="400" height="72" rx="8"/>
+    <text class="label" x="796" y="568">seed_plan / seed_continuation</text>
+    <text class="sub" x="796" y="590">nanna-daemon/tasks.rs:3170 / 3482</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="80" y="636" width="520" height="72" rx="8"/>
+    <text class="label" x="96" y="664">TursoTaskSource::next</text>
+    <text class="sub" x="96" y="686">task store is the checkpoint  P15</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="640" y="636" width="540" height="72" rx="8"/>
+    <text class="label" x="656" y="664">SessionInterjector  (mid-run send)</text>
+    <text class="sub" x="656" y="686">yield in_progress → seed priority-1</text>
+  </g>
+
+  <!-- nodes: harness -->
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="810" width="520" height="72" rx="8"/>
+    <text class="label" x="96" y="838">LongHorizonRunner::run_with_interjector</text>
+    <text class="sub" x="96" y="860">nanna-agent/harness.rs:1765</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="640" y="810" width="540" height="72" rx="8"/>
+    <text class="label" x="656" y="838">AgentStepRunner::try_run_step</text>
+    <text class="sub" x="656" y="860">nanna-daemon/tasks.rs  StepRunner</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="80" y="906" width="360" height="72" rx="8"/>
+    <text class="label" x="96" y="934">AcceptanceCheck</text>
+    <text class="sub" x="96" y="956">harness-run verdict, not the model</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="480" y="906" width="360" height="72" rx="8"/>
+    <text class="label" x="496" y="934">ChatSink</text>
+    <text class="sub" x="496" y="956">MessageDelta / ToolStart / ToolEnd</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-alt" x="880" y="906" width="300" height="72" rx="8"/>
+    <text class="label" x="896" y="934">progress-or-replan</text>
+    <text class="sub" x="896" y="956">stall → Plan step / abandon</text>
+  </g>
+
+  <!-- nodes: agent loop -->
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="1080" width="340" height="72" rx="8"/>
+    <text class="label" x="96" y="1108">Agent::run  (fresh context)</text>
+    <text class="sub" x="96" y="1130">re-anchor, O(1) window per step</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-llm" x="460" y="1080" width="340" height="72" rx="8"/>
+    <text class="label" x="476" y="1108">call_llm / call_llm_streaming</text>
+    <text class="sub" x="476" y="1130">nanna-agent/loop_runner.rs:5240</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-tool" x="840" y="1080" width="340" height="72" rx="8"/>
+    <text class="label" x="856" y="1108">execute_tools</text>
+    <text class="sub" x="856" y="1130">nanna-agent/loop_runner.rs:5645</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="80" y="1176" width="340" height="72" rx="8"/>
+    <text class="label" x="96" y="1204">discover_tools  (always on)</text>
+    <text class="sub" x="96" y="1226">never gate capability  P20</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="460" y="1176" width="340" height="72" rx="8"/>
+    <text class="label" x="476" y="1204">context compress / distill</text>
+    <text class="sub" x="476" y="1226">verified_outcomes stay pinned</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node" x="840" y="1176" width="340" height="72" rx="8"/>
+    <text class="label" x="856" y="1204">loop / narration detectors</text>
+    <text class="sub" x="856" y="1226">salvage prose tool-calls</text>
+  </g>
+
+  <!-- nodes: LLM -->
+  <g filter="url(#shadow)">
+    <rect class="node-llm" x="80" y="1380" width="500" height="72" rx="8"/>
+    <text class="label" x="96" y="1408">LlmClient::complete / stream</text>
+    <text class="sub" x="96" y="1430">nanna-llm/src/lib.rs:2880 / 5559</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-llm" x="80" y="1476" width="500" height="72" rx="8"/>
+    <text class="label" x="96" y="1504">Provider router  local → cloud</text>
+    <text class="sub" x="96" y="1526">Ollama / Anthropic / OpenAI / OpenRouter</text>
+  </g>
+
+  <!-- nodes: tools -->
+  <g filter="url(#shadow)">
+    <rect class="node-tool" x="680" y="1380" width="520" height="72" rx="8"/>
+    <text class="label" x="696" y="1408">ToolRegistry::execute</text>
+    <text class="sub" x="696" y="1430">nanna-tools/src/registry.rs:570</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect class="node-tool" x="680" y="1476" width="520" height="72" rx="8"/>
+    <text class="label" x="696" y="1504">JS/TS skills  (exec, write_file, todo, …)</text>
+    <text class="sub" x="696" y="1526">Boa / Deno  + ToolPolicy after resolve</text>
+  </g>
+
+  <!-- edges -->
+  <path class="edge" d="M400 172 H456"/>
+  <path class="edge" d="M630 208 V306"/>
+  <path class="edge" d="M250 382 V536"/>
+  <path class="edge" d="M420 346 H476"/>
+  <path class="edge" d="M840 346 H896"/>
+  <path class="edge" d="M660 382 V536"/>
+  <path class="edge" d="M380 576 H416"/>
+  <path class="edge" d="M740 576 H776"/>
+  <path class="edge" d="M340 708 V806"/>
+  <path class="edge" d="M910 708 V806"/>
+  <path class="edge" d="M600 846 H636"/>
+  <path class="edge" d="M340 882 V902"/>
+  <path class="edge" d="M910 882 V902"/>
+  <path class="edge" d="M910 978 V1076"/>
+  <path class="edge" d="M250 1176 V1076"/>
+  <path class="edge" d="M420 1116 H456"/>
+  <path class="edge" d="M800 1116 H836"/>
+  <path class="edge" d="M630 1152 V1172"/>
+  <path class="edge" d="M1010 1152 V1172"/>
+  <path class="edge" d="M630 1252 V1376"/>
+  <path class="edge" d="M1010 1252 V1376"/>
+  <path class="edge" d="M330 1452 V1472"/>
+  <path class="edge" d="M940 1452 V1472"/>
+
+  <text class="note" x="40" y="1644">Source: robinmoussu/cargo-callgraph intended as rustc-doc extractor (nightly-2021-02-16). That fork cannot typecheck a 2024-edition workspace; this SVG is the chat-path graph extracted from the live call sites above.</text>
+  <text class="note" x="40" y="1664">Format: Graphviz-style layered DAG rendered as SVG so it stays viewable without `dot` on PATH.</text>
+</svg>

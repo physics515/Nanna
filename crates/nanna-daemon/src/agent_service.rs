@@ -59,7 +59,7 @@ struct SessionQueue {
 pub struct AgentServiceConfig {
     /// Default model to use
     pub model: String,
-    /// Model priority list for fallback (e.g., ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"])
+    /// Model priority list for fallback (e.g., ["claude-opus-5", "claude-sonnet-5"])
     pub model_priority: Vec<String>,
     /// Maximum tokens per response
     pub max_tokens: u32,
@@ -123,6 +123,93 @@ impl Default for AgentServiceConfig {
     }
 }
 
+/// Copy every `[llm]`-derived field the running agent uses out of a config
+/// snapshot, in one place.
+///
+/// This is the *whole* answer to "which agent settings does a `[llm]` change
+/// reach?" — the bound is the field set the boot path already derives from
+/// `config.llm` (see `server.rs`, "Set agent configuration from loaded
+/// config"), so hot-reload and boot can never disagree about a field again.
+/// Fields boot does NOT take from `[llm]` (`max_tokens`, `temperature`, the
+/// iteration/nudge policy, thinking mode) are deliberately absent: copying
+/// them here would make a config write change behavior boot never would.
+///
+/// Split out of [`AgentService::apply_llm_config`] so the mapping is testable
+/// without a live service.
+pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmConfig) {
+    cfg.model_priority = llm.model_priority.clone();
+    // Same derivation boot uses: head of the priority list, else the single
+    // `llm.model`. A priority list that just became empty must not strand the
+    // agent on the model the old list's head named.
+    cfg.model = llm
+        .model_priority
+        .first()
+        .cloned()
+        .unwrap_or_else(|| llm.model.clone());
+    cfg.summarization_priority = llm.summarization_priority.clone();
+    cfg.summarization_ollama_url = llm.ollama_url.clone();
+    cfg.openrouter_api_key = llm.openrouter_api_key.clone();
+    cfg.openai_api_key = llm.openai_api_key.clone();
+    cfg.model_routing = llm.model_routing.clone();
+    cfg.routing_first_turn_primary = llm.routing_first_turn_primary;
+    cfg.sub_agent_model = llm.sub_agent_model.clone();
+    // Resolved (list > legacy single > main chat list), exactly as boot does,
+    // so consumers keep seeing one authoritative never-empty chain.
+    cfg.sub_agent_models = llm.effective_sub_agent_models();
+}
+
+/// Build the per-run/per-step [`AgentConfig`] from the service config.
+///
+/// Free function so the whole resolution chain — `[llm]` snapshot →
+/// [`AgentServiceConfig`] → the `AgentConfig` the agent loop actually
+/// summarizes with — is unit-testable without a live service.
+pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
+    AgentConfig {
+        model: config.model.clone(),
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        max_iterations: config.max_iterations,
+        nudge_after_iterations: config.nudge_after_iterations,
+        nudge_interval_iterations: config.nudge_interval_iterations,
+        thinking_mode: config.thinking_mode,
+        summarization_priority: config.summarization_priority.clone(),
+        summarization_ollama_url: config.summarization_ollama_url.clone(),
+        openrouter_api_key: config.openrouter_api_key.clone(),
+        openai_api_key: config.openai_api_key.clone(),
+        model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
+        routing_first_turn_primary: config.routing_first_turn_primary,
+        ..Default::default()
+    }
+}
+
+/// Point one chat turn's [`AgentConfig`] at the model that chat picked.
+///
+/// Precedence, in full: a session's own pick outranks the global `[llm]`
+/// default; with no pick, nothing here runs and the turn behaves exactly as it
+/// did before per-chat models existed.
+///
+/// Clearing `model_routing` is load-bearing, not tidiness. `route_model`
+/// re-picks a model on every iteration after the first whenever the tier table
+/// is non-empty, and a chat turn runs many iterations — leaving it populated
+/// would run the user's pinned chat on globally-configured models from step 2
+/// onward, silently.
+///
+/// Nothing else moves. `summarization_priority`, `summarization_ollama_url`,
+/// `sub_agent_model`, the provider keys and the whole iteration/nudge policy
+/// stay as [`agent_config_from`] produced them, because the pin names the CHAT
+/// model only. Embedding settings are not reachable from here at all — they
+/// live in `[embedding]` and nothing on the chat-turn path reads them.
+///
+/// Takes the per-turn clone by `&mut`, never the shared [`AgentServiceConfig`]:
+/// that struct is handed out live by [`AgentService::config_handle`] to the
+/// sub-agent spawner and the dream summarizer, so writing a per-chat pick into
+/// it would re-model every sub-agent, every summarization and every other
+/// session at once.
+pub fn apply_chat_model_override(config: &mut AgentConfig, model: impl Into<String>) {
+    config.model_routing.clear();
+    config.model = model.into();
+}
+
 /// Active chat request state
 struct ActiveChat {
     // Used for future session tracking features
@@ -172,9 +259,24 @@ struct ActiveChat {
 /// (persisted per message, shipped on remount) stays bounded.
 const TIMELINE_OUTPUT_CAP: usize = 4000;
 
-/// Lock the journal, surviving a poisoned mutex (a panicking thread must
-/// not erase the run's record — the data inside is still valid).
-fn timeline_lock(
+/// Lock the journal, surviving a poisoned mutex.
+///
+/// Poisoning is ignored here on purpose, and the justification is specific to
+/// what this mutex guards: a `Vec<TimelineItem>` has no cross-field invariant a
+/// panic could leave half-established. Every write is either a `push` or a
+/// back-fill of one item's outcome fields, and the type ALREADY models an
+/// interrupted call — `output`/`success`/`duration_ms` are `Option`, documented
+/// as "a run that dies mid-call leaves them None". So a panicking thread leaves
+/// a well-formed journal, and the only thing `unwrap()` would add is a second
+/// panic that erases the run's record precisely when it is most wanted.
+///
+/// Both journal writers must agree on this. The harness sink in `tasks.rs`
+/// writes to the *same* `Arc<Mutex<..>>` and used to `.expect("timeline lock
+/// poisoned")`, so one panic anywhere under the lock turned every later tool
+/// call in that run into another panic — inside a spawned turn, where a panic
+/// is invisible and the run just stops. Hence `pub(crate)`: one policy, one
+/// implementation, no second opinion about what a poisoned journal means.
+pub(crate) fn timeline_lock(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
 ) -> std::sync::MutexGuard<'_, Vec<TimelineItem>> {
     timeline.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -227,6 +329,9 @@ fn timeline_tool_start(
         duration_ms: None,
         tokens: (tokens > 0).then_some(tokens),
         total_tokens: (total_tokens > 0).then_some(total_tokens),
+        // Unknown until the call ends — see the field doc for why this is
+        // not `Some(false)`.
+        short_circuited: None,
         at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -256,14 +361,40 @@ fn timeline_tool_end(
     output: &str,
     ok: bool,
     duration: u64,
+    replayed: bool,
 ) {
+    // No assertions on `call_id` or on the `ok`/`replayed` combination: both
+    // are derived from provider and tool output, so an assert here would turn
+    // a malformed response into a panic inside a spawned turn — this repo has
+    // already lost a run to exactly that shape. Deviant input is *recorded*,
+    // which is the whole point of a journal.
     let mut items = timeline_lock(timeline);
+    // Only read under `debug_assertions`, so it must not exist in release —
+    // an unconditional binding would be a dead local the moment the assert
+    // below compiles away.
+    #[cfg(debug_assertions)]
+    let count_before = items.len();
     for item in items.iter_mut().rev() {
-        if let TimelineItem::Tool { call_id: id, output: out, success, duration_ms, .. } = item {
+        if let TimelineItem::Tool {
+            call_id: id,
+            output: out,
+            success,
+            duration_ms,
+            short_circuited,
+            ..
+        } = item
+        {
             if id == call_id && out.is_none() {
                 *out = Some(timeline_cap_output(output));
                 *success = Some(ok);
                 *duration_ms = Some(duration);
+                *short_circuited = Some(replayed);
+                // The outcome fields are back-filled as a set: a reader that
+                // sees `success` decided must never find the replay marker
+                // still undecided, or it is back to guessing.
+                debug_assert!(out.is_some(), "a closed call must carry its output");
+                debug_assert!(success.is_some(), "a closed call must carry its verdict");
+                debug_assert!(short_circuited.is_some(), "…and whether it was a replay");
                 return;
             }
         }
@@ -277,8 +408,22 @@ fn timeline_tool_end(
         duration_ms: Some(duration),
         tokens: None,
         total_tokens: None,
+        short_circuited: Some(replayed),
         at: chrono::Utc::now().to_rfc3339(),
     });
+    // Either branch records the call: back-filled in place (early return) or
+    // appended here. The journal never loses a completed call, which is the
+    // property the fallback exists for.
+    #[cfg(debug_assertions)]
+    debug_assert!(items.len() == count_before + 1, "the fallback must append exactly one item");
+}
+
+/// Read the breaker's machine-readable replay marker out of a tool result's
+/// structured data. Absent marker means the tool really ran.
+fn is_short_circuited(data: Option<&serde_json::Value>) -> bool {
+    data.and_then(|d| d.get("short_circuited"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Info about a tool call currently executing
@@ -367,6 +512,10 @@ pub struct AgentService {
     /// per-model request stats here so the control plane persists them and
     /// the router reads them for health-aware routing. `None` = don't record.
     model_stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Capability-transition notices, shared with the daemon's provider
+    /// plumbing (P22 Tier 4). Every run delivers pending transitions once,
+    /// in its next tool result — see [`nanna_agent::DegradationLedger`].
+    degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 impl AgentService {
@@ -418,6 +567,7 @@ impl AgentService {
             session_history: None,
             storage: None,
             model_stats: None,
+            degradations: None,
         }
     }
 
@@ -439,6 +589,14 @@ impl AgentService {
     #[must_use]
     pub fn with_stats(mut self, stats: nanna_agent::ModelStatsTracker) -> Self {
         self.model_stats = Some(stats);
+        self
+    }
+
+    /// Share the capability-transition ledger with this service's runs — see
+    /// [`nanna_agent::DegradationLedger`] for the announce-once contract.
+    #[must_use]
+    pub fn with_degradations(mut self, ledger: Arc<nanna_agent::DegradationLedger>) -> Self {
+        self.degradations = Some(ledger);
         self
     }
 
@@ -481,20 +639,34 @@ impl AgentService {
         info
     }
 
-    /// Update model configuration at runtime (hot-reload from control plane)
-    pub async fn update_config(&self, model: Option<String>, model_priority: Option<Vec<String>>) {
-        let mut config = self.config.write().await;
-        if let Some(m) = model {
-            if config.model != m {
-                info!(old = %config.model, new = %m, "Switching model");
-                config.model = m;
+    /// Re-apply the running agent's `[llm]` settings from a config snapshot
+    /// (hot-reload from the control plane).
+    ///
+    /// This used to take only `model` + `model_priority`, so every other field
+    /// the agent derives from `[llm]` stayed frozen at whatever boot read from
+    /// disk — a config-frozen-at-boot bug of the same family as the router's.
+    /// The costly one was `summarization_priority`: a user who changed their
+    /// summarization model in settings (or pinned one over IPC) kept
+    /// summarizing on the boot-time model until the daemon restarted, and
+    /// nothing said so. Every compressed context in between was produced by a
+    /// model the user had already replaced.
+    ///
+    /// The field set is [`apply_llm_settings`] — deliberately the same set the
+    /// boot path derives from `config.llm`, not a hand-picked subset.
+    pub async fn apply_llm_config(&self, llm: &nanna_config::LlmConfig) {
+        {
+            let mut config = self.config.write().await;
+            let before_model = config.model.clone();
+            apply_llm_settings(&mut config, llm);
+            if before_model != config.model {
+                info!(old = %before_model, new = %config.model, "Switching model");
             }
+            info!(
+                model_priority = ?config.model_priority,
+                summarization_priority = ?config.summarization_priority,
+                "Applied [llm] settings to the running agent"
+            );
         }
-        if let Some(p) = model_priority {
-            info!(new_priority = ?p, "Updating model priority list");
-            config.model_priority = p;
-        }
-        drop(config);
 
         // Clear cached model info to force refresh on next request
         let mut cached = self.current_model_info.write().await;
@@ -503,26 +675,44 @@ impl AgentService {
     
     /// Create agent config from service config (pub: the long-horizon
     /// step runner builds fresh per-step agents from the same config)
+    ///
+    /// Every call returns a fresh clone, which is what makes a per-turn model
+    /// pick safe: a caller may mutate the value it gets back (see
+    /// [`apply_chat_model_override`]) without touching the shared config any
+    /// other session, sub-agent or summarization reads from.
     pub async fn agent_config(&self) -> AgentConfig {
         let config = self.config.read().await;
-        AgentConfig {
-            model: config.model.clone(),
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            max_iterations: config.max_iterations,
-            nudge_after_iterations: config.nudge_after_iterations,
-            nudge_interval_iterations: config.nudge_interval_iterations,
-            thinking_mode: config.thinking_mode,
-            summarization_priority: config.summarization_priority.clone(),
-            summarization_ollama_url: config.summarization_ollama_url.clone(),
-            openrouter_api_key: config.openrouter_api_key.clone(),
-            openai_api_key: config.openai_api_key.clone(),
-            model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
-            routing_first_turn_primary: config.routing_first_turn_primary,
-            ..Default::default()
-        }
+        agent_config_from(&config)
     }
-    
+
+    /// Adopt a config handle created before this service existed.
+    ///
+    /// The daemon builds the sub-agent spawner and the script services BEFORE
+    /// the agent service, and each of those needs the same live config the
+    /// service will mutate on `config.set`. Sharing one lock is what makes
+    /// "the user changed the model" true for all of them at once; cloning the
+    /// config into each is what made it false (2026-08-15).
+    #[must_use]
+    pub fn with_shared_config(mut self, config: Arc<RwLock<AgentServiceConfig>>) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The live config itself, for the long-lived collaborators the daemon
+    /// builds once at boot but that must keep answering to `config.set`.
+    ///
+    /// Handing out the `Arc<RwLock<..>>` rather than a snapshot is the point:
+    /// a boot-time clone silently outlives every later config change, which is
+    /// exactly how the scheduled dream cycle, the sub-agent spawner and the
+    /// script summarizer each kept using the model the daemon started with
+    /// (2026-08-15). Holders read it when they act, not when they are built.
+    /// It is the config only — never the service — so no holder can form a
+    /// reference cycle back to [`AgentService`].
+    #[must_use]
+    pub fn config_handle(&self) -> Arc<RwLock<AgentServiceConfig>> {
+        Arc::clone(&self.config)
+    }
+
     /// Get or create the per-session queue for serializing chat processing
     async fn get_or_create_queue(&self, session_id: &str) -> Arc<SessionQueue> {
         // Fast path: read lock
@@ -962,7 +1152,11 @@ impl AgentService {
                                 duration_ms,
                             });
                         }
-                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms);
+                        // The replay marker rides in the result's structured
+                        // data, which the event carries but the journal used
+                        // to drop — so a restored timeline showed steering as
+                        // failures. Record it where the run record lives.
+                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms, is_short_circuited(data));
                         let _ = event_tx_tool_end.send(Event::ToolEnd {
                             session_id: session_id_tool_end.clone(),
                             call_id: call_id.to_string(),
@@ -982,60 +1176,29 @@ impl AgentService {
                         let ws_id = ws_id_for_memory.clone();
                         Box::pin(async move {
                             if let Some(ref service) = mem_service {
-                                let mut metadata = memory.tags.unwrap_or_default();
-                                metadata.insert("category".to_string(), memory.category.clone());
-                                // Persist provenance so the store records STATED vs
-                                // OBSERVED instead of everything defaulting to "stated".
-                                metadata.insert(
-                                    "fact_type".to_string(),
-                                    memory.provenance.as_str().to_string(),
-                                );
-                                // Derive importance from category. Memories never
-                                // expire — all categories are permanent.
-                                let importance: f32 = match memory.category.as_str() {
-                                    "tool_result" => 1.5,
-                                    "preference" | "identity" => 4.0,
-                                    "fact" | "insight" => 3.5,
-                                    "context" => 3.0,
-                                    _ => 3.0,
-                                };
-
-                                // Skip low-signal content: errors, tiny results, or garbled output
-                                let dominated_by_non_ascii = memory.content.chars().take(200)
-                                    .filter(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace() && !c.is_ascii_punctuation())
-                                    .count() > 40;
-
-                                if memory.content.starts_with("Error:")
-                                    || memory.content.contains("HEARTBEAT_OK")
-                                    || memory.content.trim_start().starts_with("[Tool:")
-                                    || memory.content.starts_with("Execution failed:")
-                                    || memory.content.contains("Error: Execution failed")
-                                    || memory.content.contains("Command failed")
-                                    || memory.content.contains("Missing required parameter")
-                                    || memory.content.contains("cannot find the path specified")
-                                    || memory.content.contains("Parameter format not correct")
-                                    || memory.content.contains("not recognized as an internal")
-                                    || memory.content.contains("Bridge error:")
-                                    || memory.content.contains("JS execution failed")
-                                    || (memory.category == "tool_result" && memory.content.contains("Error"))
-                                    || memory.content.len() < 20
-                                    || dominated_by_non_ascii
+                                // Filter, importance and route all live in
+                                // `memory_adapter` — ONE copy, shared with the
+                                // harness sink in `tasks.rs`. Two private
+                                // copies is how those two sinks' policies
+                                // drifted apart before, at a cost of 704
+                                // discarded writes in a single run; this path
+                                // only decides what to say about the outcome.
+                                let category = memory.category.clone();
+                                let excerpt = truncate(&memory.content, 50);
+                                match crate::memory_adapter::store_extracted_memory(
+                                    service,
+                                    memory,
+                                    ws_id,
+                                )
+                                .await
                                 {
-                                    info!("Skipping low-signal memory [{}]: {}", memory.category, truncate(&memory.content, 50));
-                                    return;
-                                }
-
-                                // Store with workspace scope if session has a workspace
-                                if let Some(ref ws_id) = ws_id {
-                                    if let Err(e) = service.remember_scoped(&memory.content, metadata, importance, Some(ws_id.clone())).await {
-                                        warn!("Failed to auto-store scoped memory: {}", e);
-                                    } else {
-                                        info!("Auto-extracted memory [{}] (workspace: {}): {}", memory.category, ws_id, truncate(&memory.content, 50));
-                                    }
-                                } else if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
-                                    warn!("Failed to auto-store memory: {}", e);
-                                } else {
-                                    info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                                    Ok(None) => info!(
+                                        "Skipping low-signal memory [{category}]: {excerpt}"
+                                    ),
+                                    Ok(Some(_)) => info!(
+                                        "Auto-extracted memory [{category}]: {excerpt}"
+                                    ),
+                                    Err(e) => warn!("Failed to auto-store memory: {e}"),
                                 }
                             }
                         })
@@ -1047,6 +1210,9 @@ impl AgentService {
                 attachments: attachments.clone(),
                 is_sub_agent,
                 all_tools_active: is_sub_agent,
+                // Capability transitions (provider benched, writes queued)
+                // reach the model once, in its next tool result.
+                degradations: self.degradations.clone(),
                 // "One path": a chat whose message opens with MISSION runs
                 // long-horizon — the loop auto-continues the model (visible
                 // as mission_control tool chips) until it declares MISSION
@@ -1106,12 +1272,19 @@ impl AgentService {
                             .clone()
                             .into_iter()
                             .map(|item| match item {
-                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at } => {
+                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at } => {
                                     let output = output.map(|o| {
                                         if o.len() > 200 {
-                                            let outcome = if success == Some(false) { "failed" } else { "completed" };
+                                            // A short circuit is neither: the tool never ran,
+                                            // so calling it "failed" is the same lie the
+                                            // journal used to tell about the whole entry.
+                                            let outcome = match (short_circuited, success) {
+                                                (Some(true), _) => "the tool never ran — the breaker replaced this call with a steering notice",
+                                                (_, Some(false)) => "the call failed exactly as recorded",
+                                                _ => "the call completed exactly as recorded",
+                                            };
                                             format!(
-                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; the call {outcome} exactly as recorded]",
+                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; {outcome}]",
                                                 truncate(&o, 200)
                                             )
                                         } else {
@@ -1129,7 +1302,7 @@ impl AgentService {
                                             i
                                         }
                                     });
-                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at }
+                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at }
                                 }
                                 TimelineItem::Thinking { content, at } if content.len() > 500 => {
                                     let total = content.len();
@@ -1941,6 +2114,293 @@ mod tests {
         );
     }
 
+    /// The 2026-08-14 series bug: five benchmark legs each pinned
+    /// `llm.summarization_priority` to their own model over IPC, and all 171
+    /// context summarizations still ran on the model the daemon had booted
+    /// with — because the hot-reload path pushed only `model`/`model_priority`
+    /// onto the running service. The pin has to survive the whole chain, not
+    /// just the on-disk write.
+    /// The sibling half of the pin: the daemon builds the sub-agent spawner
+    /// and the script summarizer BEFORE this service exists, so each was
+    /// handed a clone of the boot config and kept answering with it forever.
+    /// Sharing one lock is what makes a later change reach them; this asserts
+    /// the handle really is shared, not copied.
+    #[tokio::test]
+    async fn collaborators_sharing_the_config_handle_see_a_later_change() {
+        let boot = AgentServiceConfig {
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            ..Default::default()
+        };
+        // What the daemon hands to the spawner / script summarizer at boot.
+        let shared = Arc::new(RwLock::new(boot));
+        let collaborator = Arc::clone(&shared);
+        assert_eq!(
+            collaborator.read().await.summarization_priority,
+            vec!["ollama/lfm2.5".to_string()]
+        );
+
+        // The service adopts the SAME lock, then the user repoints summarization.
+        {
+            let mut live = shared.write().await;
+            apply_llm_settings(
+                &mut live,
+                &nanna_config::LlmConfig {
+                    summarization_priority: vec!["ollama/ornith:9b".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The collaborator resolves at USE time, so it sees the new list.
+        let resolved = agent_config_from(&*collaborator.read().await);
+        assert_eq!(
+            resolved.summarization_priority,
+            vec!["ollama/ornith:9b".to_string()],
+            "a collaborator holding the shared handle must summarize on the              model the user set, not the one the daemon booted with"
+        );
+    }
+
+    #[test]
+    fn a_changed_summarization_priority_reaches_the_next_agent_config() {
+        let mut cfg = AgentServiceConfig {
+            // What the daemon booted with.
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_config_from(&cfg).summarization_priority,
+            vec!["ollama/lfm2.5".to_string()],
+            "boot value must be what the agent starts from"
+        );
+
+        // The user (or an operator over IPC) changes the summarization model.
+        let llm = nanna_config::LlmConfig {
+            summarization_priority: vec!["ollama/ornith:9b".to_string()],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+
+        assert_eq!(cfg.summarization_priority, vec!["ollama/ornith:9b".to_string()]);
+        assert_eq!(
+            agent_config_from(&cfg).summarization_priority,
+            vec!["ollama/ornith:9b".to_string()],
+            "the next summarization request must use the new pin, not the boot model"
+        );
+
+        // Clearing the list must also propagate — empty means "truncate
+        // instead of summarize", and a stale non-empty list would keep
+        // spending a model the user just turned off.
+        apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
+        assert!(agent_config_from(&cfg).summarization_priority.is_empty());
+    }
+
+    #[test]
+    fn llm_settings_carry_the_rest_of_the_boot_derived_fields() {
+        let mut cfg = AgentServiceConfig::default();
+        let llm = nanna_config::LlmConfig {
+            model: "fallback-model".to_string(),
+            model_priority: vec!["primary".to_string(), "secondary".to_string()],
+            ollama_url: Some("http://127.0.0.1:11434".to_string()),
+            openrouter_api_key: Some("or-key".to_string()),
+            openai_api_key: Some("oa-key".to_string()),
+            model_routing: vec!["cheap:simple".to_string()],
+            routing_first_turn_primary: false,
+            sub_agent_models: vec!["sub".to_string()],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+
+        // Head of the priority list wins, exactly as at boot.
+        assert_eq!(cfg.model, "primary");
+        assert_eq!(cfg.model_priority, vec!["primary".to_string(), "secondary".to_string()]);
+        assert_eq!(cfg.summarization_ollama_url.as_deref(), Some("http://127.0.0.1:11434"));
+        assert_eq!(cfg.openrouter_api_key.as_deref(), Some("or-key"));
+        assert_eq!(cfg.openai_api_key.as_deref(), Some("oa-key"));
+        assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
+        assert!(!cfg.routing_first_turn_primary);
+        assert_eq!(cfg.sub_agent_models, vec!["sub".to_string()]);
+
+        // Empty priority list → the single `llm.model`, never the stale head.
+        let llm = nanna_config::LlmConfig {
+            model: "fallback-model".to_string(),
+            model_priority: vec![],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+        assert_eq!(cfg.model, "fallback-model");
+    }
+
+    #[test]
+    fn llm_settings_do_not_touch_fields_boot_leaves_alone() {
+        // The bound on `apply_llm_settings` is "the field set boot derives
+        // from `[llm]`". Anything boot leaves at the service default must stay
+        // untouched here, or a config write would change behavior a restart
+        // never would.
+        let mut cfg = AgentServiceConfig {
+            max_tokens: 4242,
+            temperature: 0.13,
+            nudge_after_iterations: 7,
+            nudge_interval_iterations: 3,
+            max_iterations: Some(9),
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
+        assert_eq!(cfg.max_tokens, 4242);
+        assert!((cfg.temperature - 0.13).abs() < f32::EPSILON);
+        assert_eq!(cfg.nudge_after_iterations, 7);
+        assert_eq!(cfg.nudge_interval_iterations, 3);
+        assert_eq!(cfg.max_iterations, Some(9));
+    }
+
+    /// A chat's own model pick governs THAT chat's turn and nothing else.
+    /// The failure this guards is the mirror image of the one
+    /// `with_shared_config` exists to fix: the sub-agent spawner and the dream
+    /// summarizer read the shared [`AgentServiceConfig`] live, so a pin written
+    /// into shared state would re-model every sub-agent, every summarization
+    /// and every other session at once.
+    #[test]
+    fn a_chats_model_pick_governs_only_that_chats_turn() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            model_priority: vec!["claude-sonnet-4".to_string()],
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            summarization_ollama_url: Some("http://127.0.0.1:11434".to_string()),
+            sub_agent_models: vec!["ollama/qwen3:4b".to_string()],
+            model_routing: vec!["cheap:simple".to_string()],
+            ..Default::default()
+        };
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "ollama/qwen3:14b");
+
+        // The chat runs on the pin.
+        assert_eq!(turn.model, "ollama/qwen3:14b");
+        // Summarization stays global — the pin names the CHAT model only.
+        assert_eq!(turn.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
+        assert_eq!(
+            turn.summarization_ollama_url.as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(turn.sub_agent_model, None, "sub-agents are not re-pointed by a chat pin");
+
+        // The shared config every other consumer reads is untouched, so the
+        // next sub-agent still gets the global chain and the next
+        // summarization the global summarizer.
+        assert_eq!(cfg.model, "claude-sonnet-4");
+        assert_eq!(cfg.model_priority, vec!["claude-sonnet-4".to_string()]);
+        assert_eq!(cfg.sub_agent_models, vec!["ollama/qwen3:4b".to_string()]);
+        assert_eq!(cfg.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
+        assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
+
+        // And a second chat built from the same config never sees the first
+        // chat's pin.
+        assert_eq!(agent_config_from(&cfg).model, "claude-sonnet-4");
+    }
+
+    /// Embedding models are not reachable from the chat-turn path at all: they
+    /// live in `[embedding]` and are resolved by the embedding router, and no
+    /// field of [`AgentServiceConfig`] or `AgentConfig` names one. This asserts
+    /// the field set a pin can even touch, so "helpfully" widening it later
+    /// fails here first.
+    #[test]
+    fn a_chat_model_pick_moves_exactly_two_fields() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 4242,
+            temperature: 0.13,
+            max_iterations: Some(9),
+            nudge_after_iterations: 7,
+            nudge_interval_iterations: 3,
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            openrouter_api_key: Some("or-key".to_string()),
+            openai_api_key: Some("oa-key".to_string()),
+            routing_first_turn_primary: false,
+            ..Default::default()
+        };
+        let before = agent_config_from(&cfg);
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "ollama/qwen3:14b");
+
+        assert_eq!(turn.max_tokens, before.max_tokens);
+        assert!((turn.temperature - before.temperature).abs() < f32::EPSILON);
+        assert_eq!(turn.max_iterations, before.max_iterations);
+        assert_eq!(turn.nudge_after_iterations, before.nudge_after_iterations);
+        assert_eq!(turn.nudge_interval_iterations, before.nudge_interval_iterations);
+        assert_eq!(turn.thinking_mode, before.thinking_mode);
+        assert_eq!(turn.summarization_priority, before.summarization_priority);
+        assert_eq!(turn.summarization_ollama_url, before.summarization_ollama_url);
+        assert_eq!(turn.openrouter_api_key, before.openrouter_api_key);
+        assert_eq!(turn.openai_api_key, before.openai_api_key);
+        assert_eq!(turn.context_result_threshold, before.context_result_threshold);
+        assert_eq!(turn.distillation_interval, before.distillation_interval);
+        assert_eq!(turn.routing_first_turn_primary, before.routing_first_turn_primary);
+        assert_eq!(turn.sub_agent_model, before.sub_agent_model);
+    }
+
+    /// `route_model` re-picks a model on every iteration after the first
+    /// whenever the tier table is populated, and a chat turn runs many
+    /// iterations. Leaving it in place would run the user's pinned chat on
+    /// globally-configured models from step 2 onward with nothing saying so —
+    /// so clearing it is part of honouring the pin, not tidiness.
+    #[test]
+    fn a_pin_clears_the_tier_table_but_an_unpinned_chat_keeps_it() {
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            model_routing: vec![
+                "claude-haiku-3-5:simple".to_string(),
+                "claude-sonnet-4:complex".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        // Unset override: the helper never runs, so the turn is byte-for-byte
+        // what the global default has always produced — tier table and all.
+        let unpinned = agent_config_from(&cfg);
+        assert_eq!(unpinned.model, "claude-sonnet-4");
+        assert_eq!(unpinned.model_routing.len(), 2);
+        assert_eq!(unpinned.model_routing[0].model, "claude-haiku-3-5");
+
+        let mut pinned = agent_config_from(&cfg);
+        apply_chat_model_override(&mut pinned, "ollama/qwen3:14b");
+        assert!(
+            pinned.model_routing.is_empty(),
+            "a pinned chat must not be re-routed off its model at iteration 2"
+        );
+    }
+
+    /// A pin naming a model no provider serves has to die loudly, naming the
+    /// model — never fall back to the global default. The helper's job in that
+    /// story is to leave `model` holding the USER'S spec, so the serve check
+    /// runs against what was actually asked for and the refusal can say so.
+    /// (Silently swapping in the global model is the bare-model-name
+    /// silent-cancel class this project has already been bitten by.)
+    #[test]
+    fn a_pin_no_provider_serves_stays_nameable_instead_of_reverting() {
+        // Only Anthropic is authenticated on this daemon.
+        let router = LlmRouter::new().with_anthropic("test-key");
+        let cfg = AgentServiceConfig {
+            model: "claude-sonnet-4".to_string(),
+            ..Default::default()
+        };
+
+        let mut turn = agent_config_from(&cfg);
+        apply_chat_model_override(&mut turn, "openrouter/qwen/qwen3-14b");
+
+        assert_eq!(
+            turn.model, "openrouter/qwen/qwen3-14b",
+            "the turn still carries the pin, so the refusal can name it"
+        );
+        assert!(
+            router.client_for_model(&turn.model).is_none(),
+            "no provider serves the pin — the turn must refuse, not proceed"
+        );
+        // The global default WOULD have run. Quietly using it instead is the
+        // failure mode: the user would watch a chat they pinned answer on
+        // another model.
+        assert!(router.client_for_model(&cfg.model).is_some());
+    }
+
     #[test]
     fn truncate_respects_char_boundaries() {
         // ASCII: simple cut with ellipsis.
@@ -1951,5 +2411,207 @@ mod tests {
         // lands inside the emoji, so it must back off to byte 1 (after 'a')
         // rather than panic — result "a...".
         assert_eq!(truncate("a🚀bc", 2), "a...");
+    }
+
+    /// The breaker's marker lives in the tool result's structured data, and
+    /// only there — so read it defensively: absent key, wrong type and no
+    /// data at all all mean "the tool really ran".
+    #[test]
+    fn short_circuit_marker_is_read_only_when_it_is_a_true_bool() {
+        assert!(is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": true })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": false })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "short_circuited": "true" })
+        )));
+        assert!(!is_short_circuited(Some(
+            &serde_json::json!({ "other": true })
+        )));
+        assert!(!is_short_circuited(Some(&serde_json::json!(
+            "not an object"
+        ))));
+        assert!(!is_short_circuited(None));
+    }
+
+    /// A breaker replay reports `success: false` with a notice as its output.
+    /// The journal has to record *why* that outcome happened, or a timeline
+    /// rebuilt from it renders steering as a wall of tool errors.
+    #[test]
+    fn journal_back_fills_the_replay_marker_beside_the_outcome() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(
+            &timeline,
+            "c1",
+            "exec",
+            &serde_json::json!({ "cmd": "ls" }),
+            0,
+            0,
+        );
+
+        // In flight: the outcome is not yet known, and neither is the marker.
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert!(success.is_none(), "an open call has no outcome yet");
+                assert!(
+                    short_circuited.is_none(),
+                    "an open call is not a decided non-replay"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        timeline_tool_end(&timeline, "c1", "exec", "[replayed]", false, 1, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(
+            items.len(),
+            1,
+            "the end must back-fill the open call, not append"
+        );
+        match &items[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(
+                    *success,
+                    Some(false),
+                    "a replay did not give the model its result"
+                );
+                assert_eq!(
+                    *short_circuited,
+                    Some(true),
+                    "…but it is steering, not a failure"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// Negative space: a real failure must stay a failure. `Some(false)` and
+    /// `None` are both non-replays to the GUI (it tests `=== true`), but the
+    /// journal states the decided answer once the call has ended.
+    #[test]
+    fn journal_marks_a_real_failure_as_not_replayed() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+        timeline_tool_end(&timeline, "c1", "exec", "boom", false, 7, false);
+        match &timeline_lock(&timeline)[0] {
+            TimelineItem::Tool {
+                success,
+                short_circuited,
+                ..
+            } => {
+                assert_eq!(*success, Some(false));
+                assert_eq!(
+                    *short_circuited,
+                    Some(false),
+                    "a decided non-replay is not None"
+                );
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// An end with no journaled start still records the call — and must carry
+    /// the marker on that fresh item too, or the recovery path loses exactly
+    /// the entries a crashed run most needs explained.
+    #[test]
+    fn orphan_tool_end_records_the_replay_marker_too() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_end(&timeline, "c9", "exec", "[replayed]", false, 2, true);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the call must not vanish from the record");
+        match &items[0] {
+            TimelineItem::Tool {
+                short_circuited, ..
+            } => {
+                assert_eq!(*short_circuited, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+    }
+
+    /// The field is additive on the wire: journals written before it exists
+    /// must still load, and an unmarked entry must not read as a replay.
+    #[test]
+    fn journals_without_the_marker_still_deserialize() {
+        let legacy = serde_json::json!({
+            "kind": "tool",
+            "call_id": "c1",
+            "name": "exec",
+            "output": "ok",
+            "success": true,
+            "duration_ms": 3,
+            "at": "2026-08-27T00:00:00Z",
+        });
+        let item: TimelineItem =
+            serde_json::from_value(legacy).expect("a pre-field journal entry must still load");
+        match &item {
+            TimelineItem::Tool {
+                short_circuited,
+                success,
+                ..
+            } => {
+                assert_eq!(*short_circuited, None, "absent means unknown, not replayed");
+                assert_eq!(*success, Some(true));
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
+
+        // And `None` is omitted again on the way out, so round-tripping an
+        // old journal does not rewrite it with a field it never had.
+        let round_tripped = serde_json::to_value(&item).expect("tool item must serialize");
+        assert!(
+            round_tripped.get("short_circuited").is_none(),
+            "None must not be written as null: {round_tripped}"
+        );
+    }
+
+    /// A panic under the journal lock must not take the journal with it.
+    ///
+    /// This is the property `tasks.rs` used to get wrong: it wrote to the same
+    /// `Arc<Mutex<..>>` through `.expect("timeline lock poisoned")`, so one
+    /// panic anywhere under the lock turned every later tool call in that run
+    /// into another panic — inside a spawned turn, where a panic is invisible
+    /// and the run simply stops. Both writers now go through `timeline_lock`.
+    #[test]
+    fn a_poisoned_journal_still_records_and_keeps_what_it_had() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
+
+        // Poison it exactly the way a panicking spawned turn would.
+        let poisoner = Arc::clone(&timeline);
+        let panicked = std::thread::spawn(move || {
+            let _guard = timeline_lock(&poisoner);
+            panic!("a step panicked while holding the journal");
+        })
+        .join();
+        assert!(
+            panicked.is_err(),
+            "the helper thread must actually have panicked"
+        );
+        assert!(timeline.is_poisoned(), "…and left the mutex poisoned");
+
+        // The record survives, and the run can still write to it.
+        timeline_tool_end(&timeline, "c1", "exec", "ok", true, 3, false);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "the earlier entry must not be lost");
+        match &items[0] {
+            TimelineItem::Tool {
+                success, output, ..
+            } => {
+                assert_eq!(*success, Some(true), "the write after poisoning landed");
+                assert!(output.is_some(), "…and carried its output");
+            }
+            other => panic!("expected a tool item, got {other:?}"),
+        }
     }
 }

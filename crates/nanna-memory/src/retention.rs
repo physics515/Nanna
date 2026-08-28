@@ -17,7 +17,7 @@
 //! importance) lands in a *compressible* band; `w20` is the forgetting-curve decay
 //! exponent, so it directly moves where an aged memory lands. The same aged corpus
 //! consolidates differently under `w20 = 0.5` (the lagging FSRS-5 constant we ship)
-//! versus `w20 = 0.0658` (the FSRS-6 default). This harness is how we tell whether
+//! versus `w20 = 0.1542` (the FSRS-6 default). This harness is how we tell whether
 //! flipping that constant actually recalls better instead of guessing — run the same
 //! [`RetentionCorpus`] through [`run_retention_cycle`] with each parameter set and
 //! compare [`RetentionReport::recall_retention`].
@@ -533,7 +533,7 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoryService, MemoryServiceConfig};
+    use crate::{is_verbatim_pinned, MemoryService, MemoryServiceConfig, FACT_TYPE_METADATA_KEY};
 
     fn service_for(dim: usize) -> MemoryService {
         MemoryService::new(MemoryServiceConfig {
@@ -714,6 +714,225 @@ mod tests {
         );
     }
 
+
+    /// Give the critical entry the provenance a user assertion would carry.
+    ///
+    /// The extraction path writes `fact_type` from `MemoryProvenance`, so this
+    /// is the same shape a real "never call the production database directly"
+    /// would land with when the user *said* it, rather than when the agent
+    /// inferred it from a log line.
+    fn state_the_critical_entry(mut band: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        let mut stated_count = 0_usize;
+        for entry in &mut band {
+            if entry.content.contains(CRITICAL_CLAUSE) {
+                entry
+                    .metadata
+                    .insert(FACT_TYPE_METADATA_KEY.to_string(), "stated".to_string());
+                stated_count += 1;
+            }
+        }
+        assert_eq!(stated_count, 1, "exactly one entry carries the clause");
+
+        // Move the carrier LAST. Every member of this band has identical FSRS
+        // state, so the fold's descending-weight sort is stable and preserves
+        // input order — putting the stated row at the end makes an unprotected
+        // run fold it INTO an observed survivor rather than the other way
+        // round, which is the direction that launders provenance. Without this
+        // the laundering fixture would pass vacuously. Weight is deliberately
+        // NOT used to force the order: weight also selects the consolidation
+        // band, so nudging it would move the row out of the band under test.
+        let carrier = band
+            .iter()
+            .position(|entry| entry.content.contains(CRITICAL_CLAUSE))
+            .expect("the clause was just inserted");
+        let carrier = band.remove(carrier);
+        band.push(carrier);
+        band
+    }
+
+    /// Mitigation arm (c), shipped 2026-08-21: the same corpus, the same spread
+    /// and the same summarizer as the losing baseline arm above — the *only*
+    /// difference is that the critical memory carries the provenance a user's
+    /// own assertion would have given it.
+    ///
+    /// It survives the cycle verbatim, and the band still compresses around it,
+    /// so the protection costs coverage of one row rather than the compression.
+    #[tokio::test]
+    async fn a_user_stated_clause_survives_the_summarizing_cycle() {
+        let dim = 16;
+        let service = drift_service(dim);
+        let band = state_the_critical_entry(drift_band(8, dim, 0.45));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+        let before_count = service.count().await;
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.clusters_formed > 0,
+            "the unpinned remainder must still reach the summarizer: {result:?}"
+        );
+        assert!(
+            service.count().await < before_count,
+            "the band must still compress around the pinned row: {before_count} -> {}",
+            service.count().await
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "a user-STATED clause must never be paraphrased away"
+        );
+    }
+
+    /// A fold merges a source INTO a survivor and keeps the **survivor's**
+    /// metadata. So folding a stated memory into an observed one would hand back
+    /// an `observed` row that contains a user assertion — laundering the
+    /// provenance, after which the next cycle is free to summarize it away.
+    ///
+    /// Splitting the band by provenance *before* the fold is what prevents it:
+    /// pinned and unpinned memories only ever fold among themselves.
+    #[tokio::test]
+    async fn a_dedup_fold_never_launders_stated_provenance_into_observed() {
+        let dim = 16;
+        let service = drift_service(dim);
+        // Near-identical vectors: without the partition every pair clears the
+        // Reinforce line and the stated row would fold into an observed one.
+        let band = state_the_critical_entry(drift_band(8, dim, 0.01));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+        assert!(
+            result.memories_deduped > 0,
+            "this arm must exercise the deterministic fold: {result:?}"
+        );
+
+        let carriers: Vec<_> = service
+            .list_all()
+            .await
+            .into_iter()
+            .filter(|memory| memory.content.contains(CRITICAL_CLAUSE))
+            .collect();
+        assert!(
+            !carriers.is_empty(),
+            "the clause must still be somewhere in the store"
+        );
+        for carrier in &carriers {
+            assert!(
+                is_verbatim_pinned(&carrier.metadata),
+                "a row holding a user-STATED clause must still read as stated \
+                 (id {}, fact_type {:?})",
+                carrier.id,
+                carrier.metadata.get(FACT_TYPE_METADATA_KEY)
+            );
+        }
+    }
+
+
+    /// Mark a whole band as consolidation products — what a second dream cycle
+    /// actually sees after a first one has already summarized this material.
+    fn as_gists(mut band: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        for entry in &mut band {
+            entry.fsrs.generation = 1;
+        }
+        band
+    }
+
+    /// Mitigation (b), shipped 2026-08-21: compress a session, never
+    /// re-compress a summary.
+    ///
+    /// The controlled pair for this rule is the baseline arm above: identical
+    /// corpus, spread, summarizer and config — the *only* difference is that
+    /// these rows are already consolidation products. The baseline arm forms
+    /// clusters and destroys the clause; this one forms none and keeps it.
+    ///
+    /// This is the bound that needed no number chosen for it. "How many
+    /// summarization passes are safe?" has no derivable answer — the baseline
+    /// arm loses a rare clause in ONE — so the class is forbidden instead, and
+    /// `generation` already records membership of that class exactly.
+    #[tokio::test]
+    async fn a_summary_is_never_summarized_again() {
+        let dim = 16;
+        let service = drift_service(dim);
+        let band = as_gists(drift_band(8, dim, 0.45));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+        let before_count = service.count().await;
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert_eq!(
+            result.clusters_formed, 0,
+            "a summary must never be handed back to the summarizer: {result:?}"
+        );
+        assert_eq!(
+            result.memories_merged, 0,
+            "and nothing may be merged away by one: {result:?}"
+        );
+        assert_eq!(
+            result.memories_processed, before_count,
+            "every gist is still accounted for, not silently skipped: {result:?}"
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "the clause the baseline arm loses in one cycle survives here"
+        );
+    }
+
+    /// The exemption is from the CLUSTERER, not from the cycle: two gists that
+    /// restate each other must still collapse losslessly, or refusing to
+    /// re-summarize would just let summaries pile up.
+    ///
+    /// A regression guard for that, not a second proof of the rule — at this
+    /// spread the fold consumes the band, so `clusters_formed == 0` would hold
+    /// either way. The rule itself is proven by the arm above, which fails when
+    /// the generation split is removed.
+    #[tokio::test]
+    async fn gists_that_restate_each_other_still_fold() {
+        let dim = 16;
+        let service = drift_service(dim);
+        // Near-identical vectors => every pair clears the Reinforce line.
+        let band = as_gists(drift_band(8, dim, 0.01));
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+        let before_count = service.count().await;
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.memories_deduped > 0,
+            "the lossless fold still applies to gists: {result:?}"
+        );
+        assert_eq!(
+            result.clusters_formed, 0,
+            "but the summarizer is still never paid: {result:?}"
+        );
+        assert!(
+            service.count().await < before_count,
+            "the store still compresses: {before_count} -> {}",
+            service.count().await
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "and a deterministic fold never paraphrases"
+        );
+    }
+
     #[test]
     fn corpus_generation_is_deterministic() {
         let params = CorpusParams::default();
@@ -806,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn dreaming_shrinks_store_while_holding_recall() {
         let dim = 48;
-        // Under the FSRS-6 decay exponent (w20 = 0.0658, now the default) memories
+        // Under the FSRS-6 decay exponent (w20 = 0.1542, now the default) memories
         // decay slowly, so a corpus must be aged well past a year for its weight to
         // fall into a compressible band; importance is held uniform so no topic sits
         // in the never-consolidated high-weight tail.
@@ -915,13 +1134,23 @@ mod tests {
         );
     }
 
-    /// The w20 experiment the harness exists to run: on a heavily-aged corpus,
-    /// the FSRS-5 constant we currently ship (`w20 = 0.5`) decays retrievability
-    /// so fast that valid memories fall below the recall weight gate and vanish,
-    /// while the correct FSRS-6 default (`w20 = 0.0658`) keeps them retrievable.
+    /// The w20 experiment the harness exists to run, now across all three
+    /// exponents this default has held:
     ///
-    /// This is the evidence that flipping the default is an improvement — kept as
-    /// a live gate so a future default change is validated, not guessed.
+    /// | `w20`    | what it is                          | aged recall |
+    /// |----------|-------------------------------------|-------------|
+    /// | `0.5`    | FSRS-5's hardcoded decay (shipped first) | lost        |
+    /// | `0.1542` | FSRS-6's published decay (**current**)  | full        |
+    /// | `0.0658` | `w[19]` misread as `w[20]` (shipped second) | full    |
+    ///
+    /// On a heavily-aged corpus the FSRS-5 constant decays retrievability so
+    /// fast that valid memories fall below the recall weight gate and vanish.
+    /// Both later values clear the gate — which is the point of running all
+    /// three: correcting the off-by-one from `0.0658` to the real FSRS-6
+    /// `0.1542` must **not** reintroduce the loss the first flip fixed, and the
+    /// only honest way to say that is to measure it.
+    ///
+    /// Kept as a live gate so a future default change is validated, not guessed.
     #[tokio::test]
     async fn w20_experiment_aged_recall() {
         let dim = 32;
@@ -938,30 +1167,39 @@ mod tests {
 
         let corpus = RetentionCorpus::generate(2024, params);
 
-        // Ship-current (wrong) exponent.
-        let svc_fast = service_with_w20(dim, 0.5, corpus.topic_embed_fn());
-        corpus.load_into(&svc_fast).await.unwrap();
-        let recall_fast = measure_gated_recall(&svc_fast, &corpus.probes)
-            .await
-            .unwrap();
+        // Same corpus, same probes, one variable — measured, not asserted from
+        // the curve, because the gate is `weight = retrievability × importance`
+        // against `min_weight` and it is the gate's verdict that matters.
+        let recall_at = async |w20: f32| {
+            let service = service_with_w20(dim, w20, corpus.topic_embed_fn());
+            corpus.load_into(&service).await.unwrap();
+            measure_gated_recall(&service, &corpus.probes)
+                .await
+                .unwrap()
+        };
 
-        // FSRS-6 default exponent.
-        let svc_slow = service_with_w20(dim, 0.0658, corpus.topic_embed_fn());
-        corpus.load_into(&svc_slow).await.unwrap();
-        let recall_slow = measure_gated_recall(&svc_slow, &corpus.probes)
-            .await
-            .unwrap();
+        let recall_fsrs5 = recall_at(crate::fsrs::FSRS5_DEFAULT_DECAY).await;
+        let recall_fsrs6 = recall_at(crate::fsrs::FSRS6_DEFAULT_DECAY).await;
+        let recall_misread = recall_at(0.0658).await;
 
         // The FSRS-6 exponent keeps every aged topic retrievable...
         assert!(
-            recall_slow >= 0.99,
-            "FSRS-6 w20 should still recall aged memories, got {recall_slow}"
+            recall_fsrs6 >= 0.99,
+            "FSRS-6 w20 should still recall aged memories, got {recall_fsrs6}"
         );
-        // ...while the ship-current fast-decay exponent has lost some of them.
+        // ...while the originally-shipped fast-decay exponent has lost some.
         assert!(
-            recall_fast < recall_slow,
+            recall_fsrs5 < recall_fsrs6,
             "fast decay (w20=0.5) should lose aged recall the FSRS-6 default keeps: \
-             fast={recall_fast} slow={recall_slow}"
+             fsrs5={recall_fsrs5} fsrs6={recall_fsrs6}"
+        );
+        // And correcting the off-by-one costs nothing at the gate: the flatter
+        // misread value recalls no more than the real default does. This is the
+        // assertion that makes the correction safe to take.
+        assert!(
+            (recall_fsrs6 - recall_misread).abs() < 1e-6,
+            "correcting w[19]→w[20] must not lose aged recall: \
+             fsrs6={recall_fsrs6} misread={recall_misread}"
         );
     }
 }

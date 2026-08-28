@@ -210,6 +210,8 @@ pub fn run() {
             commands::sessions::archive_and_delete_session,
             commands::sessions::rename_session,
             commands::sessions::set_session_workspace,
+            commands::sessions::set_session_model,
+            commands::sessions::set_session_tools,
             commands::settings::get_config,
             commands::settings::set_model,
             commands::settings::set_api_key,
@@ -235,6 +237,7 @@ pub fn run() {
             commands::memory::apply_memory_updates,
             // Memory & scheduling settings
             commands::memory::set_dreaming_enabled,
+            commands::memory::set_auto_remember_messages,
             commands::memory::set_max_compression_ratio,
             commands::memory::set_min_remaining_memories,
             commands::scheduler::set_scheduler_enabled,
@@ -389,8 +392,13 @@ pub fn run() {
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,
-            // Task store (read-only view for the chat's checklist)
+            // Task store operations
             commands::tasks::list_tasks,
+            commands::tasks::create_task,
+            commands::tasks::update_task,
+            commands::tasks::complete_task,
+            commands::tasks::delete_task,
+            commands::tasks::reorder_task,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

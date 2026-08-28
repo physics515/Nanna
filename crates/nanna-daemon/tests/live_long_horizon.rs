@@ -176,6 +176,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     }
     let router = Arc::new(router);
     let runner = AgentStepRunner {
+        user_selected_tools: Vec::new(),
         // One ledger for the whole eval run, matching production.
         repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
         // Fresh per run: discovery is paid once per tool, then carried across
@@ -203,6 +204,8 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         // stream into — step output is judged by acceptance checks, not read.
         chat_sink: None,
         gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        // No daemon provider plumbing in the eval — no transitions to report.
+        degradations: None,
     };
     EvalEnv { storage, runner }
 }
@@ -901,6 +904,14 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
 /// clear it; a server restart does (verified live). Gated by
 /// `NANNA_EVAL_ALLOW_OLLAMA_RESTART=1` because restarting a shared local
 /// service is an operator decision, not a test default.
+///
+/// The delegate MUST tree-kill: a parent-only `ollama.exe` kill leaves each
+/// loaded model's `llama-server.exe` runner (~6 GB VRAM for an 8B model)
+/// orphaned and invisible to the respawned server's `ollama ps`, so every
+/// heal quietly shrinks the card until the num_ctx probe latches below the
+/// min-viable floor and the eval dies on below-floor stops (2026-08-09: four
+/// orphans held 12.5 of 16 GB, killed two endurance attempts) — see the
+/// regression note on [`nanna_daemon::tasks::restart_ollama_server`].
 async fn restart_ollama_server() -> bool {
     if std::env::var("NANNA_EVAL_ALLOW_OLLAMA_RESTART").as_deref() != Ok("1") {
         return false;
@@ -1225,13 +1236,30 @@ async fn live_endurance_body() {
         segment_reports.push(report.clone());
         // Identical-failure breaker: a resume heals TRANSIENT incidents (a
         // wedged runner, a dropped stream). A segment that dies with the
-        // byte-identical error every time is deterministic — observed live
-        // 2026-08-03: a below-floor context window (AgentError::
-        // ContextBelowFloor) failed 8 segments identically, 20s apart, and
-        // the loop burned every resume treating physics as weather. Stop
-        // with a clear message instead of thrashing.
+        // byte-identical error every time AND completed nothing is
+        // deterministic — observed live 2026-08-03: a below-floor context
+        // window (AgentError::ContextBelowFloor) failed 8 segments
+        // identically, 20s apart, all at zero items, and the loop burned
+        // every resume treating physics as weather. Stop with a clear
+        // message instead of thrashing.
+        //
+        // Progress gates the verdict (2026-08-08 ministral counter-case):
+        // three segments ended with the byte-identical done=false abort,
+        // but they ran 37/104/51 productive MINUTES and completed 43 items
+        // between the aborts — the heals worked; the fault merely recurs.
+        // "Deterministic" must mean "reproduces immediately after the
+        // heal", and a segment that completed items is the definition of
+        // not-immediately. Derived from the definition, not a tuned knob.
         let streak = match &report.stop {
-            StopReason::RunnerErrors { message } => identical_failures.observe(message),
+            StopReason::RunnerErrors { message } => {
+                if report.items_completed > 0 {
+                    // The failure recurred but the segment did real work
+                    // first: the streak restarts at this sighting, so only
+                    // a string of zero-progress repeats reaches the stop.
+                    identical_failures.reset();
+                }
+                identical_failures.observe(message)
+            }
             _ => identical_failures.reset(),
         };
         if streak >= IDENTICAL_FAILURE_STOP_AFTER {

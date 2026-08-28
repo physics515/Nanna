@@ -57,12 +57,20 @@ directories.workspace = true
 # Nanna crates the daemon *client* needs. The GUI is a pure daemon client, so it
 # links only: nanna-config (config cache read/write + credential manager),
 # nanna-core (cron parsing/description, workspace registry cache + folder
-# constants, and the relocated log_buffer), and nanna-tools (workspace skills
-# discovery). All heavy subsystems (storage, memory, agent loop, scheduler, LLM
+# constants, and the relocated log_buffer), nanna-tools (workspace skills
+# discovery), and — Windows-only, below — nanna-proc (sidecar tree-kill). All
+# heavy subsystems (storage, memory, agent loop, scheduler, LLM
 # routing, channels) live in the daemon and are reached over IPC.
 nanna-core = { path = "../../crates/nanna-core" }
 nanna-config = { path = "../../crates/nanna-config" }
 nanna-tools = { path = "../../crates/nanna-tools", features = ["scripting"] }
+
+[target.'cfg(windows)'.dependencies]
+# Shared taskkill /T walk for tree-killing the daemon sidecar the GUI manages
+# (daemon_manager.rs). Windows-only on purpose: the Unix path there is a
+# deliberate no-op, because tauri-plugin-shell owns the sidecar spawn and the
+# process_group(0) contract behind nanna-proc's group kill does not hold.
+nanna-proc = { path = "../../crates/nanna-proc" }
 
 [features]
 default = ["custom-protocol"]

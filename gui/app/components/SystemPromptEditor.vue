@@ -102,7 +102,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { MessageSquare, Edit3, Save } from 'lucide-vue-next'
+import { MessageSquare, Edit3, Save } from '@lucide/vue'
 
 const emit = defineEmits<{
   saved: []

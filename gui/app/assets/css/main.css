@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./nui.css";
 
 
 
@@ -46,9 +47,12 @@
   --font-glass: 'jubilat', serif;
 }
 
-/* Base styles */
+/* Base styles.
+   The html/body ground stays TRANSPARENT: the Tauri window is transparent so
+   the shell's 32px corner radius (drawn by .nui-root) actually rounds the
+   window — an opaque ground here would square the corners right back off. */
 html {
-  background-color: #1e293b;
+  background-color: transparent;
   color: var(--color-nanna-text);
   font-family: var(--font-sans);
   font-size: 14px;

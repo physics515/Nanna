@@ -5,19 +5,19 @@
 //!
 //! Provides runtime-dispatched SIMD operations with architecture-specific tiers:
 //!
-//! ## x86_64
+//! ## `x86_64`
 //! - **AVX-512**: 16-wide f32 operations using `std::arch` intrinsics
 //! - **AVX2**: 8-wide f32 operations using the `wide` crate
 //! - **Scalar**: portable fallback
 //!
-//! ## AArch64 (Apple Silicon, ARM servers, mobile)
-//! - **NEON**: 4-wide f32 with dual accumulators and FMA (always available on AArch64)
+//! ## `AArch64` (Apple Silicon, ARM servers, mobile)
+//! - **NEON**: 4-wide f32 with dual accumulators and FMA (always available on `AArch64`)
 //!
 //! ## Other architectures
 //! - **Scalar**: portable fallback
 //!
 //! Dispatch is automatic — the best available instruction set is detected at
-//! runtime (x86_64) or compile time (AArch64) and cached for the process lifetime.
+//! runtime (`x86_64`) or compile time (`AArch64`) and cached for the process lifetime.
 
 #[cfg(target_arch = "x86_64")]
 mod avx512;
@@ -151,8 +151,8 @@ pub fn simd_tier() -> SimdTier {
 /// SIMD-accelerated dot product for f32 vectors.
 ///
 /// Dispatches to the best available instruction set:
-/// - x86_64: AVX-512 (16-wide) → AVX2 (8-wide) → scalar
-/// - AArch64: NEON (4-wide, dual accumulators)
+/// - `x86_64`: AVX-512 (16-wide) → AVX2 (8-wide) → scalar
+/// - `AArch64`: NEON (4-wide, dual accumulators)
 ///
 /// # Panics
 ///
@@ -165,15 +165,15 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         match dispatch::detect() {
-            SimdTier::Avx512 => return unsafe { avx512::dot_product_f32_avx512(a, b) },
-            SimdTier::Avx2 => return dot_product_f32_avx2(a, b),
-            SimdTier::Scalar => return dot_product_f32_scalar(a, b),
+            SimdTier::Avx512 => unsafe { avx512::dot_product_f32_avx512(a, b) },
+            SimdTier::Avx2 => dot_product_f32_avx2(a, b),
+            SimdTier::Scalar => dot_product_f32_scalar(a, b),
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { neon::dot_product_f32_neon(a, b) };
+        unsafe { neon::dot_product_f32_neon(a, b) };
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -194,16 +194,16 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
     {
         match dispatch::detect() {
             SimdTier::Avx512 => {
-                return unsafe { avx512::cosine_similarity_f32_avx512(a, b) }
+                unsafe { avx512::cosine_similarity_f32_avx512(a, b) }
             }
-            SimdTier::Avx2 => return cosine_similarity_f32_avx2(a, b),
-            SimdTier::Scalar => return cosine_similarity_f32_scalar(a, b),
+            SimdTier::Avx2 => cosine_similarity_f32_avx2(a, b),
+            SimdTier::Scalar => cosine_similarity_f32_scalar(a, b),
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { neon::cosine_similarity_f32_neon(a, b) };
+        unsafe { neon::cosine_similarity_f32_neon(a, b) };
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -218,15 +218,12 @@ pub fn normalize_f32(v: &mut [f32]) {
         match dispatch::detect() {
             SimdTier::Avx512 => {
                 unsafe { avx512::normalize_f32_avx512(v) };
-                return;
             }
             SimdTier::Avx2 => {
                 normalize_f32_avx2(v);
-                return;
             }
             SimdTier::Scalar => {
                 normalize_f32_scalar(v);
-                return;
             }
         }
     }
@@ -255,15 +252,12 @@ pub fn add_f32(a: &mut [f32], b: &[f32]) {
         match dispatch::detect() {
             SimdTier::Avx512 => {
                 unsafe { avx512::add_f32_avx512(a, b) };
-                return;
             }
             SimdTier::Avx2 => {
                 add_f32_avx2(a, b);
-                return;
             }
             SimdTier::Scalar => {
                 add_f32_scalar(a, b);
-                return;
             }
         }
     }
@@ -284,26 +278,14 @@ pub fn scale_f32(v: &mut [f32], scalar: f32) {
     #[cfg(target_arch = "x86_64")]
     {
         match dispatch::detect() {
-            SimdTier::Avx512 => {
-                unsafe { avx512::scale_f32_avx512(v, scalar) };
-                return;
-            }
-            SimdTier::Avx2 => {
-                scale_f32_avx2(v, scalar);
-                return;
-            }
-            SimdTier::Scalar => {
-                scale_f32_scalar(v, scalar);
-                return;
-            }
+            SimdTier::Avx512 => unsafe { avx512::scale_f32_avx512(v, scalar) },
+            SimdTier::Avx2 => scale_f32_avx2(v, scalar),
+            SimdTier::Scalar => scale_f32_scalar(v, scalar),
         }
     }
 
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { neon::scale_f32_neon(v, scalar) };
-        return;
-    }
+    unsafe { neon::scale_f32_neon(v, scalar) };
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     scale_f32_scalar(v, scalar);
@@ -329,7 +311,7 @@ fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut result: f32 = sum.reduce_add();
     let remainder_start = chunks * 8;
     for i in 0..remainder {
-        result += a[remainder_start + i] * b[remainder_start + i];
+        result = a[remainder_start + i].mul_add(b[remainder_start + i], result);
     }
     result
 }
@@ -360,9 +342,9 @@ fn cosine_similarity_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     for i in 0..remainder {
         let ai = a[remainder_start + i];
         let bi = b[remainder_start + i];
-        dot_sum += ai * bi;
-        mag_a += ai * ai;
-        mag_b += bi * bi;
+        dot_sum = ai.mul_add(bi, dot_sum);
+        mag_a = ai.mul_add(ai, mag_a);
+        mag_b = bi.mul_add(bi, mag_b);
     }
 
     dot_sum / (mag_a.sqrt() * mag_b.sqrt())
