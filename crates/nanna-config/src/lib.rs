@@ -119,7 +119,7 @@ pub struct LlmConfig {
     /// GitHub token for GitHub Models
     pub github_token: Option<String>,
     /// Model priority list for fallback (first working model is used)
-    /// Format: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
+    /// Format: ["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]
     pub model_priority: Vec<String>,
     /// Anthropic OAuth access token (alternative to API key)
     pub anthropic_oauth_token: Option<String>,
@@ -136,7 +136,7 @@ pub struct LlmConfig {
     /// Model routing priority for cost optimization.
     /// Format: ["model:tier", ...] where tier is simple|medium|complex.
     /// Cheapest models first. Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
@@ -198,7 +198,11 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            // A DATED id is a pinned snapshot with a retirement date, and this
+            // one was already retired: a daemon booted with no configured
+            // model_priority sent every scheduled heartbeat to a 404 (observed
+            // live 2026-08-27). Undated ids are the current-generation aliases.
+            model: "claude-sonnet-5".to_string(),
             api_key: None,
             base_url: None,
             max_tokens: 8192,
@@ -1162,5 +1166,54 @@ streaming_enabled = true
             Some(prev) => unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, prev) },
             None => unsafe { std::env::remove_var(Config::CONFIG_PATH_ENV) },
         }
+    }
+
+    /// The shipped default model must not be a DATED snapshot id.
+    ///
+    /// Anthropic publishes two shapes: an undated family alias
+    /// (`claude-sonnet-5`) that tracks the live model, and a dated snapshot
+    /// (`claude-sonnet-4-20250514`) pinned to one release — which is retired on
+    /// a schedule. A dated default therefore has an expiry date built in, and
+    /// this one had already passed it: a daemon booted with no configured
+    /// `model_priority` sent every scheduled heartbeat to a `404 not_found_error`
+    /// (observed on a real boot, 2026-08-27). Nothing failed loudly, because a
+    /// heartbeat failure is logged and swallowed.
+    ///
+    /// Pinning a snapshot is a legitimate choice for a USER to make in their own
+    /// config; it is not a legitimate default for the product to ship.
+    #[test]
+    fn the_default_model_is_not_a_dated_snapshot() {
+        let default_model = LlmConfig::default().model;
+        assert!(
+            !default_model.is_empty(),
+            "a default model must exist — the empty string reaches the router as a bare name"
+        );
+        assert!(
+            !has_date_suffix(&default_model),
+            "default model `{default_model}` is a dated snapshot, which will be retired and              turn every unconfigured boot's heartbeat into a 404. Use the undated family alias."
+        );
+    }
+
+    /// `-YYYYMMDD` at the end of a model id, which is how Anthropic spells a
+    /// pinned snapshot. Written as a scan rather than a regex so the guard
+    /// carries no dependency of its own.
+    fn has_date_suffix(model: &str) -> bool {
+        let Some((_, tail)) = model.rsplit_once('-') else {
+            return false;
+        };
+        tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    #[test]
+    fn date_suffix_detection_reads_both_shapes() {
+        assert!(has_date_suffix("claude-sonnet-4-20250514"));
+        assert!(has_date_suffix("claude-3-5-haiku-20241022"));
+        assert!(!has_date_suffix("claude-sonnet-5"));
+        assert!(!has_date_suffix("claude-haiku-4-5"));
+        // Negative space: a trailing number that is not a date must not trip it,
+        // and neither must a local model whose tag contains a colon.
+        assert!(!has_date_suffix("claude-opus-4-1"));
+        assert!(!has_date_suffix("ollama/qwen3:14b"));
+        assert!(!has_date_suffix("nodashes"));
     }
 }

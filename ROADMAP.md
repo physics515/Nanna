@@ -1460,6 +1460,43 @@ Open: swarm execution view in GUI (CriticalPathMetrics tracked but not visualize
 ### P6 — Production Hardening 🚧 (partial)
 Done: outbound rate limiting (per-provider token buckets), error recovery / exponential backoff with
 jitter, priority message queue, graceful 429 handling, health endpoint, PID file. Open:
+- [x] **The shipped default model was a retired snapshot** *(found by a real daemon boot,
+      2026-08-27)* — every unconfigured install sent its scheduled heartbeat to a `404
+      not_found_error`, and nothing said so above `WARN`. Found the only way it could be: the
+      nightly's smoke run booted the freshly built **release** daemon against a scratch config
+      (`NANNA_CONFIG_PATH` + `--data-dir`) and the log carried
+      `Model claude-sonnet-4-20250514 failed: API error: 404`. No unit test could have caught
+      it — the id is only wrong *outside* the process.
+      **Why it was wrong is the general lesson, not the specific id.** Anthropic publishes two
+      shapes: an undated family alias (`claude-sonnet-5`) that tracks the live model, and a
+      **dated snapshot** (`claude-sonnet-4-20250514`) pinned to one release and retired on a
+      schedule. A dated default ships with an expiry date. Pinning a snapshot is a legitimate
+      choice for a *user* to make in their own config; it is not a legitimate *default*.
+      Six production defaults carried the retired id — `nanna-config` (`LlmConfig`),
+      `nanna-core` (`default_model`, `summarization_model`), `nanna-agent` (`AgentConfig`),
+      `nanna-llm` (`CompletionRequest`), `nanna-server` (`AppState`) — all moved to
+      `claude-sonnet-5`, the same-tier live alias. **No contract work was needed**:
+      `anthropic_model_contract` already classifies `sonnet-5` as current-generation (adaptive
+      thinking, sampling removed), so the new default lands on a path with tests behind it.
+      Four doc examples that taught the dated shape were updated too; the tests that
+      *deliberately* exercise legacy dated ids (`a_legacy_anthropic_request_carries_a_budget…`,
+      the contract-classification fixtures) were left alone — they are the regression cover for
+      dated ids still resolving correctly when a user pins one.
+      Guarded so it cannot come back: `the_default_model_is_not_a_dated_snapshot` asserts the
+      shipped default carries no `-YYYYMMDD` suffix, with a dependency-free detector and its own
+      test for both shapes (including the negative space — `claude-opus-4-1` and `ollama/qwen3:14b`
+      must not trip it). Verified it catches the real regression by reverting the id.
+      **Proven live, not argued** — the fix was verified the same way the bug was found: rebuild
+      the release daemon, boot it against a scratch config, and diff the log against the
+      pre-fix one. Before: `3 ×` `API error: 404`, `2 ×` "All models exhausted", heartbeat dead.
+      After: **0 and 0**, `0` ERROR lines, and a completed run —
+      `RUN SUMMARY model=claude-sonnet-5 duration_s=5 input_tokens=4 output_tokens=197
+      tool_calls=2 faults_healed=0`.
+      - [ ] **Not fixed here: a failing heartbeat is only a `WARN`.** The 404 repeated every
+            scheduled cycle and the daemon reported itself healthy throughout. A model that fails
+            on *every* attempt is a configuration fault, not a transient one, and deserves to
+            surface (health endpoint degradation, or a once-per-boot loud notice) rather than
+            scroll past. Needs a decision on where operator-visible faults belong.
 - [ ] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
@@ -1921,6 +1958,20 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             [localllm.in 8 GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025),
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/),
             [Burn releases](https://github.com/tracel-ai/burn/releases).
+      - [ ] *(research 2026-08-27)* **Nothing moved again — and one candidate is worth a look purely
+            because it is *narrow*.** Re-checked this run: **Burn is still 0.21.0** (no 0.22), so every
+            0.21 note above stands and the Mummu contract needs no revision. On models, the only
+            datapoint not already recorded here is **`Llama-3-Groq-8B-Tool-Use`**, cited at **89.06%
+            overall on BFCL** (its 70B sibling at 90.76%, the highest of any open model) — a
+            tool-use-*specialised* fine-tune rather than a general model that also calls tools, which
+            is the axis Nanna's harness actually stresses. Do NOT swap the reference default for it on
+            a leaderboard number: the roadmap's own rule is that a model is judged on task-success at
+            budget, not BFCL, and this repo has a cautionary tale on exactly that (ministral:8b smoked
+            well and could not endure). Worth **one leg** on the existing ladder against the current
+            local champion, nothing more, and only when a leg is being run anyway. Also re-confirmed:
+            Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
+            per-model call formatting, not a live dependency. Source:
+            [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -2200,15 +2251,28 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+            - [ ] *(research 2026-08-27)* **Do not reach for DiskANN here — check what the graph is
+                  keyed to before adopting it.** The "Turso brings native vector search" material
+                  points at DiskANN, and pure-Rust ports now exist
+                  ([infinilabs/diskann](https://github.com/infinilabs/diskann), which extends
+                  Microsoft's partial Rust port with the missing disk-query path; also `diskann-rs`,
+                  `rust-diskann`). But DiskANN's premise is a corpus too large for RAM, which is the
+                  opposite of the measured situation above (~10ms full SIMD scan at 100k), and the
+                  `libsql_vector_idx` DiskANN belongs to the **libSQL fork**, not the pinned `turso`
+                  crate — so adopting it means a second on-disk structure beside the f32 BLOBs, which
+                  is exactly the mirroring `hnswlib-rs` was shortlisted for avoiding. Record the
+                  option, keep the shortlist as-is.
             - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
                   saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
                   parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
                   7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
                   0.8334, ...`), and six of them — `w13, w14, w15, w17, w18, w19` — are **zeroed**,
                   which matches neither table (FSRS-5's are all non-zero).
-                  **`w20 = 0.0658` is NOT in question and must not be "corrected" by this item:** it
-                  is already justified in-tree by a retention-harness experiment (an 800-day-aged
-                  corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`).
+                  **`w20` WAS in question after all, and is now settled** *(2026-08-27, see the
+                  ticked item below)*: the wiki's index inconsistency this note flagged resolved
+                  against `fsrs-rs` in favour of **`w20 = 0.1542`**, so `0.0658` was `w[19]` read one
+                  slot short. The rest of this item — the `w0..w18` table and the six zeroed entries
+                  — stands unchanged and is still not to be touched blind.
                   Not changed blind, because every weight feeds the decay of every stored memory and
                   the zeroed entries may well be deliberate — the short-term/same-day terms have no
                   meaning for a store whose "reviews" are recalls rather than study sessions. What is
@@ -2429,7 +2493,9 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
       - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
-            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17), the eventual "learn the
+            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17, corrected off-by-one
+            2026-08-27 — `fsrs-rs`'s own source is what settled it, which is a second reason to take the
+            crate rather than transcribe from a wiki), the eventual "learn the
             params from history" step has a ready tool: `fsrs-rs` (6.6.x, 2026-06) exposes
             `FSRS::compute_parameters(ComputeParametersInput) -> Result<Parameters>`, fed a `Vec<FSRSItem>` where
             each `FSRSItem` is a review vector of `FSRSReview { rating, delta_t }`. Our `FsrsState.access_count` +
@@ -2479,6 +2545,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             age past a year and hold uniform importance to reach a compressible band; still 60→6, recall 1.0→1.0).
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
+      - [x] *(2026-08-27)* **Corrected again — `w20` is `0.1542`, not `0.0658`. The 2026-07-17 flip fixed
+            the right bug with the wrong number.** The 2026-08-26 research note above spotted that the
+            upstream wiki contradicts itself about the decay's INDEX and said to settle it against source
+            before touching anything; settled here. `fsrs-rs` `src/inference.rs` defines
+            `FSRS6_DEFAULT_DECAY = 0.1542` and a 21-value `DEFAULT_PARAMETERS` ending
+            `…, 0.0912, 0.0658, 0.1542` — so **`0.0658` is `w[19]`**, and the flip read one slot short.
+            The decisive corroboration is `src/parameter_clipper.rs`: the optimizer **clamps this
+            parameter to `0.1..=0.8`**, a range `0.0658` sits *below*, so no fitted FSRS-6 parameter set
+            can contain it in that slot. (`FSRS5_DEFAULT_DECAY = 0.5` is also named there, confirming the
+            2026-07-17 diagnosis of the original constant.)
+            **The correction must not undo what the first flip bought**, so it is gated the same way:
+            `w20_experiment_aged_recall` is now a three-way over one corpus and one probe set —
+            `0.5` (loses aged recall), `0.1542` (full), `0.0658` (full) — asserting the corrected default
+            recalls *exactly* as much as the misread one, not merely "enough". Napkin math for why that
+            holds: at 800 days / `stability = 1` / `importance = 1`, `R` is `0.073` at `0.5`,
+            `0.358` at `0.1542` and `0.588` at `0.0658`, against a `min_weight` gate of `0.1` — the
+            FSRS-5 constant is the only one that falls through it, and by a wide margin (the power-law
+            tail is flat enough that `0.1542` would not reach the gate for millennia). What actually
+            differs between `0.1542` and `0.0658` is the *consolidation band* an aged memory lands in,
+            which is why fidelity to the published curve is the whole justification for the number.
+            Named constants replace the magic values (`FSRS6_DEFAULT_DECAY`, `FSRS5_DEFAULT_DECAY`,
+            `DECAY_MIN`, `DECAY_MAX`) and a new invariant test asserts the default sits inside the
+            reference clamp range — the check that would have caught the off-by-one the first time.
+            Two more tests pin the properties a decay change must preserve: the `R(t=S) = 0.9` anchor
+            holds at every exponent (so a change moves the tail, never the anchor), and the ordering
+            `0.5 < 0.1542 < 0.0658` in aged retrievability is stated as a property rather than as
+            frozen numbers. **162 nanna-memory tests green**, including the consolidation test
+            (`dreaming_shrinks_store_while_holding_recall`) that had to be re-baselined the last time
+            this constant moved — it needed no re-baselining this time, which is itself evidence the
+            correction is small where the first flip was large.
 - [~] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
       *(2026-07-23)* **Model-selection + fallback half shipped.** The two dream paths disagreed: the IPC
       `MemoryAction::Consolidate` already walked the whole `summarization_priority` with failover, while the
@@ -4225,9 +4321,62 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       the sub-agent `AgentConfig`, and script-services summarizer models each clone the
       list once at boot). The per-turn chat/harness path — the one that degraded the
       series — now re-reads it; these three need the same treatment.
-- [ ] **Steering marker on re-seeded timelines**: breaker replays render as steering
-      live, but a timeline rebuilt from the run journal after a remount does not carry
-      `short_circuited`, so history still shows them as failures.
+- [x] **Steering marker on re-seeded timelines** *(2026-08-27)* — the run journal now
+      carries `short_circuited` beside `success`, so a timeline rebuilt after a remount
+      renders breaker replays as steering exactly as the live stream does.
+      The marker was never missing from the *system*: it rides in the tool result's
+      structured `data`, and `tasks.rs::tool_end` already read it for three consumers
+      (the liveness ledger, `tool_stats`, and the "a replay is not an error" suppression).
+      The journal was the one consumer that dropped it — `timeline_tool_end` took
+      `success`/`output`/`duration_ms` and not `data` — so the record that survives a
+      remount was the only representation still calling steering a failure. A replay
+      reports `success: false` (the model did not get its result) with a notice as its
+      output, which is indistinguishable from a crash once the marker is gone.
+      Both journal writers fixed: `agent_service.rs` (chat path, via a new
+      `is_short_circuited(data)` reader) and `tasks.rs` (harness path, which already had
+      the boolean in hand). `Option<bool>`, back-filled with the rest of the outcome, so
+      an in-flight call is `None` ("not yet known") rather than a decided non-replay —
+      the same shape as `success`. `skip_serializing_if = "Option::is_none"` keeps it
+      additive: journals written before the field deserialize unchanged and round-trip
+      without gaining a `null`.
+      **No GUI change was needed** — `RunTimeline.vue` has tested `item.short_circuited
+      === true` for the steering status since P22, and `setLiveTimeline(runState.timeline)`
+      passes the daemon's items straight through; the field simply never arrived. The
+      stale comment in `useSessionState.ts` that documented the gap ("the daemon's own
+      journal does not carry the marker") is corrected.
+      Also fixed while here: the crash-recovery checkpoint's output-trim notice labelled
+      a trimmed replay `the call failed`, which is the same lie one layer down; it now
+      says the tool never ran. 6 new tests: marker read defensively from `data` (absent
+      key, wrong type, no data at all); back-fill onto an open call; a real failure stays
+      `Some(false)`; an orphan `tool_end` still carries it; a pre-field journal loads and
+      round-trips without gaining a `null`; and the existing daemon-restart round-trip
+      (`a_runs_tool_calls_survive_daemon_restart`) gained a replay entry beside its normal
+      call, so the end-to-end claim — a replay survives a restart AS a replay — is
+      asserted through Turso rather than argued. 318 nanna-daemon tests green.
+- [x] **One panic under the journal lock could wedge a whole harness run** *(found and
+      fixed 2026-08-27, while working the item above)* — the two writers to the run
+      journal disagreed about what a poisoned mutex means. `agent_service.rs` has always
+      used `timeline_lock`, which ignores poisoning with a stated reason ("a panicking
+      thread must not erase the run's record"). `tasks.rs` — the **harness** sink,
+      writing to the *same* `Arc<Mutex<Vec<TimelineItem>>>` — reached it through
+      `.lock().expect("timeline lock poisoned")` at **five** production sites (text
+      merge, thinking merge, tool start, tool end, step). So a single panic anywhere
+      under that lock turned every subsequent text delta, tool call and step of that run
+      into another panic, **inside a spawned turn where a panic is invisible and the run
+      just stops** — the exact failure shape recorded on 2026-08-10, where a `&text[..200]`
+      slice panic in a fire-and-forget turn read as a step wedge for a day.
+      Worse, one of those sites carried a comment asserting "the journal lock is
+      std::sync and infallible by design" directly above an `.expect()` — the comment
+      had the right intent and the code contradicted it.
+      Fixed by sharing ONE policy: `timeline_lock` is now `pub(crate)` and both writers
+      call it. **Ignoring poisoning is justified here specifically**, not by habit: the
+      guarded value is a `Vec<TimelineItem>` with no cross-field invariant a panic can
+      leave half-established, and the type already models an interrupted call
+      (`output`/`success`/`duration_ms` are `Option`, documented as "a run that dies
+      mid-call leaves them None"). A panicking thread leaves a well-formed journal, so
+      the only thing `expect` added was a second panic that destroys the record exactly
+      when it is most wanted. New test poisons the mutex from a real panicking thread and
+      asserts the earlier entry survives AND a later write still lands.
 - [ ] **No lift path for a declared file invariant**: once registered, a prohibition
       stands until the registry file is removed. "You can edit tests/ now" is exactly
       the permissive phrasing a conservative extractor must not act on, so lifting
@@ -4235,6 +4384,17 @@ green. Known remainders, deliberately scoped rather than silently dropped:
 - [ ] **Evidence hashing is anchored at run start, not at task-write time**: the
       repository layer has no workspace root to resolve a relative acceptance path,
       so the hash baseline is taken where the workdir is known instead.
+      *(examined and deliberately not taken 2026-08-27)* — this is a **design
+      decision, not a mechanical fix**, and `EvidenceGuard::ensure_baseline` already
+      states the tradeoff in-tree ("the truly first moment is the acceptance's
+      canonicalization at write time, but the store has no workspace root … this is
+      the earliest point that holds both the canonical check and the workdir").
+      Closing it means threading a workspace root into the storage layer, which is
+      an architectural change that wants an owner decision about whether the task
+      store may know about workspaces at all. The current anchor is already
+      *before* the step that could modify the evidence, so the exposure is narrow:
+      a write between task creation and item selection. Sizing that window against
+      real runs is the next step, not the code change.
 
 Full evidence: the 40-agent forensic analysis (per-leg + cross-cutting, adversarially
 verified) in the 2026-08-15 session; per-leg ledgers and per-poll history under
@@ -4925,6 +5085,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `package.json` no longer lists that subpath in `exports`, so the CI typecheck gate dies with
            `ERR_PACKAGE_PATH_NOT_EXPORTED` before reading a single file. Nothing in our source is
            involved — re-check when `vue-tsc` ships against the 7.1 programmatic API.
+           *(re-tried 2026-08-27 on `typescript@7.0.2` — **identical failure**, byte for byte:
+           `ERR_PACKAGE_PATH_NOT_EXPORTED: Package subpath './lib/tsc' is not defined by "exports"`,
+           thrown from `vue-tsc/index.js:73` `resolveTscPath` before any file is read. Reverted;
+           `vue-tsc --noEmit` clean and 237 vitest green on 5.9.3. Upstream confirms this is not a
+           Vue-only problem — `@vue/compiler-sfc`, Angular and ESLint all patch TypeScript's
+           Compiler API, which the Go-native core does not expose until **7.1**; the tracking issue
+           is [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381).
+           Do NOT re-attempt until 7.1 ships or `vue-tsc` publishes a tsgo-backed release.)*
+     - [ ] *(research 2026-08-27)* **Evaluate `vue-tsgo` as the TS-7 escape hatch if 7.1 slips.**
+           Two independent Go/tsgo-backed Vue SFC type checkers now exist —
+           [KazariEX/vue-tsgo](https://github.com/KazariEX/vue-tsgo) (by a Vue Language Tools core
+           contributor) and [NikhilVerma/vue-tsgo](https://github.com/NikhilVerma/vue-tsgo), the
+           latter claiming 10–50× faster checks with zero `.vue` error delta against `vue-tsc`.
+           Only worth taking if it is a drop-in for the `gui.yml` typecheck job — swapping the gate
+           for a less-proven checker to gain speed we do not need would be a bad trade. Decide by
+           running both over `gui/` and diffing the diagnostics, not by the README claim.
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -4942,7 +5118,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `OcrEngineParams { detection_model, recognition_model }` is then handed `rten-0.25::Model` where
      `rten-0.24::Model` is expected (E0308, verified by building it). Re-check when `ocrs` publishes
      against 0.25; until then the direct req must track whatever `ocrs` requires.
-     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it.
+     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it. *(re-checked 2026-08-27: `ocrs`
+           latest is still 0.12.2 on `rten ^0.24`. Now enforced by the unification guard above rather
+           than by remembering.)*
    - **`malachite-bigint` must stay at 0.9.2 — a bare `cargo update` breaks the release build**
      *(2026-08-25)*. `pymath 0.2.0` accepts `malachite-bigint 0.10` while `rustpython-codegen 0.5.0`
      requires 0.9, so `cargo update` resolves both and `rustpython-stdlib` fails to compile
@@ -4952,7 +5130,24 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      is not verified until `cargo build --release -p nanna-daemon` is green. Held with
      `cargo update -p malachite-bigint@0.10.0 --precise 0.9.2`; the pin lives only in `Cargo.lock`, so
      **every future run must redo it after `cargo update`** until `rustpython` widens its req.
+     - [x] *(2026-08-27)* **Both pin-backs are now a gate, not a habit.** The `malachite-bigint` and
+           `rten` unification requirements lived only in this file as "remember to redo it after every
+           `cargo update`" — a note, which the last three runs each had to rediscover, and which
+           `malachite` announces ~20 minutes into a release build. New
+           `crates/nanna-storage/tests/dep_version_unification.rs` asserts that each crate whose
+           **types cross a crate boundary** resolves to exactly ONE version in `Cargo.lock`
+           (`malachite-bigint`, `rten`, `rten-tensor`), and prints the exact remedy command in the
+           failure message. It sits beside `dep_guard.rs` (already the lockfile-guard home: cheap
+           crate, already in CI's `cargo test` scope) and runs in **0.00s**. Deliberately narrow:
+           duplicate versions are normal and this lockfile has ~100 of them (`syn`, `bitflags`,
+           `windows-sys`, …), so an entry is added only when a real build failure proved the crate
+           cannot split. It also fails if a guarded crate leaves the graph, so a dead guard gets
+           removed on purpose rather than passing forever. **Verified it catches the real
+           regression**: re-running `cargo update -p malachite-bigint` makes it report
+           `resolved to 2 versions ["0.9.2", "0.10.0"]` plus the pin-back command.
      - [ ] Drop the `malachite-bigint` lock pin once `rustpython-codegen` accepts 0.10.
+           *(re-checked 2026-08-27: `rustpython-{codegen,stdlib}` still 0.5.0 and `pymath` still
+           0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
@@ -5207,6 +5402,28 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      exclusion deliberately rather than by coincidence. The same step also now states plainly that
      `cargo fmt` is **not** clean on this tree (~2735 pre-existing diffs) and must not be made clean
      in passing — only the lines an increment adds need to be fmt-neutral.
+   - *(2026-08-27 sweep)* `cargo update` → 2 compatible bumps (`uuid 1.25.0 → 1.26.0`,
+     `which 8.0.5 → 8.0.6`) plus the standing `malachite-bigint` pin-back.
+     `cargo upgrade --incompatible` proposed exactly the same **two rejects as the previous run**,
+     both re-verified against the registry rather than assumed: `rten 0.24 → 0.25` (`ocrs` is still
+     0.12.2 on `rten ^0.24`) and the `criterion 0.8 → "0.7"` downgrade trap (the lock holds 0.8.2,
+     which IS latest). The one req actually taken was `uuid 1.25 → 1.26` (workspace root +
+     `nanna-server`), source unchanged. **The headline is not a bump — it is that the two standing
+     pin-backs stopped being a habit and became a test** (see the unification-guard item above).
+     Toolchain: pin moved `nightly-2026-08-25 → nightly-2026-08-27` (rustc 1.100.0-nightly
+     `bff8e12ff`), mirrored into `budget-gate.yml` / `release-check.yml` / `test-compile.yml`.
+     `cargo build --release -p nanna-daemon --locked` green in **20m08s from a cold target dir**
+     — no `tokio` ICE, no `turso_core` depth overflow, and the previous pin's
+     `recursion_depth_exceeding_limit` does not return. One future-incompat warning is new and
+     **is not ours to fix**: `attribute-derive-macro 0.10.5` (trailing semicolon in macro
+     expression position, rust#79813) sits five levels down a rustpython chain
+     (`rustpython-pylib → …-codegen → …-ruff_python_ast → get-size2 → get-size-derive2 →
+     attribute-derive`). Recorded in `rust-toolchain.toml` so a later run does not mistake it
+     for new breakage in our own code.
+     GUI: `pnpm update --latest` (excluding typescript) took the tiptap suite 3.30.3 → 3.30.5 across
+     all 12 packages, `vue 3.5.41 → 3.5.42`, `happy-dom 20.11.6 → 20.11.8`; `vue-tsc --noEmit` clean,
+     **237 vitest green**. `typescript@7.0.2` attempted and reverted for the third time — the exact
+     failure and the upstream tracking issue are recorded on the deferred item above.
    - *(2026-08-26 sweep)* `cargo update` -> 34 compatible bumps (wgpu/naga 30.0.0 -> 30.0.1,
      aes-gcm 0.11.1, h2 0.4.19, log 0.4.34, rand 0.8.8, rustls-webpki 0.103.15, syn 3.0.4, and
      others). `cargo upgrade --incompatible` proposed exactly **two**, and **both were rejected for
@@ -5227,6 +5444,8 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
        PR (#7905) whose status was not readable from the issue page. Re-check on the next sweep: if a
        turso release ships default-pure-Rust `turso_core`, drop the transitive `aegis` pin entirely
        instead of carrying an exact version forward.
+       *(re-checked 2026-08-27: issue #7660 is **still open**, still unassigned and with no milestone;
+       PR #7905 still the only linked work. The `aegis` pin stays.)*
      GUI: `pnpm install` then `pnpm outdated` — every compatible-range package is already at latest;
      the only entries left are the five known-deferred majors (tiptap 3, typescript 7, vue-router 5,
      vue-sonner 2, and the `lucide-vue-next` -> `@lucide/vue` rename). **`lucide-vue-next@1.0.0` was

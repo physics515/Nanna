@@ -57,9 +57,10 @@ export interface TimelineEntry {
   total_tokens?: number | null
   /** P22 Tier 4 breaker replay: the harness answered this call itself and the
    *  tool never ran. `success` is false because there is no tool result, but
-   *  nothing failed — steering, not an error. Live-stream only; the daemon's
-   *  own journal does not carry the marker, so a restored timeline renders
-   *  these as plain failures until it does. */
+   *  nothing failed — steering, not an error. Carried both by the live event
+   *  and (since 2026-08-27) by the daemon's own run journal, so a timeline
+   *  restored after a remount renders these as steering too. Absent/null
+   *  means "not marked" — every consumer tests `=== true`. */
   short_circuited?: boolean | null
 }
 

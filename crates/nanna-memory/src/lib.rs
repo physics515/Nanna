@@ -42,6 +42,10 @@ pub use fsrs::{
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
     power_law_retrievability,
 };
+// The decay exponent's published value and the range a fitted one may take.
+// Exported because `FsrsParameters::w20` is public and its doc names them: a
+// caller overriding the exponent needs the same bounds the default is held to.
+pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
     MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
     MemoryStats, MemoryListEntry, ConsolidationBands,

@@ -103,7 +103,7 @@ impl AppStateBuilder {
             signal_webhook_secret: None,
             discord_public_key: None,
             slack_signing_secret: None,
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-5".to_string(),
             telegram_token: None,
             discord_bot_token: None,
             discord_app_id: None,

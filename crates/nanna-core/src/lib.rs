@@ -87,7 +87,7 @@ impl Default for NannaConfig {
     fn default() -> Self {
         Self {
             name: "Nanna".to_string(),
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-5".to_string(),
             max_context_messages: 20,
             enable_gpu: true,
         }
