@@ -386,7 +386,7 @@ impl ChatRunRegistry {
         loop {
             let waiter = self.changed.notified();
             tokio::pin!(waiter);
-            waiter.enable();
+            waiter.as_mut().enable();
             if !self.active.read().await.contains_key(session_id) {
                 return;
             }
@@ -618,6 +618,7 @@ impl ControlPlane {
                         workspace_root,
                         workspace_context,
                         chat_model,
+                        chat_tools,
                     } = prep;
 
                     // The active workspace scopes stored memories, so a run's
@@ -664,6 +665,8 @@ impl ControlPlane {
                         discovered_tools: Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::new(),
                         )),
+                        // The tools the user picked for this chat, verbatim.
+                        user_selected_tools: chat_tools,
                         // One ledger for the whole turn: the breakers' streaks
                         // must outlive the step boundary that discards every
                         // other RunState field, or their thresholds are

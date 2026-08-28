@@ -24,6 +24,8 @@ pub(super) struct ChatTurnPrep {
     /// answer could differ, and the planner and the step runner must never
     /// disagree about which model this chat runs on.
     pub chat_model: Option<String>,
+    /// Tools the user selected for THIS chat (empty = no restriction).
+    pub chat_tools: Vec<String>,
 }
 
 impl ControlPlane {

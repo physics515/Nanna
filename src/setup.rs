@@ -255,10 +255,6 @@ pub async fn init_components(
     tools.register(ExploreTool).await;
     tools.register(WonderTool).await;
     tools.register(StatusTool).await;
-    
-    // Autonomous execution tool
-    let storage = Arc::clone(&storage);
-    tools.register(AutonomousExecutionTool::new(storage)).await;
 
     register_discover_tools(&tools, config).await;
 

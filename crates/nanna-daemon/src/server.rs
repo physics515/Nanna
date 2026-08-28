@@ -1465,6 +1465,9 @@ pub struct DaemonServer {
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
     _control: Arc<ControlPlane>,
+    /// Late-bound handle to the control plane for consumers created
+    /// before it exists (filled in run(), read by the agent service).
+    control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
