@@ -1114,6 +1114,73 @@ fn build_script_services(
         );
     }
 
+    // PDF text extraction. The bundled `read_pdf` skill declares
+    // `requires: ["pdf.read"]` and no such service existed, so the tool
+    // loaded, advertised itself to the model, and failed at call time with
+    // "PDF reading service not available". The Rust extractor behind it has
+    // been complete and tested the whole time; only this registration was
+    // missing.
+    //
+    // OCR fallback for image-only pages is deliberately NOT wired here: that
+    // needs the `OcrTool` pipeline, which is itself unregistered, and the
+    // extractor already states plainly when a page yielded no text. A
+    // half-wired OCR path would be indistinguishable from a scanned document
+    // that genuinely has no text.
+    services.insert(
+        "pdf.read".to_string(),
+        Arc::new(|params: Value| {
+            Box::pin(async move {
+                let path = params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if path.trim().is_empty() {
+                    return Err("pdf.read requires a `path`".to_string());
+                }
+                let selection = match params.get("pages").and_then(|v| v.as_str()) {
+                    Some(spec) => nanna_tools::parse_page_selection(spec)?,
+                    None => nanna_tools::PageSelection::All,
+                };
+
+                // Same ceiling `read_file` applies, checked before the read so
+                // an oversized document is refused rather than buffered.
+                let size_bytes = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| format!("Cannot stat {path}: {e}"))?
+                    .len();
+                let max_bytes = nanna_tools::PDF_MAX_BYTES;
+                if size_bytes > max_bytes as u64 {
+                    return Err(format!(
+                        "PDF too large: {size_bytes} bytes (max: {max_bytes} bytes)"
+                    ));
+                }
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| format!("Cannot read {path}: {e}"))?;
+
+                // lopdf parsing is synchronous and can take real time on a
+                // large document, so it must not sit on a runtime worker.
+                let extracted = tokio::task::spawn_blocking(move || {
+                    nanna_tools::read_pdf_text(&bytes, selection)
+                })
+                .await
+                .map_err(|e| format!("PDF read task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+
+                // The counts ride alongside the text for the same reason
+                // `read_file` reports `total_lines`: a caller must be able to
+                // see it did not get the whole document without inferring it.
+                Ok(json!({
+                    "text": extracted.text,
+                    "page_count": extracted.page_count,
+                    "pages_read": extracted.pages_read,
+                    "empty_pages": extracted.empty_pages.len(),
+                }))
+            })
+        }),
+    );
+
     services
 }
 use tokio::sync::broadcast;
@@ -5320,4 +5387,83 @@ mod tests {
         );
         registry.release("user-session").await;
     }
+    /// The `read_pdf` skill declares `requires: ["pdf.read"]`. Without that
+    /// service the tool still loads and still advertises itself to the model —
+    /// it just fails at call time — so a compile cannot tell you whether it is
+    /// wired. This calls it end to end against a real document.
+    #[tokio::test]
+    async fn the_pdf_read_service_is_registered_and_reads_a_real_document() {
+        let services = build_script_services(
+            &None,
+            None,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+            Arc::new(crate::tasks::TurnBaselines::new()),
+            None,
+        );
+        let pdf_read = services
+            .get("pdf.read")
+            .expect("the read_pdf skill's declared service must exist");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("probe.pdf");
+        std::fs::write(&path, minimal_two_page_pdf()).expect("write probe pdf");
+        let path_str = path.to_string_lossy().to_string();
+
+        let whole = pdf_read(serde_json::json!({ "path": path_str }))
+            .await
+            .expect("reading the whole document succeeds");
+        assert_eq!(whole["page_count"], 2);
+        assert_eq!(whole["pages_read"], 2);
+
+        // And the `pages` argument the skill sends is honoured, not dropped.
+        let page_two = pdf_read(serde_json::json!({ "path": path_str, "pages": "2" }))
+            .await
+            .expect("reading one page succeeds");
+        assert_eq!(page_two["page_count"], 2);
+        assert_eq!(page_two["pages_read"], 1);
+
+        // A selection it cannot read is refused rather than guessed at.
+        let bad = pdf_read(serde_json::json!({ "path": path_str, "pages": "5-2" })).await;
+        assert!(bad.is_err(), "a backwards range must not be reinterpreted");
+    }
+
+    /// A two-page PDF with no text content — enough to exercise page counting
+    /// and selection without depending on text extraction.
+    fn minimal_two_page_pdf() -> Vec<u8> {
+        use lopdf::{Document, Object, dictionary};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let kids: Vec<Object> = (0..2)
+            .map(|_| {
+                doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                })
+                .into()
+            })
+            .collect();
+        let count = i64::try_from(kids.len()).expect("two fits");
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => count,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("document saves");
+        bytes
+    }
+
 }

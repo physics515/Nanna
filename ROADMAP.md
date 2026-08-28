@@ -3365,8 +3365,38 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       listeners already extract voice-note file ids, but the daemon drops non-text messages
       (crates/nanna-daemon/src/channels.rs:231). Register the service, download channel media, transcribe
       before the ignore-non-text branch. Voice note from your phone → answer is hallmark personal-daemon UX.
-- [ ] **`pdf.read`** — complete ReadPdfTool (text + OCR fallback, tested) registered nowhere; read_pdf skill
+- [x] **`pdf.read`** — complete ReadPdfTool (text + OCR fallback, tested) registered nowhere; read_pdf skill
       errors at runtime. Pure registration fix.
+      *(2026-08-28)* **Landed — and it was not purely a registration fix.** The service is now
+      registered in `build_script_services` (`crates/nanna-daemon/src/server.rs`), so the bundled
+      `read_pdf` skill stops answering every call with *"PDF reading service not available"*. Two
+      things the registration alone would have shipped broken:
+      **(1) The `pages` argument was being discarded in silence.** The skill has always sent
+      `pages: "1-5"` / `"3"`; `ReadPdfTool` only ever read an integer `max_pages`, so asking for
+      page 3 of a forty-page contract would have returned all forty with nothing saying the request
+      was ignored — a wrong answer that looks like a right one, which is worse than the error the
+      skill used to return. Added `PageSelection` + `parse_page_selection` covering `"3"`, `"2-5"`,
+      `"4-"`, `"-4"` and empty, refusing what it cannot read rather than guessing: `"5-2"` is an
+      error, not a silently reversed range, and page `0` is named as a caller bug. A selection past
+      the end reads nothing and says so, instead of quietly yielding the last page. `max_pages` still
+      works; `pages` wins when both arrive, being the more specific request.
+      **(2) It was an unbounded read.** `read_file` refuses a file over 10 MB; `read_pdf` had no
+      ceiling at all, so it was a way into exactly what the file reader turns away. Same constant,
+      stated as such (`PDF_MAX_BYTES`), checked from `metadata()` before the bytes are buffered. The
+      service also returns `page_count` / `pages_read` / `empty_pages` beside the text — the same
+      contract `read_file`'s `total_lines`/`lines_returned` offers, so a caller can tell it did not
+      get the whole document without inferring it from the prose. `lopdf` parsing is synchronous and
+      runs under `spawn_blocking`, off the runtime workers.
+      5 tests over the selection grammar and clamping.
+      - [ ] **Wire the OCR fallback.** `ReadPdfTool::with_ocr_fn` exists and is tested, but `OcrTool`
+            is itself registered nowhere, so image-only pages still come back empty. Deliberately not
+            faked in this increment: a half-wired OCR path is indistinguishable from a scanned
+            document that genuinely has no text, and the extractor already says which pages yielded
+            nothing.
+      - [ ] **`create_vision_tool` has no callers either.** `vision_wiring::create_vision_tool` and
+            `OcrTool` are both complete, exported, and unreachable — the same shape of gap `pdf.read`
+            had. Worth one audit pass over `nanna-tools`' built-ins asking which are actually
+            registered anywhere, rather than finding them one at a time.
 - [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
       (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
       local model, largely redundant with exec + browser).
