@@ -1,155 +1,141 @@
 <template>
   <!-- The chat's window into the task store (P19): the planner seeds it, the
-       harness drains it, the agent's todo skill writes to it. Now with
-       interactive editing: mark complete, delete, reorder, and create. -->
-  <aside v-if="tasks.length > 0 || showCreateInput" class="task-checklist" :class="collapsed ? 'w-10' : 'w-64 xl:w-72'">
-    <!-- Collapsed rail -->
-    <button
-      v-if="collapsed"
-      class="rail"
-      :title="`Tasks: ${doneCount}/${tasks.length} done — click to expand`"
-      @click="collapsed = false"
+       harness drains it, the agent's todo skill writes to it. Task cards +
+       the action rail from the nui design; mark complete, delete, reorder
+       (drag), and create all still here. -->
+  <aside class="hidden shrink-0 items-start gap-4 self-stretch lg:flex">
+    <!-- Task pane -->
+    <div
+      v-if="paneOpen && (tasks.length > 0 || showCreateInput)"
+      class="nui-scroll flex min-h-0 w-[512px] flex-col gap-8 self-stretch overflow-y-auto"
     >
-      <ListChecks class="w-4 h-4" />
-      <span class="rail-count">{{ doneCount }}/{{ tasks.length }}</span>
-    </button>
-
-    <!-- Expanded panel -->
-    <div v-else class="panel">
-      <div class="panel-header">
-        <div class="flex items-center gap-2 min-w-0">
-          <ListChecks class="w-4 h-4 text-nanna-primary shrink-0" />
-          <span class="text-sm font-medium text-nanna-text truncate">Tasks</span>
-          <span class="text-xs font-mono text-nanna-text-dim">{{ doneCount }}/{{ tasks.length }}</span>
-        </div>
-        <div class="flex items-center gap-1">
-          <button
-            class="text-nanna-text-dim hover:text-nanna-primary transition-colors p-1"
-            title="Add task"
-            @click="showCreateInput = true"
-          >
-            <Plus class="w-4 h-4" />
-          </button>
-          <button
-            class="text-nanna-text-dim hover:text-nanna-text transition-colors p-1"
-            title="Collapse"
-            @click="collapsed = true"
-          >
-            <ChevronRight class="w-4 h-4" />
-          </button>
-        </div>
+      <div class="flex w-full items-center justify-between pl-4">
+        <p class="text-xs leading-normal text-nui-fg">
+          Tasks <span class="text-nui-muted">{{ doneCount }}/{{ tasks.length }}</span>
+        </p>
+        <NuiIconButton icon="add" label="Add task" @click="showCreateInput = true" />
       </div>
 
-      <div class="panel-body">
-        <!-- Create new task input -->
-        <div v-if="showCreateInput" class="create-task-row">
-          <input
-            ref="createInput"
-            v-model="newTaskTitle"
-            type="text"
-            placeholder="New task title..."
-            class="create-input"
-            @keydown.enter="handleCreate"
-            @keydown.escape="cancelCreate"
-          />
-          <button
-            class="create-btn"
-            :disabled="!newTaskTitle.trim() || creating"
-            @click="handleCreate"
-          >
-            <Loader2 v-if="creating" class="w-3.5 h-3.5 animate-spin" />
-            <Check v-else class="w-3.5 h-3.5" />
-          </button>
-          <button class="cancel-btn" @click="cancelCreate">
-            <X class="w-3.5 h-3.5" />
-          </button>
-        </div>
+      <!-- Create new task input -->
+      <div v-if="showCreateInput" class="flex items-center gap-2 px-2">
+        <input
+          ref="createInput"
+          v-model="newTaskTitle"
+          type="text"
+          placeholder="New task title..."
+          class="min-w-0 flex-1 border-b border-dashed border-nui-muted bg-transparent p-2 font-nui text-xs font-[450] leading-normal text-nui-fg outline-none placeholder:text-nui-muted focus:border-nui-accent"
+          @keydown.enter="handleCreate"
+          @keydown.escape="cancelCreate"
+        />
+        <NuiIconButton
+          icon="circle-check"
+          label="Create task"
+          class="text-nui-green"
+          :disabled="!newTaskTitle.trim() || creating"
+          @click="handleCreate"
+        />
+        <NuiIconButton icon="close" label="Cancel" @click="cancelCreate" />
+      </div>
 
-        <!-- Task list with drag-and-drop -->
-        <div
-          v-for="(task, index) in tasks"
-          :key="task.id"
-          class="task-row"
-          :class="{
-            'pl-6': task.parent_id != null,
-            'opacity-50': task.status === 'cancelled',
-            'dragging': draggedIndex === index,
-            'drag-over': dragOverIndex === index && draggedIndex !== index
-          }"
-          :title="task.description || task.title"
-          draggable="true"
-          @dragstart="handleDragStart($event, index)"
-          @dragover="handleDragOver($event, index)"
-          @dragleave="handleDragLeave"
-          @drop="handleDrop($event, index)"
-          @dragend="handleDragEnd"
+      <!-- Top-level tasks as cards; subtasks as compact rows inside -->
+      <div
+        v-for="task in topLevelTasks"
+        :key="task.id"
+        :class="{
+          'opacity-50': task.status === 'cancelled',
+          'opacity-60': draggedId === task.id,
+          'border-t-2 border-solid border-nui-accent': dragOverId === task.id && draggedId !== task.id,
+        }"
+        :title="task.description || task.title"
+        draggable="true"
+        @dragstart="handleDragStart($event, task)"
+        @dragover="handleDragOver($event, task)"
+        @dragleave="dragOverId = null"
+        @drop="handleDrop($event, task)"
+        @dragend="handleDragEnd"
+      >
+        <NuiTaskCard
+          :title="task.title"
+          :status="cardStatus(task)"
+          :status-label="task.status === 'cancelled' ? 'Cancelled' : undefined"
+          :description="task.description ?? undefined"
+          :assignee="assigneeLabel(task)"
+          :progress="cardProgress(task)"
+          :urgent="task.priority === 1 && task.status !== 'done'"
+          :editable="false"
+          :busy="completing === task.id || deleting === task.id"
+          @complete="handleComplete(task)"
+          @delete="handleDelete(task)"
         >
-          <!-- Drag handle -->
-          <span class="drag-handle" title="Drag to reorder">
-            <GripVertical class="w-3 h-3" />
-          </span>
-
-          <!-- Status glyph / checkbox -->
-          <button
-            class="glyph-btn"
-            :class="glyphClass(task.status)"
-            :disabled="task.status === 'done' || task.status === 'cancelled' || completing === task.id"
-            :title="task.status === 'done' ? 'Completed' : task.status === 'cancelled' ? 'Cancelled' : 'Mark as complete'"
-            @click="handleComplete(task)"
-          >
-            <Loader2 v-if="completing === task.id" class="w-3.5 h-3.5 animate-spin" />
-            <CheckCircle2 v-else-if="task.status === 'done'" class="w-3.5 h-3.5" />
-            <XCircle v-else-if="task.status === 'cancelled'" class="w-3.5 h-3.5" />
-            <Circle v-else class="w-3.5 h-3.5" />
-          </button>
-
-          <span class="flex-1 min-w-0">
-            <span
-              class="task-title"
-              :class="{
-                'line-through text-nanna-text-dim': task.status === 'done' || task.status === 'cancelled',
-                'text-nanna-text': task.status === 'in_progress',
-              }"
-            >{{ task.title }}</span>
-            <!-- Whose responsibility: the store's assignee. Sub-agents own
-                 items they were delegated; unassigned items are Nanna's. -->
-            <span
-              v-if="assigneeLabel(task)"
-              class="owner"
-              :class="isDelegated(task) ? 'owner-agent' : 'owner-self'"
-              :title="`Owner: ${task.assignee}`"
+          <div v-if="childrenOf(task.id).length" class="flex w-full flex-col gap-1">
+            <div
+              v-for="sub in childrenOf(task.id)"
+              :key="sub.id"
+              class="flex w-full items-center gap-2"
             >
-              <Bot v-if="isDelegated(task)" class="w-3 h-3" />
-              {{ assigneeLabel(task) }}
-            </span>
-          </span>
-
-          <span v-if="task.priority === 1 && task.status !== 'done'" class="prio" title="Interjected / urgent">!</span>
-
-          <!-- Delete button -->
-          <button
-            class="delete-btn"
-            :disabled="deleting === task.id"
-            title="Delete task"
-            @click.stop="handleDelete(task)"
-          >
-            <Loader2 v-if="deleting === task.id" class="w-3 h-3 animate-spin" />
-            <Trash2 v-else class="w-3 h-3" />
-          </button>
-        </div>
+              <button
+                type="button"
+                class="shrink-0 disabled:pointer-events-none"
+                :class="subGlyphClass(task, sub)"
+                :disabled="sub.status === 'done' || sub.status === 'cancelled' || completing === sub.id"
+                :title="sub.status === 'done' ? 'Completed' : sub.status === 'cancelled' ? 'Cancelled' : 'Mark as complete'"
+                @click="handleComplete(sub)"
+              >
+                <NuiIcon :name="sub.status === 'done' ? 'circle-check' : 'dot'" :size="16" />
+              </button>
+              <span
+                class="min-w-0 flex-1 truncate text-xs leading-normal"
+                :class="[
+                  task.status === 'done' ? 'text-nui-bg' : 'text-nui-fg',
+                  (sub.status === 'done' || sub.status === 'cancelled') && 'line-through opacity-70',
+                ]"
+                :title="sub.description || sub.title"
+              >{{ sub.title }}</span>
+              <span
+                v-if="isDelegated(sub)"
+                class="shrink-0 whitespace-nowrap text-xs leading-normal"
+                :class="task.status === 'done' ? 'text-nui-bg' : 'text-nui-info'"
+                :title="`Owner: ${sub.assignee}`"
+              >{{ sub.assignee }}</span>
+              <NuiIconButton
+                icon="delete"
+                label="Delete subtask"
+                class="!p-0"
+                :class="task.status === 'done' ? 'text-nui-bg hover:text-nui-bg/70' : ''"
+                :disabled="deleting === sub.id"
+                @click="handleDelete(sub)"
+              />
+            </div>
+          </div>
+        </NuiTaskCard>
       </div>
+    </div>
+
+    <!-- Action rail -->
+    <div class="flex shrink-0 flex-col items-start">
+      <NuiRailButton
+        icon="tasks"
+        :label="tasks.length ? `Tasks: ${doneCount}/${tasks.length} done` : 'Tasks'"
+        :active="paneOpen && (tasks.length > 0 || showCreateInput)"
+        accent="green"
+        @click="toggleRail"
+      />
+      <span
+        v-if="tasks.length > 0"
+        class="w-full pt-1 text-center text-xs leading-normal text-nui-muted"
+      >{{ doneCount }}/{{ tasks.length }}</span>
     </div>
   </aside>
 
   <!-- Delete confirmation dialog -->
   <Teleport to="body">
-    <div v-if="confirmDelete" class="confirm-overlay" @click="confirmDelete = null">
-      <div class="confirm-dialog" @click.stop>
-        <p class="confirm-text">Delete task "{{ confirmDelete.title }}"?</p>
-        <p class="confirm-subtext">This will also delete any subtasks.</p>
-        <div class="confirm-actions">
-          <button class="confirm-cancel" @click="confirmDelete = null">Cancel</button>
-          <button class="confirm-delete" @click="confirmDeleteTask">Delete</button>
+    <div v-if="confirmDelete" class="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 font-nui" @click="confirmDelete = null">
+      <div class="w-80 border border-solid border-nui-muted/40 bg-nui-bg p-6" @click.stop>
+        <p class="mb-1 text-sm font-semibold leading-normal text-nui-fg">Delete task "{{ confirmDelete.title }}"?</p>
+        <p class="mb-4 text-xs leading-normal text-nui-muted">This will also delete any subtasks.</p>
+        <div class="flex justify-end gap-2">
+          <button class="px-4 py-2 text-xs text-nui-muted transition-colors hover:text-nui-fg" @click="confirmDelete = null">Cancel</button>
+          <button class="bg-nui-pink px-4 py-2 text-xs text-nui-bg transition-opacity hover:opacity-80" @click="confirmDeleteTask">Delete</button>
         </div>
       </div>
     </div>
@@ -160,7 +146,6 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Bot, Check, CheckCircle2, ChevronRight, Circle, GripVertical, ListChecks, Loader2, Plus, Trash2, X, XCircle } from '@lucide/vue'
 
 interface TaskItem {
   id: number
@@ -177,8 +162,14 @@ interface TaskItem {
 const props = defineProps<{ sessionId: string }>()
 
 const tasks = ref<TaskItem[]>([])
-const collapsed = ref(false)
+const paneOpen = ref(true)
 const doneCount = computed(() => tasks.value.filter(t => t.status === 'done').length)
+
+const topLevelTasks = computed(() => tasks.value.filter(t => t.parent_id == null))
+
+function childrenOf(id: number): TaskItem[] {
+  return tasks.value.filter(t => t.parent_id === id)
+}
 
 // Create new task state
 const showCreateInput = ref(false)
@@ -191,9 +182,21 @@ const completing = ref<number | null>(null)
 const deleting = ref<number | null>(null)
 const confirmDelete = ref<TaskItem | null>(null)
 
-// Drag and drop state
-const draggedIndex = ref<number | null>(null)
-const dragOverIndex = ref<number | null>(null)
+// Drag and drop state (top-level cards reorder by priority)
+const draggedId = ref<number | null>(null)
+const dragOverId = ref<number | null>(null)
+
+// Opening the rail with no tasks yet goes straight to creating one — the
+// pane has nothing else to show.
+function toggleRail() {
+  if (paneOpen.value && (tasks.value.length > 0 || showCreateInput.value)) {
+    paneOpen.value = false
+    showCreateInput.value = false
+  } else {
+    paneOpen.value = true
+    if (tasks.value.length === 0) showCreateInput.value = true
+  }
+}
 
 // The harness runs chat items as actor "chat"; anything else was delegated
 // (a sub-agent, the scheduler, a channel). Only the delegations are worth
@@ -204,15 +207,37 @@ function isDelegated(task: TaskItem): boolean {
 }
 
 function assigneeLabel(task: TaskItem): string {
-  return isDelegated(task) ? (task.assignee as string) : ''
+  return isDelegated(task) ? (task.assignee as string) : 'Nanna'
 }
 
-function glyphClass(status: string): string {
-  switch (status) {
-    case 'done': return 'text-emerald-400'
-    case 'in_progress': return 'text-nanna-primary'
-    case 'cancelled': return 'text-nanna-text-dim'
-    default: return 'text-nanna-text-muted'
+function cardStatus(task: TaskItem): 'upcoming' | 'in-progress' | 'complete' {
+  if (task.status === 'done') return 'complete'
+  if (task.status === 'in_progress') return 'in-progress'
+  return 'upcoming'
+}
+
+/**
+ * The card's bar: subtask completion where subtasks exist, otherwise the
+ * task's own binary state (half-full while in progress — the store tracks
+ * no finer grain for a leaf task).
+ */
+function cardProgress(task: TaskItem): number {
+  const children = childrenOf(task.id)
+  if (children.length > 0) {
+    return children.filter(c => c.status === 'done').length / children.length
+  }
+  if (task.status === 'done') return 1
+  if (task.status === 'in_progress') return 0.5
+  return 0
+}
+
+function subGlyphClass(parent: TaskItem, sub: TaskItem): string {
+  if (parent.status === 'done') return 'text-nui-bg'
+  switch (sub.status) {
+    case 'done': return 'text-nui-green'
+    case 'in_progress': return 'text-nui-accent'
+    case 'cancelled': return 'text-nui-muted'
+    default: return 'text-nui-muted hover:text-nui-fg'
   }
 }
 
@@ -304,47 +329,45 @@ async function confirmDeleteTask() {
   }
 }
 
-// --- Drag and drop reordering ---
-function handleDragStart(e: DragEvent, index: number) {
-  draggedIndex.value = index
+// --- Drag and drop reordering (top-level cards) ---
+function handleDragStart(e: DragEvent, task: TaskItem) {
+  draggedId.value = task.id
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', String(index))
+    e.dataTransfer.setData('text/plain', String(task.id))
   }
 }
 
-function handleDragOver(e: DragEvent, index: number) {
+function handleDragOver(e: DragEvent, task: TaskItem) {
   e.preventDefault()
   if (e.dataTransfer) {
     e.dataTransfer.dropEffect = 'move'
   }
-  dragOverIndex.value = index
+  dragOverId.value = task.id
 }
 
-function handleDragLeave() {
-  dragOverIndex.value = null
-}
-
-async function handleDrop(e: DragEvent, targetIndex: number) {
+async function handleDrop(e: DragEvent, targetTask: TaskItem) {
   e.preventDefault()
-  dragOverIndex.value = null
+  dragOverId.value = null
 
-  if (draggedIndex.value === null || draggedIndex.value === targetIndex) {
-    draggedIndex.value = null
+  if (draggedId.value === null || draggedId.value === targetTask.id) {
+    draggedId.value = null
     return
   }
 
-  const draggedTask = tasks.value[draggedIndex.value]
-  const targetTask = tasks.value[targetIndex]
+  const list = topLevelTasks.value
+  const draggedIndex = list.findIndex(t => t.id === draggedId.value)
+  const targetIndex = list.findIndex(t => t.id === targetTask.id)
+  const draggedTask = list[draggedIndex]
 
-  if (!draggedTask || !targetTask) {
-    draggedIndex.value = null
+  if (!draggedTask || targetIndex === -1) {
+    draggedId.value = null
     return
   }
 
   // Calculate new priority based on position
   // If moving up, take target's priority; if moving down, take target's priority + 1
-  const newPriority = draggedIndex.value < targetIndex
+  const newPriority = draggedIndex < targetIndex
     ? targetTask.priority + 1
     : targetTask.priority
 
@@ -358,12 +381,12 @@ async function handleDrop(e: DragEvent, targetIndex: number) {
     console.error('Failed to reorder task:', e)
   }
 
-  draggedIndex.value = null
+  draggedId.value = null
 }
 
 function handleDragEnd() {
-  draggedIndex.value = null
-  dragOverIndex.value = null
+  draggedId.value = null
+  dragOverId.value = null
 }
 
 // Refetch on task events for this session, debounced — a run completing
@@ -390,264 +413,3 @@ onUnmounted(() => {
 
 watch(() => props.sessionId, () => { tasks.value = []; void load() })
 </script>
-
-<style scoped>
-.task-checklist {
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-  padding: 0.5rem 0.75rem 0.75rem 0;
-  transition: width 0.15s ease;
-  min-height: 0;
-}
-.rail {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 6px;
-  border-radius: 9999px;
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.8));
-  cursor: pointer;
-}
-.rail:hover {
-  color: var(--color-nanna-text, #e2e8f0);
-}
-.rail-count {
-  font-size: 10px;
-  font-family: var(--font-mono, monospace);
-  writing-mode: vertical-rl;
-}
-.panel {
-  display: flex;
-  flex-direction: column;
-  border-radius: 0.75rem;
-  min-height: 0;
-  max-height: 100%;
-  overflow: hidden;
-}
-.panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 12px;
-}
-.panel-body {
-  overflow-y: auto;
-  padding: 6px 6px 10px;
-}
-
-/* Create task input */
-.create-task-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  margin-bottom: 4px;
-}
-.create-input {
-  flex: 1;
-  min-width: 0;
-  padding: 4px 8px;
-  font-size: 12px;
-  border-radius: 4px;
-  background: rgba(148, 163, 184, 0.1);
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  color: var(--color-nanna-text, #e2e8f0);
-}
-.create-input:focus {
-  outline: none;
-  border-color: var(--color-nanna-primary, #7c3aed);
-}
-.create-input::placeholder {
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.6));
-}
-.create-btn, .cancel-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px;
-  border-radius: 4px;
-  transition: all 0.15s ease;
-}
-.create-btn {
-  color: var(--color-nanna-primary, #7c3aed);
-}
-.create-btn:hover:not(:disabled) {
-  background: rgba(124, 58, 237, 0.1);
-}
-.create-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.cancel-btn {
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.6));
-}
-.cancel-btn:hover {
-  color: var(--color-nanna-text, #e2e8f0);
-}
-
-/* Task row */
-.task-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 5px 8px;
-  border-radius: 0.5rem;
-  font-size: 13px;
-  line-height: 1.35;
-  cursor: grab;
-  transition: all 0.15s ease;
-}
-.task-row:hover {
-  background: rgba(148, 163, 184, 0.04);
-}
-.task-row.dragging {
-  opacity: 0.5;
-  background: rgba(124, 58, 237, 0.1);
-}
-.task-row.drag-over {
-  border-top: 2px solid var(--color-nanna-primary, #7c3aed);
-}
-
-/* Drag handle */
-.drag-handle {
-  flex-shrink: 0;
-  margin-top: 2px;
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.4));
-  cursor: grab;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-}
-.task-row:hover .drag-handle {
-  opacity: 1;
-}
-.drag-handle:active {
-  cursor: grabbing;
-}
-
-/* Status glyph button */
-.glyph-btn {
-  flex-shrink: 0;
-  margin-top: 1px;
-  padding: 0;
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-.glyph-btn:disabled {
-  cursor: default;
-}
-.glyph-btn:not(:disabled):hover {
-  transform: scale(1.1);
-}
-
-.task-title {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: var(--color-nanna-text-muted, rgba(203, 213, 225, 0.85));
-}
-.prio {
-  margin-left: auto;
-  flex-shrink: 0;
-  font-weight: 700;
-  font-size: 11px;
-  color: rgb(251 191 36);
-}
-
-/* Delete button */
-.delete-btn {
-  flex-shrink: 0;
-  padding: 2px;
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.4));
-  opacity: 0;
-  transition: all 0.15s ease;
-}
-.task-row:hover .delete-btn {
-  opacity: 1;
-}
-.delete-btn:hover:not(:disabled) {
-  color: rgb(239 68 68);
-}
-.delete-btn:disabled {
-  cursor: not-allowed;
-}
-
-.owner {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  margin-left: 6px;
-  padding: 0 5px;
-  border-radius: 9999px;
-  font-size: 10px;
-  font-family: var(--font-mono, monospace);
-  vertical-align: middle;
-  white-space: nowrap;
-}
-.owner-agent {
-  color: rgb(129 140 248);
-}
-.owner-self {
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.7));
-}
-
-/* Confirm dialog */
-.confirm-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
-}
-.confirm-dialog {
-  background: var(--color-nanna-bg, #1e1e2e);
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 12px;
-  padding: 20px 24px;
-  max-width: 320px;
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
-}
-.confirm-text {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--color-nanna-text, #e2e8f0);
-  margin-bottom: 4px;
-}
-.confirm-subtext {
-  font-size: 12px;
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.7));
-  margin-bottom: 16px;
-}
-.confirm-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-.confirm-cancel, .confirm-delete {
-  padding: 6px 14px;
-  font-size: 13px;
-  font-weight: 500;
-  border-radius: 6px;
-  transition: all 0.15s ease;
-}
-.confirm-cancel {
-  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.8));
-  background: transparent;
-}
-.confirm-cancel:hover {
-  background: rgba(148, 163, 184, 0.1);
-  color: var(--color-nanna-text, #e2e8f0);
-}
-.confirm-delete {
-  background: rgb(239 68 68);
-  color: white;
-}
-.confirm-delete:hover {
-  background: rgb(220 38 38);
-}
-</style>

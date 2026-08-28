@@ -1,177 +1,81 @@
 <template>
-  <div class="app-shell" style="display: flex; height: 100vh; overflow: hidden;">
+  <div class="nui-root flex h-screen flex-col overflow-hidden text-xs leading-normal">
+    <div class="flex min-h-0 w-full flex-1 items-start gap-4">
+      <!-- ═══ Main menu rail ═══ -->
+      <NuiMainMenu
+        :items="railItems"
+        :bottom-items="bottomRailItems"
+        :active-id="activeRailId"
+        class="self-stretch"
+        @select="onRailSelect"
+      />
 
-    <!-- ═══ Activity Bar (icon-only sidebar) ═══ -->
-    <aside class="activity-bar">
-      <!-- Logo -->
-      <div class="activity-logo" data-tauri-drag-region>
-        <img src="/logo.svg" alt="Nanna" style="width: 46px; height: 46px; object-fit: contain; pointer-events: none;" />
-      </div>
-
-      <!-- Navigation icons -->
-      <nav class="activity-nav">
-        <!-- Chat (toggles session panel) -->
-        <button
-          type="button"
-          aria-label="Chats"
-          title="Chats"
-          :class="['activity-icon', { active: chatPanelOpen || route.path === '/' }]"
-          @click="toggleChatPanel"
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M4 4h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 3v-3a2 2 0 01-2-2V6a2 2 0 012-2z" />
-          </svg>
-          <svg
-            class="chat-arrow"
-            :class="{ 'chat-arrow--open': chatPanelOpen }"
-            viewBox="0 0 6 10"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M1 1l4 4-4 4" />
-          </svg>
-          <span class="tooltip">Chats</span>
-        </button>
-
-        <NuxtLink
-          v-for="item in primaryNavItems" :key="item.to" :to="item.to"
-          :aria-label="item.label"
-          :title="item.label"
-          :class="['activity-icon', { active: isNavActive(item.to) }]"
-          @click="chatPanelOpen = false"
-        >
-          <component :is="item.icon" />
-          <span class="tooltip">{{ item.label }}</span>
-        </NuxtLink>
-
-        <!-- Admin overflow (progressive disclosure) -->
-        <div class="activity-more" ref="adminNavEl">
-          <button
-            type="button"
-            aria-label="More"
-            title="More"
-            :class="['activity-icon', { active: adminNavOpen || adminNavActive }]"
-            @click.stop="adminNavOpen = !adminNavOpen"
-          >
-            <MoreHorizontal />
-            <span class="tooltip">More</span>
-          </button>
-          <div v-if="adminNavOpen" class="admin-flyout" role="menu">
-            <NuxtLink
-              v-for="item in adminNavItems" :key="item.to" :to="item.to"
-              class="admin-flyout-item"
-              :class="{ active: isNavActive(item.to) }"
-              role="menuitem"
-              @click="adminNavOpen = false; chatPanelOpen = false"
-            >
-              <component :is="item.icon" class="admin-flyout-icon" />
-              <span>{{ item.label }}</span>
-            </NuxtLink>
+      <!-- ═══ Chat menu (session list, chat route only) ═══ -->
+      <aside v-if="chatPanelOpen" class="flex w-64 shrink-0 flex-col gap-4 self-stretch overflow-clip pb-8 pt-6">
+        <div class="flex w-full items-center justify-between pl-4">
+          <p class="text-xs leading-normal text-nui-fg">Chats</p>
+          <NuiIconButton icon="add" label="New chat" @click="createNewSession" />
+        </div>
+        <nav class="nui-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+          <SessionItem
+            v-for="session in sessions"
+            :key="session.id"
+            :session="session"
+            :is-active="currentSessionId === session.id"
+            @select="(s) => { switchSession(s); }"
+            @deleted="onSessionDeleted"
+            @renamed="onSessionRenamed"
+          />
+          <div v-if="sessions.length === 0" class="px-4 py-8 text-center text-xs leading-normal text-nui-muted">
+            No chats yet
           </div>
-        </div>
-      </nav>
+        </nav>
+      </aside>
 
-      <!-- Bottom: settings + hide -->
-      <div class="activity-bottom">
-        <NuxtLink to="/settings" aria-label="Settings" title="Settings" :class="['activity-icon', { active: route.path === '/settings' }]" @click="chatPanelOpen = false">
-          <Settings />
-          <span class="tooltip">Settings</span>
-        </NuxtLink>
-        <button type="button" class="activity-icon" aria-label="Hide to Tray" title="Hide to Tray" @click="hideToTray">
-          <ChevronDown />
-          <span class="tooltip">Hide to Tray</span>
-        </button>
+      <!-- ═══ Body column ═══ -->
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-4 self-stretch">
+        <!-- Top bar: workspace select + window controls -->
+        <div class="flex w-full shrink-0 items-start gap-4" data-tauri-drag-region>
+          <NuiSelect
+            :model-value="workspaceSelectValue"
+            :options="workspaceOptions"
+            label="Workspace"
+            icon="workspaces"
+            variant="attached"
+            class="w-64 shrink-0"
+            @update:model-value="onWorkspaceSelect"
+          />
+          <div class="min-w-0 flex-1 self-stretch" data-tauri-drag-region />
+          <NuiWindowControls
+            @minimize="minimizeWindow"
+            @maximize="toggleMaximizeWindow"
+            @close="closeWindow"
+          />
+        </div>
+
+        <!-- Page content -->
+        <main class="min-h-0 w-full flex-1 overflow-hidden">
+          <slot />
+        </main>
       </div>
-    </aside>
-
-    <!-- ═══ Right column: chat panel + main + status bar ═══ -->
-    <div style="flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0;">
-
-      <!-- Top row: chat panel + main content (resizable) -->
-      <UiResizableGroup direction="horizontal" style="flex: 1; min-height: 0;">
-
-        <!-- Chat Panel -->
-        <UiResizablePanel
-          v-if="chatPanelOpen"
-          :default-size="18"
-          :min-size="12"
-          :max-size="35"
-          :order="1"
-          class="chat-panel"
-        >
-          <!-- Header -->
-          <div style="padding: 0.25rem 0.75rem; display: flex; align-items: center; justify-content: space-between;">
-            <span style="font-size: 0.7rem; font-weight: 500; color: rgba(196,205,214,0.5); text-transform: uppercase; letter-spacing: 0.06em;">Chats</span>
-            <button class="panel-icon-btn" @click="createNewSession" title="New chat">
-              <Plus style="width: 14px; height: 14px;" />
-            </button>
-          </div>
-
-          <!-- Session list -->
-          <nav style="flex: 1; overflow-y: auto; min-height: 0; padding: 0 0.375rem;">
-            <SessionItem
-              v-for="session in sessions"
-              :key="session.id"
-              :session="session"
-              :is-active="currentSessionId === session.id"
-              @select="(s) => { switchSession(s); }"
-              @deleted="onSessionDeleted"
-              @renamed="onSessionRenamed"
-            />
-            <div v-if="sessions.length === 0" style="font-size: 0.7rem; color: rgba(100,116,139,0.5); padding: 2rem 0.5rem; text-align: center;">
-              No chats yet
-            </div>
-          </nav>
-        </UiResizablePanel>
-
-        <UiResizableHandle v-if="chatPanelOpen" />
-
-        <!-- Main content column -->
-        <UiResizablePanel :default-size="chatPanelOpen ? 82 : 100" :order="2" style="display: flex; flex-direction: column; min-height: 0; min-width: 0;">
-          <TitleBar />
-          <main style="flex: 1; overflow: hidden;">
-            <slot />
-          </main>
-        </UiResizablePanel>
-
-      </UiResizableGroup>
-
-      <!-- ═══ Bottom Status Bar (full width except activity bar) ═══ -->
-      <div class="status-bar">
-        <div class="status-left">
-          <span class="status-version" :title="versionTooltip">{{ versionLabel }}</span>
-          <button
-            :class="['status-update', updateVersion ? 'status-update-available' : '']"
-            :disabled="updating || checking"
-            :title="updateTooltip"
-            @click="applyUpdate"
-          >
-            {{ updateButtonLabel }}
-          </button>
-          <span
-            v-if="backendStatus"
-            :class="['status-badge', backendLabel.online ? 'status-badge-accent' : '']"
-            :title="backendLabel.tooltip"
-          >
-            {{ backendLabel.short }}
-          </span>
-        </div>
-        <div class="status-right">
-          <span
-            :class="[
-              'status-dot',
-              statusBar.tone === 'ok' ? 'dot-ok' : statusBar.tone === 'warn' || statusBar.tone === 'info' ? 'dot-warn' : 'dot-err'
-            ]"
-            :title="backendLabel.tooltip"
-          ></span>
-          <span class="status-label" :title="backendLabel.tooltip">{{ statusBar.text }}</span>
-        </div>
-      </div>
-
     </div>
+
+    <!-- ═══ Bottom status bar ═══ -->
+    <NuiStatusBar
+      :ui-version="appVersion || undefined"
+      :server-version="daemonVersion || undefined"
+      :connected="statusBar.tone === 'ok'"
+      :status-text="statusBar.text"
+      :updating="updating || checking"
+      :update-label="updateLabel"
+      :update-tooltip="updateTooltip"
+      @update="applyUpdate"
+    />
+
+    <!-- Notification Center sheet (opened from the rail bell) -->
+    <UiSheet :open="notifOpen" side="right" @update:open="notifOpen = $event">
+      <NotificationCenter />
+    </UiSheet>
 
     <!-- Workspace Picker Modal -->
     <WorkspacePicker
@@ -210,36 +114,73 @@ import { ref, computed, watch, onMounted, onUnmounted, provide, nextTick } from 
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, MoreHorizontal } from '@lucide/vue'
 import { statusBarLabel } from '~/lib/backendLabels'
 import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
+import type { NuiRailItem } from '~/components/nui/NuiMainMenu.vue'
 
-const primaryNavItems = [
-  { to: '/memory', label: 'Memory', icon: Brain },
-  { to: '/tools', label: 'Tools', icon: Wrench },
-  { to: '/channels', label: 'Channels', icon: Radio },
+// ═══ Main menu rail (nui design: every page gets its own entry) ═══
+const { unreadCount, isOpen: notifOpen } = useNotificationCenter()
+
+const railItems = computed<NuiRailItem[]>(() => [
+  { id: 'chat', icon: 'chat', label: 'Chats' },
+  { id: 'notifications', icon: 'notifications', label: 'Notifications', badge: unreadCount.value },
+  { id: '/memory', icon: 'memory', label: 'Memory' },
+  { id: '/tools', icon: 'toolbox', label: 'Tools' },
+  { id: '/channels', icon: 'channels', label: 'Channels' },
+  { id: '/logs', icon: 'log', label: 'Logs' },
+  { id: '/workspaces', icon: 'workspaces', label: 'Workspaces' },
+  { id: '/agents', icon: 'agents', label: 'Agents' },
+  { id: '/scheduler', icon: 'scheduler', label: 'Scheduler' },
+  { id: '/model-stats', icon: 'model-stats', label: 'Model Stats' },
+  { id: '/tool-stats', icon: 'tool-stats', label: 'Tool Stats' },
+])
+
+const bottomRailItems: NuiRailItem[] = [
+  { id: '/settings', icon: 'settings', label: 'Settings' },
+  { id: 'tray', icon: 'chevron-down', label: 'Hide to Tray' },
 ]
 
-const adminNavItems = [
-  { to: '/logs', label: 'Logs', icon: FileText },
-  { to: '/workspaces', label: 'Workspaces', icon: FolderKanban },
-  { to: '/agents', label: 'Agents', icon: Bot },
-  { to: '/scheduler', label: 'Scheduler', icon: Clock },
-  { to: '/model-stats', label: 'Model Stats', icon: BarChart3 },
-  { to: '/tool-stats', label: 'Tool Stats', icon: Activity },
-]
+const activeRailId = computed(() => {
+  if (notifOpen.value) return 'notifications'
+  if (route.path === '/' || route.path === '') return 'chat'
+  const entry = [...railItems.value, ...bottomRailItems].find(
+    item => item.id.startsWith('/') && isNavActive(item.id),
+  )
+  return entry?.id
+})
 
-const adminNavOpen = ref(false)
-const adminNavEl = ref<HTMLElement | null>(null)
-const adminNavActive = computed(() => adminNavItems.some(item => isNavActive(item.to)))
+function onRailSelect(id: string) {
+  if (id === 'notifications') {
+    notifOpen.value = !notifOpen.value
+    return
+  }
+  if (id === 'chat') {
+    toggleChatPanel()
+    return
+  }
+  if (id === 'tray') {
+    void hideToTray()
+    return
+  }
+  navigateTo(id)
+}
 
-function onAdminNavPointerDown(e: MouseEvent) {
-  const root = adminNavEl.value
-  if (!root) return
-  if (!root.contains(e.target as Node)) adminNavOpen.value = false
+async function hideToTray() {
+  try { await invoke('hide_to_tray') } catch (e) { console.error('Failed to hide to tray:', e) }
+}
+
+// ═══ Window controls (frameless window — the top bar is the title bar) ═══
+async function minimizeWindow() {
+  try { await getCurrentWindow().minimize() } catch (e) { console.error('minimize failed:', e) }
+}
+async function toggleMaximizeWindow() {
+  try { await getCurrentWindow().toggleMaximize() } catch (e) { console.error('maximize failed:', e) }
+}
+async function closeWindow() {
+  try { await getCurrentWindow().close() } catch (e) { console.error('close failed:', e) }
 }
 
 interface SessionInfo {
@@ -277,11 +218,10 @@ const route = useRoute()
 
 const { currentVersion: appVersion, updateVersion, checking, updating, updateError, applyUpdate } = useAppUpdater()
 
-const updateButtonLabel = computed(() => {
+const updateLabel = computed(() => {
   if (updating.value) return 'Updating…'
-  if (checking.value) return 'Checking…'
-  if (updateVersion.value) return '⭮ Update to v' + updateVersion.value
-  return 'Update'
+  if (updateVersion.value) return 'Update to v' + updateVersion.value
+  return undefined
 })
 const updateTooltip = computed(() => {
   if (updateError.value) return 'Update failed: ' + updateError.value + ' — click to retry'
@@ -295,24 +235,65 @@ const apiKeySet = ref(false)
 const showOnboarding = ref(false)
 const ONBOARDING_KEY = 'nanna.onboarding.done'
 const showWorkspacePicker = ref(false)
-const chatPanelOpen = ref(false)
+const chatPanelOpen = ref(true)
 
 const openWorkspaces = ref<WorkspaceInfo[]>([])
+const allWorkspaces = ref<WorkspaceInfo[]>([])
 const currentTab = ref<Tab>({ type: 'global' })
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 let unlistenCloseRequested: UnlistenFn | null = null
 let unlistenSessionsCleared: UnlistenFn | null = null
 let unlistenSessionRenamed: UnlistenFn | null = null
+let unlistenWorkspacesChanged: UnlistenFn | null = null
 
 function isNavActive(path: string) {
   return route.path === path || (path !== '/' && route.path.startsWith(path))
 }
 
 function toggleChatPanel() {
-  chatPanelOpen.value = !chatPanelOpen.value
-  if (chatPanelOpen.value && route.path !== '/') {
+  if (route.path !== '/') {
+    // Not on chat: go there with the panel open.
+    chatPanelOpen.value = true
     navigateTo('/')
+    return
+  }
+  chatPanelOpen.value = !chatPanelOpen.value
+}
+
+// ═══ Workspace select (top bar) ═══
+const GLOBAL_TAB = 'global'
+const OPEN_WORKSPACE = '::open'
+const MANAGE_WORKSPACES = '::manage'
+
+const workspaceSelectValue = computed(() =>
+  currentTab.value?.type === 'workspace' ? (currentTab.value.workspaceId ?? GLOBAL_TAB) : GLOBAL_TAB,
+)
+
+const workspaceOptions = computed(() => [
+  { value: GLOBAL_TAB, label: 'Global — all chats' },
+  ...allWorkspaces.value.map(ws => ({ value: ws.id, label: ws.name || ws.path })),
+  { value: OPEN_WORKSPACE, label: 'Open Workspace…' },
+  { value: MANAGE_WORKSPACES, label: 'Manage Workspaces' },
+])
+
+function onWorkspaceSelect(value: string) {
+  if (value === OPEN_WORKSPACE) {
+    showWorkspacePicker.value = true
+    return
+  }
+  if (value === MANAGE_WORKSPACES) {
+    navigateTo('/workspaces')
+    return
+  }
+  if (value === GLOBAL_TAB) {
+    selectTab({ type: 'global' })
+    return
+  }
+  const ws = allWorkspaces.value.find(w => w.id === value)
+  if (ws) {
+    addWorkspaceTab(ws)
+    selectTab({ type: 'workspace', workspaceId: ws.id })
   }
 }
 
@@ -361,32 +342,9 @@ provide('closeWorkspaceTab', closeWorkspaceTab)
 provide('showWorkspacePicker', showWorkspacePicker)
 
 const { checkPermission } = useNotifications()
-const { init: initBackend, status: backendStatus, daemonVersion, isDaemon, label: backendLabel } = useBackend()
+const { init: initBackend, status: backendStatus, daemonVersion } = useBackend()
 const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
 
-// App and daemon versions are two different things and only look like one.
-// `appVersion` is this window's build; `daemonVersion` is what the process on
-// the other end of the socket reports about itself. Showing a single number
-// when they disagree is how a stale daemon hides — so when they differ, both
-// are named. When they match, one number says it.
-const versionLabel = computed(() => {
-  if (!appVersion.value) return ''
-  const daemon = daemonVersion.value
-  if (!daemon || daemon === appVersion.value) return `v${appVersion.value}`
-  return `v${appVersion.value} · daemon v${daemon}`
-})
-const versionTooltip = computed(() => {
-  const app = appVersion.value ? `App v${appVersion.value}` : 'App version unknown'
-  if (!daemonVersion.value) {
-    return backendStatus.value?.connected
-      ? `${app}\nDaemon version unavailable`
-      : `${app}\nNo daemon connected`
-  }
-  const daemon = `Daemon v${daemonVersion.value}`
-  return daemonVersion.value === appVersion.value
-    ? `${app}\n${daemon} (same build)`
-    : `${app}\n${daemon}\nVersions differ — the daemon is a different build than this window.`
-})
 const { bind: bindShortcut } = useShortcuts()
 const { open: paletteOpen, toggle: togglePalette, hide: hidePalette } = useCommandPalette()
 const { info: toastInfo } = useToast()
@@ -415,7 +373,6 @@ async function onPaletteRun(action: PaletteAction) {
   hidePalette()
   if (action.href) {
     await navigateTo(action.href)
-    if (action.href !== '/') chatPanelOpen.value = false
     return
   }
   const act = action.action
@@ -443,7 +400,6 @@ async function onPaletteRun(action: PaletteAction) {
   }
   if (act === 'open-settings-models') {
     await navigateTo('/settings?tab=models')
-    chatPanelOpen.value = false
     return
   }
   if (act === 'toggle-live-logs') {
@@ -532,7 +488,6 @@ onMounted(async () => {
       document.documentElement.classList.add('density-compact')
     }
   } catch { /* ignore */ }
-  document.addEventListener('pointerdown', onAdminNavPointerDown)
   const mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   loadTabsFromStorage()
@@ -559,6 +514,12 @@ onMounted(async () => {
     const idx = sessions.value.findIndex(s => s.id === id)
     if (idx !== -1) sessions.value[idx] = { ...sessions.value[idx], name }
   })
+  // The daemon owns workspace registration, so anything registered while this
+  // window is open — by a script, a harness, or another client — must show up
+  // in the select without a restart.
+  unlistenWorkspacesChanged = await listen('workspaces-changed', () => {
+    void loadOpenWorkspaces()
+  })
 
   // Named `appWindow`, not `window` — shadowing the global inside an async mount hook is a trap.
   const appWindow = getCurrentWindow()
@@ -572,11 +533,11 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  document.removeEventListener('pointerdown', onAdminNavPointerDown)
   unlistenTrayNewChat?.()
   unlistenCloseRequested?.()
   unlistenSessionsCleared?.()
   unlistenSessionRenamed?.()
+  unlistenWorkspacesChanged?.()
 })
 
 watch(() => route.query.session, (newSessionId) => {
@@ -585,9 +546,10 @@ watch(() => route.query.session, (newSessionId) => {
   }
 })
 
-// Close chat panel when navigating away from chat
+// The chat menu lives on the chat route: restore it when arriving, drop it
+// when leaving (the rail's Chat item can still toggle it while on chat).
 watch(() => route.path, (path) => {
-  if (path !== '/' && path !== '') chatPanelOpen.value = false
+  chatPanelOpen.value = (path === '/' || path === '')
 })
 
 watch(currentTab, async () => {
@@ -623,34 +585,35 @@ function saveTabsToStorage() {
 
 async function loadOpenWorkspaces() {
   try {
-    const allWorkspaces = await invoke<WorkspaceInfo[]>('list_workspaces')
+    const registered = await invoke<WorkspaceInfo[]>('list_workspaces')
+    allWorkspaces.value = registered
     const savedIds = openWorkspaces.value.map(w => w.id)
-    
+
     if (savedIds.length > 0) {
       // Restore from localStorage (match IDs with backend)
-      openWorkspaces.value = allWorkspaces.filter(ws => savedIds.includes(ws.id))
+      openWorkspaces.value = registered.filter(ws => savedIds.includes(ws.id))
     } else {
       // No localStorage tabs — restore all registered workspaces from DB
-      openWorkspaces.value = allWorkspaces
+      openWorkspaces.value = registered
     }
-    
+
     // If current tab points to a workspace that no longer exists, fall back to global
     if (currentTab.value?.type === 'workspace') {
       if (!openWorkspaces.value.some(w => w.id === currentTab.value.workspaceId)) {
         currentTab.value = { type: 'global' }
       }
     }
-    
+
     // Auto-select active workspace if no current tab is set and one is active
     if (currentTab.value?.type === 'global') {
-      const activeWs = allWorkspaces.find(ws => ws.active)
+      const activeWs = registered.find(ws => ws.active)
       if (activeWs && openWorkspaces.value.some(w => w.id === activeWs.id)) {
         currentTab.value = { type: 'workspace', workspaceId: activeWs.id }
       }
     }
-    
+
     saveTabsToStorage()
-  } catch (e) { console.error('Failed to load workspaces:', e); openWorkspaces.value = [] }
+  } catch (e) { console.error('Failed to load workspaces:', e); openWorkspaces.value = []; allWorkspaces.value = [] }
 }
 
 async function loadSessions() {
@@ -754,284 +717,4 @@ function onSessionRenamed(updated: SessionInfo) {
   const idx = sessions.value.findIndex(s => s.id === updated.id)
   if (idx !== -1) sessions.value[idx] = updated
 }
-
-async function hideToTray() {
-  try { await invoke('hide_to_tray') } catch (e) { console.error('Failed to hide to tray:', e) }
-}
 </script>
-
-<style scoped>
-/* ═══ Activity Bar ═══ */
-.activity-bar {
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  width: 64px;
-  /* no border, no background — inherits shell gradient */
-}
-
-.activity-logo {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 52px;
-  height: 52px;
-  margin-top: 8px;
-  margin-bottom: 8px;
-}
-
-.activity-nav {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  width: 100%;
-  padding: 0 8px;
-}
-
-.activity-icon {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 40px;
-  border-radius: 8px;
-  color: rgba(196, 205, 214, 0.4);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-  text-decoration: none;
-}
-.activity-icon svg,
-.activity-icon :deep(svg) {
-  width: 20px;
-  height: 20px;
-}
-.activity-icon:hover {
-  color: #c4cdd6;
-  background: rgba(255, 255, 255, 0.04);
-}
-.activity-icon.active {
-  color: #e2e8f0;
-}
-/* Active indicator bar */
-.activity-icon.active::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 6px;
-  bottom: 6px;
-  width: 2px;
-  background: #8b5cf6;
-  border-radius: 0 2px 2px 0;
-}
-
-/* Chat drawer arrow */
-.chat-arrow {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 4px !important;
-  height: 7px !important;
-  opacity: 0.35;
-  transition: transform 0.2s ease, opacity 0.2s ease;
-}
-.activity-icon:hover .chat-arrow {
-  opacity: 0.7;
-}
-.chat-arrow--open {
-  transform: translateY(-50%) rotate(180deg);
-}
-
-.activity-bottom {
-  margin-top: auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  width: 100%;
-  padding: 0 8px 12px;
-}
-
-/* Tooltip */
-.tooltip {
-  position: absolute;
-  left: 100%;
-  top: 50%;
-  transform: translateY(-50%);
-  margin-left: 8px;
-  padding: 4px 10px;
-  background: rgba(15, 23, 42, 0.72);
-  backdrop-filter: blur(20px) saturate(150%);
-  -webkit-backdrop-filter: blur(20px) saturate(150%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #e2e8f0;
-  font-size: 12px;
-  white-space: nowrap;
-  border-radius: 4px;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-  z-index: 100;
-}
-.activity-icon:hover .tooltip {
-  opacity: 1;
-}
-
-/* ═══ Chat Panel (secondary slide-out) ═══ */
-.chat-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  /* borderless — no background, no border, inherits shell gradient */
-}
-
-.panel-icon-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  border: none;
-  background: transparent;
-  color: #c4cdd6;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-.panel-icon-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: #e2e8f0;
-}
-
-/* ═══ Bottom Status Bar ═══ */
-.status-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-  height: 28px;
-  flex-shrink: 0;
-  border: none;
-  font-size: 11px;
-  color: #64748b;
-  background: transparent;
-}
-.status-left, .status-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.status-version {
-  color: #64748b;
-}
-.status-update {
-  padding: 1px 8px;
-  border-radius: 3px;
-  font-size: 10px;
-  border: 1px solid rgba(51, 65, 85, 0.6);
-  background: transparent;
-  color: #64748b;
-  cursor: pointer;
-}
-.status-update:hover:not(:disabled) {
-  border-color: rgba(100, 116, 139, 0.8);
-  color: #94a3b8;
-}
-.status-update-available {
-  border-color: rgba(34, 211, 238, 0.4);
-  background: rgba(34, 211, 238, 0.15);
-  color: #22d3ee;
-}
-.status-update-available:hover:not(:disabled) {
-  background: rgba(34, 211, 238, 0.3);
-  color: #22d3ee;
-}
-.status-update:disabled {
-  opacity: 0.6;
-  cursor: wait;
-}
-.status-badge {
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 10px;
-  background: rgba(51, 65, 85, 0.6);
-  color: #64748b;
-}
-.status-badge-accent {
-  background: rgba(34, 211, 238, 0.15);
-  color: #22d3ee;
-}
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-}
-.dot-ok { background: #34d399; }
-.dot-warn { background: #fbbf24; }
-.dot-err { background: #fb7185; }
-.status-label {
-  color: #94a3b8;
-}
-
-/* Admin overflow flyout */
-.activity-more {
-  position: relative;
-}
-.admin-flyout {
-  position: absolute;
-  left: calc(100% + 8px);
-  bottom: 0;
-  min-width: 168px;
-  padding: 6px;
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.72);
-  backdrop-filter: blur(28px) saturate(150%);
-  -webkit-backdrop-filter: blur(28px) saturate(150%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
-    0 18px 48px -12px rgba(0, 0, 0, 0.55);
-  z-index: 120;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.admin-flyout-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 7px;
-  color: #a6accd;
-  text-decoration: none;
-  font-size: 12.5px;
-  transition: background 0.12s, color 0.12s;
-}
-.admin-flyout-item:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: #e2e8f0;
-}
-.admin-flyout-item.active {
-  color: #e2e8f0;
-  background: rgba(139, 92, 246, 0.14);
-}
-.admin-flyout-icon {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  opacity: 0.85;
-}
-
-/* compact density: tighter activity icons (class on <html>) */
-:global(html.density-compact) .activity-icon {
-  height: 36px;
-}
-:global(html.density-compact) .status-bar {
-  height: 22px;
-}
-</style>
