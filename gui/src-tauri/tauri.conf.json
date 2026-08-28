@@ -4,7 +4,7 @@
   "version": "0.3.11",
   "identifier": "com.nanna.app",
   "build": {
-    "beforeDevCommand": "pnpm build:daemon:debug && pnpm dev",
+    "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:3000",
     "beforeBuildCommand": "pnpm build:daemon && pnpm generate",
     "frontendDist": "../.output/public"
