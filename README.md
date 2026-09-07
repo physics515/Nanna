@@ -296,6 +296,12 @@ pnpm run tauri:build    # Production
 - Node.js 18+
 - pnpm
 
+**Linux:** the workspace builds and its test suite passes on Linux as of 2026-09-07 — before that it
+did not compile there at all (a Windows-only `exec` code path was compiled on every platform, and
+`libc >= 0.2.187` breaks the vendored Python runtime; both are fixed/pinned). The **Tauri GUI on
+Linux is not yet verified** — `cargo build` and `cargo test` are. Building the GUI additionally needs
+WebKitGTK (`webkit2gtk-4.1`) and its development headers.
+
 ---
 
 ## Privacy & Data
