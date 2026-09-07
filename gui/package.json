@@ -65,7 +65,7 @@
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/test-utils": "^2.4.11",
     "happy-dom": "^20.11.8",
-    "postcss": "^8.5.26",
+    "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11",
