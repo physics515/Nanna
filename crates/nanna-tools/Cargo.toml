@@ -45,7 +45,7 @@ lopdf = "0.44"
 
 # Pure Rust OCR (ONNX models via RTen) — Tier 0 embedded OCR
 # rten-imageproc is a transitive dep of ocrs (not used directly)
-ocrs = "0.12"
+ocrs = "0.13"
 rten = { version = "0.24", default-features = false, features = ["rten_format"] }
 
 # Image processing (needed by ocrs for decoding input images)
