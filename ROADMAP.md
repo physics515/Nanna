@@ -1912,9 +1912,17 @@ so neither CI nor any prior run could have caught them:
       and shuts down cleanly — **zero `panicked` lines**. The only errors are Ollama being
       unreachable (it is not installed on this host), which the readiness-wait path handles as
       designed rather than by burning retry budget.
-- [ ] **Nothing yet proves this stays fixed.** CI has no Linux job, so the next Windows-only
-      assumption lands the same way. Add a `cargo check --workspace` Linux runner to
-      `test-compile.yml` (cheap — `check`, not `build`) before trusting the port.
+- [x] **Now enforced in CI.** *(2026-09-07)* `test-compile.yml` gains `compile-tests-linux`, an
+      `ubuntu-latest` mirror of the existing Windows `cargo test --no-run --workspace --exclude
+      nanna-gui --locked`. Both breaks above are plain compile errors, so this job would have caught
+      each on the commit that introduced it. The Windows job stays — its comment's reasoning (only
+      Windows exercises `#[cfg(windows)]`, where the service layer lives) is correct, just
+      one-sided: **a platform gate is only tested by the platform it excludes.** `nanna-gui` stays
+      excluded on Linux too, since the Tauri crate needs WebKitGTK system packages and that would
+      turn a smoke check into a provisioning job.
+- [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
+      `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
+      whether that is worth a job before claiming the desktop app is cross-platform.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
