@@ -60,6 +60,87 @@ const UNIFIED_CRATES: &[UnifiedCrate] = &[
     },
 ];
 
+/// A crate that must NOT be resolved past a known-good version, and why.
+///
+/// This is the mirror image of `UnifiedCrate`: there the danger is two copies,
+/// here it is one copy that is too new. A dependency of ours can require a
+/// version range that includes a release it does not itself compile against —
+/// and cargo will happily pick the newest member of that range.
+struct CeilingCrate {
+    /// Crate name exactly as it appears in `Cargo.lock`.
+    name: &'static str,
+    /// Highest version known to build this workspace, inclusive.
+    version_max: &'static str,
+    /// What breaks above the ceiling.
+    reason: &'static str,
+    /// The concrete command that restores a buildable version.
+    remedy: &'static str,
+    /// The condition under which this entry should be deleted, not renewed.
+    lift_when: &'static str,
+}
+
+/// Crates held below their latest release because a *dependency* cannot build
+/// against the newer one.
+///
+/// As with `UNIFIED_CRATES`, an entry earns its place by having broken a real
+/// build. A ceiling is a liability — it holds back security fixes — so each one
+/// carries the condition that retires it.
+const CEILING_CRATES: &[CeilingCrate] = &[CeilingCrate {
+    name: "libc",
+    version_max: "0.2.186",
+    reason: "libc 0.2.187 corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on linux-gnu \
+             (glibc really does store spawn flags in a `short`). `rustpython-vm 0.5.0` passes that \
+             constant straight into `nix::spawn::PosixSpawnFlags::from_bits_retain`, which nix \
+             types as `c_int` — E0308 at rustpython-vm-0.5.0/src/stdlib/posix.rs:1812. That kills \
+             the `python` feature, and with it the `nanna` binary, on Linux only. Note \
+             `rustpython-stdlib 0.5.0` requires `libc ^0.2.183`, so the buildable window is the \
+             four releases 0.2.183..=0.2.186 — narrow enough that a bare `cargo update` always \
+             lands outside it",
+    remedy: "cargo update -p libc --precise 0.2.186",
+    lift_when: "rustpython publishes any release after 0.5.0 — the fix is upstream already \
+                (RustPython PR #8343 `Fix building against new libc`, merged 2026-07-22), it has \
+                simply never been released",
+}];
+
+/// Compare two dotted numeric versions positionally.
+///
+/// Deliberately not a semver dependency: these are plain `x.y.z` lockfile
+/// versions and this guard stays dependency-free like its sibling parser.
+/// Missing components read as zero, so `1.2` and `1.2.0` compare equal.
+fn version_is_at_most(version: &str, ceiling: &str) -> bool {
+    assert!(!version.is_empty(), "version must be non-empty");
+    assert!(!ceiling.is_empty(), "ceiling must be non-empty");
+
+    let mut left = version.split('.');
+    let mut right = ceiling.split('.');
+    // Bounded: a lockfile version is at most major.minor.patch plus a suffix,
+    // so four components is already one more than can appear.
+    for _ in 0..4 {
+        let (a, b) = (
+            numeric_component(left.next()),
+            numeric_component(right.next()),
+        );
+        if a != b {
+            return a < b;
+        }
+    }
+    true
+}
+
+/// Read one dotted component as a number, ignoring any pre-release suffix.
+///
+/// A missing component is zero; a non-numeric one (e.g. `0-rc1`) contributes
+/// only its leading digits, which is enough to order the releases we pin.
+fn numeric_component(part: Option<&str>) -> u64 {
+    let Some(text) = part else { return 0 };
+    let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+    debug_assert!(
+        digits.len() <= text.len(),
+        "digit prefix cannot exceed the component"
+    );
+    digits.parse().unwrap_or(0)
+}
+
 /// Locate the workspace `Cargo.lock` starting from this crate's manifest dir.
 fn workspace_lockfile() -> PathBuf {
     // CARGO_MANIFEST_DIR = <root>/crates/nanna-storage → up two levels.
@@ -204,4 +285,75 @@ version = \"0.10.0\"
         versions.contains(&"0.10.0"),
         "the offending copy must be visible: {versions:?}"
     );
+}
+
+#[test]
+fn held_back_crates_stay_below_their_ceiling() {
+    let lockfile = workspace_lockfile();
+    let contents = std::fs::read_to_string(&lockfile)
+        .unwrap_or_else(|e| panic!("cannot read {lockfile:?}: {e}"));
+    let packages = resolved_packages(&contents);
+    assert!(
+        !packages.is_empty(),
+        "parsed zero packages from {lockfile:?} — lockfile format changed?"
+    );
+
+    for guarded in CEILING_CRATES {
+        let versions: Vec<&str> = packages
+            .iter()
+            .filter(|(name, _)| *name == guarded.name)
+            .map(|(_, version)| *version)
+            .collect();
+
+        // Same reasoning as the unification guard: a ceiling on a crate that
+        // left the graph can never fire, so make its removal deliberate.
+        assert!(
+            !versions.is_empty(),
+            "`{}` is no longer in the dependency graph — delete its CEILING_CRATES entry \
+             in this test rather than leaving a guard that can never fire",
+            guarded.name,
+        );
+
+        for version in &versions {
+            assert!(
+                version_is_at_most(version, guarded.version_max),
+                "`{}` resolved to {} but must stay at or below {}.\n  why: {}\n  fix: {}\n  \
+                 lift this ceiling when: {}",
+                guarded.name,
+                version,
+                guarded.version_max,
+                guarded.reason,
+                guarded.remedy,
+                guarded.lift_when,
+            );
+        }
+    }
+}
+
+#[test]
+fn version_comparison_orders_releases_and_respects_the_boundary() {
+    // Positive space: at or below the ceiling.
+    assert!(version_is_at_most("0.2.186", "0.2.186"), "equal is allowed");
+    assert!(version_is_at_most("0.2.183", "0.2.186"), "older patch");
+    assert!(version_is_at_most("0.1.999", "0.2.186"), "older minor");
+
+    // Negative space: the exact release that broke the build must be rejected,
+    // and numeric (not lexicographic) ordering must be used — "0.2.9" would sort
+    // ABOVE "0.2.186" as text.
+    assert!(
+        !version_is_at_most("0.2.187", "0.2.186"),
+        "the breaking release must fail the guard"
+    );
+    assert!(
+        !version_is_at_most("0.2.189", "0.2.186"),
+        "current latest must fail the guard"
+    );
+    assert!(
+        version_is_at_most("0.2.9", "0.2.186"),
+        "components compare numerically, not as text"
+    );
+    assert!(!version_is_at_most("1.0.0", "0.2.186"), "newer major");
+
+    // Missing components read as zero, so a two-part version is comparable.
+    assert!(version_is_at_most("0.2", "0.2.0"), "0.2 == 0.2.0");
 }

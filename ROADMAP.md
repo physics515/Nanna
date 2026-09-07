@@ -5236,6 +5236,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `cargo update -p libc --precise 0.2.186`. The buildable window is only
      **0.2.183..=0.2.186** — `rustpython-stdlib 0.5.0` itself requires `libc ^0.2.183` — so a bare
      `cargo update` always lands outside it.
+     - [x] *(2026-09-07)* **Enforced, not remembered.** `held_back_crates_stay_below_their_ceiling`
+           in `crates/nanna-storage/tests/dep_version_unification.rs` asserts a version **ceiling**
+           (the mirror of the existing single-version guard) and prints the remedy plus the exact
+           condition that retires the pin. Verified it fires: re-running
+           `cargo update -p libc --precise 0.2.189` makes it report
+           `libc resolved to 0.2.189 but must stay at or below 0.2.186`. Runs in 0.00s.
      - [ ] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
            already upstream, so this is a release-watch, not a migration.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
