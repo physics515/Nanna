@@ -1,106 +1,74 @@
-# Nanna v0.3.11-beta.20 — True in the Code, False in the World
+# Nanna v0.3.13-beta.22 — It Never Built Here
 
-Five fixes, two of which no test could have caught because the code was self-consistent and wrong
-about the outside world. The other three turn standing "remember to do X" notes into checks that
-fail in milliseconds.
+The project moved to Linux in September. This release is the discovery that it had never actually
+compiled there — and the two-line class of mistake that hid it.
 
 ## What's New
 
-### Scheduled work reached a model that no longer exists (this release)
+### The workspace did not build on Linux at all
 
-Every install that had never configured `llm.model_priority` sent its scheduled heartbeat to
-**`claude-sonnet-4-20250514`**, a retired model snapshot, and got a `404 not_found_error` back. The
-daemon reported itself healthy throughout — the failure was logged at `WARN` and swallowed, so the
-only visible symptom was that scheduled work silently never happened.
+`origin/master` was red on Linux before this branch touched anything. Not "had warnings", not "failed
+a test" — `cargo build --workspace` did not produce a binary. Two independent causes, both invisible
+from Windows, and neither one reachable by any amount of testing on the platform CI runs:
 
-The shipped default is now **`claude-sonnet-5`**, the live same-tier alias. Six defaults carried the
-dead id (`nanna-config`, `nanna-core` ×2, `nanna-agent`, `nanna-llm`, `nanna-server`) and all six
-moved together.
+**1. A runtime `cfg!` where a compile-time `#[cfg]` was meant.** The `exec` tool picks its shell with
 
-The general lesson is in the fix, not the id. Anthropic publishes an **undated family alias** that
-tracks the live model and a **dated snapshot** pinned to one release and retired on a schedule. A
-dated *default* ships with an expiry date built into it. Pinning a snapshot is a perfectly good
-choice for a user to make in their own config — it is not a good default for the product to ship, and
-a new test refuses to let one become the default again.
+```rust
+let mut cmd = if cfg!(windows) { /* Git Bash / PowerShell routing */ } else { /* sh */ };
+```
 
-Verified on the real binary, not argued: booting the release daemon against a scratch config went
-from `3 ×` `API error: 404` and `2 ×` "All models exhausted" to **zero of each**, with a completed
-run — `model=claude-sonnet-5, duration_s=5, tool_calls=2, faults_healed=0`.
+`cfg!(windows)` is a *boolean expression*, not conditional compilation. It selects the right branch at
+runtime, so the behaviour was always correct — but **both arms are still type-checked on every
+platform**, and the four helpers the Windows arm calls (`strip_outer_quotes`, `classify_windows_command`,
+`git_bash_path`, `WinShell`) are `#[cfg(windows)]` and simply do not exist on Linux. Five
+`E0425`/`E0433` errors, and `nanna-scripting` — hence the `nanna` binary — could not compile.
 
-**If you have a model pinned in your own config, nothing changes for you.** This only affects installs
-running on the built-in default.
+Split into `#[cfg(windows)]` / `#[cfg(not(windows))]` bindings so the Windows arm is compiled out.
+**Nothing changes on Windows:** the same branch is chosen, just earlier. Net −7/+5 lines.
 
-### Steering no longer looks like breakage after a reload
+**2. `libc 0.2.187` broke the vendored Python runtime.** libc corrected `POSIX_SPAWN_SETSID` from
+`c_int` to `c_short` on linux-gnu — correctly, since glibc really does store spawn flags in a
+`short`. But `rustpython-vm 0.5.0` hands that constant straight to
+`nix::spawn::PosixSpawnFlags::from_bits_retain`, which `nix` types as `c_int`. E0308, and the `python`
+feature stops building.
 
-When the zero-information breaker answers a repeated tool call itself, the timeline renders it as
-*steering* — the tool never ran, so nothing failed. That was true only while the run was live. A
-timeline **rebuilt after navigating away and back** showed the same calls as a wall of red tool
-errors, because the run journal recorded the outcome (`success: false`) without recording *why*.
+The fix is already upstream — RustPython PR #8343, merged 2026-07-22 — and has never been released;
+0.5.0 is still the newest crates.io version. So `libc` is held at **0.2.186**. That window is narrower
+than it looks: `rustpython-stdlib 0.5.0` itself requires `libc ^0.2.183`, leaving exactly four usable
+releases, which is why a plain `cargo update` lands outside it every single time.
 
-The journal now carries the replay marker beside the outcome, so a restored timeline reads the same
-as the live one. The marker is additive on the wire: journals written before this release load
-unchanged.
+### A pin that can no longer be forgotten
 
-Also fixed one layer down — a trimmed replay in a crash-recovery checkpoint used to be labelled
-"the call failed". It now says the tool never ran.
-
-### A panic under the journal lock could take the rest of the run with it
-
-The two writers to a run's journal disagreed about what a poisoned mutex means. The chat path had
-always treated poisoning as survivable, with a stated reason: a panicking thread must not erase the
-run's record. The **harness** path — writing to the very same journal — panicked instead, at five
-places.
-
-So one panic anywhere under that lock turned every later text delta, tool call and step of that run
-into another panic, inside a spawned turn where a panic is invisible and the run simply stops. That
-is the shape of a bug that once read as a mysterious wedge for a day. Both writers now share one
-policy, and a test poisons the lock from a real panicking thread to prove the record survives and
-later writes still land.
-
-### Memory: the forgetting curve's decay constant was off by one slot
-
-The FSRS decay exponent was `0.0658`, believed to be FSRS-6's published default. It is
-FSRS-6's **`w[19]`**. The decay is `w[20]` = **`0.1542`** — confirmed against the reference
-implementation, which also clamps that parameter to `0.1..=0.8`, a range the old value sat *below*.
-No fitted parameter set could have contained it.
-
-The correction is deliberately gated so it cannot re-break what the previous fix bought: the
-retention harness now measures aged recall at **all three** exponents the default has held and
-asserts the corrected value recalls exactly as much as the misread one — not merely "enough". At the
-practical extreme (800-day-old memories) both clear the recall gate comfortably; what actually
-differs is which consolidation band an aged memory lands in, which is why matching the published
-curve is the whole point.
+The `libc` ceiling is the third dependency constraint in this repo that existed only as a note saying
+"remember to redo this after `cargo update`". The other two became a test in August; this one joins
+them now. `held_back_crates_stay_below_their_ceiling` asserts a version **ceiling** — the mirror of the
+existing single-version guard — and its failure message carries the remedy command *and* the condition
+that retires the pin, so the ceiling gets removed on purpose rather than renewed forever. It runs in
+0.00s and was verified against the real regression, not just written.
 
 ### Dependency freshness
 
-`uuid 1.26`, `which 8.0.6`, the tiptap suite at `3.30.5`, `vue 3.5.42`, `happy-dom 20.11.8`, and the
-Rust toolchain moved to `nightly-2026-08-27`. TypeScript 7 was attempted and reverted for the third
-time — `vue-tsc` cannot run on it until TypeScript 7.1 exposes a programmatic compiler API, which is
-an upstream constraint affecting Vue, Angular and ESLint alike.
+`ocrs 0.13.0` finally shipped against `rten 0.26`, unblocking a pin that three previous runs recorded
+as "not ours to fix" — `rten 0.24 → 0.26` with zero source changes. Plus the routine sweep: `wide 1.7`,
+`playwright-rs 0.17`, `deno_core 0.411`, and on the frontend `@tiptap/* 3.31.3`, `vitest 5`,
+`@lucide/vue 1.42`, `vue-router 5.3.1`, `@playwright/test 1.63` and the Tauri plugins.
 
-Two dependency pins that previously lived only as a note ("remember to redo this after every
-update") are now enforced by a test that runs in **0.00 seconds** and prints the exact fix command.
-It was verified against the real regression rather than assumed.
+## Verified
 
-## Fixed
+On Linux, after the fixes: `cargo build --workspace --exclude nanna-gui` green ·
+`cargo test --workspace --exclude nanna-gui` **1683 passed / 0 failed / 12 ignored** across 47 test
+binaries · `cargo clippy --workspace --all-targets --exclude nanna-gui` **0 errors**, no new warnings
+in the changed regions · frontend `vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green.
 
-- Scheduled heartbeats failing with `404` on every unconfigured install.
-- Breaker replays rendering as tool failures in any timeline restored after a reload.
-- A single panic under the run-journal lock cascading into a stalled run.
-- FSRS forgetting-curve decay using `w[19]` where `w[20]` was meant.
-- A crash-recovery checkpoint describing a trimmed replay as a failed call.
+The built Linux daemon was booted against a scratch config (never the operator's): it reaches
+`Daemon ready`, serves IPC and health, answers `GET /health` with
+`{"status":"ok","version":"0.3.11","uptime_secs":1}`, handles SIGTERM cleanly, and logs **zero
+panics**. The only errors are Ollama being unreachable — it is not installed on this host — which the
+readiness-wait path handles as designed instead of burning retry budget.
 
-## Known / still open
+## Known limits
 
-- **A heartbeat that fails on every attempt is still only a `WARN`**, and the daemon still reports
-  itself healthy while it happens. A model that fails *every* time is a configuration fault, not a
-  transient one, and deserves to surface. Where operator-visible faults belong is not yet decided.
-- The `malachite-bigint` and `rten` version pins remain, both waiting on upstream
-  (`rustpython-codegen` accepting malachite 0.10; `ocrs` moving to `rten 0.25`).
-- TypeScript 7 stays deferred until 7.1 or a tsgo-backed `vue-tsc`.
-
-## Verification
-
-1691 workspace tests green · clippy clean with no new warnings in any changed file · release build
-green on the new toolchain · frontend typecheck clean with 237 tests · release daemon booted against
-a scratch config with a before/after log diff proving the model fix.
+- **The Tauri GUI on Linux is still unverified.** `cargo build` and `cargo test` are green; the desktop
+  app is not part of that claim.
+- **CI has no Linux job**, so nothing yet stops the next Windows-only assumption from landing the same
+  way. That is filed, not fixed.

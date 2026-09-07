@@ -1923,6 +1923,14 @@ so neither CI nor any prior run could have caught them:
 - [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
       `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
       whether that is worth a job before claiming the desktop app is cross-platform.
+- [ ] **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
+      baseline.** The 2026-09-07 run measured `simd_batch` at **0.040 / 0.869 / 5.20 ms** for
+      N = 1k/10k/50k — comfortably inside the ≤0.20 / ≤5.0 / ≤25 ms budgets and *below* the recorded
+      p95s, which is a sound pass (it held under a load average of 112 with a second Rust build
+      running, so contention can only have hurt it). It is **not** a new baseline and was
+      deliberately not written into `bench/BASELINE.md`: the recorded numbers are Windows, these are
+      Linux, and the machine was saturated — three uncontrolled variables at once. Re-run quiet
+      before claiming any of it as an improvement or attributing it to `wide 1.7`.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
