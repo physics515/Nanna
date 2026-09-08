@@ -146,6 +146,13 @@ impl Storage {
         MemoryRepository::new(self.conn.clone())
     }
 
+    /// The episodic stream beneath [`Self::memories`] — raw events on a
+    /// wall-clock axis, append-only.
+    #[must_use]
+    pub fn memory_events(&self) -> MemoryEventRepository {
+        MemoryEventRepository::new(self.conn.clone())
+    }
+
     #[must_use] 
     pub fn config_store(&self) -> ConfigRepository {
         ConfigRepository::new(self.conn.clone())

@@ -6,7 +6,7 @@ description = "JavaScript/TypeScript scripting engine for Nanna tools"
 
 [features]
 default = ["boa"]
-boa = ["boa_engine", "boa_runtime"]
+boa = ["boa_engine"]
 deno = ["deno_core", "deno_ast", "deno_error"]
 python = ["rustpython-vm", "rustpython-stdlib", "rustpython-pylib", "malachite-bigint"]
 full = ["boa", "deno"]
@@ -30,13 +30,13 @@ directories.workspace = true
 nanna-proc = { path = "../nanna-proc" }
 
 # Boa - Pure Rust JS engine (lightweight)
-# Git-pinned past the 0.21.1 release: released boa pins icu ~2.0 and an older
-# temporal_capi, both of which conflict with deno_core 0.407 (v8 149 needs
-# temporal_capi ^0.2.3) and turso 0.6+ (icu 2.2). Boa main tracks current
-# icu/temporal. Pin an exact rev for reproducibility; drop back to crates.io
-# once boa releases with icu 2.2 / temporal_capi 0.2.3+.
-boa_engine = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1c5923153f8c7e1beda3a891bfe", optional = true }
-boa_runtime = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1c5923153f8c7e1beda3a891bfe", optional = true }
+# Back on crates.io as of 0.22.0 (2026-08-28), which retires the git pin this
+# dep carried since 2026-07-10. The pin existed because the then-latest release
+# (0.21.1) held icu ~2.0 against a tree on icu 2.2; 0.22.0 requires icu ~2.3
+# and pulls the whole tree forward to a single 2.3.x, so the conflict is gone
+# in the other direction. boa_runtime was dropped at the same time: it was an
+# optional dep that no source file has ever referenced.
+boa_engine = { version = "0.22", optional = true }
 
 # Deno - V8-based (full featured fallback)
 deno_core = { version = "0.411", optional = true }

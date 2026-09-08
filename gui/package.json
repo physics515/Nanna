@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.13",
+  "version": "0.3.15",
   "type": "module",
   "private": true,
   "scripts": {
@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
-    "@lucide/vue": "^1.42.0",
+    "@lucide/vue": "^1.43.0",
     "@monaco-editor/loader": "^1.7.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
@@ -46,7 +46,7 @@
     "@vueuse/core": "^14.4.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "marked": "^18.0.11",
+    "marked": "^18.0.12",
     "monaco-editor": "^0.56.0",
     "nuxt": "^4.5.2",
     "radix-vue": "^1.9.17",

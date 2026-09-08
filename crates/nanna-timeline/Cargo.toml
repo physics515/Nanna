@@ -1,0 +1,15 @@
+[package]
+name = "nanna-timeline"
+version.workspace = true
+edition.workspace = true
+description = "Episodic event timeline for Nanna memory"
+
+[dependencies]
+nanna-storage = { path = "../nanna-storage" }
+
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -76,7 +76,7 @@ tempfile = "3"
 # Test-only: builds a real multi-page PDF in memory so the `pdf.read`
 # service is proven against a parsed document rather than a fixture blob.
 # Same version nanna-tools already resolves, so it adds no graph entry.
-lopdf = "0.44"
+lopdf = "0.45"
 
 # Platform services
 [target.'cfg(windows)'.dependencies]

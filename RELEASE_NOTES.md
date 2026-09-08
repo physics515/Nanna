@@ -1,74 +1,94 @@
-# Nanna v0.3.13-beta.22 — It Never Built Here
+# Nanna v0.3.15-beta.24 — The Log Underneath the Facts
 
-The project moved to Linux in September. This release is the discovery that it had never actually
-compiled there — and the two-line class of mistake that hid it.
+Memory has had one layer for a long time: facts, FSRS-weighted, never expiring. This release adds the
+layer underneath it — the raw episodic stream of what actually happened, on a wall-clock axis — and
+retires a dependency pin that has been in the tree since July.
 
 ## What's New
 
-### The workspace did not build on Linux at all
+### An append-only episodic timeline
 
-`origin/master` was red on Linux before this branch touched anything. Not "had warnings", not "failed
-a test" — `cargo build --workspace` did not produce a binary. Two independent causes, both invisible
-from Windows, and neither one reachable by any amount of testing on the platform CI runs:
+`memories` answers *what is true*. It cannot answer *what happened, and when*, because a fact is the
+residue of many episodes and has no single timestamp. `MIGRATION_014` adds `memory_events`: messages,
+tool calls, recalls and outcomes as they occur, each stamped in Unix milliseconds, with a nullable
+embedding and a normalized salience. `nanna-storage` gains an append-only `MemoryEventRepository`, and
+a new **`nanna-timeline`** crate owns the policy — the closed `EventKind` set, the caps, and the
+`Timeline` facade.
 
-**1. A runtime `cfg!` where a compile-time `#[cfg]` was meant.** The `exec` tool picks its shell with
+Four properties are enforced rather than assumed, and each exists for a phase that comes later:
 
-```rust
-let mut cmd = if cfg!(windows) { /* Git Bash / PowerShell routing */ } else { /* sh */ };
+- **Integer timestamps.** Every consumer of this table is arithmetic — resample into a series,
+  decimate a window, detect a peak. Text timestamps would mean parsing on every sample.
+- **Half-open windows `[start, end)`.** Adjacent windows tile the axis exactly once, so a resampler
+  stepping bucket to bucket cannot double-count an event that lands on a boundary.
+- **Truncation is recorded, not just performed.** `content_len_chars` stores the length *before* the
+  8192-character cap, so a shortened episode is detectable by comparison rather than by a flag nobody
+  sets. The cut is character-wise, never byte-wise — there is a test that caps 8202 em dashes,
+  because byte-slicing arbitrary text at a fixed offset is the exact mistake that has panicked this
+  codebase twice.
+- **Append is idempotent on `event_id`.** A channel retrying a message cannot inflate the timeline.
+
+Nothing writes to this log yet; wiring the producers is a separate change.
+
+### A migration bug caught before it shipped, and closed for good
+
+`Storage::migrate` executes a migration with `sql.split(';')` — a splitter that does not know what a
+comment is. A semicolon inside a `--` comment therefore cuts the statement *around* it in half and
+hands the database two fragments. Migration 014 hit this while being written:
+
+```sql
+embedding BLOB,               -- f32 little-endian; NULL until embedded
 ```
 
-`cfg!(windows)` is a *boolean expression*, not conditional compilation. It selects the right branch at
-runtime, so the behaviour was always correct — but **both arms are still type-checked on every
-platform**, and the four helpers the Windows arm calls (`strip_outer_quotes`, `classify_windows_command`,
-`git_bash_path`, `WinShell`) are `#[cfg(windows)]` and simply do not exist on Linux. Five
-`E0425`/`E0433` errors, and `nanna-scripting` — hence the `nanna` binary — could not compile.
+That comment split the `CREATE TABLE` at the preceding comma. The failure would have been invisible
+until someone opened a **fresh** database, because every existing install already has the table —
+so it would have shipped as "works for me" and broken only new installs.
 
-Split into `#[cfg(windows)]` / `#[cfg(not(windows))]` bindings so the Windows arm is compiled out.
-**Nothing changes on Windows:** the same branch is chosen, just earlier. Net −7/+5 lines.
+Three unit tests now assert the property across all 14 migrations: no semicolon inside a comment, no
+comment-only chunk reaching `conn.execute`, and unique names in applied order. The 13 pre-existing
+migrations were audited and are clean, so this is a trap closed before it was ever sprung.
 
-**2. `libc 0.2.187` broke the vendored Python runtime.** libc corrected `POSIX_SPAWN_SETSID` from
-`c_int` to `c_short` on linux-gnu — correctly, since glibc really does store spawn flags in a
-`short`. But `rustpython-vm 0.5.0` hands that constant straight to
-`nix::spawn::PosixSpawnFlags::from_bits_retain`, which `nix` types as `c_int`. E0308, and the `python`
-feature stops building.
+### The boa git pin is gone
 
-The fix is already upstream — RustPython PR #8343, merged 2026-07-22 — and has never been released;
-0.5.0 is still the newest crates.io version. So `libc` is held at **0.2.186**. That window is narrower
-than it looks: `rustpython-stdlib 0.5.0` itself requires `libc ^0.2.183`, leaving exactly four usable
-releases, which is why a plain `cargo update` lands outside it every single time.
+`boa_engine`/`boa_runtime` have been pinned to a git revision of boa `main` since 2026-07-10, because
+the then-current release (0.21.1) held `icu ~2.0` against a tree on icu 2.2. **`boa_engine 0.22.0`
+shipped on 2026-08-28** — newer than the pinned revision, so returning to crates.io moves forward, not
+back. It requires `icu ~2.3` and pulls the whole tree there: all 15 `icu*` crates resolve to a single
+2.3.x, with no split anywhere.
 
-### A pin that can no longer be forgotten
-
-The `libc` ceiling is the third dependency constraint in this repo that existed only as a note saying
-"remember to redo this after `cargo update`". The other two became a test in August; this one joins
-them now. `held_back_crates_stay_below_their_ceiling` asserts a version **ceiling** — the mirror of the
-existing single-version guard — and its failure message carries the remedy command *and* the condition
-that retires the pin, so the ceiling gets removed on purpose rather than renewed forever. It runs in
-0.00s and was verified against the real regression, not just written.
+`boa_runtime` was dropped at the same time. It was an optional dependency that **no source file has
+ever referenced** — the same dead-weight class as the `swc_core` removal before it.
 
 ### Dependency freshness
 
-`ocrs 0.13.0` finally shipped against `rten 0.26`, unblocking a pin that three previous runs recorded
-as "not ours to fix" — `rten 0.24 → 0.26` with zero source changes. Plus the routine sweep: `wide 1.7`,
-`playwright-rs 0.17`, `deno_core 0.411`, and on the frontend `@tiptap/* 3.31.3`, `vitest 5`,
-`@lucide/vue 1.42`, `vue-router 5.3.1`, `@playwright/test 1.63` and the Tauri plugins.
+`lopdf 0.44 → 0.45`, plus the routine sweep (`bon 3.10.1`, `serde_with 3.23.0`) and on the frontend
+`marked 18.0.12` and `@lucide/vue 1.43.0`. Both documented lockfile landmines fired exactly as
+recorded and were re-pinned: `libc` back to 0.2.186 (RustPython 0.5.0 still needs the ceiling) and
+`malachite-bigint` back to 0.9.2. The guard tests reported each in 0.00s rather than twenty minutes
+into a release build, which is what they were written for.
+
+One trap worth naming: `cargo upgrade` reported `lopdf → 0.42.0` for one crate and `→ 0.45.0` for
+another **in the same table** — a stale registry-index read, not two different requirements. Never
+take a `cargo-upgrade` row without checking the crate's real version list.
 
 ## Verified
 
-On Linux, after the fixes: `cargo build --workspace --exclude nanna-gui` green ·
-`cargo test --workspace --exclude nanna-gui` **1683 passed / 0 failed / 12 ignored** across 47 test
-binaries · `cargo clippy --workspace --all-targets --exclude nanna-gui` **0 errors**, no new warnings
-in the changed regions · frontend `vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green.
+`cargo check --workspace --exclude nanna-gui --all-targets` clean ·
+`cargo test --workspace --exclude nanna-gui` **1722 passed / 0 failed / 12 ignored** across 69 test
+binaries, doctests included · `cargo clippy` **0 errors**, and the new `nanna-timeline` crate is
+warning-clean under `pedantic` + `nursery` · rustfmt clean on every new file · frontend
+`vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green with 4 routes prerendered.
 
-The built Linux daemon was booted against a scratch config (never the operator's): it reaches
-`Daemon ready`, serves IPC and health, answers `GET /health` with
-`{"status":"ok","version":"0.3.11","uptime_secs":1}`, handles SIGTERM cleanly, and logs **zero
-panics**. The only errors are Ollama being unreachable — it is not installed on this host — which the
-readiness-wait path handles as designed instead of burning retry budget.
+The 16 new timeline tests include `migration_014_creates_a_usable_event_log`, which opens a **fresh**
+database — the exact case the comment-splitting bug above would have broken, and the one an existing
+install can never exercise.
 
 ## Known limits
 
-- **The Tauri GUI on Linux is still unverified.** `cargo build` and `cargo test` are green; the desktop
-  app is not part of that claim.
-- **CI has no Linux job**, so nothing yet stops the next Windows-only assumption from landing the same
-  way. That is filed, not fixed.
+- **The Tauri GUI is unverified, and on this host it cannot be verified.** `webkit2gtk-4.1` is
+  installed but Arch's package ships no `WebKitWebDriver` binary at all, and Arch has no
+  `webkit2gtk-driver` package — so `tauri-driver` cannot start. The fix is a WebKitGTK source build,
+  not a package install. Filed with the evidence.
+- **Nothing produces timeline events yet.** The store, its bounds and its tests are real; the
+  producers are not wired.
+- The toolchain pin was not re-tested against the current nightly this cycle.
