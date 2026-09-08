@@ -112,7 +112,7 @@ jobs:
       # A release build is rare and dominated by cargo compile time, so the
       # cache buys almost nothing and costs a failure mode that only shows up
       # after everything expensive has already succeeded.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -194,7 +194,7 @@ jobs:
       # A release build is rare and dominated by cargo compile time, so the
       # cache buys almost nothing and costs a failure mode that only shows up
       # after everything expensive has already succeeded.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -261,7 +261,7 @@ jobs:
       # A release build is rare and dominated by cargo compile time, so the
       # cache buys almost nothing and costs a failure mode that only shows up
       # after everything expensive has already succeeded.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
