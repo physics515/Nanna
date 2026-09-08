@@ -1009,6 +1009,24 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `gui/e2e/tauri-driver.md` (launch → Settings → Logs → close hygiene). Soft-skips when binary/driver missing
       so web CI stays hermetic; armed via `NANNA_TAURI_E2E=1` once a packaged binary is present. Wire full
       WebDriverIO session when nightly hosts a display + driver pair.
+- [ ] *(measured 2026-09-08)* **GUI WebDriver verification is unavailable on the Linux host, and
+      NOT because a package is merely uninstalled.** The routine's own host notes say
+      `WebKitWebDriver` arrives with `pacman -S webkit2gtk-4.1`. That is wrong for Arch:
+      **`webkit2gtk-4.1` 2.52.6-1 IS installed** here and its 416-file manifest ships
+      `MiniBrowser`, `WebKitGPUProcess`, `WebKitNetworkProcess`, `WebKitWebProcess` and `jsc` — and
+      **no `WebKitWebDriver` at all** (`pacman -Ql webkit2gtk-4.1 | grep -i driver` is empty; the
+      binary exists nowhere on the filesystem). Arch has no `webkit2gtk-driver` package either —
+      the repo carries only `webkit2gtk-4.1` and `webkit2gtk-4.1-docs`. Upstream confirms the gap:
+      unlike Debian's `webkit2gtk-driver`, Arch's packages do not include the WebDriver binary, and
+      the community fix is a
+      [source build](https://gist.github.com/jamesmeneghello/37fc7988ec94edc962969ade428cd710).
+      So the fix is **not** an owner-gated `pacman -S`; it is a WebKitGTK build with
+      `-DENABLE_WEBDRIVER=ON`, or an alternative provider such as
+      [Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver). Until one of
+      those lands, **`tauri-webdriver.sh ensure` cannot pass on this host and no run may claim GUI
+      verification** — headless checks plus "needs on-device verification" is the honest ceiling.
+      `cargo-tauri` and `tauri-driver` are also not installed, but those are `cargo install`-able
+      and are not the blocker.
 - [x] **Critical-path scenarios** *(2026-07-22)* — `e2e/critical-path.spec.ts`: first-run/no-key empty state;
       chat send → stream → Stop (mock LLM); session create/rename/delete/switch; backend disconnect toast +
       reconnect affordance; Settings API-key round-trip; Logs Live/Paused, Clear, Copy all.
@@ -3068,8 +3086,79 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `memory_consolidation` task itself is a separate named arm, so it never self-stamps.)
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
-- [ ] **`nanna-timeline` crate + append-only event log** — `MemoryEvent { id, ts, kind, workspace_id, content, embedding, salience, source_ids }` in a new Turso migration; the raw episodic stream (messages, tool calls, recalls, outcomes) on a wall-clock axis. `MemoryEntry` stays the semantic/fact layer; episodes consolidate *into* facts during dreaming.
+- [x] **`nanna-timeline` crate + append-only event log** — `MemoryEvent { id, ts, kind, workspace_id, content, embedding, salience, source_ids }` in a new Turso migration; the raw episodic stream (messages, tool calls, recalls, outcomes) on a wall-clock axis. `MemoryEntry` stays the semantic/fact layer; episodes consolidate *into* facts during dreaming.
+      *(2026-09-08)* **Landed as the substrate the rest of this section stands on.** `MIGRATION_014`
+      adds `memory_events` (+4 indexes), `nanna-storage` gains `MemoryEventRepository` behind
+      `Storage::memory_events()`, and the new **`nanna-timeline`** crate owns the policy: the closed
+      `EventKind` set, the caps, and the `Timeline` facade. 11 integration tests + 5 unit tests.
+      Four decisions are load-bearing and were made against the phases that come next, not for this
+      one:
+      **`ts_unix_ms` is an integer, not a datetime string.** Every consumer of this table is
+      arithmetic — resample into a series, decimate a window, detect a peak — and text timestamps
+      would mean parsing on every sample.
+      **Windows are half-open `[start, end)`.** Adjacent windows then tile the axis exactly once,
+      so a resampler stepping bucket to bucket cannot double-count an event that lands on a
+      boundary. Tested directly: 4 events across two abutting windows come back 2 and 2.
+      **Truncation is recorded, not just performed.** `content_len_chars` stores the length
+      *before* the 8192-char cap, so a shortened episode is detectable by comparison rather than by
+      a flag nobody sets — the same "announce the truncation" rule the summarizer artifacts follow.
+      The cut is **character-wise, never byte-wise**, and there is a test that caps 8202 em dashes
+      specifically because byte-slicing arbitrary text at a fixed offset is the exact bug that has
+      panicked this codebase twice.
+      **Append is idempotent on `event_id`** (`INSERT OR IGNORE`), so an at-least-once producer —
+      a channel retrying a message — cannot inflate the timeline.
+      Sizing that set the caps: ~200 events/day at ~500 B of content plus a 768-dim f32 embedding
+      is ~3.6 KB/event, ~260 MB/year, of which the **embedding is 85%** — hence a nullable
+      embedding column with a pending index, and a hard `MAX_EVENT_PAGE` of 1000 (~11 MB resident
+      worst case) so a range scan can never quietly become a bulk load.
+      Also: value-range failures **return `StorageError::Invalid` rather than asserting**. This code
+      runs inside the daemon's spawned turns, where a panic does not surface as a failure — it
+      wedges the turn silently, which is how a `&text[..200]` slice once cost a whole benchmark leg.
+      Still open (their own items below): resampling into per-signal series, the DSP compressor, and
+      nothing writes to this log yet — wiring the producers is a separate increment.
+- [x] *(2026-09-08)* **Migration SQL is now checked for the runner's own blind spot.**
+      `Storage::migrate` executes a migration by `sql.split(';')` — a tokenizer that does not know
+      what a comment is — so a semicolon inside a `--` comment cuts the statement *around* it in
+      half and hands the database two fragments. Migration 014 hit this while being written
+      (`embedding BLOB, -- f32 little-endian; NULL until embedded` split the `CREATE TABLE` at the
+      comma), and the failure would have been invisible until a **fresh** database was opened,
+      because every existing install already has the table. Three unit tests in `migrations.rs` now
+      assert the property for all 14 migrations: no semicolon inside a comment, no comment-only
+      chunk reaching `conn.execute`, and unique names in applied order. Audited the 13 pre-existing
+      migrations — all clean, so this is a trap that was closed before it was ever sprung.
+      - [ ] Consider making the runner strip comments before splitting, rather than relying on the
+            test to keep authors out of the trap. Deferred on purpose: it changes how all 14
+            migrations are parsed, so it deserves its own increment with round-trip tests, not a
+            drive-by inside a feature commit.
 - [ ] **Resample the timeline into per-signal series** — salience(t), access-rate(t), emotional valence(t), per-cluster topic-activation(t).
+- [ ] *(research 2026-09-08)* **Give each consolidated fact a validity window instead of
+      overwriting it.** [Beyond Dialogue Time: Temporal Semantic Memory for Personalized LLM
+      Agents](https://arxiv.org/pdf/2601.07468) builds a temporal knowledge graph from the episodic
+      log and consolidates it into *time-aware durative* memory: each fact carries a validity
+      interval, and a contradicting fact **invalidates** the old one rather than replacing it, so
+      the historical record survives. That is a direct fit for the layering we just built — the
+      episodic log is already append-only, but `MemoryEntry` still overwrites on consolidation, so
+      "what did I believe last month" is currently unanswerable even though the episodes to
+      reconstruct it are on disk. Note the benchmark context too: **LoCoMo and LongMemEval both
+      report LLM agents failing specifically on temporal queries**, which is the class this phase
+      exists to fix, so those are the denominators to score against rather than inventing one.
+- [ ] *(research 2026-09-08)* **Promote by access-frequency + confidence, not by similarity alone.**
+      [BMAM](https://arxiv.org/pdf/2601.20465) counters "semantic erosion" with an explicit
+      hippocampus-to-temporal-lobe step that promotes **frequently accessed and high-confidence**
+      episodes into stable semantic representations. We already store the two signals FSRS needs
+      (`fsrs_access_count`, `fsrs_importance`) but the consolidator ranks by
+      `composite_cluster_score` — similarity — so a rarely-recalled cluster can outrank a load-
+      bearing one. Worth A/B-ing against the retention harness before adopting; the point is that
+      the promotion gate is a *separate* decision from the clustering, and right now it is not.
+      Related: [TiMem](https://arxiv.org/pdf/2601.02845) (temporal-hierarchical consolidation for
+      long-horizon conversation) is the closest published shape to the P13 end state and worth
+      reading before the resampler design is fixed.
+- [ ] *(research 2026-09-08)* **Check the compression survey before hand-rolling the decimator.**
+      The [time-series compression survey](https://dl.acm.org/doi/10.1145/3560814) catalogues the
+      lossy-decimation family the DSP item below reaches for. The specific thing to steal is the
+      *error-bounded* framing: a compressor that guarantees a reconstruction error bound is
+      auditable, whereas "decimate until it looks fine" is not — and an auditable bound is what
+      would let the keep-rate be driven by `power_law_retrievability` and still be defensible.
 - [ ] **DSP compression = dreaming over time** — keep the recent window at full sample rate; for older windows decimate/wavelet-drop low-energy detail with the **keep-rate driven by FSRS `power_law_retrievability`** — sharp near-term detail, blurred long-term gist. Lift DSP's pure `simplify_with_aggressiveness` + slope-change simplifier + `splimes::auto_interpolate` (see design notes); store decimated windows / coeff blobs as Turso `f32` BLOBs.
 - [ ] **Peak detection seeds consolidation** — DSP peak/energy detection marks salient moments → promote those episodes to facts + boost importance; long flat stretches → compress to Essence/drop. Ties the timeline back into the existing FSRS weight bands.
 - [ ] **Single-GPU DSP kernels** — implement FFT/wavelet/convolution as wgpu compute shaders in `nanna-gpu` (alongside `CosineSimilaritySearch`), with a CPU fallback in `nanna-simd`. No external DSP service.
@@ -5278,8 +5367,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
-   - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
-     crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
+   - Pins now: `turso =0.7.2`, `aegis =0.9.15` (exact — pre-1.0; both at latest stable as of
+     2026-09-08). The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
+     is gone too** — see the 2026-09-08 sweep. The only lockfile-only holds left are
+     `malachite-bigint =0.9.2` and the `libc <= 0.2.186` ceiling, both gated by tests.
    - **`rten` is pinned at `0.24` by `ocrs`, not by us** *(2026-08-25)* — `cargo upgrade --incompatible`
      offers `rten 0.24 → 0.25`, and taking it is a hard error, not a migration: `ocrs 0.12.2` (latest)
      requires `rten ^0.24`, so the bump resolves **two** semver-incompatible `rten` crates and
@@ -5620,6 +5711,67 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      all 12 packages, `vue 3.5.41 → 3.5.42`, `happy-dom 20.11.6 → 20.11.8`; `vue-tsc --noEmit` clean,
      **237 vitest green**. `typescript@7.0.2` attempted and reverted for the third time — the exact
      failure and the upstream tracking issue are recorded on the deferred item above.
+   - *(2026-09-08 sweep)* `cargo update` -> 8 compatible bumps (`bon`/`bon-macros 3.10.1`,
+     `serde_with`/`serde_with_macros 3.23.0`, and the removal of a stale `darling 0.23`).
+     **Both documented landmines fired, exactly as written down, and both release-watches were
+     re-checked against the registry rather than assumed**: `libc 0.2.186 -> 0.2.189` (above the
+     ceiling `rustpython-vm 0.5.0` needs) and `malachite-bigint 0.11.0` alongside `rustpython`'s
+     0.9.2. Re-pinned with the two documented commands. `rustpython-{vm,stdlib,codegen}` are **still
+     0.5.0 (published 2026-03-31)**, so both pins stay; the guard tests reported each in 0.00s.
+     `cargo upgrade --incompatible` offered three rows and **only one was a real upgrade**:
+     - **`lopdf 0.44 -> 0.45`** (`nanna-tools` + `nanna-daemon`) — applied. 0.45.0 was published
+       **the morning of this run**, which is also why the same `cargo-upgrade` run reported
+       `lopdf -> 0.42.0` for `nanna-daemon` and `-> 0.45.0` for `nanna-tools` **in the same table**:
+       a stale registry-index read, not two different requirements. *Never take a `cargo-upgrade`
+       row without checking the crate's real version list first* — the criterion trap and this one
+       are the same failure mode, and this run shows it can disagree with itself between crates.
+     - **`criterion 0.8 -> "0.7"`** — rejected again (the lock resolves 0.8.2; the row is a
+       downgrade). It has now been reported and rejected on six consecutive sweeps.
+     - **The `boa` git pin is retired — this is the headline dependency change.** `boa_engine
+       0.22.0` shipped **2026-08-28**, which is *newer* than the rev we were pinned to
+       (`4f98f644`, committed 2026-07-10), so returning to crates.io is a step forward and not
+       back. The pin's stated retirement condition was "once boa releases with icu 2.2"; the
+       actual release wants **icu ~2.3**, so the condition was met from the other direction —
+       0.22.0 pulls the whole tree from icu 2.2 to 2.3, and **every one of the 15 `icu*` crates
+       resolves to a single 2.3.x** (checked before spending a build on it: `icu_normalizer 2.3.0`,
+       `icu_provider 2.3.1`, `temporal_capi 0.2.6`, no split anywhere). `JsArray::new` is still
+       `JsResult<Self>` and `JsVariant` still carries the same nine variants, so the 8-item API
+       surface `boa_impl.rs` uses compiles unchanged. **`boa_runtime` was dropped at the same
+       time**: it was an optional dependency that **no source file has ever referenced** — the
+       same dead-weight class as the `swc_core` and `@formkit/drag-and-drop` removals.
+     Frontend: `pnpm outdated` showed exactly three rows. `marked 18.0.11 -> 18.0.12` and
+     `@lucide/vue 1.42.0 -> 1.43.0` applied green (**238/238 vitest, `vue-tsc --noEmit` clean,
+     `pnpm build` green, 4 routes prerendered**); `typescript 7.0.2` **not attempted** — the
+     `vue-tsc`/`ERR_PACKAGE_PATH_NOT_EXPORTED` blocker and its upstream issue are already on record
+     and nothing has moved, so a fifth identical attempt would be ceremony.
+     **Toolchain deliberately NOT bumped this run, and the reason is the machine, not the code.**
+     `rustup check` offers nightly `2026-09-07` against our pinned `2026-08-27`, but the only
+     evidence that would justify moving the pin is a green `cargo build --release -p nanna-daemon`,
+     which took 20m on an *idle* host. This run shared the machine with a concurrent `mummu`
+     nightly (`cargo test --workspace -j 6`); **load average held between 120 and 170 for the whole
+     run** and a single debug `cargo build -p nanna-tools -p nanna-daemon` took **~40 minutes**.
+     Spending the run on one speculative release build would have shipped nothing else. Left for
+     the next run on a quiet host.
+     - [ ] **Try `nightly-2026-09-07` (or later) on a quiet host**, gated on a green
+           `cargo build --release -p nanna-daemon`, and move the pin plus the mirrored `toolchain:`
+           inputs in `.github/workflows/{budget-gate,release-check,test-compile}.yml` together.
+     - [ ] **The nightly routines contend on DISK, not CPU, and it distorts every run's timings.**
+           Three Rust routines were live at once on 2026-09-08 — `nanna`, `mummu`
+           (`cargo test --workspace -j 6`) and `eggersmann/eas2` (`cargo build --workspace`) — all
+           against the one `/mnt/deepmem` volume. **`vmstat` showed ~105 blocked processes and
+           81-85% iowait with the CPU at 2-3% user**, so the load average of 120-170 was almost
+           entirely processes queued on the disk. That is why `-j N` does not help: the jobs are
+           not competing for cores. A single debug `cargo build -p nanna-tools -p nanna-daemon`
+           took **50+ minutes**, of which ~33 was one `rust-lld` invocation that had consumed only
+           **12 seconds of CPU** — pure write contention (it had written 1.8 GB). A neighbouring
+           routine's `rust-lld` sat at 0% CPU with 4.9 GB resident for over two hours.
+           Two concrete consequences for how a run should be written:
+           **(a) `cargo check` before `cargo build`.** Checking does no linking, and linking is
+           what writes the gigabytes — so a check-first gate buys the entire compile-error signal
+           for a fraction of the I/O.
+           **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
+           risks corrupting the shared target dir. It has to be waited out.
+           Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
    - *(2026-08-28 sweep)* `cargo update` -> 6 compatible bumps (`chacha20 0.10.2`,
      `cpufeatures 0.3.1`, `flate2 1.1.10`, `libredox 0.1.21`, `twox-hash 2.1.4`, `wide 1.7.0`).
      `cargo upgrade --incompatible` offered four; **two applied green, both compiled unchanged** —
