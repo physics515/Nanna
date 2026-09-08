@@ -309,3 +309,45 @@ pub struct NewMemoryChunk {
     pub chunker_version: i64,
     pub workspace_id: Option<String>,
 }
+
+/// One row of the episodic stream (`memory_events`).
+///
+/// This is the storage shape only — the timeline's *policy* (which kinds
+/// exist, what bounds an append must respect) lives in `nanna-timeline`, so
+/// this crate stays a schema mapping and nothing more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEventRow {
+    pub id: i64,
+    pub event_id: String,
+    /// Unix milliseconds. The wall-clock axis every timeline query walks.
+    pub ts_unix_ms: i64,
+    pub kind: String,
+    /// Workspace scope (None = global).
+    pub workspace_id: Option<String>,
+    pub content: String,
+    /// Character length of the content *before* the append-time cap. Greater
+    /// than `content.chars().count()` exactly when the episode was truncated.
+    pub content_len_chars: i64,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub salience: f32,
+    /// Ids this event derives from (memories, messages, tool uses).
+    pub source_ids: Vec<String>,
+    pub created_at: String,
+}
+
+/// An episode to append. There is no `Update` counterpart by design: the
+/// event log is append-only, so the only write shape is this one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMemoryEvent {
+    pub event_id: String,
+    pub ts_unix_ms: i64,
+    pub kind: String,
+    pub workspace_id: Option<String>,
+    pub content: String,
+    pub content_len_chars: i64,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub salience: f32,
+    pub source_ids: Vec<String>,
+}

@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, MemoryChunk, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -2401,3 +2401,257 @@ impl WorkspaceRepository {
         Ok(affected > 0)
     }
 }
+
+/// Append-only access to `memory_events` — the episodic stream.
+///
+/// The API deliberately offers no single-row `update` or `delete`: an event
+/// log that can be edited cannot answer "what did I know, and when", which is
+/// the only reason to keep raw episodes beside the consolidated facts.
+/// Compaction of *old windows* is a separate, whole-window operation and does
+/// not belong to this type.
+pub struct MemoryEventRepository {
+    conn: Arc<Mutex<Connection>>,
+}
+
+/// Largest page any single timeline query will return.
+///
+/// Sized against the worst case a caller can hit: one event carries up to
+/// 8 KiB of content plus a 768-dim f32 embedding (3 KiB), so 1000 rows is
+/// ~11 MB resident. Above that a range scan stops being a query and becomes
+/// a bulk load, which is what `bulk_load` on the memory side already proved
+/// too expensive to do implicitly.
+pub const MAX_EVENT_PAGE: usize = 1000;
+
+impl MemoryEventRepository {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Append one episode.
+    ///
+    /// Idempotent on `event_id`: a redelivered event is ignored rather than
+    /// duplicated, so an at-least-once producer (a channel retrying a message)
+    /// cannot inflate the timeline.
+    ///
+    /// Returns `true` when the row was newly inserted.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the insert fails.
+    pub async fn append(&self, event: &NewMemoryEvent) -> Result<bool, StorageError> {
+        // Validated, not asserted. This runs inside the daemon's spawned
+        // turns, where a panic does not surface as a failure -- it wedges the
+        // turn silently, which is how a `&text[..200]` slice once cost a whole
+        // benchmark leg. A bad value here is worth an error, never a crash.
+        if event.event_id.is_empty() {
+            return Err(StorageError::Invalid(
+                "an episode must carry a non-empty event_id".to_string(),
+            ));
+        }
+        if !event.salience.is_finite() || !(0.0..=1.0).contains(&event.salience) {
+            return Err(StorageError::Invalid(format!(
+                "salience is a normalized weight in [0,1], got {}",
+                event.salience
+            )));
+        }
+        debug_assert!(
+            event.content_len_chars >= 0,
+            "a pre-truncation length cannot be negative"
+        );
+        debug_assert!(
+            event.content_len_chars >= i64::try_from(event.content.chars().count()).unwrap_or(0),
+            "the pre-truncation length can never be shorter than what is stored"
+        );
+
+        let blob: Option<Vec<u8>> = event
+            .embedding
+            .as_ref()
+            .map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect());
+        let source_ids = serde_json::to_string(&event.source_ids)?;
+
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                APPEND_MEMORY_EVENT,
+                turso::params![
+                    event.event_id.clone(),
+                    event.ts_unix_ms,
+                    event.kind.clone(),
+                    event.workspace_id.clone(),
+                    event.content.clone(),
+                    event.content_len_chars,
+                    blob,
+                    event.embedding_model.clone(),
+                    f64::from(event.salience),
+                    source_ids,
+                ],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Events with `start_ms <= ts < end_ms`, oldest first, capped at `limit`.
+    ///
+    /// Half-open on purpose: adjacent windows tile the axis exactly once, so
+    /// resampling into fixed buckets cannot double-count an event that lands
+    /// on a boundary.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn range(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        workspace_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEventRow>, StorageError> {
+        check_window(start_ms, end_ms)?;
+        check_page(limit)?;
+
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = match workspace_id {
+            Some(ws) => {
+                conn.query(
+                    RANGE_MEMORY_EVENTS_SCOPED,
+                    turso::params![start_ms, end_ms, ws.to_string(), limit_i64],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    RANGE_MEMORY_EVENTS,
+                    turso::params![start_ms, end_ms, limit_i64],
+                )
+                .await?
+            }
+        };
+
+        // Drained fully before the guard drops: an open cursor on this shared
+        // connection silently swallows the next write.
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_memory_event(&row)?);
+        }
+        debug_assert!(out.len() <= limit, "the page cap must hold");
+        Ok(out)
+    }
+
+    /// How many events fall in `[start_ms, end_ms)`.
+    ///
+    /// Separate from [`Self::range`] because sizing a resample window must not
+    /// require materializing it — that is exactly the read the page cap
+    /// forbids.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn count_in_range(&self, start_ms: i64, end_ms: i64) -> Result<i64, StorageError> {
+        check_window(start_ms, end_ms)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(COUNT_MEMORY_EVENTS, turso::params![start_ms, end_ms])
+            .await?;
+        let count = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
+        debug_assert!(count >= 0, "a row count cannot be negative");
+        Ok(count)
+    }
+
+    /// The `limit` most recent events, newest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn recent(&self, limit: usize) -> Result<Vec<MemoryEventRow>, StorageError> {
+        check_page(limit)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                RECENT_MEMORY_EVENTS,
+                turso::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_memory_event(&row)?);
+        }
+        debug_assert!(out.len() <= limit, "the page cap must hold");
+        Ok(out)
+    }
+}
+
+/// Reject a backwards window rather than returning an empty page for it: an
+/// inverted window is a caller bug, and answering it with "no events" hides
+/// the bug behind a plausible result.
+fn check_window(start_ms: i64, end_ms: i64) -> Result<(), StorageError> {
+    if start_ms > end_ms {
+        return Err(StorageError::Invalid(format!(
+            "a time window cannot end before it starts ({start_ms} > {end_ms})"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an oversized page instead of quietly serving `MAX_EVENT_PAGE` of
+/// them -- a silently clamped page reads as "that was all of it".
+fn check_page(limit: usize) -> Result<(), StorageError> {
+    if limit > MAX_EVENT_PAGE {
+        return Err(StorageError::Invalid(format!(
+            "a timeline page is bounded at {MAX_EVENT_PAGE} events, asked for {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn row_to_memory_event(row: &turso::Row) -> Result<MemoryEventRow, StorageError> {
+    let source_ids: String = row.get(11)?;
+    Ok(MemoryEventRow {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        ts_unix_ms: row.get(2)?,
+        kind: row.get(3)?,
+        workspace_id: row.get(4)?,
+        content: row.get(5)?,
+        content_len_chars: row.get(6)?,
+        embedding: decode_embedding(row.get(7)?),
+        embedding_model: row.get(8)?,
+        salience: row.get::<f64>(9)? as f32,
+        created_at: row.get(10)?,
+        // A row whose lineage JSON is unreadable is still a real episode; the
+        // timeline loses the link, not the event. Failing the whole page here
+        // would make one bad row hide every good one behind it.
+        source_ids: serde_json::from_str(&source_ids).unwrap_or_default(),
+    })
+}
+
+const APPEND_MEMORY_EVENT: &str = "
+INSERT OR IGNORE INTO memory_events
+    (event_id, ts_unix_ms, kind, workspace_id, content, content_len_chars,
+     embedding, embedding_model, salience, source_ids)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
+const RANGE_MEMORY_EVENTS: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE ts_unix_ms >= ?1 AND ts_unix_ms < ?2
+ORDER BY ts_unix_ms ASC, id ASC
+LIMIT ?3";
+
+const RANGE_MEMORY_EVENTS_SCOPED: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+WHERE ts_unix_ms >= ?1 AND ts_unix_ms < ?2 AND workspace_id = ?3
+ORDER BY ts_unix_ms ASC, id ASC
+LIMIT ?4";
+
+const RECENT_MEMORY_EVENTS: &str = "
+SELECT id, event_id, ts_unix_ms, kind, workspace_id, content,
+       content_len_chars, embedding, embedding_model, salience, created_at, source_ids
+FROM memory_events
+ORDER BY ts_unix_ms DESC, id DESC
+LIMIT ?1";
+
+const COUNT_MEMORY_EVENTS: &str = "
+SELECT COUNT(*) FROM memory_events WHERE ts_unix_ms >= ?1 AND ts_unix_ms < ?2";

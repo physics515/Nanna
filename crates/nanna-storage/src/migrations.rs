@@ -15,6 +15,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("011_tasks", MIGRATION_011),
     ("012_memory_chunks", MIGRATION_012),
     ("013_embedding_buckets", MIGRATION_013),
+    ("014_memory_events", MIGRATION_014),
 ];
 
 const MIGRATION_001: &str = r"
@@ -481,3 +482,148 @@ CREATE INDEX IF NOT EXISTS idx_memory_chunk_vectors_parent
 CREATE INDEX IF NOT EXISTS idx_embedding_queue_parent
     ON embedding_queue(memory_id);
 ";
+
+const MIGRATION_014: &str = r"
+-- The episodic stream: what happened, on a wall-clock axis.
+--
+-- `memories` is the SEMANTIC layer (facts, FSRS-weighted, never expiring).
+-- This table is the RAW layer underneath it -- messages, tool calls, recalls
+-- and outcomes as they occur -- which dreaming later consolidates *into*
+-- facts. The two are deliberately separate: a fact has no single timestamp
+-- (it is the residue of many episodes), and an episode has no FSRS state
+-- (it is not independently recalled). Collapsing them would force one of
+-- those two to lie.
+--
+-- Append-only by construction: there is no updated_at, and the repository
+-- exposes no UPDATE or DELETE for a single row. Rewriting history is what
+-- makes a timeline unable to answer 'what did I know, when'.
+CREATE TABLE IF NOT EXISTS memory_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+
+    -- Unix milliseconds, not a datetime string. Every consumer of this table
+    -- is arithmetic (resample into a series, decimate a window, detect a
+    -- peak), and text timestamps would need parsing on every sample.
+    ts_unix_ms INTEGER NOT NULL,
+
+    kind TEXT NOT NULL,           -- 'message' | 'tool_call' | 'recall' | 'outcome'
+    workspace_id TEXT,            -- NULL = global scope
+    content TEXT NOT NULL,
+
+    -- Length of the content BEFORE the append-time cap was applied. Equal to
+    -- length(content) when nothing was dropped, so a truncated episode is
+    -- detectable by comparison rather than by a flag nobody sets.
+    content_len_chars INTEGER NOT NULL,
+
+    embedding BLOB,               -- f32 little-endian, NULL until embedded
+    embedding_model TEXT,
+
+    -- [0.0, 1.0]. Drives which episodes survive DSP decimation of older
+    -- windows and which get promoted to facts.
+    salience REAL NOT NULL,
+
+    -- JSON array of the ids this event derives from (memory ids, message ids,
+    -- tool_use ids). Lineage, so a consolidated fact can be traced back.
+    source_ids TEXT NOT NULL DEFAULT '[]',
+
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The wall-clock axis itself: every range scan and every resample walks it.
+CREATE INDEX IF NOT EXISTS idx_memory_events_ts
+    ON memory_events(ts_unix_ms);
+
+-- Scoped ranges filter inline rather than joining, so the workspace is
+-- denormalized onto the event exactly as it is onto memory_chunks.
+CREATE INDEX IF NOT EXISTS idx_memory_events_workspace_ts
+    ON memory_events(workspace_id, ts_unix_ms);
+
+-- Per-signal resampling reads one kind at a time (salience(t) over tool
+-- calls is a different series from salience(t) over messages).
+CREATE INDEX IF NOT EXISTS idx_memory_events_kind_ts
+    ON memory_events(kind, ts_unix_ms);
+
+-- Finds events whose text exists but whose vector does not yet, which is what
+-- makes embedding the backlog a resumable drain instead of a full rescan.
+CREATE INDEX IF NOT EXISTS idx_memory_events_pending
+    ON memory_events(embedding_model, id);
+";
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATIONS;
+
+    /// Strip `--` line comments the way a reader does, so what is left is the
+    /// SQL the database would actually see.
+    fn sql_only(chunk: &str) -> String {
+        chunk
+            .lines()
+            .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    /// `Storage::migrate` executes a migration by `split(';')`, which is a
+    /// tokenizer that does not know what a comment is. A semicolon inside a
+    /// `--` comment therefore cuts the *statement around it* in half, and the
+    /// two fragments are then handed to the database as if they were whole.
+    ///
+    /// The failure is invisible until a fresh database is opened — every
+    /// existing install has the table already — so this asserts the property
+    /// at test time instead. Caught exactly this in migration 014 before it
+    /// shipped: `embedding BLOB, -- f32 little-endian; NULL until embedded`
+    /// split the `CREATE TABLE` at the comma.
+    #[test]
+    fn no_migration_hides_a_semicolon_in_a_comment() {
+        for (name, sql) in MIGRATIONS {
+            for (n, line) in sql.lines().enumerate() {
+                if let Some((_, comment)) = line.split_once("--") {
+                    assert!(
+                        !comment.contains(';'),
+                        "{name} line {}: a ';' inside a comment splits the statement \
+                         around it -- the runner splits on ';' without parsing. \
+                         Offending line: {}",
+                        n + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every chunk the runner keeps must contain real SQL. A chunk that is
+    /// only comments reaches `conn.execute` as a bare comment, which is not a
+    /// statement — so a trailing note after the last `;` fails the whole
+    /// migration rather than being ignored.
+    #[test]
+    fn every_executed_chunk_is_a_real_statement() {
+        for (name, sql) in MIGRATIONS {
+            for chunk in sql.split(';').filter(|s| !s.trim().is_empty()) {
+                assert!(
+                    !sql_only(chunk).is_empty(),
+                    "{name}: a comment-only chunk would be executed as a statement: {}",
+                    chunk.trim()
+                );
+            }
+        }
+    }
+
+    /// Names are the applied-migration key, so a duplicate would silently skip
+    /// the second one forever.
+    #[test]
+    fn migration_names_are_unique_and_ordered() {
+        let names: Vec<&str> = MIGRATIONS.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate migration name");
+        let mut in_order = names.clone();
+        in_order.sort_unstable();
+        assert_eq!(
+            names, in_order,
+            "migrations must be listed in applied order"
+        );
+    }
+}

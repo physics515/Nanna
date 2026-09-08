@@ -5894,6 +5894,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanna-timeline"
+version = "0.3.13"
+dependencies = [
+ "nanna-storage",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nanna-tools"
 version = "0.3.13"
 dependencies = [
