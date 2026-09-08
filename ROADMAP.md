@@ -1780,6 +1780,17 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       next sweep, and do NOT reach for a direct `arti-*` pin, which this phase forbids. Sources:
       [Arti 2.5.1](https://blog.torproject.org/arti_2_5_1_released/),
       [onyums](https://crates.io/crates/onyums).
+- [ ] *(research 2026-09-07)* **arti 2.6.0 is out and `onyums` is now the sole blocker — worth a
+      decision, not another re-check.** 2.6.0 makes congestion control and Counter Galois Onion
+      *always enabled* (they were experimental in 2.5.1) and continues relay/dirauth work. Meanwhile
+      `onyums` is unchanged since the 2026-08-26 note. Three sweeps have now recorded "arti moved,
+      onyums did not", which is a pattern rather than a coincidence: P9's rule that all Tor traffic
+      goes through `onyums` also means P9 inherits `onyums`'s release cadence. Before P9 starts,
+      decide explicitly whether that is acceptable or whether the phase should depend on
+      `arti-client` + `tor-hsservice` directly and treat `onyums` as a reference implementation —
+      and record the decision here so the next sweep stops re-deriving it. Sources:
+      [Arti 2.6.0](https://blog.torproject.org/arti_2_6_0_released/),
+      [onyums](https://crates.io/crates/onyums).
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -1876,6 +1887,50 @@ of either one:
 - [x] **Windows `exec` ergonomics** — `normalize_cmdisms` rewrites the exact cmd.exe idiom `cd /d <path>` → `cd <path>` (the "cd: too many arguments" failure) before Git-Bash routing; the `exec` description + system prompt steer to POSIX and to `code_search` over `rg`. 2 tests.
 - [x] **Heartbeat** no longer commands the model to `Read HEARTBEAT.md` (which hard-errored on the missing `~/HEARTBEAT.md`); workspace `HEARTBEAT.md` is already injected via context. 2 tests. (Full retirement of the bespoke file is P17.)
 - [x] Removed committed debris `gui/src-tauri/src/_patch.py`.
+
+**Linux portability (2026-09-07) — the host moved to Arch/Omarchy in September and `master` did not
+build there at all.** Both breaks are Windows-era assumptions that only a non-Windows compile can see,
+so neither CI nor any prior run could have caught them:
+- [x] **`exec` routing used `cfg!(windows)` where it needed `#[cfg(windows)]`** —
+      `bridge.rs:746` wrote `let mut cmd = if cfg!(windows) { … } else { … }`. `cfg!` is a *runtime*
+      boolean, so **both arms are still type-checked on every platform**, while the four helpers the
+      Windows arm calls (`strip_outer_quotes`, `classify_windows_command`, `git_bash_path`,
+      `WinShell`) are `#[cfg(windows)]` and genuinely absent on Linux — 5 × `E0425`/`E0433`, and
+      `nanna-scripting` (hence the `nanna` binary) could not compile. Fixed by splitting into
+      `#[cfg(windows)]` / `#[cfg(not(windows))]` bindings so the Windows arm is compiled out. Net
+      −7/+5 lines and **no behaviour change on Windows**: the same arm is selected, just at compile
+      time. Note this was never a latent runtime bug — `cfg!(windows)` picks the right branch — it is
+      purely a compilation-portability defect.
+- [x] **Dead `#[cfg(not(windows))] normalize_drive_paths`** — an identity stub whose only non-test
+      caller (`bridge.rs:736`) is itself `#[cfg(windows)]`, and whose tests are
+      `#[cfg(all(test, windows))]`. Dead on *every* platform, invisible while the crate never
+      compiled on Linux. Deleted rather than `#[allow]`-ed.
+- [x] **Proven at runtime, not just compiled.** The freshly built Linux `nanna-daemon`, booted against
+      a scratch config (`NANNA_CONFIG_PATH` + `--data-dir` + `--no-pid-file`, ports 51997/51998),
+      reaches `Daemon ready`, serves IPC and health, answers
+      `GET /health` with `{"status":"ok","version":"0.3.11","uptime_secs":1}`, handles **SIGTERM**
+      and shuts down cleanly — **zero `panicked` lines**. The only errors are Ollama being
+      unreachable (it is not installed on this host), which the readiness-wait path handles as
+      designed rather than by burning retry budget.
+- [x] **Now enforced in CI.** *(2026-09-07)* `test-compile.yml` gains `compile-tests-linux`, an
+      `ubuntu-latest` mirror of the existing Windows `cargo test --no-run --workspace --exclude
+      nanna-gui --locked`. Both breaks above are plain compile errors, so this job would have caught
+      each on the commit that introduced it. The Windows job stays — its comment's reasoning (only
+      Windows exercises `#[cfg(windows)]`, where the service layer lives) is correct, just
+      one-sided: **a platform gate is only tested by the platform it excludes.** `nanna-gui` stays
+      excluded on Linux too, since the Tauri crate needs WebKitGTK system packages and that would
+      turn a smoke check into a provisioning job.
+- [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
+      `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
+      whether that is worth a job before claiming the desktop app is cross-platform.
+- [ ] **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
+      baseline.** The 2026-09-07 run measured `simd_batch` at **0.040 / 0.869 / 5.20 ms** for
+      N = 1k/10k/50k — comfortably inside the ≤0.20 / ≤5.0 / ≤25 ms budgets and *below* the recorded
+      p95s, which is a sound pass (it held under a load average of 112 with a second Rust build
+      running, so contention can only have hurt it). It is **not** a new baseline and was
+      deliberately not written into `bench/BASELINE.md`: the recorded numbers are Windows, these are
+      Linux, and the machine was saturated — three uncontrolled variables at once. Re-run quiet
+      before claiming any of it as an improvement or attributing it to `wide 1.7`.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
@@ -2266,6 +2321,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   index earns nothing at today's corpus size. The real trigger is the **O(N^2)
                   clustering in dreaming**, not recall. Source:
                   [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+                  - [ ] *(research 2026-09-07)* **Recall is now measured across the shortlist, and it
+                        confirms the "do not schedule on recall grounds" call rather than
+                        challenging it.** Published comparisons put `usearch` at 0.987 recall /
+                        ~2,388 qps and `hnswlib` at 0.995 / ~2,194 qps — i.e. the candidates differ
+                        from each other by less than a point of recall, while the exact SIMD scan we
+                        already run has *no* recall trade at all. So the choice between them is not
+                        a quality decision and should not be argued as one; it stays a decision about
+                        the **O(N^2) dreaming clustering** and about which crate avoids mirroring the
+                        f32 BLOBs. One new shape worth knowing: `sqlite-vector-rs` keeps a
+                        usearch-backed HNSW in a **shadow table** persisted across connections — the
+                        same "index beside the rows" pattern, and a useful reference for what a
+                        Turso-side equivalent would have to own. Sources:
+                        [usearch](https://crates.io/crates/usearch),
+                        [sqlite-vector-rs](https://crates.io/crates/sqlite-vector-rs).
             - [ ] *(research 2026-08-27)* **Do not reach for DiskANN here — check what the graph is
                   keyed to before adopting it.** The "Turso brings native vector search" material
                   points at DiskANN, and pure-Rust ports now exist
@@ -5133,9 +5202,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `OcrEngineParams { detection_model, recognition_model }` is then handed `rten-0.25::Model` where
      `rten-0.24::Model` is expected (E0308, verified by building it). Re-check when `ocrs` publishes
      against 0.25; until then the direct req must track whatever `ocrs` requires.
-     - [ ] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it. *(re-checked 2026-08-27: `ocrs`
-           latest is still 0.12.2 on `rten ^0.24`. Now enforced by the unification guard above rather
-           than by remembering.)*
+     - [x] Re-try `rten 0.25` once `ocrs > 0.12.2` moves to it. *(2026-09-07 — **unblocked and
+           landed, skipping 0.25 entirely.** `ocrs 0.13.0` shipped against `rten 0.26`, so the pair
+           moves together: `ocrs 0.12 → 0.13` + `rten 0.24 → 0.26` in `nanna-tools`, a two-line
+           req change with **zero source edits**. `rten` and `rten-tensor` both resolve to a single
+           `0.26.0`, so the `dep_version_unification` guard stays green, and the exact call the old
+           note predicted would fail — `OcrEngineParams { detection_model, recognition_model }` at
+           `ocr.rs:308` — compiles clean. The pin was never ours; it moved the moment `ocrs` moved.)*
    - **`malachite-bigint` must stay at 0.9.2 — a bare `cargo update` breaks the release build**
      *(2026-08-25)*. `pymath 0.2.0` accepts `malachite-bigint 0.10` while `rustpython-codegen 0.5.0`
      requires 0.9, so `cargo update` resolves both and `rustpython-stdlib` fails to compile
@@ -5165,6 +5238,28 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
+   - **`libc` must stay at or below 0.2.186 — above it the workspace does not build on Linux at all**
+     *(2026-09-07)*. `libc 0.2.187` corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on
+     linux-gnu (glibc genuinely stores spawn flags in a `short`, so libc is right). But
+     `rustpython-vm 0.5.0` passes that constant straight into
+     `nix::spawn::PosixSpawnFlags::from_bits_retain`, which `nix 0.30` types as `c_int` — **E0308 at
+     `rustpython-vm-0.5.0/src/stdlib/posix.rs:1812`**, which kills the `python` feature and with it
+     the `nanna` binary. Windows never saw it (the constant is `c_short` only on linux/android), so
+     it arrived with the host migration, not with a bump: **`origin/master` was already red here**.
+     The upstream fix is merged but unreleased — RustPython PR
+     [#8343](https://github.com/RustPython/RustPython/pull/8343) *"Fix building against new libc"*,
+     merged 2026-07-22, with no release after 0.5.0. Held with
+     `cargo update -p libc --precise 0.2.186`. The buildable window is only
+     **0.2.183..=0.2.186** — `rustpython-stdlib 0.5.0` itself requires `libc ^0.2.183` — so a bare
+     `cargo update` always lands outside it.
+     - [x] *(2026-09-07)* **Enforced, not remembered.** `held_back_crates_stay_below_their_ceiling`
+           in `crates/nanna-storage/tests/dep_version_unification.rs` asserts a version **ceiling**
+           (the mirror of the existing single-version guard) and prints the remedy plus the exact
+           condition that retires the pin. Verified it fires: re-running
+           `cargo update -p libc --precise 0.2.189` makes it report
+           `libc resolved to 0.2.189 but must stay at or below 0.2.186`. Runs in 0.00s.
+     - [ ] Drop the `libc` ceiling the moment rustpython publishes anything after 0.5.0 — the fix is
+           already upstream, so this is a release-watch, not a migration.
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
      `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
      `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
@@ -5255,9 +5350,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - **`rten 0.24 → 0.25`** (`nanna-tools`) — **reverted.** `ocrs 0.12.2` still requires `rten 0.24`,
        so bumping our direct req puts **two `rten` versions in one graph** and `ocr.rs:309` fails with
        `expected rten::model::Model, found Model`. Not our migration to do:
-       - [ ] Re-try `rten 0.25` once **`ocrs`** ships a release built against it (watch
+       - [x] Re-try `rten 0.25` once **`ocrs`** ships a release built against it (watch
              `ocrs`/`rten-imageproc`); the bump is a one-line req change plus a rebuild once the
-             transitive pin moves.
+             transitive pin moves. *(2026-09-07 — done; `ocrs 0.13.0` went straight to `rten 0.26`,
+             so the landed bump is `0.24 → 0.26`. Exactly the one-line-req-plus-rebuild this
+             predicted.)*
      - **`criterion 0.8 → "0.7"`** — **rejected as a downgrade.** `cargo-upgrade` reports `latest 0.7.0`
        for criterion while the lock happily resolves `0.8.2`; taking its suggestion would walk the
        benches *backwards*. Never apply a `cargo-upgrade` row whose "latest" is below the current req.
