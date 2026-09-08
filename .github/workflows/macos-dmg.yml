@@ -130,7 +130,7 @@ jobs:
           xcrun stapler staple Nanna_${{ env.VERSION }}.dmg
 
       - name: Upload release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: Nanna_${{ env.VERSION }}.dmg
           draft: false
