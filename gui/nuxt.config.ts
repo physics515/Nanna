@@ -98,7 +98,6 @@ export default defineNuxtConfig({
         // dependency, so it does not resolve from the project root. It is
         // already folded into the starter-kit / vue-3 bundles below.
         '@tiptap/extension-image',
-        '@tiptap/extension-link',
         '@tiptap/extension-placeholder',
         '@tiptap/extension-task-item',
         '@tiptap/extension-task-list',
