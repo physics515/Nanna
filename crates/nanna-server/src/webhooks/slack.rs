@@ -221,12 +221,26 @@ pub async fn handle(
                             (&item.channel, &item.ts, &inner.reaction) 
                         {
                             let message_key = format!("{}:{}:{}", PROVIDER, channel, ts);
-                            let positive = is_positive_reaction(reaction);
-                            
-                            // Only process additions of feedback reactions
+                            // A reaction that is not a feedback signal must change nothing:
+                            // FSRS weights are the agent's long-term memory, and an emoji
+                            // with no assigned meaning is not evidence either way.
                             if inner.event_type == "reaction_added" {
-                                info!("Slack reaction {} on {} (positive: {})", reaction, message_key, positive);
-                                state.record_message_feedback(&message_key, positive).await;
+                                match classify_reaction(reaction) {
+                                    ReactionFeedback::NotFeedback => {
+                                        debug!(
+                                            "Slack reaction {} on {} carries no feedback",
+                                            reaction, message_key
+                                        );
+                                    }
+                                    signal => {
+                                        let positive = signal == ReactionFeedback::Positive;
+                                        info!(
+                                            "Slack reaction {} on {} (positive: {})",
+                                            reaction, message_key, positive
+                                        );
+                                        state.record_message_feedback(&message_key, positive).await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -357,29 +371,114 @@ pub async fn _handle_slash_command(
     }))
 }
 
-/// Check if a Slack reaction is positive feedback
-fn is_positive_reaction(reaction: &str) -> bool {
-    let positive_reactions = [
-        "+1", "thumbsup", "thumbs_up", "white_check_mark", "heavy_check_mark",
-        "star", "star2", "heart", "hearts", "fire", "tada", "clap", "raised_hands",
-        "100", "ok_hand", "muscle", "trophy", "medal", "1st_place_medal",
-        "sunglasses", "rocket", "sparkles", "boom", "zap",
-    ];
-    
-    let negative_reactions = [
-        "-1", "thumbsdown", "thumbs_down", "x", "no_entry", "no_entry_sign",
-        "warning", "rage", "angry", "disappointed", "confused", "pensive",
-        "worried", "cry", "sob",
-    ];
-    
-    if positive_reactions.iter().any(|r| reaction.contains(r)) {
-        return true;
+/// What a reaction says about the memories behind the message it landed on.
+///
+/// Three states, not a `bool`, because "someone reacted" and "someone gave
+/// feedback" are different facts. A 🍕 on an answer says nothing about whether
+/// the answer was right, and a `bool` has nowhere to put that — which is how
+/// the previous classifier came to return `true` (praise) for every emoji it
+/// did not recognise, quietly promoting up to 50 recent memories per pizza.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactionFeedback {
+    /// Read as approval: promote the memories behind the message.
+    Positive,
+    /// Read as a correction: demote them.
+    Negative,
+    /// Not a feedback signal. Nothing happens.
+    NotFeedback,
+}
+
+/// Reaction names read as approval. Matched exactly, after the skin-tone
+/// modifier is stripped — substring matching is what made `broken_heart`
+/// register as praise, because it contains `heart`.
+const POSITIVE_REACTIONS: &[&str] = &[
+    "+1",
+    "100",
+    "1st_place_medal",
+    "ballot_box_with_check",
+    "clap",
+    "dart",
+    "fire",
+    "heart",
+    "heart_eyes",
+    "hearts",
+    "heavy_check_mark",
+    "medal",
+    "muscle",
+    "ok_hand",
+    "pray",
+    "raised_hands",
+    "rocket",
+    "sparkles",
+    "sparkling_heart",
+    "star",
+    "star-struck",
+    "star2",
+    "sunglasses",
+    "tada",
+    "thumbs_up",
+    "thumbsup",
+    "trophy",
+    "white_check_mark",
+    "zap",
+];
+
+/// Reaction names read as a correction.
+const NEGATIVE_REACTIONS: &[&str] = &[
+    "-1",
+    "angry",
+    "broken_heart",
+    "bug",
+    "confused",
+    "cry",
+    "disappointed",
+    "exploding_head",
+    "facepalm",
+    "hankey",
+    "heavy_multiplication_x",
+    "man-facepalm",
+    "negative_squared_cross_mark",
+    "no_entry",
+    "no_entry_sign",
+    "no_good",
+    "poop",
+    "rage",
+    "skull",
+    "sob",
+    "thumbs_down",
+    "thumbsdown",
+    "warning",
+    "woman-facepalm",
+    "worried",
+    "x",
+];
+
+/// Classify a Slack reaction name into a feedback signal.
+///
+/// Unrecognised reactions are [`ReactionFeedback::NotFeedback`] on purpose:
+/// FSRS weights are the agent's long-term memory, and an emoji nobody assigned
+/// a meaning to is not evidence about a memory's usefulness in either
+/// direction. Silence is the honest answer.
+fn classify_reaction(reaction: &str) -> ReactionFeedback {
+    // Slack appends a skin-tone modifier to reactions that support one:
+    // `thumbsup::skin-tone-6`. The tone carries no feedback, so the name is
+    // everything before the separator.
+    let name = reaction.split("::").next().unwrap_or(reaction).trim();
+    debug_assert!(
+        !name.contains("::"),
+        "the skin-tone modifier must already be stripped"
+    );
+
+    if name.is_empty() {
+        return ReactionFeedback::NotFeedback;
     }
-    if negative_reactions.iter().any(|r| reaction.contains(r)) {
-        return false;
+    if POSITIVE_REACTIONS.contains(&name) {
+        return ReactionFeedback::Positive;
     }
-    
-    true
+    if NEGATIVE_REACTIONS.contains(&name) {
+        return ReactionFeedback::Negative;
+    }
+    ReactionFeedback::NotFeedback
 }
 
 #[cfg(test)]
@@ -463,5 +562,88 @@ mod tests {
         assert!(!empty_sig, "empty signature");
         let bad_ts = verify_slack_signature("s", "v0=deadbeef", "notanumber", b"x");
         assert!(!bad_ts, "bad timestamp");
+    }
+
+    #[test]
+    fn known_reactions_classify_by_exact_name() {
+        assert_eq!(classify_reaction("thumbsup"), ReactionFeedback::Positive);
+        assert_eq!(classify_reaction("+1"), ReactionFeedback::Positive);
+        assert_eq!(
+            classify_reaction("white_check_mark"),
+            ReactionFeedback::Positive
+        );
+        assert_eq!(classify_reaction("thumbsdown"), ReactionFeedback::Negative);
+        assert_eq!(classify_reaction("-1"), ReactionFeedback::Negative);
+        assert_eq!(classify_reaction("x"), ReactionFeedback::Negative);
+    }
+
+    #[test]
+    fn an_unrecognised_reaction_is_not_feedback() {
+        // The regression this replaces: the old classifier fell through to
+        // `true`, so a pizza on an answer promoted every memory behind it.
+        for name in ["pizza", "eyes", "wave", "cat", "spider", ""] {
+            assert_eq!(
+                classify_reaction(name),
+                ReactionFeedback::NotFeedback,
+                "{name} is not a feedback signal"
+            );
+        }
+    }
+
+    #[test]
+    fn substring_lookalikes_no_longer_flip_the_sign() {
+        // `broken_heart` contains `heart` and `heavy_multiplication_x`
+        // contains `x`; substring matching read the first as praise.
+        assert_eq!(
+            classify_reaction("broken_heart"),
+            ReactionFeedback::Negative
+        );
+        assert_eq!(
+            classify_reaction("heavy_multiplication_x"),
+            ReactionFeedback::Negative
+        );
+        assert_eq!(classify_reaction("heart"), ReactionFeedback::Positive);
+        // And a name that merely *contains* a known one is not that one.
+        assert_eq!(
+            classify_reaction("thumbsup_but_sarcastic"),
+            ReactionFeedback::NotFeedback
+        );
+    }
+
+    #[test]
+    fn skin_tone_modifiers_are_stripped() {
+        // Slack sends `name::skin-tone-N` for N in 2..=6.
+        for tone in 2..=6 {
+            assert_eq!(
+                classify_reaction(&format!("thumbsup::skin-tone-{tone}")),
+                ReactionFeedback::Positive
+            );
+            assert_eq!(
+                classify_reaction(&format!("thumbsdown::skin-tone-{tone}")),
+                ReactionFeedback::Negative
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_reaction_tables_are_disjoint_and_well_formed() {
+        for name in POSITIVE_REACTIONS.iter().chain(NEGATIVE_REACTIONS) {
+            assert!(!name.is_empty(), "an empty reaction name matches nothing");
+            assert!(
+                !name.contains("::"),
+                "{name} carries a modifier the lookup already strips"
+            );
+            assert_eq!(
+                *name,
+                name.to_lowercase(),
+                "{name} must be lowercase to match Slack's names"
+            );
+        }
+        for name in POSITIVE_REACTIONS {
+            assert!(
+                !NEGATIVE_REACTIONS.contains(name),
+                "{name} cannot be both approval and correction"
+            );
+        }
     }
 }

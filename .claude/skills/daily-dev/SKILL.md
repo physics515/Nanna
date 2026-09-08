@@ -29,6 +29,26 @@ is safely actionable). Depth over breadth *within* an item; sustained volume *ac
 - **NEVER touch the user's uncommitted work-in-progress.** This repo carries a large uncommitted WIP.
   Stage and commit **only the files you changed for the current item** (`git add <explicit paths>`),
   never `git add -A`/`git add .`. Verify the staged set before every commit.
+- **Pin `CARGO_TARGET_DIR` for the run, before the first cargo command.** This machine's user-global
+  `~/.cargo/config.toml` points every project at ONE shared `D:\Development\Cargo Target`, and the
+  neighbouring projects there build under their own toolchains. A shared dir spanning two rustc
+  versions does not merely serialise builds — it **corrupts the gate**. Measured 2026-08-28:
+  `cargo test --workspace --exclude nanna-gui` reported **1697 passed / 0 failed** and then died in
+  `nanna-agent`'s doctests with `E0514: found crate 'unicode_ident' compiled by an incompatible
+  version of rustc` — a neighbour had built it under `nightly 787af2b8c` while this workspace pins
+  `bff8e12ff`. A run cannot tell a real failure from a contaminated one, so every number it reports
+  is unearned. Export a worktree-specific `CARGO_TARGET_DIR` on **every** cargo invocation (shell
+  state does not survive between tool calls). **Put it INSIDE the shared dir** —
+  `D:\Development\Cargo Target\<worktree-name>` — which is already this machine's convention
+  (`nanna-nightly`, `mummu-nightly-*`, `wt-*`, `*-routine` all live there). A *sibling* directory
+  such as `Cargo Target-nightly` does **not** survive: one was created and used for a whole run on
+  2026-08-28, and the entire ~30 GB tree vanished minutes after the last build finished, taking the
+  freshly-built release binary with it. Nothing was lost that mattered because the builds had
+  already been observed green, but a smoke run against that binary was no longer possible.
+  The price is one cold build (~10 min debug, ~16-23 min release); the alternative is a green gate
+  that proved nothing. Do **not** commit a repo-level `.cargo/config.toml` to force this — the
+  shared dir is the operator's deliberate choice for their own work, and this is the routine's
+  concern, not the repo's.
 - **Never ship red.** If `cargo build`, `cargo test`, `cargo clippy --all-targets`, or a benchmark
   budget is failing, fix it or revert your change — do not commit a broken tree.
 - **No performance regressions.** A perf-affecting change that regresses a budget in

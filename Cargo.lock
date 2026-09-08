@@ -5730,6 +5730,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "libc",
+ "lopdf",
  "nanna-agent",
  "nanna-channels",
  "nanna-config",
