@@ -1,11 +1,11 @@
 {
-  "version": "0.3.10",
-  "notes": "Public Beta 19 - auto-update works again (it could not fire from beta.14 through beta.18, because the app's version never moved). Tool-result ingestion is off the turn's critical path, queued vectors drain at the end of a turn, four frontend majors, toolchain nightly-2026-08-25, and NANNA_CONFIG_PATH.",
-  "pub_date": "2026-08-26T22:15:00.000Z",
+  "version": "0.3.15",
+  "notes": "Append-only episodic timeline (P13); boa git pin retired to crates.io 0.22.0; lopdf 0.45; a migration-splitter bug caught before it shipped.",
+  "pub_date": "2026-09-08T21:56:15.133Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.10-beta.19/Nanna_0.3.10_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWovYWxpTW96VVpuK21GY1AyVmRmbFdTL0JxdjRveXg2bDVsVjRUd3pVUFBMZko3R29KaFRpY3J1QjRTRzFTWllqMWltMmw4QjlkS1B4SnhXYnc0M3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NzgyMTMyCWZpbGU6TmFubmFfMC4zLjEwX3g2NC1zZXR1cC5leGUKY2UxRnM4TjNNSDRiSm5HSDRVZ0xFYmNXVENtbTFBRFI5ODdlWHJERzNNbFYxd0pIbzdMZ0RMSlFXL28yUlFjNUdYQUNwZWZZRmdDUGNPRWlvN0wwQ2c9PQo="
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFxc1NIWmE0eUluczRDTXE4SE5ZdnhmUWRwNlp4WkdSbFlpTUtjd09ZckhsSmhEV3c2NkpQZjVLR2M2ZHJCMk9LQ09XMWtQaUcvZHZCcndxbDJrVWdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4OTA0NDgxCWZpbGU6TmFubmFfMC4zLjE1X3g2NC1zZXR1cC5leGUKbHNhaDFLZ1BlV0Q5dFdiUmZtY0hKYzlPa3MvUkE5WG5YcTU0SlAreDloUzBTOER0MGtBbkFsS1lzMHkzYk9KYTg3RUJ2ZW5VdnpIRzdjaWRnZHhOQlE9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.15-beta.24/Nanna_0.3.15_x64-setup.exe"
     }
   }
 }
