@@ -214,11 +214,6 @@ fn normalize_drive_paths(command: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-#[cfg(not(windows))]
-fn normalize_drive_paths(command: &str) -> std::borrow::Cow<'_, str> {
-    std::borrow::Cow::Borrowed(command)
-}
-
 /// Rewrite the small set of cmd.exe idioms that Git Bash rejects.
 ///
 /// Currently only `cd /d <path>` → `cd <path>`. `/d` is a cmd.exe-only flag
@@ -743,7 +738,8 @@ impl NannaBridge {
         // - explicit PowerShell (`$env:`, `Verb-Noun` cmdlets, `powershell`/`pwsh`) → powershell.exe
         // - everything else → Git Bash (models write POSIX/bash by default), falling
         //   back to cmd.exe only when Git Bash isn't installed.
-        let mut cmd = if cfg!(windows) {
+        #[cfg(windows)]
+        let mut cmd = {
             let trimmed = command.trim_start();
 
             // Detect `python[3] -c "..."` one-liners (route directly to avoid quote
@@ -787,7 +783,9 @@ impl NannaBridge {
                     }
                 }
             }
-        } else {
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
             let mut c = tokio::process::Command::new("sh");
             c.args(["-c", command]);
             c

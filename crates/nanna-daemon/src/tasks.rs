@@ -1414,7 +1414,7 @@ impl TaskSource for TursoTaskSource {
 }
 
 /// Runs one harness step as a fresh `Agent` with an isolated context — the
-/// re-anchor. Mirrors `AgentSpawnerImpl` construction.
+/// re-anchor.
 pub struct AgentStepRunner {
     /// Tools the model has discovered so far in THIS harness run.
     ///

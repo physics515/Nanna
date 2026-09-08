@@ -27,6 +27,10 @@ jobs:
     # pinned against (MSVC toolchain, `aegis` on the pure-Rust path, the
     # `windows-service` integration). A Linux runner would not exercise the
     # `#[cfg(windows)]` code, which is where the service layer lives.
+    #
+    # That reasoning is still correct and is why this job stays — but it is only
+    # half the picture, and the missing half was expensive. See
+    # `compile-tests-linux` below.
     runs-on: windows-latest
     # Measured: 16m12s on the first run, with a completely cold cache
     # (run 29557077493). 30 gives ~2x headroom for a dependency bump that
@@ -59,6 +63,51 @@ jobs:
       # binary (`gui/src-tauri/binaries/nanna-daemon-<triple>.exe`) and the built
       # frontend at `gui/.output/public`. Building it here would mean running the
       # full pnpm + daemon build, which is a packaging job, not a smoke check.
+      - name: Compile all test targets
+        run: cargo test --no-run --workspace --exclude nanna-gui --locked
+
+  # The mirror of the job above, and the reason it exists (2026-09-07): on Linux
+  # this workspace **did not compile at all**, and had not since the dev host
+  # moved to Linux in September. Two independent breaks, neither of which any
+  # amount of Windows CI could see:
+  #
+  #   1. `bridge.rs` selected the exec shell with `cfg!(windows)` — a *runtime*
+  #      boolean — so both arms were type-checked everywhere while the Windows
+  #      arm's helpers are `#[cfg(windows)]` and absent on Linux (5x E0425/E0433).
+  #   2. `libc >= 0.2.187` retyped `POSIX_SPAWN_SETSID` to `c_short`, which
+  #      `rustpython-vm 0.5.0` hands to a `c_int` bitflags ctor (E0308), killing
+  #      the `python` feature.
+  #
+  # Both are plain compile errors, so `--no-run` on a Linux runner would have
+  # caught each of them on the commit that introduced it. The job above cannot,
+  # by construction: a platform gate is only tested by the platform it excludes.
+  #
+  # `nanna-gui` is excluded here for the same reason as above, plus one more:
+  # the Tauri crate needs WebKitGTK system packages on Linux, which would turn a
+  # smoke check into a provisioning job. Linux GUI coverage is deliberately not
+  # claimed by this workflow.
+  compile-tests-linux:
+    name: Compile all test targets (Linux)
+    runs-on: ubuntu-latest
+    # Matches the Windows job's bound: the shared dependency graph dominates and
+    # is the same graph. Re-measure rather than raise if it starts timing out.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same pin as every other job here; keep in lockstep with
+      # rust-toolchain.toml, which carries the rationale.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-27
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-compile-linux
+
       - name: Compile all test targets
         run: cargo test --no-run --workspace --exclude nanna-gui --locked
 

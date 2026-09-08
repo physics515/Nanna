@@ -1,131 +1,74 @@
-# Nanna v0.3.12-beta.21 — Signals That Mean Something
+# Nanna v0.3.13-beta.22 — It Never Built Here
 
-A thumbs-up in Slack has been feeding Nanna's long-term memory for a while. So has a 🍕, a party hat,
-and a 💔 — all of them as *praise*. A PDF tool the README has been advertising turns out to have
-failed at every call. And the nightly routine's own test gate was, for at least one run, reporting
-green about a build it had not actually made.
-
-**This release also carries everything prepared for v0.3.11-beta.20, which was never published.**
-That version was cut into `master` and its build never dispatched, so its content ships here and its
-notes are folded in below rather than lost.
+The project moved to Linux in September. This release is the discovery that it had never actually
+compiled there — and the two-line class of mistake that hid it.
 
 ## What's New
 
-### A reaction that isn't feedback no longer counts as praise
+### The workspace did not build on Linux at all
 
-Slack `reaction_added` events already reached the memory system — that path has been live in
-`nanna serve` all along. What it did with them was the problem: the classifier matched **substrings**
-and **fell through to "positive"** for anything it did not recognise.
+`origin/master` was red on Linux before this branch touched anything. Not "had warnings", not "failed
+a test" — `cargo build --workspace` did not produce a binary. Two independent causes, both invisible
+from Windows, and neither one reachable by any amount of testing on the platform CI runs:
 
-So any unrecognised emoji applied a `Helpful` signal (+0.3 to the FSRS weight) to **every** memory the
-session had stored in the last ten minutes. A 🍕 on an answer promoted the whole batch. And because
-matching was by substring, `broken_heart` contains `heart` — so 💔 **promoted** too, the exact
-opposite of what the person meant.
+**1. A runtime `cfg!` where a compile-time `#[cfg]` was meant.** The `exec` tool picks its shell with
 
-Reactions are now classified into three states rather than two: approval, correction, or **not a
-feedback signal at all**. Nothing happens for the third, which is the honest answer to an emoji
-nobody assigned a meaning to. Matching is exact, after Slack's `::skin-tone-N` modifier is stripped —
-`thumbsup::skin-tone-6` previously matched nothing and fell through to the default.
+```rust
+let mut cmd = if cfg!(windows) { /* Git Bash / PowerShell routing */ } else { /* sh */ };
+```
 
-### The bookkeeping behind that feedback was growing without a ceiling
+`cfg!(windows)` is a *boolean expression*, not conditional compilation. It selects the right branch at
+runtime, so the behaviour was always correct — but **both arms are still type-checked on every
+platform**, and the four helpers the Windows arm calls (`strip_outer_quotes`, `classify_windows_command`,
+`git_bash_path`, `WinShell`) are `#[cfg(windows)]` and simply do not exist on Linux. Five
+`E0425`/`E0433` errors, and `nanna-scripting` — hence the `nanna` binary — could not compile.
 
-Two maps sit between a reaction and the memories it credits, and both were unbounded in practice.
+Split into `#[cfg(windows)]` / `#[cfg(not(windows))]` bindings so the Windows arm is compiled out.
+**Nothing changes on Windows:** the same branch is chosen, just earlier. Net −7/+5 lines.
 
-The memory map had two writers: one capped at 50 entries per session, and an inline copy with no cap
-at all — and the uncapped one is the one that actually runs. Its ten-minute recency filter only ran
-when somebody reacted, which on the common path nobody does, so a long-lived daemon grew it for the
-lifetime of the process.
+**2. `libc 0.2.187` broke the vendored Python runtime.** libc corrected `POSIX_SPAWN_SETSID` from
+`c_int` to `c_short` on linux-gnu — correctly, since glibc really does store spawn flags in a
+`short`. But `rustpython-vm 0.5.0` hands that constant straight to
+`nix::spawn::PosixSpawnFlags::from_bits_retain`, which `nix` types as `c_int`. E0308, and the `python`
+feature stops building.
 
-The message-link map was worse in a quieter way: its cap discarded **five thousand arbitrary entries
-at once** in hash order, so the message a person was about to react to was exactly as likely to be
-dropped as one from an hour earlier — and nothing ever expired, so it grew with uptime rather than
-with traffic.
+The fix is already upstream — RustPython PR #8343, merged 2026-07-22 — and has never been released;
+0.5.0 is still the newest crates.io version. So `libc` is held at **0.2.186**. That window is narrower
+than it looks: `rustpython-stdlib 0.5.0` itself requires `libc ^0.2.183`, leaving exactly four usable
+releases, which is why a plain `cargo update` lands outside it every single time.
 
-Both now prune by the same ten-minute attribution window, on write. That window is not a tidiness
-rule: an entry past it can only ever resolve to memories that have already expired, so dropping it
-loses nothing anything could have used. The caps survive as burst backstops, and the link map now
-evicts the oldest entry rather than a random handful.
+### A pin that can no longer be forgotten
 
-### `read_pdf` works
-
-The bundled `read_pdf` tool declared a `pdf.read` service that was never registered, so every call
-returned *"PDF reading service not available"* — while the Rust extractor behind it sat complete and
-tested, and the README listed PDF among the shipped tools. It is registered now.
-
-Registration alone would have shipped it broken in a quieter way. The tool has always been sent a
-page range (`"1-5"`, `"3"`) and has only ever read an integer page *count*, so asking for page 3 of a
-forty-page contract would have returned all forty with nothing saying the request had been dropped —
-a wrong answer that looks like a right one, which is a worse failure than a tool that plainly does
-not work. `pages` is now honoured, and refuses what it cannot read rather than guessing: `"5-2"` is
-an error, not a silently reversed range.
-
-It also gained the 10 MB ceiling `read_file` already applies, so reading a PDF is no longer a way in
-for a file the plain file reader turns away, and it reports `page_count` / `pages_read` beside the
-text so a caller can tell it did not get the whole document.
-
-### The nightly routine was grading its own homework on the wrong desk
-
-Every project on this machine shares one Cargo target directory. A neighbouring project had built a
-dependency there under a *different* Rust nightly, and the test run reported **1697 passed, 0
-failed** — then died compiling doctests with `found crate compiled by an incompatible version of
-rustc`. Nothing in Nanna was wrong. The gate was.
-
-That matters more than the wasted minutes: a run that cannot tell a genuine failure from a
-contaminated one has not earned any of the numbers it reports. The routine now pins its own target
-directory before the first build, and every figure below was re-earned from a cold one.
+The `libc` ceiling is the third dependency constraint in this repo that existed only as a note saying
+"remember to redo this after `cargo update`". The other two became a test in August; this one joins
+them now. `held_back_crates_stay_below_their_ceiling` asserts a version **ceiling** — the mirror of the
+existing single-version guard — and its failure message carries the remedy command *and* the condition
+that retires the pin, so the ceiling gets removed on purpose rather than renewed forever. It runs in
+0.00s and was verified against the real regression, not just written.
 
 ### Dependency freshness
 
-`wide 1.7`, `deno_core 0.411`, and six compatible bumps. On the frontend, `@lucide/vue 1.35`,
-`vue-router 5.3`, `@vue/test-utils 2.5`, `happy-dom 20.11.12`.
+`ocrs 0.13.0` finally shipped against `rten 0.26`, unblocking a pin that three previous runs recorded
+as "not ours to fix" — `rten 0.24 → 0.26` with zero source changes. Plus the routine sweep: `wide 1.7`,
+`playwright-rs 0.17`, `deno_core 0.411`, and on the frontend `@tiptap/* 3.31.3`, `vitest 5`,
+`@lucide/vue 1.42`, `vue-router 5.3.1`, `@playwright/test 1.63` and the Tauri plugins.
 
-A guard added last release, to stop two version pins from being a per-run habit, did its job — it
-caught the `malachite-bigint` split in 0.00 seconds instead of twenty minutes into a release build.
-But its printed fix command named a version no longer in the graph, so running it would have failed.
-The command is now derived from what the lockfile actually holds.
+## Verified
 
-## Also in this release (prepared for v0.3.11-beta.20, never published)
+On Linux, after the fixes: `cargo build --workspace --exclude nanna-gui` green ·
+`cargo test --workspace --exclude nanna-gui` **1683 passed / 0 failed / 12 ignored** across 47 test
+binaries · `cargo clippy --workspace --all-targets --exclude nanna-gui` **0 errors**, no new warnings
+in the changed regions · frontend `vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green.
 
-- **Scheduled work reached a model that no longer exists.** Every install that had never configured
-  `llm.model_priority` sent its heartbeat to a retired snapshot and got a 404 back, logged at `WARN`
-  and swallowed — so scheduled work silently never happened. The default is now the live family
-  alias. If you have a model pinned in your own config, nothing changes for you.
-- **Steering no longer looks like breakage after a reload.** A timeline rebuilt after navigating away
-  showed breaker replays as a wall of red tool errors, because the journal recorded the outcome
-  without recording why. Journals written before this release load unchanged.
-- **A panic under the run-journal lock could take the rest of the run with it.** The two writers to
-  the same journal disagreed about what a poisoned mutex means; they now share one policy.
-- **The FSRS forgetting curve's decay constant was off by one slot** — `w[19]` where `w[20]` was
-  meant, a value that sat below the reference implementation's own clamp.
+The built Linux daemon was booted against a scratch config (never the operator's): it reaches
+`Daemon ready`, serves IPC and health, answers `GET /health` with
+`{"status":"ok","version":"0.3.11","uptime_secs":1}`, handles SIGTERM cleanly, and logs **zero
+panics**. The only errors are Ollama being unreachable — it is not installed on this host — which the
+readiness-wait path handles as designed instead of burning retry budget.
 
-## Fixed
+## Known limits
 
-- Unrecognised Slack reactions promoting every recent memory; `broken_heart` promoting rather than
-  demoting; skin-toned reactions matching nothing.
-- Two unbounded maps behind reaction attribution, one of which also evicted at random.
-- `read_pdf` failing at every call, and silently ignoring the page range it was sent.
-- `read_pdf` having no input size ceiling where `read_file` has one.
-- A dependency guard printing a fix command that no longer applies.
-- (from 0.3.11) Scheduled heartbeats 404-ing on unconfigured installs; breaker replays rendering as
-  failures in a restored timeline; a journal-lock panic cascading into a stalled run; the FSRS decay
-  exponent.
-
-## Known / still open
-
-- **Reactions are the only feedback signal wired.** Corrections and tool success/failure — the
-  `UsedSuccessfully` / `CausedError` half of the model — are still unfed.
-- **Telegram and Discord cannot deliver reactions today.** Telegram needs `message_reaction` named in
-  `allowed_updates` plus admin rights in the chat; Discord needs the Gateway, which this daemon does
-  not run.
-- **`read_pdf` has no OCR fallback yet.** The hook exists and is tested, but the OCR pipeline it
-  would call is itself unregistered. Image-only pages come back empty and say so, rather than
-  pretending. Two other built-in tools are complete, exported and unreachable in the same way.
-- A heartbeat that fails on *every* attempt is still only a `WARN`.
-- The `malachite-bigint` and `rten` pins remain, both waiting on upstream.
-- TypeScript 7 stays deferred until 7.1 or a tsgo-backed `vue-tsc`.
-
-## Verification
-
-1714 workspace tests green with doctests included, from a cold, uncontaminated target directory ·
-release build of the daemon green on `nightly-2026-08-27` · clippy with no new warnings · frontend
-typecheck clean, 238 tests, production build green with four routes prerendered.
+- **The Tauri GUI on Linux is still unverified.** `cargo build` and `cargo test` are green; the desktop
+  app is not part of that claim.
+- **CI has no Linux job**, so nothing yet stops the next Windows-only assumption from landing the same
+  way. That is filed, not fixed.
