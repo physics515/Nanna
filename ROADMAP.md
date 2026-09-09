@@ -2307,6 +2307,32 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-09) Baselined first, and the premise above is wrong as stated — read this before
+      picking a crate.** `bench/BASELINE.md` Suite 3b now measures the pass. It is **not O(N²) in
+      general**: `max_cluster_memories` (64) breaks the inner loop as soon as a cluster fills, so on a
+      corpus with findable clusters `pairs` grows **linearly** (984 → 15,750 for N 1k → 16k; 0.8 →
+      15.7 ms). **Cost is governed by match density, not by N.** The quadratic regime is a store where
+      little clears the threshold — nothing fills, so every seed scans to the end — which *is* the
+      realistic shape for a long-lived, already-consolidated store. Justify and measure the ANN work
+      **on that regime**; a dense corpus will show almost no win, and a benchmark run on one would
+      make the change look pointless.
+      - [ ] Sharpen the bench's sparse arm — both arms currently produce identical `pairs` because a
+            fixed threshold clusters them the same way. A genuinely non-clustering corpus is what
+            exhibits the quadratic case the ANN work targets.
+      - [x] *(2026-09-09)* **Found while baselining: cosine similarity could not veto a merge.**
+            `composite_cluster_score`'s non-similarity terms are all maximal for the commonest pair in
+            a store (`recall_affinity` and `importance_proximity` are 1.0 by construction when the
+            values are *equal*, including `0 == 0`; `age_prox` ~1.0 within a session), pinning the
+            score at **0.50** against a **0.45** default threshold **whatever the embeddings say**.
+            Measured: orthogonal vectors 0.500, anti-correlated 0.500, four mutually unrelated
+            memories → one cluster of four. Fixed by the *default*, not the algorithm — the drift
+            fixture's own 0.65 threshold always satisfied the invariant and demands cosine ≥ 0.30;
+            the shipped default demanded 0.000. Default `cluster_threshold` 0.45 → 0.55, plus
+            `non_similarity_floor()`, `min_required_similarity()` (what a config *really* asks for)
+            and `ConsolidationConfig::validate()` to keep weights and threshold in step — this went
+            stale silently the last time the weights alone were retuned. Suite 3 numbers unmoved
+            (0.90 / 1.000 / 54 deduped / 60 → 6), and that test now asserts them exactly instead of
+            `> 0.0`, which would have passed at 30 memories as happily as at 6.
       - [ ] *(research 2026-07-24 — **corrects a load-bearing "fact"; read before picking an HNSW crate**)*
             **The `turso` crate we already pin ships native vector SQL functions.** Both this roadmap and the
             `daily-dev` Appendix C assert "Turso stores embeddings as f32 BLOBs and does **NO** vector search —

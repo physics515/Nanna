@@ -94,6 +94,39 @@ below it would paraphrase-merge genuinely distinct memories.
 
 ---
 
+## Suite 3b — Dream-time clustering (scaling)
+
+Instrument: `cargo bench -p nanna-memory --bench clustering_scaling`. Deterministic
+fixed-seed corpus (integer hash, not an RNG), MiniLM-width 384-dim vectors. The
+**`pairs` column is hardware-independent** — it counts the inner-loop iterations the
+greedy pass actually performs — so it is the number an ANN replacement must be held to
+even off the reference tier. Wall-clock is reference-tier (AMD Zen 4).
+
+*Dense* = N/20 topics, clusters fill easily. *Sparse* = every memory its own topic.
+
+| N | pairs (dense) | wall_ms (dense) | pairs (sparse) | wall_ms (sparse) |
+| --- | --- | --- | --- | --- |
+| 1,000 | 984 | 0.8 | 984 | 0.3 |
+| 2,000 | 1,968 | 1.5 | 1,968 | 0.6 |
+| 4,000 | 3,937 | 3.0 | 3,937 | 1.2 |
+| 8,000 | 7,875 | 6.7 | 7,875 | 3.3 |
+| 16,000 | 15,750 | 15.7 | 15,750 | 14.5 |
+
+*(2026-09-09, first baseline)* **This measurement corrects the roadmap's stated premise
+for the "indexed clustering" item.** The greedy pass is *not* O(N²) in general: pairs grow
+**linearly** here, because `max_cluster_memories` (64) breaks the inner loop as soon as a
+cluster fills. Cost is governed by **match density**, not by N. The quadratic regime is a
+store in which little clears the threshold — no cluster ever fills, so every seed scans to
+the end — which is the realistic shape for a long-lived store that has already been
+consolidated, and it is the case an ANN candidate set actually addresses. Justify the ANN
+work on that regime, and measure it there; a dense corpus will show almost no win.
+
+Note both columns are identical above. That is a property of the fixture, not a bug: at
+the *fixed* threshold these corpora cluster the same way. Sharpening the sparse arm into a
+genuinely non-clustering corpus is the obvious next improvement to this bench.
+
+---
+
 ## Suite 4 — Long-horizon harness (task-success @ tokens)
 
 Denominator (which evals count, tiers, pass-rate rules): [`AGENT_EVAL.md`](./AGENT_EVAL.md).
