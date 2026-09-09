@@ -104,26 +104,30 @@ even off the reference tier. Wall-clock is reference-tier (AMD Zen 4).
 
 *Dense* = N/20 topics, clusters fill easily. *Sparse* = every memory its own topic.
 
-| N | pairs (dense) | wall_ms (dense) | pairs (sparse) | wall_ms (sparse) |
-| --- | --- | --- | --- | --- |
-| 1,000 | 984 | 0.8 | 984 | 0.3 |
-| 2,000 | 1,968 | 1.5 | 1,968 | 0.6 |
-| 4,000 | 3,937 | 3.0 | 3,937 | 1.2 |
-| 8,000 | 7,875 | 6.7 | 7,875 | 3.3 |
-| 16,000 | 15,750 | 15.7 | 15,750 | 14.5 |
+| N | clusters (dense) | pairs (dense) | wall_ms (dense) | clusters (sparse) | pairs (sparse) | wall_ms (sparse) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 35 | 11,024 | 1.5 | 76 | 18,031 | 0.9 |
+| 2,000 | 60 | 30,134 | 2.6 | 95 | 43,915 | 2.2 |
+| 4,000 | 97 | 85,605 | 6.5 | 132 | 104,687 | 5.0 |
+| 8,000 | 177 | 221,970 | 15.0 | 205 | 266,985 | 12.8 |
+| 16,000 | 322 | 613,659 | 39.7 | 338 | 676,212 | 39.5 |
 
-*(2026-09-09, first baseline)* **This measurement corrects the roadmap's stated premise
-for the "indexed clustering" item.** The greedy pass is *not* O(N²) in general: pairs grow
-**linearly** here, because `max_cluster_memories` (64) breaks the inner loop as soon as a
-cluster fills. Cost is governed by **match density**, not by N. The quadratic regime is a
-store in which little clears the threshold — no cluster ever fills, so every seed scans to
-the end — which is the realistic shape for a long-lived store that has already been
-consolidated, and it is the case an ANN candidate set actually addresses. Justify the ANN
-work on that regime, and measure it there; a dense corpus will show almost no win.
+*(2026-09-09, first baseline)* Growth is **superlinear but sub-quadratic**: doubling N
+multiplies `pairs` by ~2.7 (dense, **N^1.45**) and ~2.5 (sparse, **N^1.31**), not by 4.
+`max_cluster_memories` (64) is what keeps it off N² — a seed stops scanning once its
+cluster fills — so the exponent is set by how fast clusters fill, i.e. by match density.
+Extrapolating the dense arm: **N=50k ≈ 3.2M pairs / ~0.21 s**, **N=500k ≈ 90M pairs /
+~5.8 s**. The "~50k in-RAM ceiling" is not a wall at 50k; the pass is still sub-second
+there. Size the ANN work against those numbers rather than against a feared N².
 
-Note both columns are identical above. That is a property of the fixture, not a bug: at
-the *fixed* threshold these corpora cluster the same way. Sharpening the sparse arm into a
-genuinely non-clustering corpus is the obvious next improvement to this bench.
+> **Read this before trusting an earlier number.** The first version of this table was
+> measured on the same day against the **pre-fix** `cluster_threshold` of 0.45 and
+> reported `pairs` growing *linearly* (15,750 at N=16k). That was an artifact of the
+> similarity-veto bug fixed in the same run: with the non-semantic floor (0.50) above the
+> threshold (0.45), **every** pair matched on its first comparison, so every cluster
+> filled to 64 immediately and each seed broke out after ~64 iterations. The measurement
+> was real; the system it measured was broken. The corrected numbers above are ~40× higher
+> at N=16k. A benchmark can only ever be as honest as the configuration under it.
 
 ---
 
