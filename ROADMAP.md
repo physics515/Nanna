@@ -6084,19 +6084,43 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
          - **wgpu unifies at 30.0.1** — Nanna's `nanna-gpu` and Mummu's burn-0.22-pre chain resolve
            to one version, so the dependency adds no second graphics stack. This was the real
            integration risk and it is clear.
-         - **BLOCKER:** `mummu` enables `burn/autotune` → `cubecl-core` → `cubecl-common` →
-           `cubecl-environment`'s `cache` feature → **`rusqlite 0.40` with `features = ["bundled"]`**,
-           i.e. a second SQLite statically compiled from C. `no_banned_database_crates_in_lockfile`
-           fails as soon as the dep is added and is *correct* to: the lockfile records optional deps
-           regardless of features, and `bundled` really does compile the C engine in. Not fixable
-           here — autotune is part of Mummu's parity-validated GPU config and its published decode
-           numbers. **Owner decision needed**, three ways out:
-           - [ ] Ask Mummu to make the CubeCL autotune *cache* optional (keep autotune, drop the
-                 persistence) — the cleanest, and a Mummu-side change.
-           - [ ] Narrow `dep_guard`'s ban to Nanna's own storage path, explicitly permitting a
-                 vendored GPU-autotune cache. Weakens a deliberate guard; only with eyes open.
-           - [ ] Accept losing `burn/autotune` in Nanna builds, paying Mummu's kernel-tuning
-                 performance for architectural purity.
+         - **BLOCKER: a bundled C SQLite, and it is upstream of Mummu.** Adding the dependency
+           fails `no_banned_database_crates_in_lockfile` — **`rusqlite 0.40` with
+           `features = ["bundled"]`**, i.e. a second SQLite statically compiled from C. The guard
+           is correct to fail: the lockfile records optional deps regardless of features, and
+           `bundled` really does compile the C engine in.
+           **Traced to the exact line (2026-09-09):** `cubecl-runtime`'s manifest declares
+           ```toml
+           [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.cubecl-environment]
+           features = ["cache"]
+           ```
+           — **unconditional on every desktop target, behind no feature flag of its own**, and
+           `cubecl-environment`'s `cache` feature is what pulls `dep:rusqlite`. Confirmed
+           empirically: `rusqlite` is in the lock even with `mummu = { default-features = false }`
+           (no `fusion`, no `vulkan-spirv`).
+           **Correction to an earlier note this same run:** this was first recorded as "`mummu`
+           enables `burn/autotune`, so ask Mummu to make the autotune cache optional". That
+           remediation is wrong. It is not Mummu's to disable and it is not autotune's doing —
+           `cubecl-runtime` is a core dependency of any cubecl/wgpu backend, so **every consumer of
+           burn's GPU backend on a desktop OS links a bundled C SQLite.** Turning off
+           `burn/autotune` would not remove it.
+           **Owner decision needed**, and the options are narrower than first thought:
+           - [ ] Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
+                 clear (it is a persistent autotune-results DB; CubeCL's own docs note the cache
+                 can be pre-built and shipped, so a no-DB mode is coherent). The only fix that
+                 keeps both the GPU backend and the Turso-only rule.
+           - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
+                 vendored GPU-autotune cache. Weakens a deliberate guard — do it with eyes open,
+                 and only if the owner accepts a C SQLite in the shipped binary (it also cuts
+                 against the "prefer pure-Rust, no-C" rule that chose native-tls over rustls).
+           - [ ] Ask Mummu to make its **GPU stack optional** so a CPU-only consumer can avoid
+                 cubecl entirely. Checked, and this does *not* work today: `burn-cubecl`, `cubecl`,
+                 `cubecl-runtime` and `wgpu` are all **non-optional** dependencies of the `mummu`
+                 crate (only `fusion`/`vulkan-spirv`/`cuda`/`jinja-template`/`flamegraph` are
+                 features), so `default-features = false` still links rusqlite. Worth asking for
+                 regardless, because the roadmap's own first local consumer — the MiniLM embedder —
+                 is CPU-only (`burn-flex`), so a `gpu` feature on Mummu would unblock P12 item 4
+                 (local embeddings) without waiting on item 5 or on upstream CubeCL.
    - [x] **`[infer]` config surface** — *(2026-09-09)* landed in `nanna-config::infer`: `enabled`,
          `model`, `embedding_model`, `models_root`, `device` (auto/gpu/cpu), `precision`
          (auto/f16/f32), `vram_budget_bytes`, plus `LocalPlan` — the boot-time decision
