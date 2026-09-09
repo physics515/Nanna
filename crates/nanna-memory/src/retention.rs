@@ -1078,6 +1078,32 @@ mod tests {
         );
         assert!(report.compression_ratio() > 0.0);
 
+        // The committed baseline (`bench/BASELINE.md`, Suite 3) is described
+        // there as "deterministic, offline, fixed-seed — exact, reproducible
+        // values, not timing samples". Assert it as exactly that. Bounds alone
+        // let the recorded numbers drift out from under the file that quotes
+        // them: every assertion above passes just as happily at 30 memories as
+        // at 6, so a change that halved compression would still look green.
+        assert!(
+            (report.compression_ratio() - 0.90).abs() < 1e-6,
+            "BASELINE.md records compression 0.90, measured {}",
+            report.compression_ratio()
+        );
+        assert_eq!(
+            (report.before.memory_count, report.after.memory_count),
+            (60, 6),
+            "BASELINE.md records 60 -> 6 memories"
+        );
+        assert_eq!(
+            result.memories_deduped, 54,
+            "BASELINE.md records memories_deduped: 54"
+        );
+        assert_eq!(
+            result.clusters_formed, 0,
+            "BASELINE.md records clusters_formed: 0 — phase (b) folds this corpus \
+             deterministically and the summarizer is never called"
+        );
+
         // And recall must be fully retained — same-topic merges keep the topic
         // reachable at its centroid.
         assert!(
