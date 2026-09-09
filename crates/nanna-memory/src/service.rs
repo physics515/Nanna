@@ -1882,6 +1882,17 @@ impl MemoryService {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: Future<Output = Result<String, String>> + Send,
     {
+        // Refuse a config in which cosine similarity cannot veto a merge —
+        // see `ConsolidationConfig::validate`. Checked here, at the entry
+        // point, because this is the one place every dream path funnels
+        // through (scheduled cycle and the IPC `Consolidate` handler both
+        // reach it via `DreamingService`), and because consolidation rewrites
+        // memories: under a bad config it replaces unrelated entries with one
+        // gist, which no later warning can undo.
+        config
+            .validate()
+            .map_err(MemoryError::InvalidClusteringConfig)?;
+
         let mut result = ConsolidationResult::default();
         let total_memories = self.count().await;
 
@@ -3192,6 +3203,69 @@ mod tests {
         );
         assert!(merged.starts_with(&existing), "and so must the existing one");
         assert_eq!(merged.len(), existing.len() + 2 + incoming.len());
+    }
+
+    /// A clustering config in which cosine similarity has no veto must be
+    /// refused **before** anything is rewritten, not warned about after.
+    #[tokio::test]
+    async fn consolidate_refuses_a_config_that_cannot_tell_memories_apart() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        for i in 0..8 {
+            service
+                .remember(&format!("memory number {i}"), Default::default())
+                .await
+                .expect("seed");
+        }
+        let before = service.count().await;
+
+        // The exact configuration that shipped before 2026-09-09: a 0.45
+        // threshold under a 0.50 non-semantic floor.
+        let broken = ConsolidationConfig {
+            cluster_threshold: 0.45,
+            min_remaining_memories: 1,
+            max_compression_ratio: 0.9,
+            ..ConsolidationConfig::default()
+        };
+
+        let err = service
+            .consolidate(&broken, |_p| async { Ok(String::from("gist")) })
+            .await
+            .expect_err("a config with no semantic veto must be refused");
+        assert!(
+            matches!(err, MemoryError::InvalidClusteringConfig(_)),
+            "wrong variant: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("cluster_threshold"),
+            "the refusal must name the knob to change: {err}"
+        );
+        assert_eq!(
+            service.count().await,
+            before,
+            "refusing must not have rewritten or removed anything"
+        );
+
+        // And the shipped default is accepted on the same store.
+        service
+            .consolidate(
+                &ConsolidationConfig {
+                    min_remaining_memories: 1,
+                    max_compression_ratio: 0.9,
+                    ..ConsolidationConfig::default()
+                },
+                |_p| async { Ok(String::from("gist")) },
+            )
+            .await
+            .expect("the shipped default must satisfy its own invariant");
     }
 
     #[tokio::test]
