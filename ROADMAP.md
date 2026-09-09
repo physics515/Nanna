@@ -2617,11 +2617,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       0.55 threshold. Reaching the field's 0.7 with the shipped weights would need
       `cluster_threshold = 0.85` (0.65 → 0.30, 0.75 → 0.50, 0.85 → 0.70), or a rebalance that
       lowers the floor instead.
-      **Do not just turn the knob** — pick the target with the retention harness, which is built for
-      exactly this: raising the bar trades compression for fidelity, and Suite 3 measures both
-      (compression 0.90 / recall 1.000 today). Run the sweep and record the curve; note that the
-      current fixture is folded entirely by phase (b) (`clusters_formed: 0`), so it will show *no*
-      sensitivity to the clustering threshold and a new fixture is needed to see the trade at all.
+      **Do not just turn the knob** — pick the target with the retention harness: raising the bar
+      trades compression for fidelity, and Suite 3 measures both (compression 0.90 / recall 1.000).
+      - [x] *(2026-09-09)* **The missing instrument now exists.** Suite 3's corpus could not measure
+            this at all — its members sit at cosine ~0.999, above the `Reinforce` line, so phase (b)
+            folds them and `clusters_formed` is 0 regardless of the threshold. `CorpusParams` gained
+            `member_spread` (default 0.02 — every existing fixture unchanged); widening it to 0.6
+            drops within-topic similarity between the clustering bar and the dedup bar, so pairs
+            must go through `cluster_memories`. `the_clustering_threshold_is_a_measurable_lever`
+            pins that the lever responds: threshold **0.55 → 2 clusters, 32 → 18 memories**;
+            **0.75 → 2 clusters, 32 → 18**; **0.95 (demands cosine 0.90) → 0 clusters, 32 → 32**,
+            no compression at all. The discriminating range for that corpus is 0.75..0.95.
+      - [ ] Now run the real sweep on a corpus shaped like a **live** store and record the
+            compression-vs-fidelity curve, then choose the default from it. Note the test above pins
+            the *instrument*, deliberately not a tuning target — it asserts monotonicity and the two
+            extremes, so it will not fight a future retune.
       Sources: [Memory in the Age of AI Agents](https://arxiv.org/pdf/2512.13564),
       [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
