@@ -41,7 +41,7 @@ pub fn legacy_clawd_project_dirs() -> Option<ProjectDirs> {
 }
 
 
-pub use bind::{LOOPBACK_HOST, is_loopback_host};
+pub use bind::{DEFAULT_IPC_PORT, LOOPBACK_HOST, default_daemon_ws_url, is_loopback_host};
 pub use credentials::{
     ClaudeCredentialManager, CredentialError, CredentialSource, LoadedCredential, OAuthCredential,
     SecureStore, resolve_anthropic_oauth,
