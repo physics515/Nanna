@@ -108,14 +108,26 @@ pub struct ConsolidationConfig {
 impl Default for ConsolidationConfig {
     fn default() -> Self {
         Self {
-            // 0.55, not 0.45 — see [`ClusteringWeights::non_similarity_floor`]
-            // and [`ConsolidationConfig::validate`]. At 0.45 the shipped
-            // weights let a pair clear this bar on non-semantic terms ALONE
-            // (their floor is 0.50), so semantic dissimilarity could not veto a
-            // merge and two orthogonal memories clustered. 0.55 restores the
-            // veto; the value is the floor plus a margin, and `validate()` is
-            // what keeps the two in step rather than this comment.
-            cluster_threshold: 0.55,
+            // 0.75, and both digits are measured — see
+            // [`ClusteringWeights::non_similarity_floor`],
+            // [`ConsolidationConfig::validate`] and the
+            // `clustering_threshold_sweep` bench.
+            //
+            // The old 0.45 was below the shipped weights' non-semantic floor
+            // (0.50), so a pair cleared this bar on non-semantic terms ALONE:
+            // semantic dissimilarity could not veto a merge and two orthogonal
+            // memories clustered. Anything above 0.50 restores the veto.
+            //
+            // 0.75 rather than the bare minimum because the sweep says the
+            // range is free: 0.55, 0.65 and 0.75 produce *identical* outcomes
+            // on the loose corpus (3 clusters, 27 merged, compression 0.450,
+            // recall 1.000) while the cosine each actually demands rises
+            // 0.10 → 0.30 → 0.50. Taking the top of the flat range buys a 5×
+            // stricter semantic bar at zero measured cost. Above it the trade
+            // becomes real: 0.85 (cosine 0.70, the bar the 2026 literature
+            // uses) drops compression to 0.383 — still at recall 1.000 — and
+            // 0.95 stops clustering entirely.
+            cluster_threshold: 0.75,
             min_cluster_size: 2,
             max_cluster_memories: DEFAULT_MAX_CLUSTER_MEMORIES,
             max_cluster_content_bytes: DEFAULT_MAX_CLUSTER_CONTENT_BYTES,

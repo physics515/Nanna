@@ -19,3 +19,7 @@ nanna-gpu = { path = "../nanna-gpu" }
 [[bench]]
 name = "clustering_scaling"
 harness = false
+
+[[bench]]
+name = "clustering_threshold_sweep"
+harness = false

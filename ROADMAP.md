@@ -2628,10 +2628,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             pins that the lever responds: threshold **0.55 → 2 clusters, 32 → 18 memories**;
             **0.75 → 2 clusters, 32 → 18**; **0.95 (demands cosine 0.90) → 0 clusters, 32 → 32**,
             no compression at all. The discriminating range for that corpus is 0.75..0.95.
-      - [ ] Now run the real sweep on a corpus shaped like a **live** store and record the
-            compression-vs-fidelity curve, then choose the default from it. Note the test above pins
-            the *instrument*, deliberately not a tuning target — it asserts monotonicity and the two
-            extremes, so it will not fight a future retune.
+      - [x] *(2026-09-09)* **Sweep run and priced — `bench/BASELINE.md` Suite 3c.**
+            **0.55 → 0.75 is free**: identical clusters/merges/compression (0.450) and recall
+            (1.000) while the cosine actually demanded rises 0.10 → 0.30 → **0.50**. Default moved
+            to **0.75**, the top of that flat range — a 5× stricter semantic bar at zero measured
+            cost. The control arm (tight corpus, folded by phase (b)) is flat at every threshold,
+            which is what validates the instrument.
+            **The remaining move is priced, not free:** 0.85 (cosine **0.70**, the θ_sim the 2026
+            literature uses) costs compression 0.450 → 0.383 — a 15% relative drop — at recall
+            **1.000**. Recall never moves anywhere in the sweep, so this trades compression against
+            merge *precision*, not retrievability.
+      - [ ] **Owner call: spend that 15% for the literature's 0.70 bar?** The number is no longer
+            the unknown; what is unknown is whether these synthetic corpora represent a live store.
+            Re-run Suite 3c against a real memory dump before deciding.
       Sources: [Memory in the Age of AI Agents](https://arxiv.org/pdf/2512.13564),
       [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
