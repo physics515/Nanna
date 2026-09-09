@@ -2604,6 +2604,26 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             2026-07-25 (`search_by_embedding_sql`) is the near-term path for the RAM-ceiling win, and an
             **external pure-Rust HNSW crate** (`hnsw_rs`/`hnswlib-rs` above) remains the only route to
             *approximate* indexing — do not block on a turso release for it.
+- [ ] *(research 2026-09-09 — grades the similarity-veto fix landed the same run)* **Our semantic bar
+      is 0.10; the field's is ~0.7. Restoring the veto was necessary, not sufficient.**
+      The 2026 agent-memory literature reports the failure mode we hit almost verbatim — a
+      clustering similarity threshold that is "too low" causes *"semantically unrelated interactions
+      [to] merge incorrectly"*, while too high fragments related ones — and settles around
+      **θ_sim ≈ 0.7** for clustering, **τ ≈ 0.85** for merge decisions, and **0.92** for
+      near-identical facts. That last number is exactly the `IngestAction::Reinforce` bar dream
+      phase (b) already folds at, which is a good independent check that our *dedup* line is right.
+      Our *clustering* line is not: after this run's fix the composite still only demands
+      `min_required_similarity() = 0.10`, because the non-semantic floor (0.50) eats most of the
+      0.55 threshold. Reaching the field's 0.7 with the shipped weights would need
+      `cluster_threshold = 0.85` (0.65 → 0.30, 0.75 → 0.50, 0.85 → 0.70), or a rebalance that
+      lowers the floor instead.
+      **Do not just turn the knob** — pick the target with the retention harness, which is built for
+      exactly this: raising the bar trades compression for fidelity, and Suite 3 measures both
+      (compression 0.90 / recall 1.000 today). Run the sweep and record the curve; note that the
+      current fixture is folded entirely by phase (b) (`clusters_formed: 0`), so it will show *no*
+      sensitivity to the clustering threshold and a new fixture is needed to see the trade at all.
+      Sources: [Memory in the Age of AI Agents](https://arxiv.org/pdf/2512.13564),
+      [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
       `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
