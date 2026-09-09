@@ -3673,10 +3673,24 @@ asks permission or restricts her.)*:
 - [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
-- [ ] **Doctor probes** — health checks report availability, not root cause. Add config validation, provider
-      connectivity / API-key probes, Ollama reachability, tools-dir checks with fix suggestions. Our own
-      history (loopback stream faults misread as provider 502s → restart spirals) is exactly the failure class
-      a self-diagnosing always-on daemon must catch.
+- [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
+      stream faults misread as provider 502s → restart spirals) is exactly the failure class a
+      self-diagnosing always-on daemon must catch.
+      - [x] *(2026-09-09)* **`nanna doctor` — the offline leg.** `src/commands/doctor.rs`: six checks
+            (config file, clustering invariant, `[infer]`, server bind exposure, tools dir, embedding
+            provider), each carrying a **remedy**, not just a verdict — that is the whole difference
+            from `status`. Exits non-zero on a failure so it is usable from a script or a health
+            probe. Verified on the real binary: a bad `[tools].tools_dir` reports `FAIL` with the fix
+            and `EXIT=1`; the shipped defaults report clean. 7 tests, one of which asserts the
+            *invariant* that no non-ok check may ship without a remedy.
+            Nice side effect: the clustering row prints the **effective** semantic bar
+            (`a merge needs cosine >= 0.10`) rather than `cluster_threshold`, which reads higher than
+            what it actually demands — so the gap the research item describes is visible to an
+            operator without reading the source.
+      - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
+            Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
+            reasons that are not configuration, so mixing them means a laptop with no internet
+            reports its config as broken. Give them their own flag (`--probe`/`--online`).
 
 **D. Agent quality-of-life** (cheap, high-leverage; several pairs share infrastructure — build together):
 - [ ] **Instruction skills + slash macros** — tools are executable-only; there's no packaged *procedure* the

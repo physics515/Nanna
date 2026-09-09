@@ -66,6 +66,12 @@ enum Commands {
     /// Show configuration status
     Status,
 
+    /// Diagnose configuration problems and say how to fix each one.
+    ///
+    /// Offline: no provider, network or keyring probe runs, so this is safe and
+    /// fast anywhere. Exits non-zero when a check fails.
+    Doctor,
+
     /// Start the HTTP server
     Server {
         /// Host to bind to. Defaults to loopback; pass `0.0.0.0` to expose the
@@ -297,6 +303,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Status) => {
             onboarding::show_status(&config)?;
+            return Ok(());
+        }
+        Some(Commands::Doctor) => {
+            let path = Config::default_config_path()?;
+            let checks = commands::doctor::run_checks(&config, &path);
+            let worst = commands::doctor::report(&checks);
+            // Non-zero on a real fault so this is usable from a script or a
+            // health probe, not just by eye.
+            if worst == commands::doctor::Severity::Fail {
+                std::process::exit(1);
+            }
             return Ok(());
         }
         Some(Commands::Config { generate }) => {
