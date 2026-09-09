@@ -97,37 +97,45 @@ below it would paraphrase-merge genuinely distinct memories.
 ## Suite 3b — Dream-time clustering (scaling)
 
 Instrument: `cargo bench -p nanna-memory --bench clustering_scaling`. Deterministic
-fixed-seed corpus (integer hash, not an RNG), MiniLM-width 384-dim vectors. The
-**`pairs` column is hardware-independent** — it counts the inner-loop iterations the
+fixed-seed corpus (integer hash / xorshift, not an RNG), MiniLM-width 384-dim vectors.
+The **`pairs` column is hardware-independent** — it counts the inner-loop iterations the
 greedy pass actually performs — so it is the number an ANN replacement must be held to
 even off the reference tier. Wall-clock is reference-tier (AMD Zen 4).
 
-*Dense* = N/20 topics, clusters fill easily. *Sparse* = every memory its own topic.
+*Dense* = N/20 tight topics, so clusters fill. *Sparse* = mutually unrelated unit vectors
+(expected cosine 0, sd ~1/√384 ≈ 0.051), so nothing clears the bar and no cluster fills.
 
 | N | clusters (dense) | pairs (dense) | wall_ms (dense) | clusters (sparse) | pairs (sparse) | wall_ms (sparse) |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1,000 | 35 | 11,024 | 1.5 | 76 | 18,031 | 0.9 |
-| 2,000 | 60 | 30,134 | 2.6 | 95 | 43,915 | 2.2 |
-| 4,000 | 97 | 85,605 | 6.5 | 132 | 104,687 | 5.0 |
-| 8,000 | 177 | 221,970 | 15.0 | 205 | 266,985 | 12.8 |
-| 16,000 | 322 | 613,659 | 39.7 | 338 | 676,212 | 39.5 |
+| 1,000 | 35 | 11,024 | 1.4 | 133 | 38,226 | 1.6 |
+| 2,000 | 60 | 30,134 | 2.7 | 179 | 95,301 | 3.9 |
+| 4,000 | 97 | 85,605 | 6.3 | 271 | 274,517 | 10.4 |
+| 8,000 | 177 | 221,970 | 16.1 | 449 | 998,944 | 37.2 |
+| 16,000 | 322 | 613,659 | 38.9 | 796 | 4,425,658 | 217.8 |
 
-*(2026-09-09, first baseline)* Growth is **superlinear but sub-quadratic**: doubling N
-multiplies `pairs` by ~2.7 (dense, **N^1.45**) and ~2.5 (sparse, **N^1.31**), not by 4.
-`max_cluster_memories` (64) is what keeps it off N² — a seed stops scanning once its
-cluster fills — so the exponent is set by how fast clusters fill, i.e. by match density.
-Extrapolating the dense arm: **N=50k ≈ 3.2M pairs / ~0.21 s**, **N=500k ≈ 90M pairs /
-~5.8 s**. The "~50k in-RAM ceiling" is not a wall at 50k; the pass is still sub-second
-there. Size the ANN work against those numbers rather than against a feared N².
+*(2026-09-09, first baseline)* **The two regimes are the finding.** Cost is governed by
+**match density**, not by N:
+
+- **Dense** — `max_cluster_memories` (64) breaks the inner loop as soon as a cluster
+  fills, holding growth to **N^1.45** (doubling factors 2.7). 16k memories cluster in 39 ms.
+- **Sparse** — nothing fills, so every seed scans to the end and the bound never engages.
+  Doubling factors climb **2.49 → 2.88 → 3.64 → 4.43**, i.e. converging on quadratic and
+  reaching **N^2.15** at the top of the range. 16k memories take **218 ms and 4.4M pairs**
+  — 7.2× the pairs and 5.6× the wall of the dense arm at the same N.
+
+Extrapolating the sparse arm at N^2.15: **50k ≈ 51M pairs / ~2.5 s**, **200k ≈ 1.0B pairs /
+~49 s**, **500k ≈ 7.2B pairs / ~6 min**. *That* is the wall the indexed-clustering item is
+for, and the sparse regime is the realistic shape for a long-lived personal store that has
+already been consolidated — the leftovers are precisely the memories that did not merge.
+Benchmark the ANN work on the sparse arm; the dense arm cannot show a win.
 
 > **Read this before trusting an earlier number.** The first version of this table was
-> measured on the same day against the **pre-fix** `cluster_threshold` of 0.45 and
-> reported `pairs` growing *linearly* (15,750 at N=16k). That was an artifact of the
-> similarity-veto bug fixed in the same run: with the non-semantic floor (0.50) above the
-> threshold (0.45), **every** pair matched on its first comparison, so every cluster
-> filled to 64 immediately and each seed broke out after ~64 iterations. The measurement
-> was real; the system it measured was broken. The corrected numbers above are ~40× higher
-> at N=16k. A benchmark can only ever be as honest as the configuration under it.
+> measured the same day against the **pre-fix** `cluster_threshold` of 0.45 and reported
+> `pairs` growing *linearly* (15,750 at N=16k). That was an artifact of the similarity-veto
+> bug fixed in the same run: with the non-semantic floor (0.50) above the threshold (0.45),
+> **every** pair matched on its first comparison, so every cluster filled to 64 immediately
+> and each seed broke out after ~64 iterations. The measurement was real; the system under
+> it was broken. A benchmark is only as honest as the configuration beneath it.
 
 ---
 

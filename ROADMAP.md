@@ -2307,23 +2307,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
-      **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b.** Growth is **superlinear but
-      sub-quadratic**: doubling N multiplies `pairs` by ~2.7 (dense, **N^1.45**) and ~2.5 (sparse,
-      **N^1.31**), not by 4. `max_cluster_memories` (64) is what keeps it off N² — a seed stops
-      scanning once its cluster fills — so the exponent is set by how fast clusters fill, i.e. by
-      **match density**. Extrapolated: **N=50k ≈ 3.2M pairs / ~0.21 s**, **N=500k ≈ 90M pairs /
-      ~5.8 s**. So the "~50k in-RAM ceiling" is *not* a wall at 50k — the pass is still sub-second
-      there. Size the ANN work against those numbers, and justify it on the sparse regime (a store
-      that has already been consolidated, where little clusters), not on a feared N².
-      **Correction, same run:** an earlier reading of this bench claimed the pass was *linear* and
-      that the O(N²) premise was simply wrong. That was an artifact of the similarity-veto bug
-      below — with the non-semantic floor (0.50) above the old threshold (0.45), every pair matched
-      on first comparison, every cluster filled to 64 instantly, and each seed broke out after ~64
-      iterations. Corrected numbers are ~40× higher at N=16k. The original premise was closer to
-      right than that first measurement suggested.
-      - [ ] Sharpen the bench's sparse arm — both arms currently produce identical `pairs` because a
-            fixed threshold clusters them the same way. A genuinely non-clustering corpus is what
-            exhibits the quadratic case the ANN work targets.
+      **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
+      the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
+      `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
+      (mutually unrelated vectors, nothing fills, every seed scans to the end): doubling factors
+      climb 2.49 → 2.88 → 3.64 → **4.43**, i.e. **N^2.15**, and 16k memories cost **4.4M pairs /
+      218 ms** — 7.2× the pairs of the dense arm at the same N. Extrapolated: **50k ≈ 51M pairs /
+      ~2.5 s**, **200k ≈ 1.0B / ~49 s**, **500k ≈ 7.2B / ~6 min**. That is the real wall, and the
+      sparse regime is the realistic shape for a long-lived already-consolidated store — the
+      leftovers are exactly the memories that did not merge. **Benchmark the ANN work on the
+      sparse arm; the dense arm cannot show a win.**
+      *(Correction, same run: an earlier reading of this bench claimed the pass was linear and the
+      O(N²) premise wrong. That was an artifact of the similarity-veto bug below — with the floor
+      0.50 above the old 0.45 threshold every pair matched immediately, every cluster filled at 64,
+      and each seed broke out after ~64 iterations. The premise was right; the first measurement
+      was taken on a broken system.)*
       - [x] *(2026-09-09)* **Found while baselining: cosine similarity could not veto a merge.**
             `composite_cluster_score`'s non-similarity terms are all maximal for the commonest pair in
             a store (`recall_affinity` and `importance_proximity` are 1.0 by construction when the

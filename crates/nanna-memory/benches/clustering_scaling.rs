@@ -62,14 +62,50 @@ fn vector_for(topic: usize, index: usize, spread: f32) -> Vec<f32> {
     v
 }
 
-fn corpus(count: usize, topics: usize, spread: f32) -> Vec<MemoryEntry> {
+/// A deterministic pseudo-random unit vector, unrelated to every other one.
+///
+/// Two independent unit vectors in 384 dimensions have expected cosine 0 with
+/// standard deviation ~1/sqrt(384) ≈ 0.051, so essentially none of them clear
+/// the semantic bar the shipped config demands. That is what makes this the
+/// *sparse* corpus: no cluster ever fills, so `max_cluster_memories` never
+/// breaks the inner loop and every seed scans to the end — the quadratic
+/// regime an ANN candidate set is meant to remove.
+fn unrelated_vector(index: usize) -> Vec<f32> {
+    // xorshift over a per-(index, dim) seed: reproducible on any host, and
+    // enough decorrelation between indices to keep the vectors independent.
+    let mut v = Vec::with_capacity(DIM);
+    let mut norm_sq = 0.0f32;
+    for d in 0..DIM {
+        let mut x = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (d as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        let f = (x % 2_000_000) as f32 / 1_000_000.0 - 1.0; // -1.0 ..= 1.0
+        norm_sq += f * f;
+        v.push(f);
+    }
+    let norm = norm_sq.sqrt().max(f32::MIN_POSITIVE);
+    for x in &mut v {
+        *x /= norm;
+    }
+    v
+}
+
+fn corpus(count: usize, topics: usize, spread: f32, related: bool) -> Vec<MemoryEntry> {
     (0..count)
         .map(|i| {
             let topic = i % topics;
             MemoryEntry {
                 id: format!("m{i}"),
                 content: format!("memory {i} about topic {topic}"),
-                embedding: vector_for(topic, i, spread),
+                embedding: if related {
+                    vector_for(topic, i, spread)
+                } else {
+                    unrelated_vector(i)
+                },
                 embedding_model: None,
                 embeddings: HashMap::new(),
                 metadata: HashMap::new(),
@@ -145,15 +181,15 @@ fn main() {
         (8_000, 400),
         (16_000, 800),
     ] {
-        run_case(count, topics, 0.25, &config);
+        run_case(count, topics, 0.25, true, &config);
     }
 
     // SPARSE: every memory is its own topic, so almost nothing clears the
     // threshold, no cluster ever fills, and each seed scans to the end. This
     // is the quadratic regime — and the one an ANN candidate set removes.
-    println!("\n-- sparse: every memory its own topic (nothing clusters) --");
+    println!("\n-- sparse: mutually unrelated vectors (nothing clusters) --");
     for &count in &[1_000usize, 2_000, 4_000, 8_000, 16_000] {
-        run_case(count, count, 0.25, &config);
+        run_case(count, count, 0.25, false, &config);
     }
 
     println!(
@@ -168,8 +204,8 @@ fn main() {
 }
 
 /// Time one corpus shape and print its row.
-fn run_case(count: usize, topics: usize, spread: f32, config: &ConsolidationConfig) {
-    let memories = corpus(count, topics, spread);
+fn run_case(count: usize, topics: usize, spread: f32, related: bool, config: &ConsolidationConfig) {
+    let memories = corpus(count, topics, spread, related);
     let pairs = pairs_considered(&memories, config);
 
     let start = Instant::now();
