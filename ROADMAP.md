@@ -5560,6 +5560,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
+           (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
+           target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
+           tokio codegen ICE and no `turso_core` depth overflow. Full gate re-run under the new
+           channel (1751 tests, clippy 0 errors), and the mirrored `toolchain:` inputs in
+           `budget-gate.yml`, `test-compile.yml` and `release-check.yml` moved with it.
+           **Caveat recorded in the pin comment:** the channel does not control cargo's
+           build-script output layout, which is what breaks the Tauri GUI build on Linux — moving
+           the pin neither caused nor fixes that.
      - [ ] *(re-checked 2026-09-09, no re-attempt)* TypeScript 7 still blocked and **cheaply
            confirmed without burning another migration**: npm `typescript` latest is still 7.0.2
            (no 7.1) and `vue-tsc` is still 3.3.11 — byte-identical to the state that failed on
