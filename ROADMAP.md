@@ -5413,6 +5413,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
+     - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
+           --incompatible` now reports lopdf's "latest" as 0.42.0 while 0.45 is what the req holds
+           and what builds. Two crates showing this means it is a pattern, not a one-off — treat
+           any `--incompatible` row whose "latest" is *lower* than the current req as a registry
+           artifact and verify before taking it.
+     - [x] *(2026-09-09 sweep)* `cargo update` → 10 compatible bumps (`encoding_rs 0.8.41`,
+           `hybrid-array 0.4.15`, `multiversion 0.8→0.9`, `reqwest 0.13.5`, `tantivy 0.26.2`,
+           `zerocopy 0.8.57`, `target-features` dropped) and **`playwright-rs 0.17 → 0.18`**
+           (major; compiled unchanged). Both held-back crates re-asserted themselves and were
+           pinned back. The libc one is worth recording: **`cargo upgrade -p playwright-rs
+           --incompatible` runs a recursive dependency upgrade that moved `libc` to 0.2.189 as a
+           side effect**, and `held_back_crates_stay_below_their_ceiling` caught it — the ceiling
+           was re-broken by a command with nothing to do with libc, which is exactly the case a
+           remembered pin would have missed. Re-checked both retirement conditions: rustpython-
+           {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
+           GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [ ] *(re-checked 2026-09-09, no re-attempt)* TypeScript 7 still blocked and **cheaply
+           confirmed without burning another migration**: npm `typescript` latest is still 7.0.2
+           (no 7.1) and `vue-tsc` is still 3.3.11 — byte-identical to the state that failed on
+           2026-08-27. Check those two version numbers before ever re-trying; if neither moved,
+           the `ERR_PACKAGE_PATH_NOT_EXPORTED` failure is guaranteed.
    - **`libc` must stay at or below 0.2.186 — above it the workspace does not build on Linux at all**
      *(2026-09-07)*. `libc 0.2.187` corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on
      linux-gnu (glibc genuinely stores spawn flags in a `short`, so libc is right). But
@@ -6021,11 +6042,51 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    MiniLM-class CPU sentence embedder; and `plan::pick_precision` for VRAM-aware dtype choice.
    Runner code still must NOT be written in this repo — but the *consumer glue* is now the real work,
    and it is no longer blocked:
-   - [ ] **Take Mummu as a dependency** — decide git-rev pin vs path dep, and land the `[infer]`
-         config surface (model id, device preference, precision override). A rev pin is the honest
-         default while Mummu is pre-release: it is the same reproducibility argument as the boa git
-         rev and the exact `turso`/`aegis` pins. Budget the build cost first — `burn` + `wgpu` +
-         CubeCL is a large cold compile, and `nanna-gui` already needs a sidecar and a built frontend.
+   - [~] **Take Mummu as a dependency** — *(2026-09-09)* **config surface landed; the dependency
+         itself is BLOCKED on a bundled C SQLite.** All three questions the item asked are now
+         answered with measurements rather than guesses:
+         - **Pin:** git rev. Mummu is public, so CI needs no credentials, and a rev is the same
+           reproducibility lever as the boa pin. A path dep would build only where the sibling
+           checkout happens to exist. (Rev verified to build: `e7e430c`.)
+         - **Build cost — cheaper than the item feared.** Cold, isolated, 4 jobs, `debug=0`:
+           **384 crates / 1m19s / 1.7 GB** with `default-features = false`, **1m46s / 2.3 GB** with
+           mummu's defaults (`fusion` + `vulkan-spirv`). Linked into this workspace: **74s**. The
+           "large cold compile" warning does not hold on this host.
+         - **wgpu unifies at 30.0.1** — Nanna's `nanna-gpu` and Mummu's burn-0.22-pre chain resolve
+           to one version, so the dependency adds no second graphics stack. This was the real
+           integration risk and it is clear.
+         - **BLOCKER:** `mummu` enables `burn/autotune` → `cubecl-core` → `cubecl-common` →
+           `cubecl-environment`'s `cache` feature → **`rusqlite 0.40` with `features = ["bundled"]`**,
+           i.e. a second SQLite statically compiled from C. `no_banned_database_crates_in_lockfile`
+           fails as soon as the dep is added and is *correct* to: the lockfile records optional deps
+           regardless of features, and `bundled` really does compile the C engine in. Not fixable
+           here — autotune is part of Mummu's parity-validated GPU config and its published decode
+           numbers. **Owner decision needed**, three ways out:
+           - [ ] Ask Mummu to make the CubeCL autotune *cache* optional (keep autotune, drop the
+                 persistence) — the cleanest, and a Mummu-side change.
+           - [ ] Narrow `dep_guard`'s ban to Nanna's own storage path, explicitly permitting a
+                 vendored GPU-autotune cache. Weakens a deliberate guard; only with eyes open.
+           - [ ] Accept losing `burn/autotune` in Nanna builds, paying Mummu's kernel-tuning
+                 performance for architectural purity.
+   - [x] **`[infer]` config surface** — *(2026-09-09)* landed in `nanna-config::infer`: `enabled`,
+         `model`, `embedding_model`, `models_root`, `device` (auto/gpu/cpu), `precision`
+         (auto/f16/f32), `vram_budget_bytes`, plus `LocalPlan` — the boot-time decision
+         `Provider::Local` reads. Model names are Mummu **catalog** names, not HF repo ids, so a
+         reference stays pinned to a repo + revision. 14 tests. Two deliberate calls: the decision
+         logic lives in `nanna-config` rather than behind a `nanna-llm` feature, because CI runs
+         `cargo test --no-run --workspace` with **default features only** and a feature-gated
+         decision table would never be compiled or tested; and Nanna does **not** re-derive VRAM
+         policy — `vram_budget_bytes` is an override forwarded verbatim, with
+         `DeviceBudget::usable_bytes()` left owning the display's share.
+   - [ ] **`InferPrecision::Auto` cannot choose f16 on Linux, and this is Mummu's gap to close.**
+         *(2026-09-09)* `plan::pick_precision` needs a `DeviceBudget`, which comes from
+         `GpuAdapter::vram_bytes` — populated **only** by Mummu's Windows DXGI walk.
+         `backend::vram_by_adapter_name()` returns an empty vec on Linux/macOS (its own comment
+         marks Vulkan memory heaps a P6 follow-up) and `video_memory()` returns `None`, so
+         `DeviceBudget::from_adapter` is `None` and the planner correctly refuses to guess. Nanna
+         handles it honestly (`PrecisionReason::Unsized` announces the remedy rather than silently
+         serving f32), but the fix belongs in Mummu: **size VRAM from Vulkan memory heaps**. File
+         it there — a silent f32 fallback reads as a Mummu perf regression, not a platform gap.
    - [ ] **Back the memory `embed_fn` with Mummu's MiniLM embedder** (P12 item 4) — this is the
          lowest-risk first consumer: CPU-only, no VRAM budget to negotiate, and it removes the last
          API dependency from the memory path. Mind the **embedding-dimension latch** (see the stale
