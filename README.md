@@ -149,6 +149,22 @@ sudo dpkg -i nanna_x.y.z_amd64.deb
 
 ## Troubleshooting
 
+### Start here: `nanna doctor`
+
+```bash
+nanna doctor
+```
+
+Checks the configuration and, for anything it finds, prints the fix rather than
+just the verdict — a missing tools directory, a `[infer]` section that names no
+model, a clustering configuration that would merge unrelated memories. Exits
+non-zero when something is actually broken, so it also works from a script or a
+health probe.
+
+It is deliberately **offline**: no provider call, no network probe, no keyring
+read. That makes it fast and safe to run anywhere, and it means a clean report
+says your *configuration* is sound — not that a provider is reachable.
+
 ### API Key Invalid
 - Verify the key in **Settings → Models**
 - Check that you're using the correct provider's key format

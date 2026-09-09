@@ -66,7 +66,7 @@ pub struct DaemonClientConfig {
 impl Default for DaemonClientConfig {
     fn default() -> Self {
         Self {
-            url: "ws://127.0.0.1:5149".to_string(),
+            url: nanna_config::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(300), // 5 minutes for large content summarization (many chunks)
             auto_reconnect: true,

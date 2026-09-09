@@ -32,7 +32,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            url: "ws://127.0.0.1:5149".to_string(),
+            url: nanna_daemon::ipc::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             auto_reconnect: true,

@@ -96,6 +96,15 @@ pub enum MemoryError {
     Serialization(#[from] serde_json::Error),
     #[error("Persistence error: {0}")]
     Persistence(String),
+    /// The clustering configuration would merge memories that are not related.
+    ///
+    /// Refusing is the conservative direction here and the only safe one:
+    /// consolidation *rewrites* memories, replacing several with one gist, so a
+    /// cycle run under a config in which cosine similarity has no veto destroys
+    /// content it had no evidence was redundant. A warning would be read after
+    /// the merge had already happened.
+    #[error("invalid clustering configuration: {0}")]
+    InvalidClusteringConfig(String),
 }
 
 /// Trait for pluggable persistence backends (Turso, etc.)

@@ -12,9 +12,17 @@
 #   while a cached rlib existed, so "the pin built fine yesterday" proves nothing after
 #   any bump that dirties turso_core.
 #
-# This channel (rustc 1.100.0-nightly, commit bff8e12ff) builds `cargo build --release
-# -p nanna-daemon` green — verified in 20m08s on 2026-08-27, from a cold target dir —
-# with no tokio ICE and no turso depth overflow.
+# This channel (rustc 1.100.0-nightly, commit cea272fa3) builds `cargo build --release
+# -p nanna-daemon` green — verified in 8m33s on 2026-09-09, from a cold target dir —
+# with no tokio ICE and no turso depth overflow. (The previous pin,
+# nightly-2026-08-27 / bff8e12ff, was verified the same way in 20m08s on 2026-08-27;
+# nightly-2026-08-29 / fd7ed57df was also checked green this pass, at 8m37s.)
+#
+# NOTE for whoever moves this next: the pin does NOT control cargo's build-script
+# output layout, and that layout is what currently breaks the Tauri GUI build on
+# Linux (tauri-build 2.6.3 assumes `debug/build/<crate>-<hash>/out`; this cargo emits
+# `debug/build/<crate>/<hash>/out`). Moving the pin neither caused nor fixes it — see
+# the Linux host blockers section in ROADMAP.md.
 #
 # Future-incompatible warnings under this channel, and what they are NOT:
 # - `attribute-derive-macro 0.10.5` — "trailing semicolon in macro used in expression
@@ -31,5 +39,5 @@
 # `toolchain:` inputs in .github/workflows/{budget-gate,release-check,test-compile}.yml —
 # release-check was missing from this list until 2026-08-26) forward to it.
 [toolchain]
-channel = "nightly-2026-08-27"
+channel = "nightly-2026-09-08"
 components = ["rustfmt", "clippy"]

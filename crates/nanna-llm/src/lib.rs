@@ -6678,7 +6678,54 @@ mod tests {
     /// something else in the crate happens to be running alongside it.
     static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Pin tracing's PROCESS-wide max-level hint at INFO for the whole test
+    /// binary.
+    ///
+    /// This is the other half of the race the comment above describes, and the
+    /// half `LOG_CAPTURE` cannot fix. The mutex serializes the capture tests
+    /// against *each other*, but the hint is recomputed every time a subscriber
+    /// is installed or dropped, and it is global. With no global default
+    /// installed, the hint falls back to OFF in the window between one
+    /// `with_default` guard dropping and the next installing — and any of the
+    /// crate's ~119 other tests running concurrently can evaluate a callsite in
+    /// that window and have it cached as disabled. The next capture then comes
+    /// back EMPTY and the test fails on its first `contains`.
+    ///
+    /// Observed 2026-09-09 under `cargo test --workspace -j 4`:
+    /// `a_demotion_announces_old_new_floor_and_clamp` failed with
+    /// `the decision: ` (an empty capture) while passing alone and 3/3 for the
+    /// crate on its own — i.e. exactly when the crate is run alongside enough
+    /// other work.
+    ///
+    /// Installing a permanent no-op INFO subscriber holds the hint at INFO for
+    /// the process's whole life, so a callsite is never cached as disabled and
+    /// the thread-local capture always sees its events. The global sink
+    /// discards; only the thread-local `with_default` subscriber records.
+    fn pin_global_log_level() {
+        static PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        PINNED.get_or_init(|| {
+            struct Discard;
+            impl std::io::Write for Discard {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| Discard)
+                .with_ansi(false)
+                .finish();
+            // Another test harness may legitimately have set one already; the
+            // hint is what matters, not whose subscriber won.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
     fn capture_info_logs(f: impl FnOnce()) -> String {
+        pin_global_log_level();
         let _serialized = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
 
         #[derive(Clone, Default)]

@@ -108,7 +108,26 @@ pub struct ConsolidationConfig {
 impl Default for ConsolidationConfig {
     fn default() -> Self {
         Self {
-            cluster_threshold: 0.45,
+            // 0.75, and both digits are measured — see
+            // [`ClusteringWeights::non_similarity_floor`],
+            // [`ConsolidationConfig::validate`] and the
+            // `clustering_threshold_sweep` bench.
+            //
+            // The old 0.45 was below the shipped weights' non-semantic floor
+            // (0.50), so a pair cleared this bar on non-semantic terms ALONE:
+            // semantic dissimilarity could not veto a merge and two orthogonal
+            // memories clustered. Anything above 0.50 restores the veto.
+            //
+            // 0.75 rather than the bare minimum because the sweep says the
+            // range is free: 0.55, 0.65 and 0.75 produce *identical* outcomes
+            // on the loose corpus (3 clusters, 27 merged, compression 0.450,
+            // recall 1.000) while the cosine each actually demands rises
+            // 0.10 → 0.30 → 0.50. Taking the top of the flat range buys a 5×
+            // stricter semantic bar at zero measured cost. Above it the trade
+            // becomes real: 0.85 (cosine 0.70, the bar the 2026 literature
+            // uses) drops compression to 0.383 — still at recall 1.000 — and
+            // 0.95 stops clustering entirely.
+            cluster_threshold: 0.75,
             min_cluster_size: 2,
             max_cluster_memories: DEFAULT_MAX_CLUSTER_MEMORIES,
             max_cluster_content_bytes: DEFAULT_MAX_CLUSTER_CONTENT_BYTES,
@@ -121,6 +140,49 @@ impl Default for ConsolidationConfig {
 }
 
 impl ConsolidationConfig {
+    /// Reject a configuration in which cosine similarity cannot veto a merge.
+    ///
+    /// The invariant: **the non-semantic terms must not, on their own, clear
+    /// [`Self::cluster_threshold`]** — that is,
+    /// [`ClusteringWeights::non_similarity_floor`] `< cluster_threshold`.
+    /// Otherwise two memories that are equally unimportant, equally
+    /// never-recalled and written near each other cluster regardless of what
+    /// they are *about*, and a dream cycle summarizes unrelated memories into
+    /// one gist.
+    ///
+    /// This is a relationship between four weights and a threshold, which is
+    /// exactly the kind of thing that goes stale when either side is tuned
+    /// alone — it was violated by the shipped defaults from the day the weights
+    /// were last retuned until 2026-09-09. Hence a check rather than a comment.
+    ///
+    /// # Errors
+    /// Returns a sentence naming the floor, the threshold, and the two ways to
+    /// fix it.
+    pub fn validate(&self) -> Result<(), String> {
+        let floor = self.clustering_weights.non_similarity_floor();
+        if floor >= self.cluster_threshold {
+            return Err(format!(
+                "clustering config lets non-semantic terms alone form a cluster: the \
+                 recall/importance/age floor is {floor:.3} but cluster_threshold is \
+                 {:.3}, so a pair with ZERO cosine similarity still clusters and \
+                 semantic dissimilarity cannot veto a merge. Raise cluster_threshold \
+                 above {floor:.3}, or lower recall_affinity/importance_proximity/\
+                 age_proximity relative to similarity.",
+                self.cluster_threshold
+            ));
+        }
+        Ok(())
+    }
+
+    /// The minimum cosine similarity this configuration really demands — the
+    /// honest reading of [`Self::cluster_threshold`]. See
+    /// [`ClusteringWeights::min_required_similarity`].
+    #[must_use]
+    pub fn min_required_similarity(&self) -> f32 {
+        self.clustering_weights
+            .min_required_similarity(self.cluster_threshold)
+    }
+
     /// Size [`Self::max_cluster_content_bytes`] to the summarizer model's context
     /// window (in tokens) so an automatically-built consolidation prompt always
     /// fits it — replacing the small-model fallback with the real budget. Leaves
@@ -164,6 +226,58 @@ pub struct ClusteringWeights {
 /// One day, for callers that never set an observed span.
 fn default_time_span_minutes() -> f32 {
     1440.0
+}
+
+impl ClusteringWeights {
+    /// The sum of every weight — the divisor [`composite_cluster_score`] uses.
+    #[must_use]
+    pub fn total(&self) -> f32 {
+        self.similarity + self.recall_affinity + self.importance_proximity + self.age_proximity
+    }
+
+    /// The composite score a pair receives with **zero semantic support**.
+    ///
+    /// This is not a corner case; it is the commonest pair in a real store.
+    /// `recall_affinity` and `importance_proximity` are 1.0 *by construction*
+    /// whenever the two values are equal — including `0 == 0`, two memories
+    /// neither of which has ever been recalled — and `age_prox` is ~1.0 for any
+    /// two memories written inside one session. So for two fresh, equally
+    /// unimportant, contemporaneous memories the score is pinned at this floor
+    /// no matter what their embeddings say.
+    ///
+    /// If this reaches [`ConsolidationConfig::cluster_threshold`], cosine
+    /// similarity has **no veto** and the clusterer groups by "written around
+    /// the same time and equally unremarkable". Measured against the weights
+    /// shipped before 2026-09-09 (floor 0.50, threshold 0.45): two orthogonal
+    /// unit vectors scored 0.500, two anti-correlated ones also scored 0.500,
+    /// and four mutually unrelated memories formed a single cluster of four.
+    #[must_use]
+    pub fn non_similarity_floor(&self) -> f32 {
+        let total = self.total();
+        if total <= 0.0 {
+            // `composite_cluster_score` falls back to pure similarity here, so
+            // there is no floor at all.
+            return 0.0;
+        }
+        (self.recall_affinity + self.importance_proximity + self.age_proximity) / total
+    }
+
+    /// The minimum cosine similarity a pair actually needs to reach `threshold`
+    /// when every non-semantic term is maximal — i.e. the real semantic bar
+    /// this configuration enforces, as opposed to the one `threshold` looks
+    /// like it enforces.
+    ///
+    /// Returns 0.0 when the floor already clears the threshold (the broken
+    /// case: no similarity is required at all).
+    #[must_use]
+    pub fn min_required_similarity(&self, threshold: f32) -> f32 {
+        let total = self.total();
+        if total <= 0.0 || self.similarity <= 0.0 {
+            return threshold.max(0.0);
+        }
+        let deficit = threshold - self.non_similarity_floor();
+        (deficit * total / self.similarity).max(0.0)
+    }
 }
 
 impl Default for ClusteringWeights {
@@ -811,6 +925,135 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The defect this invariant exists to prevent, pinned as a test so it
+    /// cannot return by a weight tweak.
+    #[test]
+    fn non_semantic_terms_alone_must_not_form_a_cluster() {
+        let config = ConsolidationConfig::default();
+        config
+            .validate()
+            .expect("the shipped defaults must satisfy their own invariant");
+
+        let floor = config.clustering_weights.non_similarity_floor();
+        assert!(
+            floor < config.cluster_threshold,
+            "floor {floor} must sit below threshold {}",
+            config.cluster_threshold
+        );
+
+        // The concrete consequence: two ORTHOGONAL memories, both fresh, both
+        // never accessed, written at the same instant — the commonest pair
+        // shape in a real store — must not cluster.
+        let mut a_emb = vec![0.0_f32; 16];
+        a_emb[0] = 1.0;
+        let mut b_emb = vec![0.0_f32; 16];
+        b_emb[1] = 1.0;
+        let a = entry_with("a", a_emb, 1_700_000_000);
+        let b = entry_with("b", b_emb, 1_700_000_000);
+
+        let score = composite_cluster_score(&a, &b, &config.clustering_weights);
+        assert!(
+            score < config.cluster_threshold,
+            "two orthogonal memories scored {score}, at or above threshold {} — \
+             cosine similarity has no veto",
+            config.cluster_threshold
+        );
+
+        let clusters = cluster_memories(vec![a, b], &config);
+        assert!(
+            clusters.iter().all(|c| c.len() == 1),
+            "unrelated memories were clustered together: sizes {:?}",
+            clusters.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+    }
+
+    /// The exact configuration that shipped before 2026-09-09 must now be
+    /// rejected, and the message must say how to fix it.
+    #[test]
+    fn the_pre_fix_default_threshold_is_now_rejected() {
+        let broken = ConsolidationConfig {
+            cluster_threshold: 0.45,
+            ..ConsolidationConfig::default()
+        };
+        let err = broken
+            .validate()
+            .expect_err("floor 0.50 >= threshold 0.45 must not validate");
+        assert!(err.contains("0.500"), "message must name the floor: {err}");
+        assert!(err.contains("cluster_threshold"), "must name the knob: {err}");
+        assert_eq!(
+            broken.min_required_similarity(),
+            0.0,
+            "the broken config demands no similarity at all — that is the defect"
+        );
+    }
+
+    /// `min_required_similarity` reports what a config really asks for, which
+    /// is not what `cluster_threshold` looks like it asks for.
+    #[test]
+    fn min_required_similarity_is_the_honest_reading_of_the_threshold() {
+        let config = ConsolidationConfig::default();
+        let need = config.min_required_similarity();
+        assert!(need > 0.0, "the fixed default must demand some similarity");
+
+        // Derived, not asserted against a literal: a pair sitting exactly at
+        // the reported bar, with every non-semantic term maximal, must land at
+        // the threshold.
+        let w = &config.clustering_weights;
+        let reconstructed = (w.similarity * need) / w.total() + w.non_similarity_floor();
+        assert!(
+            (reconstructed - config.cluster_threshold).abs() < 1e-5,
+            "reported bar {need} reconstructs to {reconstructed}, not {}",
+            config.cluster_threshold
+        );
+
+        // The drift fixture's own config (threshold 0.65) always satisfied the
+        // invariant — it is the shipped default that did not.
+        let drift = ConsolidationConfig {
+            cluster_threshold: 0.65,
+            ..ConsolidationConfig::default()
+        };
+        assert!(drift.validate().is_ok());
+        assert!((drift.min_required_similarity() - 0.30).abs() < 1e-5);
+    }
+
+    /// A weights table with no similarity weight has no floor to speak of —
+    /// `composite_cluster_score` falls back to pure similarity — so the
+    /// invariant must not fire spuriously there.
+    #[test]
+    fn a_zero_total_weight_table_has_no_floor() {
+        let w = ClusteringWeights {
+            similarity: 0.0,
+            recall_affinity: 0.0,
+            importance_proximity: 0.0,
+            age_proximity: 0.0,
+            time_span_minutes: 1440.0,
+        };
+        assert_eq!(w.non_similarity_floor(), 0.0);
+        let config = ConsolidationConfig {
+            clustering_weights: w,
+            ..ConsolidationConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "pure-similarity fallback is fine"
+        );
+    }
+
+    /// Helper: a fresh, never-accessed memory at a given instant.
+    fn entry_with(id: &str, embedding: Vec<f32>, timestamp: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("content {id}"),
+            embedding,
+            embedding_model: None,
+            embeddings: HashMap::new(),
+            metadata: HashMap::new(),
+            timestamp,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        }
+    }
     use super::*;
 
     #[test]

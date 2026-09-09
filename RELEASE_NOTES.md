@@ -1,94 +1,103 @@
-# Nanna v0.3.15-beta.24 — The Log Underneath the Facts
+# Nanna v0.3.16-beta.25 — What Dreaming Was Actually Merging
 
-Memory has had one layer for a long time: facts, FSRS-weighted, never expiring. This release adds the
-layer underneath it — the raw episodic stream of what actually happened, on a wall-clock axis — and
-retires a dependency pin that has been in the tree since July.
+Nanna's memory consolidates: it clusters related memories and folds them into one. This release fixes
+a defect in how "related" was decided — for the commonest pair of memories in a real store, it was not
+being decided at all.
+
+## What's Fixed
+
+### Cosine similarity could not veto a merge
+
+`composite_cluster_score` blends four signals: semantic similarity, recall affinity, importance
+proximity, and age proximity. Three of those are **maximal by construction** for the most ordinary
+pair a store contains — two memories that are equally unimportant, that have both never been recalled,
+and that were written in the same session. `recall_affinity` and `importance_proximity` return 1.0
+whenever the two values are *equal*, including `0 == 0`; `age_prox` sits near 1.0 within a session.
+
+With the shipped weights that put a floor of **0.50** under every score, against a clustering threshold
+of **0.45**. The bar was cleared before similarity was consulted, so no embedding could prevent a
+merge. Measured, not inferred:
+
+```
+two orthogonal unit vectors        score 0.500  -> clustered
+two anti-correlated vectors        score 0.500  -> clustered
+four mutually unrelated memories   -> ONE cluster of four
+```
+
+A dream cycle would summarize those four into a single gist and record it as a merge. In effect the
+clusterer was grouping by *"written around the same time and equally unremarkable"*.
+
+The fix is the default, not the algorithm. The threshold is judged against the composite score, not
+against raw cosine, and the drift fixture's own 0.65 threshold always satisfied the invariant — it was
+the shipped default that demanded a cosine of **0.000**.
+
+### The bar is now 0.50, and the range up to it was free
+
+A new sweep (`cargo bench -p nanna-memory --bench clustering_threshold_sweep`) prices the trade:
+
+| threshold | cosine actually demanded | clusters | compression | recall |
+| --- | --- | --- | --- | --- |
+| 0.55 | 0.10 | 3 | 0.450 | 1.000 |
+| 0.65 | 0.30 | 3 | 0.450 | 1.000 |
+| **0.75** (shipped) | **0.50** | 3 | 0.450 | 1.000 |
+| 0.85 | 0.70 | 5 | 0.383 | 1.000 |
+
+Those first three rows are *identical* in every outcome while the cosine demanded rises five-fold, so
+the default takes the top of the flat range: a five-times stricter semantic bar at zero measured cost.
+Recall is 1.000 throughout — this trades compression against merge *precision*, never retrievability.
+
+Consolidation now **refuses to run** under a configuration where similarity has no veto, rather than
+warning about it: consolidation rewrites memories, and a warning arrives after the merge has already
+happened.
 
 ## What's New
 
-### An append-only episodic timeline
+### `nanna doctor`
 
-`memories` answers *what is true*. It cannot answer *what happened, and when*, because a fact is the
-residue of many episodes and has no single timestamp. `MIGRATION_014` adds `memory_events`: messages,
-tool calls, recalls and outcomes as they occur, each stamped in Unix milliseconds, with a nullable
-embedding and a normalized salience. `nanna-storage` gains an append-only `MemoryEventRepository`, and
-a new **`nanna-timeline`** crate owns the policy — the closed `EventKind` set, the caps, and the
-`Timeline` facade.
-
-Four properties are enforced rather than assumed, and each exists for a phase that comes later:
-
-- **Integer timestamps.** Every consumer of this table is arithmetic — resample into a series,
-  decimate a window, detect a peak. Text timestamps would mean parsing on every sample.
-- **Half-open windows `[start, end)`.** Adjacent windows tile the axis exactly once, so a resampler
-  stepping bucket to bucket cannot double-count an event that lands on a boundary.
-- **Truncation is recorded, not just performed.** `content_len_chars` stores the length *before* the
-  8192-character cap, so a shortened episode is detectable by comparison rather than by a flag nobody
-  sets. The cut is character-wise, never byte-wise — there is a test that caps 8202 em dashes,
-  because byte-slicing arbitrary text at a fixed offset is the exact mistake that has panicked this
-  codebase twice.
-- **Append is idempotent on `event_id`.** A channel retrying a message cannot inflate the timeline.
-
-Nothing writes to this log yet; wiring the producers is a separate change.
-
-### A migration bug caught before it shipped, and closed for good
-
-`Storage::migrate` executes a migration with `sql.split(';')` — a splitter that does not know what a
-comment is. A semicolon inside a `--` comment therefore cuts the statement *around* it in half and
-hands the database two fragments. Migration 014 hit this while being written:
-
-```sql
-embedding BLOB,               -- f32 little-endian; NULL until embedded
+```bash
+nanna doctor
 ```
 
-That comment split the `CREATE TABLE` at the preceding comma. The failure would have been invisible
-until someone opened a **fresh** database, because every existing install already has the table —
-so it would have shipped as "works for me" and broken only new installs.
+Six configuration checks, each of which prints **the fix** rather than only the verdict — a missing
+tools directory, an `[infer]` section naming no model, a clustering configuration that would merge
+unrelated memories. Exits non-zero on a real fault, so it works from a script or a health probe.
 
-Three unit tests now assert the property across all 14 migrations: no semicolon inside a comment, no
-comment-only chunk reaching `conn.execute`, and unique names in applied order. The 13 pre-existing
-migrations were audited and are clean, so this is a trap closed before it was ever sprung.
+Deliberately offline: no provider call, no network probe, no keyring read. A clean report means your
+*configuration* is sound, not that a provider is reachable.
 
-### The boa git pin is gone
+Writing it surfaced its own finding: `[server].host` is read by nothing. The bind address comes from
+the `--host` flag (default loopback), so a user setting that field to `127.0.0.1` has secured nothing,
+and the shipped `0.0.0.0` reads as exposed while binding nothing of the sort. The doctor now reports
+the effective answer instead of raising a false alarm about it.
 
-`boa_engine`/`boa_runtime` have been pinned to a git revision of boa `main` since 2026-07-10, because
-the then-current release (0.21.1) held `icu ~2.0` against a tree on icu 2.2. **`boa_engine 0.22.0`
-shipped on 2026-08-28** — newer than the pinned revision, so returning to crates.io moves forward, not
-back. It requires `icu ~2.3` and pulls the whole tree there: all 15 `icu*` crates resolve to a single
-2.3.x, with no split anywhere.
+### Local-inference configuration (`[infer]`)
 
-`boa_runtime` was dropped at the same time. It was an optional dependency that **no source file has
-ever referenced** — the same dead-weight class as the `swc_core` removal before it.
+The config surface for the on-device runner — model, embedding model, device, precision, VRAM budget —
+plus the boot-time decision the router will read. Inert by default.
 
-### Dependency freshness
+`InferPrecision::Auto` cannot choose f16 on Linux, and the code says so out loud rather than quietly
+serving f32: the precision planner needs a VRAM budget, and that number is only available through a
+Windows-specific path today. The remedy (`[infer].precision = "f16"`) is named in the message.
 
-`lopdf 0.44 → 0.45`, plus the routine sweep (`bon 3.10.1`, `serde_with 3.23.0`) and on the frontend
-`marked 18.0.12` and `@lucide/vue 1.43.0`. Both documented lockfile landmines fired exactly as
-recorded and were re-pinned: `libc` back to 0.2.186 (RustPython 0.5.0 still needs the ceiling) and
-`malachite-bigint` back to 0.9.2. The guard tests reported each in 0.00s rather than twenty minutes
-into a release build, which is what they were written for.
+## Also In This Release
 
-One trap worth naming: `cargo upgrade` reported `lopdf → 0.42.0` for one crate and `→ 0.45.0` for
-another **in the same table** — a stale registry-index read, not two different requirements. Never
-take a `cargo-upgrade` row without checking the crate's real version list.
+- **Toolchain** moved to `nightly-2026-09-08`, release-verified.
+- **Dependencies** swept to latest — `playwright-rs 0.18`, `reqwest 0.13.5`, `tantivy 0.26.2` and
+  seven more. The `libc` and `malachite-bigint` ceilings still stand and are still enforced by tests.
+- **One definition of the daemon IPC port.** Two call sites still hardcoded `ws://127.0.0.1:5149`
+  beside the constant meant to prevent exactly that; a guard test now fails on any Rust source that
+  spells the port into a URL.
+- **A flaky test fixed** — the log-capture tests failed intermittently under a wide parallel run
+  because tracing's process-wide level hint drops between subscriber installs.
+- **Two new benchmarks**, `clustering_scaling` and `clustering_threshold_sweep`, with baselines
+  recorded in `bench/BASELINE.md`.
 
-## Verified
+## Known Issues
 
-`cargo check --workspace --exclude nanna-gui --all-targets` clean ·
-`cargo test --workspace --exclude nanna-gui` **1722 passed / 0 failed / 12 ignored** across 69 test
-binaries, doctests included · `cargo clippy` **0 errors**, and the new `nanna-timeline` crate is
-warning-clean under `pedantic` + `nursery` · rustfmt clean on every new file · frontend
-`vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green with 4 routes prerendered.
-
-The 16 new timeline tests include `migration_014_creates_a_usable_event_log`, which opens a **fresh**
-database — the exact case the comment-splitting bug above would have broken, and the one an existing
-install can never exercise.
-
-## Known limits
-
-- **The Tauri GUI is unverified, and on this host it cannot be verified.** `webkit2gtk-4.1` is
-  installed but Arch's package ships no `WebKitWebDriver` binary at all, and Arch has no
-  `webkit2gtk-driver` package — so `tauri-driver` cannot start. The fix is a WebKitGTK source build,
-  not a package install. Filed with the evidence.
-- **Nothing produces timeline events yet.** The store, its bounds and its tests are real; the
-  producers are not wired.
-- The toolchain pin was not re-tested against the current nightly this cycle.
+- **The Tauri GUI does not build on Linux.** `tauri-build 2.6.3` infers its target directory assuming
+  cargo's classic build-script layout; current cargo emits a nested one, and the sidecar destination
+  resolves onto a directory. Pre-existing and upstream, not caused by this release — but it means this
+  build is **unverified on Linux desktop**, and Windows builds are unaffected.
+- **`[server].host` is still a dead field.** Reported honestly by `nanna doctor`; deliberately not
+  "fixed" by wiring it, since doing so with its current `0.0.0.0` default would turn an inert field
+  into a real exposure of an unauthenticated HTTP surface.

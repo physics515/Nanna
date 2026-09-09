@@ -46,7 +46,7 @@ pub struct IpcServerConfig {
 /// the docs, and the copies drifted — `nanna daemon start` defaulted to `9999` while
 /// `nanna daemon status`, the GUI sidecar and the README all used `5149`, so a CLI-started daemon
 /// reported itself as not running.
-pub const DEFAULT_IPC_PORT: u16 = 5149;
+pub use nanna_config::{DEFAULT_IPC_PORT, default_daemon_ws_url};
 
 impl Default for IpcServerConfig {
     fn default() -> Self {
