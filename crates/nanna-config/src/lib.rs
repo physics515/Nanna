@@ -4,6 +4,13 @@
 //! Configuration management for Nanna
 
 pub mod credentials;
+/// Local on-device inference config (`[infer]`) and the boot-time decisions
+/// derived from it.
+pub mod infer;
+pub use infer::{
+    DEFAULT_LOCAL_EMBEDDING_MODEL, InferConfig, InferDevice, InferPrecision, LocalPlan,
+    PrecisionReason, ResolvedPrecision,
+};
 pub mod bind;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
@@ -82,6 +89,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// Background scheduler settings (heartbeat + cron runner)
     pub scheduler: SchedulerConfig,
+    /// Local (on-device) inference settings — the Mummu runner.
+    pub infer: InferConfig,
 }
 
 
