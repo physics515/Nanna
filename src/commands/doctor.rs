@@ -177,27 +177,47 @@ fn check_infer(config: &Config) -> Check {
     )
 }
 
-/// Binding the HTTP server off loopback exposes it with no authentication of
-/// its own — worth saying out loud, since the default is `0.0.0.0`.
+/// `[server].host` is **not** the bind address, and saying so is the check.
+///
+/// Verified 2026-09-09: nothing reads `nanna_config::ServerConfig::host`. The
+/// bind in `nanna_server::start_server` takes `nanna_server::ServerConfig` — a
+/// *different* struct — which `commands::serve` builds from the `--host` CLI
+/// flag, defaulting to loopback. Only `webhook_secret` is carried over from the
+/// config.
+///
+/// That makes the field worse than unused: it is shaped exactly like a security
+/// control. Someone who sets it to `127.0.0.1` has secured nothing, and someone
+/// reading the shipped `0.0.0.0` default reasonably concludes the server is
+/// exposed when it is not. A doctor that warned about the default would be
+/// raising a false alarm — which is the failure this command exists to avoid —
+/// so it reports the effective answer instead.
 fn check_server_exposure(config: &Config) -> Check {
     if !config.server.enabled {
         return Check::ok("server.bind", "HTTP server disabled");
     }
     if nanna_config::is_loopback_host(&config.server.host) {
+        // Harmless, but still not what binds — say so rather than implying the
+        // field did the securing.
         return Check::ok(
             "server.bind",
-            format!("{}:{} (loopback)", config.server.host, config.server.port),
+            format!(
+                "binds loopback (from --host, default {}); `[server].host = \"{}\"` is not read",
+                nanna_config::LOOPBACK_HOST,
+                config.server.host
+            ),
         );
     }
     Check::warn(
         "server.bind",
         format!(
-            "{}:{} is reachable from other machines and the HTTP server has no authentication \
-             of its own",
-            config.server.host, config.server.port
+            "`[server].host = \"{}\"` is NOT read by anything — the bind address comes from the \
+             `--host` flag, which defaults to loopback. Setting this field secures nothing and \
+             exposes nothing",
+            config.server.host
         ),
         format!(
-            "set `[server].host = \"{}\"` unless the exposure is deliberate",
+            "pass `--host` to `nanna server` to change the bind; use {} unless exposure is \
+             deliberate (the HTTP surface has no authentication of its own)",
             nanna_config::LOOPBACK_HOST
         ),
     )
@@ -333,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_loopback_bind_warns_about_the_missing_auth() {
+    fn the_server_host_field_is_reported_as_the_dead_field_it_is() {
         let mut config = cfg();
         config.server.enabled = true;
         config.server.host = "0.0.0.0".to_string();
@@ -341,9 +361,13 @@ mod tests {
         let check = checks.iter().find(|c| c.name == "server.bind").unwrap();
         assert_eq!(check.severity, Severity::Warn);
         assert!(
-            check.detail.contains("no authentication"),
-            "the reason must be stated, not just the fact: {}",
+            check.detail.contains("NOT read"),
+            "the point is that the field is inert, not that 0.0.0.0 is exposed: {}",
             check.detail
+        );
+        assert!(
+            check.remedy.as_ref().is_some_and(|r| r.contains("--host")),
+            "the remedy must name the thing that actually binds: {check:?}"
         );
     }
 

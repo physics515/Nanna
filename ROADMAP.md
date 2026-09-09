@@ -3696,6 +3696,20 @@ asks permission or restricts her.)*:
             (`a merge needs cosine >= 0.10`) rather than `cluster_threshold`, which reads higher than
             what it actually demands — so the gap the research item describes is visible to an
             operator without reading the source.
+      - [ ] **`[server].host` is a dead field shaped like a security control** *(found 2026-09-09
+            while writing the doctor)*. **Nothing reads `nanna_config::ServerConfig::host`** —
+            verified by an exhaustive grep across Rust, TS and Vue. The bind in
+            `nanna_server::start_server` takes `nanna_server::ServerConfig`, a *different* struct,
+            which `commands::serve` builds from the **`--host` CLI flag** (default loopback); only
+            `webhook_secret` is carried over from the config. So a user who sets
+            `[server].host = "127.0.0.1"` has secured nothing, and the shipped **`0.0.0.0`** default
+            reads as "exposed to the network" while binding nothing of the sort.
+            **Do not fix this by making the field live.** With its current `0.0.0.0` default that
+            would turn an inert field into a real exposure of an HTTP surface that has no
+            authentication of its own — a security regression delivered as a cleanup. Either delete
+            the field, or change its default to loopback *first* and wire it *second*, in that
+            order. Meanwhile `nanna doctor` reports the field as inert rather than warning about a
+            binding that never happens.
       - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet
