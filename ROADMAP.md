@@ -1938,9 +1938,22 @@ so neither CI nor any prior run could have caught them:
       one-sided: **a platform gate is only tested by the platform it excludes.** `nanna-gui` stays
       excluded on Linux too, since the Tauri crate needs WebKitGTK system packages and that would
       turn a smoke check into a provisioning job.
-- [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
+- [x] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
       `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
       whether that is worth a job before claiming the desktop app is cross-platform.
+      *(2026-09-10 — decided by evidence: the crate had not built on Linux for weeks, see below,
+      and nothing noticed.)* New `check-gui-linux` job in `test-compile.yml` (WebKitGTK apt set
+      from `release.yml`'s Linux job, stubbed sidecar + frontend, `cargo check -p nanna-gui`), and
+      **both GUI jobs now assert the sidecar landed beside the app binary** — the part that
+      makes a *fresh* runner catch the tauri-build class, since the panic needs a pre-existing
+      `build/nanna-daemon/` but the misplaced copy happens every time. Simulated locally both
+      ways in fresh target dirs: stock 2.6.3 → check exit 0, sidecar **not** beside the binary,
+      a stray regular file at `build/nanna-daemon` (assertion fails, as it must); vendored fix →
+      check exit 0, sidecar beside the binary, nothing in `build/` (passes). **First Linux
+      package built:** `pnpm tauri build --bundles deb` → `Nanna_0.3.15_amd64.deb` (40.8 MB,
+      `usr/bin/nanna-gui` + the `usr/bin/nanna-daemon` sidecar, GUI release link 5m38s); the
+      command's only error was updater signing without `TAURI_SIGNING_PRIVATE_KEY`, correct for
+      an unsigned local build.
 - [x] *(2026-09-10)* **`nanna-gui` did not build on Linux or macOS at all — an upstream bug, now
       patched.** Cargo's build-dir layout v2 (default on nightly since August, stable in **Rust
       1.100, 2026-11-12**) nests `OUT_DIR` one level deeper (`build/<pkg>/<hash>/out`).

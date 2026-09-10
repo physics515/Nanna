@@ -83,9 +83,9 @@ jobs:
   # by construction: a platform gate is only tested by the platform it excludes.
   #
   # `nanna-gui` is excluded here for the same reason as above, plus one more:
-  # the Tauri crate needs WebKitGTK system packages on Linux, which would turn a
-  # smoke check into a provisioning job. Linux GUI coverage is deliberately not
-  # claimed by this workflow.
+  # the Tauri crate needs WebKitGTK system packages on Linux, which would turn
+  # this smoke check into a provisioning job. Linux GUI coverage lives in its
+  # own job, `check-gui-linux`, which pays for that provisioning separately.
   compile-tests-linux:
     name: Compile all test targets (Linux)
     runs-on: ubuntu-latest
@@ -159,3 +159,67 @@ jobs:
 
       - name: Typecheck the GUI crate
         run: cargo check --package nanna-gui --locked
+
+      # tauri-build copies the sidecar next to the app binary from its build
+      # script. Under cargo's build-dir layout v2 the stock 2.6.3 put it in
+      # `target/debug/build/` instead — silently here, because the `.exe` name
+      # collides with nothing. See `check-gui-linux` and `vendor/tauri-build`.
+      - name: Assert the sidecar landed beside the app binary
+        shell: bash
+        run: |
+          test -f target/debug/nanna-daemon.exe
+          test ! -e target/debug/build/nanna-daemon.exe
+
+  # The Linux mirror of `check-gui`, added 2026-09-10 after `nanna-gui` turned
+  # out not to build on Linux (or macOS) at all: tauri-build 2.6.3 located the
+  # target dir by a fixed walk up from OUT_DIR, which cargo's build-dir layout
+  # v2 (nightly default, stable in 1.100) made one level short, and its
+  # `copy_binaries` then panicked with IsADirectory on `build/nanna-daemon`.
+  # Nothing caught it because nothing compiled this crate on Linux.
+  #
+  # The placement assertion is the part that makes this job catch that class on
+  # a *fresh* runner: the panic needs a pre-existing `build/nanna-daemon/`
+  # directory (a dev tree that has built the daemon), but the misplaced copy
+  # happens every time. Verified locally both ways: with the stock 2.6.3 the
+  # check passes and the assertion fails; with the vendored fix both pass.
+  check-gui-linux:
+    name: Typecheck nanna-gui (Linux)
+    runs-on: ubuntu-latest
+    # Same bound as `check-gui`: the shared dependency graph dominates.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-08
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-gui-linux
+
+      # The WebKitGTK stack Tauri links on Linux; the same set `release.yml`'s
+      # Linux job installs, minus the packaging-only tools.
+      - name: Install WebKitGTK system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Stub the two uncommitted build artifacts
+        run: |
+          mkdir -p gui/src-tauri/binaries gui/.output/public
+          printf 'stub' > gui/src-tauri/binaries/nanna-daemon-x86_64-unknown-linux-gnu
+          chmod +x gui/src-tauri/binaries/nanna-daemon-x86_64-unknown-linux-gnu
+          printf '<!doctype html><title>stub</title>' > gui/.output/public/index.html
+
+      - name: Typecheck the GUI crate
+        run: cargo check --package nanna-gui --locked
+
+      - name: Assert the sidecar landed beside the app binary
+        run: |
+          test -f target/debug/nanna-daemon
+          test ! -e target/debug/build/nanna-daemon/nanna-daemon
+          test ! -f target/debug/build/nanna-daemon
