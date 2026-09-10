@@ -1771,7 +1771,28 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       a few separator chars). 5 tests (basic table, alignment colons + surrounding text, inline-markdown in
       cells, prose-pipe/HR negatives, tight-table growth guard); 45 nanna-channels tests green. Remaining:
       Discord embeds, Slack Block Kit.
-- [~] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+- [x] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+      *(2026-09-10, second half)* **`client.subscribe_session(id)`** returns a `SessionEvents`
+      stream carrying only that session's events, keyed by a new **exhaustive**
+      `Event::session_id()` in the protocol (no wildcard arm, so a new variant must be
+      classified before it compiles). Lag on the bounded broadcast is returned as
+      `RecvError::Lagged(n)`, never skipped silently. Unit-tested on a real broadcast
+      channel (filtering, lag) and per variant family; not e2e, because every event that
+      carries a session needs a live chat turn, i.e. an LLM. Tracing it turned up three
+      daemon-side gaps, filed below.
+      - [ ] **The daemon never emits `SessionCreated` / `SessionDeleted` / `SessionRenamed`.**
+            They are declared in the protocol and sent nowhere. The GUI does not notice because it
+            emits its own `session-renamed` Tauri event, so a session renamed from the CLI or a
+            second client never reaches an open GUI. Emit them from the session control handlers.
+      - [ ] **`Subscribe` narrows nothing on the wire.** `SubscribeAction::Session` is recorded in
+            the session store, but every IPC connection forwards the whole event stream
+            (`ipc.rs` outgoing task; the per-client `_subscriptions` field is unused). Decide
+            whether server-side filtering is wanted before a chatty channel makes it matter;
+            `Event::session_id()` is the classifier either would use.
+      - [ ] **A lagging IPC client loses events without being told.** The forwarder matches
+            `Ok(event) = event_rx.recv()`, so a `RecvError::Lagged(n)` just fails the pattern and
+            the missed events vanish. Surface it to the client (e.g. an `Error` event naming the
+            count) so it can resync.
       *(2026-09-10)* `client.scheduler()` / `.workspaces()` / `.channels()` landed: typed wrappers
       over all **22** scheduler/workspace/channel protocol actions, proven against the real
       hermetic daemon in `e2e_daemon.rs` — a cron job added → listed → fetched → removed, a temp

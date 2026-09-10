@@ -222,6 +222,16 @@ impl Client {
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
     }
+
+    /// Subscribe to the events of one session only.
+    ///
+    /// The daemon's IPC layer forwards every event to every connected client (a
+    /// `Subscribe` action is recorded in the session store but does not narrow what
+    /// the connection sends), so the filtering happens here, by [`Event::session_id`].
+    #[must_use]
+    pub fn subscribe_session(&self, session_id: impl Into<String>) -> SessionEvents {
+        SessionEvents::new(self.event_tx.subscribe(), session_id.into())
+    }
     
     /// Send a request and wait for response
     pub async fn request(&self, action: Action) -> Result<Value> {
@@ -713,5 +723,96 @@ impl ChannelsApi<'_> {
                 content: content.to_string(),
             }))
             .await
+    }
+}
+
+/// The events of one session, filtered out of the client's shared event stream.
+pub struct SessionEvents {
+    receiver: broadcast::Receiver<Event>,
+    session_id: String,
+}
+
+impl SessionEvents {
+    fn new(receiver: broadcast::Receiver<Event>, session_id: String) -> Self {
+        debug_assert!(
+            !session_id.is_empty(),
+            "a session filter needs a session id"
+        );
+        Self {
+            receiver,
+            session_id,
+        }
+    }
+
+    /// The session this stream carries.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The next event for this session; other sessions' and session-less events are
+    /// skipped.
+    ///
+    /// Lag is reported, not hidden: the shared stream is a bounded broadcast, and a
+    /// slow reader that falls behind gets `RecvError::Lagged(n)` so it can decide to
+    /// resync rather than silently missing events of its own session.
+    ///
+    /// # Errors
+    ///
+    /// `Lagged` when this reader fell behind the shared stream, `Closed` when the
+    /// client shut down.
+    pub async fn recv(&mut self) -> std::result::Result<Event, broadcast::error::RecvError> {
+        loop {
+            let event = self.receiver.recv().await?;
+            if event.session_id() == Some(self.session_id.as_str()) {
+                return Ok(event);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_events_tests {
+    use super::{Event, SessionEvents};
+    use tokio::sync::broadcast;
+
+    fn delta(session_id: &str, text: &str) -> Event {
+        Event::MessageDelta {
+            session_id: session_id.to_string(),
+            message_id: "m".to_string(),
+            delta: text.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_subscribed_session_comes_through() {
+        let (tx, rx) = broadcast::channel(16);
+        let mut events = SessionEvents::new(rx, "mine".to_string());
+        tx.send(delta("other", "not for me"))
+            .expect("a receiver exists");
+        tx.send(Event::ConfigChanged).expect("a receiver exists");
+        tx.send(delta("mine", "for me")).expect("a receiver exists");
+
+        match events.recv().await.expect("an event for this session") {
+            Event::MessageDelta { delta, .. } => assert_eq!(delta, "for me"),
+            other => panic!("expected this session's delta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lagging_reader_is_told_rather_than_silently_skipping() {
+        let (tx, rx) = broadcast::channel(2);
+        let mut events = SessionEvents::new(rx, "mine".to_string());
+        for n in 0..5 {
+            tx.send(delta("mine", &n.to_string()))
+                .expect("a receiver exists");
+        }
+        assert!(
+            matches!(
+                events.recv().await,
+                Err(broadcast::error::RecvError::Lagged(3))
+            ),
+            "a bounded stream that overflowed must say how much was lost"
+        );
     }
 }

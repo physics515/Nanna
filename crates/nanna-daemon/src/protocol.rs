@@ -941,6 +941,54 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// The session this event belongs to, if it belongs to one.
+    ///
+    /// Exhaustive on purpose, with no wildcard arm: a new variant has to be classified
+    /// here before it compiles, or a per-session subscriber would silently drop (or
+    /// wrongly receive) it. Session lifecycle events name their session as `id`.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::MessageStart { session_id, .. }
+            | Self::MessageDelta { session_id, .. }
+            | Self::MessageEnd { session_id, .. }
+            | Self::ThinkingDelta { session_id, .. }
+            | Self::StepStarted { session_id, .. }
+            | Self::ToolStart { session_id, .. }
+            | Self::ToolEnd { session_id, .. }
+            | Self::LivenessBeat { session_id, .. }
+            | Self::SubSessionSpawned { session_id, .. }
+            | Self::SubSessionCompleted { session_id, .. }
+            | Self::SubSessionFailed { session_id, .. }
+            | Self::SubSessionKilled { session_id, .. }
+            | Self::SubSessionQuestion { session_id, .. }
+            | Self::ContextUsage { session_id, .. } => Some(session_id),
+            Self::SessionCreated { id, .. }
+            | Self::SessionDeleted { id }
+            | Self::SessionRenamed { id, .. } => Some(id),
+            Self::Error { session_id, .. } => session_id.as_deref(),
+            Self::WorkspacesChanged
+            | Self::ConfigChanged
+            | Self::MemoryCreated { .. }
+            | Self::MemoryStoreRebuilt { .. }
+            | Self::MemoryUpdated { .. }
+            | Self::MemoryDeleted { .. }
+            | Self::ChannelConnected { .. }
+            | Self::ChannelDisconnected { .. }
+            | Self::ChannelError { .. }
+            | Self::ChannelMessage { .. }
+            | Self::ModelSwitch { .. }
+            | Self::StatusChange { .. }
+            | Self::Connected { .. }
+            | Self::Disconnected { .. }
+            | Self::TaskRunStarted { .. }
+            | Self::TaskRunProgress { .. }
+            | Self::TaskRunCompleted { .. } => None,
+        }
+    }
+}
+
 // =============================================================================
 // Control Actions (legacy compat / convenience)
 // =============================================================================
@@ -1050,5 +1098,50 @@ mod tests {
                 "no model on the wire is the clear, not a parse error"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod event_session_tests {
+    use super::Event;
+
+    #[test]
+    fn chat_and_tool_events_belong_to_their_session() {
+        let delta = Event::MessageDelta {
+            session_id: "s1".to_string(),
+            message_id: "m".to_string(),
+            delta: "hi".to_string(),
+        };
+        assert_eq!(delta.session_id(), Some("s1"));
+        let usage = Event::ContextUsage {
+            session_id: "s2".to_string(),
+            used: 1,
+            window: 2,
+        };
+        assert_eq!(usage.session_id(), Some("s2"));
+    }
+
+    #[test]
+    fn lifecycle_events_name_their_session_as_id() {
+        let renamed = Event::SessionRenamed {
+            id: "s3".to_string(),
+            name: "n".to_string(),
+        };
+        assert_eq!(renamed.session_id(), Some("s3"));
+    }
+
+    #[test]
+    fn session_less_events_belong_to_no_session() {
+        assert_eq!(Event::ConfigChanged.session_id(), None);
+        let orphan = Event::Error {
+            code: "c".to_string(),
+            message: "m".to_string(),
+            session_id: None,
+        };
+        assert_eq!(
+            orphan.session_id(),
+            None,
+            "an unattributed error is nobody's"
+        );
     }
 }
