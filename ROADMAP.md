@@ -2051,6 +2051,16 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+            - [ ] *(research 2026-09-10)* **Burn 0.22 is in pre-release and breaks the API Mummu
+                  is written against** — stable is still 0.21.0, but
+                  [0.22.0-pre.3](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3)
+                  (2026-08-25) removes the `Tensor` backend generic in favour of a high-level
+                  `Device` ([0.22.0-pre.1](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.1),
+                  #4717), deletes `burn-candle` and deprecates `burn-ndarray`. Inference-relevant
+                  additions: two-level quantization scales, UE4M3 scales (CPU only so far), custom
+                  fusion, a graph-capture backend. For Nanna the consequence is a rule for the P12
+                  glue: **never name a `burn` type in Nanna's API** — take Mummu's own request /
+                  token / embedding types, so the 0.22 migration stays inside Mummu.
       - [ ] *(research 2026-07-23)* **Re-confirmed, nothing moved: Qwen3.5-9B is still the 8 GB default, and
             Burn is still 0.21.** Two checks worth recording because they *prevent* churn rather than cause it.
             (1) 2026 round-ups still rate **Qwen3.5-9B the best 8 GB function-calling pick "by a significant
@@ -2684,6 +2694,13 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             workspace dependency by then (don't add a second heavy ML dep just for this). Validate any fitted set
             through the retention harness before it becomes the default, same gate the w20 flip used. Sources:
             [fsrs-rs](https://github.com/open-spaced-repetition/fsrs-rs), [fsrs crate](https://crates.io/crates/fsrs).
+            - [ ] *(research 2026-09-10)* **`fsrs 6.6.2` (2026-08-28) is maintenance only** —
+                  training skips validation, a Cost-ADR seed-isolation fix, and a new
+                  `evaluate_with_card_ids` ([release](https://github.com/open-spaced-repetition/fsrs-rs/releases/tag/v6.6.2)).
+                  Nothing here changes the adoption gate above. **FSRS-7 is now visibly in
+                  progress in the Rust crate** (issue [#445](https://github.com/open-spaced-repetition/fsrs-rs/issues/445)
+                  reports a bug in `clip_fsrs7_parameters`; [#428](https://github.com/open-spaced-repetition/fsrs-rs/issues/428)
+                  tracks the timeline) but unreleased — still do not plan on it.
       - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
             The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
             forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
