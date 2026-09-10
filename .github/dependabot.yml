@@ -9,9 +9,8 @@ updates:
     open-pull-requests-limit: 10
     labels: ["dependencies", "rust"]
     ignore:
-      # Pre-1.0 pins we deliberately hold (see ROADMAP dep notes).
+      # Pre-1.0 pin we deliberately hold (see ROADMAP dep notes).
       - dependency-name: turso
-      - dependency-name: aegis
 
   # GUI / Tauri frontend
   - package-ecosystem: npm

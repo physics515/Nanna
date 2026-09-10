@@ -5881,7 +5881,6 @@ dependencies = [
 name = "nanna-storage"
 version = "0.3.15"
 dependencies = [
- "aegis",
  "chrono",
  "serde",
  "serde_json",

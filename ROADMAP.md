@@ -5388,8 +5388,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
-   - Pins now: `turso =0.7.2`, `aegis =0.9.15` (exact — pre-1.0; both at latest stable as of
-     2026-09-08). The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
+   - Pins now: `turso =0.7.2` (exact — pre-1.0; latest stable as of 2026-09-10). The exact
+     `aegis` pin is **gone** (2026-09-10): it froze a version to dodge aegis's C build, and turso
+     already selects the pure-Rust backend itself — now named explicitly as
+     `features = ["pure-rust-crypto"]`. The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
      is gone too** — see the 2026-09-08 sweep. The only lockfile-only holds left are
      `malachite-bigint =0.9.2` and the `libc <= 0.2.186` ceiling, both gated by tests.
    - **`rten` is pinned at `0.24` by `ocrs`, not by us** *(2026-08-25)* — `cargo upgrade --incompatible`
@@ -5862,7 +5864,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Also re-checked and left pinned on purpose: `boa` (crates.io latest is still **0.21.1**, which
      pins icu ~2.0 while the tree is on icu 2.2 / temporal_capi 0.2.6 — the git rev `4f98f644` stays),
      `turso =0.7.2`, `aegis =0.9.15`.
-     - [ ] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
+     - [x] *(2026-09-10)* **Retired — and it had been redundant since turso 0.7.** Issue #7660
+       closed 2026-09-08 via PR #7905, but that only made `simsimd` optional; the real answer was
+       already shipping: `turso 0.7.2` has a `pure-rust-crypto` feature (`turso_core` →
+       `aegis/pure-rust`, whose build.rs returns before touching `cc`), and **`turso_sdk_kit`
+       enables it by default**. `cargo tree -e features -i aegis` shows `aegis feature
+       "pure-rust"` ← `turso_core/pure-rust-crypto` on `x86_64-unknown-linux-gnu`,
+       `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` alike, and aegis's build-script out
+       dir is empty (no C objects) on this host even though clang is installed. So the pin was
+       guarding a C build that could no longer happen. Replaced the version freeze with the
+       lever turso provides — `turso = { version = "=0.7.2", features = ["pure-rust-crypto"] }`
+       — so a future turso that drops it from its defaults cannot silently bring the C build
+       back; deleted the direct `aegis` dependency (nothing imports it) and its dependabot
+       ignore rule. Lock diff: `nanna-storage` loses one dependency edge; aegis stays 0.9.15
+       (latest). No behaviour change — Nanna never enables turso encryption, and the pure-Rust
+       backend was already the one in use. 132 `nanna-storage` tests pass.
+     - [x] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
        [#7660](https://github.com/tursodatabase/turso/issues/7660) asks for `aegis` and `simsimd` to
        be put behind feature flags so `turso_core` defaults to pure Rust — which is precisely the
        property the `aegis =0.9.15` pin exists to preserve (0.9.8+ mandates a clang-cl C build,
