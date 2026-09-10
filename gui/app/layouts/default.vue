@@ -521,7 +521,8 @@ onMounted(async () => {
   unlistenSessionRenamed = await listen<{ id: string, name: string }>('session-renamed', (event) => {
     const { id, name } = event.payload
     const idx = sessions.value.findIndex(s => s.id === id)
-    if (idx !== -1) sessions.value[idx] = { ...sessions.value[idx], name }
+    const existing = sessions.value[idx]
+    if (existing) sessions.value[idx] = { ...existing, name }
   })
   // The daemon owns workspace registration, so anything registered while this
   // window is open — by a script, a harness, or another client — must show up

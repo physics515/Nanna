@@ -312,8 +312,8 @@ export function useSessionState(sessionId: Ref<string | null>) {
           if (idx === -1) idx = i
         }
       }
-      if (idx !== -1) {
-        const existing = calls[idx]
+      const existing = idx === -1 ? undefined : calls[idx]
+      if (existing !== undefined) {
         const filtered: Record<string, any> = {}
         for (const [key, value] of Object.entries(update)) {
           if (value !== undefined) {

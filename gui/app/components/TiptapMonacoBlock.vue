@@ -183,7 +183,8 @@ function handleMount(editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof
 
   // Escape to blur and return to TipTap
   editor.addCommand(monaco.KeyCode.Escape, () => {
-    editor.blur()
+    // Focusing TipTap moves DOM focus out of Monaco, which is the blur. The editor
+    // has no `blur()`: the old call threw here, so Escape never reached TipTap.
     props.editor.commands.focus()
   })
 }

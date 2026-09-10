@@ -18,6 +18,7 @@
           <p :id="descId" class="confirm-message">{{ state.message }}</p>
           <div class="confirm-actions">
             <button
+              ref="cancelBtnRef"
               type="button"
               class="confirm-btn confirm-btn--ghost min-h-8"
               @click="handleCancel"
@@ -41,37 +42,30 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onUnmounted, ref, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 import { useConfirm } from '~/composables/useConfirm'
-import { pushEscapeHandler } from '~/composables/useShortcuts'
 
 const titleId = 'nanna-confirm-title'
 const descId = 'nanna-confirm-desc'
 const confirmBtnRef = ref<HTMLButtonElement | null>(null)
+const cancelBtnRef = ref<HTMLButtonElement | null>(null)
 
 const { state, handleConfirm, handleCancel } = useConfirm()
 
-let popEscape: (() => void) | null = null
-
+// `useConfirm` owns Escape (it registers the handler when a confirm opens), so this
+// watcher only moves focus into the dialog. It used to read `state.open` on the ref
+// itself, which is always undefined, so it never fired and focus never entered the
+// dialog. A danger confirm focuses Cancel: Enter must never land on the destructive
+// action (WAI-ARIA alertdialog pattern).
 watch(
-  () => state.open,
+  () => state.value.open,
   async (open) => {
-    if (open) {
-      popEscape?.()
-      popEscape = pushEscapeHandler(() => handleCancel())
-      await nextTick()
-      confirmBtnRef.value?.focus()
-    } else {
-      popEscape?.()
-      popEscape = null
-    }
+    if (!open) return
+    await nextTick()
+    const target = state.value.danger ? cancelBtnRef.value : confirmBtnRef.value
+    target?.focus()
   },
 )
-
-onUnmounted(() => {
-  popEscape?.()
-  popEscape = null
-})
 </script>
 
 <style scoped>

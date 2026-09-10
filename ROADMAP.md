@@ -1274,7 +1274,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       blocked**, and edits were dropped silently on switching tools. Now a real awaited confirm.
       The scoped test locator (`/^Delete$/i` *inside* the dialog) now also pins the label, so the UI bug
       and its test cannot drift apart again.
-- [ ] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
+- [x] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
       it.** `gui.yml` runs `pnpm exec vue-tsc --noEmit`, and the roadmap records it as "Enforced as of
       2026-07-24: the tree typechecks with 0 errors, so a new one is a regression". It does not. Nuxt 4
       writes a **solution-style** `tsconfig.json` — `"files": []` plus four project `references` — and
@@ -1288,7 +1288,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       Not switched on in the same run, deliberately — flipping the flag turns CI red on 96 pre-existing
       errors, and a green build achieved by leaving the gate blind is the thing being fixed here, so it
       should not be traded for a red one nobody can land against. Do it as its own increment(s):
-      - [~] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+      - [x] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
             *(2026-08-23)* **First batch: `app/lib/tiptapMarkdown.ts` — 26 errors → 0, total 96 → 66.**
             All of the `noUncheckedIndexedAccess` family (`lines[i]` types as `string | undefined`
             even under an `i < lines.length` guard, and regex group reads likewise).
@@ -1365,10 +1365,37 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             **Running total for the run: 96 → 25 errors**, with 208 vitest green and `pnpm build` green
             throughout. Remaining backlog: `app/components/settings/*`, `app/components/ToolCallCard.vue`,
             `app/layouts/default.vue`, the `ui/` primitives, and a handful of one-error files.
-      - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
+            *(2026-09-10)* **Final batch: 22 → 0, and five of the 22 were broken features.**
+            - **Settings → Data → Import configuration never waited for its confirm.** `confirm` is
+              the async dialog; `if (!confirm('…'))` tested a Promise (always truthy), so the import
+              replaced the user's config whatever they answered. Now `await confirm({… danger })`.
+            - **`ConfirmDialog`'s focus watcher never fired** — it watched `state.open` on the ref
+              itself (always `undefined`). Fixed to `state.value.open`, and since `useConfirm`
+              already owns Escape the duplicate handler registration is gone; a **danger** confirm
+              now focuses **Cancel**, so Enter cannot land on "Delete All". New
+              `ConfirmDialog.spec.ts` (2 tests), **verified to fail on the old dialog**.
+            - **`ErrorBoundary`'s Reload button threw on click** — `location` in a template resolves
+              against the component, not `window`.
+            - **Escape in a Monaco code block threw** (`IStandaloneCodeEditor` has no `blur()`), so it
+              never returned focus to TipTap.
+            - Three `variant="outline"` UiButtons (not a variant → unstyled, same class as the
+              scheduler fix above) and ChannelStatusLive's `destructive` badge (the badge calls it
+              `error`) rendered unstyled.
+            The rest were index-access proofs (`?? ''`, guarded reads — never `!`), the glass records
+            typed by their colour unions instead of `Record<string, …>`, and Sonner's `class` joined
+            to the string its prop declares.
+      - [x] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
-      - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
+            *(2026-09-10)* `gui.yml` now runs `pnpm typecheck` = `gui/scripts/typecheck.mjs`, which
+            runs `vue-tsc --build`: **0 errors**.
+      - [x] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
             reports zero *checked files*, the same way a coverage gate fails at 0%.
+            *(2026-09-10)* `--extendedDiagnostics` prints no file counts in `--build` mode, so the
+            check is a **canary** instead of a count, which is the stronger proof anyway: after the
+            real run the script plants `app/__typecheck_canary__.ts` with a deliberate type error
+            and fails unless the checker reports it by name (always deleted; gitignored). Shown to
+            matter: with the canary planted, the old `vue-tsc --noEmit` exits **0** and never
+            mentions it.
 - [x] *(2026-08-24, fixed the same day)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
       deadline in a test, not a regression.** Six of its seventeen tests failed a full-workspace
       `cargo test` with `"Timeout after 30000ms"` while two cargo builds and sixteen other test binaries
