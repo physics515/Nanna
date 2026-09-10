@@ -3744,9 +3744,29 @@ asks permission or restricts her.)*:
       hook would plug into. Remaining: the **guard** half — a hook that can *refuse* a call — which is a
       different shape (it has to run before execution and be able to fail the call), and a scripting
       binding so the interceptor is user-editable rather than Rust-only.
-- [ ] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
+- [x] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
       `with_hour_cache_write`). One field + a config flag keeps the big prefix warm across heartbeat/cron
       gaps on the cloud escape hatch.
+      *(2026-09-10)* `[llm] prompt_cache_ttl = "5m" | "1h"` → `nanna_llm::CacheTtl` on every
+      breakpoint of a request, on both the boot and the hot-reload path. **The invariant is one TTL
+      per request**: Anthropic returns 400 when a longer-TTL breakpoint follows a shorter one, or
+      when an explicit last-block marker disagrees with the top-level one — and the OAuth path
+      stamped a *fresh 5-minute* marker on the last system block, which would have been exactly
+      that 400 the moment 1h was switched on. It now inherits the request's own marker (tested
+      on the serialized JSON). The three copy-pasted `starts_with("claude")` blocks in the agent
+      loop (initial build, routing swap, rescue retry) collapsed into one
+      `prompt_cache_control(model, ttl)`, so no path can mix TTLs. The 5-minute default is sent
+      as **no `ttl` key**, so every existing request is byte-identical (asserted on the wire);
+      an unknown value fails config parsing naming `5m`/`1h`. 9 new tests across 4 crates.
+- [ ] *(2026-09-10)* **Price 1-hour cache writes at 2x in the cost report.** `estimate_cost_usd`
+      takes one undifferentiated `cache_write_tokens` and prices it at the 5-minute 1.25x rate, so
+      with `prompt_cache_ttl = "1h"` the reported spend under-counts every write by 0.75x input.
+      `ModelPricing::with_hour_cache_write` exists and is still unwired. Fix from the API's own
+      split rather than from config (config can change between requests):
+      parse `usage.cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` in
+      `Usage` + `MessageStartUsage`, carry it through `StreamEvent::MessageStart` and
+      `RequestObservation`, keep a separate 1h total in `model_stats`, and price the two parts
+      separately.
 - [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
       cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
       visibility more than a per-terminal-session number.

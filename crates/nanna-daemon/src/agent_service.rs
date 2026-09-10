@@ -6,7 +6,7 @@ use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
 use crate::session::{MessageRole, RunUsage, SessionId, SessionMessage, TimelineItem, ToolCallRecord};
 use nanna_agent::{Agent, AgentConfig, CancelToken, ModelTier, RunOptions, ThinkingMode};
-use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
+use nanna_llm::{AnthropicMessage, CacheTtl, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
 use nanna_tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
@@ -95,6 +95,17 @@ pub struct AgentServiceConfig {
     pub openrouter_api_key: Option<String>,
     /// OpenAI API key (passed to agents for summarization/extraction)
     pub openai_api_key: Option<String>,
+    /// Anthropic prompt-cache lifetime for every breakpoint of a request.
+    pub prompt_cache_ttl: CacheTtl,
+}
+
+/// `[llm] prompt_cache_ttl` → the TTL the agent sends. An exhaustive match, so the config
+/// enum and the wire enum cannot drift apart without this failing to compile.
+pub(crate) const fn cache_ttl_from(ttl: nanna_config::PromptCacheTtl) -> CacheTtl {
+    match ttl {
+        nanna_config::PromptCacheTtl::FiveMinutes => CacheTtl::FiveMinutes,
+        nanna_config::PromptCacheTtl::OneHour => CacheTtl::OneHour,
+    }
 }
 
 impl Default for AgentServiceConfig {
@@ -119,6 +130,7 @@ impl Default for AgentServiceConfig {
             sub_agent_models: vec![],
             openrouter_api_key: None,
             openai_api_key: None,
+            prompt_cache_ttl: CacheTtl::FiveMinutes,
         }
     }
 }
@@ -156,6 +168,7 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
     // Resolved (list > legacy single > main chat list), exactly as boot does,
     // so consumers keep seeing one authoritative never-empty chain.
     cfg.sub_agent_models = llm.effective_sub_agent_models();
+    cfg.prompt_cache_ttl = cache_ttl_from(llm.prompt_cache_ttl);
 }
 
 /// Build the per-run/per-step [`AgentConfig`] from the service config.
@@ -178,6 +191,7 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
         openai_api_key: config.openai_api_key.clone(),
         model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
         routing_first_turn_primary: config.routing_first_turn_primary,
+        prompt_cache_ttl: config.prompt_cache_ttl,
         ..Default::default()
     }
 }
@@ -2192,6 +2206,34 @@ mod tests {
         // spending a model the user just turned off.
         apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
         assert!(agent_config_from(&cfg).summarization_priority.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_cache_ttl_reaches_the_next_agent_config() {
+        let mut cfg = AgentServiceConfig::default();
+        assert_eq!(
+            agent_config_from(&cfg).prompt_cache_ttl,
+            CacheTtl::FiveMinutes,
+            "the API default is what a daemon boots with"
+        );
+
+        let llm = nanna_config::LlmConfig {
+            prompt_cache_ttl: nanna_config::PromptCacheTtl::OneHour,
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+        assert_eq!(
+            agent_config_from(&cfg).prompt_cache_ttl,
+            CacheTtl::OneHour,
+            "a hot-reloaded [llm] prompt_cache_ttl must reach the next request"
+        );
+
+        // And back: switching off the 2x write price must propagate too.
+        apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
+        assert_eq!(
+            agent_config_from(&cfg).prompt_cache_ttl,
+            CacheTtl::FiveMinutes
+        );
     }
 
     #[test]

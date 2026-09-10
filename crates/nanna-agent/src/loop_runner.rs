@@ -3,8 +3,8 @@
 use crate::cancel::CancelToken;
 use crate::{AgentContext, AgentError, ContextSummarizationConfig, prompts};
 use nanna_llm::{
-    AnthropicMessage, AnthropicRequest, CacheControl, ContentBlock, ImageSource, LlmClient,
-    StreamEvent, ToolDefinition as LlmToolDef,
+    AnthropicMessage, AnthropicRequest, CacheControl, CacheTtl, ContentBlock, ImageSource,
+    LlmClient, StreamEvent, ToolDefinition as LlmToolDef,
 };
 use nanna_tools::{OutputTarget, ToolCall, ToolRegistry, ToolResponse, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -442,6 +442,24 @@ pub struct AgentConfig {
     /// Use a cheaper model here to reduce costs for delegated sub-tasks.
     /// Format: "provider/model" e.g. "ollama/qwen3:4b" or "claude-3-5-haiku-20241022"
     pub sub_agent_model: Option<String>,
+    /// Anthropic prompt-cache lifetime, applied to every breakpoint of a request (one TTL
+    /// per request — see [`CacheControl`]). Default: the API's 5 minutes.
+    pub prompt_cache_ttl: CacheTtl,
+}
+
+/// The prompt-cache marker for a request to `model`: `Some` for Claude models, `None`
+/// for providers that do not take one. Every call site derives its marker here, so a
+/// routing swap or a rescue retry can never mix TTLs within one request.
+fn prompt_cache_control(model: &str, ttl: CacheTtl) -> Option<CacheControl> {
+    debug_assert!(!model.is_empty(), "a request always names its model");
+    let control = model
+        .starts_with("claude")
+        .then(|| CacheControl::ephemeral_for(ttl));
+    debug_assert!(
+        control.as_ref().is_none_or(|c| c.effective_ttl() == ttl),
+        "the marker carries the configured TTL"
+    );
+    control
 }
 
 /// A model with its maximum complexity tier for routing purposes.
@@ -511,6 +529,7 @@ impl Default for AgentConfig {
             model_routing: vec![],
             routing_first_turn_primary: true,
             sub_agent_model: None,
+            prompt_cache_ttl: CacheTtl::default(),
         }
     }
 }
@@ -4493,11 +4512,7 @@ impl Agent {
                     request.model = routed.clone();
                 }
                 // Update cache_control based on new model
-                request.cache_control = if request.model.starts_with("claude") {
-                    Some(CacheControl::ephemeral())
-                } else {
-                    None
-                };
+                request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
                 // `thinking` and `temperature` were derived from the CONFIGURED
                 // model a moment ago; routing has just replaced it with a
                 // different one, and those two fields are contract-bound per
@@ -4631,11 +4646,7 @@ impl Agent {
                     // cache miss it was the 4096 unknown floor, so the retry
                     // that exists to save the turn truncated it instead.
                     request.model = self.config.model.clone();
-                    request.cache_control = if request.model.starts_with("claude") {
-                        Some(CacheControl::ephemeral())
-                    } else {
-                        None
-                    };
+                    request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
                     let primary_contract =
                         nanna_llm::anthropic_model_contract(&request.model);
                     let primary_mode =
@@ -7972,11 +7983,7 @@ impl Agent {
         // Enable prompt caching for Anthropic models (system prompt + tools get cached,
         // 90% discount on cached input tokens). Safe to send for non-Anthropic providers
         // as the field is skipped when None.
-        let cache_control = if self.config.model.starts_with("claude") {
-            Some(CacheControl::ephemeral())
-        } else {
-            None
-        };
+        let cache_control = prompt_cache_control(&self.config.model, self.config.prompt_cache_ttl);
 
         // Get messages and ensure all images fit within provider size limits.
         // New attachments are resized when added (line ~1143), but images already
@@ -14423,5 +14430,27 @@ context 2 (attempt 4)", false)],
 
         let state = RunState::new();
         assert!(!state.into_response(false).degenerate_loop);
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_control_tests {
+    use super::{CacheControl, CacheTtl, prompt_cache_control};
+
+    #[test]
+    fn claude_models_get_a_marker_carrying_the_configured_ttl() {
+        let hour = prompt_cache_control("claude-opus-5", CacheTtl::OneHour)
+            .expect("Claude models are cached");
+        assert_eq!(hour.effective_ttl(), CacheTtl::OneHour);
+
+        // The default must stay exactly today's marker, so no request changes bytes.
+        let default = prompt_cache_control("claude-sonnet-5", CacheTtl::FiveMinutes);
+        assert_eq!(default, Some(CacheControl::ephemeral()));
+    }
+
+    #[test]
+    fn other_providers_never_get_a_marker() {
+        assert!(prompt_cache_control("qwen3.5:9b", CacheTtl::OneHour).is_none());
+        assert!(prompt_cache_control("gpt-5", CacheTtl::FiveMinutes).is_none());
     }
 }

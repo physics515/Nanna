@@ -1674,20 +1674,71 @@ pub struct AnthropicRequest {
 ///
 /// When set at the request level, enables automatic caching: the API caches all content
 /// up to and including the last cacheable block. On subsequent requests with the same
-/// prefix, cached content is reused automatically (~5 minute TTL on Anthropic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// prefix, cached content is reused automatically.
+///
+/// **One TTL per request.** Anthropic rejects a request whose longer-TTL breakpoints do
+/// not precede its shorter ones, and one whose explicit marker on the last block disagrees
+/// with the top-level TTL. Every marker Nanna emits for a request is derived from that
+/// request's single `CacheControl`, which keeps both rules true by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub cache_type: String,
+    /// `None` is the API default (5 minutes); only a 1-hour TTL is ever sent explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+}
+
+/// Prompt-cache lifetime on Anthropic.
+///
+/// A 1-hour write costs 2x base input (5-minute: 1.25x); reads cost 0.1x either way and
+/// refresh the timer. So 1-hour pays only when requests sharing a prefix start 5-60 minutes
+/// apart — heartbeat and cron gaps on the cloud escape hatch — and needs at least three
+/// requests per write to break even.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CacheTtl {
+    /// The API default.
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
 }
 
 impl CacheControl {
-    /// Create an ephemeral cache control (standard ~5 minute TTL)
+    /// Create an ephemeral cache control with the API's default ~5 minute TTL.
     #[must_use]
     pub fn ephemeral() -> Self {
-        Self {
+        Self::ephemeral_for(CacheTtl::FiveMinutes)
+    }
+
+    /// Create an ephemeral cache control with `ttl`.
+    ///
+    /// The 5-minute default is sent as no `ttl` key at all, so a default request is
+    /// byte-identical to the one sent before the TTL was configurable.
+    #[must_use]
+    pub fn ephemeral_for(ttl: CacheTtl) -> Self {
+        let explicit = match ttl {
+            CacheTtl::FiveMinutes => None,
+            CacheTtl::OneHour => Some(CacheTtl::OneHour),
+        };
+        let control = Self {
             cache_type: "ephemeral".to_string(),
-        }
+            ttl: explicit,
+        };
+        debug_assert_eq!(control.effective_ttl(), ttl, "the TTL must round-trip");
+        debug_assert_ne!(
+            control.ttl,
+            Some(CacheTtl::FiveMinutes),
+            "5m stays implicit"
+        );
+        control
+    }
+
+    /// The TTL the API applies, resolving an absent key to its 5-minute default.
+    #[must_use]
+    pub fn effective_ttl(&self) -> CacheTtl {
+        self.ttl.unwrap_or_default()
     }
 }
 
@@ -1758,13 +1809,22 @@ impl OAuthAnthropicRequest {
             }
         }
 
-        // Place explicit cache breakpoint on the last system block.
-        // This ensures the system prompt prefix is cached server-side (~5 min TTL).
-        if request.cache_control.is_some() {
+        // Place explicit cache breakpoint on the last system block, so the system prompt
+        // prefix is cached server-side. It carries the request's own marker rather than a
+        // fresh default: a 5-minute breakpoint ahead of a 1-hour top-level one is a 400
+        // (longer TTLs must come first), so one request gets exactly one TTL.
+        if let Some(ref control) = request.cache_control {
             if let Some(last) = system.last_mut() {
-                last.cache_control = Some(CacheControl::ephemeral());
+                last.cache_control = Some(control.clone());
             }
         }
+        debug_assert!(
+            system
+                .iter()
+                .filter_map(|block| block.cache_control.as_ref())
+                .all(|marker| Some(marker) == request.cache_control.as_ref()),
+            "every system-block breakpoint must match the request-level TTL"
+        );
 
         Self {
             model: request.model.clone(),
@@ -8089,5 +8149,81 @@ mod input_overflow_tests {
         // Ollama — the pin is an Ollama-path decision only.
         let client = EmbeddingClient::openai("k").with_base_url("http://localhost:8080");
         assert_eq!(client.base_url, "http://localhost:8080");
+    }
+}
+
+#[cfg(test)]
+mod cache_ttl_tests {
+    use super::*;
+
+    fn cached_request(ttl: CacheTtl) -> AnthropicRequest {
+        AnthropicRequest {
+            model: "claude-opus-5".to_string(),
+            messages: vec![AnthropicMessage::user_text("hello")],
+            max_tokens: 128,
+            context_limit: None,
+            temperature: None,
+            system: Some("You are Nanna.".to_string()),
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: Some(CacheControl::ephemeral_for(ttl)),
+        }
+    }
+
+    #[test]
+    fn the_default_marker_is_byte_identical_to_the_pre_ttl_wire_format() {
+        let json = serde_json::to_string(&CacheControl::ephemeral()).expect("serializes");
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
+        assert_eq!(
+            CacheControl::ephemeral_for(CacheTtl::FiveMinutes),
+            CacheControl::ephemeral()
+        );
+    }
+
+    #[test]
+    fn a_one_hour_marker_sends_the_ttl_and_reads_back() {
+        let hour = CacheControl::ephemeral_for(CacheTtl::OneHour);
+        let json = serde_json::to_string(&hour).expect("serializes");
+        assert_eq!(json, r#"{"type":"ephemeral","ttl":"1h"}"#);
+
+        let parsed: CacheControl = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(parsed.effective_ttl(), CacheTtl::OneHour);
+        let bare: CacheControl = serde_json::from_str(r#"{"type":"ephemeral"}"#).expect("parses");
+        assert_eq!(
+            bare.effective_ttl(),
+            CacheTtl::FiveMinutes,
+            "absent means the API default"
+        );
+    }
+
+    #[test]
+    fn the_oauth_system_breakpoint_carries_the_request_ttl() {
+        let request = cached_request(CacheTtl::OneHour);
+        let oauth = OAuthAnthropicRequest::from_request(&request, true);
+        assert_eq!(oauth.system.len(), 2, "identity block + the system prompt");
+        assert_eq!(
+            oauth.system[0].cache_control, None,
+            "only the last block is a breakpoint"
+        );
+        assert_eq!(oauth.system[1].cache_control, request.cache_control);
+
+        // On the wire: both breakpoints say 1h, and no marker falls back to the 5-minute
+        // default — a 5m breakpoint ahead of a 1h one is the ordering the API rejects.
+        let json = serde_json::to_string(&oauth).expect("serializes");
+        assert_eq!(json.matches(r#""cache_control":"#).count(), 2);
+        assert_eq!(json.matches(r#""ttl":"1h""#).count(), 2);
+    }
+
+    #[test]
+    fn a_default_ttl_request_sends_no_ttl_key_anywhere() {
+        let oauth =
+            OAuthAnthropicRequest::from_request(&cached_request(CacheTtl::FiveMinutes), true);
+        let json = serde_json::to_string(&oauth).expect("serializes");
+        assert_eq!(json.matches(r#""cache_control":"#).count(), 2);
+        assert!(
+            !json.contains(r#""ttl""#),
+            "the default must not change a byte: {json}"
+        );
     }
 }

@@ -150,6 +150,22 @@ pub struct LlmConfig {
     /// Empty = sub-agents use the main chat list (`model_priority`).
     /// Format: ["ollama/qwen3:4b", "claude-haiku-3-5"]
     pub sub_agent_models: Vec<String>,
+    /// Anthropic prompt-cache lifetime: `"5m"` (default) or `"1h"`. A 1-hour cache write
+    /// costs 2x input instead of 1.25x and pays only when requests sharing a prompt start
+    /// 5-60 minutes apart (heartbeats, cron, a reply after a break). Applies to every
+    /// cache breakpoint of a request.
+    pub prompt_cache_ttl: PromptCacheTtl,
+}
+
+/// `[llm] prompt_cache_ttl` — the two lifetimes Anthropic's prompt cache offers. Any other
+/// value fails config parsing with an error naming the two accepted spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PromptCacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
 }
 
 impl LlmConfig {
@@ -220,6 +236,7 @@ impl Default for LlmConfig {
             routing_first_turn_primary: true,
             sub_agent_model: None, // Legacy — see sub_agent_models
             sub_agent_models: vec![], // Empty = fall back to model_priority
+            prompt_cache_ttl: PromptCacheTtl::FiveMinutes, // the API default
         }
     }
 }
@@ -1215,5 +1232,34 @@ streaming_enabled = true
         assert!(!has_date_suffix("claude-opus-4-1"));
         assert!(!has_date_suffix("ollama/qwen3:14b"));
         assert!(!has_date_suffix("nodashes"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_ttl_tests {
+    use super::{Config, PromptCacheTtl};
+
+    #[test]
+    fn prompt_cache_ttl_defaults_to_five_minutes_and_accepts_one_hour() {
+        let absent: Config = toml::from_str("[llm]\nmodel = \"claude-sonnet-5\"\n")
+            .expect("a config without the key must load");
+        assert_eq!(absent.llm.prompt_cache_ttl, PromptCacheTtl::FiveMinutes);
+
+        let hour: Config = toml::from_str("[llm]\nprompt_cache_ttl = \"1h\"\n")
+            .expect("\"1h\" is an accepted spelling");
+        assert_eq!(hour.llm.prompt_cache_ttl, PromptCacheTtl::OneHour);
+    }
+
+    #[test]
+    fn an_unknown_prompt_cache_ttl_is_rejected_by_name() {
+        let error = toml::from_str::<Config>("[llm]\nprompt_cache_ttl = \"2h\"\n")
+            .expect_err("only the two lifetimes Anthropic offers are accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains("2h"),
+            "the error names the bad value: {message}"
+        );
+        assert!(message.contains("5m"), "and the accepted ones: {message}");
+        assert!(message.contains("1h"), "and the accepted ones: {message}");
     }
 }

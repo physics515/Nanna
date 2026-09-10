@@ -236,6 +236,8 @@ name = "Nanna"
 [llm]
 provider = "ollama"       # ollama | anthropic | openai | openrouter
 model = "qwen3.5:9b"
+# prompt_cache_ttl = "1h" # Anthropic only: "5m" (default) or "1h" — 1h keeps the prompt
+#                         # cache warm across 5-60 min gaps, at 2x the cache-write price
 
 [server]
 enabled = true
