@@ -1941,6 +1941,27 @@ so neither CI nor any prior run could have caught them:
 - [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
       `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
       whether that is worth a job before claiming the desktop app is cross-platform.
+- [x] *(2026-09-10)* **`nanna-gui` did not build on Linux or macOS at all — an upstream bug, now
+      patched.** Cargo's build-dir layout v2 (default on nightly since August, stable in **Rust
+      1.100, 2026-11-12**) nests `OUT_DIR` one level deeper (`build/<pkg>/<hash>/out`).
+      `tauri-build 2.6.3` walks a fixed three levels up to find the target dir, lands on
+      `target/<profile>/build`, and `copy_binaries` calls `remove_file` on `build/nanna-daemon` —
+      the daemon's own build directory — so the build script panics `IsADirectory`
+      (`tauri-build-2.6.3/src/lib.rs:80`). **Windows escaped only by the `.exe` suffix**, and was
+      still wrong: its sidecar was copied into `build/`, not beside the app. Upstream fix:
+      [tauri#15831](https://github.com/tauri-apps/tauri/pull/15831) (merged 2026-08-06, due in
+      tauri-build 2.7.0 via release PR [#15634](https://github.com/tauri-apps/tauri/pull/15634)).
+      Landed `vendor/tauri-build` = crates.io 2.6.3 plus exactly that diff, through
+      `[patch.crates-io]` and excluded from the workspace (not linted or tested as ours).
+      Verified both ways on one target dir: `cargo check -p nanna-gui` panics on the committed
+      tree and exits 0 with the patch, with the sidecar now at `target/debug/nanna-daemon`.
+      Rejected: `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT` (cargo-internal, temporary by
+      name, and needed in every shell and CI step) and a git-rev patch (pulls tauri's whole repo
+      and a second, git-sourced `tauri-utils`). **Retirement is a test, not a note:** a path
+      `[patch]` stays applied even after a fixed release exists, so
+      `vendored_tauri_build_retires_with_the_next_tauri_release` keys on `tauri-codegen`, which
+      ships in lockstep with `tauri-build` — verified it fires by bumping it to 2.7.0 in the lock.
+      WebDriver still cannot run on this host (no `WebKitWebDriver` on Arch; see P4).
 - [ ] **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
       baseline.** The 2026-09-07 run measured `simd_batch` at **0.040 / 0.869 / 5.20 ms** for
       N = 1k/10k/50k — comfortably inside the ≤0.20 / ≤5.0 / ≤25 ms budgets and *below* the recorded

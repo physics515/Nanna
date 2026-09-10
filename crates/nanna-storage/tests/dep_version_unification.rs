@@ -435,3 +435,103 @@ fn version_comparison_orders_releases_and_respects_the_boundary() {
     // Missing components read as zero, so a two-part version is comparable.
     assert!(version_is_at_most("0.2", "0.2.0"), "0.2 == 0.2.0");
 }
+
+/// The crates.io `tauri-build` release carried in `vendor/tauri-build` with the
+/// target-dir fix from tauri-apps/tauri#15831 applied on top.
+const TAURI_BUILD_VENDORED_VERSION: &str = "2.6.3";
+
+/// Return the single `[[package]]` block for `name`, or `None` if it is absent.
+///
+/// A second block means the crate split across sources — for a `[patch]`, the
+/// vendored copy sitting beside crates.io's instead of replacing it.
+fn package_block<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
+    assert!(!name.is_empty(), "package name must be non-empty");
+    let name_line = format!("name = \"{name}\"");
+    let mut blocks = contents
+        .split("[[package]]")
+        .filter(|block| block.lines().any(|line| line.trim() == name_line));
+    let block = blocks.next();
+    assert!(
+        blocks.next().is_none(),
+        "`{name}` resolves more than once in the lockfile"
+    );
+    block
+}
+
+/// The quoted `version` of a `[[package]]` block.
+fn block_version(block: &str) -> Option<&str> {
+    let version = block
+        .lines()
+        .find_map(|line| quoted_value(line.trim(), "version"));
+    debug_assert!(version.is_none_or(|v| !v.is_empty()), "empty version");
+    version
+}
+
+/// A path `[patch]` is sticky: cargo keeps the vendored 2.6.3 even after a
+/// fixed release exists, so "is it still registry-sourced?" can never fire.
+/// `tauri-codegen` is the trigger instead — it ships in lockstep with
+/// `tauri-build` (both 2.6.3 today) and moves the moment `cargo update` takes
+/// the next tauri release, every one of which carries #15831.
+#[test]
+fn vendored_tauri_build_retires_with_the_next_tauri_release() {
+    let lockfile = workspace_lockfile();
+    let contents = std::fs::read_to_string(&lockfile)
+        .unwrap_or_else(|e| panic!("cannot read {lockfile:?}: {e}"));
+    let retire = "delete vendor/tauri-build plus the [patch.crates-io] table and the \
+                  `exclude` entry in the root Cargo.toml, then confirm `cargo check -p \
+                  nanna-gui` on Linux";
+
+    let build = package_block(&contents, "tauri-build")
+        .unwrap_or_else(|| panic!("`tauri-build` left the graph — {retire}, and this test"));
+    assert!(
+        !build.contains("source = \"registry+"),
+        "tauri-build resolves from crates.io, so the vendored patch is not applied — {retire}"
+    );
+    assert_eq!(
+        block_version(build),
+        Some(TAURI_BUILD_VENDORED_VERSION),
+        "the patched tauri-build is not the vendored release"
+    );
+
+    let codegen = package_block(&contents, "tauri-codegen")
+        .unwrap_or_else(|| panic!("`tauri-codegen` left the graph — re-decide this guard"));
+    assert_eq!(
+        block_version(codegen),
+        Some(TAURI_BUILD_VENDORED_VERSION),
+        "tauri released past the vendored tauri-build (tauri-codegen moved); the new \
+         tauri-build carries tauri-apps/tauri#15831 — {retire}"
+    );
+
+    // A re-vendor of plain 2.6.3 would pass everything above and bring back the
+    // `IsADirectory` panic, so the fix itself is part of the invariant.
+    let vendored_lib = lockfile
+        .parent()
+        .map(|root| root.join("vendor/tauri-build/src/lib.rs"))
+        .expect("the lockfile sits in the workspace root");
+    let source = std::fs::read_to_string(&vendored_lib)
+        .unwrap_or_else(|e| panic!("cannot read {vendored_lib:?}: {e}"));
+    assert!(
+        source.contains("fn target_dir_from_out_dir("),
+        "vendor/tauri-build lost the tauri-apps/tauri#15831 fix"
+    );
+}
+
+#[test]
+fn package_block_finds_one_block_and_reads_its_version() {
+    let lockfile = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n\
+                    source = \"registry+x\"\n\n[[package]]\nname = \"ab\"\nversion = \"2.0.0\"\n";
+
+    let block = package_block(lockfile, "a").expect("`a` is present");
+    assert_eq!(block_version(block), Some("1.0.0"));
+    assert!(
+        block.contains("registry+"),
+        "the block carries its own source"
+    );
+
+    // Negative space: a name that is only a prefix of another must not match.
+    assert!(package_block(lockfile, "b").is_none(), "`b` is not `ab`");
+    assert_eq!(
+        package_block(lockfile, "ab").and_then(block_version),
+        Some("2.0.0")
+    );
+}
