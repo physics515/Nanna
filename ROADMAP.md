@@ -1975,7 +1975,10 @@ so neither CI nor any prior run could have caught them:
       `vendored_tauri_build_retires_with_the_next_tauri_release` keys on `tauri-codegen`, which
       ships in lockstep with `tauri-build` — verified it fires by bumping it to 2.7.0 in the lock.
       WebDriver still cannot run on this host (no `WebKitWebDriver` on Arch; see P4).
-- [ ] **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
+- [x] *(2026-09-10 — done: `bench/BASELINE.md` Suite 2 now carries Linux rows, **38.1 µs /
+      0.591 ms / 4.08 ms** at N = 1k/10k/50k on a quiet 7950X3D, every budget with ≥ 5x
+      headroom; recorded as a platform baseline beside the Windows rows, not as an
+      improvement.)* **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
       baseline.** The 2026-09-07 run measured `simd_batch` at **0.040 / 0.869 / 5.20 ms** for
       N = 1k/10k/50k — comfortably inside the ≤0.20 / ≤5.0 / ≤25 ms budgets and *below* the recorded
       p95s, which is a sound pass (it held under a load average of 112 with a second Rust build

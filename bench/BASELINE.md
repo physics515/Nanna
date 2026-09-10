@@ -553,6 +553,21 @@ Reference measurement *(2026-08-05, release, AMD Zen 4 / AVX-512, 768-dim, fixed
 | SIMD batch search @ N=50k | **10.1 / 11.0 ms** | **≤ 25 ms** | same / `simd_batch/50000` | GPU crossover threshold |
 | GPU fixed dispatch overhead | ~200 µs (characterized) | not budgeted | `nanna-gpu` after wgpu 30 | was ~750 µs; GPU path still needs a live adapter |
 
+Linux platform baseline *(2026-09-10, release, AMD Ryzen 9 7950X3D / AVX-512, Arch Linux,
+nightly-2026-09-08, same seed and bench body; quiet host — load 2.7-2.9 from the run's own idle
+tail, no other build running)* — criterion mean with its 95% CI, 30 samples each:
+
+| Metric | Linux mean [95% CI] | vs Windows p50 above | Budget (p95 max) |
+| --- | --- | --- | --- |
+| SIMD batch search @ N=1k | **38.1 µs** [37.8, 38.3] | 0.91x | ≤ 0.20 ms |
+| SIMD batch search @ N=10k | **0.591 ms** [0.586, 0.598] | 0.36x | ≤ 5.0 ms |
+| SIMD batch search @ N=50k | **4.08 ms** [4.06, 4.11] | 0.40x | ≤ 25 ms |
+
+A **platform** baseline, not an improvement claim: it differs from the Windows rows in OS,
+toolchain and dependency versions at once, so the 2.5-2.8x at 10k/50k is not attributed to any
+one of them. Every budget holds with ≥ 5x headroom. The 2026-09-07 run's 0.040 / 0.869 / 5.20 ms
+was taken under a load average of 112 and is superseded by these rows.
+
 Budget: SIMD p95 must not exceed the ceilings above on the reference tier (≈2× measured headroom
 for CI noise). N=100k and RAM/100k remain unbaselined until a criterion body covers them. The
 GPU half of the crossover stays in `nanna-gpu` benches (adapter-dependent) and is not a CI gate.
