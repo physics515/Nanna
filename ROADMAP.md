@@ -3761,7 +3761,16 @@ asks permission or restricts her.)*:
       `prompt_cache_control(model, ttl)`, so no path can mix TTLs. The 5-minute default is sent
       as **no `ttl` key**, so every existing request is byte-identical (asserted on the wire);
       an unknown value fails config parsing naming `5m`/`1h`. 9 new tests across 4 crates.
-- [ ] *(2026-09-10)* **Price 1-hour cache writes at 2x in the cost report.** `estimate_cost_usd`
+- [x] *(2026-09-10 — landed the same run.)* `usage.cache_creation.ephemeral_1h_input_tokens` is
+      parsed on both the response and the `message_start` stream path (a split that exceeds its
+      total is provider data and is clamped, not asserted); it rides `StreamEvent::MessageStart`
+      → `LlmResult` → `RequestObservation` → a separate `total_cache_creation_1h_tokens` in
+      `model_stats` (serde-defaulted, so stored stats from before still load) → migration
+      `015_model_stats_cache_ttl` (an `ALTER TABLE … DEFAULT 0` column, round-tripped through
+      insert *and* upsert); the report prices it through `estimate_cost_usd_with_hour_writes`.
+      1M tokens written at 1h now report **2x input** ($6.00 on Sonnet-class) instead of the
+      5-minute $3.75. 8 new tests; 994 pass across the four touched crates.
+      **Price 1-hour cache writes at 2x in the cost report.** `estimate_cost_usd`
       takes one undifferentiated `cache_write_tokens` and prices it at the 5-minute 1.25x rate, so
       with `prompt_cache_ttl = "1h"` the reported spend under-counts every write by 0.75x input.
       `ModelPricing::with_hour_cache_write` exists and is still unwired. Fix from the API's own

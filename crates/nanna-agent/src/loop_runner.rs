@@ -923,6 +923,8 @@ struct LlmResult {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
+    /// The 1-hour share of `cache_creation_tokens`.
+    cache_creation_1h_tokens: u32,
     /// Error tool results from malformed JSON parsing failures.
     /// These need to be sent back to the model so it knows the call failed.
     error_tool_results: Vec<ContentBlock>,
@@ -4631,6 +4633,7 @@ impl Agent {
                                 output_tokens: 0,
                                 cache_read_tokens: 0,
                                 cache_creation_tokens: 0,
+                                cache_creation_1h_tokens: 0,
                                 tier: complexity,
                                 escalated: false,
                             })
@@ -4811,6 +4814,7 @@ impl Agent {
                     },
                     cache_read_tokens: result.cache_read_tokens,
                     cache_creation_tokens: result.cache_creation_tokens,
+                    cache_creation_1h_tokens: result.cache_creation_1h_tokens,
                     input_tokens: result.input_tokens,
                     output_tokens: result.output_tokens,
                     // The live latch, not `configured_window`: an escalated or
@@ -4832,6 +4836,7 @@ impl Agent {
                         output_tokens: result.output_tokens,
                         cache_read_tokens: result.cache_read_tokens,
                         cache_creation_tokens: result.cache_creation_tokens,
+                        cache_creation_1h_tokens: result.cache_creation_1h_tokens,
                         tier: complexity,
                         escalated,
                     })
@@ -5978,6 +5983,7 @@ impl Agent {
         let mut input_tokens = 0u32;
         let mut cache_read_tokens = 0u32;
         let mut cache_creation_tokens = 0u32;
+        let mut cache_creation_1h_tokens = 0u32;
         let mut narration_check_len = 0usize; // track text length at last narration check
         // Re-arm per call: a spiral flag left unconsumed (e.g. the abort raced
         // finalized tool calls) must not fire recovery on a healthy later round.
@@ -6180,12 +6186,14 @@ impl Agent {
                     input_tokens: msg_input,
                     cache_read_tokens: msg_cache_read,
                     cache_creation_tokens: msg_cache_creation,
+                    cache_creation_1h_tokens: msg_cache_creation_1h,
                     ..
                 } => {
                     // Prompt-side usage (incl. cache hits/writes) is reported here.
                     input_tokens = msg_input;
                     cache_read_tokens = msg_cache_read;
                     cache_creation_tokens = msg_cache_creation;
+                    cache_creation_1h_tokens = msg_cache_creation_1h;
                 }
                 _ => {}
             }
@@ -6199,6 +6207,7 @@ impl Agent {
             output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            cache_creation_1h_tokens,
             error_tool_results: asm.error_tool_results,
         })
     }
@@ -6237,6 +6246,7 @@ impl Agent {
             output_tokens: response.usage.output_tokens,
             cache_read_tokens: response.usage.cache_read_input_tokens,
             cache_creation_tokens: response.usage.cache_creation_input_tokens,
+            cache_creation_1h_tokens: response.usage.cache_creation_1h_tokens(),
             error_tool_results: Vec::new(),
         })
     }

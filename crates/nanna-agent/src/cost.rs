@@ -173,6 +173,67 @@ pub fn estimate_cost_usd(
     cost
 }
 
+/// [`estimate_cost_usd`] for a cache-write total that mixes lifetimes: the
+/// `cache_write_1h_tokens` share of `cache_write_tokens` is billed at the
+/// 1-hour rate ([`ModelPricing::with_hour_cache_write`], 2x input), the rest
+/// at the pricing's 5-minute rate.
+///
+/// The 1-hour count is a subset of the total, never an addition. A larger
+/// value is a caller bug; release builds clamp it to the total rather than
+/// bill a negative 5-minute remainder.
+#[must_use]
+pub fn estimate_cost_usd_with_hour_writes(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cache_write_1h_tokens: u64,
+    pricing: &ModelPricing,
+) -> f64 {
+    debug_assert!(
+        cache_write_1h_tokens <= cache_write_tokens,
+        "the 1-hour share is a subset of the write total"
+    );
+    let hour_tokens = cache_write_1h_tokens.min(cache_write_tokens);
+    let five_minute_tokens = cache_write_tokens - hour_tokens;
+    let base = estimate_cost_usd(
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        five_minute_tokens,
+        pricing,
+    );
+    let hour = estimate_cost_usd(0, 0, 0, hour_tokens, &pricing.with_hour_cache_write());
+    let cost = base + hour;
+    debug_assert!(cost >= base, "a 1-hour share can only add cost");
+    cost
+}
+
+#[cfg(test)]
+mod hour_write_tests {
+    use super::*;
+
+    #[test]
+    fn with_no_hour_share_it_is_exactly_the_five_minute_estimate() {
+        let p = ModelPricing::new(3.0, 15.0, 0.3, 3.75);
+        let plain = estimate_cost_usd(1_000_000, 1_000_000, 2_000_000, 1_000_000, &p);
+        let split =
+            estimate_cost_usd_with_hour_writes(1_000_000, 1_000_000, 2_000_000, 1_000_000, 0, &p);
+        assert!((plain - split).abs() < 1e-9, "{plain} vs {split}");
+    }
+
+    #[test]
+    fn an_hour_write_costs_twice_input_not_one_and_a_quarter() {
+        let p = ModelPricing::new(3.0, 15.0, 0.3, 3.75);
+        // 1M written at 1h: $6.00 (2 x $3 input), where the 5-minute rate says $3.75.
+        let hour = estimate_cost_usd_with_hour_writes(0, 0, 0, 1_000_000, 1_000_000, &p);
+        assert!((hour - 6.0).abs() < 1e-9, "got {hour}");
+        // A half-and-half mix: $1.875 + $3.00.
+        let mixed = estimate_cost_usd_with_hour_writes(0, 0, 0, 1_000_000, 500_000, &p);
+        assert!((mixed - 4.875).abs() < 1e-9, "got {mixed}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

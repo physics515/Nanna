@@ -16,6 +16,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("012_memory_chunks", MIGRATION_012),
     ("013_embedding_buckets", MIGRATION_013),
     ("014_memory_events", MIGRATION_014),
+    ("015_model_stats_cache_ttl", MIGRATION_015),
 ];
 
 const MIGRATION_001: &str = r"
@@ -547,6 +548,14 @@ CREATE INDEX IF NOT EXISTS idx_memory_events_kind_ts
 -- makes embedding the backlog a resumable drain instead of a full rescan.
 CREATE INDEX IF NOT EXISTS idx_memory_events_pending
     ON memory_events(embedding_model, id);
+";
+
+const MIGRATION_015: &str = r"
+-- The 1-hour share of total_cache_creation_tokens. Anthropic bills a 1-hour
+-- cache write at 2x input and a 5-minute one at 1.25x, so one write total
+-- cannot be priced once [llm] prompt_cache_ttl can be 1h. A subset of
+-- total_cache_creation_tokens, never added to it.
+ALTER TABLE model_stats ADD COLUMN total_cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;
 ";
 
 #[cfg(test)]

@@ -47,6 +47,9 @@ pub struct ModelStats {
     pub total_cache_read_tokens: u64,
     /// Total tokens written to cache
     pub total_cache_creation_tokens: u64,
+    /// The 1-hour share of `total_cache_creation_tokens` (billed at 2x input, not 1.25x).
+    #[serde(default)]
+    pub total_cache_creation_1h_tokens: u64,
     /// Response latencies in milliseconds (ring buffer, last N)
     pub latencies_ms: Vec<u64>,
     /// Tokens per second measurements (ring buffer, last N)
@@ -83,6 +86,8 @@ pub struct RequestObservation {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    /// The 1-hour share of `cache_creation_tokens`.
+    pub cache_creation_1h_tokens: u32,
     /// What complexity tier was this request classified as?
     pub tier: Option<super::loop_runner::TaskComplexity>,
     /// Was this an escalation from a cheaper model?
@@ -104,6 +109,9 @@ pub struct ModelStatsSummary {
     /// Tokens written to the prompt cache (billed above input; needed for
     /// accurate cost display — was previously dropped from the summary).
     pub total_cache_creation_tokens: u64,
+    /// The 1-hour share of `total_cache_creation_tokens`.
+    #[serde(default)]
+    pub total_cache_creation_1h_tokens: u64,
     pub cache_hit_rate: f64,
     pub consecutive_failures: u32,
     pub is_healthy: bool,
@@ -139,6 +147,9 @@ pub struct RequestModelStats {
     pub cache_read_tokens: u32,
     /// Cache tokens written
     pub cache_creation_tokens: u32,
+    /// The 1-hour share of `cache_creation_tokens`.
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u32,
     /// Input tokens
     pub input_tokens: u32,
     /// Output tokens
@@ -219,6 +230,11 @@ impl ModelStatsTracker {
         stats.total_output_tokens += u64::from(obs.output_tokens);
         stats.total_cache_read_tokens += u64::from(obs.cache_read_tokens);
         stats.total_cache_creation_tokens += u64::from(obs.cache_creation_tokens);
+        debug_assert!(
+            obs.cache_creation_1h_tokens <= obs.cache_creation_tokens,
+            "the 1-hour share is a subset of the write total"
+        );
+        stats.total_cache_creation_1h_tokens += u64::from(obs.cache_creation_1h_tokens);
 
         if obs.escalated {
             stats.escalations += 1;
@@ -262,7 +278,7 @@ impl ModelStatsTracker {
         // Snapshot (model, token counts) under the read lock, then release it
         // before pricing lookups/arithmetic so the lock isn't held over work
         // that doesn't touch shared state.
-        let usage: Vec<(String, u64, u64, u64, u64)> = {
+        let usage: Vec<(String, u64, u64, u64, u64, u64)> = {
             let inner = self.inner.read().await;
             inner
                 .models
@@ -274,6 +290,7 @@ impl ModelStatsTracker {
                         s.total_output_tokens,
                         s.total_cache_read_tokens,
                         s.total_cache_creation_tokens,
+                        s.total_cache_creation_1h_tokens,
                     )
                 })
                 .collect()
@@ -281,7 +298,7 @@ impl ModelStatsTracker {
 
         let mut report: Vec<ModelCost> = usage
             .into_iter()
-            .map(|(model, input, output, cache_read, cache_write)| {
+            .map(|(model, input, output, cache_read, cache_write, cache_write_1h)| {
                 crate::cost::default_pricing(&model).map_or_else(
                     || ModelCost {
                         model: model.clone(),
@@ -290,8 +307,13 @@ impl ModelStatsTracker {
                     },
                     |pricing| ModelCost {
                         model: model.clone(),
-                        estimated_cost_usd: crate::cost::estimate_cost_usd(
-                            input, output, cache_read, cache_write, &pricing,
+                        estimated_cost_usd: crate::cost::estimate_cost_usd_with_hour_writes(
+                            input,
+                            output,
+                            cache_read,
+                            cache_write,
+                            cache_write_1h,
+                            &pricing,
                         ),
                         priced: true,
                     },
@@ -346,6 +368,7 @@ impl ModelStats {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            total_cache_creation_1h_tokens: 0,
             latencies_ms: Vec::with_capacity(MAX_LATENCY_SAMPLES),
             throughput_tps: Vec::with_capacity(MAX_THROUGHPUT_SAMPLES),
             consecutive_failures: 0,
@@ -396,6 +419,7 @@ impl ModelStats {
             total_output_tokens: self.total_output_tokens,
             total_cache_read_tokens: self.total_cache_read_tokens,
             total_cache_creation_tokens: self.total_cache_creation_tokens,
+            total_cache_creation_1h_tokens: self.total_cache_creation_1h_tokens,
             cache_hit_rate,
             consecutive_failures: self.consecutive_failures,
             is_healthy: self.consecutive_failures < UNHEALTHY_THRESHOLD,
@@ -438,6 +462,7 @@ impl ModelStatsTracker {
             total_output_tokens: s.total_output_tokens,
             total_cache_read_tokens: s.total_cache_read_tokens,
             total_cache_creation_tokens: s.total_cache_creation_tokens,
+            total_cache_creation_1h_tokens: s.total_cache_creation_1h_tokens,
             consecutive_failures: s.consecutive_failures,
             last_success_epoch_ms: s.last_success_epoch_ms,
             last_failure_epoch_ms: s.last_failure_epoch_ms,
@@ -466,6 +491,7 @@ impl ModelStatsTracker {
                 total_output_tokens: s.total_output_tokens,
                 total_cache_read_tokens: s.total_cache_read_tokens,
                 total_cache_creation_tokens: s.total_cache_creation_tokens,
+                total_cache_creation_1h_tokens: s.total_cache_creation_1h_tokens,
                 consecutive_failures: s.consecutive_failures,
                 last_success_epoch_ms: s.last_success_epoch_ms,
                 last_failure_epoch_ms: s.last_failure_epoch_ms,
@@ -501,6 +527,8 @@ pub struct StorableModelStats {
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
+    #[serde(default)]
+    pub total_cache_creation_1h_tokens: u64,
     pub consecutive_failures: u32,
     pub last_success_epoch_ms: u64,
     pub last_failure_epoch_ms: u64,
@@ -530,6 +558,7 @@ impl From<StoredModelStats> for StorableModelStats {
             total_output_tokens: s.total_output_tokens,
             total_cache_read_tokens: s.total_cache_read_tokens,
             total_cache_creation_tokens: s.total_cache_creation_tokens,
+            total_cache_creation_1h_tokens: s.total_cache_creation_1h_tokens,
             consecutive_failures: s.consecutive_failures,
             last_success_epoch_ms: s.last_success_epoch_ms,
             last_failure_epoch_ms: s.last_failure_epoch_ms,
@@ -557,6 +586,7 @@ impl From<StorableModelStats> for StoredModelStats {
             total_output_tokens: s.total_output_tokens,
             total_cache_read_tokens: s.total_cache_read_tokens,
             total_cache_creation_tokens: s.total_cache_creation_tokens,
+            total_cache_creation_1h_tokens: s.total_cache_creation_1h_tokens,
             consecutive_failures: s.consecutive_failures,
             last_success_epoch_ms: s.last_success_epoch_ms,
             last_failure_epoch_ms: s.last_failure_epoch_ms,
@@ -586,6 +616,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
             tier: None,
             escalated: false,
         }
@@ -648,6 +679,7 @@ mod tests {
                 output_tokens: 200,
                 cache_read_tokens: 4000,
                 cache_creation_tokens: 800,
+                cache_creation_1h_tokens: 0,
                 tier: None,
                 escalated: false,
             })
@@ -666,6 +698,7 @@ mod tests {
             output_tokens: output,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
             tier: None,
             escalated: false,
         }
@@ -715,5 +748,62 @@ mod tests {
             .await;
         let total = tracker.total_cost_usd().await;
         assert!((total - 29.25).abs() < 1e-6, "got {total}");
+    }
+}
+
+#[cfg(test)]
+mod hour_cache_write_tests {
+    use super::*;
+
+    fn write_observation(cache_writes: u32, cache_writes_1h: u32) -> RequestObservation {
+        RequestObservation {
+            model: "claude-sonnet-5".to_string(),
+            success: true,
+            latency: Duration::from_millis(10),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: cache_writes,
+            cache_creation_1h_tokens: cache_writes_1h,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    // A 1-hour write is billed at 2x input; before the split existed every write
+    // was priced at the 5-minute 1.25x, under-reporting a 1h user's spend.
+    #[tokio::test]
+    async fn cost_report_prices_one_hour_writes_at_twice_input() {
+        let pricing = crate::cost::default_pricing("claude-sonnet-5").expect("priced model");
+        let tracker = ModelStatsTracker::new();
+        tracker
+            .record(write_observation(1_000_000, 1_000_000))
+            .await;
+
+        let report = tracker.cost_report().await;
+        let expected = pricing.input_usd_per_mtok * 2.0;
+        assert!(
+            (report[0].estimated_cost_usd - expected).abs() < 1e-9,
+            "got {}, expected {expected}",
+            report[0].estimated_cost_usd
+        );
+        let summary = tracker
+            .summary("claude-sonnet-5")
+            .await
+            .expect("summary exists");
+        assert_eq!(summary.total_cache_creation_1h_tokens, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn the_one_hour_share_survives_the_storage_bridge() {
+        let tracker = ModelStatsTracker::new();
+        tracker.record(write_observation(900, 600)).await;
+
+        let exported = tracker.export_for_storage().await;
+        assert_eq!(exported[0].total_cache_creation_1h_tokens, 600);
+        let restored = ModelStatsTracker::new();
+        restored.import_from_storage(exported).await;
+        let summary = restored.summary("claude-sonnet-5").await.expect("imported");
+        assert_eq!(summary.total_cache_creation_1h_tokens, 600);
     }
 }

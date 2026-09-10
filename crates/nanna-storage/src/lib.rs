@@ -529,6 +529,9 @@ pub struct StoredModelStats {
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
+    /// The 1-hour share of `total_cache_creation_tokens` (billed at 2x input, not 1.25x).
+    #[serde(default)]
+    pub total_cache_creation_1h_tokens: u64,
     pub consecutive_failures: u32,
     pub last_success_epoch_ms: u64,
     pub last_failure_epoch_ms: u64,
@@ -558,8 +561,8 @@ impl Storage {
                     consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
                     tier_successes_simple, tier_successes_medium, tier_successes_complex,
                     tier_failures_simple, tier_failures_medium, tier_failures_complex,
-                    escalations, latencies_ms_json, throughput_tps_json, updated_at
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,datetime('now'))
+                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,datetime('now'))
                 ON CONFLICT(model) DO UPDATE SET
                     total_requests=?2, successful_requests=?3, failed_requests=?4,
                     total_input_tokens=?5, total_output_tokens=?6,
@@ -567,7 +570,7 @@ impl Storage {
                     consecutive_failures=?9, last_success_epoch_ms=?10, last_failure_epoch_ms=?11,
                     tier_successes_simple=?12, tier_successes_medium=?13, tier_successes_complex=?14,
                     tier_failures_simple=?15, tier_failures_medium=?16, tier_failures_complex=?17,
-                    escalations=?18, latencies_ms_json=?19, throughput_tps_json=?20, updated_at=datetime('now')",
+                    escalations=?18, latencies_ms_json=?19, throughput_tps_json=?20, total_cache_creation_1h_tokens=?21, updated_at=datetime('now')",
                 turso::params![
                     s.model.clone(),
                     s.total_requests as i64,
@@ -588,7 +591,8 @@ impl Storage {
                     s.tier_failures_complex as i64,
                     s.escalations as i64,
                     latencies_json,
-                    throughput_json
+                    throughput_json,
+                    s.total_cache_creation_1h_tokens as i64
                 ],
             ).await?;
         }
@@ -605,7 +609,7 @@ impl Storage {
                     consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
                     tier_successes_simple, tier_successes_medium, tier_successes_complex,
                     tier_failures_simple, tier_failures_medium, tier_failures_complex,
-                    escalations, latencies_ms_json, throughput_tps_json
+                    escalations, latencies_ms_json, throughput_tps_json, total_cache_creation_1h_tokens
              FROM model_stats",
             (),
         ).await?;
@@ -635,6 +639,7 @@ impl Storage {
                 escalations: row.get::<i64>(17)? as u64,
                 latencies_ms: serde_json::from_str(&latencies_json).unwrap_or_default(),
                 throughput_tps: serde_json::from_str(&throughput_json).unwrap_or_default(),
+                total_cache_creation_1h_tokens: row.get::<i64>(20)? as u64,
             });
         }
         Ok(result)

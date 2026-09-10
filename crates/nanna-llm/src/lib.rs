@@ -1863,6 +1863,40 @@ pub struct Usage {
     /// Tokens read from the prompt cache on this request (billed at 10% of input rate on Anthropic)
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// Per-lifetime split of `cache_creation_input_tokens`. Absent on older responses and
+    /// on other providers, which then count as all 5-minute writes.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// Anthropic's `usage.cache_creation`: the cache writes of one request, by TTL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
+}
+
+impl Usage {
+    /// The 1-hour share of `cache_creation_input_tokens`; 0 when the split is absent.
+    #[must_use]
+    pub fn cache_creation_1h_tokens(&self) -> u32 {
+        hour_share(
+            self.cache_creation.as_ref(),
+            self.cache_creation_input_tokens,
+        )
+    }
+}
+
+/// The 1-hour share of a cache-write total. Provider data, not an invariant of ours, so an
+/// inconsistent split is clamped to the total it is part of rather than asserted.
+fn hour_share(split: Option<&CacheCreation>, total: u32) -> u32 {
+    let reported = split.map_or(0, |s| s.ephemeral_1h_input_tokens);
+    let share = reported.min(total);
+    debug_assert!(share <= total, "a share never exceeds its total");
+    debug_assert!(share <= reported, "clamping only ever lowers the share");
+    share
 }
 
 // ============================================================================
@@ -4289,6 +4323,8 @@ pub enum StreamEvent {
         cache_read_tokens: u32,
         /// Prompt tokens written into the cache (a creation, one-time cost).
         cache_creation_tokens: u32,
+        /// The 1-hour share of `cache_creation_tokens` (billed at 2x input, not 1.25x).
+        cache_creation_1h_tokens: u32,
     },
     /// Start of a content block
     ContentBlockStart {
@@ -4434,6 +4470,8 @@ struct MessageStartUsage {
     cache_read_input_tokens: u32,
     #[serde(default)]
     cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_creation: Option<CacheCreation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5214,6 +5252,7 @@ impl LlmClient {
                                 input_tokens: prompt_eval as u32,
                                 cache_read_tokens: 0,
                                 cache_creation_tokens: 0,
+                                cache_creation_1h_tokens: 0,
                             });
                         }
                         // Emit output token count
@@ -6022,7 +6061,13 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens },
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens,
+            cache_creation: None,
+        },
     })
 }
 
@@ -6129,7 +6174,13 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation: None,
+        },
     })
 }
 
@@ -6168,6 +6219,10 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
                 input_tokens: usage.input_tokens,
                 cache_read_tokens: usage.cache_read_input_tokens,
                 cache_creation_tokens: usage.cache_creation_input_tokens,
+                cache_creation_1h_tokens: hour_share(
+                    usage.cache_creation.as_ref(),
+                    usage.cache_creation_input_tokens,
+                ),
             })
         }
         AnthropicSSE::ContentBlockStart { index, content_block } => {
@@ -8224,6 +8279,51 @@ mod cache_ttl_tests {
         assert!(
             !json.contains(r#""ttl""#),
             "the default must not change a byte: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_creation_split_tests {
+    use super::*;
+
+    #[test]
+    fn message_start_surfaces_the_one_hour_share_of_cache_writes() {
+        let event = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":34,\"cache_creation\":{\"ephemeral_5m_input_tokens\":10,\"ephemeral_1h_input_tokens\":24}}}}";
+        match parse_sse_event(event).expect("message_start should parse") {
+            StreamEvent::MessageStart {
+                cache_creation_tokens,
+                cache_creation_1h_tokens,
+                ..
+            } => {
+                assert_eq!(cache_creation_tokens, 34);
+                assert_eq!(cache_creation_1h_tokens, 24);
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_usage_without_the_split_counts_as_all_five_minute_writes() {
+        let bare = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":40}"#;
+        let usage: Usage = serde_json::from_str(bare).expect("parses");
+        assert_eq!(usage.cache_creation_1h_tokens(), 0);
+
+        let split = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":40,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":40}}"#;
+        let usage: Usage = serde_json::from_str(split).expect("parses");
+        assert_eq!(usage.cache_creation_1h_tokens(), 40);
+    }
+
+    #[test]
+    fn an_inconsistent_split_is_clamped_to_its_total() {
+        let json = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":10,
+            "cache_creation":{"ephemeral_1h_input_tokens":99}}"#;
+        let usage: Usage = serde_json::from_str(json).expect("parses");
+        assert_eq!(
+            usage.cache_creation_1h_tokens(),
+            10,
+            "a share never exceeds its total"
         );
     }
 }
