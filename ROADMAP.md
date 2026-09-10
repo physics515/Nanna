@@ -5793,6 +5793,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-10 sweep)* `cargo update` -> 17 compatible bumps (`reqwest 0.13.5`,
+     `tantivy 0.26.2`, `multiversion 0.9.0`, `uuid 1.26.1`, `zerocopy 0.8.57`, …; the stale
+     `target-features 0.1.6` drops out). Both guarded landmines fired again and were pinned back
+     with the documented commands (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`);
+     `rustpython-{vm,stdlib}` are still 0.5.0 on crates.io, so both pins stay.
+     `cargo upgrade --incompatible`: `playwright-rs 0.17 -> 0.18` taken (compiled unchanged);
+     `lopdf 0.45 -> "0.42"` rejected — the downgrade row again. GUI: `happy-dom 20.14.3`,
+     `@lucide/vue 1.44.0` (in range); `typescript 7` not attempted, blocker unchanged.
+     **Toolchain: carried the `nightly-2026-09-08` pin from the still-open 2026-09-09 PR
+     (#318) as the identical commit, instead of moving to `2026-09-09`.** One day of drift buys
+     nothing, a different pin would be a certain merge conflict, and the identical commit merges
+     as a no-op whichever PR lands first.
+     Verified cold on tmpfs (quiet host, load < 4): **1722 tests pass / 0 fail / 12 ignored**
+     (69 binaries), clippy **0 errors** (2737 warnings), `cargo build --release -p nanna-daemon
+     --locked` green in **7m23s**, 238/238 vitest, `vue-tsc --noEmit` clean.
    - *(2026-08-28 sweep)* `cargo update` -> 6 compatible bumps (`chacha20 0.10.2`,
      `cpufeatures 0.3.1`, `flate2 1.1.10`, `libredox 0.1.21`, `twox-hash 2.1.4`, `wide 1.7.0`).
      `cargo upgrade --incompatible` offered four; **two applied green, both compiled unchanged** —
