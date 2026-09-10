@@ -1771,7 +1771,17 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       a few separator chars). 5 tests (basic table, alignment colons + surrounding text, inline-markdown in
       cells, prose-pipe/HR negatives, tight-table growth guard); 45 nanna-channels tests green. Remaining:
       Discord embeds, Slack Block Kit.
-- [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+- [~] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+      *(2026-09-10)* `client.scheduler()` / `.workspaces()` / `.channels()` landed: typed wrappers
+      over all **22** scheduler/workspace/channel protocol actions, proven against the real
+      hermetic daemon in `e2e_daemon.rs` — a cron job added → listed → fetched → removed, a temp
+      project opened → listed → fetched → closed, and the channel inventory naming all five
+      adapters (7/7 e2e tests). Two deliberate shapes: `scheduler().update` does **not** take a
+      `task`, because the daemon ignores it (`task: _`) and an argument that silently does nothing
+      is a lie; and `enable`/`disable`/`test`/`send` on channels are wrapped but documented as
+      answering `not_implemented` until the daemon grows them. **Still open:** the "typed event
+      subscription" half — `subscribe_events()` already yields the typed `Event` enum; what is
+      missing is per-session filtering.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
 - [ ] **Sub-agent named sessions** — `spawn_child_session()`, labels, inter-session messaging, timeouts, result callbacks, GUI monitor.

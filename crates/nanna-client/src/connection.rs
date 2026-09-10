@@ -308,6 +308,24 @@ impl Client {
     pub fn system(&self) -> SystemApi<'_> {
         SystemApi { client: self }
     }
+
+    /// Get scheduler API
+    #[must_use]
+    pub const fn scheduler(&self) -> SchedulerApi<'_> {
+        SchedulerApi { client: self }
+    }
+
+    /// Get workspaces API
+    #[must_use]
+    pub const fn workspaces(&self) -> WorkspacesApi<'_> {
+        WorkspacesApi { client: self }
+    }
+
+    /// Get channels API
+    #[must_use]
+    pub const fn channels(&self) -> ChannelsApi<'_> {
+        ChannelsApi { client: self }
+    }
 }
 
 // =============================================================================
@@ -492,5 +510,208 @@ impl<'a> SystemApi<'a> {
     
     pub async fn shutdown(&self) -> Result<Value> {
         self.client.request(Action::System(SystemAction::Shutdown)).await
+    }
+}
+
+/// Scheduler API: cron jobs, owned and run by the daemon.
+pub struct SchedulerApi<'a> {
+    client: &'a Client,
+}
+
+impl SchedulerApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Scheduler(SchedulerAction::List))
+            .await
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Get { id }))
+            .await
+    }
+
+    /// Add a cron job: `schedule` is a cron expression, `task` the prompt it runs.
+    pub async fn add(&self, schedule: &str, task: &str, name: Option<&str>) -> Result<Value> {
+        debug_assert!(!schedule.trim().is_empty(), "a job needs a schedule");
+        debug_assert!(!task.trim().is_empty(), "a job needs a task");
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Add {
+                schedule: schedule.to_string(),
+                task: task.to_string(),
+                name: name.map(String::from),
+            }))
+            .await
+    }
+
+    /// Change a job's schedule and/or enabled state.
+    ///
+    /// The protocol also carries a `task`, but the daemon does not apply payload
+    /// updates yet, so this wrapper does not offer an argument that would be ignored.
+    pub async fn update(
+        &self,
+        id: &str,
+        schedule: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Value> {
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Update {
+                id: id.to_string(),
+                schedule: schedule.map(String::from),
+                task: None,
+                enabled,
+            }))
+            .await
+    }
+
+    pub async fn remove(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Remove { id }))
+            .await
+    }
+
+    pub async fn run_now(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::RunNow { id }))
+            .await
+    }
+
+    pub async fn history(&self, id: &str, limit: Option<usize>) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::History { id, limit }))
+            .await
+    }
+}
+
+/// Workspaces API: the daemon's registry of project directories.
+pub struct WorkspacesApi<'a> {
+    client: &'a Client,
+}
+
+impl WorkspacesApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::List))
+            .await
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Get { id }))
+            .await
+    }
+
+    /// Register `path` as a workspace (the daemon creates its `.nanna` folder if absent).
+    pub async fn open(&self, path: &str) -> Result<Value> {
+        debug_assert!(!path.trim().is_empty(), "a workspace needs a path");
+        let path = path.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Open { path }))
+            .await
+    }
+
+    pub async fn close(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Close { id }))
+            .await
+    }
+
+    pub async fn set_active(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::SetActive { id }))
+            .await
+    }
+
+    pub async fn clear_active(&self) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::ClearActive))
+            .await
+    }
+
+    pub async fn reload(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Reload { id }))
+            .await
+    }
+
+    pub async fn context(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::GetContext { id }))
+            .await
+    }
+
+    pub async fn update_context(&self, id: &str, file: &str, content: &str) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::UpdateContext {
+                id: id.to_string(),
+                file: file.to_string(),
+                content: content.to_string(),
+            }))
+            .await
+    }
+}
+
+/// Channels API: the chat adapters (Telegram, Discord, Slack, Signal, `WhatsApp`).
+///
+/// `list` and `status` are live. The daemon still answers `enable`, `disable`, `test`
+/// and `send` with `"status": "not_implemented"`; they are wrapped so a client can
+/// already speak the whole protocol, and they start working when the daemon does.
+pub struct ChannelsApi<'a> {
+    client: &'a Client,
+}
+
+impl ChannelsApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Channel(ChannelAction::List))
+            .await
+    }
+
+    /// Status of one channel, or of all of them (with a summary) when `id` is `None`.
+    pub async fn status(&self, id: Option<&str>) -> Result<Value> {
+        let id = id.map(String::from);
+        self.client
+            .request(Action::Channel(ChannelAction::Status { id }))
+            .await
+    }
+
+    pub async fn enable(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Enable { id }))
+            .await
+    }
+
+    pub async fn disable(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Disable { id }))
+            .await
+    }
+
+    pub async fn test(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Test { id }))
+            .await
+    }
+
+    pub async fn send(&self, channel_id: &str, target: &str, content: &str) -> Result<Value> {
+        self.client
+            .request(Action::Channel(ChannelAction::Send {
+                channel_id: channel_id.to_string(),
+                target: target.to_string(),
+                content: content.to_string(),
+            }))
+            .await
     }
 }

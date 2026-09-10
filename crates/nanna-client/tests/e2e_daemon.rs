@@ -294,3 +294,114 @@ async fn sessions_persist_across_a_daemon_restart() {
     client.disconnect().await;
     restarted.stop();
 }
+
+/// P8 "Client API completeness": a job added through the typed scheduler wrapper is
+/// the one the daemon lists, fetches and removes.
+#[tokio::test]
+async fn scheduler_jobs_round_trip_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let scheduler = client.scheduler();
+
+    // The daemon's cron dialect is five fields: minute hour day month weekday.
+    let added = scheduler
+        .add("0 9 * * *", "summarize the inbox", Some("morning-digest"))
+        .await
+        .expect("scheduler.add answers");
+    assert_eq!(added["status"], "created", "{added}");
+    let id = added["id"]
+        .as_str()
+        .expect("a created job has an id")
+        .to_string();
+
+    let listed = scheduler.list().await.expect("scheduler.list answers");
+    assert!(
+        response_mentions(&listed, &id),
+        "the job is listed: {listed}"
+    );
+    let fetched = scheduler.get(&id).await.expect("scheduler.get answers");
+    assert_eq!(fetched["job"]["name"], "morning-digest", "{fetched}");
+
+    let removed = scheduler
+        .remove(&id)
+        .await
+        .expect("scheduler.remove answers");
+    assert_eq!(removed["status"], "deleted", "{removed}");
+    let after = scheduler.list().await.expect("scheduler.list answers");
+    assert!(!response_mentions(&after, &id), "the job is gone: {after}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A project directory registered through the typed workspace wrapper is listed,
+/// fetchable by id, and gone after `close`.
+#[tokio::test]
+async fn workspaces_open_list_and_close_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let workspaces = client.workspaces();
+    let project = tempfile::tempdir().expect("temp project dir");
+    let path = project.path().to_str().expect("a UTF-8 temp path");
+
+    let opened = workspaces.open(path).await.expect("workspace.open answers");
+    assert_eq!(opened["status"], "opened", "{opened}");
+    let id = opened["id"]
+        .as_str()
+        .expect("an opened workspace has an id")
+        .to_string();
+
+    let listed = workspaces.list().await.expect("workspace.list answers");
+    assert!(
+        response_mentions(&listed, &id),
+        "the workspace is listed: {listed}"
+    );
+    let fetched = workspaces.get(&id).await.expect("workspace.get answers");
+    assert_eq!(fetched["workspace"]["id"], id.as_str(), "{fetched}");
+
+    let closed = workspaces
+        .close(&id)
+        .await
+        .expect("workspace.close answers");
+    assert_eq!(closed["status"], "closed", "{closed}");
+    let after = workspaces.list().await.expect("workspace.list answers");
+    assert!(
+        !response_mentions(&after, &id),
+        "the workspace is gone: {after}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// The typed channel wrapper reaches the daemon's adapter inventory: all five chat
+/// adapters are reported, each with a boolean `configured`.
+#[tokio::test]
+async fn channels_list_every_adapter_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let listed = client
+        .channels()
+        .list()
+        .await
+        .expect("channel.list answers");
+    let channels = listed["channels"].as_array().expect("a channel array");
+    let ids: Vec<&str> = channels.iter().filter_map(|c| c["id"].as_str()).collect();
+    for expected in ["telegram", "discord", "slack", "signal", "whatsapp"] {
+        assert!(ids.contains(&expected), "{expected} is listed: {listed}");
+    }
+    assert!(
+        channels.iter().all(|c| c["configured"].is_boolean()),
+        "every adapter says whether it is configured: {listed}"
+    );
+    let status = client
+        .channels()
+        .status(None)
+        .await
+        .expect("channel.status answers");
+    assert!(status.is_object(), "{status}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
