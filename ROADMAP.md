@@ -1794,7 +1794,12 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             (`ipc.rs` outgoing task; the per-client `_subscriptions` field is unused). Decide
             whether server-side filtering is wanted before a chatty channel makes it matter;
             `Event::session_id()` is the classifier either would use.
-      - [ ] **A lagging IPC client loses events without being told.** The forwarder matches
+      - [x] *(2026-09-10 — fixed the same run.)* The forwarder now handles every receive result
+            through a pure `forwardable()`: a lag becomes an `Error` event with code
+            `events_lagged` naming the count ("re-fetch state to resync"), and a closed broadcast
+            ends the loop; 3 unit tests. The outgoing handler it lives in was already over clippy's
+            100-line limit (116 lines) before this; not split in passing.
+            **A lagging IPC client loses events without being told.** The forwarder matches
             `Ok(event) = event_rx.recv()`, so a `RecvError::Lagged(n)` just fails the pattern and
             the missed events vanish. Surface it to the client (e.g. an `Error` event naming the
             count) so it can resync.
