@@ -1780,7 +1780,12 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       channel (filtering, lag) and per variant family; not e2e, because every event that
       carries a session needs a live chat turn, i.e. an LLM. Tracing it turned up three
       daemon-side gaps, filed below.
-      - [ ] **The daemon never emits `SessionCreated` / `SessionDeleted` / `SessionRenamed`.**
+      - [x] *(2026-09-10 — fixed the same run.)* The control plane now emits all three from the
+            session handlers, only after the store confirms the change (`DeleteAll` reads the ids
+            first, since the store returns only a count). Proven end to end in `e2e_daemon.rs`: one
+            client renames then deletes a session, and a second client's `subscribe_session`
+            stream receives `SessionRenamed` then `SessionDeleted`.
+            **The daemon never emitted `SessionCreated` / `SessionDeleted` / `SessionRenamed`.**
             They are declared in the protocol and sent nowhere. The GUI does not notice because it
             emits its own `session-renamed` Tauri event, so a session renamed from the CLI or a
             second client never reaches an open GUI. Emit them from the session control handlers.

@@ -405,3 +405,57 @@ async fn channels_list_every_adapter_through_the_typed_api() {
     client.disconnect().await;
     daemon.stop();
 }
+
+/// Session lifecycle events reach every client: a rename and a delete made by one
+/// client arrive on another client's per-session stream. Before the daemon emitted
+/// them, a session renamed from the CLI never reached an open GUI.
+#[tokio::test]
+async fn lifecycle_changes_by_one_client_reach_another_clients_session_stream() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let watcher = daemon.connect_client().await;
+    let actor = daemon.connect_client().await;
+
+    let created = actor
+        .sessions()
+        .create(Some("before".to_string()))
+        .await
+        .expect("sessions.create succeeds");
+    let session_id = session_id_of(&created);
+    // Subscribe before acting: a broadcast only carries what is sent after it.
+    let mut events = watcher.subscribe_session(session_id.clone());
+
+    actor
+        .sessions()
+        .rename(&session_id, "after")
+        .await
+        .expect("sessions.rename succeeds");
+    let renamed = tokio::time::timeout(READY_HANG_CEILING, events.recv())
+        .await
+        .expect("the rename event arrives before the hang ceiling")
+        .expect("the stream is open and not lagging");
+    match renamed {
+        nanna_client::Event::SessionRenamed { id, name } => {
+            assert_eq!(id, session_id);
+            assert_eq!(name, "after");
+        }
+        other => panic!("expected SessionRenamed, got {other:?}"),
+    }
+
+    actor
+        .sessions()
+        .delete(&session_id)
+        .await
+        .expect("sessions.delete succeeds");
+    let deleted = tokio::time::timeout(READY_HANG_CEILING, events.recv())
+        .await
+        .expect("the delete event arrives before the hang ceiling")
+        .expect("the stream is open and not lagging");
+    assert!(
+        matches!(&deleted, nanna_client::Event::SessionDeleted { id } if *id == session_id),
+        "expected SessionDeleted for {session_id}, got {deleted:?}"
+    );
+
+    watcher.disconnect().await;
+    actor.disconnect().await;
+    daemon.stop();
+}
