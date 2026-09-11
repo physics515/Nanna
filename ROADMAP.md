@@ -5310,7 +5310,11 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
             verification went from "startup is not wedged" to "the mechanism arms on the real
             binary" as soon as an alternate config became reachable.
 
-- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+- [~] *(re-marked 2026-09-11: half of it landed. The "each chunk is still awaited inline" part is
+      done: tool results persist their row and defer the vector, so "the chunks no longer cost
+      the turn anything", with 12 tests (see the deferred-vector entry above). Only the chunk-count
+      bound is left, tracked as its own item: "Bound the chunk *count* per tool result…".)*
+      **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
       (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
       memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
       `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
@@ -5322,9 +5326,12 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
       rather than at the next restart. The chunk-COUNT bound is still open and still needs a
       derivation, not a magic number.
-- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+- [x] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.
+      *(ticked 2026-09-11 — stale: the audit it asks for was done 2026-08-25. See "Audited item by
+      item, 2026-08-25 — every P24 item has landed" above, which names the anchor proving each
+      verdict.)*
 
 
 #### What is already working — do not re-litigate
