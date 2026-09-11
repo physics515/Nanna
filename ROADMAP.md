@@ -3872,9 +3872,14 @@ asks permission or restricts her.)*:
             `[server] port = 3000` example sets nothing and the `PORT` env override in
             `Config::with_env_overrides` writes a field no code reads. `[server].enabled` is
             read only by onboarding (which writes it) and, until today, the doctor.
-            - [ ] **`port`:** make `[server].port` (and `PORT`) the default for
+            - [x] **`port`:** make `[server].port` (and `PORT`) the default for
                   `nanna server --port`, the flag still overriding — the documented key then
                   does what it says. No exposure risk: the host stays loopback.
+                  *(2026-09-11 — done. `--port` is now `Option<u16>`, resolved by the pure
+                  `commands::serve::server_port(flag, &config)`: flag, else `[server].port`,
+                  which `PORT` and the onboarding "Server port" answer both write — the
+                  onboarding answer had been silently discarded. README's example now shows
+                  only keys that do something.)*
             - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
                   command without surprising whoever typed it; delete it, or define it as
                   "the daemon starts the HTTP surface" and wire that.

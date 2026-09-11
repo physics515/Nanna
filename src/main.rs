@@ -79,9 +79,10 @@ enum Commands {
         #[arg(short = 'H', long, default_value = nanna_config::LOOPBACK_HOST)]
         host: String,
 
-        /// Port to listen on
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
+        /// Port to listen on. Defaults to `[server].port` in config.toml (or the
+        /// `PORT` environment variable), which itself defaults to 3000.
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 
     /// Daemon management (always-on background service)
@@ -349,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Server { host, port }) => {
             // Check for API key, offer quick setup if missing
             let config = ensure_api_key(config)?;
+            let port = commands::serve::server_port(port, &config);
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
@@ -384,4 +386,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nanna server` with no `--port` must parse to `None` so the config
+    /// decides the port: a clap `default_value` here is exactly what used to
+    /// shadow `[server].port`. The subcommand's flag must also not be
+    /// confused with the hidden global daemon `--port`.
+    #[test]
+    fn the_server_port_flag_is_optional_so_the_config_can_decide() {
+        let bare = Cli::try_parse_from(["nanna", "server"]).expect("bare `nanna server` parses");
+        match bare.command {
+            Some(Commands::Server { port, .. }) => assert_eq!(port, None),
+            _ => panic!("expected the server command"),
+        }
+        let flagged = Cli::try_parse_from(["nanna", "server", "--port", "8080"])
+            .expect("`nanna server --port 8080` parses");
+        match flagged.command {
+            Some(Commands::Server { port, .. }) => assert_eq!(port, Some(8080)),
+            _ => panic!("expected the server command"),
+        }
+        assert_eq!(
+            flagged.port, DEFAULT_IPC_PORT,
+            "the subcommand's --port does not leak into the global daemon port"
+        );
+    }
 }

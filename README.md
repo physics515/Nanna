@@ -256,8 +256,7 @@ model = "qwen3.5:9b"
 #                         # cache warm across 5-60 min gaps, at 2x the cache-write price
 
 [server]
-enabled = true
-port = 3000
+port = 3000               # `nanna server` port; the PORT env var or --port override it
 ```
 
 **Environment Variables:**
