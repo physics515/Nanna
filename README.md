@@ -164,9 +164,19 @@ summarization pointed at two different Ollama servers by accident. Exits
 non-zero when something is actually broken, so it also works from a script or a
 health probe.
 
-It is deliberately **offline**: no provider call, no network probe, no keyring
+By default it is **offline**: no provider call, no network probe, no keyring
 read. That makes it fast and safe to run anywhere, and it means a clean report
 says your *configuration* is sound — not that a provider is reachable.
+
+```bash
+nanna doctor --online
+```
+
+Adds the one probe that needs no credential: each Ollama server your
+configuration uses is asked whether it is answering and whether it has the
+models you configured, and a missing one is reported with the `ollama pull`
+that fixes it. It never tests a provider API key — that would mean reading the
+keyring and sending the key off the machine.
 
 ### API Key Invalid
 - Verify the key in **Settings → Models**

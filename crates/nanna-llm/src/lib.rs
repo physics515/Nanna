@@ -13,6 +13,9 @@ pub mod oauth;
 #[cfg(feature = "auto-refresh")]
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
+pub mod ollama_probe;
+pub use ollama_probe::{OllamaProbe, probe_ollama};
+
 pub mod heal;
 pub use heal::{
     count_balanced_top_level_objects, escape_bare_controls_in_strings, heal_json, heal_json_as,

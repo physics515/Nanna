@@ -48,6 +48,21 @@ pub enum ExportTarget {
 }
 
 impl ExportTarget {
+    /// The target the command line names: one session id, or `--memories`
+    /// with an optional scope. clap already requires exactly one of the two;
+    /// this says so rather than guess if that ever stops being true.
+    pub fn from_cli(
+        session: Option<String>,
+        memories: bool,
+        scope: Option<String>,
+    ) -> anyhow::Result<Self> {
+        match (session, memories) {
+            (Some(id), false) => Ok(Self::Session(id)),
+            (None, true) => Ok(Self::Memories { scope }),
+            _ => bail!("name one session to export, or pass --memories"),
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::Session(id) => format!("session {id}"),
@@ -208,5 +223,21 @@ mod tests {
             .describe(),
             "memories in scope global"
         );
+    }
+
+    #[test]
+    fn the_command_line_names_exactly_one_target() {
+        assert_eq!(
+            ExportTarget::from_cli(Some("s1".into()), false, None).expect("a session"),
+            ExportTarget::Session("s1".into())
+        );
+        assert_eq!(
+            ExportTarget::from_cli(None, true, Some("ws".into())).expect("memories"),
+            ExportTarget::Memories {
+                scope: Some("ws".into())
+            }
+        );
+        assert!(ExportTarget::from_cli(Some("s1".into()), true, None).is_err());
+        assert!(ExportTarget::from_cli(None, false, None).is_err());
     }
 }

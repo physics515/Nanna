@@ -3945,10 +3945,27 @@ asks permission or restricts her.)*:
             cannot tell a deliberate split from an untouched one (the `[server].host` trap
             again). Meanwhile `nanna doctor` warns when both are in use and differ
             (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
-      - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
+      - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet
             reports its config as broken. Give them their own flag (`--probe`/`--online`).
+            - [x] *(2026-09-11)* **Ollama, behind `nanna doctor --online`.**
+                  `nanna_llm::probe_ollama`: one unauthenticated `GET /api/tags`, connect and
+                  request each bounded by 3 s, the answer read in chunks against a 4 MiB cap (a
+                  real store answers in tens of KiB); a non-2xx answer or a body that is not
+                  Ollama's (a router login page) is reported, not parsed. The doctor probes each
+                  server in use **once** — chat+embeddings and summarization are folded when they
+                  name one server in any loopback spelling — and FAILs on a server that does not
+                  answer and on a configured model it does not have (`nomic-embed-text` compared
+                  as `nomic-embed-text:latest`, Ollama's own default). Verified on the real binary
+                  against a dead port (FAIL, exit 1), a mock server missing the summarizer (only
+                  `qwen3:4b` named, `localhost` and `127.0.0.1` probed once, exit 1) and the same
+                  mock with every model (exit 0). 13 tests, four of them over real sockets.
+            - [ ] **Provider connectivity and API-key validity.** Not done, on purpose: a key
+                  probe reads the keyring and sends the key off the machine, and
+                  `NANNA_CONFIG_PATH` does not isolate the keyring, so it cannot even be tested
+                  here without touching the owner's real credentials. **Owner call** on whether
+                  `--online` should ever do that, and behind what confirmation.
 
 **D. Agent quality-of-life** (cheap, high-leverage; several pairs share infrastructure — build together):
 - [ ] **Instruction skills + slash macros** — tools are executable-only; there's no packaged *procedure* the

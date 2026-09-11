@@ -68,9 +68,15 @@ enum Commands {
 
     /// Diagnose configuration problems and say how to fix each one.
     ///
-    /// Offline: no provider, network or keyring probe runs, so this is safe and
-    /// fast anywhere. Exits non-zero when a check fails.
-    Doctor,
+    /// Offline by default: no provider, network or keyring probe runs, so this
+    /// is safe and fast anywhere. Exits non-zero when a check fails.
+    Doctor {
+        /// Also probe each Ollama server the configuration uses: is it
+        /// answering, and does it have the configured models? Never reads the
+        /// keyring or sends a provider key.
+        #[arg(long)]
+        online: bool,
+    },
 
     /// Start the HTTP server
     Server {
@@ -336,10 +342,9 @@ async fn main() -> anyhow::Result<()> {
             onboarding::show_status(&config)?;
             return Ok(());
         }
-        Some(Commands::Doctor) => {
+        Some(Commands::Doctor { online }) => {
             let path = Config::default_config_path()?;
-            let checks = commands::doctor::run_checks(&config, &path);
-            let worst = commands::doctor::report(&checks);
+            let worst = commands::doctor::run(&config, &path, online).await;
             // Non-zero on a real fault so this is usable from a script or a
             // health probe, not just by eye.
             if worst == commands::doctor::Severity::Fail {
@@ -384,16 +389,8 @@ async fn main() -> anyhow::Result<()> {
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
-            // Check for first run
-            if onboarding::is_first_run() {
-                println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding()?;
-                run_cli(&config, session, model, stream).await?;
-            } else {
-                // Check for API key, offer quick setup if missing
-                let config = ensure_api_key(config)?;
-                run_cli(&config, session, model, stream).await?;
-            }
+            let config = interactive_config(config)?;
+            run_cli(&config, session, model, stream).await?;
         }
         Some(Commands::Export {
             session,
@@ -402,13 +399,7 @@ async fn main() -> anyhow::Result<()> {
             format,
             output,
         }) => {
-            // clap already requires exactly one of the two; say so rather than
-            // guess if that ever stops being true.
-            let target = match (session, memories) {
-                (Some(id), false) => commands::export::ExportTarget::Session(id),
-                (None, true) => commands::export::ExportTarget::Memories { scope },
-                _ => anyhow::bail!("name one session to export, or pass --memories"),
-            };
+            let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
             commands::export::export(target, format, output).await?;
             return Ok(());
         }
@@ -420,19 +411,23 @@ async fn main() -> anyhow::Result<()> {
             run_once(&config, &prompt, model).await?;
         }
         None => {
-            // Default: check for first run, then CLI mode
-            if onboarding::is_first_run() {
-                println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding()?;
-                run_cli(&config, None, None, false).await?;
-            } else {
-                let config = ensure_api_key(config)?;
-                run_cli(&config, None, None, false).await?;
-            }
+            // Default: interactive chat.
+            let config = interactive_config(config)?;
+            run_cli(&config, None, None, false).await?;
         }
     }
 
     Ok(())
+}
+
+/// The config an interactive chat starts with: onboarding on a first run,
+/// otherwise the loaded config, with quick setup offered if no API key is set.
+fn interactive_config(config: Config) -> anyhow::Result<Config> {
+    if onboarding::is_first_run() {
+        println!("Welcome! Let's get you set up first.\n");
+        return onboarding::run_onboarding();
+    }
+    ensure_api_key(config)
 }
 
 #[cfg(test)]
@@ -460,6 +455,22 @@ mod tests {
             flagged.port, DEFAULT_IPC_PORT,
             "the subcommand's --port does not leak into the global daemon port"
         );
+    }
+
+    /// `doctor` stays offline unless asked: the network leg is opt-in.
+    #[test]
+    fn doctor_is_offline_unless_asked() {
+        let bare = Cli::try_parse_from(["nanna", "doctor"]).expect("`nanna doctor` parses");
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Doctor { online: false })
+        ));
+        let online =
+            Cli::try_parse_from(["nanna", "doctor", "--online"]).expect("`--online` parses");
+        assert!(matches!(
+            online.command,
+            Some(Commands::Doctor { online: true })
+        ));
     }
 
     #[test]

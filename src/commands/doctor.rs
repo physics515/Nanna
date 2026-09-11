@@ -7,17 +7,23 @@
 //! *availability* and none reported *why*. Each check here therefore carries a
 //! remedy, not just a verdict.
 //!
-//! **Deliberately offline.** Nothing in this module opens a socket. Network
-//! probes (provider reachability, an Ollama ping, key validity) are the other
-//! half of the roadmap item and are a separate leg: they are slow, they fail
-//! for reasons that have nothing to do with configuration, and mixing them in
-//! means a machine with no internet reports its config as broken. What is here
-//! runs in milliseconds, is deterministic, and is safe to run anywhere.
+//! **Offline by default.** Nothing in the default pass opens a socket. Network
+//! probes are slow, they fail for reasons that have nothing to do with
+//! configuration, and mixing them in means a machine with no internet reports
+//! its config as broken. The default pass runs in milliseconds, is
+//! deterministic, and is safe to run anywhere.
+//!
+//! **`--online` adds the one probe that needs no credential**: each Ollama
+//! server in use is asked for its model list ([`run_online_checks`]). Provider
+//! key checks are absent on purpose — they would read the keyring and send a
+//! key off the machine.
 
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use nanna_config::Config;
+use nanna_llm::{OllamaProbe, probe_ollama};
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -146,7 +152,7 @@ fn check_clustering(config: &Config) -> Check {
         ),
         Err(why) => Check::fail(
             "memory.clustering",
-            why.to_string(),
+            why,
             "dreaming will refuse to run until this is fixed; raise the threshold or lower the \
              non-similarity clustering weights",
         ),
@@ -328,16 +334,225 @@ fn ollama_endpoint(url: &str) -> (String, u16) {
     (host, port)
 }
 
+/// How long one Ollama probe may take, connect and answer together. A local
+/// server answers `/api/tags` in milliseconds and a LAN one in tens; 3 s is
+/// past both with room, and a dead host still cannot stall the report.
+const ONLINE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Most missing model names one check lists before counting the rest.
+const MISSING_MODELS_SHOWN_MAX: usize = 8;
+
+/// One Ollama server the configuration points at, and the models configured
+/// against it, as the tags Ollama lists them under (`name:tag`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OllamaServer {
+    url: String,
+    models: Vec<String>,
+}
+
+/// The network leg of `doctor`: probe every Ollama server the configuration
+/// uses, and check that each has the models configured against it.
+///
+/// Ollama only, by design: it is the one dependency that answers without a
+/// credential. Probing a provider key would read the keyring and send the key
+/// off the machine, which a diagnostic must not do.
+pub async fn run_online_checks(config: &Config) -> Vec<Check> {
+    let servers = ollama_servers_in_use(config);
+    let mut checks = Vec::with_capacity(servers.len() * 2 + 1);
+    if servers.is_empty() {
+        checks.push(Check::ok(
+            "ollama.online",
+            "no Ollama model is configured; there was nothing to probe",
+        ));
+    }
+    for server in &servers {
+        let probe = probe_ollama(&server.url, ONLINE_PROBE_TIMEOUT).await;
+        checks.extend(judge_ollama_server(server, &probe));
+    }
+    debug_assert!(
+        !checks.is_empty(),
+        "the online leg always reports something"
+    );
+    debug_assert!(
+        checks
+            .iter()
+            .all(|c| c.severity == Severity::Ok || c.remedy.is_some()),
+        "every non-ok check must carry a remedy"
+    );
+    checks
+}
+
+/// Every Ollama server in use, each with the models expected there. Chat and
+/// embeddings go to `[memory].ollama_host`, summarization to
+/// `[llm].ollama_url`; when both name one server it is probed once.
+fn ollama_servers_in_use(config: &Config) -> Vec<OllamaServer> {
+    let mut chat_models: Vec<&str> = config
+        .llm
+        .model_priority
+        .iter()
+        .chain(&config.memory.embedding_priority)
+        .map(String::as_str)
+        .filter(|m| is_ollama_spec(m))
+        .collect();
+    if config.llm.provider.eq_ignore_ascii_case("ollama") {
+        chat_models.push(&config.llm.model);
+    }
+    if config
+        .memory
+        .embedding_provider
+        .eq_ignore_ascii_case("ollama")
+    {
+        chat_models.push(&config.memory.embedding_model);
+    }
+    let summary_models: Vec<&str> = config
+        .llm
+        .summarization_priority
+        .iter()
+        .map(String::as_str)
+        .filter(|m| is_ollama_spec(m))
+        .collect();
+    let summary_url = config
+        .llm
+        .ollama_url
+        .as_deref()
+        .unwrap_or(OLLAMA_DEFAULT_URL);
+    let mut servers: Vec<OllamaServer> = Vec::with_capacity(2);
+    for (url, models) in [
+        (config.memory.ollama_host.as_str(), chat_models),
+        (summary_url, summary_models),
+    ] {
+        if models.is_empty() {
+            continue;
+        }
+        let tags = models.iter().map(|m| ollama_tag(m));
+        let same = servers
+            .iter()
+            .position(|s| ollama_endpoint(&s.url) == ollama_endpoint(url));
+        match same {
+            Some(index) => servers[index].models.extend(tags),
+            None => servers.push(OllamaServer {
+                url: url.trim().to_string(),
+                models: tags.collect(),
+            }),
+        }
+    }
+    for server in &mut servers {
+        server.models.sort_unstable();
+        server.models.dedup();
+    }
+    debug_assert!(servers.len() <= 2, "two keys name at most two servers");
+    debug_assert!(
+        servers.iter().all(|s| !s.models.is_empty()),
+        "only a server with models configured against it is probed"
+    );
+    servers
+}
+
+/// A configured model as the tag Ollama lists it under: no `ollama/` prefix,
+/// and `:latest` when no tag is given — Ollama's own default.
+fn ollama_tag(model: &str) -> String {
+    let model = model.trim();
+    let model = model.strip_prefix("ollama/").unwrap_or(model);
+    let name = model.rsplit('/').next().unwrap_or(model);
+    if name.contains(':') {
+        model.to_string()
+    } else {
+        format!("{model}:latest")
+    }
+}
+
+/// What one probe says about one server: whether it answered, and whether it
+/// has every model configured against it.
+fn judge_ollama_server(server: &OllamaServer, probe: &OllamaProbe) -> Vec<Check> {
+    debug_assert!(
+        !server.models.is_empty(),
+        "only servers with work are probed"
+    );
+    let installed = match probe {
+        OllamaProbe::Unreachable { reason } => {
+            return vec![Check::fail(
+                "ollama.online",
+                format!("{}: {reason}", server.url),
+                "start Ollama there (`ollama serve`), or point the config at the server that runs it",
+            )];
+        }
+        OllamaProbe::Reachable { models } => models,
+    };
+    let answered = Check::ok(
+        "ollama.online",
+        format!(
+            "{} answered; {} models installed",
+            server.url,
+            installed.len()
+        ),
+    );
+    let missing: Vec<&str> = server
+        .models
+        .iter()
+        .filter(|want| !installed.iter().any(|have| have.eq_ignore_ascii_case(want)))
+        .map(String::as_str)
+        .collect();
+    let models = if missing.is_empty() {
+        Check::ok(
+            "ollama.models",
+            format!(
+                "all {} configured models are installed on {}",
+                server.models.len(),
+                server.url
+            ),
+        )
+    } else {
+        let shown = missing[..missing.len().min(MISSING_MODELS_SHOWN_MAX)].join(", ");
+        let more = missing.len().saturating_sub(MISSING_MODELS_SHOWN_MAX);
+        let more = if more == 0 {
+            String::new()
+        } else {
+            format!(" and {more} more")
+        };
+        Check::fail(
+            "ollama.models",
+            format!(
+                "configured but not installed on {}: {shown}{more}",
+                server.url
+            ),
+            "`ollama pull <name>` each one on that host, or drop it from the config",
+        )
+    };
+    let checks = vec![answered, models];
+    debug_assert_eq!(checks.len(), 2, "a server that answered gets both verdicts");
+    checks
+}
+
+/// `nanna doctor [--online]`: every offline check, then the Ollama probe when
+/// `online`, then the printed report. Returns the worst severity seen.
+pub async fn run(config: &Config, config_path: &Path, online: bool) -> Severity {
+    let mut checks = run_checks(config, config_path);
+    let offline = checks.len();
+    if online {
+        checks.extend(run_online_checks(config).await);
+    }
+    debug_assert!(offline > 0, "the offline pass always runs");
+    debug_assert!(
+        online || checks.len() == offline,
+        "no network check without --online"
+    );
+    report(&checks, online)
+}
+
 /// Print the report. Returns the worst severity seen, so the caller can choose
-/// an exit code.
-pub fn report(checks: &[Check]) -> Severity {
+/// an exit code. `online` says whether [`run_online_checks`] contributed.
+pub fn report(checks: &[Check], online: bool) -> Severity {
     let worst = checks
         .iter()
         .map(|c| c.severity)
         .max()
         .unwrap_or(Severity::Ok);
 
-    println!("Nanna doctor — offline configuration checks");
+    if online {
+        println!("Nanna doctor — configuration checks and an Ollama probe");
+    } else {
+        println!("Nanna doctor — offline configuration checks");
+    }
     println!("{}", "─".repeat(44));
     for check in checks {
         println!(
@@ -354,10 +569,18 @@ pub fn report(checks: &[Check]) -> Severity {
         Severity::Warn => println!("Some checks warned; nothing is broken."),
         Severity::Fail => println!("Something will not work — see the FAIL lines above."),
     }
-    println!(
-        "\nThis pass is offline: no provider, network or keyring probe ran. \
-         Availability is a separate question from configuration."
-    );
+    if online {
+        println!(
+            "\nOllama was probed over the network. No provider key was tested and the \
+             keyring was not read."
+        );
+    } else {
+        println!(
+            "\nThis pass is offline: no provider, network or keyring probe ran. \
+             Availability is a separate question from configuration; \
+             `nanna doctor --online` also probes Ollama."
+        );
+    }
     worst
 }
 
@@ -577,5 +800,125 @@ mod tests {
     fn severity_orders_so_the_worst_wins() {
         assert!(Severity::Fail > Severity::Warn);
         assert!(Severity::Warn > Severity::Ok);
+    }
+
+    /// Chat, embeddings and summarization all on the default local Ollama.
+    fn probe_config() -> Config {
+        let mut config = cfg();
+        config.llm.provider = "ollama".to_string();
+        config.llm.model = "qwen3:8b".to_string();
+        config.llm.model_priority = Vec::new();
+        config.llm.summarization_priority = vec!["ollama/qwen3:4b".to_string()];
+        config.llm.ollama_url = None;
+        config.memory.embedding_provider = "ollama".to_string();
+        config.memory.embedding_model = "nomic-embed-text".to_string();
+        config.memory.embedding_priority = Vec::new();
+        config
+    }
+
+    #[test]
+    fn one_shared_server_is_probed_once_for_every_model() {
+        let servers = ollama_servers_in_use(&probe_config());
+        assert_eq!(servers.len(), 1, "{servers:?}");
+        assert_eq!(
+            servers[0].models,
+            vec!["nomic-embed-text:latest", "qwen3:4b", "qwen3:8b"]
+        );
+    }
+
+    #[test]
+    fn a_split_config_probes_each_server_for_its_own_models() {
+        let mut config = probe_config();
+        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
+        let servers = ollama_servers_in_use(&config);
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers[1].url, "http://gpu-box:11434");
+        assert_eq!(servers[1].models, vec!["qwen3:4b"]);
+    }
+
+    #[test]
+    fn nothing_on_ollama_means_nothing_to_probe() {
+        let mut config = probe_config();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.summarization_priority = Vec::new();
+        config.memory.embedding_provider = "openai".to_string();
+        assert_eq!(ollama_servers_in_use(&config), Vec::new());
+    }
+
+    #[test]
+    fn model_tags_are_normalized_the_way_ollama_lists_them() {
+        assert_eq!(ollama_tag("ollama/qwen3:8b"), "qwen3:8b");
+        assert_eq!(ollama_tag(" nomic-embed-text "), "nomic-embed-text:latest");
+        assert_eq!(ollama_tag("hf.co/org/model"), "hf.co/org/model:latest");
+    }
+
+    fn local_server(models: &[&str]) -> OllamaServer {
+        OllamaServer {
+            url: "http://localhost:11434".to_string(),
+            models: models.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn an_unreachable_server_fails_with_a_remedy() {
+        let probe = OllamaProbe::Unreachable {
+            reason: "timed out".to_string(),
+        };
+        let checks = judge_ollama_server(&local_server(&["qwen3:8b"]), &probe);
+        assert_eq!(checks.len(), 1, "no model verdict without an answer");
+        assert_eq!(checks[0].severity, Severity::Fail);
+        assert!(
+            checks[0].detail.contains("timed out"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0].remedy.is_some());
+    }
+
+    #[test]
+    fn a_missing_model_fails_and_present_ones_pass() {
+        let server = local_server(&["nomic-embed-text:latest", "qwen3:8b"]);
+        let all = OllamaProbe::Reachable {
+            models: vec![
+                "Qwen3:8b".to_string(),
+                "nomic-embed-text:latest".to_string(),
+            ],
+        };
+        let checks = judge_ollama_server(&server, &all);
+        assert!(
+            checks.iter().all(|c| c.severity == Severity::Ok),
+            "{checks:?}"
+        );
+        let one = OllamaProbe::Reachable {
+            models: vec!["qwen3:8b".to_string()],
+        };
+        let checks = judge_ollama_server(&server, &one);
+        let models = checks
+            .iter()
+            .find(|c| c.name == "ollama.models")
+            .expect("a models verdict");
+        assert_eq!(models.severity, Severity::Fail);
+        assert!(
+            models.detail.contains("nomic-embed-text:latest")
+                && !models.detail.contains("qwen3:8b"),
+            "only the missing model is named: {}",
+            models.detail
+        );
+    }
+
+    /// The whole online leg against a port nothing listens on: one FAIL, and it
+    /// returns rather than hangs.
+    #[tokio::test]
+    async fn the_online_leg_reports_a_dead_server() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let mut config = probe_config();
+        config.memory.ollama_host = format!("http://127.0.0.1:{port}");
+        config.llm.ollama_url = Some(format!("http://localhost:{port}"));
+        let checks = run_online_checks(&config).await;
+        assert_eq!(checks.len(), 1, "one server, probed once: {checks:?}");
+        assert_eq!(checks[0].severity, Severity::Fail);
     }
 }
