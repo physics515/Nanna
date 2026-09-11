@@ -382,6 +382,17 @@ impl<'a> SessionsApi<'a> {
             before: None,
         })).await
     }
+
+    /// Export a session as a document (Markdown or JSON), rendered by the
+    /// daemon: `{format, filename, content}`, or `{error, message}`.
+    pub async fn export(&self, id: &str, format: ExportFormat) -> Result<Value> {
+        self.client
+            .request(Action::Session(SessionAction::Export {
+                id: id.to_string(),
+                format,
+            }))
+            .await
+    }
 }
 
 /// Chat API

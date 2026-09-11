@@ -127,6 +127,25 @@ impl ControlPlane {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
                 }
             }
+            SessionAction::Export { id, format } => {
+                // Rendered here, by the store's owner, so every client — the
+                // CLI's `nanna export` today, a GUI button later — gets the
+                // same document instead of re-deriving the transcript.
+                let Some(session) = self.sessions.get(&id).await else {
+                    return json!({ "error": "not_found", "message": format!("Session {} not found", id) });
+                };
+                match crate::export::export_session(&session, format, chrono::Utc::now()) {
+                    Ok(document) => json!({
+                        "format": format,
+                        "filename": document.filename,
+                        "content": document.content,
+                    }),
+                    Err(e) => json!({
+                        "error": "export_failed",
+                        "message": format!("Session {id} could not be exported: {e}"),
+                    }),
+                }
+            }
             SessionAction::Switch { id } => {
                 if self.sessions.get(&id).await.is_some() {
                     // Subscribe client to this session

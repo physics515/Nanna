@@ -215,6 +215,18 @@ pub struct Attachment {
     pub data: String,
 }
 
+/// Document format for [`SessionAction::Export`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    /// A readable transcript: messages, thinking, tool calls with their input
+    /// and output, and each edit's before/after view.
+    #[default]
+    Markdown,
+    /// The whole session as stored, inside a versioned envelope — lossless.
+    Json,
+}
+
 // =============================================================================
 // Session Actions
 // =============================================================================
@@ -248,6 +260,14 @@ pub enum SessionAction {
         id: String,
         limit: Option<usize>,
         before: Option<String>,
+    },
+    /// Export a session as a document the user owns. Rendered by the daemon —
+    /// the store's owner — so every client gets the same transcript. Replies
+    /// `{format, filename, content}`, or `{error, message}` for an unknown id.
+    Export {
+        id: String,
+        #[serde(default)]
+        format: ExportFormat,
     },
     /// Switch active session (for this client)
     Switch { id: String },

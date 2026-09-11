@@ -236,6 +236,59 @@ async fn created_session_is_visible_to_the_client() {
     daemon.stop();
 }
 
+/// Export end to end: the daemon — the session store's owner — renders the
+/// document and hands it over the real protocol, in both formats, and an
+/// unknown id is refused rather than exported as an empty document.
+#[tokio::test]
+async fn a_session_exports_over_the_protocol_in_both_formats() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let created = client
+        .sessions()
+        .create(Some("Export Me".to_string()))
+        .await
+        .expect("sessions.create succeeds");
+    let session_id = session_id_of(&created);
+
+    let markdown = client
+        .sessions()
+        .export(&session_id, nanna_client::ExportFormat::Markdown)
+        .await
+        .expect("sessions.export answers");
+    assert_eq!(markdown["filename"], "export-me.md", "{markdown}");
+    let content = markdown["content"].as_str().expect("a markdown document");
+    assert!(content.starts_with("# Export Me\n"), "{content}");
+    assert!(
+        content.contains(&session_id),
+        "the document names its session: {content}"
+    );
+
+    let json = client
+        .sessions()
+        .export(&session_id, nanna_client::ExportFormat::Json)
+        .await
+        .expect("sessions.export answers");
+    let document: serde_json::Value =
+        serde_json::from_str(json["content"].as_str().expect("a json document"))
+            .expect("valid JSON");
+    assert_eq!(
+        document["session"]["id"],
+        serde_json::json!(session_id),
+        "{document}"
+    );
+
+    let missing = client
+        .sessions()
+        .export("no-such-session", nanna_client::ExportFormat::Markdown)
+        .await
+        .expect("sessions.export answers");
+    assert_eq!(missing["error"], "not_found", "{missing}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// The reconnection half of the P8 gap: a client that drops and attaches again must
 /// find the daemon's state intact, because the daemon — not the client — owns it.
 #[tokio::test]

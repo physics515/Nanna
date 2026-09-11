@@ -113,6 +113,21 @@ enum Commands {
         limit: i64,
     },
 
+    /// Export a session as Markdown (a readable transcript) or JSON (lossless)
+    Export {
+        /// Session ID (see `nanna sessions`)
+        session: String,
+
+        /// Document format
+        #[arg(short, long, value_enum, default_value_t = commands::export::ExportFormatArg::Markdown)]
+        format: commands::export::ExportFormatArg,
+
+        /// Write here — a file, or a directory that receives the suggested
+        /// file name. Prints to stdout when omitted.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Run a single prompt and exit
     Run {
         /// The prompt to run
@@ -365,6 +380,14 @@ async fn main() -> anyhow::Result<()> {
                 run_cli(&config, session, model, stream).await?;
             }
         }
+        Some(Commands::Export {
+            session,
+            format,
+            output,
+        }) => {
+            commands::export::export_session(&session, format, output).await?;
+            return Ok(());
+        }
         Some(Commands::Sessions { limit }) => {
             list_sessions(&config, limit).await?;
         }
@@ -413,5 +436,39 @@ mod tests {
             flagged.port, DEFAULT_IPC_PORT,
             "the subcommand's --port does not leak into the global daemon port"
         );
+    }
+
+    #[test]
+    fn export_parses_its_session_format_and_output() {
+        let cli = Cli::try_parse_from(["nanna", "export", "abc123", "-f", "md", "-o", "out.md"])
+            .expect("`nanna export` parses");
+        match cli.command {
+            Some(Commands::Export {
+                session,
+                format,
+                output,
+            }) => {
+                assert_eq!(session, "abc123");
+                assert_eq!(
+                    format,
+                    commands::export::ExportFormatArg::Markdown,
+                    "`md` is an alias"
+                );
+                assert_eq!(output, Some(std::path::PathBuf::from("out.md")));
+            }
+            _ => panic!("expected the export command"),
+        }
+        let bare = Cli::try_parse_from(["nanna", "export", "abc123"]).expect("parses");
+        match bare.command {
+            Some(Commands::Export { format, output, .. }) => {
+                assert_eq!(
+                    format,
+                    commands::export::ExportFormatArg::Markdown,
+                    "markdown by default"
+                );
+                assert_eq!(output, None, "stdout by default");
+            }
+            _ => panic!("expected the export command"),
+        }
     }
 }

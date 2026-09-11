@@ -4018,9 +4018,24 @@ asks permission or restricts her.)*:
 - [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
       cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
       visibility more than a per-terminal-session number.
-- [ ] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
+- [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.
+      *(2026-09-11 — **conversation export shipped**; memory export, the GUI button and
+      `personality_mode` remain open.)* New `session.export {id, format}` IPC verb, rendered by
+      the daemon (the store's owner, and turso's exclusive lock holder) in `nanna_daemon::export`,
+      so every client gets one document: **Markdown** laid out the way the chat page lays out a
+      message — the run journal (thinking, tool calls with input/output, the P18 edit diffs as
+      ```` ```diff ```` blocks, healed faults, steps), `content` only when the journal has no text of
+      its own, `TASK COMPLETE` plumbing stripped, fences one backtick longer than any run inside
+      so a quoted tool output cannot escape its block — and **JSON**, the stored `Session`
+      verbatim in a versioned envelope (`nanna_export: 1`), proven to deserialize back. CLI:
+      `nanna export <id> [-f md|json] [-o file-or-dir]`, stdout by default; the daemon's
+      suggested filename is a bounded ASCII slug and only its last component is ever joined
+      onto a directory. An unknown id is refused, not exported empty. `PRIVACY.md` updated.
+      - [ ] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
+            session menu, verified over WebDriver once `WebKitWebDriver` exists on the host.
+      - [ ] **Memory export** — the same shape for the memory store (FSRS state included).
 
 **E. Deliberately not building** (audited 2026-07-24, off-thesis — revisit only if the product direction
 changes). **Owner decision 2026-07-24 adds the entire permission-gate family here**: async approval gates,

@@ -97,6 +97,8 @@ A fully local run needs none.
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
 - **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
+- **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
+- **Conversation export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -329,6 +331,9 @@ See [PRIVACY.md](PRIVACY.md) for full details.
 - Config: `config.toml`
 - Database: `nanna.db` (sessions, memory, tasks)
 - Credentials: OS keyring (encrypted)
+
+**Taking your data with you:** `nanna export <session-id>` (Markdown, or `--format json`
+for the complete stored session) — the daemon must be running.
 
 **What's sent externally (when configured):**
 - Chat messages → your chosen LLM provider
