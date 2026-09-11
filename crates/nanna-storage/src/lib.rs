@@ -109,9 +109,10 @@ impl Storage {
 
             if !applied {
                 info!("Running migration: {}", name);
-                // Execute each statement in the migration
-                for statement in sql.split(';').filter(|s| !s.trim().is_empty()) {
-                    conn.execute(statement, ()).await?;
+                // Execute each statement in the migration — split by a lexer
+                // that knows comments and quotes, not by every ';'.
+                for statement in migrations::split_statements(sql) {
+                    conn.execute(&statement, ()).await?;
                 }
                 conn.execute(
                     "INSERT INTO _migrations (name, applied_at) VALUES (?1, datetime('now'))",

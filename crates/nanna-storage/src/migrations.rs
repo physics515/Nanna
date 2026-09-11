@@ -558,9 +558,98 @@ const MIGRATION_015: &str = r"
 ALTER TABLE model_stats ADD COLUMN total_cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Lexer state while splitting a migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lex {
+    Code,
+    /// Inside `'…'`, `"…"` or `` `…` ``, closed by the same character.
+    Quoted(char),
+    LineComment,
+    BlockComment,
+}
+
+/// Split a migration into the statements `Storage::migrate` executes, one
+/// `conn.execute` each.
+///
+/// A small SQL lexer rather than `sql.split(';')`, which does not know what a
+/// comment is: a `;` inside a `--` comment used to cut the statement around
+/// it in half (migration 014 nearly shipped that). Here a `;` ends a statement
+/// only outside `--` and `/* */` comments and outside `'…'` strings and
+/// `"…"`/`` `…` `` identifiers. Comments are dropped — the database never
+/// needed them — so a note after the last `;` is no longer a comment-only
+/// "statement" that fails the whole migration. SQL escapes a quote by
+/// doubling it (`'it''s'`), which falls out of leaving and re-entering the
+/// string. An unterminated string or comment is passed through for the
+/// database to reject, never silently repaired.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::with_capacity(sql.len());
+    let mut lex = Lex::Code;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match lex {
+            Lex::Code => match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    lex = Lex::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    // A space, so `a/* … */b` cannot glue two tokens.
+                    current.push(' ');
+                    lex = Lex::BlockComment;
+                }
+                '\'' | '"' | '`' => {
+                    current.push(ch);
+                    lex = Lex::Quoted(ch);
+                }
+                ';' => push_statement(&mut statements, &mut current),
+                _ => current.push(ch),
+            },
+            Lex::Quoted(quote) => {
+                current.push(ch);
+                if ch == quote {
+                    lex = Lex::Code;
+                }
+            }
+            Lex::LineComment => {
+                if ch == '\n' {
+                    current.push('\n');
+                    lex = Lex::Code;
+                }
+            }
+            Lex::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    lex = Lex::Code;
+                }
+            }
+        }
+    }
+    push_statement(&mut statements, &mut current);
+    debug_assert!(
+        statements.iter().all(|s| !s.trim().is_empty()),
+        "a blank or comment-only chunk is never executed"
+    );
+    debug_assert!(
+        statements.len() <= sql.matches(';').count() + 1,
+        "a statement ends only at a ';' or at the end of the migration"
+    );
+    statements
+}
+
+/// Close the statement being collected, keeping it only if it holds SQL.
+fn push_statement(statements: &mut Vec<String>, current: &mut String) {
+    let statement = current.trim();
+    if !statement.is_empty() {
+        statements.push(statement.to_string());
+    }
+    current.clear();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::MIGRATIONS;
+    use super::{MIGRATIONS, split_statements};
 
     /// Strip `--` line comments the way a reader does, so what is left is the
     /// SQL the database would actually see.
@@ -574,49 +663,73 @@ mod tests {
             .to_string()
     }
 
-    /// `Storage::migrate` executes a migration by `split(';')`, which is a
-    /// tokenizer that does not know what a comment is. A semicolon inside a
-    /// `--` comment therefore cuts the *statement around it* in half, and the
-    /// two fragments are then handed to the database as if they were whole.
-    ///
-    /// The failure is invisible until a fresh database is opened — every
-    /// existing install has the table already — so this asserts the property
-    /// at test time instead. Caught exactly this in migration 014 before it
-    /// shipped: `embedding BLOB, -- f32 little-endian; NULL until embedded`
-    /// split the `CREATE TABLE` at the comma.
+    /// SQL with comments removed and whitespace collapsed: what two splits
+    /// must agree on for the database to see the same statement.
+    fn normalized(chunk: &str) -> String {
+        sql_only(chunk)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The runner used to execute `sql.split(';')`, and every shipped
+    /// migration was written (and test-guarded) against that. Moving to a real
+    /// lexer must not change what a single one of them executes — every
+    /// existing install has applied them, but a fresh database runs them all.
     #[test]
-    fn no_migration_hides_a_semicolon_in_a_comment() {
+    fn every_shipped_migration_splits_exactly_as_it_did_before() {
         for (name, sql) in MIGRATIONS {
-            for (n, line) in sql.lines().enumerate() {
-                if let Some((_, comment)) = line.split_once("--") {
-                    assert!(
-                        !comment.contains(';'),
-                        "{name} line {}: a ';' inside a comment splits the statement \
-                         around it -- the runner splits on ';' without parsing. \
-                         Offending line: {}",
-                        n + 1,
-                        line.trim()
-                    );
-                }
-            }
+            let before: Vec<String> = sql
+                .split(';')
+                .map(normalized)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let after: Vec<String> = split_statements(sql)
+                .iter()
+                .map(|s| normalized(s))
+                .collect();
+            assert!(!after.is_empty(), "{name} executes nothing");
+            assert_eq!(after, before, "{name} now splits differently");
         }
     }
 
-    /// Every chunk the runner keeps must contain real SQL. A chunk that is
-    /// only comments reaches `conn.execute` as a bare comment, which is not a
-    /// statement — so a trailing note after the last `;` fails the whole
-    /// migration rather than being ignored.
+    /// The traps the old `split(';')` fell into, and the ones a naive
+    /// comment-stripper would: a `;` in a comment (migration 014's near miss),
+    /// a `;` or `--` inside a string, a doubled-quote escape, a block comment
+    /// between statements, and a note after the last `;`.
+    const TRICKY: &str = "CREATE TABLE t (a BLOB, -- f32 little-endian; NULL until embedded\n\
+                          b TEXT DEFAULT 'x;y');\n\
+                          INSERT INTO t (b) VALUES ('it''s; fine -- not a comment');\n\
+                          /* a block; comment */ CREATE INDEX i ON t(b);\n\
+                          -- a trailing note; never executed\n";
+
     #[test]
-    fn every_executed_chunk_is_a_real_statement() {
-        for (name, sql) in MIGRATIONS {
-            for chunk in sql.split(';').filter(|s| !s.trim().is_empty()) {
-                assert!(
-                    !sql_only(chunk).is_empty(),
-                    "{name}: a comment-only chunk would be executed as a statement: {}",
-                    chunk.trim()
-                );
-            }
-        }
+    fn a_semicolon_in_a_comment_or_a_string_does_not_end_a_statement() {
+        let statements = split_statements(TRICKY);
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(
+            statements[0].starts_with("CREATE TABLE t (a BLOB,")
+                && statements[0].ends_with("b TEXT DEFAULT 'x;y')"),
+            "{}",
+            statements[0]
+        );
+        assert!(!statements[0].contains("f32"), "the comment is dropped");
+        assert_eq!(
+            statements[1],
+            "INSERT INTO t (b) VALUES ('it''s; fine -- not a comment')"
+        );
+        assert_eq!(statements[2], "CREATE INDEX i ON t(b)");
+    }
+
+    #[test]
+    fn blank_and_comment_only_input_executes_nothing() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(split_statements(""), none);
+        assert_eq!(
+            split_statements(" ;\n; -- just a note; really\n/* and; this */"),
+            none
+        );
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
     }
 
     /// Names are the applied-migration key, so a duplicate would silently skip
@@ -634,5 +747,52 @@ mod tests {
             names, in_order,
             "migrations must be listed in applied order"
         );
+    }
+
+    /// The split statements are what the database accepts: every trap above,
+    /// executed on a real turso connection, and the escaped value read back.
+    #[tokio::test]
+    async fn the_tricky_statements_run_on_a_real_database() {
+        // The `Database` is dropped once connected, as `Storage::new` does.
+        let conn = turso::Builder::new_local(":memory:")
+            .build()
+            .await
+            .expect("open an in-memory database")
+            .connect()
+            .expect("connect");
+        for statement in split_statements(TRICKY) {
+            conn.execute(&statement, ()).await.expect(&statement);
+        }
+        let mut rows = conn
+            .query("SELECT b FROM t", ())
+            .await
+            .expect("query the table");
+        let row = rows.next().await.expect("read a row").expect("one row");
+        let value: String = row.get(0).expect("a text value");
+        assert_eq!(value, "it's; fine -- not a comment");
+        assert!(
+            rows.next().await.expect("read").is_none(),
+            "exactly one row"
+        );
+    }
+
+    /// A fresh database runs every shipped migration through the lexer: all of
+    /// them must apply, each exactly once.
+    #[tokio::test]
+    async fn a_fresh_database_applies_every_migration_once() {
+        let storage = crate::Storage::in_memory()
+            .await
+            .expect("every migration applies to a fresh database");
+        let conn = storage.conn().lock().await;
+        let mut rows = conn
+            .query("SELECT COUNT(*), COUNT(DISTINCT name) FROM _migrations", ())
+            .await
+            .expect("query the ledger");
+        drop(conn);
+        let row = rows.next().await.expect("read a row").expect("one row");
+        let applied: i64 = row.get(0).expect("a count");
+        let distinct: i64 = row.get(1).expect("a count");
+        assert_eq!(usize::try_from(applied).ok(), Some(MIGRATIONS.len()));
+        assert_eq!(applied, distinct, "no migration recorded twice");
     }
 }

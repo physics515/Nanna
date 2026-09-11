@@ -3356,10 +3356,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       assert the property for all 14 migrations: no semicolon inside a comment, no comment-only
       chunk reaching `conn.execute`, and unique names in applied order. Audited the 13 pre-existing
       migrations — all clean, so this is a trap that was closed before it was ever sprung.
-      - [ ] Consider making the runner strip comments before splitting, rather than relying on the
+      - [x] Consider making the runner strip comments before splitting, rather than relying on the
             test to keep authors out of the trap. Deferred on purpose: it changes how all 14
             migrations are parsed, so it deserves its own increment with round-trip tests, not a
             drive-by inside a feature commit.
+            *(2026-09-11 — done, as its own increment.)* `migrations::split_statements` is a
+            small SQL lexer: a `;` ends a statement only outside `--`/`/* */` comments and
+            `'…'`/`"…"`/`` `…` `` quoting (a doubled `''` escape falls out of leaving and
+            re-entering the string); comments are dropped, so a trailing note is never a
+            comment-only "statement". The round-trip test the deferral asked for:
+            **every one of the 15 shipped migrations executes exactly the statements it did
+            under `split(';')`** (compared comment-free, whitespace-collapsed). Plus the traps on
+            a real turso database — a `;` in a comment, a `;` and `--` inside a string, an
+            escaped quote, a block comment, a trailing note — and a fresh in-memory store applying
+            all 15 exactly once. The guard test that only kept authors away from `;` in comments
+            is retired with the trap.
 - [ ] **Resample the timeline into per-signal series** — salience(t), access-rate(t), emotional valence(t), per-cluster topic-activation(t).
 - [ ] *(research 2026-09-08)* **Give each consolidated fact a validity window instead of
       overwriting it.** [Beyond Dialogue Time: Temporal Semantic Memory for Personalized LLM
