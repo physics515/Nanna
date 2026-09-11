@@ -261,7 +261,7 @@ fn check_ollama_servers(config: &Config) -> Check {
         .llm
         .summarization_priority
         .iter()
-        .any(|m| is_ollama_spec(m));
+        .any(|m| is_ollama_summary_spec(m));
     let chats_on_ollama = config.llm.provider.eq_ignore_ascii_case("ollama")
         || config.llm.model_priority.iter().any(|m| is_ollama_spec(m))
         || config
@@ -303,6 +303,18 @@ fn check_ollama_servers(config: &Config) -> Check {
 fn is_ollama_spec(model: &str) -> bool {
     let model = model.trim();
     model.starts_with("ollama/") || (!model.contains('/') && model.contains(':'))
+}
+
+/// Does a `summarization_priority` entry go to Ollama? The summarizer's own
+/// rule, which is looser than the chat router's: an `ollama/` prefix, or **no
+/// provider prefix at all** — `qwen3` with no tag is Ollama there
+/// (`nanna_agent::context`, `create_client_for_model`).
+fn is_ollama_summary_spec(model: &str) -> bool {
+    let model = model.trim();
+    match model.split_once('/') {
+        Some((provider, _)) => provider.eq_ignore_ascii_case("ollama"),
+        None => !model.is_empty(),
+    }
 }
 
 /// `(host, port)` of an Ollama base URL, the host lowercased and every
@@ -409,7 +421,7 @@ fn ollama_servers_in_use(config: &Config) -> Vec<OllamaServer> {
         .summarization_priority
         .iter()
         .map(String::as_str)
-        .filter(|m| is_ollama_spec(m))
+        .filter(|m| is_ollama_summary_spec(m))
         .collect();
     let summary_url = config
         .llm
@@ -452,7 +464,10 @@ fn ollama_servers_in_use(config: &Config) -> Vec<OllamaServer> {
 /// and `:latest` when no tag is given — Ollama's own default.
 fn ollama_tag(model: &str) -> String {
     let model = model.trim();
-    let model = model.strip_prefix("ollama/").unwrap_or(model);
+    let model = match model.split_once('/') {
+        Some((prefix, rest)) if prefix.eq_ignore_ascii_case("ollama") => rest,
+        _ => model,
+    };
     let name = model.rsplit('/').next().unwrap_or(model);
     if name.contains(':') {
         model.to_string()
@@ -920,5 +935,24 @@ mod tests {
         let checks = run_online_checks(&config).await;
         assert_eq!(checks.len(), 1, "one server, probed once: {checks:?}");
         assert_eq!(checks[0].severity, Severity::Fail);
+    }
+
+    /// The summarizer sends any spec without a provider prefix to Ollama —
+    /// an untagged `qwen3` included — so a split with one must still be
+    /// flagged, and the server summaries really go to must be probed.
+    #[test]
+    fn an_untagged_summary_model_still_counts_as_ollama() {
+        assert!(is_ollama_summary_spec("qwen3"));
+        assert!(is_ollama_summary_spec("Ollama/qwen3:4b"));
+        assert!(!is_ollama_summary_spec("anthropic/claude-haiku-4-5"));
+        assert!(!is_ollama_summary_spec("  "));
+        assert_eq!(ollama_tag("Ollama/qwen3:4b"), "qwen3:4b");
+        let mut config = probe_config();
+        config.llm.summarization_priority = vec!["qwen3".to_string()];
+        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
+        assert_eq!(ollama_check(&config).severity, Severity::Warn);
+        let servers = ollama_servers_in_use(&config);
+        assert_eq!(servers.len(), 2, "{servers:?}");
+        assert_eq!(servers[1].models, vec!["qwen3:latest"]);
     }
 }

@@ -91,7 +91,7 @@ pub async fn export(
 
     let (filename, content) = document_from_reply(&reply)?;
     match output {
-        None => print!("{content}"),
+        None => write_document(std::io::stdout().lock(), content)?,
         Some(path) => {
             let target_path = resolve_target(&path, filename);
             std::fs::write(&target_path, content)
@@ -104,6 +104,18 @@ pub async fn export(
         }
     }
     Ok(())
+}
+
+/// Write the document to `out` (stdout in practice). A reader that stops early
+/// — `nanna export <id> | head` — closes the pipe; that is its choice, not a
+/// failure, and `print!` would panic on it instead.
+fn write_document(mut out: impl std::io::Write, content: &str) -> anyhow::Result<()> {
+    match out.write_all(content.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(e).context("could not write the export to stdout")
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn connect() -> anyhow::Result<Client> {
@@ -239,5 +251,28 @@ mod tests {
         );
         assert!(ExportTarget::from_cli(Some("s1".into()), true, None).is_err());
         assert!(ExportTarget::from_cli(None, false, None).is_err());
+    }
+
+    /// A writer that fails every write with `kind`.
+    struct Failing(std::io::ErrorKind);
+
+    impl std::io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `nanna export <id> | head` closes the pipe early: that is the reader's
+    /// choice, not an error — but any other write failure still is.
+    #[test]
+    fn a_closed_pipe_is_not_a_failure_but_other_write_errors_are() {
+        assert!(write_document(Failing(std::io::ErrorKind::BrokenPipe), "doc").is_ok());
+        assert!(write_document(Failing(std::io::ErrorKind::StorageFull), "doc").is_err());
+        let mut sink = Vec::new();
+        write_document(&mut sink, "# doc\n").expect("a working writer");
+        assert_eq!(sink, b"# doc\n");
     }
 }

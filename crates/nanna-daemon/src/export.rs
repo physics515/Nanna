@@ -394,8 +394,59 @@ fn push_prose(out: &mut String, text: &str, is_assistant: bool) {
     if text.trim().is_empty() {
         return;
     }
-    out.push_str(text.trim_end());
+    let body = text.trim_end();
+    out.push_str(body);
+    if let Some(fence) = unclosed_fence(body) {
+        let _ = write!(out, "\n{fence}");
+        debug_assert!(
+            unclosed_fence(&format!("{body}\n{fence}")).is_none(),
+            "the appended fence closes the one left open"
+        );
+    }
     out.push_str("\n\n");
+}
+
+/// The fence that would close a code block `text` leaves open, if any.
+///
+/// Message prose is pasted verbatim, and the chat page renders each message on
+/// its own — but the export concatenates them, so a reply cut off mid-block
+/// would swallow every heading, tool block and diff after it. The rule, as
+/// `CommonMark` has it: a fence is a run of 3+ backticks or tildes after at most 3 spaces;
+/// a backtick fence's info string holds no backtick; it is closed by a run of
+/// the same character at least as long, followed by nothing but spaces.
+fn unclosed_fence(text: &str) -> Option<String> {
+    let mut open: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let rest = &line[indent..];
+        let Some(ch) = rest.chars().next().filter(|c| *c == '`' || *c == '~') else {
+            continue;
+        };
+        let run = rest.chars().take_while(|c| *c == ch).count();
+        if run < 3 {
+            continue;
+        }
+        // `ch` is ASCII, so `run` characters are `run` bytes.
+        let after = &rest[run..];
+        open = match open {
+            None if ch == '`' && after.contains('`') => None,
+            None => Some((ch, run)),
+            Some((open_ch, open_run))
+                if ch == open_ch && run >= open_run && after.trim().is_empty() =>
+            {
+                None
+            }
+            still_open => still_open,
+        };
+    }
+    debug_assert!(
+        open.is_none_or(|(_, run)| run >= 3),
+        "only real fences open"
+    );
+    open.map(|(ch, run)| ch.to_string().repeat(run))
 }
 
 fn render_thinking(out: &mut String, thinking: &str) {
@@ -879,5 +930,51 @@ mod tests {
         let md = memories_markdown(&[], Some("global"));
         assert!(md.contains("- Memories: 0"), "{md}");
         assert!(md.contains("- Scope: global memories only"), "{md}");
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_found_by_commonmark_rules() {
+        assert_eq!(unclosed_fence("plain prose"), None);
+        assert_eq!(unclosed_fence("```rust\nfn main() {}\n```"), None);
+        assert_eq!(
+            unclosed_fence("cut off:\n```rust\nfn main() {"),
+            Some("```".to_string())
+        );
+        assert_eq!(unclosed_fence("~~~~\ncode"), Some("~~~~".to_string()));
+        // Closed only by the same character, at least as long, alone on its line.
+        assert_eq!(
+            unclosed_fence("````md\n```\ninner\n```\n"),
+            Some("````".to_string())
+        );
+        assert_eq!(unclosed_fence("~~~\n```\n~~~"), None);
+        assert_eq!(
+            unclosed_fence("```\ncode\n``` trailing"),
+            Some("```".to_string())
+        );
+        // Not fences: four spaces of indent, a backtick in a backtick info
+        // string, an inline run mid-line, a run shorter than three.
+        assert_eq!(unclosed_fence("    ```\ncode"), None);
+        assert_eq!(unclosed_fence("```a`b\ncode"), None);
+        assert_eq!(unclosed_fence("see ```x``` here"), None);
+        assert_eq!(unclosed_fence("``\ncode"), None);
+        // Multi-byte text around a fence cannot split a character.
+        assert_eq!(
+            unclosed_fence("  ```é\nnaïve — code"),
+            Some("```".to_string())
+        );
+    }
+
+    /// The reviewed failure: a reply cut off mid-block used to swallow every
+    /// heading and tool block after it in the concatenated export.
+    #[test]
+    fn prose_that_leaves_a_fence_open_is_closed_before_the_next_block() {
+        let mut out = String::new();
+        push_prose(&mut out, "Here:\n```rust\nfn main() {", true);
+        push_prose(&mut out, "## Next message", false);
+        assert_eq!(unclosed_fence(&out), None, "{out}");
+        assert!(
+            out.contains("fn main() {\n```\n\n## Next message"),
+            "the fence closes right after the cut-off text: {out}"
+        );
     }
 }

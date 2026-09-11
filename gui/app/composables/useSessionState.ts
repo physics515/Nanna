@@ -399,6 +399,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
       tokens: null,
       total_tokens: null,
       short_circuited: shortCircuited,
+      diff,
       at: new Date().toISOString(),
     })
   }
