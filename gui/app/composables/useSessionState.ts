@@ -9,6 +9,7 @@
  */
 
 import { ref, reactive, computed, type Ref } from 'vue'
+import type { EditDiff } from '~/lib/editDiff'
 
 interface ToolCallInfo {
   id: string
@@ -62,6 +63,10 @@ export interface TimelineEntry {
    *  restored after a remount renders these as steering too. Absent/null
    *  means "not marked" — every consumer tests `=== true`. */
   short_circuited?: boolean | null
+  /** edit_file's before/after view of a successful edit. Carried by the live
+   *  event's data and by the daemon's journal, so a restored timeline shows
+   *  each edit too. Absent for every other tool and for a failed edit. */
+  diff?: EditDiff | null
 }
 
 /**
@@ -368,6 +373,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
     success: boolean,
     durationMs: number,
     shortCircuited = false,
+    diff: EditDiff | null = null,
   ) {
     if (!state.value) return
     const items = state.value.liveTimeline
@@ -378,6 +384,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
         item.success = success
         item.duration_ms = durationMs
         item.short_circuited = shortCircuited
+        item.diff = diff
         return
       }
     }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { parseEditDiff } from '~/lib/editDiff'
 
 export interface NuiToolCall {
   id: string
@@ -81,6 +82,13 @@ const displayInput = computed(() => {
 const writtenContent = computed(() => {
   if (props.status !== 'completed') return ''
   return props.toolCall.data?.written ?? ''
+})
+
+/** The before/after view edit_file attaches as data.diff, shown only on a call
+ *  that completed: a failed edit changed nothing, so a diff would be a false claim. */
+const editDiff = computed(() => {
+  if (props.status !== 'completed') return null
+  return parseEditDiff(props.toolCall.data?.diff)
 })
 
 const statusGlyph = computed(() => {
@@ -177,6 +185,15 @@ function formatJson(obj: any): string {
         </div>
         <NuiCodeBlock :max-height="400">
           <pre class="whitespace-pre-wrap break-words font-nui text-xs font-[450] leading-normal text-nui-green">{{ writtenContent }}</pre>
+        </NuiCodeBlock>
+      </template>
+      <template v-if="editDiff">
+        <div class="flex w-full items-start gap-2">
+          <NuiIcon name="edit-task" :size="16" class="text-nui-green" />
+          <p class="min-w-0 flex-1 text-xs leading-normal text-nui-fg">Changed at line {{ editDiff.start_line }}</p>
+        </div>
+        <NuiCodeBlock :max-height="400">
+          <pre class="whitespace-pre-wrap break-words font-nui text-xs font-[450] leading-normal" data-diff><span v-for="(line, i) in editDiff.removed" :key="'r' + i" class="block text-nui-pink" data-diff-removed>- {{ line }}</span><span v-for="(line, i) in editDiff.added" :key="'a' + i" class="block text-nui-green" data-diff-added>+ {{ line }}</span><span v-if="editDiff.truncated" class="block text-nui-muted">… (longer than shown)</span></pre>
         </NuiCodeBlock>
       </template>
     </template>

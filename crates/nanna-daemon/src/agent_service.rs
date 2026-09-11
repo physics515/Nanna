@@ -4,7 +4,9 @@
 
 use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
-use crate::session::{MessageRole, RunUsage, SessionId, SessionMessage, TimelineItem, ToolCallRecord};
+use crate::session::{
+    EditDiff, MessageRole, RunUsage, SessionId, SessionMessage, TimelineItem, ToolCallRecord,
+};
 use nanna_agent::{Agent, AgentConfig, CancelToken, ModelTier, RunOptions, ThinkingMode};
 use nanna_llm::{AnthropicMessage, CacheTtl, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
@@ -346,6 +348,7 @@ fn timeline_tool_start(
         // Unknown until the call ends — see the field doc for why this is
         // not `Some(false)`.
         short_circuited: None,
+        diff: None,
         at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -362,6 +365,44 @@ fn timeline_cap_output(output: &str) -> String {
     )
 }
 
+/// A finished tool call's outcome, as the journal records it. One value
+/// instead of positional scalars: two of them (`ok`, `replayed`) are bools
+/// that would transpose silently, and the diff made it one field too many.
+struct ToolEndRecord<'a> {
+    output: &'a str,
+    ok: bool,
+    duration_ms: u64,
+    /// The breaker replaced the call — see `TimelineItem::Tool::short_circuited`.
+    replayed: bool,
+    /// `edit_file`'s bounded view of what a successful edit changed.
+    diff: Option<EditDiff>,
+}
+
+impl<'a> ToolEndRecord<'a> {
+    /// Derive the record's structured markers from the result's data.
+    fn from_result(
+        output: &'a str,
+        ok: bool,
+        duration_ms: u64,
+        data: Option<&serde_json::Value>,
+    ) -> Self {
+        let replayed = is_short_circuited(data);
+        let diff = EditDiff::for_outcome(ok, replayed, data);
+        debug_assert!(
+            diff.is_none() || ok,
+            "only a successful call carries a diff"
+        );
+        debug_assert!(diff.is_none() || !replayed, "…and only one that really ran");
+        Self {
+            output,
+            ok,
+            duration_ms,
+            replayed,
+            diff,
+        }
+    }
+}
+
 /// Back-fill a tool call's outcome. Only OPEN items (no output yet) match:
 /// Ollama synthesizes call ids per response (`toolu_00000000`, …), so the
 /// same id recurs across iterations — matching a completed record would
@@ -372,10 +413,7 @@ fn timeline_tool_end(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
     call_id: &str,
     name: &str,
-    output: &str,
-    ok: bool,
-    duration: u64,
-    replayed: bool,
+    mut record: ToolEndRecord<'_>,
 ) {
     // No assertions on `call_id` or on the `ok`/`replayed` combination: both
     // are derived from provider and tool output, so an assert here would turn
@@ -395,14 +433,16 @@ fn timeline_tool_end(
             success,
             duration_ms,
             short_circuited,
+            diff,
             ..
         } = item
         {
             if id == call_id && out.is_none() {
-                *out = Some(timeline_cap_output(output));
-                *success = Some(ok);
-                *duration_ms = Some(duration);
-                *short_circuited = Some(replayed);
+                *out = Some(timeline_cap_output(record.output));
+                *success = Some(record.ok);
+                *duration_ms = Some(record.duration_ms);
+                *short_circuited = Some(record.replayed);
+                *diff = record.diff.take();
                 // The outcome fields are back-filled as a set: a reader that
                 // sees `success` decided must never find the replay marker
                 // still undecided, or it is back to guessing.
@@ -417,12 +457,13 @@ fn timeline_tool_end(
         call_id: call_id.to_string(),
         name: name.to_string(),
         input: None,
-        output: Some(timeline_cap_output(output)),
-        success: Some(ok),
-        duration_ms: Some(duration),
+        output: Some(timeline_cap_output(record.output)),
+        success: Some(record.ok),
+        duration_ms: Some(record.duration_ms),
         tokens: None,
         total_tokens: None,
-        short_circuited: Some(replayed),
+        short_circuited: Some(record.replayed),
+        diff: record.diff,
         at: chrono::Utc::now().to_rfc3339(),
     });
     // Either branch records the call: back-filled in place (early return) or
@@ -1170,7 +1211,12 @@ impl AgentService {
                         // data, which the event carries but the journal used
                         // to drop — so a restored timeline showed steering as
                         // failures. Record it where the run record lives.
-                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms, is_short_circuited(data));
+                        timeline_tool_end(
+                            &timeline_for_tool_end,
+                            call_id,
+                            name,
+                            ToolEndRecord::from_result(output, success, duration_ms, data),
+                        );
                         let _ = event_tx_tool_end.send(Event::ToolEnd {
                             session_id: session_id_tool_end.clone(),
                             call_id: call_id.to_string(),
@@ -1286,7 +1332,13 @@ impl AgentService {
                             .clone()
                             .into_iter()
                             .map(|item| match item {
-                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at } => {
+                                // `diff` is dropped here: up to 8 KB of file text per
+                                // edit, carried into a checkpoint rewritten every
+                                // iteration, grows the writes quadratically exactly like
+                                // the full outputs trimmed below. The journal persisted
+                                // when the run ends keeps it; a crash-recovered entry just
+                                // shows no diff — an absence, never a false claim.
+                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: _, at } => {
                                     let output = output.map(|o| {
                                         if o.len() > 200 {
                                             // A short circuit is neither: the tool never ran,
@@ -1316,7 +1368,7 @@ impl AgentService {
                                             i
                                         }
                                     });
-                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, at }
+                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: None, at }
                                 }
                                 TimelineItem::Thinking { content, at } if content.len() > 500 => {
                                     let total = content.len();
@@ -2509,7 +2561,7 @@ mod tests {
             other => panic!("expected a tool item, got {other:?}"),
         }
 
-        timeline_tool_end(&timeline, "c1", "exec", "[replayed]", false, 1, true);
+        timeline_tool_end(&timeline, "c1", "exec", end("[replayed]", false, 1, true));
         let items = timeline_lock(&timeline).clone();
         assert_eq!(
             items.len(),
@@ -2537,6 +2589,64 @@ mod tests {
         }
     }
 
+    /// A finished call's record with no structured data — the shape every
+    /// journal test before the diff used.
+    fn end(output: &str, ok: bool, duration_ms: u64, replayed: bool) -> ToolEndRecord<'_> {
+        ToolEndRecord {
+            output,
+            ok,
+            duration_ms,
+            replayed,
+            diff: None,
+        }
+    }
+
+    fn edit_data() -> serde_json::Value {
+        serde_json::json!({ "diff": {
+            "start_line": 3, "removed": ["a"], "added": ["b"], "truncated": false
+        }})
+    }
+
+    /// P18 "Diff presentation": a landed edit's view is back-filled onto the
+    /// journaled call with the rest of its outcome, so the record the GUI
+    /// restores from carries it — not only the live event.
+    #[test]
+    fn journal_back_fills_a_landed_edits_diff() {
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        timeline_tool_start(&timeline, "c1", "edit_file", &serde_json::json!({}), 0, 0);
+        let data = edit_data();
+        let record = ToolEndRecord::from_result("Edited", true, 4, Some(&data));
+        timeline_tool_end(&timeline, "c1", "edit_file", record);
+        let items = timeline_lock(&timeline).clone();
+        assert_eq!(items.len(), 1, "back-filled in place, not appended");
+        match &items[0] {
+            TimelineItem::Tool {
+                diff: Some(diff),
+                success,
+                ..
+            } => {
+                assert_eq!(*success, Some(true));
+                assert_eq!(diff.start_line, 3);
+                assert_eq!(diff.added, vec!["b"]);
+            }
+            other => panic!("expected the edit with its diff, got {other:?}"),
+        }
+    }
+
+    /// Negative space: a failed edit changed nothing and a replay never ran,
+    /// so neither may carry a diff — even when the data holds one.
+    #[test]
+    fn journal_records_no_diff_for_a_failed_or_replayed_edit() {
+        let data = edit_data();
+        let failed = ToolEndRecord::from_result("boom", false, 1, Some(&data));
+        assert!(failed.diff.is_none(), "a failed edit changed nothing");
+        let mut replay_data = data.clone();
+        replay_data["short_circuited"] = serde_json::json!(true);
+        let replay = ToolEndRecord::from_result("[replayed]", true, 1, Some(&replay_data));
+        assert!(replay.replayed, "the marker is still read");
+        assert!(replay.diff.is_none(), "…and a replay carries no diff");
+    }
+
     /// Negative space: a real failure must stay a failure. `Some(false)` and
     /// `None` are both non-replays to the GUI (it tests `=== true`), but the
     /// journal states the decided answer once the call has ended.
@@ -2544,7 +2654,7 @@ mod tests {
     fn journal_marks_a_real_failure_as_not_replayed() {
         let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
         timeline_tool_start(&timeline, "c1", "exec", &serde_json::json!({}), 0, 0);
-        timeline_tool_end(&timeline, "c1", "exec", "boom", false, 7, false);
+        timeline_tool_end(&timeline, "c1", "exec", end("boom", false, 7, false));
         match &timeline_lock(&timeline)[0] {
             TimelineItem::Tool {
                 success,
@@ -2568,7 +2678,7 @@ mod tests {
     #[test]
     fn orphan_tool_end_records_the_replay_marker_too() {
         let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
-        timeline_tool_end(&timeline, "c9", "exec", "[replayed]", false, 2, true);
+        timeline_tool_end(&timeline, "c9", "exec", end("[replayed]", false, 2, true));
         let items = timeline_lock(&timeline).clone();
         assert_eq!(items.len(), 1, "the call must not vanish from the record");
         match &items[0] {
@@ -2615,6 +2725,16 @@ mod tests {
             round_tripped.get("short_circuited").is_none(),
             "None must not be written as null: {round_tripped}"
         );
+        // Same contract for the edit diff, added later still: an old entry
+        // loads with no diff and is not rewritten with one.
+        assert!(
+            matches!(&item, TimelineItem::Tool { diff: None, .. }),
+            "absent means no diff"
+        );
+        assert!(
+            round_tripped.get("diff").is_none(),
+            "a None diff must not be written: {round_tripped}"
+        );
     }
 
     /// A panic under the journal lock must not take the journal with it.
@@ -2643,7 +2763,7 @@ mod tests {
         assert!(timeline.is_poisoned(), "…and left the mutex poisoned");
 
         // The record survives, and the run can still write to it.
-        timeline_tool_end(&timeline, "c1", "exec", "ok", true, 3, false);
+        timeline_tool_end(&timeline, "c1", "exec", end("ok", true, 3, false));
         let items = timeline_lock(&timeline).clone();
         assert_eq!(items.len(), 1, "the earlier entry must not be lost");
         match &items[0] {

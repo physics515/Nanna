@@ -1620,6 +1620,7 @@ impl ChatSink {
                     total_tokens: None,
                     // Back-filled with the rest of the outcome in `tool_end`.
                     short_circuited: None,
+                    diff: None,
                     at: chrono::Utc::now().to_rfc3339(),
                 });
         }
@@ -1675,6 +1676,7 @@ impl ChatSink {
                 success: slot_success,
                 duration_ms: slot_duration,
                 short_circuited: slot_short_circuited,
+                diff: slot_diff,
                 ..
             }) = journal
                 .iter_mut()
@@ -1689,6 +1691,10 @@ impl ChatSink {
                 // last consumer that did not, which is why a timeline
                 // rebuilt after a remount showed steering as tool errors.
                 *slot_short_circuited = Some(short_circuited);
+                // An unattended task run is exactly where a user most needs
+                // to see what each edit did; same rule as the chat path.
+                *slot_diff =
+                    crate::session::EditDiff::for_outcome(success, short_circuited, data);
             }
         }
         if let Some(stats) = &self.tool_stats {

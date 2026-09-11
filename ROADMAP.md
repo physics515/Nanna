@@ -3786,9 +3786,23 @@ asks permission or restricts her.)*:
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
-- [ ] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
+- [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
+      *(2026-09-11 — landed end to end, finishing the 2026-09-10 run's uncommitted half.)*
+      `edit_file` 0.1.10 attaches `data.diff` = `{start_line, removed, added, truncated}`, found
+      with native 4 KiB prefix/suffix compares and only the changed region split (Boa's `split` is
+      lines × length), capped at 40 lines / 4000 chars per side. **The half the WIP lacked:** the
+      run journal persisted only `short_circuited` from a result's data, and `RunTimeline` dropped
+      `data` entirely — so the diff showed only to a client watching live and vanished on reload,
+      the exact "while you were away" case. Now a typed `EditDiff` rides `TimelineItem::Tool.diff`,
+      validated and clamped (40 lines / 4000 bytes per side, char-boundary cuts) at the trust
+      boundary, journaled by BOTH writers (chat + task-run sink) through one rule
+      (`EditDiff::for_outcome`: only a call that succeeded and really ran). Omitted from the wire
+      when absent, so older journals load unchanged; dropped from crash-recovery checkpoints like
+      full outputs (quadratic rewrite). Zero model tokens — only `content` reaches the model.
+      Tests: 3 Boa skill, 6 journal/type + a daemon-restart survival test, 4 parser + 1 timeline +
+      3 card vitest.
 - [~] *(2026-09-10 — the wrapping half landed on both paths.)* A generic hook authenticates a
       *caller*, not the user, yet its text reached the agent as the user's own chat message.
       `nanna_channels::frame_untrusted_webhook_payload` now puts a provenance line first ("sent by
