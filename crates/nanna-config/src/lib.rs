@@ -321,7 +321,15 @@ impl Default for AgentConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub enabled: bool,
-    pub host: String,
+    // NOTE: `host` was removed 2026-09-11. Nothing ever read it — `nanna
+    // server` binds its `--host` flag (default loopback) — so it was a field
+    // shaped exactly like a security control that controlled nothing: setting
+    // it to 127.0.0.1 secured nothing, and its shipped `0.0.0.0` default read
+    // as an exposure that never happened. Deleted rather than wired, because
+    // wiring it under that default would have exposed an unauthenticated HTTP
+    // surface. Existing config.toml files still carrying `host = …` load
+    // unchanged (no `#[serde(deny_unknown_fields)]`, so serde ignores the stale
+    // key). Covered by `legacy_server_host_key_still_loads`.
     pub port: u16,
     pub webhook_secret: Option<String>,
 }
@@ -330,7 +338,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: "0.0.0.0".to_string(),
             port: 3000,
             webhook_secret: None,
         }
@@ -1130,6 +1137,35 @@ streaming_enabled = true
         let legacy_off = "[agent]\nthinking_enabled = false\n";
         let off: Config = toml::from_str(legacy_off).expect("legacy off-state must still parse");
         assert_eq!(off.agent.name, AgentConfig::default().name);
+    }
+
+    #[test]
+    fn legacy_server_host_key_still_loads() {
+        // `[server].host` was removed 2026-09-11: nothing ever read it (the
+        // bind is `nanna server --host`, default loopback). Every config ever
+        // written from the old defaults carries `host = "0.0.0.0"` on disk,
+        // and a config that refuses to parse is a dead app — so the stale key
+        // must be ignored, and the keys beside it must still land.
+        let legacy = r#"
+[server]
+enabled = true
+host = "0.0.0.0"
+port = 4100
+webhook_secret = "s3cret"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.server.port, 4100, "the keys beside it still land");
+        assert_eq!(config.server.webhook_secret.as_deref(), Some("s3cret"));
+
+        // And it is gone for good: a config written from today's defaults no
+        // longer carries a key that looks like it controls the bind.
+        let written = toml::to_string(&Config::default()).expect("default config serializes");
+        let server = written
+            .split("[server]")
+            .nth(1)
+            .expect("the default config writes a [server] table");
+        let server = server.split("\n[").next().unwrap_or_default();
+        assert!(!server.contains("host"), "no host key is written: {server}");
     }
 
     #[test]

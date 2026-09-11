@@ -3843,7 +3843,16 @@ asks permission or restricts her.)*:
             (`a merge needs cosine >= 0.10`) rather than `cluster_threshold`, which reads higher than
             what it actually demands — so the gap the research item describes is visible to an
             operator without reading the source.
-      - [ ] **`[server].host` is a dead field shaped like a security control** *(found 2026-09-09
+      - [x] *(2026-09-11 — **deleted**, the first of the two orders this item allows; wiring it
+            was never safe, because every config ever written from the old defaults already
+            carries `host = "0.0.0.0"` on disk, so "change the default first" could not have
+            protected them. A stale key still loads — no `deny_unknown_fields`, pinned by
+            `legacy_server_host_key_still_loads`, which also asserts a freshly written config
+            no longer carries the key. `nanna doctor`'s `server.bind` now states the effective
+            answer — loopback unless `nanna server --host` — and stopped branching on
+            `[server].enabled`, which `nanna server` does not read either: its "HTTP server
+            disabled" verdict was itself a false claim.)*
+            **`[server].host` is a dead field shaped like a security control** *(found 2026-09-09
             while writing the doctor)*. **Nothing reads `nanna_config::ServerConfig::host`** —
             verified by an exhaustive grep across Rust, TS and Vue. The bind in
             `nanna_server::start_server` takes `nanna_server::ServerConfig`, a *different* struct,
@@ -3857,6 +3866,18 @@ asks permission or restricts her.)*:
             the field, or change its default to loopback *first* and wire it *second*, in that
             order. Meanwhile `nanna doctor` reports the field as inert rather than warning about a
             binding that never happens.
+      - [ ] *(found 2026-09-11, deleting the field above)* **The rest of `[server]` is inert
+            too, and the README documents it.** `nanna server --port` defaults to the literal
+            `"3000"` in `src/main.rs`, not to `config.server.port`, so the README's
+            `[server] port = 3000` example sets nothing and the `PORT` env override in
+            `Config::with_env_overrides` writes a field no code reads. `[server].enabled` is
+            read only by onboarding (which writes it) and, until today, the doctor.
+            - [ ] **`port`:** make `[server].port` (and `PORT`) the default for
+                  `nanna server --port`, the flag still overriding — the documented key then
+                  does what it says. No exposure risk: the host stays loopback.
+            - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
+                  command without surprising whoever typed it; delete it, or define it as
+                  "the daemon starts the HTTP surface" and wire that.
       - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

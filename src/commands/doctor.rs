@@ -107,7 +107,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
 
     checks.push(check_clustering(config));
     checks.push(check_infer(config));
-    checks.push(check_server_exposure(config));
+    checks.push(check_server_exposure());
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
 
@@ -177,47 +177,26 @@ fn check_infer(config: &Config) -> Check {
     )
 }
 
-/// `[server].host` is **not** the bind address, and saying so is the check.
+/// Where `nanna server` binds, stated from the one place that decides it.
 ///
-/// Verified 2026-09-09: nothing reads `nanna_config::ServerConfig::host`. The
-/// bind in `nanna_server::start_server` takes `nanna_server::ServerConfig` — a
-/// *different* struct — which `commands::serve` builds from the `--host` CLI
-/// flag, defaulting to loopback. Only `webhook_secret` is carried over from the
-/// config.
+/// The bind address comes only from the `--host` flag, which defaults to
+/// loopback: `commands::serve` builds `nanna_server::ServerConfig` from it and
+/// carries nothing else over but `webhook_secret`. There is deliberately no
+/// config key for it. `[server].host` existed until 2026-09-11 and nothing ever
+/// read it — it was shaped exactly like a security control while controlling
+/// nothing, so it was deleted rather than wired (wiring it under its old
+/// `0.0.0.0` default would have exposed an HTTP surface with no authentication
+/// of its own). A stale key left in an old `config.toml` is still ignored.
 ///
-/// That makes the field worse than unused: it is shaped exactly like a security
-/// control. Someone who sets it to `127.0.0.1` has secured nothing, and someone
-/// reading the shipped `0.0.0.0` default reasonably concludes the server is
-/// exposed when it is not. A doctor that warned about the default would be
-/// raising a false alarm — which is the failure this command exists to avoid —
-/// so it reports the effective answer instead.
-fn check_server_exposure(config: &Config) -> Check {
-    if !config.server.enabled {
-        return Check::ok("server.bind", "HTTP server disabled");
-    }
-    if nanna_config::is_loopback_host(&config.server.host) {
-        // Harmless, but still not what binds — say so rather than implying the
-        // field did the securing.
-        return Check::ok(
-            "server.bind",
-            format!(
-                "binds loopback (from --host, default {}); `[server].host = \"{}\"` is not read",
-                nanna_config::LOOPBACK_HOST,
-                config.server.host
-            ),
-        );
-    }
-    Check::warn(
+/// No branch on `[server].enabled` either: `nanna server` does not read it, so
+/// reporting "disabled" from it would be the false alarm this command exists to
+/// replace.
+fn check_server_exposure() -> Check {
+    Check::ok(
         "server.bind",
         format!(
-            "`[server].host = \"{}\"` is NOT read by anything — the bind address comes from the \
-             `--host` flag, which defaults to loopback. Setting this field secures nothing and \
-             exposes nothing",
-            config.server.host
-        ),
-        format!(
-            "pass `--host` to `nanna server` to change the bind; use {} unless exposure is \
-             deliberate (the HTTP surface has no authentication of its own)",
+            "`nanna server` binds {} unless started with `--host`; no config key sets the bind \
+             address",
             nanna_config::LOOPBACK_HOST
         ),
     )
@@ -314,7 +293,6 @@ mod tests {
         // The whole point of this command over `status`: a verdict with no
         // remedy is the thing it replaces.
         let mut config = cfg();
-        config.server.host = "0.0.0.0".to_string();
         config.tools.tools_dir = Some("/definitely/not/a/real/dir".into());
         config.memory.embedding_provider = "disabled".to_string();
         config.infer.enabled = true;
@@ -353,22 +331,46 @@ mod tests {
     }
 
     #[test]
-    fn the_server_host_field_is_reported_as_the_dead_field_it_is() {
-        let mut config = cfg();
-        config.server.enabled = true;
-        config.server.host = "0.0.0.0".to_string();
-        let checks = run_checks(&config, Path::new("/x"));
-        let check = checks.iter().find(|c| c.name == "server.bind").unwrap();
-        assert_eq!(check.severity, Severity::Warn);
+    fn the_server_bind_check_names_the_flag_that_actually_binds() {
+        // `[server].host` is gone — it never bound anything — so the check
+        // states the effective answer: loopback unless `--host` says
+        // otherwise. No config key can expose the server, so nothing to warn.
+        let checks = run_checks(&cfg(), Path::new("/x"));
+        let check = checks
+            .iter()
+            .find(|c| c.name == "server.bind")
+            .expect("server.bind is always checked");
+        assert_eq!(check.severity, Severity::Ok);
         assert!(
-            check.detail.contains("NOT read"),
-            "the point is that the field is inert, not that 0.0.0.0 is exposed: {}",
+            check.detail.contains("--host"),
+            "names the thing that binds: {}",
             check.detail
         );
         assert!(
-            check.remedy.as_ref().is_some_and(|r| r.contains("--host")),
-            "the remedy must name the thing that actually binds: {check:?}"
+            check.detail.contains(nanna_config::LOOPBACK_HOST),
+            "and its default: {}",
+            check.detail
         );
+    }
+
+    #[test]
+    fn the_server_bind_check_does_not_trust_the_inert_enabled_flag() {
+        // `nanna server` does not read `[server].enabled`; the old check
+        // reported "HTTP server disabled" from it, which is a false claim
+        // about a server that starts regardless.
+        let mut config = cfg();
+        config.server.enabled = false;
+        let checks = run_checks(&config, Path::new("/x"));
+        let check = checks
+            .iter()
+            .find(|c| c.name == "server.bind")
+            .expect("server.bind is always checked");
+        assert!(
+            !check.detail.contains("disabled"),
+            "an inert flag must not be reported as a fact: {}",
+            check.detail
+        );
+        assert!(check.detail.contains("--host"));
     }
 
     #[test]
