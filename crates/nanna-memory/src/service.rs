@@ -1479,17 +1479,37 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<(Vec<RecallResult>, crate::SearchCoverage), MemoryError> {
+        let report = self.recall_scoped_with_report(query, workspace_id).await?;
+        Ok((report.results, report.coverage))
+    }
+
+    /// [`Self::recall_scoped_with_coverage`], plus how long each stage took.
+    ///
+    /// Retrieval latency is per stage, and the stages are not alike: the query
+    /// embedding is a model call — a provider round-trip, or local inference —
+    /// while the search is an in-RAM scan. A single number named "search" hid
+    /// the half that usually dominates: a 4 ms scan behind a 400 ms embed is a
+    /// 404 ms recall.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_scoped_with_report(
+        &self,
+        query: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<RecallReport, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
-        let store_count = self.store.len().await;
-        info!("Recall (scoped {:?}): generating embedding for query (store has {} entries)", 
-              workspace_id, store_count);
-
+        let embed_started = std::time::Instant::now();
         let query_embedding = (embed_fn)(query)
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-        
-        info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
+        let embed = embed_started.elapsed();
+        // Everything from here to the answer is the search stage: the row
+        // scan, the chunk scan, scoring and assembly.
+        let search_started = std::time::Instant::now();
 
         // Scoped search
         let (results, coverage) = self
@@ -1524,6 +1544,62 @@ impl MemoryService {
             )
             .await;
 
+        let filtered = self
+            .rank_and_assemble(results, &chunk_hits, workspace_id, min_score)
+            .await;
+
+        let timings = RecallTimings {
+            embed,
+            search: search_started.elapsed(),
+        };
+        // One line per recall, both stages named — it replaces the two
+        // "generating embedding" / "searching" lines that bracketed the embed
+        // without ever saying how long either half took.
+        info!(
+            "Recall (scoped {:?}) '{}': embed {} ms, search {} ms, {} results from {} memories",
+            workspace_id,
+            truncate(query, 30),
+            timings.embed_ms(),
+            timings.search_ms(),
+            filtered.len(),
+            coverage.total
+        );
+        // An answer of nothing, given from a scan that could not read most of
+        // the store, is worth a WARN even when the caller discards the
+        // coverage: it is the shape of the blackout, not of a miss.
+        if filtered.is_empty() && !coverage.is_complete() {
+            warn!(
+                "Recall '{}' answered empty from an incomplete scan: {} of {} memories \
+                 were comparable (query width matches binding: {})",
+                truncate(query, 30),
+                coverage.comparable,
+                coverage.total,
+                coverage.query_width_matches
+            );
+        }
+        Ok(RecallReport {
+            results: filtered,
+            coverage,
+            timings,
+        })
+    }
+
+    /// Rank one recall's candidates and assemble its answer.
+    ///
+    /// A row hit is admitted on the better of its row and chunk similarity;
+    /// memories only their chunks matched are added; the rest is ordered by
+    /// rank, cut at the weight floor and `max_results`, and every memory
+    /// returned gets its testing-effect review queued. Split out of
+    /// [`Self::recall_scoped_with_report`] so the stage timing there did not
+    /// push one function past the length limit.
+    async fn rank_and_assemble(
+        &self,
+        results: Vec<(MemoryEntry, f32)>,
+        chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
+        workspace_id: Option<&str>,
+        min_score: f32,
+    ) -> Vec<RecallResult> {
+        debug_assert!(min_score.is_finite(), "a similarity floor is a number");
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
@@ -1552,7 +1628,7 @@ impl MemoryService {
         // clear the top-k cut. These are the ones chunking is FOR: without
         // this pass, splitting a memory would improve nothing, because the
         // row-level search would still be the only way in.
-        for (id, hit) in &chunk_hits {
+        for (id, hit) in chunk_hits {
             if seen.contains(id) {
                 continue;
             }
@@ -1596,21 +1672,11 @@ impl MemoryService {
             self.pending_updates.write().await.extend(updates);
         }
 
-        debug!("Recall (scoped) '{}' found {} results", truncate(query, 30), filtered.len());
-        // An answer of nothing, given from a scan that could not read most of
-        // the store, is worth a WARN even when the caller discards the
-        // coverage: it is the shape of the blackout, not of a miss.
-        if filtered.is_empty() && !coverage.is_complete() {
-            warn!(
-                "Recall '{}' answered empty from an incomplete scan: {} of {} memories \
-                 were comparable (query width matches binding: {})",
-                truncate(query, 30),
-                coverage.comparable,
-                coverage.total,
-                coverage.query_width_matches
-            );
-        }
-        Ok((filtered, coverage))
+        debug_assert!(
+            filtered.len() <= self.config.max_results,
+            "the answer is bounded by max_results"
+        );
+        filtered
     }
 
     /// How many FSRS testing-effect reviews are queued and not yet applied.
@@ -2732,6 +2798,40 @@ pub struct ConsolidationBands {
     pub expand: Vec<MemoryEntry>,
 }
 
+/// What a recall found, how much of the store it could see, and how long each
+/// stage took. See [`MemoryService::recall_scoped_with_report`].
+#[derive(Debug, Clone)]
+pub struct RecallReport {
+    pub results: Vec<RecallResult>,
+    pub coverage: crate::SearchCoverage,
+    pub timings: RecallTimings,
+}
+
+/// Wall-clock time per recall stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecallTimings {
+    /// Embedding the query: a model call, local or remote.
+    pub embed: std::time::Duration,
+    /// The row scan, the chunk scan, scoring and assembly — everything after
+    /// the embed.
+    pub search: std::time::Duration,
+}
+
+impl RecallTimings {
+    /// [`Self::embed`] in whole milliseconds, saturating: a `u128` does not fit
+    /// JSON's integers, and no recall outlives `u64::MAX` milliseconds.
+    #[must_use]
+    pub fn embed_ms(&self) -> u64 {
+        u64::try_from(self.embed.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// [`Self::search`] in whole milliseconds, saturating.
+    #[must_use]
+    pub fn search_ms(&self) -> u64 {
+        u64::try_from(self.search.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Result from memory recall
 #[derive(Debug, Clone)]
 pub struct RecallResult {
@@ -3415,6 +3515,56 @@ mod tests {
             !json.contains("\"embeddings\":"),
             "no vector buckets either: {json}"
         );
+    }
+
+    /// Recall names its two stages separately: a slow embed must show up as
+    /// embed time, not be folded into "search".
+    #[tokio::test]
+    async fn recall_reports_embedding_time_separately_from_search() {
+        const EMBED_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
+        let embed: EmbedFn = Arc::new(|_t: &str| {
+            Box::pin(async {
+                tokio::time::sleep(EMBED_DELAY).await;
+                Ok(vec![1.0_f32, 0.0, 0.0])
+            })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+        service
+            .add_entry(dedup_entry(
+                "m",
+                "the user prefers dark roast",
+                vec![1.0, 0.0, 0.0],
+                None,
+            ))
+            .await
+            .expect("seed");
+
+        let started = std::time::Instant::now();
+        let report = service
+            .recall_scoped_with_report("coffee", None)
+            .await
+            .expect("recall");
+        let total = started.elapsed();
+
+        assert!(
+            report.timings.embed >= EMBED_DELAY,
+            "the embed stage carries the model call: {:?}",
+            report.timings
+        );
+        assert!(
+            report.timings.embed + report.timings.search <= total,
+            "the stages fit inside the call: {:?} vs {total:?}",
+            report.timings
+        );
+        assert!(
+            report.timings.embed_ms() >= 30,
+            "the JSON-facing milliseconds agree"
+        );
+        assert_eq!(report.coverage.total, 1, "the one memory was in scope");
     }
 
     /// A fixture for the enrichment path: `(service, seeded entry)` with a

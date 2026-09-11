@@ -65,10 +65,14 @@ impl ControlPlane {
                     _ => None,
                 };
                 let result = memory
-                    .recall_scoped_with_coverage(&query, scope_filter)
+                    .recall_scoped_with_report(&query, scope_filter)
                     .await;
                 match result {
-                    Ok((results, coverage)) => {
+                    Ok(nanna_memory::RecallReport {
+                        results,
+                        coverage,
+                        timings,
+                    }) => {
                         let memories: Vec<_> = results.into_iter()
                             .take(limit.unwrap_or(10))
                             .map(|r| json!({
@@ -110,6 +114,12 @@ impl ControlPlane {
                             "searched": coverage.comparable,
                             "total": coverage.total,
                             "note": note,
+                            // Per stage, because they are not alike: the embed
+                            // is a model call, the search an in-RAM scan.
+                            "timings": {
+                                "embed_ms": timings.embed_ms(),
+                                "search_ms": timings.search_ms(),
+                            },
                         })
                     }
                     Err(e) => json!({ "error": "search_failed", "message": e.to_string() })

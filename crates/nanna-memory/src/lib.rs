@@ -47,7 +47,7 @@ pub use fsrs::{
 // caller overriding the exponent needs the same bounds the default is held to.
 pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
-    MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
+    MemoryService, MemoryServiceConfig, RecallResult, RecallReport, RecallTimings, EmbedFn,
     MemoryStats, MemoryListEntry, MemoryExportRecord, ConsolidationBands,
     // Exported so the episodic writer chunks against the same bound the merge
     // path caps against. Those two numbers drifting apart is precisely how a

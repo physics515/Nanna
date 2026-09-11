@@ -3270,7 +3270,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             rather than a sample; the ordinary-fact budget is a **floor**, because 0 there would mean the
             deferral had swallowed a path that must still dedup inline. Instrument:
             `cargo test -p nanna-daemon write_path`.
-      - [ ] **Report embedding-generation latency separately from vector-search latency.** The retrieval
+      - [x] *(2026-09-11 — done.)* New `MemoryService::recall_scoped_with_report` returns a
+            `RecallReport` whose `RecallTimings` time the query embed and the search (row
+            scan, chunk scan, scoring, assembly) separately; `recall_scoped_with_coverage`
+            is now a two-line wrapper, so no caller changed. Every recall logs ONE line naming
+            both stages (it replaces the two "generating embedding" / "searching" lines that
+            bracketed the embed without timing it), and the daemon's `memory.search` reply
+            carries `timings: {embed_ms, search_ms}`. Bench Suite 2 still measures the scan
+            alone by design; this is the live number beside it.
+            **Report embedding-generation latency separately from vector-search latency.** The retrieval
             budget is per *stage* (embed → search → rerank → assemble); a 4 ms search behind a 400 ms embed
             is a 400 ms retrieval, and our numbers currently name only the second half.
       Sources: [Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads
