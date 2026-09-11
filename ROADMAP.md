@@ -4027,8 +4027,30 @@ asks permission or restricts her.)*:
       file injection beats a read_file roundtrip the model may fumble; pairs with the P4 drag-drop item.
 - [ ] **"think hard" phrases** — map natural-language budget phrases onto the existing ThinkingMode ladder;
       chat-first users on Telegram can't flip config flags mid-message.
-- [ ] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
+      - *(scoped 2026-09-11, not built — the ladder above `Medium` does not reach the wire, so a
+        phrase mapped onto it would be a lie.)* Traced through `nanna-agent::loop_runner`:
+        on **adaptive** Claude models (4.6+) a higher mode only adds its budget as output-ceiling
+        headroom (`request_output_budget`) — the model still chooses its own depth, nothing asks
+        it to think harder; on the **legacy** contract the sent budget is clamped to
+        `max_tokens − MIN_OUTPUT_RESERVE_TOKENS` (7080 at the shipped 8192), so `High` and
+        `Maximum` send the *same* budget, as `Medium`'s own doc warns; on **Ollama** the mode
+        does not reach the request at all. **Prerequisite, owner call:** make the upper rungs
+        real first — widen the legacy ceiling by the budget as the adaptive path already does,
+        and/or map rungs onto the API's effort control on models that have one — then the
+        phrase layer is a small pure function over the user's message plus one per-turn
+        `agent_config.thinking_mode` bump beside `apply_chat_model_override` in
+        `chat_with_options` (escalate only: `Instant` stays internal-only).
+- [~] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
       carries `model: Option<String>`, the Chat message doesn't.
+      - [x] *(found done 2026-09-11 — landed 2026-08-17 in #252, "per-chat model selection")*
+            **For clients:** the `session.set_model` IPC verb pins a session's chat model (`null`
+            clears it), the GUI's session model picker drives it, and
+            `apply_chat_model_override` moves exactly the chat model on the per-turn config clone
+            — never the shared service config, so sub-agents, summarization and other sessions
+            are untouched (pinned by `a_chat_model_pick_moves_exactly_two_fields`).
+      - [ ] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
+            user still cannot say "use the big model for this conversation" — a `/model <name>`
+            channel command over the same `session.set_model` verb would close it.
 - [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
       restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
       (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
