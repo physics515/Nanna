@@ -94,6 +94,82 @@ below it would paraphrase-merge genuinely distinct memories.
 
 ---
 
+## Suite 3b — Dream-time clustering (scaling)
+
+Instrument: `cargo bench -p nanna-memory --bench clustering_scaling`. Deterministic
+fixed-seed corpus (integer hash / xorshift, not an RNG), MiniLM-width 384-dim vectors,
+at the shipped `cluster_threshold` (0.75). The **`pairs` column is hardware-independent**
+— it counts the inner-loop iterations the greedy pass actually performs — so it is the
+number an ANN replacement must be held to even off the reference tier. Wall-clock is
+reference-tier (AMD Zen 4).
+
+*Dense* = N/20 tight topics, so clusters fill. *Sparse* = mutually unrelated unit vectors
+(expected cosine 0, sd ~1/√384 ≈ 0.051), so nothing clusters.
+
+| N | clusters (dense) | pairs (dense) | wall_ms (dense) | clusters (sparse) | pairs (sparse) | wall_ms (sparse) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 50 | 25,450 | 1.7 | 1,000 | 499,500 | 14.5 |
+| 2,000 | 100 | 100,900 | 4.7 | 2,000 | 1,999,000 | 58.0 |
+| 4,000 | 195 | 381,410 | 15.5 | 4,000 | 7,998,000 | 223.1 |
+| 8,000 | 387 | 1,478,686 | 52.4 | 8,000 | 31,996,000 | 930.3 |
+| 16,000 | 796 | 6,114,418 | 255.2 | 16,000 | **127,992,000** | **4,281.2** |
+
+*(2026-09-09)* **The sparse arm is exactly N(N−1)/2** — 127,992,000 at N=16,000 — i.e.
+every pair compared, every memory its own cluster. That is the literal O(N²) the
+indexed-clustering item names, reproduced. The dense arm is **N^2.0 in pairs but bounded
+in practice** by `max_cluster_memories` (64): a seed stops scanning once its cluster fills,
+which is why it stays 21× cheaper at the same N.
+
+Extrapolating the sparse arm (35 ns/pair): **50k ≈ 1.25B pairs / ~44 s**, **200k ≈ 20B /
+~12 min**, **500k ≈ 125B / ~73 min**. A dream cycle cannot take an hour. Benchmark the ANN
+work on the **sparse** arm — the dense arm is bounded by the cluster cap and cannot show a
+win no matter how good the index is.
+
+The sparse regime is also the realistic one for a long-lived store: what survives
+consolidation is precisely the memories that did *not* merge into anything.
+
+> **Two earlier readings of this table were wrong, and both for the same reason — the
+> configuration underneath moved.** The first (pre-fix `cluster_threshold` 0.45) showed
+> `pairs` growing *linearly*, because the non-semantic floor (0.50) sat above the threshold
+> so every pair matched immediately, every cluster filled to 64 at once, and each seed broke
+> out after ~64 iterations. The second (threshold 0.55) showed N^1.45/N^1.31. The numbers
+> above are at the shipped 0.75. A benchmark is only as honest as the configuration beneath
+> it, and this one moved twice in one day.
+
+---
+
+## Suite 3c — Clustering threshold: compression vs fidelity
+
+Instrument: `cargo bench -p nanna-memory --bench clustering_threshold_sweep`. Deterministic,
+offline, fixed-seed; echo summarizer. **`min cosine` is the axis to compare against
+published numbers**, not `threshold` — the threshold is judged against the *composite*
+score, and `min_required_similarity()` converts between them.
+
+*Loose corpus* (`member_spread` 0.6): related but not near-identical, so clustering decides.
+
+| threshold | min cosine | clusters | merged | compression | recall retention |
+| --- | --- | --- | --- | --- | --- |
+| 0.55 | 0.10 | 3 | 27 | 0.450 | 1.000 |
+| 0.65 | 0.30 | 3 | 27 | 0.450 | 1.000 |
+| **0.75** (shipped) | **0.50** | 3 | 27 | 0.450 | 1.000 |
+| 0.85 | 0.70 | 5 | 23 | 0.383 | 1.000 |
+| 0.95 | 0.90 | 0 | 0 | 0.000 | 1.000 |
+
+*Tight corpus* (`member_spread` 0.02) is the **control** and is flat at every threshold:
+0 clusters, 54 deduped, compression 0.900, recall 1.000. Its members sit above the
+`Reinforce` line (0.92) so dream phase (b) folds them and clustering never runs. Movement
+there would mean the clustering threshold was reaching pairs dedup already owns.
+
+*(2026-09-09)* **0.55 → 0.75 is free**: identical clusters, merges, compression and recall,
+while the cosine actually demanded rises 0.10 → 0.50. The shipped default takes the top of
+that flat range — a 5× stricter semantic bar at zero measured cost. Above it the trade is
+real and now priced: **0.85 (cosine 0.70, the θ_sim the 2026 literature uses) costs
+compression 0.450 → 0.383, a 15% relative drop, at recall 1.000.** Recall never moves
+anywhere in this sweep, so the trade is compression against merge *precision*, not against
+retrievability. Whether to spend it is an owner call; the number is no longer the unknown.
+
+---
+
 ## Suite 4 — Long-horizon harness (task-success @ tokens)
 
 Denominator (which evals count, tiers, pass-rate rules): [`AGENT_EVAL.md`](./AGENT_EVAL.md).

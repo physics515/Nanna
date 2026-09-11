@@ -2422,6 +2422,35 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
+      the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
+      `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
+      (mutually unrelated vectors, nothing fills, every seed scans to the end): doubling factors
+      climb 2.49 → 2.88 → 3.64 → **4.43**, i.e. **N^2.15**, and 16k memories cost **4.4M pairs /
+      218 ms** — 7.2× the pairs of the dense arm at the same N. Extrapolated: **50k ≈ 51M pairs /
+      ~2.5 s**, **200k ≈ 1.0B / ~49 s**, **500k ≈ 7.2B / ~6 min**. That is the real wall, and the
+      sparse regime is the realistic shape for a long-lived already-consolidated store — the
+      leftovers are exactly the memories that did not merge. **Benchmark the ANN work on the
+      sparse arm; the dense arm cannot show a win.**
+      *(Correction, same run: an earlier reading of this bench claimed the pass was linear and the
+      O(N²) premise wrong. That was an artifact of the similarity-veto bug below — with the floor
+      0.50 above the old 0.45 threshold every pair matched immediately, every cluster filled at 64,
+      and each seed broke out after ~64 iterations. The premise was right; the first measurement
+      was taken on a broken system.)*
+      - [x] *(2026-09-09)* **Found while baselining: cosine similarity could not veto a merge.**
+            `composite_cluster_score`'s non-similarity terms are all maximal for the commonest pair in
+            a store (`recall_affinity` and `importance_proximity` are 1.0 by construction when the
+            values are *equal*, including `0 == 0`; `age_prox` ~1.0 within a session), pinning the
+            score at **0.50** against a **0.45** default threshold **whatever the embeddings say**.
+            Measured: orthogonal vectors 0.500, anti-correlated 0.500, four mutually unrelated
+            memories → one cluster of four. Fixed by the *default*, not the algorithm — the drift
+            fixture's own 0.65 threshold always satisfied the invariant and demands cosine ≥ 0.30;
+            the shipped default demanded 0.000. Default `cluster_threshold` 0.45 → 0.55, plus
+            `non_similarity_floor()`, `min_required_similarity()` (what a config *really* asks for)
+            and `ConsolidationConfig::validate()` to keep weights and threshold in step — this went
+            stale silently the last time the weights alone were retuned. Suite 3 numbers unmoved
+            (0.90 / 1.000 / 54 deduped / 60 → 6), and that test now asserts them exactly instead of
+            `> 0.0`, which would have passed at 30 memories as happily as at 6.
       - [ ] *(research 2026-07-24 — **corrects a load-bearing "fact"; read before picking an HNSW crate**)*
             **The `turso` crate we already pin ships native vector SQL functions.** Both this roadmap and the
             `daily-dev` Appendix C assert "Turso stores embeddings as f32 BLOBs and does **NO** vector search —
@@ -2690,6 +2719,45 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             2026-07-25 (`search_by_embedding_sql`) is the near-term path for the RAM-ceiling win, and an
             **external pure-Rust HNSW crate** (`hnsw_rs`/`hnswlib-rs` above) remains the only route to
             *approximate* indexing — do not block on a turso release for it.
+- [ ] *(research 2026-09-09 — grades the similarity-veto fix landed the same run)* **Our semantic bar
+      is 0.10; the field's is ~0.7. Restoring the veto was necessary, not sufficient.**
+      The 2026 agent-memory literature reports the failure mode we hit almost verbatim — a
+      clustering similarity threshold that is "too low" causes *"semantically unrelated interactions
+      [to] merge incorrectly"*, while too high fragments related ones — and settles around
+      **θ_sim ≈ 0.7** for clustering, **τ ≈ 0.85** for merge decisions, and **0.92** for
+      near-identical facts. That last number is exactly the `IngestAction::Reinforce` bar dream
+      phase (b) already folds at, which is a good independent check that our *dedup* line is right.
+      Our *clustering* line is not: after this run's fix the composite still only demands
+      `min_required_similarity() = 0.10`, because the non-semantic floor (0.50) eats most of the
+      0.55 threshold. Reaching the field's 0.7 with the shipped weights would need
+      `cluster_threshold = 0.85` (0.65 → 0.30, 0.75 → 0.50, 0.85 → 0.70), or a rebalance that
+      lowers the floor instead.
+      **Do not just turn the knob** — pick the target with the retention harness: raising the bar
+      trades compression for fidelity, and Suite 3 measures both (compression 0.90 / recall 1.000).
+      - [x] *(2026-09-09)* **The missing instrument now exists.** Suite 3's corpus could not measure
+            this at all — its members sit at cosine ~0.999, above the `Reinforce` line, so phase (b)
+            folds them and `clusters_formed` is 0 regardless of the threshold. `CorpusParams` gained
+            `member_spread` (default 0.02 — every existing fixture unchanged); widening it to 0.6
+            drops within-topic similarity between the clustering bar and the dedup bar, so pairs
+            must go through `cluster_memories`. `the_clustering_threshold_is_a_measurable_lever`
+            pins that the lever responds: threshold **0.55 → 2 clusters, 32 → 18 memories**;
+            **0.75 → 2 clusters, 32 → 18**; **0.95 (demands cosine 0.90) → 0 clusters, 32 → 32**,
+            no compression at all. The discriminating range for that corpus is 0.75..0.95.
+      - [x] *(2026-09-09)* **Sweep run and priced — `bench/BASELINE.md` Suite 3c.**
+            **0.55 → 0.75 is free**: identical clusters/merges/compression (0.450) and recall
+            (1.000) while the cosine actually demanded rises 0.10 → 0.30 → **0.50**. Default moved
+            to **0.75**, the top of that flat range — a 5× stricter semantic bar at zero measured
+            cost. The control arm (tight corpus, folded by phase (b)) is flat at every threshold,
+            which is what validates the instrument.
+            **The remaining move is priced, not free:** 0.85 (cosine **0.70**, the θ_sim the 2026
+            literature uses) costs compression 0.450 → 0.383 — a 15% relative drop — at recall
+            **1.000**. Recall never moves anywhere in the sweep, so this trades compression against
+            merge *precision*, not retrievability.
+      - [ ] **Owner call: spend that 15% for the literature's 0.70 bar?** The number is no longer
+            the unknown; what is unknown is whether these synthetic corpora represent a live store.
+            Re-run Suite 3c against a real memory dump before deciding.
+      Sources: [Memory in the Age of AI Agents](https://arxiv.org/pdf/2512.13564),
+      [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
       `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
@@ -3747,10 +3815,38 @@ asks permission or restricts her.)*:
 - [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
-- [ ] **Doctor probes** — health checks report availability, not root cause. Add config validation, provider
-      connectivity / API-key probes, Ollama reachability, tools-dir checks with fix suggestions. Our own
-      history (loopback stream faults misread as provider 502s → restart spirals) is exactly the failure class
-      a self-diagnosing always-on daemon must catch.
+- [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
+      stream faults misread as provider 502s → restart spirals) is exactly the failure class a
+      self-diagnosing always-on daemon must catch.
+      - [x] *(2026-09-09)* **`nanna doctor` — the offline leg.** `src/commands/doctor.rs`: six checks
+            (config file, clustering invariant, `[infer]`, server bind exposure, tools dir, embedding
+            provider), each carrying a **remedy**, not just a verdict — that is the whole difference
+            from `status`. Exits non-zero on a failure so it is usable from a script or a health
+            probe. Verified on the real binary: a bad `[tools].tools_dir` reports `FAIL` with the fix
+            and `EXIT=1`; the shipped defaults report clean. 7 tests, one of which asserts the
+            *invariant* that no non-ok check may ship without a remedy.
+            Nice side effect: the clustering row prints the **effective** semantic bar
+            (`a merge needs cosine >= 0.10`) rather than `cluster_threshold`, which reads higher than
+            what it actually demands — so the gap the research item describes is visible to an
+            operator without reading the source.
+      - [ ] **`[server].host` is a dead field shaped like a security control** *(found 2026-09-09
+            while writing the doctor)*. **Nothing reads `nanna_config::ServerConfig::host`** —
+            verified by an exhaustive grep across Rust, TS and Vue. The bind in
+            `nanna_server::start_server` takes `nanna_server::ServerConfig`, a *different* struct,
+            which `commands::serve` builds from the **`--host` CLI flag** (default loopback); only
+            `webhook_secret` is carried over from the config. So a user who sets
+            `[server].host = "127.0.0.1"` has secured nothing, and the shipped **`0.0.0.0`** default
+            reads as "exposed to the network" while binding nothing of the sort.
+            **Do not fix this by making the field live.** With its current `0.0.0.0` default that
+            would turn an inert field into a real exposure of an HTTP surface that has no
+            authentication of its own — a security regression delivered as a cleanup. Either delete
+            the field, or change its default to loopback *first* and wire it *second*, in that
+            order. Meanwhile `nanna doctor` reports the field as inert rather than warning about a
+            binding that never happens.
+      - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
+            Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
+            reasons that are not configuration, so mixing them means a laptop with no internet
+            reports its config as broken. Give them their own flag (`--probe`/`--online`).
 
 **D. Agent quality-of-life** (cheap, high-leverage; several pairs share infrastructure — build together):
 - [ ] **Instruction skills + slash macros** — tools are executable-only; there's no packaged *procedure* the
@@ -5362,6 +5458,45 @@ keep the phases readable; promote individual items into a phase when they become
 
 ---
 
+### Linux host blockers (found 2026-09-09)
+
+- [x] *(2026-09-11 — fixed by the 2026-09-10 run, which reached master only through this
+      stacked PR: `vendor/tauri-build` carries upstream tauri#15831; see the P11 Linux entry.
+      Both sub-items below were settled by that run too.)*
+      **The Tauri GUI does not build on this Linux host, and it is not our code.** `cargo check -p
+      nanna-gui` fails in `tauri-build 2.6.3`'s build script — verified **pre-existing** by stashing
+      the run's only GUI edit and reproducing it byte-for-byte on unmodified sources.
+      **Root cause, traced:** `tauri_build::copy_binaries` does
+      `if dest.exists() { fs::remove_file(&dest).unwrap() }` (`tauri-build-2.6.3/src/lib.rs:80`),
+      and here `dest` **is a directory**, so it panics with
+      `Os { code: 21, kind: IsADirectory }`. It is a directory because tauri-build infers the target
+      dir by walking up from `OUT_DIR`, assuming cargo's **classic** build-script layout
+      `debug/build/<crate>-<hash>/out` (up 3 → `debug`). This toolchain
+      (`cargo 1.100.0-nightly e8cb624d5`) emits the **nested** layout
+      `debug/build/<crate>/<hash>/out` (up 3 → `debug/build`), and `debug/build/nanna-daemon` is a
+      real directory — the daemon's own build-script output. So the sidecar destination resolves one
+      level too high, onto a directory.
+      Consequences: no `cargo tauri build`, therefore **no WebDriver GUI verification on Linux
+      regardless of the `WebKitWebDriver` gap below**, and `gui.yml` will fail the moment CI moves to
+      this cargo.
+      - [x] *(2026-09-10: vendored the upstream fix — the pin option could not work, the layout
+            is cargo's.)* Fix options, cheapest first: pin cargo/nightly to one still emitting the classic layout;
+            build the GUI with `CARGO_TARGET_DIR` set somewhere no `nanna-daemon` build dir exists;
+            or upstream a `remove_dir_all`/`is_dir` guard to tauri-build. Confirm which layout the
+            currently pinned `nightly-2026-08-27` emits before assuming a pin fixes it — the layout
+            comes from **cargo**, not rustc.
+      - [x] *(2026-09-10: tracked, commit 6032968d.)* `gui/src-tauri/gen/schemas/linux-schema.json` is generated by a Linux build and is not
+            tracked, while `windows-schema.json` and `desktop-schema.json` are. Decide whether to
+            track it once the GUI builds here; not added this run because an unfinished build cannot
+            be trusted to have produced a complete one.
+
+- [ ] **`WebKitWebDriver` is missing (owner-gated).** `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh
+      ensure` reports every other check green — `tauri-driver` installed this run
+      (`cargo install tauri-driver`), curl/python3/base64 present, Wayland session live
+      (`WAYLAND_DISPLAY=wayland-1`). The single remaining gap needs
+      `sudo pacman -S --needed webkit2gtk-4.1`. **The Linux WebDriver harness therefore remains
+      UNVALIDATED** — no run has yet driven the real Nanna GUI on this host.
+
 ## Immediate next actions (top of queue)
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
@@ -5577,6 +5712,36 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
+     - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
+           --incompatible` now reports lopdf's "latest" as 0.42.0 while 0.45 is what the req holds
+           and what builds. Two crates showing this means it is a pattern, not a one-off — treat
+           any `--incompatible` row whose "latest" is *lower* than the current req as a registry
+           artifact and verify before taking it.
+     - [x] *(2026-09-09 sweep)* `cargo update` → 10 compatible bumps (`encoding_rs 0.8.41`,
+           `hybrid-array 0.4.15`, `multiversion 0.8→0.9`, `reqwest 0.13.5`, `tantivy 0.26.2`,
+           `zerocopy 0.8.57`, `target-features` dropped) and **`playwright-rs 0.17 → 0.18`**
+           (major; compiled unchanged). Both held-back crates re-asserted themselves and were
+           pinned back. The libc one is worth recording: **`cargo upgrade -p playwright-rs
+           --incompatible` runs a recursive dependency upgrade that moved `libc` to 0.2.189 as a
+           side effect**, and `held_back_crates_stay_below_their_ceiling` caught it — the ceiling
+           was re-broken by a command with nothing to do with libc, which is exactly the case a
+           remembered pin would have missed. Re-checked both retirement conditions: rustpython-
+           {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
+           GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
+           (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
+           target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
+           tokio codegen ICE and no `turso_core` depth overflow. Full gate re-run under the new
+           channel (1751 tests, clippy 0 errors), and the mirrored `toolchain:` inputs in
+           `budget-gate.yml`, `test-compile.yml` and `release-check.yml` moved with it.
+           **Caveat recorded in the pin comment:** the channel does not control cargo's
+           build-script output layout, which is what breaks the Tauri GUI build on Linux — moving
+           the pin neither caused nor fixes that.
+     - [ ] *(re-checked 2026-09-09, no re-attempt)* TypeScript 7 still blocked and **cheaply
+           confirmed without burning another migration**: npm `typescript` latest is still 7.0.2
+           (no 7.1) and `vue-tsc` is still 3.3.11 — byte-identical to the state that failed on
+           2026-08-27. Check those two version numbers before ever re-trying; if neither moved,
+           the `ERR_PACKAGE_PATH_NOT_EXPORTED` failure is guaranteed.
    - **`libc` must stay at or below 0.2.186 — above it the workspace does not build on Linux at all**
      *(2026-09-07)*. `libc 0.2.187` corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on
      linux-gnu (glibc genuinely stores spawn flags in a `short`, so libc is right). But
@@ -6215,11 +6380,75 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    MiniLM-class CPU sentence embedder; and `plan::pick_precision` for VRAM-aware dtype choice.
    Runner code still must NOT be written in this repo — but the *consumer glue* is now the real work,
    and it is no longer blocked:
-   - [ ] **Take Mummu as a dependency** — decide git-rev pin vs path dep, and land the `[infer]`
-         config surface (model id, device preference, precision override). A rev pin is the honest
-         default while Mummu is pre-release: it is the same reproducibility argument as the boa git
-         rev and the exact `turso`/`aegis` pins. Budget the build cost first — `burn` + `wgpu` +
-         CubeCL is a large cold compile, and `nanna-gui` already needs a sidecar and a built frontend.
+   - [~] **Take Mummu as a dependency** — *(2026-09-09)* **config surface landed; the dependency
+         itself is BLOCKED on a bundled C SQLite.** All three questions the item asked are now
+         answered with measurements rather than guesses:
+         - **Pin:** git rev. Mummu is public, so CI needs no credentials, and a rev is the same
+           reproducibility lever as the boa pin. A path dep would build only where the sibling
+           checkout happens to exist. (Rev verified to build: `e7e430c`.)
+         - **Build cost — cheaper than the item feared.** Cold, isolated, 4 jobs, `debug=0`:
+           **384 crates / 1m19s / 1.7 GB** with `default-features = false`, **1m46s / 2.3 GB** with
+           mummu's defaults (`fusion` + `vulkan-spirv`). Linked into this workspace: **74s**. The
+           "large cold compile" warning does not hold on this host.
+         - **wgpu unifies at 30.0.1** — Nanna's `nanna-gpu` and Mummu's burn-0.22-pre chain resolve
+           to one version, so the dependency adds no second graphics stack. This was the real
+           integration risk and it is clear.
+         - **BLOCKER: a bundled C SQLite, and it is upstream of Mummu.** Adding the dependency
+           fails `no_banned_database_crates_in_lockfile` — **`rusqlite 0.40` with
+           `features = ["bundled"]`**, i.e. a second SQLite statically compiled from C. The guard
+           is correct to fail: the lockfile records optional deps regardless of features, and
+           `bundled` really does compile the C engine in.
+           **Traced to the exact line (2026-09-09):** `cubecl-runtime`'s manifest declares
+           ```toml
+           [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.cubecl-environment]
+           features = ["cache"]
+           ```
+           — **unconditional on every desktop target, behind no feature flag of its own**, and
+           `cubecl-environment`'s `cache` feature is what pulls `dep:rusqlite`. Confirmed
+           empirically: `rusqlite` is in the lock even with `mummu = { default-features = false }`
+           (no `fusion`, no `vulkan-spirv`).
+           **Correction to an earlier note this same run:** this was first recorded as "`mummu`
+           enables `burn/autotune`, so ask Mummu to make the autotune cache optional". That
+           remediation is wrong. It is not Mummu's to disable and it is not autotune's doing —
+           `cubecl-runtime` is a core dependency of any cubecl/wgpu backend, so **every consumer of
+           burn's GPU backend on a desktop OS links a bundled C SQLite.** Turning off
+           `burn/autotune` would not remove it.
+           **Owner decision needed**, and the options are narrower than first thought:
+           - [ ] Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
+                 clear (it is a persistent autotune-results DB; CubeCL's own docs note the cache
+                 can be pre-built and shipped, so a no-DB mode is coherent). The only fix that
+                 keeps both the GPU backend and the Turso-only rule.
+           - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
+                 vendored GPU-autotune cache. Weakens a deliberate guard — do it with eyes open,
+                 and only if the owner accepts a C SQLite in the shipped binary (it also cuts
+                 against the "prefer pure-Rust, no-C" rule that chose native-tls over rustls).
+           - [ ] Ask Mummu to make its **GPU stack optional** so a CPU-only consumer can avoid
+                 cubecl entirely. Checked, and this does *not* work today: `burn-cubecl`, `cubecl`,
+                 `cubecl-runtime` and `wgpu` are all **non-optional** dependencies of the `mummu`
+                 crate (only `fusion`/`vulkan-spirv`/`cuda`/`jinja-template`/`flamegraph` are
+                 features), so `default-features = false` still links rusqlite. Worth asking for
+                 regardless, because the roadmap's own first local consumer — the MiniLM embedder —
+                 is CPU-only (`burn-flex`), so a `gpu` feature on Mummu would unblock P12 item 4
+                 (local embeddings) without waiting on item 5 or on upstream CubeCL.
+   - [x] **`[infer]` config surface** — *(2026-09-09)* landed in `nanna-config::infer`: `enabled`,
+         `model`, `embedding_model`, `models_root`, `device` (auto/gpu/cpu), `precision`
+         (auto/f16/f32), `vram_budget_bytes`, plus `LocalPlan` — the boot-time decision
+         `Provider::Local` reads. Model names are Mummu **catalog** names, not HF repo ids, so a
+         reference stays pinned to a repo + revision. 14 tests. Two deliberate calls: the decision
+         logic lives in `nanna-config` rather than behind a `nanna-llm` feature, because CI runs
+         `cargo test --no-run --workspace` with **default features only** and a feature-gated
+         decision table would never be compiled or tested; and Nanna does **not** re-derive VRAM
+         policy — `vram_budget_bytes` is an override forwarded verbatim, with
+         `DeviceBudget::usable_bytes()` left owning the display's share.
+   - [ ] **`InferPrecision::Auto` cannot choose f16 on Linux, and this is Mummu's gap to close.**
+         *(2026-09-09)* `plan::pick_precision` needs a `DeviceBudget`, which comes from
+         `GpuAdapter::vram_bytes` — populated **only** by Mummu's Windows DXGI walk.
+         `backend::vram_by_adapter_name()` returns an empty vec on Linux/macOS (its own comment
+         marks Vulkan memory heaps a P6 follow-up) and `video_memory()` returns `None`, so
+         `DeviceBudget::from_adapter` is `None` and the planner correctly refuses to guess. Nanna
+         handles it honestly (`PrecisionReason::Unsized` announces the remedy rather than silently
+         serving f32), but the fix belongs in Mummu: **size VRAM from Vulkan memory heaps**. File
+         it there — a silent f32 fallback reads as a Mummu perf regression, not a platform gap.
    - [ ] **Back the memory `embed_fn` with Mummu's MiniLM embedder** (P12 item 4) — this is the
          lowest-risk first consumer: CPU-only, no VRAM budget to negotiate, and it removes the last
          API dependency from the memory path. Mind the **embedding-dimension latch** (see the stale
