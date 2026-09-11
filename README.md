@@ -98,7 +98,7 @@ A fully local run needs none.
 - **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
 - **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
-- **Conversation export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session
+- **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -333,7 +333,7 @@ See [PRIVACY.md](PRIVACY.md) for full details.
 - Credentials: OS keyring (encrypted)
 
 **Taking your data with you:** `nanna export <session-id>` (Markdown, or `--format json`
-for the complete stored session) — the daemon must be running.
+for the complete stored session) and `nanna export --memories` — the daemon must be running.
 
 **What's sent externally (when configured):**
 - Chat messages → your chosen LLM provider

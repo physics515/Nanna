@@ -4049,7 +4049,17 @@ asks permission or restricts her.)*:
       onto a directory. An unknown id is refused, not exported empty. `PRIVACY.md` updated.
       - [ ] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
             session menu, verified over WebDriver once `WebKitWebDriver` exists on the host.
-      - [ ] **Memory export** — the same shape for the memory store (FSRS state included).
+      - [x] **Memory export** — the same shape for the memory store (FSRS state included).
+            *(2026-09-11 — shipped.)* `memory.export {scope, format}`, rendered by the daemon;
+            `nanna export --memories [--scope global|<workspace>]`. Each memory carries
+            content, provenance (`unknown` when none was recorded — never a guessed
+            `stated`), workspace, the raw FSRS state and the state derived from it, and
+            **no embedding vectors**: they are derived data and most of an entry's bytes.
+            `VectorStore::map_entries` projects under one read lock, so the export never
+            clones the vectors either. Oldest first with an id tiebreak, so the same store
+            exports identically; the scope rule is now one function `list` and `export`
+            share. A daemon running without memory refuses with its reason instead of
+            exporting an empty store as if it were the user's.
 
 **E. Deliberately not building** (audited 2026-07-24, off-thesis — revisit only if the product direction
 changes). **Owner decision 2026-07-24 adds the entire permission-gate family here**: async approval gates,

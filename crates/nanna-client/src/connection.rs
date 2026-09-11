@@ -465,6 +465,14 @@ impl<'a> MemoryApi<'a> {
     pub async fn stats(&self) -> Result<Value> {
         self.client.request(Action::Memory(MemoryAction::Stats)).await
     }
+
+    /// Export memories as a document (Markdown or JSON), rendered by the
+    /// daemon: `{format, filename, content, count}`, or `{error, message}`.
+    pub async fn export(&self, scope: Option<String>, format: ExportFormat) -> Result<Value> {
+        self.client
+            .request(Action::Memory(MemoryAction::Export { scope, format }))
+            .await
+    }
 }
 
 /// Config API

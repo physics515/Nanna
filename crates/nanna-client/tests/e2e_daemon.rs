@@ -322,6 +322,25 @@ async fn a_session_exports_over_the_protocol_in_both_formats() {
     daemon.stop();
 }
 
+/// Memory export routes through the protocol. A daemon running without memory
+/// — as this hermetic one does — refuses with its reason instead of exporting
+/// an empty store as though it were the user's.
+#[tokio::test]
+async fn memory_export_on_a_daemon_without_memory_says_why() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let reply = client
+        .memory()
+        .export(None, nanna_client::ExportFormat::Json)
+        .await
+        .expect("memory.export answers");
+    assert_eq!(reply["error"], "memory_unavailable", "{reply}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// The reconnection half of the P8 gap: a client that drops and attaches again must
 /// find the daemon's state intact, because the daemon — not the client — owns it.
 #[tokio::test]

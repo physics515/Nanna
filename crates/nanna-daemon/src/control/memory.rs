@@ -7,23 +7,28 @@ impl ControlPlane {
     // Memory Handlers
     // =========================================================================
     
+    /// Does a memory in `workspace_id` belong to `scope`? `None` = every
+    /// memory, `"global"` = global memories only, a workspace id = global
+    /// memories plus that workspace's. One rule for `list` and `export`, so the
+    /// two can never disagree about what a scope contains.
+    fn memory_in_scope(scope: Option<&str>, workspace_id: Option<&str>) -> bool {
+        match scope {
+            None => true,
+            Some("global") => workspace_id.is_none(),
+            Some(workspace) => workspace_id.is_none() || workspace_id == Some(workspace),
+        }
+    }
+
     pub(super) async fn handle_memory(&self, _client_id: &str, action: MemoryAction) -> Value {
         let Some(ref memory) = self.memory else {
             return json!({ "error": "memory_unavailable", "message": "Memory service not configured" });
         };
-        
+
         match action {
             MemoryAction::List { scope } => {
                 let all_memories = memory.list_all().await;
                 let memories: Vec<_> = all_memories.into_iter()
-                    .filter(|m| {
-                        // Apply scope filter
-                        match &scope {
-                            None => true,
-                            Some(s) if s == "global" => m.workspace_id.is_none(),
-                            Some(ws_id) => m.workspace_id.is_none() || m.workspace_id.as_deref() == Some(ws_id),
-                        }
-                    })
+                    .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
                     .map(|m| {
                         // Absent provenance is "unknown" — NOT "stated". A legacy
                         // memory stored before provenance was captured must not be
@@ -214,6 +219,34 @@ impl ControlPlane {
                         info!("Cleared {} memories in scope {}", removed, s);
                         json!({ "status": "cleared", "scope": s, "removed": removed })
                     }
+                }
+            }
+            MemoryAction::Export { scope, format } => {
+                // Rendered here for the same reason as `session.export`: the
+                // store's owner renders once and every client gets that
+                // document. Filtered by the same rule `list` uses.
+                let records: Vec<_> = memory
+                    .export_records()
+                    .await
+                    .into_iter()
+                    .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+                    .collect();
+                match crate::export::export_memories(
+                    &records,
+                    scope.as_deref(),
+                    format,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(document) => json!({
+                        "format": format,
+                        "filename": document.filename,
+                        "content": document.content,
+                        "count": records.len(),
+                    }),
+                    Err(e) => json!({
+                        "error": "export_failed",
+                        "message": format!("Memories could not be exported: {e}"),
+                    }),
                 }
             }
             MemoryAction::Stats => {

@@ -417,6 +417,15 @@ pub enum MemoryAction {
     Stats,
     /// Trigger consolidation
     Consolidate,
+    /// Export memories as a document the user owns. `scope` filters as `List`
+    /// does (None = all, "global" = global-only, a workspace id = global plus
+    /// that workspace). Replies `{format, filename, content, count}`.
+    Export {
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        format: ExportFormat,
+    },
 }
 
 // =============================================================================

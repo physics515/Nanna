@@ -25,6 +25,7 @@ use crate::protocol::ExportFormat;
 use crate::session::{
     EditDiff, MessageRole, Session, SessionMessage, TimelineItem, ToolCallRecord,
 };
+use nanna_memory::MemoryExportRecord;
 
 /// Bumped when the JSON envelope changes incompatibly.
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
@@ -83,12 +84,27 @@ pub fn export_session(
     Ok(document)
 }
 
-/// A filesystem-safe stem from the session name: lowercase ASCII alphanumerics
-/// joined by single dashes, falling back to the id when the name yields nothing
-/// (unnamed, or all punctuation and emoji).
+/// A filesystem-safe stem from the session name, falling back to the id when
+/// the name yields nothing (unnamed, or all punctuation and emoji).
 fn filename_stem(session: &Session) -> String {
+    let stem = slug(session.name.as_deref().unwrap_or_default());
+    if !stem.is_empty() {
+        return stem;
+    }
+    let id: String = session
+        .id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    format!("session-{id}")
+}
+
+/// Lowercase ASCII alphanumerics joined by single dashes, at most
+/// [`FILENAME_STEM_BYTES_MAX`] bytes; empty when `source` has none.
+fn slug(source: &str) -> String {
     let mut stem = String::with_capacity(FILENAME_STEM_BYTES_MAX);
-    for ch in session.name.as_deref().unwrap_or_default().chars() {
+    for ch in source.chars() {
         if stem.len() >= FILENAME_STEM_BYTES_MAX {
             break;
         }
@@ -99,15 +115,6 @@ fn filename_stem(session: &Session) -> String {
         }
     }
     let trimmed = stem.trim_end_matches('-');
-    if trimmed.is_empty() {
-        let id: String = session
-            .id
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .take(8)
-            .collect();
-        return format!("session-{id}");
-    }
     debug_assert!(
         trimmed.len() <= FILENAME_STEM_BYTES_MAX,
         "the stem is bounded"
@@ -119,6 +126,135 @@ fn filename_stem(session: &Session) -> String {
         "the stem is filesystem-safe"
     );
     trimmed.to_string()
+}
+
+/// Longest heading a memory gets in the Markdown export, in chars: a preview,
+/// the full content follows it.
+const MEMORY_HEADING_CHARS_MAX: usize = 72;
+
+#[derive(Serialize)]
+struct MemoryEnvelope<'a> {
+    nanna_export: u32,
+    kind: &'static str,
+    exported_at: String,
+    scope: Option<&'a str>,
+    count: usize,
+    memories: &'a [&'a MemoryExportRecord],
+}
+
+/// Render memory `records` — already filtered to `scope` — as a document.
+///
+/// Records are ordered oldest first with the id as tiebreak, so exporting the
+/// same store twice yields the same document.
+///
+/// # Errors
+/// Only the JSON path can fail, as for [`export_session`].
+pub fn export_memories(
+    records: &[MemoryExportRecord],
+    scope: Option<&str>,
+    format: ExportFormat,
+    exported_at: DateTime<Utc>,
+) -> Result<ExportDocument, serde_json::Error> {
+    let mut ordered: Vec<&MemoryExportRecord> = records.iter().collect();
+    ordered.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+    let stem = scope.map(slug).filter(|s| !s.is_empty()).map_or_else(
+        || "nanna-memories".to_string(),
+        |scope_slug| format!("nanna-memories-{scope_slug}"),
+    );
+    let document = match format {
+        ExportFormat::Markdown => ExportDocument {
+            filename: format!("{stem}.md"),
+            content: render_memories_markdown(&ordered, scope, exported_at),
+        },
+        ExportFormat::Json => {
+            let envelope = MemoryEnvelope {
+                nanna_export: EXPORT_FORMAT_VERSION,
+                kind: "memories",
+                exported_at: exported_at.to_rfc3339(),
+                scope,
+                count: ordered.len(),
+                memories: &ordered,
+            };
+            ExportDocument {
+                filename: format!("{stem}.json"),
+                content: serde_json::to_string_pretty(&envelope)?,
+            }
+        }
+    };
+    debug_assert!(!document.content.is_empty(), "an export always has content");
+    debug_assert!(
+        document.filename.starts_with("nanna-memories"),
+        "the name says what it holds"
+    );
+    Ok(document)
+}
+
+fn render_memories_markdown(
+    records: &[&MemoryExportRecord],
+    scope: Option<&str>,
+    exported_at: DateTime<Utc>,
+) -> String {
+    let mut out = String::from("# Nanna memories\n\n");
+    let scope_text = match scope {
+        None => "every memory".to_string(),
+        Some("global") => "global memories only".to_string(),
+        Some(workspace) => format!("global memories and workspace `{workspace}`"),
+    };
+    let _ = writeln!(out, "- Scope: {scope_text}");
+    let _ = writeln!(out, "- Memories: {}", records.len());
+    let _ = writeln!(out, "- Exported: {} by Nanna", exported_at.to_rfc3339());
+    out.push_str(
+        "- Embedding vectors are not included: they are derived data, recomputed by a re-embed.\n",
+    );
+    for record in records {
+        render_memory(&mut out, record);
+    }
+    debug_assert!(
+        out.starts_with("# Nanna memories"),
+        "the document says what it holds"
+    );
+    out
+}
+
+fn render_memory(out: &mut String, record: &MemoryExportRecord) {
+    let preview: String = one_line(&record.content)
+        .chars()
+        .take(MEMORY_HEADING_CHARS_MAX)
+        .collect();
+    let heading = if preview.is_empty() {
+        record.id.as_str()
+    } else {
+        preview.as_str()
+    };
+    let _ = write!(out, "\n---\n\n### {heading}\n\n");
+    push_prose(out, &record.content, false);
+    let workspace = record
+        .workspace_id
+        .as_deref()
+        .map_or_else(|| "global".to_string(), |w| format!("`{w}`"));
+    let _ = writeln!(out, "- Id: `{}`", record.id);
+    let _ = writeln!(out, "- Provenance: {}", record.fact_type);
+    let _ = writeln!(out, "- Workspace: {workspace}");
+    let _ = writeln!(out, "- Stored: {}", unix_seconds_rfc3339(record.timestamp));
+    let _ = writeln!(
+        out,
+        "- State: {} · importance {:.2} · retrievability {:.2} · weight {:.2}",
+        record.state, record.fsrs.importance, record.retrievability, record.weight
+    );
+    let _ = writeln!(
+        out,
+        "- FSRS: stability {:.2} d · difficulty {:.2} · accessed {}× (last {}) · generation {}",
+        record.fsrs.stability,
+        record.fsrs.difficulty,
+        record.fsrs.access_count,
+        unix_seconds_rfc3339(record.fsrs.last_access),
+        record.fsrs.generation
+    );
+}
+
+/// Unix seconds as RFC 3339, or the raw number when out of chrono's range.
+fn unix_seconds_rfc3339(seconds: i64) -> String {
+    DateTime::from_timestamp(seconds, 0).map_or_else(|| seconds.to_string(), |at| at.to_rfc3339())
 }
 
 fn render_markdown(session: &Session, exported_at: DateTime<Utc>) -> String {
@@ -634,5 +770,114 @@ mod tests {
             document.filename.len(),
             FILENAME_STEM_BYTES_MAX + ".md".len()
         );
+    }
+
+    fn record(
+        id: &str,
+        content: &str,
+        timestamp: i64,
+        workspace: Option<&str>,
+    ) -> MemoryExportRecord {
+        MemoryExportRecord {
+            id: id.to_string(),
+            content: content.to_string(),
+            fact_type: "stated".to_string(),
+            metadata: std::collections::HashMap::new(),
+            timestamp,
+            workspace_id: workspace.map(str::to_string),
+            embedding_model: Some("ollama:nomic-embed-text".to_string()),
+            state: "active".to_string(),
+            weight: 0.9,
+            retrievability: 0.95,
+            fsrs: nanna_memory::FsrsState::default(),
+        }
+    }
+
+    fn memories_markdown(records: &[MemoryExportRecord], scope: Option<&str>) -> String {
+        export_memories(records, scope, ExportFormat::Markdown, at())
+            .expect("markdown export is infallible")
+            .content
+    }
+
+    #[test]
+    fn memory_markdown_lists_each_memory_oldest_first() {
+        let records = [
+            record("b", "prefers tea in the afternoon", 200, Some("ws1")),
+            record("a", "the user prefers dark roast", 100, None),
+        ];
+        let md = memories_markdown(&records, None);
+        assert!(md.starts_with("# Nanna memories\n"), "{md}");
+        assert!(md.contains("- Memories: 2"), "{md}");
+        assert!(md.contains("Embedding vectors are not included"), "{md}");
+        let first = md
+            .find("the user prefers dark roast")
+            .expect("memory a is exported");
+        let second = md
+            .find("prefers tea in the afternoon")
+            .expect("memory b is exported");
+        assert!(first < second, "oldest first:\n{md}");
+        assert!(md.contains("- Provenance: stated"), "{md}");
+        assert!(md.contains("- Workspace: global"), "{md}");
+        assert!(md.contains("- Workspace: `ws1`"), "{md}");
+        assert!(
+            md.contains("- FSRS: stability 1.00 d · difficulty 5.00"),
+            "{md}"
+        );
+    }
+
+    /// The lossless memory export is versioned, says what it holds, and
+    /// carries FSRS state but no embedding vectors.
+    #[test]
+    fn memory_json_is_versioned_and_carries_no_vectors() {
+        let records = [
+            record("a", "x", 100, None),
+            record("b", "y", 200, Some("ws1")),
+        ];
+        let document =
+            export_memories(&records, Some("ws1"), ExportFormat::Json, at()).expect("json export");
+        let value: serde_json::Value = serde_json::from_str(&document.content).expect("valid JSON");
+        assert_eq!(
+            value["nanna_export"],
+            serde_json::json!(EXPORT_FORMAT_VERSION)
+        );
+        assert_eq!(value["kind"], "memories");
+        assert_eq!(value["scope"], "ws1");
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["memories"][0]["id"], "a", "oldest first");
+        assert_eq!(
+            value["memories"][0]["fsrs"]["stability"],
+            serde_json::json!(1.0)
+        );
+        assert!(!document.content.contains("\"embedding\":"), "no vector");
+        assert!(
+            !document.content.contains("\"embeddings\":"),
+            "no vector buckets"
+        );
+    }
+
+    #[test]
+    fn memory_export_filenames_follow_the_scope() {
+        let name = |scope: Option<&str>, format| {
+            export_memories(&[], scope, format, at())
+                .expect("export")
+                .filename
+        };
+        assert_eq!(name(None, ExportFormat::Markdown), "nanna-memories.md");
+        assert_eq!(
+            name(Some("global"), ExportFormat::Json),
+            "nanna-memories-global.json"
+        );
+        assert_eq!(
+            name(Some("../My Workspace"), ExportFormat::Markdown),
+            "nanna-memories-my-workspace.md",
+            "a scope is slugged, never used as a path"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_still_exports_a_document() {
+        let md = memories_markdown(&[], Some("global"));
+        assert!(md.contains("- Memories: 0"), "{md}");
+        assert!(md.contains("- Scope: global memories only"), "{md}");
     }
 }

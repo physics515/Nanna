@@ -1802,6 +1802,37 @@ impl MemoryService {
         }).collect()
     }
 
+    /// Every memory as an export record: content, provenance, workspace, the
+    /// raw FSRS state and the state derived from it — and NO embedding
+    /// vectors. Vectors are derived data a re-embed recomputes, and they are
+    /// most of an entry's bytes, so an export that carried them would be mostly
+    /// floats nobody can read. Projected under the store's read lock, so the
+    /// vectors are never cloned either.
+    pub async fn export_records(&self) -> Vec<MemoryExportRecord> {
+        let params = &self.config.fsrs;
+        self.store
+            .map_entries(|e| MemoryExportRecord {
+                id: e.id.clone(),
+                content: e.content.clone(),
+                // Absent provenance is "unknown", never "stated" — the rule the
+                // daemon's memory list already applies.
+                fact_type: e
+                    .metadata
+                    .get("fact_type")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metadata: e.metadata.clone(),
+                timestamp: e.timestamp,
+                workspace_id: e.workspace_id.clone(),
+                embedding_model: e.embedding_model.clone(),
+                state: format!("{:?}", e.fsrs.state(params)).to_lowercase(),
+                weight: e.fsrs.weight(params),
+                retrievability: e.fsrs.retrievability(params),
+                fsrs: e.fsrs.clone(),
+            })
+            .await
+    }
+
     /// Get a single memory by ID
     pub async fn get(&self, id: &str) -> Option<MemoryListEntry> {
         let entry = self.store.get(id).await?;
@@ -2643,6 +2674,34 @@ pub struct MemoryStats {
     pub unavailable: usize,
 }
 
+/// One memory as `nanna export --memories` writes it.
+///
+/// Everything a person, or a re-import, needs — and none of the embedding
+/// vectors, which are derived data a re-embed recomputes (see
+/// [`MemoryService::export_records`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryExportRecord {
+    pub id: String,
+    pub content: String,
+    /// Provenance: `stated` (the user said it), `observed`, …, or `unknown`
+    /// when none was recorded — never a guess of `stated`.
+    pub fact_type: String,
+    pub metadata: HashMap<String, String>,
+    /// Unix seconds when the memory was stored.
+    pub timestamp: i64,
+    /// `None` = a global memory.
+    pub workspace_id: Option<String>,
+    /// Which model produced the active embedding, named so a re-import knows
+    /// what to re-embed with. The vector itself is not exported.
+    pub embedding_model: Option<String>,
+    /// Derived from `fsrs` at export time: `active`, `dormant`, `silent`, …
+    pub state: String,
+    pub weight: f32,
+    pub retrievability: f32,
+    /// The raw FSRS-6 state, so nothing about the memory's schedule is lost.
+    pub fsrs: FsrsState,
+}
+
 /// Memory entry for listing (includes computed FSRS state)
 #[derive(Debug, Clone)]
 pub struct MemoryListEntry {
@@ -3330,6 +3389,33 @@ mod tests {
         assert!(service.get("b").await.is_some(), "source b survives");
     }
 
+
+    /// Export carries content, provenance and FSRS state — and no vectors,
+    /// which are derived data and most of an entry's bytes.
+    #[tokio::test]
+    async fn export_records_carry_state_but_no_vectors() {
+        let (service, entry) = enrichment_fixture("the user prefers dark roast").await;
+        let records = service.export_records().await;
+        assert_eq!(records.len(), 1, "one record per memory");
+        let record = &records[0];
+        assert_eq!(record.id, entry.id);
+        assert_eq!(record.content, "the user prefers dark roast");
+        assert_eq!(
+            record.fact_type, "unknown",
+            "absent provenance is unknown, never stated"
+        );
+        assert!(record.retrievability > 0.0, "derived at export time");
+        assert!(record.retrievability <= 1.0, "a probability");
+        let json = serde_json::to_string(record).expect("a record serializes");
+        assert!(
+            !json.contains("\"embedding\":"),
+            "no vector in the export: {json}"
+        );
+        assert!(
+            !json.contains("\"embeddings\":"),
+            "no vector buckets either: {json}"
+        );
+    }
 
     /// A fixture for the enrichment path: `(service, seeded entry)` with a
     /// constant embedder, so the tests below differ only in what the

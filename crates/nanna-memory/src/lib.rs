@@ -48,7 +48,7 @@ pub use fsrs::{
 pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
     MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
-    MemoryStats, MemoryListEntry, ConsolidationBands,
+    MemoryStats, MemoryListEntry, MemoryExportRecord, ConsolidationBands,
     // Exported so the episodic writer chunks against the same bound the merge
     // path caps against. Those two numbers drifting apart is precisely how a
     // 4096-byte ceiling ended up silently rejecting 3200-char chunks.
@@ -1297,6 +1297,20 @@ impl VectorStore {
     /// Get all entries (for consolidation)
     pub async fn all_entries(&self) -> Vec<MemoryEntry> {
         self.entries.read().await.clone()
+    }
+
+    /// Project every entry through `project` under one read lock, without
+    /// cloning the entries themselves.
+    ///
+    /// [`Self::all_entries`] clones every vector in every model bucket — for
+    /// an export that wants content and FSRS state, that is the dominant cost
+    /// for nothing (a 1536-dim bucket is 6 KiB per memory per model). One
+    /// output per entry, so the result is bounded by the store.
+    pub async fn map_entries<T>(&self, project: impl Fn(&MemoryEntry) -> T) -> Vec<T> {
+        let entries = self.entries.read().await;
+        let projected: Vec<T> = entries.iter().map(project).collect();
+        debug_assert_eq!(projected.len(), entries.len(), "one output per entry");
+        projected
     }
 
     /// Get total number of entries

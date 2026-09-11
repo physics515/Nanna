@@ -113,10 +113,25 @@ enum Commands {
         limit: i64,
     },
 
-    /// Export a session as Markdown (a readable transcript) or JSON (lossless)
+    /// Export a session — or, with `--memories`, the memory store — as
+    /// Markdown (readable) or JSON (lossless)
+    //
+    // Exactly one target, enforced by a group: `requires = "memories"` on
+    // `--scope` was satisfied by the bool flag's implicit `false` default, so
+    // `nanna export <id> --scope x` parsed and silently ignored the scope.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["session", "memories"])))]
     Export {
-        /// Session ID (see `nanna sessions`)
-        session: String,
+        /// Session ID (see `nanna sessions`); omit it with --memories
+        session: Option<String>,
+
+        /// Export the memory store instead of a session
+        #[arg(long)]
+        memories: bool,
+
+        /// With --memories: `global`, or a workspace id (global plus that
+        /// workspace). Every memory when omitted.
+        #[arg(long, conflicts_with = "session")]
+        scope: Option<String>,
 
         /// Document format
         #[arg(short, long, value_enum, default_value_t = commands::export::ExportFormatArg::Markdown)]
@@ -382,10 +397,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Export {
             session,
+            memories,
+            scope,
             format,
             output,
         }) => {
-            commands::export::export_session(&session, format, output).await?;
+            // clap already requires exactly one of the two; say so rather than
+            // guess if that ever stops being true.
+            let target = match (session, memories) {
+                (Some(id), false) => commands::export::ExportTarget::Session(id),
+                (None, true) => commands::export::ExportTarget::Memories { scope },
+                _ => anyhow::bail!("name one session to export, or pass --memories"),
+            };
+            commands::export::export(target, format, output).await?;
             return Ok(());
         }
         Some(Commands::Sessions { limit }) => {
@@ -445,10 +469,13 @@ mod tests {
         match cli.command {
             Some(Commands::Export {
                 session,
+                memories,
                 format,
                 output,
+                ..
             }) => {
-                assert_eq!(session, "abc123");
+                assert_eq!(session.as_deref(), Some("abc123"));
+                assert!(!memories, "a session export is not a memory export");
                 assert_eq!(
                     format,
                     commands::export::ExportFormatArg::Markdown,
@@ -470,5 +497,36 @@ mod tests {
             }
             _ => panic!("expected the export command"),
         }
+    }
+
+    #[test]
+    fn export_memories_takes_a_scope_and_no_session() {
+        let cli = Cli::try_parse_from(["nanna", "export", "--memories", "--scope", "ws1"])
+            .expect("`nanna export --memories` parses");
+        match cli.command {
+            Some(Commands::Export {
+                session,
+                memories,
+                scope,
+                ..
+            }) => {
+                assert!(memories);
+                assert_eq!(session, None);
+                assert_eq!(scope.as_deref(), Some("ws1"));
+            }
+            _ => panic!("expected the export command"),
+        }
+        assert!(
+            Cli::try_parse_from(["nanna", "export", "abc123", "--memories"]).is_err(),
+            "a session id and --memories are one or the other"
+        );
+        assert!(
+            Cli::try_parse_from(["nanna", "export", "abc123", "--scope", "ws1"]).is_err(),
+            "--scope only means something with --memories"
+        );
+        assert!(
+            Cli::try_parse_from(["nanna", "export"]).is_err(),
+            "exporting nothing is refused"
+        );
     }
 }

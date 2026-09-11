@@ -1,8 +1,10 @@
-//! `nanna export` — write a session out as Markdown or JSON.
+//! `nanna export` — write a session, or the memory store, out as Markdown or
+//! JSON.
 //!
-//! Goes through the daemon: it owns the session database (turso holds an
-//! exclusive lock on it) and renders the document itself (`session.export`),
-//! so the file is exactly what any other client would get.
+//! Goes through the daemon: it owns the session database and the memory store
+//! (turso holds an exclusive lock on them) and renders the document itself
+//! (`session.export` / `memory.export`), so the file is exactly what any other
+//! client would get.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,7 +25,7 @@ pub enum ExportFormatArg {
     /// A readable transcript
     #[value(alias = "md")]
     Markdown,
-    /// The whole session as stored — lossless
+    /// The whole record as stored — lossless
     Json,
 }
 
@@ -36,49 +38,83 @@ impl From<ExportFormatArg> for ExportFormat {
     }
 }
 
-/// Export `session_id` to `output` — a file, or a directory that receives the
+/// What to export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportTarget {
+    /// One session, by id.
+    Session(String),
+    /// The memory store; `scope` filters as `memory.list` does.
+    Memories { scope: Option<String> },
+}
+
+impl ExportTarget {
+    fn describe(&self) -> String {
+        match self {
+            Self::Session(id) => format!("session {id}"),
+            Self::Memories { scope: None } => "every memory".to_string(),
+            Self::Memories { scope: Some(scope) } => format!("memories in scope {scope}"),
+        }
+    }
+}
+
+/// Export `target` to `output` — a file, or a directory that receives the
 /// daemon's suggested file name — or to stdout when `output` is `None`.
-pub async fn export_session(
-    session_id: &str,
+pub async fn export(
+    target: ExportTarget,
     format: ExportFormatArg,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
-    let connect = Client::connect(ClientConfig::new(&address));
-    let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(client)) => client,
-        Ok(Err(e)) => bail!(
-            "could not reach the Nanna daemon at {address}: {e}. Start it with \
-             `nanna daemon start` — it owns the session database, so export goes through it"
-        ),
-        Err(_) => bail!(
-            "the Nanna daemon at {address} did not answer within {}s. Start it with \
-             `nanna daemon start`",
-            CONNECT_TIMEOUT.as_secs()
-        ),
-    };
-    let reply = client
-        .sessions()
-        .export(session_id, format.into())
-        .await
-        .context("the daemon did not answer the export request")?;
+    let client = connect().await?;
+    let reply = match &target {
+        ExportTarget::Session(id) => client.sessions().export(id, format.into()).await,
+        ExportTarget::Memories { scope } => {
+            client.memory().export(scope.clone(), format.into()).await
+        }
+    }
+    .context("the daemon did not answer the export request")?;
     client.disconnect().await;
 
     let (filename, content) = document_from_reply(&reply)?;
     match output {
         None => print!("{content}"),
         Some(path) => {
-            let target = resolve_target(&path, filename);
-            std::fs::write(&target, content)
-                .with_context(|| format!("could not write {}", target.display()))?;
-            eprintln!("Exported session {session_id} to {}", target.display());
+            let target_path = resolve_target(&path, filename);
+            std::fs::write(&target_path, content)
+                .with_context(|| format!("could not write {}", target_path.display()))?;
+            eprintln!(
+                "Exported {} to {}",
+                target.describe(),
+                target_path.display()
+            );
         }
     }
     Ok(())
 }
 
+async fn connect() -> anyhow::Result<Client> {
+    let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        Client::connect(ClientConfig::new(&address)),
+    )
+    .await
+    {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(e)) => bail!(
+            "could not reach the Nanna daemon at {address}: {e}. Start it with \
+             `nanna daemon start` — it owns the data, so export goes through it"
+        ),
+        Err(_) => bail!(
+            "the Nanna daemon at {address} did not answer within {}s. Start it with \
+             `nanna daemon start`",
+            CONNECT_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 /// Pull the document out of the daemon's reply. An `{error, message}` reply is
-/// the daemon saying no — an unknown id — and becomes the command's error.
+/// the daemon saying no — an unknown id, or memory switched off — and becomes
+/// the command's error.
 fn document_from_reply(reply: &Value) -> anyhow::Result<(&str, &str)> {
     if let Some(error) = reply.get("error").and_then(Value::as_str) {
         let message = reply
@@ -107,7 +143,7 @@ fn resolve_target(path: &Path, filename: &str) -> PathBuf {
     }
     let name = Path::new(filename)
         .file_name()
-        .map_or_else(|| "session-export".into(), std::ffi::OsStr::to_os_string);
+        .map_or_else(|| "nanna-export".into(), std::ffi::OsStr::to_os_string);
     path.join(name)
 }
 
@@ -155,6 +191,22 @@ mod tests {
         assert_eq!(
             ExportFormat::from(ExportFormatArg::Json),
             ExportFormat::Json
+        );
+    }
+
+    #[test]
+    fn a_target_describes_itself_for_the_confirmation_line() {
+        assert_eq!(ExportTarget::Session("s1".into()).describe(), "session s1");
+        assert_eq!(
+            ExportTarget::Memories { scope: None }.describe(),
+            "every memory"
+        );
+        assert_eq!(
+            ExportTarget::Memories {
+                scope: Some("global".into())
+            }
+            .describe(),
+            "memories in scope global"
         );
     }
 }

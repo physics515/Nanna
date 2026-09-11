@@ -99,9 +99,11 @@ outbound calls beyond whatever you implicitly ask for (e.g. `web_fetch`).
 
 To take a conversation with you, `nanna export <session-id>` writes it out as a
 readable Markdown transcript, or with `--format json` as the complete stored
-session (lossless); `nanna sessions` lists the ids. Export runs through the
-daemon, so start it first (`nanna daemon start`). A GUI export button is still
-open; the Turso database files remain the full-fidelity backup.
+session (lossless); `nanna sessions` lists the ids. `nanna export --memories`
+exports what Nanna remembers about you — each memory's text, where it came from,
+and its FSRS state (`--scope global` or a workspace id narrows it). Export runs
+through the daemon, so start it first (`nanna daemon start`). A GUI export
+button is still open; the Turso database files remain the full-fidelity backup.
 
 ## Channels and third parties
 
