@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use tracing::{debug, error, info, warn};
 
 /// Client configuration
@@ -107,7 +110,14 @@ impl Client {
     }
     
     async fn do_connect(config: &ClientConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        let connect_future = connect_async(&config.url);
+        // Read with the same limits the daemon reads with. tungstenite's
+        // default is a 16 MiB frame, and the daemon's large replies — a whole
+        // session's history, a full run state, an export — exceed it: a bare
+        // `connect_async` dropped them as `Connection("Disconnected")`.
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(nanna_daemon::ipc::IPC_MAX_MESSAGE_BYTES);
+        ws_config.max_frame_size = Some(nanna_daemon::ipc::IPC_MAX_MESSAGE_BYTES);
+        let connect_future = connect_async_with_config(&config.url, Some(ws_config), false);
         
         match tokio::time::timeout(config.connect_timeout, connect_future).await {
             Ok(Ok((ws, _))) => Ok(ws),

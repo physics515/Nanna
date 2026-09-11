@@ -105,6 +105,86 @@ fn no_rust_source_hardcodes_the_daemon_ws_url() {
     );
 }
 
+/// The IPC read limit has one definition too, and every client applies it.
+///
+/// A WebSocket read limit protects only the side that sets it. The daemon
+/// raised its own to 128 MB after long sessions overflowed tungstenite's
+/// 16 MiB frame default, the GUI copied the number beside a comment saying it
+/// "must match", and `nanna-client` never set one — so every large reply the
+/// daemon sent to the CLI could still drop the connection. Found 2026-09-11.
+#[test]
+fn the_ipc_message_limit_has_one_definition_and_the_client_applies_it() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    rust_sources(&root, &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk is not reaching the sources it guards"
+    );
+
+    // The drift's shape, not its number: a WebSocket read limit set from
+    // anything but the shared constant, or a local copy of it. (Matching on
+    // `128 * 1024 * 1024` itself also caught the embedded Python interpreter's
+    // unrelated 128 MiB stack floor.)
+    let mut offenders = Vec::new();
+    let mut limit_sites = 0_usize;
+    for file in &files {
+        if file.ends_with("bind.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                continue;
+            }
+            let sets_limit = line.contains("max_message_size") || line.contains("max_frame_size");
+            let uses_shared = line.contains("IPC_MAX_MESSAGE_BYTES");
+            let local_copy = trimmed.contains("const ")
+                && ["MESSAGE_SIZE", "FRAME_SIZE", "MESSAGE_BYTES"]
+                    .iter()
+                    .any(|name| line.contains(name));
+            limit_sites += usize::from(sets_limit && uses_shared);
+            if (sets_limit && !uses_shared) || local_copy {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(&root).unwrap_or(file).display(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the IPC message limit is set or copied instead of using \
+         `nanna_config::bind::IPC_MAX_MESSAGE_BYTES`:\n  {}",
+        offenders.join("\n  ")
+    );
+    // Positive space: the daemon's accept, nanna-client's connect and the
+    // GUI's daemon_client each set both limits — or the guard reaches nothing.
+    assert!(
+        limit_sites >= 6,
+        "expected the three IPC endpoints to set both limits from the shared \
+         constant; found {limit_sites} such lines"
+    );
+
+    // The client must pass an explicit config: a bare `connect_async` reads
+    // with tungstenite's 16 MiB frame default, which is the bug itself.
+    let client = std::fs::read_to_string(root.join("crates/nanna-client/src/connection.rs"))
+        .expect("nanna-client's connection module exists");
+    assert!(
+        client.contains("connect_async_with_config"),
+        "nanna-client must connect with an explicit WebSocketConfig"
+    );
+    assert!(
+        !client.contains("connect_async(&"),
+        "nanna-client still has a bare connect_async call, which reads with the 16 MiB default"
+    );
+}
+
 #[test]
 fn the_url_helper_agrees_with_its_parts() {
     let url = nanna_config::default_daemon_ws_url();

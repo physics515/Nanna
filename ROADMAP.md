@@ -1903,6 +1903,20 @@ tests, **superseded by P16** (which deleted embedded mode), or **handed to its o
 Kept as a compact ledger; the full dated rationale and `file:line` anchors for each fix live in its commit.
 
 **Security (all done):**
+- [x] **`nanna-client` could not read a daemon reply over 16 MiB** *(found and fixed
+      2026-09-11, while sizing `session.export`)* — a WebSocket read limit protects only the
+      side that sets it. The daemon raised its OWN read limit to 128 MiB after long sessions
+      overflowed tungstenite's 16 MiB frame default; the GUI copied the number beside a
+      comment saying it "must match"; `nanna-client` connected with a bare `connect_async`,
+      so every large reply the daemon SENT the CLI — a whole-session `history`, a full run
+      state, an export — dropped the connection. **Reproduced before fixing:** a session
+      whose name is 20 MiB makes the `create` reply that large, and the new e2e test failed
+      with `Connection("Disconnected")`. One definition now,
+      `nanna_config::bind::IPC_MAX_MESSAGE_BYTES` (in `nanna-config` because the GUI cannot
+      see `nanna-daemon` — the `DEFAULT_IPC_PORT` precedent), applied by the daemon's accept,
+      `nanna-client`'s connect and the GUI's `daemon_client`. The port guard test grew a
+      sibling that fails on any second definition of the value and on a bare
+      `connect_async` in `nanna-client`.
 - [x] User-tool path traversal — `validate_tool_name` at the `create_tool` chokepoint (daemon + GUI). *(2026-07-06)*
 - [x] Workspace file traversal — `validate_context_filename` guards `save_context_file`. *(2026-07-06)*
 - [x] Discord webhook Ed25519 + Slack webhook HMAC-SHA256 verification (constant-time, replay-guarded). *(2026-07-07)*

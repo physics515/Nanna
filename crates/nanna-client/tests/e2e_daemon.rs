@@ -236,6 +236,39 @@ async fn created_session_is_visible_to_the_client() {
     daemon.stop();
 }
 
+/// A reply larger than tungstenite's default 16 MiB frame must reach the
+/// client. The daemon raised its OWN read limit to 128 MB because long
+/// sessions exceeded the default and dropped the connection — but a read
+/// limit protects only the side that applies it, and every large reply the
+/// daemon SENDS (a whole-session `history`, a full run state, an export) is
+/// read by this client. A session whose name is 20 MiB makes the `create`
+/// reply that large, deterministically, with no model involved.
+#[tokio::test]
+async fn a_reply_over_the_default_frame_limit_reaches_the_client() {
+    const REPLY_BYTES: usize = 20 * 1024 * 1024;
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let huge_name = "n".repeat(REPLY_BYTES);
+    let created = client
+        .sessions()
+        .create(Some(huge_name.clone()))
+        .await
+        .expect("a 20 MiB reply must be readable, not a dropped connection");
+    assert_eq!(
+        created["session"]["name"].as_str().map(str::len),
+        Some(REPLY_BYTES),
+        "the whole reply arrived"
+    );
+    assert!(
+        client.is_connected().await,
+        "and the connection survived it"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// Export end to end: the daemon — the session store's owner — renders the
 /// document and hands it over the real protocol, in both formats, and an
 /// unknown id is refused rather than exported as an empty document.

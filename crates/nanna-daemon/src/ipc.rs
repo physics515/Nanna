@@ -12,10 +12,9 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
 use tracing::{debug, error, info, warn};
 
-/// Maximum WebSocket message size (128 MB).
-/// Sessions with large tool outputs or long histories can exceed the
-/// default 16 MB tungstenite limit, crashing the connection.
-const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+/// The IPC read limit, shared with every client — see its definition for why
+/// a limit set on one end only ever protected that end.
+pub use nanna_config::bind::IPC_MAX_MESSAGE_BYTES;
 
 /// Server-initiated keepalive ping cadence. A live client answers with a pong
 /// (an incoming frame), which resets the read deadline below.
@@ -244,8 +243,8 @@ impl IpcServer {
         addr: SocketAddr,
     ) {
         let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
-        ws_config.max_frame_size = Some(WS_MAX_MESSAGE_SIZE);
+        ws_config.max_message_size = Some(IPC_MAX_MESSAGE_BYTES);
+        ws_config.max_frame_size = Some(IPC_MAX_MESSAGE_BYTES);
         let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
             Ok(ws) => ws,
             Err(e) => {
