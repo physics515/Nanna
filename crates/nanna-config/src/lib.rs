@@ -4,6 +4,13 @@
 //! Configuration management for Nanna
 
 pub mod credentials;
+/// Local on-device inference config (`[infer]`) and the boot-time decisions
+/// derived from it.
+pub mod infer;
+pub use infer::{
+    DEFAULT_LOCAL_EMBEDDING_MODEL, InferConfig, InferDevice, InferPrecision, LocalPlan,
+    PrecisionReason, ResolvedPrecision,
+};
 pub mod bind;
 
 /// Canonical application identity for [`directories::ProjectDirs`].
@@ -34,7 +41,7 @@ pub fn legacy_clawd_project_dirs() -> Option<ProjectDirs> {
 }
 
 
-pub use bind::{LOOPBACK_HOST, is_loopback_host};
+pub use bind::{DEFAULT_IPC_PORT, LOOPBACK_HOST, default_daemon_ws_url, is_loopback_host};
 pub use credentials::{
     ClaudeCredentialManager, CredentialError, CredentialSource, LoadedCredential, OAuthCredential,
     SecureStore, resolve_anthropic_oauth,
@@ -82,6 +89,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// Background scheduler settings (heartbeat + cron runner)
     pub scheduler: SchedulerConfig,
+    /// Local (on-device) inference settings — the Mummu runner.
+    pub infer: InferConfig,
 }
 
 
@@ -150,6 +159,22 @@ pub struct LlmConfig {
     /// Empty = sub-agents use the main chat list (`model_priority`).
     /// Format: ["ollama/qwen3:4b", "claude-haiku-3-5"]
     pub sub_agent_models: Vec<String>,
+    /// Anthropic prompt-cache lifetime: `"5m"` (default) or `"1h"`. A 1-hour cache write
+    /// costs 2x input instead of 1.25x and pays only when requests sharing a prompt start
+    /// 5-60 minutes apart (heartbeats, cron, a reply after a break). Applies to every
+    /// cache breakpoint of a request.
+    pub prompt_cache_ttl: PromptCacheTtl,
+}
+
+/// `[llm] prompt_cache_ttl` — the two lifetimes Anthropic's prompt cache offers. Any other
+/// value fails config parsing with an error naming the two accepted spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PromptCacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
 }
 
 impl LlmConfig {
@@ -220,6 +245,7 @@ impl Default for LlmConfig {
             routing_first_turn_primary: true,
             sub_agent_model: None, // Legacy — see sub_agent_models
             sub_agent_models: vec![], // Empty = fall back to model_priority
+            prompt_cache_ttl: PromptCacheTtl::FiveMinutes, // the API default
         }
     }
 }
@@ -295,7 +321,15 @@ impl Default for AgentConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub enabled: bool,
-    pub host: String,
+    // NOTE: `host` was removed 2026-09-11. Nothing ever read it — `nanna
+    // server` binds its `--host` flag (default loopback) — so it was a field
+    // shaped exactly like a security control that controlled nothing: setting
+    // it to 127.0.0.1 secured nothing, and its shipped `0.0.0.0` default read
+    // as an exposure that never happened. Deleted rather than wired, because
+    // wiring it under that default would have exposed an unauthenticated HTTP
+    // surface. Existing config.toml files still carrying `host = …` load
+    // unchanged (no `#[serde(deny_unknown_fields)]`, so serde ignores the stale
+    // key). Covered by `legacy_server_host_key_still_loads`.
     pub port: u16,
     pub webhook_secret: Option<String>,
 }
@@ -304,7 +338,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: "0.0.0.0".to_string(),
             port: 3000,
             webhook_secret: None,
         }
@@ -1107,6 +1140,35 @@ streaming_enabled = true
     }
 
     #[test]
+    fn legacy_server_host_key_still_loads() {
+        // `[server].host` was removed 2026-09-11: nothing ever read it (the
+        // bind is `nanna server --host`, default loopback). Every config ever
+        // written from the old defaults carries `host = "0.0.0.0"` on disk,
+        // and a config that refuses to parse is a dead app — so the stale key
+        // must be ignored, and the keys beside it must still land.
+        let legacy = r#"
+[server]
+enabled = true
+host = "0.0.0.0"
+port = 4100
+webhook_secret = "s3cret"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.server.port, 4100, "the keys beside it still land");
+        assert_eq!(config.server.webhook_secret.as_deref(), Some("s3cret"));
+
+        // And it is gone for good: a config written from today's defaults no
+        // longer carries a key that looks like it controls the bind.
+        let written = toml::to_string(&Config::default()).expect("default config serializes");
+        let server = written
+            .split("[server]")
+            .nth(1)
+            .expect("the default config writes a [server] table");
+        let server = server.split("\n[").next().unwrap_or_default();
+        assert!(!server.contains("host"), "no host key is written: {server}");
+    }
+
+    #[test]
     fn project_dirs_uses_canonical_identity() {
         let dirs = project_dirs().expect("home dir");
         let cfg = dirs.config_dir().to_string_lossy().to_lowercase();
@@ -1215,5 +1277,34 @@ streaming_enabled = true
         assert!(!has_date_suffix("claude-opus-4-1"));
         assert!(!has_date_suffix("ollama/qwen3:14b"));
         assert!(!has_date_suffix("nodashes"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_ttl_tests {
+    use super::{Config, PromptCacheTtl};
+
+    #[test]
+    fn prompt_cache_ttl_defaults_to_five_minutes_and_accepts_one_hour() {
+        let absent: Config = toml::from_str("[llm]\nmodel = \"claude-sonnet-5\"\n")
+            .expect("a config without the key must load");
+        assert_eq!(absent.llm.prompt_cache_ttl, PromptCacheTtl::FiveMinutes);
+
+        let hour: Config = toml::from_str("[llm]\nprompt_cache_ttl = \"1h\"\n")
+            .expect("\"1h\" is an accepted spelling");
+        assert_eq!(hour.llm.prompt_cache_ttl, PromptCacheTtl::OneHour);
+    }
+
+    #[test]
+    fn an_unknown_prompt_cache_ttl_is_rejected_by_name() {
+        let error = toml::from_str::<Config>("[llm]\nprompt_cache_ttl = \"2h\"\n")
+            .expect_err("only the two lifetimes Anthropic offers are accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains("2h"),
+            "the error names the bad value: {message}"
+        );
+        assert!(message.contains("5m"), "and the accepted ones: {message}");
+        assert!(message.contains("1h"), "and the accepted ones: {message}");
     }
 }

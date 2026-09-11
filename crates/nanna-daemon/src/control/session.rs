@@ -7,6 +7,30 @@ impl ControlPlane {
     // Session Handlers
     // =========================================================================
     
+    /// Tell every connected client about a session lifecycle change.
+    ///
+    /// These events were declared in the protocol and never sent, so a session
+    /// renamed or deleted by one client (the CLI, a second window) never reached the
+    /// others. Best-effort like every broadcast here: no receivers is not an error.
+    fn notify_session_event(&self, event: Event) {
+        debug_assert!(
+            event.session_id().is_some(),
+            "a lifecycle event names its session"
+        );
+        debug_assert!(
+            matches!(
+                event,
+                Event::SessionCreated { .. }
+                    | Event::SessionDeleted { .. }
+                    | Event::SessionRenamed { .. }
+            ),
+            "only session lifecycle events go through here"
+        );
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event);
+        }
+    }
+
     pub(super) async fn handle_session(&self, client_id: &str, action: SessionAction) -> Value {
         match action {
             SessionAction::List => {
@@ -33,15 +57,27 @@ impl ControlPlane {
                 let session = self.sessions.create(name).await;
                 // Auto-subscribe the creating client
                 self.sessions.subscribe(&session.id, client_id.to_string()).await;
+                self.notify_session_event(Event::SessionCreated {
+                    id: session.id.clone(),
+                    name: session.name.clone(),
+                });
                 json!({ "session": session })
             }
             SessionAction::CreateInWorkspace { name, workspace_id } => {
                 let session = self.sessions.create_in_workspace(name, workspace_id).await;
                 self.sessions.subscribe(&session.id, client_id.to_string()).await;
+                self.notify_session_event(Event::SessionCreated {
+                    id: session.id.clone(),
+                    name: session.name.clone(),
+                });
                 json!({ "session": session })
             }
             SessionAction::Rename { id, name } => {
                 if self.sessions.rename(&id, name.clone()).await {
+                    self.notify_session_event(Event::SessionRenamed {
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
                     json!({ "status": "renamed", "id": id, "name": name })
                 } else {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
@@ -49,13 +85,21 @@ impl ControlPlane {
             }
             SessionAction::Delete { id } => {
                 if self.sessions.delete(&id).await {
+                    self.notify_session_event(Event::SessionDeleted { id: id.clone() });
                     json!({ "status": "deleted", "id": id })
                 } else {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
                 }
             }
             SessionAction::DeleteAll => {
+                // The store reports only a count, so read the ids first. A session created in
+                // the gap between the two calls is deleted without an event; clients re-fetch
+                // the list on any deletion, so the window costs one stale row at most.
+                let ids: Vec<crate::SessionId> = self.sessions.list().await.into_iter().map(|s| s.id).collect();
                 let count = self.sessions.delete_all().await;
+                for id in ids {
+                    self.notify_session_event(Event::SessionDeleted { id });
+                }
                 json!({ "status": "deleted", "count": count })
             }
             SessionAction::Clear { id } => {
@@ -81,6 +125,25 @@ impl ControlPlane {
                     json!({ "messages": messages })
                 } else {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
+                }
+            }
+            SessionAction::Export { id, format } => {
+                // Rendered here, by the store's owner, so every client — the
+                // CLI's `nanna export` today, a GUI button later — gets the
+                // same document instead of re-deriving the transcript.
+                let Some(session) = self.sessions.get(&id).await else {
+                    return json!({ "error": "not_found", "message": format!("Session {} not found", id) });
+                };
+                match crate::export::export_session(&session, format, chrono::Utc::now()) {
+                    Ok(document) => json!({
+                        "format": format,
+                        "filename": document.filename,
+                        "content": document.content,
+                    }),
+                    Err(e) => json!({
+                        "error": "export_failed",
+                        "message": format!("Session {id} could not be exported: {e}"),
+                    }),
                 }
             }
             SessionAction::Switch { id } => {

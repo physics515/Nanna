@@ -1479,17 +1479,37 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<(Vec<RecallResult>, crate::SearchCoverage), MemoryError> {
+        let report = self.recall_scoped_with_report(query, workspace_id).await?;
+        Ok((report.results, report.coverage))
+    }
+
+    /// [`Self::recall_scoped_with_coverage`], plus how long each stage took.
+    ///
+    /// Retrieval latency is per stage, and the stages are not alike: the query
+    /// embedding is a model call — a provider round-trip, or local inference —
+    /// while the search is an in-RAM scan. A single number named "search" hid
+    /// the half that usually dominates: a 4 ms scan behind a 400 ms embed is a
+    /// 404 ms recall.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured, or if
+    /// embedding the query fails.
+    pub async fn recall_scoped_with_report(
+        &self,
+        query: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<RecallReport, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
-        let store_count = self.store.len().await;
-        info!("Recall (scoped {:?}): generating embedding for query (store has {} entries)", 
-              workspace_id, store_count);
-
+        let embed_started = std::time::Instant::now();
         let query_embedding = (embed_fn)(query)
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-        
-        info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
+        let embed = embed_started.elapsed();
+        // Everything from here to the answer is the search stage: the row
+        // scan, the chunk scan, scoring and assembly.
+        let search_started = std::time::Instant::now();
 
         // Scoped search
         let (results, coverage) = self
@@ -1524,6 +1544,62 @@ impl MemoryService {
             )
             .await;
 
+        let filtered = self
+            .rank_and_assemble(results, &chunk_hits, workspace_id, min_score)
+            .await;
+
+        let timings = RecallTimings {
+            embed,
+            search: search_started.elapsed(),
+        };
+        // One line per recall, both stages named — it replaces the two
+        // "generating embedding" / "searching" lines that bracketed the embed
+        // without ever saying how long either half took.
+        info!(
+            "Recall (scoped {:?}) '{}': embed {} ms, search {} ms, {} results from {} memories",
+            workspace_id,
+            truncate(query, 30),
+            timings.embed_ms(),
+            timings.search_ms(),
+            filtered.len(),
+            coverage.total
+        );
+        // An answer of nothing, given from a scan that could not read most of
+        // the store, is worth a WARN even when the caller discards the
+        // coverage: it is the shape of the blackout, not of a miss.
+        if filtered.is_empty() && !coverage.is_complete() {
+            warn!(
+                "Recall '{}' answered empty from an incomplete scan: {} of {} memories \
+                 were comparable (query width matches binding: {})",
+                truncate(query, 30),
+                coverage.comparable,
+                coverage.total,
+                coverage.query_width_matches
+            );
+        }
+        Ok(RecallReport {
+            results: filtered,
+            coverage,
+            timings,
+        })
+    }
+
+    /// Rank one recall's candidates and assemble its answer.
+    ///
+    /// A row hit is admitted on the better of its row and chunk similarity;
+    /// memories only their chunks matched are added; the rest is ordered by
+    /// rank, cut at the weight floor and `max_results`, and every memory
+    /// returned gets its testing-effect review queued. Split out of
+    /// [`Self::recall_scoped_with_report`] so the stage timing there did not
+    /// push one function past the length limit.
+    async fn rank_and_assemble(
+        &self,
+        results: Vec<(MemoryEntry, f32)>,
+        chunk_hits: &HashMap<String, crate::chunk_rank::ChunkHit>,
+        workspace_id: Option<&str>,
+        min_score: f32,
+    ) -> Vec<RecallResult> {
+        debug_assert!(min_score.is_finite(), "a similarity floor is a number");
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
@@ -1552,7 +1628,7 @@ impl MemoryService {
         // clear the top-k cut. These are the ones chunking is FOR: without
         // this pass, splitting a memory would improve nothing, because the
         // row-level search would still be the only way in.
-        for (id, hit) in &chunk_hits {
+        for (id, hit) in chunk_hits {
             if seen.contains(id) {
                 continue;
             }
@@ -1596,21 +1672,11 @@ impl MemoryService {
             self.pending_updates.write().await.extend(updates);
         }
 
-        debug!("Recall (scoped) '{}' found {} results", truncate(query, 30), filtered.len());
-        // An answer of nothing, given from a scan that could not read most of
-        // the store, is worth a WARN even when the caller discards the
-        // coverage: it is the shape of the blackout, not of a miss.
-        if filtered.is_empty() && !coverage.is_complete() {
-            warn!(
-                "Recall '{}' answered empty from an incomplete scan: {} of {} memories \
-                 were comparable (query width matches binding: {})",
-                truncate(query, 30),
-                coverage.comparable,
-                coverage.total,
-                coverage.query_width_matches
-            );
-        }
-        Ok((filtered, coverage))
+        debug_assert!(
+            filtered.len() <= self.config.max_results,
+            "the answer is bounded by max_results"
+        );
+        filtered
     }
 
     /// How many FSRS testing-effect reviews are queued and not yet applied.
@@ -1773,7 +1839,8 @@ impl MemoryService {
                 MemoryState::Unavailable => stats.unavailable += 1,
             }
         }
-        
+        stats.searchable_latency = self.store.searchable_latency();
+
         stats
     }
 
@@ -1800,6 +1867,37 @@ impl MemoryService {
                 workspace_id: e.workspace_id,
             }
         }).collect()
+    }
+
+    /// Every memory as an export record: content, provenance, workspace, the
+    /// raw FSRS state and the state derived from it — and NO embedding
+    /// vectors. Vectors are derived data a re-embed recomputes, and they are
+    /// most of an entry's bytes, so an export that carried them would be mostly
+    /// floats nobody can read. Projected under the store's read lock, so the
+    /// vectors are never cloned either.
+    pub async fn export_records(&self) -> Vec<MemoryExportRecord> {
+        let params = &self.config.fsrs;
+        self.store
+            .map_entries(|e| MemoryExportRecord {
+                id: e.id.clone(),
+                content: e.content.clone(),
+                // Absent provenance is "unknown", never "stated" — the rule the
+                // daemon's memory list already applies.
+                fact_type: e
+                    .metadata
+                    .get("fact_type")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metadata: e.metadata.clone(),
+                timestamp: e.timestamp,
+                workspace_id: e.workspace_id.clone(),
+                embedding_model: e.embedding_model.clone(),
+                state: format!("{:?}", e.fsrs.state(params)).to_lowercase(),
+                weight: e.fsrs.weight(params),
+                retrievability: e.fsrs.retrievability(params),
+                fsrs: e.fsrs.clone(),
+            })
+            .await
     }
 
     /// Get a single memory by ID
@@ -1882,6 +1980,17 @@ impl MemoryService {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: Future<Output = Result<String, String>> + Send,
     {
+        // Refuse a config in which cosine similarity cannot veto a merge —
+        // see `ConsolidationConfig::validate`. Checked here, at the entry
+        // point, because this is the one place every dream path funnels
+        // through (scheduled cycle and the IPC `Consolidate` handler both
+        // reach it via `DreamingService`), and because consolidation rewrites
+        // memories: under a bad config it replaces unrelated entries with one
+        // gist, which no later warning can undo.
+        config
+            .validate()
+            .map_err(MemoryError::InvalidClusteringConfig)?;
+
         let mut result = ConsolidationResult::default();
         let total_memories = self.count().await;
 
@@ -2630,6 +2739,38 @@ pub struct MemoryStats {
     pub dormant: usize,
     pub silent: usize,
     pub unavailable: usize,
+    /// Queue-to-searchable latency over the recent window (see
+    /// [`crate::SearchableLatency`]); `None` until a memory written without a
+    /// vector has received one in this process.
+    pub searchable_latency: Option<crate::SearchableLatency>,
+}
+
+/// One memory as `nanna export --memories` writes it.
+///
+/// Everything a person, or a re-import, needs — and none of the embedding
+/// vectors, which are derived data a re-embed recomputes (see
+/// [`MemoryService::export_records`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryExportRecord {
+    pub id: String,
+    pub content: String,
+    /// Provenance: `stated` (the user said it), `observed`, …, or `unknown`
+    /// when none was recorded — never a guess of `stated`.
+    pub fact_type: String,
+    pub metadata: HashMap<String, String>,
+    /// Unix seconds when the memory was stored.
+    pub timestamp: i64,
+    /// `None` = a global memory.
+    pub workspace_id: Option<String>,
+    /// Which model produced the active embedding, named so a re-import knows
+    /// what to re-embed with. The vector itself is not exported.
+    pub embedding_model: Option<String>,
+    /// Derived from `fsrs` at export time: `active`, `dormant`, `silent`, …
+    pub state: String,
+    pub weight: f32,
+    pub retrievability: f32,
+    /// The raw FSRS-6 state, so nothing about the memory's schedule is lost.
+    pub fsrs: FsrsState,
 }
 
 /// Memory entry for listing (includes computed FSRS state)
@@ -2660,6 +2801,40 @@ pub struct ConsolidationBands {
     pub detailed: Vec<MemoryEntry>,
     /// Weight > 1.0: expand/research
     pub expand: Vec<MemoryEntry>,
+}
+
+/// What a recall found, how much of the store it could see, and how long each
+/// stage took. See [`MemoryService::recall_scoped_with_report`].
+#[derive(Debug, Clone)]
+pub struct RecallReport {
+    pub results: Vec<RecallResult>,
+    pub coverage: crate::SearchCoverage,
+    pub timings: RecallTimings,
+}
+
+/// Wall-clock time per recall stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecallTimings {
+    /// Embedding the query: a model call, local or remote.
+    pub embed: std::time::Duration,
+    /// The row scan, the chunk scan, scoring and assembly — everything after
+    /// the embed.
+    pub search: std::time::Duration,
+}
+
+impl RecallTimings {
+    /// [`Self::embed`] in whole milliseconds, saturating: a `u128` does not fit
+    /// JSON's integers, and no recall outlives `u64::MAX` milliseconds.
+    #[must_use]
+    pub fn embed_ms(&self) -> u64 {
+        u64::try_from(self.embed.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// [`Self::search`] in whole milliseconds, saturating.
+    #[must_use]
+    pub fn search_ms(&self) -> u64 {
+        u64::try_from(self.search.as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Result from memory recall
@@ -3194,6 +3369,69 @@ mod tests {
         assert_eq!(merged.len(), existing.len() + 2 + incoming.len());
     }
 
+    /// A clustering config in which cosine similarity has no veto must be
+    /// refused **before** anything is rewritten, not warned about after.
+    #[tokio::test]
+    async fn consolidate_refuses_a_config_that_cannot_tell_memories_apart() {
+        use std::sync::Arc;
+
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        for i in 0..8 {
+            service
+                .remember(&format!("memory number {i}"), Default::default())
+                .await
+                .expect("seed");
+        }
+        let before = service.count().await;
+
+        // The exact configuration that shipped before 2026-09-09: a 0.45
+        // threshold under a 0.50 non-semantic floor.
+        let broken = ConsolidationConfig {
+            cluster_threshold: 0.45,
+            min_remaining_memories: 1,
+            max_compression_ratio: 0.9,
+            ..ConsolidationConfig::default()
+        };
+
+        let err = service
+            .consolidate(&broken, |_p| async { Ok(String::from("gist")) })
+            .await
+            .expect_err("a config with no semantic veto must be refused");
+        assert!(
+            matches!(err, MemoryError::InvalidClusteringConfig(_)),
+            "wrong variant: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("cluster_threshold"),
+            "the refusal must name the knob to change: {err}"
+        );
+        assert_eq!(
+            service.count().await,
+            before,
+            "refusing must not have rewritten or removed anything"
+        );
+
+        // And the shipped default is accepted on the same store.
+        service
+            .consolidate(
+                &ConsolidationConfig {
+                    min_remaining_memories: 1,
+                    max_compression_ratio: 0.9,
+                    ..ConsolidationConfig::default()
+                },
+                |_p| async { Ok(String::from("gist")) },
+            )
+            .await
+            .expect("the shipped default must satisfy its own invariant");
+    }
+
     #[tokio::test]
     async fn consolidate_cluster_never_loses_memories_on_failed_add() {
         use std::sync::Arc;
@@ -3256,6 +3494,83 @@ mod tests {
         assert!(service.get("b").await.is_some(), "source b survives");
     }
 
+
+    /// Export carries content, provenance and FSRS state — and no vectors,
+    /// which are derived data and most of an entry's bytes.
+    #[tokio::test]
+    async fn export_records_carry_state_but_no_vectors() {
+        let (service, entry) = enrichment_fixture("the user prefers dark roast").await;
+        let records = service.export_records().await;
+        assert_eq!(records.len(), 1, "one record per memory");
+        let record = &records[0];
+        assert_eq!(record.id, entry.id);
+        assert_eq!(record.content, "the user prefers dark roast");
+        assert_eq!(
+            record.fact_type, "unknown",
+            "absent provenance is unknown, never stated"
+        );
+        assert!(record.retrievability > 0.0, "derived at export time");
+        assert!(record.retrievability <= 1.0, "a probability");
+        let json = serde_json::to_string(record).expect("a record serializes");
+        assert!(
+            !json.contains("\"embedding\":"),
+            "no vector in the export: {json}"
+        );
+        assert!(
+            !json.contains("\"embeddings\":"),
+            "no vector buckets either: {json}"
+        );
+    }
+
+    /// Recall names its two stages separately: a slow embed must show up as
+    /// embed time, not be folded into "search".
+    #[tokio::test]
+    async fn recall_reports_embedding_time_separately_from_search() {
+        const EMBED_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
+        let embed: EmbedFn = Arc::new(|_t: &str| {
+            Box::pin(async {
+                tokio::time::sleep(EMBED_DELAY).await;
+                Ok(vec![1.0_f32, 0.0, 0.0])
+            })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+        service
+            .add_entry(dedup_entry(
+                "m",
+                "the user prefers dark roast",
+                vec![1.0, 0.0, 0.0],
+                None,
+            ))
+            .await
+            .expect("seed");
+
+        let started = std::time::Instant::now();
+        let report = service
+            .recall_scoped_with_report("coffee", None)
+            .await
+            .expect("recall");
+        let total = started.elapsed();
+
+        assert!(
+            report.timings.embed >= EMBED_DELAY,
+            "the embed stage carries the model call: {:?}",
+            report.timings
+        );
+        assert!(
+            report.timings.embed + report.timings.search <= total,
+            "the stages fit inside the call: {:?} vs {total:?}",
+            report.timings
+        );
+        assert!(
+            report.timings.embed_ms() >= 30,
+            "the JSON-facing milliseconds agree"
+        );
+        assert_eq!(report.coverage.total, 1, "the one memory was in scope");
+    }
 
     /// A fixture for the enrichment path: `(service, seeded entry)` with a
     /// constant embedder, so the tests below differ only in what the

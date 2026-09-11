@@ -6,6 +6,28 @@ use nanna_core::{LlmClient, Nanna, NannaConfig};
 use nanna_server::{AppStateBuilder, ServerConfig, start_server};
 use tracing::{debug, info, warn};
 
+/// The port `nanna server` listens on: the `--port` flag when given, otherwise
+/// `[server].port` from the config — which the `PORT` env override and the
+/// onboarding "Server port" answer both write, and which defaults to 3000.
+///
+/// Until 2026-09-11 the flag defaulted to the literal 3000 and the config key
+/// was read by nothing, so the port a user chose during onboarding, the README's
+/// documented `[server] port = …`, and `PORT` were all silently ignored. Pure,
+/// so the precedence is pinned by a test rather than argued.
+#[must_use]
+pub fn server_port(flag: Option<u16>, config: &Config) -> u16 {
+    let port = flag.unwrap_or(config.server.port);
+    debug_assert!(
+        flag.is_none_or(|f| f == port),
+        "an explicit flag always wins"
+    );
+    debug_assert!(
+        flag.is_some() || port == config.server.port,
+        "…else the config decides"
+    );
+    port
+}
+
 /// Run the HTTP server
 pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     let (llm, tools, storage) = init_components(config).await?;
@@ -227,4 +249,33 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
 
     info!("Daemon shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The port a user chose during onboarding — written to `[server].port`,
+    /// as is `PORT` — is the one `nanna server` listens on when no `--port`
+    /// is given. Before 2026-09-11 it was silently ignored.
+    #[test]
+    fn server_port_falls_back_to_the_configured_port() {
+        let mut config = Config::default();
+        config.server.port = 4100;
+        assert_eq!(server_port(None, &config), 4100);
+    }
+
+    /// An explicit `--port` still wins over the config.
+    #[test]
+    fn an_explicit_port_flag_overrides_the_config() {
+        let mut config = Config::default();
+        config.server.port = 4100;
+        assert_eq!(server_port(Some(8080), &config), 8080);
+    }
+
+    /// With nothing configured the listening port is what it always was.
+    #[test]
+    fn the_default_port_is_unchanged() {
+        assert_eq!(server_port(None, &Config::default()), 3000);
+    }
 }

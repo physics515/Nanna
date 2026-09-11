@@ -4262,6 +4262,8 @@ impl DaemonBuilder {
         // Resolved here (list > legacy single > main chat list) so every
         // consumer sees one authoritative, never-empty chain.
         builder.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
+        builder.config.agent.prompt_cache_ttl =
+            crate::agent_service::cache_ttl_from(config.llm.prompt_cache_ttl);
         if !config.llm.model_routing.is_empty() {
             info!("Model routing enabled: {:?}", config.llm.model_routing);
         }

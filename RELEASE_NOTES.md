@@ -1,94 +1,105 @@
-# Nanna v0.3.15-beta.24 — The Log Underneath the Facts
+# Nanna v0.3.17-beta.26 — Your Data, Readable
 
-Memory has had one layer for a long time: facts, FSRS-weighted, never expiring. This release adds the
-layer underneath it — the raw episodic stream of what actually happened, on a wall-clock axis — and
-retires a dependency pin that has been in the tree since July.
+This release lets you take a conversation — or everything Nanna remembers — out as a document you can
+read, and shows you what each edit did while you were away. Underneath, it fixes a transport limit that
+silently dropped large replies to the CLI, and it finishes Linux: the desktop app now builds there.
 
 ## What's New
 
-### An append-only episodic timeline
+### `nanna export` — conversations and memories as documents you own
 
-`memories` answers *what is true*. It cannot answer *what happened, and when*, because a fact is the
-residue of many episodes and has no single timestamp. `MIGRATION_014` adds `memory_events`: messages,
-tool calls, recalls and outcomes as they occur, each stamped in Unix milliseconds, with a nullable
-embedding and a normalized salience. `nanna-storage` gains an append-only `MemoryEventRepository`, and
-a new **`nanna-timeline`** crate owns the policy — the closed `EventKind` set, the caps, and the
-`Timeline` facade.
-
-Four properties are enforced rather than assumed, and each exists for a phase that comes later:
-
-- **Integer timestamps.** Every consumer of this table is arithmetic — resample into a series,
-  decimate a window, detect a peak. Text timestamps would mean parsing on every sample.
-- **Half-open windows `[start, end)`.** Adjacent windows tile the axis exactly once, so a resampler
-  stepping bucket to bucket cannot double-count an event that lands on a boundary.
-- **Truncation is recorded, not just performed.** `content_len_chars` stores the length *before* the
-  8192-character cap, so a shortened episode is detectable by comparison rather than by a flag nobody
-  sets. The cut is character-wise, never byte-wise — there is a test that caps 8202 em dashes,
-  because byte-slicing arbitrary text at a fixed offset is the exact mistake that has panicked this
-  codebase twice.
-- **Append is idempotent on `event_id`.** A channel retrying a message cannot inflate the timeline.
-
-Nothing writes to this log yet; wiring the producers is a separate change.
-
-### A migration bug caught before it shipped, and closed for good
-
-`Storage::migrate` executes a migration with `sql.split(';')` — a splitter that does not know what a
-comment is. A semicolon inside a `--` comment therefore cuts the statement *around* it in half and
-hands the database two fragments. Migration 014 hit this while being written:
-
-```sql
-embedding BLOB,               -- f32 little-endian; NULL until embedded
+```bash
+nanna export <session-id>                    # readable Markdown transcript
+nanna export <session-id> --format json      # the complete stored session, lossless
+nanna export --memories [--scope global]     # what Nanna remembers, with provenance
 ```
 
-That comment split the `CREATE TABLE` at the preceding comma. The failure would have been invisible
-until someone opened a **fresh** database, because every existing install already has the table —
-so it would have shipped as "works for me" and broken only new installs.
+The daemon renders the document — it owns the data — so every client gets the same one. The Markdown
+transcript follows the chat page's own layout: thinking, tool calls with their input and output, each
+edit's before/after view, and the reply, which is neither dropped nor printed twice. Code fences are
+sized so a tool output that quotes Markdown cannot break out of its block. JSON is the stored record in
+a versioned envelope, proven to load back.
 
-Three unit tests now assert the property across all 14 migrations: no semicolon inside a comment, no
-comment-only chunk reaching `conn.execute`, and unique names in applied order. The 13 pre-existing
-migrations were audited and are clean, so this is a trap closed before it was ever sprung.
+A memory export carries each memory's text, where it came from (`unknown` when that was never recorded —
+never a guessed "you said so"), its workspace and its full FSRS state, and **no embedding vectors**:
+they are derived data, recomputed by a re-embed, and most of the bytes. The daemon must be running;
+`nanna sessions` lists the ids.
 
-### The boa git pin is gone
+### See what each edit did
 
-`boa_engine`/`boa_runtime` have been pinned to a git revision of boa `main` since 2026-07-10, because
-the then-current release (0.21.1) held `icu ~2.0` against a tree on icu 2.2. **`boa_engine 0.22.0`
-shipped on 2026-08-28** — newer than the pinned revision, so returning to crates.io moves forward, not
-back. It requires `icu ~2.3` and pulls the whole tree there: all 15 `icu*` crates resolve to a single
-2.3.x, with no split anywhere.
+Every `edit_file` call now records a bounded before/after view of what it changed — the lines, where
+they start, and whether the view was cut. It shows in the run timeline, and it is **kept with the
+session**, so it is still there when you open the session after an unattended run, or after a restart.
+Only an edit that succeeded and actually ran carries one.
 
-`boa_runtime` was dropped at the same time. It was an optional dependency that **no source file has
-ever referenced** — the same dead-weight class as the `swc_core` removal before it.
+### The desktop app builds on Linux
 
-### Dependency freshness
+`nanna-gui` did not build on Linux at all: `tauri-build 2.6.3` walks a fixed three directories up from
+its build output, and current cargo nests that output one level deeper, so the sidecar copy landed on a
+directory and the build panicked. This release carries the upstream fix (tauri#15831, due in
+`tauri-build` 2.7.0) as a vendored patch with a test that retires it with the next Tauri release, and
+CI now compiles the GUI on Linux too.
 
-`lopdf 0.44 → 0.45`, plus the routine sweep (`bon 3.10.1`, `serde_with 3.23.0`) and on the frontend
-`marked 18.0.12` and `@lucide/vue 1.43.0`. Both documented lockfile landmines fired exactly as
-recorded and were re-pinned: `libc` back to 0.2.186 (RustPython 0.5.0 still needs the ceiling) and
-`malachite-bigint` back to 0.9.2. The guard tests reported each in 0.00s rather than twenty minutes
-into a release build, which is what they were written for.
+## What's Fixed
 
-One trap worth naming: `cargo upgrade` reported `lopdf → 0.42.0` for one crate and `→ 0.45.0` for
-another **in the same table** — a stale registry-index read, not two different requirements. Never
-take a `cargo-upgrade` row without checking the crate's real version list.
+- **The CLI dropped any daemon reply over 16 MiB.** A WebSocket read limit protects only the side that
+  sets it. The daemon had raised its own to 128 MiB, but `nanna-client` still read with the 16 MiB
+  default, so a long session's history — or a large export — arrived as a dropped connection.
+  Reproduced with a 20 MiB reply before fixing; one shared limit now, applied at both ends, with a
+  guard test.
+- **`nanna server` ignored the port you chose.** `--port` defaulted to 3000 regardless of
+  `[server].port`, so the onboarding answer, the documented config key and the `PORT` variable were
+  all discarded. The flag still wins; otherwise your configured port is used.
+- **`[server].host` is gone.** Nothing ever read it — `nanna server` binds `--host`, loopback by
+  default — so it looked like a security setting while controlling nothing. Existing config files that
+  still carry it load unchanged.
+- **The long-run journal disagreed with itself.** Unattended task runs stored tool output uncapped in
+  their run record and could overwrite an earlier call's result when a model reused a call id; they now
+  share the chat path's journal writer.
+- **Webhook text no longer reaches the agent in your voice.** A generic webhook authenticates a caller,
+  not you; its payload is now framed as external data the agent must not take as your instructions.
+- **Database migrations are split by a lexer that knows comments and quotes.** They used to be split on
+  every `;`, so a semicolon inside a SQL comment would have cut a statement in half. That would not show
+  on an existing install, but would fail on a fresh one. Only a test kept that from happening. Every
+  existing migration is proven to run exactly as before.
+- **`nanna export <id> | head` no longer crashes** when the reader stops early. A message that leaves a
+  code block open no longer swallows the rest of a Markdown export either.
+- **Cost estimates now use current Claude prices.** Several were out of date:
+  - Sonnet 5 was reported 50% too high.
+  - Opus 4 and 4.1 were reported at a third of their price.
+  - Fable 5.1 cache reads were 4× too high.
+  - Mythos 5 was priced as Sonnet.
 
-## Verified
+  The table now matches Anthropic's published rates, checked 2026-09-11.
 
-`cargo check --workspace --exclude nanna-gui --all-targets` clean ·
-`cargo test --workspace --exclude nanna-gui` **1722 passed / 0 failed / 12 ignored** across 69 test
-binaries, doctests included · `cargo clippy` **0 errors**, and the new `nanna-timeline` crate is
-warning-clean under `pedantic` + `nursery` · rustfmt clean on every new file · frontend
-`vue-tsc --noEmit` clean, **238/238** vitest, `pnpm build` green with 4 routes prerendered.
+## Also In This Release
 
-The 16 new timeline tests include `migration_014_creates_a_usable_event_log`, which opens a **fresh**
-database — the exact case the comment-splitting bug above would have broken, and the one an existing
-install can never exercise.
+- **Recall reports its two stages separately.** Embedding the query (a model call) and searching (an
+  in-memory scan) are timed on their own, logged once per recall and returned by `memory.search`; a
+  slow embed no longer hides behind a fast search.
+- **How long new memories stay unfindable** is now measured: the time from a memory being written
+  without a vector to receiving one, reported as p50/p95 in `memory.stats`.
+- **`nanna doctor`** now warns when chat and summarization point at two different Ollama servers — a
+  split that is easy to create by setting only one of the two keys — and **`nanna doctor --online`**
+  asks each Ollama server in use whether it is answering and has the models you configured, naming
+  any that need an `ollama pull`. It never reads the keyring or tests a provider key.
+- **1-hour prompt caching** for Anthropic (`[llm].prompt_cache_ttl = "1h"`), priced correctly at the
+  API's own 2x write rate.
+- **Session events reach every client**: a rename or delete from one window now updates the others,
+  and a client that falls behind is told how many events it missed instead of silently losing them.
+- **Typed `nanna-client` APIs** for the scheduler, workspaces and channels.
+- **GUI type-check at zero errors** (22 were left, five of them hiding real bugs), now gated in CI.
+- **Dependencies** swept to latest; the `libc` and `malachite-bigint` ceilings still stand, enforced by
+  tests. The exact `aegis` pin is retired — `turso` already builds it pure-Rust.
 
-## Known limits
+## Known Issues
 
-- **The Tauri GUI is unverified, and on this host it cannot be verified.** `webkit2gtk-4.1` is
-  installed but Arch's package ships no `WebKitWebDriver` binary at all, and Arch has no
-  `webkit2gtk-driver` package — so `tauri-driver` cannot start. The fix is a WebKitGTK source build,
-  not a package install. Filed with the evidence.
-- **Nothing produces timeline events yet.** The store, its bounds and its tests are real; the
-  producers are not wired.
-- The toolchain pin was not re-tested against the current nightly this cycle.
+- **No in-app GUI verification on Linux yet.** The app builds, but the WebDriver harness needs
+  `WebKitWebDriver` (`webkit2gtk-4.1`), which is not installed on the build host. The new edit-diff view
+  is covered by unit tests only.
+- **Exporting from the app** is not there yet — `nanna export` is the way today.
+- **Two config keys name the Ollama server** (`[memory].ollama_host` for chat and embeddings,
+  `[llm].ollama_url` for summarization). `nanna doctor` flags a mismatch; which key should win is an
+  open decision.
+- **`[server].enabled` and the Agent tab's personality selector are read by nothing.** Both are open
+  decisions rather than silent fixes.

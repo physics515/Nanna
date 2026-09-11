@@ -236,6 +236,111 @@ async fn created_session_is_visible_to_the_client() {
     daemon.stop();
 }
 
+/// A reply larger than tungstenite's default 16 MiB frame must reach the
+/// client. The daemon raised its OWN read limit to 128 MB because long
+/// sessions exceeded the default and dropped the connection — but a read
+/// limit protects only the side that applies it, and every large reply the
+/// daemon SENDS (a whole-session `history`, a full run state, an export) is
+/// read by this client. A session whose name is 20 MiB makes the `create`
+/// reply that large, deterministically, with no model involved.
+#[tokio::test]
+async fn a_reply_over_the_default_frame_limit_reaches_the_client() {
+    const REPLY_BYTES: usize = 20 * 1024 * 1024;
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let huge_name = "n".repeat(REPLY_BYTES);
+    let created = client
+        .sessions()
+        .create(Some(huge_name.clone()))
+        .await
+        .expect("a 20 MiB reply must be readable, not a dropped connection");
+    assert_eq!(
+        created["session"]["name"].as_str().map(str::len),
+        Some(REPLY_BYTES),
+        "the whole reply arrived"
+    );
+    assert!(
+        client.is_connected().await,
+        "and the connection survived it"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Export end to end: the daemon — the session store's owner — renders the
+/// document and hands it over the real protocol, in both formats, and an
+/// unknown id is refused rather than exported as an empty document.
+#[tokio::test]
+async fn a_session_exports_over_the_protocol_in_both_formats() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let created = client
+        .sessions()
+        .create(Some("Export Me".to_string()))
+        .await
+        .expect("sessions.create succeeds");
+    let session_id = session_id_of(&created);
+
+    let markdown = client
+        .sessions()
+        .export(&session_id, nanna_client::ExportFormat::Markdown)
+        .await
+        .expect("sessions.export answers");
+    assert_eq!(markdown["filename"], "export-me.md", "{markdown}");
+    let content = markdown["content"].as_str().expect("a markdown document");
+    assert!(content.starts_with("# Export Me\n"), "{content}");
+    assert!(
+        content.contains(&session_id),
+        "the document names its session: {content}"
+    );
+
+    let json = client
+        .sessions()
+        .export(&session_id, nanna_client::ExportFormat::Json)
+        .await
+        .expect("sessions.export answers");
+    let document: serde_json::Value =
+        serde_json::from_str(json["content"].as_str().expect("a json document"))
+            .expect("valid JSON");
+    assert_eq!(
+        document["session"]["id"],
+        serde_json::json!(session_id),
+        "{document}"
+    );
+
+    let missing = client
+        .sessions()
+        .export("no-such-session", nanna_client::ExportFormat::Markdown)
+        .await
+        .expect("sessions.export answers");
+    assert_eq!(missing["error"], "not_found", "{missing}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Memory export routes through the protocol. A daemon running without memory
+/// — as this hermetic one does — refuses with its reason instead of exporting
+/// an empty store as though it were the user's.
+#[tokio::test]
+async fn memory_export_on_a_daemon_without_memory_says_why() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let reply = client
+        .memory()
+        .export(None, nanna_client::ExportFormat::Json)
+        .await
+        .expect("memory.export answers");
+    assert_eq!(reply["error"], "memory_unavailable", "{reply}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
 /// The reconnection half of the P8 gap: a client that drops and attaches again must
 /// find the daemon's state intact, because the daemon — not the client — owns it.
 #[tokio::test]
@@ -293,4 +398,186 @@ async fn sessions_persist_across_a_daemon_restart() {
 
     client.disconnect().await;
     restarted.stop();
+}
+
+/// P8 "Client API completeness": a job added through the typed scheduler wrapper is
+/// the one the daemon lists, fetches and removes.
+#[tokio::test]
+async fn scheduler_jobs_round_trip_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let scheduler = client.scheduler();
+
+    // The daemon's cron dialect is five fields: minute hour day month weekday.
+    let added = scheduler
+        .add("0 9 * * *", "summarize the inbox", Some("morning-digest"))
+        .await
+        .expect("scheduler.add answers");
+    assert_eq!(added["status"], "created", "{added}");
+    let id = added["id"]
+        .as_str()
+        .expect("a created job has an id")
+        .to_string();
+
+    let listed = scheduler.list().await.expect("scheduler.list answers");
+    assert!(
+        response_mentions(&listed, &id),
+        "the job is listed: {listed}"
+    );
+    let fetched = scheduler.get(&id).await.expect("scheduler.get answers");
+    assert_eq!(fetched["job"]["name"], "morning-digest", "{fetched}");
+
+    let removed = scheduler
+        .remove(&id)
+        .await
+        .expect("scheduler.remove answers");
+    assert_eq!(removed["status"], "deleted", "{removed}");
+    let after = scheduler.list().await.expect("scheduler.list answers");
+    assert!(!response_mentions(&after, &id), "the job is gone: {after}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// A project directory registered through the typed workspace wrapper is listed,
+/// fetchable by id, and gone after `close`.
+#[tokio::test]
+async fn workspaces_open_list_and_close_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let workspaces = client.workspaces();
+    let project = tempfile::tempdir().expect("temp project dir");
+    let path = project.path().to_str().expect("a UTF-8 temp path");
+
+    let opened = workspaces.open(path).await.expect("workspace.open answers");
+    assert_eq!(opened["status"], "opened", "{opened}");
+    let id = opened["id"]
+        .as_str()
+        .expect("an opened workspace has an id")
+        .to_string();
+
+    let listed = workspaces.list().await.expect("workspace.list answers");
+    assert!(
+        response_mentions(&listed, &id),
+        "the workspace is listed: {listed}"
+    );
+    let fetched = workspaces.get(&id).await.expect("workspace.get answers");
+    assert_eq!(fetched["workspace"]["id"], id.as_str(), "{fetched}");
+
+    let closed = workspaces
+        .close(&id)
+        .await
+        .expect("workspace.close answers");
+    assert_eq!(closed["status"], "closed", "{closed}");
+    let after = workspaces.list().await.expect("workspace.list answers");
+    assert!(
+        !response_mentions(&after, &id),
+        "the workspace is gone: {after}"
+    );
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// The typed channel wrapper reaches the daemon's adapter inventory: all five chat
+/// adapters are reported, each with a boolean `configured`.
+#[tokio::test]
+async fn channels_list_every_adapter_through_the_typed_api() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+
+    let listed = client
+        .channels()
+        .list()
+        .await
+        .expect("channel.list answers");
+    let channels = listed["channels"].as_array().expect("a channel array");
+    let ids: Vec<&str> = channels.iter().filter_map(|c| c["id"].as_str()).collect();
+    for expected in ["telegram", "discord", "slack", "signal", "whatsapp"] {
+        assert!(ids.contains(&expected), "{expected} is listed: {listed}");
+    }
+    assert!(
+        channels.iter().all(|c| c["configured"].is_boolean()),
+        "every adapter says whether it is configured: {listed}"
+    );
+    let status = client
+        .channels()
+        .status(None)
+        .await
+        .expect("channel.status answers");
+    assert!(status.is_object(), "{status}");
+
+    client.disconnect().await;
+    daemon.stop();
+}
+
+/// Session lifecycle events reach every client: a rename and a delete made by one
+/// client arrive on another client's per-session stream. Before the daemon emitted
+/// them, a session renamed from the CLI never reached an open GUI.
+#[tokio::test]
+async fn lifecycle_changes_by_one_client_reach_another_clients_session_stream() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let watcher = daemon.connect_client().await;
+    let actor = daemon.connect_client().await;
+
+    let created = actor
+        .sessions()
+        .create(Some("before".to_string()))
+        .await
+        .expect("sessions.create succeeds");
+    let session_id = session_id_of(&created);
+    // Subscribe before acting: a broadcast only carries what is sent after it.
+    let mut events = watcher.subscribe_session(session_id.clone());
+
+    actor
+        .sessions()
+        .rename(&session_id, "after")
+        .await
+        .expect("sessions.rename succeeds");
+    // The watcher's socket can still be carrying the `SessionCreated` that the
+    // create broadcast before this subscription existed: a subscription filters
+    // the live stream, it does not fence it. That one event — and only that one
+    // — may precede the rename. Observed 2026-09-11 under a parallel suite:
+    // `expected SessionRenamed, got SessionCreated { .. name: Some("before") }`.
+    let mut created_skipped = 0_usize;
+    let renamed = loop {
+        let event = tokio::time::timeout(READY_HANG_CEILING, events.recv())
+            .await
+            .expect("the rename event arrives before the hang ceiling")
+            .expect("the stream is open and not lagging");
+        if matches!(&event, nanna_client::Event::SessionCreated { id, .. } if *id == session_id) {
+            created_skipped += 1;
+            assert!(
+                created_skipped <= 1,
+                "only the one create can predate the subscription"
+            );
+            continue;
+        }
+        break event;
+    };
+    match renamed {
+        nanna_client::Event::SessionRenamed { id, name } => {
+            assert_eq!(id, session_id);
+            assert_eq!(name, "after");
+        }
+        other => panic!("expected SessionRenamed, got {other:?}"),
+    }
+
+    actor
+        .sessions()
+        .delete(&session_id)
+        .await
+        .expect("sessions.delete succeeds");
+    let deleted = tokio::time::timeout(READY_HANG_CEILING, events.recv())
+        .await
+        .expect("the delete event arrives before the hang ceiling")
+        .expect("the stream is open and not lagging");
+    assert!(
+        matches!(&deleted, nanna_client::Event::SessionDeleted { id } if *id == session_id),
+        "expected SessionDeleted for {session_id}, got {deleted:?}"
+    );
+
+    watcher.disconnect().await;
+    actor.disconnect().await;
+    daemon.stop();
 }

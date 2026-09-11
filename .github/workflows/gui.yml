@@ -38,9 +38,11 @@ jobs:
           cache-dependency-path: gui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
-      # Enforced as of 2026-07-24: the tree typechecks with 0 errors, so a new one is a
-      # regression, not pre-existing debt. Revert to continue-on-error only with a reason.
-      - run: pnpm exec vue-tsc --noEmit
+      # `vue-tsc --noEmit` on Nuxt 4's solution-style tsconfig checked ZERO files and
+      # always exited 0 (ROADMAP P4). `pnpm typecheck` runs `vue-tsc --build`, then plants
+      # a deliberate type error in app/ and fails if the checker does not report it,
+      # so a blind gate cannot come back unnoticed. 0 errors as of 2026-09-10.
+      - run: pnpm typecheck
 
   e2e-web:
     name: Playwright web/dev shell

@@ -46,12 +46,12 @@
 
             <!-- Helper buttons -->
             <div class="flex gap-2">
-              <UiButton @click="runClaudeSetupToken" :disabled="oauthLoading" variant="outline" size="sm" class="flex-1">
+              <UiButton @click="runClaudeSetupToken" :disabled="oauthLoading" variant="secondary" size="sm" class="flex-1">
                 <UiSpinner v-if="oauthLoading && oauthAction === 'setup'" size="sm" class="mr-1" />
                 <Terminal v-else class="w-3 h-3 mr-1" />
                 {{ oauthLoading && oauthAction === 'setup' ? 'Running...' : 'Run CLI' }}
               </UiButton>
-              <UiButton @click="importClaudeCodeCredentials" :disabled="oauthLoading" variant="outline" size="sm" class="flex-1">
+              <UiButton @click="importClaudeCodeCredentials" :disabled="oauthLoading" variant="secondary" size="sm" class="flex-1">
                 <UiSpinner v-if="oauthLoading && oauthAction === 'import'" size="sm" class="mr-1" />
                 <Download v-else class="w-3 h-3 mr-1" />
                 {{ oauthLoading && oauthAction === 'import' ? 'Importing...' : 'Import' }}

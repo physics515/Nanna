@@ -13,6 +13,9 @@ pub mod oauth;
 #[cfg(feature = "auto-refresh")]
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
+pub mod ollama_probe;
+pub use ollama_probe::{OllamaProbe, probe_ollama};
+
 pub mod heal;
 pub use heal::{
     count_balanced_top_level_objects, escape_bare_controls_in_strings, heal_json, heal_json_as,
@@ -1674,20 +1677,71 @@ pub struct AnthropicRequest {
 ///
 /// When set at the request level, enables automatic caching: the API caches all content
 /// up to and including the last cacheable block. On subsequent requests with the same
-/// prefix, cached content is reused automatically (~5 minute TTL on Anthropic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// prefix, cached content is reused automatically.
+///
+/// **One TTL per request.** Anthropic rejects a request whose longer-TTL breakpoints do
+/// not precede its shorter ones, and one whose explicit marker on the last block disagrees
+/// with the top-level TTL. Every marker Nanna emits for a request is derived from that
+/// request's single `CacheControl`, which keeps both rules true by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub cache_type: String,
+    /// `None` is the API default (5 minutes); only a 1-hour TTL is ever sent explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+}
+
+/// Prompt-cache lifetime on Anthropic.
+///
+/// A 1-hour write costs 2x base input (5-minute: 1.25x); reads cost 0.1x either way and
+/// refresh the timer. So 1-hour pays only when requests sharing a prefix start 5-60 minutes
+/// apart — heartbeat and cron gaps on the cloud escape hatch — and needs at least three
+/// requests per write to break even.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CacheTtl {
+    /// The API default.
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
 }
 
 impl CacheControl {
-    /// Create an ephemeral cache control (standard ~5 minute TTL)
+    /// Create an ephemeral cache control with the API's default ~5 minute TTL.
     #[must_use]
     pub fn ephemeral() -> Self {
-        Self {
+        Self::ephemeral_for(CacheTtl::FiveMinutes)
+    }
+
+    /// Create an ephemeral cache control with `ttl`.
+    ///
+    /// The 5-minute default is sent as no `ttl` key at all, so a default request is
+    /// byte-identical to the one sent before the TTL was configurable.
+    #[must_use]
+    pub fn ephemeral_for(ttl: CacheTtl) -> Self {
+        let explicit = match ttl {
+            CacheTtl::FiveMinutes => None,
+            CacheTtl::OneHour => Some(CacheTtl::OneHour),
+        };
+        let control = Self {
             cache_type: "ephemeral".to_string(),
-        }
+            ttl: explicit,
+        };
+        debug_assert_eq!(control.effective_ttl(), ttl, "the TTL must round-trip");
+        debug_assert_ne!(
+            control.ttl,
+            Some(CacheTtl::FiveMinutes),
+            "5m stays implicit"
+        );
+        control
+    }
+
+    /// The TTL the API applies, resolving an absent key to its 5-minute default.
+    #[must_use]
+    pub fn effective_ttl(&self) -> CacheTtl {
+        self.ttl.unwrap_or_default()
     }
 }
 
@@ -1758,13 +1812,22 @@ impl OAuthAnthropicRequest {
             }
         }
 
-        // Place explicit cache breakpoint on the last system block.
-        // This ensures the system prompt prefix is cached server-side (~5 min TTL).
-        if request.cache_control.is_some() {
+        // Place explicit cache breakpoint on the last system block, so the system prompt
+        // prefix is cached server-side. It carries the request's own marker rather than a
+        // fresh default: a 5-minute breakpoint ahead of a 1-hour top-level one is a 400
+        // (longer TTLs must come first), so one request gets exactly one TTL.
+        if let Some(ref control) = request.cache_control {
             if let Some(last) = system.last_mut() {
-                last.cache_control = Some(CacheControl::ephemeral());
+                last.cache_control = Some(control.clone());
             }
         }
+        debug_assert!(
+            system
+                .iter()
+                .filter_map(|block| block.cache_control.as_ref())
+                .all(|marker| Some(marker) == request.cache_control.as_ref()),
+            "every system-block breakpoint must match the request-level TTL"
+        );
 
         Self {
             model: request.model.clone(),
@@ -1803,6 +1866,40 @@ pub struct Usage {
     /// Tokens read from the prompt cache on this request (billed at 10% of input rate on Anthropic)
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// Per-lifetime split of `cache_creation_input_tokens`. Absent on older responses and
+    /// on other providers, which then count as all 5-minute writes.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// Anthropic's `usage.cache_creation`: the cache writes of one request, by TTL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
+}
+
+impl Usage {
+    /// The 1-hour share of `cache_creation_input_tokens`; 0 when the split is absent.
+    #[must_use]
+    pub fn cache_creation_1h_tokens(&self) -> u32 {
+        hour_share(
+            self.cache_creation.as_ref(),
+            self.cache_creation_input_tokens,
+        )
+    }
+}
+
+/// The 1-hour share of a cache-write total. Provider data, not an invariant of ours, so an
+/// inconsistent split is clamped to the total it is part of rather than asserted.
+fn hour_share(split: Option<&CacheCreation>, total: u32) -> u32 {
+    let reported = split.map_or(0, |s| s.ephemeral_1h_input_tokens);
+    let share = reported.min(total);
+    debug_assert!(share <= total, "a share never exceeds its total");
+    debug_assert!(share <= reported, "clamping only ever lowers the share");
+    share
 }
 
 // ============================================================================
@@ -4229,6 +4326,8 @@ pub enum StreamEvent {
         cache_read_tokens: u32,
         /// Prompt tokens written into the cache (a creation, one-time cost).
         cache_creation_tokens: u32,
+        /// The 1-hour share of `cache_creation_tokens` (billed at 2x input, not 1.25x).
+        cache_creation_1h_tokens: u32,
     },
     /// Start of a content block
     ContentBlockStart {
@@ -4374,6 +4473,8 @@ struct MessageStartUsage {
     cache_read_input_tokens: u32,
     #[serde(default)]
     cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_creation: Option<CacheCreation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5154,6 +5255,7 @@ impl LlmClient {
                                 input_tokens: prompt_eval as u32,
                                 cache_read_tokens: 0,
                                 cache_creation_tokens: 0,
+                                cache_creation_1h_tokens: 0,
                             });
                         }
                         // Emit output token count
@@ -5962,7 +6064,13 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens },
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens,
+            cache_creation: None,
+        },
     })
 }
 
@@ -6069,7 +6177,13 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation: None,
+        },
     })
 }
 
@@ -6108,6 +6222,10 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
                 input_tokens: usage.input_tokens,
                 cache_read_tokens: usage.cache_read_input_tokens,
                 cache_creation_tokens: usage.cache_creation_input_tokens,
+                cache_creation_1h_tokens: hour_share(
+                    usage.cache_creation.as_ref(),
+                    usage.cache_creation_input_tokens,
+                ),
             })
         }
         AnthropicSSE::ContentBlockStart { index, content_block } => {
@@ -6678,7 +6796,54 @@ mod tests {
     /// something else in the crate happens to be running alongside it.
     static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Pin tracing's PROCESS-wide max-level hint at INFO for the whole test
+    /// binary.
+    ///
+    /// This is the other half of the race the comment above describes, and the
+    /// half `LOG_CAPTURE` cannot fix. The mutex serializes the capture tests
+    /// against *each other*, but the hint is recomputed every time a subscriber
+    /// is installed or dropped, and it is global. With no global default
+    /// installed, the hint falls back to OFF in the window between one
+    /// `with_default` guard dropping and the next installing — and any of the
+    /// crate's ~119 other tests running concurrently can evaluate a callsite in
+    /// that window and have it cached as disabled. The next capture then comes
+    /// back EMPTY and the test fails on its first `contains`.
+    ///
+    /// Observed 2026-09-09 under `cargo test --workspace -j 4`:
+    /// `a_demotion_announces_old_new_floor_and_clamp` failed with
+    /// `the decision: ` (an empty capture) while passing alone and 3/3 for the
+    /// crate on its own — i.e. exactly when the crate is run alongside enough
+    /// other work.
+    ///
+    /// Installing a permanent no-op INFO subscriber holds the hint at INFO for
+    /// the process's whole life, so a callsite is never cached as disabled and
+    /// the thread-local capture always sees its events. The global sink
+    /// discards; only the thread-local `with_default` subscriber records.
+    fn pin_global_log_level() {
+        static PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        PINNED.get_or_init(|| {
+            struct Discard;
+            impl std::io::Write for Discard {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| Discard)
+                .with_ansi(false)
+                .finish();
+            // Another test harness may legitimately have set one already; the
+            // hint is what matters, not whose subscriber won.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
     fn capture_info_logs(f: impl FnOnce()) -> String {
+        pin_global_log_level();
         let _serialized = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
 
         #[derive(Clone, Default)]
@@ -8042,5 +8207,126 @@ mod input_overflow_tests {
         // Ollama — the pin is an Ollama-path decision only.
         let client = EmbeddingClient::openai("k").with_base_url("http://localhost:8080");
         assert_eq!(client.base_url, "http://localhost:8080");
+    }
+}
+
+#[cfg(test)]
+mod cache_ttl_tests {
+    use super::*;
+
+    fn cached_request(ttl: CacheTtl) -> AnthropicRequest {
+        AnthropicRequest {
+            model: "claude-opus-5".to_string(),
+            messages: vec![AnthropicMessage::user_text("hello")],
+            max_tokens: 128,
+            context_limit: None,
+            temperature: None,
+            system: Some("You are Nanna.".to_string()),
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: Some(CacheControl::ephemeral_for(ttl)),
+        }
+    }
+
+    #[test]
+    fn the_default_marker_is_byte_identical_to_the_pre_ttl_wire_format() {
+        let json = serde_json::to_string(&CacheControl::ephemeral()).expect("serializes");
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
+        assert_eq!(
+            CacheControl::ephemeral_for(CacheTtl::FiveMinutes),
+            CacheControl::ephemeral()
+        );
+    }
+
+    #[test]
+    fn a_one_hour_marker_sends_the_ttl_and_reads_back() {
+        let hour = CacheControl::ephemeral_for(CacheTtl::OneHour);
+        let json = serde_json::to_string(&hour).expect("serializes");
+        assert_eq!(json, r#"{"type":"ephemeral","ttl":"1h"}"#);
+
+        let parsed: CacheControl = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(parsed.effective_ttl(), CacheTtl::OneHour);
+        let bare: CacheControl = serde_json::from_str(r#"{"type":"ephemeral"}"#).expect("parses");
+        assert_eq!(
+            bare.effective_ttl(),
+            CacheTtl::FiveMinutes,
+            "absent means the API default"
+        );
+    }
+
+    #[test]
+    fn the_oauth_system_breakpoint_carries_the_request_ttl() {
+        let request = cached_request(CacheTtl::OneHour);
+        let oauth = OAuthAnthropicRequest::from_request(&request, true);
+        assert_eq!(oauth.system.len(), 2, "identity block + the system prompt");
+        assert_eq!(
+            oauth.system[0].cache_control, None,
+            "only the last block is a breakpoint"
+        );
+        assert_eq!(oauth.system[1].cache_control, request.cache_control);
+
+        // On the wire: both breakpoints say 1h, and no marker falls back to the 5-minute
+        // default — a 5m breakpoint ahead of a 1h one is the ordering the API rejects.
+        let json = serde_json::to_string(&oauth).expect("serializes");
+        assert_eq!(json.matches(r#""cache_control":"#).count(), 2);
+        assert_eq!(json.matches(r#""ttl":"1h""#).count(), 2);
+    }
+
+    #[test]
+    fn a_default_ttl_request_sends_no_ttl_key_anywhere() {
+        let oauth =
+            OAuthAnthropicRequest::from_request(&cached_request(CacheTtl::FiveMinutes), true);
+        let json = serde_json::to_string(&oauth).expect("serializes");
+        assert_eq!(json.matches(r#""cache_control":"#).count(), 2);
+        assert!(
+            !json.contains(r#""ttl""#),
+            "the default must not change a byte: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_creation_split_tests {
+    use super::*;
+
+    #[test]
+    fn message_start_surfaces_the_one_hour_share_of_cache_writes() {
+        let event = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":34,\"cache_creation\":{\"ephemeral_5m_input_tokens\":10,\"ephemeral_1h_input_tokens\":24}}}}";
+        match parse_sse_event(event).expect("message_start should parse") {
+            StreamEvent::MessageStart {
+                cache_creation_tokens,
+                cache_creation_1h_tokens,
+                ..
+            } => {
+                assert_eq!(cache_creation_tokens, 34);
+                assert_eq!(cache_creation_1h_tokens, 24);
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_usage_without_the_split_counts_as_all_five_minute_writes() {
+        let bare = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":40}"#;
+        let usage: Usage = serde_json::from_str(bare).expect("parses");
+        assert_eq!(usage.cache_creation_1h_tokens(), 0);
+
+        let split = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":40,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":40}}"#;
+        let usage: Usage = serde_json::from_str(split).expect("parses");
+        assert_eq!(usage.cache_creation_1h_tokens(), 40);
+    }
+
+    #[test]
+    fn an_inconsistent_split_is_clamped_to_its_total() {
+        let json = r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":10,
+            "cache_creation":{"ephemeral_1h_input_tokens":99}}"#;
+        let usage: Usage = serde_json::from_str(json).expect("parses");
+        assert_eq!(
+            usage.cache_creation_1h_tokens(),
+            10,
+            "a share never exceeds its total"
+        );
     }
 }

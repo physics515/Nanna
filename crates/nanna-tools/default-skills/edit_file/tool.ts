@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.9",
+  version: "0.1.10",
   output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. After each edit the cheapest structural check (sh -n / node --check / JSON.parse) runs on the result and its verdict is appended — including whether the file parsed before the edit. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -1126,10 +1126,59 @@ export default {
     // absent, unrun or fail-open verdict leaves this off entirely, because a
     // false "broken" would suppress completion and drain the item's budget —
     // `sh -n` is documented to cry wolf on valid bash where /bin/sh is dash.
-    var result = { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote + removalNote, success: true };
-    if (verdict) {
-      result.data = { structure: { parses: verdict.ok === true, tool: verdict.tool, detail: verdict.detail } };
+    // A before/after view of what the edit changed, so a user returning to hours of
+    // unattended work can SEE each edit instead of "replaced 1 occurrence(s)". It is
+    // observability for the timeline, never an approval step.
+    //
+    // Never split the whole file: in Boa, split() costs lines x length. The common
+    // prefix and suffix are found with native 4 KiB substring compares, both ends are
+    // snapped to line boundaries, and only the changed region (capped) is split.
+    function editDiff(before, after, maxLines, maxChars) {
+      var n = Math.min(before.length, after.length);
+      var step = 4096;
+      var p = 0;
+      while (p + step <= n && before.substring(p, p + step) === after.substring(p, p + step)) p += step;
+      while (p < n && before.charCodeAt(p) === after.charCodeAt(p)) p++;
+      var limit = n - p;
+      var s = 0;
+      while (s + step <= limit && before.substring(before.length - s - step, before.length - s) === after.substring(after.length - s - step, after.length - s)) s += step;
+      while (s < limit && before.charCodeAt(before.length - 1 - s) === after.charCodeAt(after.length - 1 - s)) s++;
+      if (p === before.length && p === after.length) return null;
+      var lineStart = p === 0 ? 0 : before.lastIndexOf("\n", p - 1) + 1;
+      var endA = before.indexOf("\n", before.length - s);
+      if (endA === -1) endA = before.length;
+      var endB = after.indexOf("\n", after.length - s);
+      if (endB === -1) endB = after.length;
+      var lineNo = 1;
+      var at = before.indexOf("\n");
+      while (at !== -1 && at < lineStart) { lineNo++; at = before.indexOf("\n", at + 1); }
+      function lines(text, from, to) {
+        var region = text.substring(from, Math.min(to, from + maxChars));
+        var out = region.length === 0 ? [] : region.split("\n");
+        if (out.length > 1 && out[out.length - 1] === "") out.pop();
+        for (var i = 0; i < out.length; i++) out[i] = out[i].replace(/\r$/, "");
+        return { list: out.slice(0, maxLines), cut: to - from > maxChars || out.length > maxLines };
+      }
+      var removed = lines(before, lineStart, endA);
+      var added = lines(after, lineStart, endB);
+      return {
+        start_line: lineNo,
+        removed: removed.list,
+        added: added.list,
+        truncated: removed.cut || added.cut
+      };
     }
+    var result = { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters." + structNote + removalNote, success: true };
+    var data = {};
+    if (verdict) {
+      data.structure = { parses: verdict.ok === true, tool: verdict.tool, detail: verdict.detail };
+    }
+    // 40 lines / 4000 chars per side: the daemon journals this view beside the
+    // call's output, which it caps at 4000 bytes, and clamps a diff to the same
+    // bound — matching it here keeps that clamp a guard, not the normal path.
+    var diff = editDiff(content, updated, 40, 4000);
+    if (diff) data.diff = diff;
+    if (data.structure || data.diff) result.data = data;
     return result;
   }
 }

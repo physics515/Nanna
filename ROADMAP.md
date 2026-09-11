@@ -604,7 +604,24 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       loopback. Only a setup relying on the old `0.0.0.0` default for direct inbound webhooks needs to set
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
-- [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+- [x] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      *(ticked 2026-09-11. Each part was checked against the code, and the one untested gap was
+      closed.)* Evidence for each part the item names:
+      - **Telegram secret:** fail-closed, constant-time (2026-08-22, below).
+      - **WhatsApp POST:** the Meta `X-Hub-Signature-256` is verified (2026-07-25) and the route
+        fails closed (2026-08-22).
+      - **WhatsApp GET verification handshake:** `whatsapp_verify` echoes `hub.challenge` only
+        for the configured verify token, through the constant-time `webhook_secret_matches`.
+        Until today nothing tested it. Now
+        `whatsapp_verification_echoes_the_challenge_only_for_the_configured_token` pins it:
+        the right token → 200 plus the challenge; a wrong one, none configured, or an empty
+        configured token → 403, with no echo.
+      - **Signal bridge trust:** Signal is served by `nanna-server` (`/webhooks/signal`), and its
+        `X-Webhook-Secret` refusal is pinned in `nanna-server/tests/webhook_fail_closed.rs`.
+      - **Replay protection:** a window exists wherever the protocol signs a timestamp (Slack,
+        Discord, both tested). Telegram's secret header, Meta's HMAC and the Signal bridge's
+        shared secret sign **no** timestamp, so there is nothing to window. Replay protection
+        there would need a nonce store, which none of those protocols provides a nonce for.
       - [x] *(2026-08-22)* **The whole inbound webhook surface now fails CLOSED, and the generic route
             no longer aborts the daemon.** Every verifier in `nanna-daemon/src/webhook.rs` was correct and
             every handler *skipped* it when nothing was configured — `if let Some(secret) = …` with no
@@ -1274,7 +1291,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       blocked**, and edits were dropped silently on switching tools. Now a real awaited confirm.
       The scoped test locator (`/^Delete$/i` *inside* the dialog) now also pins the label, so the UI bug
       and its test cannot drift apart again.
-- [ ] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
+- [x] *(2026-08-23)* **The `vue-tsc` CI gate type-checks NOTHING, and there are 96 real errors behind
       it.** `gui.yml` runs `pnpm exec vue-tsc --noEmit`, and the roadmap records it as "Enforced as of
       2026-07-24: the tree typechecks with 0 errors, so a new one is a regression". It does not. Nuxt 4
       writes a **solution-style** `tsconfig.json` — `"files": []` plus four project `references` — and
@@ -1288,7 +1305,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       Not switched on in the same run, deliberately — flipping the flag turns CI red on 96 pre-existing
       errors, and a green build achieved by leaving the gate blind is the thing being fixed here, so it
       should not be traded for a red one nobody can land against. Do it as its own increment(s):
-      - [~] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
+      - [x] Burn down the 96 in batches by file, largest first, keeping CI green throughout.
             *(2026-08-23)* **First batch: `app/lib/tiptapMarkdown.ts` — 26 errors → 0, total 96 → 66.**
             All of the `noUncheckedIndexedAccess` family (`lines[i]` types as `string | undefined`
             even under an `i < lines.length` guard, and regex group reads likewise).
@@ -1365,10 +1382,37 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             **Running total for the run: 96 → 25 errors**, with 208 vitest green and `pnpm build` green
             throughout. Remaining backlog: `app/components/settings/*`, `app/components/ToolCallCard.vue`,
             `app/layouts/default.vue`, the `ui/` primitives, and a handful of one-error files.
-      - [ ] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
+            *(2026-09-10)* **Final batch: 22 → 0, and five of the 22 were broken features.**
+            - **Settings → Data → Import configuration never waited for its confirm.** `confirm` is
+              the async dialog; `if (!confirm('…'))` tested a Promise (always truthy), so the import
+              replaced the user's config whatever they answered. Now `await confirm({… danger })`.
+            - **`ConfirmDialog`'s focus watcher never fired** — it watched `state.open` on the ref
+              itself (always `undefined`). Fixed to `state.value.open`, and since `useConfirm`
+              already owns Escape the duplicate handler registration is gone; a **danger** confirm
+              now focuses **Cancel**, so Enter cannot land on "Delete All". New
+              `ConfirmDialog.spec.ts` (2 tests), **verified to fail on the old dialog**.
+            - **`ErrorBoundary`'s Reload button threw on click** — `location` in a template resolves
+              against the component, not `window`.
+            - **Escape in a Monaco code block threw** (`IStandaloneCodeEditor` has no `blur()`), so it
+              never returned focus to TipTap.
+            - Three `variant="outline"` UiButtons (not a variant → unstyled, same class as the
+              scheduler fix above) and ChannelStatusLive's `destructive` badge (the badge calls it
+              `error`) rendered unstyled.
+            The rest were index-access proofs (`?? ''`, guarded reads — never `!`), the glass records
+            typed by their colour unions instead of `Record<string, …>`, and Sonner's `class` joined
+            to the string its prop declares.
+      - [x] Then switch `gui.yml` to `vue-tsc --build` (or `nuxt typecheck`) and re-assert the
             "0 errors" claim — this time with evidence that the command sees the files.
-      - [ ] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
+            *(2026-09-10)* `gui.yml` now runs `pnpm typecheck` = `gui/scripts/typecheck.mjs`, which
+            runs `vue-tsc --build`: **0 errors**.
+      - [x] Add a **meta-check** so a blind gate cannot recur: the typecheck step should fail if it
             reports zero *checked files*, the same way a coverage gate fails at 0%.
+            *(2026-09-10)* `--extendedDiagnostics` prints no file counts in `--build` mode, so the
+            check is a **canary** instead of a count, which is the stronger proof anyway: after the
+            real run the script plants `app/__typecheck_canary__.ts` with a deliberate type error
+            and fails unless the checker reports it by name (always deleted; gitignored). Shown to
+            matter: with the canary planted, the old `vue-tsc --noEmit` exits **0** and never
+            mentions it.
 - [x] *(2026-08-24, fixed the same day)* **`nanna-scripting/tests/edit_file_skill.rs` fails under machine load — an absolute
       deadline in a test, not a regression.** Six of its seventeen tests failed a full-workspace
       `cargo test` with `"Timeout after 30000ms"` while two cargo builds and sixteen other test binaries
@@ -1565,6 +1609,20 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             write). Both `#[must_use]`, `debug_assert`-guarded (discount only lowers; 1-h write ≥ input), 2 tests.
             Still open: making the table itself config-overridable (`[pricing]` TOML / fetched) and wiring the
             multipliers into the tracker per request-mode.
+            *(2026-09-11)* **The rates had already rotted, which is this item's case, measured.** Checked
+            against Anthropic's pricing page (`platform.claude.com/docs/en/about-claude/pricing`,
+            fetched 2026-09-11):
+            - **Sonnet 5** ($2/$10) was priced at the Sonnet 4 row ($3/$15): **+50%** on every report.
+            - **Opus 4 and 4.1** ($15/$75) matched the `claude-opus-4` row meant for 4.5–4.8
+              ($5/$25): **a third** of their price.
+            - **Fable 5.1**'s cache read (0.025×, $0.25) was billed at Fable 5's $1.00.
+            - **Mythos 5/5.1** fell through to the generic Sonnet row.
+
+            All are corrected in `PRICING_TABLE`, most-specific first, with a test per row. The two
+            `model_stats` tests that had encoded the stale Sonnet 5 rate as their expected dollars now
+            expect the real ones. Still open, and now with evidence: rates live in code, so they rot
+            between releases. A config override or a fetched table would let a user fix one without
+            waiting for a build.
       *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
       already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
@@ -1744,7 +1802,48 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       a few separator chars). 5 tests (basic table, alignment colons + surrounding text, inline-markdown in
       cells, prose-pipe/HR negatives, tight-table growth guard); 45 nanna-channels tests green. Remaining:
       Discord embeds, Slack Block Kit.
-- [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+- [x] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
+      *(2026-09-10, second half)* **`client.subscribe_session(id)`** returns a `SessionEvents`
+      stream carrying only that session's events, keyed by a new **exhaustive**
+      `Event::session_id()` in the protocol (no wildcard arm, so a new variant must be
+      classified before it compiles). Lag on the bounded broadcast is returned as
+      `RecvError::Lagged(n)`, never skipped silently. Unit-tested on a real broadcast
+      channel (filtering, lag) and per variant family; not e2e, because every event that
+      carries a session needs a live chat turn, i.e. an LLM. Tracing it turned up three
+      daemon-side gaps, filed below.
+      - [x] *(2026-09-10 — fixed the same run.)* The control plane now emits all three from the
+            session handlers, only after the store confirms the change (`DeleteAll` reads the ids
+            first, since the store returns only a count). Proven end to end in `e2e_daemon.rs`: one
+            client renames then deletes a session, and a second client's `subscribe_session`
+            stream receives `SessionRenamed` then `SessionDeleted`.
+            **The daemon never emitted `SessionCreated` / `SessionDeleted` / `SessionRenamed`.**
+            They are declared in the protocol and sent nowhere. The GUI does not notice because it
+            emits its own `session-renamed` Tauri event, so a session renamed from the CLI or a
+            second client never reaches an open GUI. Emit them from the session control handlers.
+      - [ ] **`Subscribe` narrows nothing on the wire.** `SubscribeAction::Session` is recorded in
+            the session store, but every IPC connection forwards the whole event stream
+            (`ipc.rs` outgoing task; the per-client `_subscriptions` field is unused). Decide
+            whether server-side filtering is wanted before a chatty channel makes it matter;
+            `Event::session_id()` is the classifier either would use.
+      - [x] *(2026-09-10 — fixed the same run.)* The forwarder now handles every receive result
+            through a pure `forwardable()`: a lag becomes an `Error` event with code
+            `events_lagged` naming the count ("re-fetch state to resync"), and a closed broadcast
+            ends the loop; 3 unit tests. The outgoing handler it lives in was already over clippy's
+            100-line limit (116 lines) before this; not split in passing.
+            **A lagging IPC client loses events without being told.** The forwarder matches
+            `Ok(event) = event_rx.recv()`, so a `RecvError::Lagged(n)` just fails the pattern and
+            the missed events vanish. Surface it to the client (e.g. an `Error` event naming the
+            count) so it can resync.
+      *(2026-09-10)* `client.scheduler()` / `.workspaces()` / `.channels()` landed: typed wrappers
+      over all **22** scheduler/workspace/channel protocol actions, proven against the real
+      hermetic daemon in `e2e_daemon.rs` — a cron job added → listed → fetched → removed, a temp
+      project opened → listed → fetched → closed, and the channel inventory naming all five
+      adapters (7/7 e2e tests). Two deliberate shapes: `scheduler().update` does **not** take a
+      `task`, because the daemon ignores it (`task: _`) and an argument that silently does nothing
+      is a lie; and `enable`/`disable`/`test`/`send` on channels are wrapped but documented as
+      answering `not_implemented` until the daemon grows them. **Still open:** the "typed event
+      subscription" half — `subscribe_events()` already yields the typed `Event` enum; what is
+      missing is per-session filtering.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
 - [ ] **Sub-agent named sessions** — `spawn_child_session()`, labels, inter-session messaging, timeouts, result callbacks, GUI monitor.
@@ -1835,6 +1934,20 @@ tests, **superseded by P16** (which deleted embedded mode), or **handed to its o
 Kept as a compact ledger; the full dated rationale and `file:line` anchors for each fix live in its commit.
 
 **Security (all done):**
+- [x] **`nanna-client` could not read a daemon reply over 16 MiB** *(found and fixed
+      2026-09-11, while sizing `session.export`)* — a WebSocket read limit protects only the
+      side that sets it. The daemon raised its OWN read limit to 128 MiB after long sessions
+      overflowed tungstenite's 16 MiB frame default; the GUI copied the number beside a
+      comment saying it "must match"; `nanna-client` connected with a bare `connect_async`,
+      so every large reply the daemon SENT the CLI — a whole-session `history`, a full run
+      state, an export — dropped the connection. **Reproduced before fixing:** a session
+      whose name is 20 MiB makes the `create` reply that large, and the new e2e test failed
+      with `Connection("Disconnected")`. One definition now,
+      `nanna_config::bind::IPC_MAX_MESSAGE_BYTES` (in `nanna-config` because the GUI cannot
+      see `nanna-daemon` — the `DEFAULT_IPC_PORT` precedent), applied by the daemon's accept,
+      `nanna-client`'s connect and the GUI's `daemon_client`. The port guard test grew a
+      sibling that fails on any second definition of the value and on a bare
+      `connect_async` in `nanna-client`.
 - [x] User-tool path traversal — `validate_tool_name` at the `create_tool` chokepoint (daemon + GUI). *(2026-07-06)*
 - [x] Workspace file traversal — `validate_context_filename` guards `save_context_file`. *(2026-07-06)*
 - [x] Discord webhook Ed25519 + Slack webhook HMAC-SHA256 verification (constant-time, replay-guarded). *(2026-07-07)*
@@ -1938,10 +2051,47 @@ so neither CI nor any prior run could have caught them:
       one-sided: **a platform gate is only tested by the platform it excludes.** `nanna-gui` stays
       excluded on Linux too, since the Tauri crate needs WebKitGTK system packages and that would
       turn a smoke check into a provisioning job.
-- [ ] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
+- [x] **Linux GUI coverage is still absent** — neither `compile-tests-linux` nor `gui.yml` compiles
       `nanna-gui` on Linux. Adding it means provisioning `libwebkit2gtk-4.1-dev` in CI; decide
       whether that is worth a job before claiming the desktop app is cross-platform.
-- [ ] **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
+      *(2026-09-10 — decided by evidence: the crate had not built on Linux for weeks, see below,
+      and nothing noticed.)* New `check-gui-linux` job in `test-compile.yml` (WebKitGTK apt set
+      from `release.yml`'s Linux job, stubbed sidecar + frontend, `cargo check -p nanna-gui`), and
+      **both GUI jobs now assert the sidecar landed beside the app binary** — the part that
+      makes a *fresh* runner catch the tauri-build class, since the panic needs a pre-existing
+      `build/nanna-daemon/` but the misplaced copy happens every time. Simulated locally both
+      ways in fresh target dirs: stock 2.6.3 → check exit 0, sidecar **not** beside the binary,
+      a stray regular file at `build/nanna-daemon` (assertion fails, as it must); vendored fix →
+      check exit 0, sidecar beside the binary, nothing in `build/` (passes). **First Linux
+      package built:** `pnpm tauri build --bundles deb` → `Nanna_0.3.15_amd64.deb` (40.8 MB,
+      `usr/bin/nanna-gui` + the `usr/bin/nanna-daemon` sidecar, GUI release link 5m38s); the
+      command's only error was updater signing without `TAURI_SIGNING_PRIVATE_KEY`, correct for
+      an unsigned local build.
+- [x] *(2026-09-10)* **`nanna-gui` did not build on Linux or macOS at all — an upstream bug, now
+      patched.** Cargo's build-dir layout v2 (default on nightly since August, stable in **Rust
+      1.100, 2026-11-12**) nests `OUT_DIR` one level deeper (`build/<pkg>/<hash>/out`).
+      `tauri-build 2.6.3` walks a fixed three levels up to find the target dir, lands on
+      `target/<profile>/build`, and `copy_binaries` calls `remove_file` on `build/nanna-daemon` —
+      the daemon's own build directory — so the build script panics `IsADirectory`
+      (`tauri-build-2.6.3/src/lib.rs:80`). **Windows escaped only by the `.exe` suffix**, and was
+      still wrong: its sidecar was copied into `build/`, not beside the app. Upstream fix:
+      [tauri#15831](https://github.com/tauri-apps/tauri/pull/15831) (merged 2026-08-06, due in
+      tauri-build 2.7.0 via release PR [#15634](https://github.com/tauri-apps/tauri/pull/15634)).
+      Landed `vendor/tauri-build` = crates.io 2.6.3 plus exactly that diff, through
+      `[patch.crates-io]` and excluded from the workspace (not linted or tested as ours).
+      Verified both ways on one target dir: `cargo check -p nanna-gui` panics on the committed
+      tree and exits 0 with the patch, with the sidecar now at `target/debug/nanna-daemon`.
+      Rejected: `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT` (cargo-internal, temporary by
+      name, and needed in every shell and CI step) and a git-rev patch (pulls tauri's whole repo
+      and a second, git-sourced `tauri-utils`). **Retirement is a test, not a note:** a path
+      `[patch]` stays applied even after a fixed release exists, so
+      `vendored_tauri_build_retires_with_the_next_tauri_release` keys on `tauri-codegen`, which
+      ships in lockstep with `tauri-build` — verified it fires by bumping it to 2.7.0 in the lock.
+      WebDriver still cannot run on this host (no `WebKitWebDriver` on Arch; see P4).
+- [x] *(2026-09-10 — done: `bench/BASELINE.md` Suite 2 now carries Linux rows, **38.1 µs /
+      0.591 ms / 4.08 ms** at N = 1k/10k/50k on a quiet 7950X3D, every budget with ≥ 5x
+      headroom; recorded as a platform baseline beside the Windows rows, not as an
+      improvement.)* **Re-measure Suite 2 (vector search) on Linux, on a quiet box, and record a platform
       baseline.** The 2026-09-07 run measured `simd_batch` at **0.040 / 0.869 / 5.20 ms** for
       N = 1k/10k/50k — comfortably inside the ≤0.20 / ≤5.0 / ≤25 ms budgets and *below* the recorded
       p95s, which is a sound pass (it held under a load average of 112 with a second Rust build
@@ -2030,6 +2180,16 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+            - [ ] *(research 2026-09-10)* **Burn 0.22 is in pre-release and breaks the API Mummu
+                  is written against** — stable is still 0.21.0, but
+                  [0.22.0-pre.3](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3)
+                  (2026-08-25) removes the `Tensor` backend generic in favour of a high-level
+                  `Device` ([0.22.0-pre.1](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.1),
+                  #4717), deletes `burn-candle` and deprecates `burn-ndarray`. Inference-relevant
+                  additions: two-level quantization scales, UE4M3 scales (CPU only so far), custom
+                  fusion, a graph-capture backend. For Nanna the consequence is a rule for the P12
+                  glue: **never name a `burn` type in Nanna's API** — take Mummu's own request /
+                  token / embedding types, so the 0.22 migration stays inside Mummu.
       - [ ] *(research 2026-07-23)* **Re-confirmed, nothing moved: Qwen3.5-9B is still the 8 GB default, and
             Burn is still 0.21.** Two checks worth recording because they *prevent* churn rather than cause it.
             (1) 2026 round-ups still rate **Qwen3.5-9B the best 8 GB function-calling pick "by a significant
@@ -2060,6 +2220,14 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
             per-model call formatting, not a live dependency. Source:
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
+      - [ ] *(research 2026-09-11)* **Qwen3.8-Flash-Next (2026-08-26) is not a local candidate
+            — do not chase it for the 16 GB tier.** 125B total / 6B active MoE (512 experts,
+            10+1 active), ~360 GB full precision with only an official FP8 variant; even int4
+            would be ~62 GB of weights. Its Gated DeltaNet + sparse-attention hybrid has
+            day-one support only in vLLM/SGLang, framed as a Qwen4 architecture preview, under
+            the Qwen Community License (not Apache-2.0). Relevant only to the CPU-offload item
+            below, and only once a runner supports the architecture.
+            Source: [CellCog](https://cellcog.ai/blog/qwen3-8-flash-next).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -2307,6 +2475,35 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
+      the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
+      `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*
+      (mutually unrelated vectors, nothing fills, every seed scans to the end): doubling factors
+      climb 2.49 → 2.88 → 3.64 → **4.43**, i.e. **N^2.15**, and 16k memories cost **4.4M pairs /
+      218 ms** — 7.2× the pairs of the dense arm at the same N. Extrapolated: **50k ≈ 51M pairs /
+      ~2.5 s**, **200k ≈ 1.0B / ~49 s**, **500k ≈ 7.2B / ~6 min**. That is the real wall, and the
+      sparse regime is the realistic shape for a long-lived already-consolidated store — the
+      leftovers are exactly the memories that did not merge. **Benchmark the ANN work on the
+      sparse arm; the dense arm cannot show a win.**
+      *(Correction, same run: an earlier reading of this bench claimed the pass was linear and the
+      O(N²) premise wrong. That was an artifact of the similarity-veto bug below — with the floor
+      0.50 above the old 0.45 threshold every pair matched immediately, every cluster filled at 64,
+      and each seed broke out after ~64 iterations. The premise was right; the first measurement
+      was taken on a broken system.)*
+      - [x] *(2026-09-09)* **Found while baselining: cosine similarity could not veto a merge.**
+            `composite_cluster_score`'s non-similarity terms are all maximal for the commonest pair in
+            a store (`recall_affinity` and `importance_proximity` are 1.0 by construction when the
+            values are *equal*, including `0 == 0`; `age_prox` ~1.0 within a session), pinning the
+            score at **0.50** against a **0.45** default threshold **whatever the embeddings say**.
+            Measured: orthogonal vectors 0.500, anti-correlated 0.500, four mutually unrelated
+            memories → one cluster of four. Fixed by the *default*, not the algorithm — the drift
+            fixture's own 0.65 threshold always satisfied the invariant and demands cosine ≥ 0.30;
+            the shipped default demanded 0.000. Default `cluster_threshold` 0.45 → 0.55, plus
+            `non_similarity_floor()`, `min_required_similarity()` (what a config *really* asks for)
+            and `ConsolidationConfig::validate()` to keep weights and threshold in step — this went
+            stale silently the last time the weights alone were retuned. Suite 3 numbers unmoved
+            (0.90 / 1.000 / 54 deduped / 60 → 6), and that test now asserts them exactly instead of
+            `> 0.0`, which would have passed at 30 memories as happily as at 6.
       - [ ] *(research 2026-07-24 — **corrects a load-bearing "fact"; read before picking an HNSW crate**)*
             **The `turso` crate we already pin ships native vector SQL functions.** Both this roadmap and the
             `daily-dev` Appendix C assert "Turso stores embeddings as f32 BLOBs and does **NO** vector search —
@@ -2575,6 +2772,45 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             2026-07-25 (`search_by_embedding_sql`) is the near-term path for the RAM-ceiling win, and an
             **external pure-Rust HNSW crate** (`hnsw_rs`/`hnswlib-rs` above) remains the only route to
             *approximate* indexing — do not block on a turso release for it.
+- [ ] *(research 2026-09-09 — grades the similarity-veto fix landed the same run)* **Our semantic bar
+      is 0.10; the field's is ~0.7. Restoring the veto was necessary, not sufficient.**
+      The 2026 agent-memory literature reports the failure mode we hit almost verbatim — a
+      clustering similarity threshold that is "too low" causes *"semantically unrelated interactions
+      [to] merge incorrectly"*, while too high fragments related ones — and settles around
+      **θ_sim ≈ 0.7** for clustering, **τ ≈ 0.85** for merge decisions, and **0.92** for
+      near-identical facts. That last number is exactly the `IngestAction::Reinforce` bar dream
+      phase (b) already folds at, which is a good independent check that our *dedup* line is right.
+      Our *clustering* line is not: after this run's fix the composite still only demands
+      `min_required_similarity() = 0.10`, because the non-semantic floor (0.50) eats most of the
+      0.55 threshold. Reaching the field's 0.7 with the shipped weights would need
+      `cluster_threshold = 0.85` (0.65 → 0.30, 0.75 → 0.50, 0.85 → 0.70), or a rebalance that
+      lowers the floor instead.
+      **Do not just turn the knob** — pick the target with the retention harness: raising the bar
+      trades compression for fidelity, and Suite 3 measures both (compression 0.90 / recall 1.000).
+      - [x] *(2026-09-09)* **The missing instrument now exists.** Suite 3's corpus could not measure
+            this at all — its members sit at cosine ~0.999, above the `Reinforce` line, so phase (b)
+            folds them and `clusters_formed` is 0 regardless of the threshold. `CorpusParams` gained
+            `member_spread` (default 0.02 — every existing fixture unchanged); widening it to 0.6
+            drops within-topic similarity between the clustering bar and the dedup bar, so pairs
+            must go through `cluster_memories`. `the_clustering_threshold_is_a_measurable_lever`
+            pins that the lever responds: threshold **0.55 → 2 clusters, 32 → 18 memories**;
+            **0.75 → 2 clusters, 32 → 18**; **0.95 (demands cosine 0.90) → 0 clusters, 32 → 32**,
+            no compression at all. The discriminating range for that corpus is 0.75..0.95.
+      - [x] *(2026-09-09)* **Sweep run and priced — `bench/BASELINE.md` Suite 3c.**
+            **0.55 → 0.75 is free**: identical clusters/merges/compression (0.450) and recall
+            (1.000) while the cosine actually demanded rises 0.10 → 0.30 → **0.50**. Default moved
+            to **0.75**, the top of that flat range — a 5× stricter semantic bar at zero measured
+            cost. The control arm (tight corpus, folded by phase (b)) is flat at every threshold,
+            which is what validates the instrument.
+            **The remaining move is priced, not free:** 0.85 (cosine **0.70**, the θ_sim the 2026
+            literature uses) costs compression 0.450 → 0.383 — a 15% relative drop — at recall
+            **1.000**. Recall never moves anywhere in the sweep, so this trades compression against
+            merge *precision*, not retrievability.
+      - [ ] **Owner call: spend that 15% for the literature's 0.70 bar?** The number is no longer
+            the unknown; what is unknown is whether these synthetic corpora represent a live store.
+            Re-run Suite 3c against a real memory dump before deciding.
+      Sources: [Memory in the Age of AI Agents](https://arxiv.org/pdf/2512.13564),
+      [State of AI Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
       `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
@@ -2663,6 +2899,13 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             workspace dependency by then (don't add a second heavy ML dep just for this). Validate any fitted set
             through the retention harness before it becomes the default, same gate the w20 flip used. Sources:
             [fsrs-rs](https://github.com/open-spaced-repetition/fsrs-rs), [fsrs crate](https://crates.io/crates/fsrs).
+            - [ ] *(research 2026-09-10)* **`fsrs 6.6.2` (2026-08-28) is maintenance only** —
+                  training skips validation, a Cost-ADR seed-isolation fix, and a new
+                  `evaluate_with_card_ids` ([release](https://github.com/open-spaced-repetition/fsrs-rs/releases/tag/v6.6.2)).
+                  Nothing here changes the adoption gate above. **FSRS-7 is now visibly in
+                  progress in the Rust crate** (issue [#445](https://github.com/open-spaced-repetition/fsrs-rs/issues/445)
+                  reports a bug in `clip_fsrs7_parameters`; [#428](https://github.com/open-spaced-repetition/fsrs-rs/issues/428)
+                  tracks the timeline) but unreleased — still do not plan on it.
       - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
             The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
             forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
@@ -3045,7 +3288,17 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       be bounded and measured, not assumed** — the drain's budget bound (embed only what this process
       parked) is the mechanism, and the missing half is evidence that it converges within a turn.
       Concrete, in reach:
-      - [ ] **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
+      - [~] *(2026-09-11 — the instrument landed; the live-mission number is still to take.)*
+            The whole-row vector is what makes a memory findable, and it is filled by the
+            in-memory backfill through `VectorStore::set_embedding_for_model` — the durable
+            `embedding_queue` only ever holds chunk work. So the store now records, on a
+            memory's FIRST vector ever, `now − timestamp` into a ring of the last 512 waits
+            (sized for the p95: 25 samples above it). A re-embed after a provider switch keeps
+            its old buckets and is deliberately not counted, or a days-old memory would read
+            as a days-long wait. `memory.stats` reports `queue_to_searchable {samples,
+            p50_secs, p95_secs}`. Seconds, because `timestamp` is — ample for a number that
+            lives in seconds-to-minutes. **Open:** run a live mission and record p50/p95.
+            **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
             row having a vector, p50/p95, under a live mission. This is Nanna's staleness number and it does
             not exist yet.
       - [x] **Add a write-path suite to `bench/BASELINE.md`** *(2026-08-25)* — "Suite 2 (write path)",
@@ -3058,7 +3311,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             rather than a sample; the ordinary-fact budget is a **floor**, because 0 there would mean the
             deferral had swallowed a path that must still dedup inline. Instrument:
             `cargo test -p nanna-daemon write_path`.
-      - [ ] **Report embedding-generation latency separately from vector-search latency.** The retrieval
+      - [x] *(2026-09-11 — done.)* New `MemoryService::recall_scoped_with_report` returns a
+            `RecallReport` whose `RecallTimings` time the query embed and the search (row
+            scan, chunk scan, scoring, assembly) separately; `recall_scoped_with_coverage`
+            is now a two-line wrapper, so no caller changed. Every recall logs ONE line naming
+            both stages (it replaces the two "generating embedding" / "searching" lines that
+            bracketed the embed without timing it), and the daemon's `memory.search` reply
+            carries `timings: {embed_ms, search_ms}`. Bench Suite 2 still measures the scan
+            alone by design; this is the live number beside it.
+            **Report embedding-generation latency separately from vector-search latency.** The retrieval
             budget is per *stage* (embed → search → rerank → assemble); a 4 ms search behind a 400 ms embed
             is a 400 ms retrieval, and our numbers currently name only the second half.
       Sources: [Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads
@@ -3126,10 +3387,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       assert the property for all 14 migrations: no semicolon inside a comment, no comment-only
       chunk reaching `conn.execute`, and unique names in applied order. Audited the 13 pre-existing
       migrations — all clean, so this is a trap that was closed before it was ever sprung.
-      - [ ] Consider making the runner strip comments before splitting, rather than relying on the
+      - [x] Consider making the runner strip comments before splitting, rather than relying on the
             test to keep authors out of the trap. Deferred on purpose: it changes how all 14
             migrations are parsed, so it deserves its own increment with round-trip tests, not a
             drive-by inside a feature commit.
+            *(2026-09-11 — done, as its own increment.)* `migrations::split_statements` is a
+            small SQL lexer: a `;` ends a statement only outside `--`/`/* */` comments and
+            `'…'`/`"…"`/`` `…` `` quoting (a doubled `''` escape falls out of leaving and
+            re-entering the string); comments are dropped, so a trailing note is never a
+            comment-only "statement". The round-trip test the deferral asked for:
+            **every one of the 15 shipped migrations executes exactly the statements it did
+            under `split(';')`** (compared comment-free, whitespace-collapsed). Plus the traps on
+            a real turso database — a `;` in a comment, a `;` and `--` inside a string, an
+            escaped quote, a block comment, a trailing note — and a fresh in-memory store applying
+            all 15 exactly once. The guard test that only kept authors away from `;` in comments
+            is retired with the trap.
 - [ ] **Resample the timeline into per-signal series** — salience(t), access-rate(t), emotional valence(t), per-cluster topic-activation(t).
 - [ ] *(research 2026-09-08)* **Give each consolidated fact a validity window instead of
       overwriting it.** [Beyond Dialogue Time: Temporal Semantic Memory for Personalized LLM
@@ -3596,10 +3868,48 @@ asks permission or restricts her.)*:
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
-- [ ] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
+      - [ ] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
+            already ships, in the wrong place.** `write_file` parks the outgoing version at
+            `<file>.__prev__` (ONE slot, overwritten each write) plus the richest earlier version
+            at `<file>.__best__` — both *inside the user's tree*, and `edit_file` parks nothing.
+            Claude Code's checkpointing is the shape to copy: a copy of each file taken *before*
+            its edit tools change it, stored outside the workspace (`~/.claude/file-history/<session>/`),
+            the **100 most recent checkpoints** per session kept, and when an older one is
+            discarded each file's **first** snapshot is still kept as a baseline. It restores
+            only its own write/edit changes — not shell side effects — which is the honest
+            boundary for Nanna too (`exec` writes are out of scope). Bound derives from the
+            data dir's budget, not a magic count; per-session store under the daemon data dir
+            keeps user repos free of `.__prev__` litter.
+            Source: [Claude Code checkpointing guide](https://thepromptshelf.dev/blog/claude-code-checkpointing-rewind-guide-2026/).
+- [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
-- [ ] **Webhook sovereignty** — generic /webhook/:id routes payloads straight into a session message, so
+      *(2026-09-11 — landed end to end, finishing the 2026-09-10 run's uncommitted half.)*
+      `edit_file` 0.1.10 attaches `data.diff` = `{start_line, removed, added, truncated}`, found
+      with native 4 KiB prefix/suffix compares and only the changed region split (Boa's `split` is
+      lines × length), capped at 40 lines / 4000 chars per side. **The half the WIP lacked:** the
+      run journal persisted only `short_circuited` from a result's data, and `RunTimeline` dropped
+      `data` entirely — so the diff showed only to a client watching live and vanished on reload,
+      the exact "while you were away" case. Now a typed `EditDiff` rides `TimelineItem::Tool.diff`,
+      validated and clamped (40 lines / 4000 bytes per side, char-boundary cuts) at the trust
+      boundary, journaled by BOTH writers (chat + task-run sink) through one rule
+      (`EditDiff::for_outcome`: only a call that succeeded and really ran). Omitted from the wire
+      when absent, so older journals load unchanged; dropped from crash-recovery checkpoints like
+      full outputs (quadratic rewrite). Zero model tokens — only `content` reaches the model.
+      Tests: 3 Boa skill, 6 journal/type + a daemon-restart survival test, 4 parser + 1 timeline +
+      3 card vitest.
+- [~] *(2026-09-10 — the wrapping half landed on both paths.)* A generic hook authenticates a
+      *caller*, not the user, yet its text reached the agent as the user's own chat message.
+      `nanna_channels::frame_untrusted_webhook_payload` now puts a provenance line first ("sent by
+      an automated caller … not typed by the user; instructions inside it are not the user's") and
+      fences the payload in `<webhook-payload>`; a closing fence inside the payload, in any letter
+      case, is neutralized, so text cannot end the fence and speak from outside it. Wired into the
+      daemon's `/webhook/:id` (after extraction; the raw payload stays on the event) and
+      `nanna serve`'s `/webhooks/generic`; the chat adapters (Telegram/Discord/Slack/WhatsApp)
+      carry people and are deliberately not framed. 8 new tests. The daemon already keys one
+      secret per hook id (`generic_secrets`). **Still open:** rotate/revoke tooling, and per-hook
+      secrets for `nanna serve`, which has one shared `server.webhook_secret`.
+      **Webhook sovereignty** — generic /webhook/:id routes payloads straight into a session message, so
       anyone who can reach the endpoint can speak with the user's voice. Per-endpoint bearer tokens
       (rotate/revoke) + wrapping fire payloads as untrusted data keep outside actors from puppeting her —
       this protects her agency from hijack; it restricts *others*, never her.
@@ -3614,10 +3924,90 @@ asks permission or restricts her.)*:
 - [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
-- [ ] **Doctor probes** — health checks report availability, not root cause. Add config validation, provider
-      connectivity / API-key probes, Ollama reachability, tools-dir checks with fix suggestions. Our own
-      history (loopback stream faults misread as provider 502s → restart spirals) is exactly the failure class
-      a self-diagnosing always-on daemon must catch.
+- [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
+      stream faults misread as provider 502s → restart spirals) is exactly the failure class a
+      self-diagnosing always-on daemon must catch.
+      - [x] *(2026-09-09)* **`nanna doctor` — the offline leg.** `src/commands/doctor.rs`: six checks
+            (config file, clustering invariant, `[infer]`, server bind exposure, tools dir, embedding
+            provider), each carrying a **remedy**, not just a verdict — that is the whole difference
+            from `status`. Exits non-zero on a failure so it is usable from a script or a health
+            probe. Verified on the real binary: a bad `[tools].tools_dir` reports `FAIL` with the fix
+            and `EXIT=1`; the shipped defaults report clean. 7 tests, one of which asserts the
+            *invariant* that no non-ok check may ship without a remedy.
+            Nice side effect: the clustering row prints the **effective** semantic bar
+            (`a merge needs cosine >= 0.10`) rather than `cluster_threshold`, which reads higher than
+            what it actually demands — so the gap the research item describes is visible to an
+            operator without reading the source.
+      - [x] *(2026-09-11 — **deleted**, the first of the two orders this item allows; wiring it
+            was never safe, because every config ever written from the old defaults already
+            carries `host = "0.0.0.0"` on disk, so "change the default first" could not have
+            protected them. A stale key still loads — no `deny_unknown_fields`, pinned by
+            `legacy_server_host_key_still_loads`, which also asserts a freshly written config
+            no longer carries the key. `nanna doctor`'s `server.bind` now states the effective
+            answer — loopback unless `nanna server --host` — and stopped branching on
+            `[server].enabled`, which `nanna server` does not read either: its "HTTP server
+            disabled" verdict was itself a false claim.)*
+            **`[server].host` is a dead field shaped like a security control** *(found 2026-09-09
+            while writing the doctor)*. **Nothing reads `nanna_config::ServerConfig::host`** —
+            verified by an exhaustive grep across Rust, TS and Vue. The bind in
+            `nanna_server::start_server` takes `nanna_server::ServerConfig`, a *different* struct,
+            which `commands::serve` builds from the **`--host` CLI flag** (default loopback); only
+            `webhook_secret` is carried over from the config. So a user who sets
+            `[server].host = "127.0.0.1"` has secured nothing, and the shipped **`0.0.0.0`** default
+            reads as "exposed to the network" while binding nothing of the sort.
+            **Do not fix this by making the field live.** With its current `0.0.0.0` default that
+            would turn an inert field into a real exposure of an HTTP surface that has no
+            authentication of its own — a security regression delivered as a cleanup. Either delete
+            the field, or change its default to loopback *first* and wire it *second*, in that
+            order. Meanwhile `nanna doctor` reports the field as inert rather than warning about a
+            binding that never happens.
+      - [ ] *(found 2026-09-11, deleting the field above)* **The rest of `[server]` is inert
+            too, and the README documents it.** `nanna server --port` defaults to the literal
+            `"3000"` in `src/main.rs`, not to `config.server.port`, so the README's
+            `[server] port = 3000` example sets nothing and the `PORT` env override in
+            `Config::with_env_overrides` writes a field no code reads. `[server].enabled` is
+            read only by onboarding (which writes it) and, until today, the doctor.
+            - [x] **`port`:** make `[server].port` (and `PORT`) the default for
+                  `nanna server --port`, the flag still overriding — the documented key then
+                  does what it says. No exposure risk: the host stays loopback.
+                  *(2026-09-11 — done. `--port` is now `Option<u16>`, resolved by the pure
+                  `commands::serve::server_port(flag, &config)`: flag, else `[server].port`,
+                  which `PORT` and the onboarding "Server port" answer both write — the
+                  onboarding answer had been silently discarded. README's example now shows
+                  only keys that do something.)*
+            - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
+                  command without surprising whoever typed it; delete it, or define it as
+                  "the daemon starts the HTTP surface" and wire that.
+      - [ ] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
+            server.** Chat and embeddings reach Ollama through `[memory].ollama_host`;
+            summarization (dreaming, context compression) through `[llm].ollama_url`, which
+            defaults to localhost — so pointing the first at a GPU box leaves summaries on
+            localhost. **Owner call** on which key wins: `ollama_url` defaults to
+            `Some("http://localhost:11434")` and saved configs carry that default, so code
+            cannot tell a deliberate split from an untouched one (the `[server].host` trap
+            again). Meanwhile `nanna doctor` warns when both are in use and differ
+            (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
+      - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
+            Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
+            reasons that are not configuration, so mixing them means a laptop with no internet
+            reports its config as broken. Give them their own flag (`--probe`/`--online`).
+            - [x] *(2026-09-11)* **Ollama, behind `nanna doctor --online`.**
+                  `nanna_llm::probe_ollama`: one unauthenticated `GET /api/tags`, connect and
+                  request each bounded by 3 s, the answer read in chunks against a 4 MiB cap (a
+                  real store answers in tens of KiB); a non-2xx answer or a body that is not
+                  Ollama's (a router login page) is reported, not parsed. The doctor probes each
+                  server in use **once** — chat+embeddings and summarization are folded when they
+                  name one server in any loopback spelling — and FAILs on a server that does not
+                  answer and on a configured model it does not have (`nomic-embed-text` compared
+                  as `nomic-embed-text:latest`, Ollama's own default). Verified on the real binary
+                  against a dead port (FAIL, exit 1), a mock server missing the summarizer (only
+                  `qwen3:4b` named, `localhost` and `127.0.0.1` probed once, exit 1) and the same
+                  mock with every model (exit 0). 13 tests, four of them over real sockets.
+            - [ ] **Provider connectivity and API-key validity.** Not done, on purpose: a key
+                  probe reads the keyring and sends the key off the machine, and
+                  `NANNA_CONFIG_PATH` does not isolate the keyring, so it cannot even be tested
+                  here without touching the owner's real credentials. **Owner call** on whether
+                  `--online` should ever do that, and behind what confirmation.
 
 **D. Agent quality-of-life** (cheap, high-leverage; several pairs share infrastructure — build together):
 - [ ] **Instruction skills + slash macros** — tools are executable-only; there's no packaged *procedure* the
@@ -3679,8 +4069,45 @@ asks permission or restricts her.)*:
       file injection beats a read_file roundtrip the model may fumble; pairs with the P4 drag-drop item.
 - [ ] **"think hard" phrases** — map natural-language budget phrases onto the existing ThinkingMode ladder;
       chat-first users on Telegram can't flip config flags mid-message.
-- [ ] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
+      - *(scoped 2026-09-11, not built — the ladder above `Medium` does not reach the wire, so a
+        phrase mapped onto it would be a lie.)* Traced through `nanna-agent::loop_runner`:
+        on **adaptive** Claude models (4.6+) a higher mode only adds its budget as output-ceiling
+        headroom (`request_output_budget`) — the model still chooses its own depth, nothing asks
+        it to think harder; on the **legacy** contract the sent budget is clamped to
+        `max_tokens − MIN_OUTPUT_RESERVE_TOKENS` (7080 at the shipped 8192), so `High` and
+        `Maximum` send the *same* budget, as `Medium`'s own doc warns; on **Ollama** the mode
+        does not reach the request at all. **Prerequisite, owner call:** make the upper rungs
+        real first — widen the legacy ceiling by the budget as the adaptive path already does,
+        and/or map rungs onto the API's effort control on models that have one — then the
+        phrase layer is a small pure function over the user's message plus one per-turn
+        `agent_config.thinking_mode` bump beside `apply_chat_model_override` in
+        `chat_with_options` (escalate only: `Instant` stays internal-only).
+        *(research, 2026-09-11)* **Both upper-rung targets exist upstream, and nanna uses
+        neither.**
+        - **Anthropic:** `output_config.effort` (`low`/`medium`/`high` (the default)/`xhigh`/`max`;
+          Opus 4.5+, Sonnet 4.6/5, Fable, Mythos). The docs call it *the* recommended thinking-depth
+          control where adaptive thinking exists. nanna sends no `output_config` today.
+        - **Ollama:** `think` takes `"low"|"medium"|"high"|"max"` as well as a bool, on models that
+          support levels (gpt-oss). nanna sends only `think: true` (`nanna-llm` `lib.rs`).
+
+        **The design constraint for the owner call:** changing top-level effort between requests
+        invalidates the prompt cache. Only Fable 5.1, Mythos 5.1 and Opus 5 take a per-message effort
+        change that keeps it (beta header `mid-conversation-output-config-2026-07-01`). A per-turn
+        "think hard" bump would therefore cost cache hits on every other model. So either escalate
+        per message only where that is supported, or make the phrase set effort for the rest of the
+        conversation. (Sources: platform.claude.com/docs/en/build-with-claude/effort,
+        docs.ollama.com/api/chat.)
+- [~] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
       carries `model: Option<String>`, the Chat message doesn't.
+      - [x] *(found done 2026-09-11 — landed 2026-08-17 in #252, "per-chat model selection")*
+            **For clients:** the `session.set_model` IPC verb pins a session's chat model (`null`
+            clears it), the GUI's session model picker drives it, and
+            `apply_chat_model_override` moves exactly the chat model on the per-turn config clone
+            — never the shared service config, so sub-agents, summarization and other sessions
+            are untouched (pinned by `a_chat_model_pick_moves_exactly_two_fields`).
+      - [ ] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
+            user still cannot say "use the big model for this conversation" — a `/model <name>`
+            channel command over the same `session.set_model` verb would close it.
 - [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
       restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
       (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
@@ -3693,15 +4120,69 @@ asks permission or restricts her.)*:
       hook would plug into. Remaining: the **guard** half — a hook that can *refuse* a call — which is a
       different shape (it has to run before execution and be able to fail the call), and a scripting
       binding so the interceptor is user-editable rather than Rust-only.
-- [ ] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
+- [x] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
       `with_hour_cache_write`). One field + a config flag keeps the big prefix warm across heartbeat/cron
       gaps on the cloud escape hatch.
+      *(2026-09-10)* `[llm] prompt_cache_ttl = "5m" | "1h"` → `nanna_llm::CacheTtl` on every
+      breakpoint of a request, on both the boot and the hot-reload path. **The invariant is one TTL
+      per request**: Anthropic returns 400 when a longer-TTL breakpoint follows a shorter one, or
+      when an explicit last-block marker disagrees with the top-level one — and the OAuth path
+      stamped a *fresh 5-minute* marker on the last system block, which would have been exactly
+      that 400 the moment 1h was switched on. It now inherits the request's own marker (tested
+      on the serialized JSON). The three copy-pasted `starts_with("claude")` blocks in the agent
+      loop (initial build, routing swap, rescue retry) collapsed into one
+      `prompt_cache_control(model, ttl)`, so no path can mix TTLs. The 5-minute default is sent
+      as **no `ttl` key**, so every existing request is byte-identical (asserted on the wire);
+      an unknown value fails config parsing naming `5m`/`1h`. 9 new tests across 4 crates.
+- [x] *(2026-09-10 — landed the same run.)* `usage.cache_creation.ephemeral_1h_input_tokens` is
+      parsed on both the response and the `message_start` stream path (a split that exceeds its
+      total is provider data and is clamped, not asserted); it rides `StreamEvent::MessageStart`
+      → `LlmResult` → `RequestObservation` → a separate `total_cache_creation_1h_tokens` in
+      `model_stats` (serde-defaulted, so stored stats from before still load) → migration
+      `015_model_stats_cache_ttl` (an `ALTER TABLE … DEFAULT 0` column, round-tripped through
+      insert *and* upsert); the report prices it through `estimate_cost_usd_with_hour_writes`.
+      1M tokens written at 1h now report **2x input** ($6.00 on Sonnet-class) instead of the
+      5-minute $3.75. 8 new tests; 994 pass across the four touched crates.
+      **Price 1-hour cache writes at 2x in the cost report.** `estimate_cost_usd`
+      takes one undifferentiated `cache_write_tokens` and prices it at the 5-minute 1.25x rate, so
+      with `prompt_cache_ttl = "1h"` the reported spend under-counts every write by 0.75x input.
+      `ModelPricing::with_hour_cache_write` exists and is still unwired. Fix from the API's own
+      split rather than from config (config can change between requests):
+      parse `usage.cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` in
+      `Usage` + `MessageStartUsage`, carry it through `StreamEvent::MessageStart` and
+      `RequestObservation`, keep a separate 1h total in `model_stats`, and price the two parts
+      separately.
 - [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
       cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
       visibility more than a per-terminal-session number.
-- [ ] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
+- [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.
+      *(2026-09-11 — **conversation export shipped**; memory export, the GUI button and
+      `personality_mode` remain open.)* New `session.export {id, format}` IPC verb, rendered by
+      the daemon (the store's owner, and turso's exclusive lock holder) in `nanna_daemon::export`,
+      so every client gets one document: **Markdown** laid out the way the chat page lays out a
+      message — the run journal (thinking, tool calls with input/output, the P18 edit diffs as
+      ```` ```diff ```` blocks, healed faults, steps), `content` only when the journal has no text of
+      its own, `TASK COMPLETE` plumbing stripped, fences one backtick longer than any run inside
+      so a quoted tool output cannot escape its block — and **JSON**, the stored `Session`
+      verbatim in a versioned envelope (`nanna_export: 1`), proven to deserialize back. CLI:
+      `nanna export <id> [-f md|json] [-o file-or-dir]`, stdout by default; the daemon's
+      suggested filename is a bounded ASCII slug and only its last component is ever joined
+      onto a directory. An unknown id is refused, not exported empty. `PRIVACY.md` updated.
+      - [ ] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
+            session menu, verified over WebDriver once `WebKitWebDriver` exists on the host.
+      - [x] **Memory export** — the same shape for the memory store (FSRS state included).
+            *(2026-09-11 — shipped.)* `memory.export {scope, format}`, rendered by the daemon;
+            `nanna export --memories [--scope global|<workspace>]`. Each memory carries
+            content, provenance (`unknown` when none was recorded — never a guessed
+            `stated`), workspace, the raw FSRS state and the state derived from it, and
+            **no embedding vectors**: they are derived data and most of an entry's bytes.
+            `VectorStore::map_entries` projects under one read lock, so the export never
+            clones the vectors either. Oldest first with an id tiebreak, so the same store
+            exports identically; the scope rule is now one function `list` and `export`
+            share. A daemon running without memory refuses with its reason instead of
+            exporting an empty store as if it were the user's.
 
 **E. Deliberately not building** (audited 2026-07-24, off-thesis — revisit only if the product direction
 changes). **Owner decision 2026-07-24 adds the entire permission-gate family here**: async approval gates,
@@ -4610,6 +5091,20 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       (`a_runs_tool_calls_survive_daemon_restart`) gained a replay entry beside its normal
       call, so the end-to-end claim — a replay survives a restart AS a replay — is
       asserted through Turso rather than argued. 318 nanna-daemon tests green.
+- [x] **The harness sink kept its own copy of the journal writer, and the copy drifted**
+      *(found and fixed 2026-09-11, while wiring the P18 edit diff through both writers)* —
+      `tasks.rs`'s `tool_end` hand-rolled the back-fill that `agent_service::timeline_tool_end`
+      already does, and got three things wrong the shared one gets right: it stored the tool
+      output **uncapped** (the journal's 4000-byte `TIMELINE_OUTPUT_CAP` exists so a
+      thousand-call mission's record stays shippable on remount — task runs are exactly
+      those missions); it back-filled the **newest item with that call id even if it had
+      already completed**, and Ollama reuses call ids per response, so an end with no
+      journaled start overwrote an EARLIER call's outcome; and that same orphan end was
+      otherwise never recorded. Both `tool_start` and `tool_end` now call the chat path's
+      `timeline_tool_start`/`timeline_tool_end` (`pub(crate)`, with `ToolEndRecord`), the
+      same "one policy, one implementation" fix the poisoned-lock entry below applied to
+      `timeline_lock`. 3 sink tests: output capped with its marker, a reused id appends
+      instead of overwriting, and the edit diff rides through.
 - [x] **One panic under the journal lock could wedge a whole harness run** *(found and
       fixed 2026-08-27, while working the item above)* — the two writers to the run
       journal disagreed about what a poisoned mutex means. `agent_service.rs` has always
@@ -4847,7 +5342,11 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
             verification went from "startup is not wedged" to "the mechanism arms on the real
             binary" as soon as an alternate config became reachable.
 
-- [ ] **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
+- [~] *(re-marked 2026-09-11: half of it landed. The "each chunk is still awaited inline" part is
+      done: tool results persist their row and defer the vector, so "the chunks no longer cost
+      the turn anything", with 12 tests (see the deferred-vector entry above). Only the chunk-count
+      bound is left, tracked as its own item: "Bound the chunk *count* per tool result…".)*
+      **P24.3 part 3 is the one genuinely open gap.** Parts 1, 2 and 4 landed
       (`collapse_repeated_lines`, the mid-ingest cancellation check, `log_excerpt`), and the "two
       memory sinks disagree" rider was resolved 2026-08-21 (see P24.3 below). Still open:
       `semantic_chunk(&ingest_content, MEMORY_CHUNK_MAX_CHARS, 0.15)` is bounded only by bytes, and
@@ -4859,9 +5358,12 @@ double-charged preamble vector no longer exists and `estimate_request_tokens` is
       (above) is that drain trigger, so a deferred vector is now recovered at the end of the turn
       rather than at the next restart. The chunk-COUNT bound is still open and still needs a
       derivation, not a magic number.
-- [ ] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
+- [x] **Audit the remaining P24 items one by one and tick them.** This run verified the anchors
       listed above and deliberately did not claim the rest; a per-item pass would let this whole
       section collapse to a few lines of history.
+      *(ticked 2026-09-11 — stale: the audit it asks for was done 2026-08-25. See "Audited item by
+      item, 2026-08-25 — every P24 item has landed" above, which names the anchor proving each
+      verdict.)*
 
 
 #### What is already working — do not re-litigate
@@ -5200,6 +5702,45 @@ keep the phases readable; promote individual items into a phase when they become
 
 ---
 
+### Linux host blockers (found 2026-09-09)
+
+- [x] *(2026-09-11 — fixed by the 2026-09-10 run, which reached master only through this
+      stacked PR: `vendor/tauri-build` carries upstream tauri#15831; see the P11 Linux entry.
+      Both sub-items below were settled by that run too.)*
+      **The Tauri GUI does not build on this Linux host, and it is not our code.** `cargo check -p
+      nanna-gui` fails in `tauri-build 2.6.3`'s build script — verified **pre-existing** by stashing
+      the run's only GUI edit and reproducing it byte-for-byte on unmodified sources.
+      **Root cause, traced:** `tauri_build::copy_binaries` does
+      `if dest.exists() { fs::remove_file(&dest).unwrap() }` (`tauri-build-2.6.3/src/lib.rs:80`),
+      and here `dest` **is a directory**, so it panics with
+      `Os { code: 21, kind: IsADirectory }`. It is a directory because tauri-build infers the target
+      dir by walking up from `OUT_DIR`, assuming cargo's **classic** build-script layout
+      `debug/build/<crate>-<hash>/out` (up 3 → `debug`). This toolchain
+      (`cargo 1.100.0-nightly e8cb624d5`) emits the **nested** layout
+      `debug/build/<crate>/<hash>/out` (up 3 → `debug/build`), and `debug/build/nanna-daemon` is a
+      real directory — the daemon's own build-script output. So the sidecar destination resolves one
+      level too high, onto a directory.
+      Consequences: no `cargo tauri build`, therefore **no WebDriver GUI verification on Linux
+      regardless of the `WebKitWebDriver` gap below**, and `gui.yml` will fail the moment CI moves to
+      this cargo.
+      - [x] *(2026-09-10: vendored the upstream fix — the pin option could not work, the layout
+            is cargo's.)* Fix options, cheapest first: pin cargo/nightly to one still emitting the classic layout;
+            build the GUI with `CARGO_TARGET_DIR` set somewhere no `nanna-daemon` build dir exists;
+            or upstream a `remove_dir_all`/`is_dir` guard to tauri-build. Confirm which layout the
+            currently pinned `nightly-2026-08-27` emits before assuming a pin fixes it — the layout
+            comes from **cargo**, not rustc.
+      - [x] *(2026-09-10: tracked, commit 6032968d.)* `gui/src-tauri/gen/schemas/linux-schema.json` is generated by a Linux build and is not
+            tracked, while `windows-schema.json` and `desktop-schema.json` are. Decide whether to
+            track it once the GUI builds here; not added this run because an unfinished build cannot
+            be trusted to have produced a complete one.
+
+- [ ] **`WebKitWebDriver` is missing (owner-gated).** `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh
+      ensure` reports every other check green — `tauri-driver` installed this run
+      (`cargo install tauri-driver`), curl/python3/base64 present, Wayland session live
+      (`WAYLAND_DISPLAY=wayland-1`). The single remaining gap needs
+      `sudo pacman -S --needed webkit2gtk-4.1`. **The Linux WebDriver harness therefore remains
+      UNVALIDATED** — no run has yet driven the real Nanna GUI on this host.
+
 ## Immediate next actions (top of queue)
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
@@ -5358,6 +5899,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Only worth taking if it is a drop-in for the `gui.yml` typecheck job — swapping the gate
            for a less-proven checker to gain speed we do not need would be a bad trade. Decide by
            running both over `gui/` and diffing the diagnostics, not by the README claim.
+     - [ ] *(research 2026-09-11)* **TypeScript 7.1 — the release carrying the stable programmatic
+           API `vue-tsc` waits on — is targeted for around October 2026**, and framework checkers
+           are expected to ship native builds "within a release cycle or two" after it. So the
+           earliest realistic retry is Q4, and the two version numbers below (npm `typescript`
+           `latest` still 7.0.2, `vue-tsc` still 3.3.11 on 2026-09-11) remain the cheap gate.
+           Sources: [DEV Community](https://dev.to/the-modern-web/why-angular-vue-and-eslint-cant-upgrade-to-typescript-70-yet-and-why-ts-71-changes-441g),
+           [vuejs/language-tools#6121](https://github.com/vuejs/language-tools/discussions/6121).
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -5367,8 +5915,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
-   - Pins now: `turso =0.7.2`, `aegis =0.9.15` (exact — pre-1.0; both at latest stable as of
-     2026-09-08). The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
+   - *(2026-09-11)* `turso 0.8.0-pre.11` was published today (pre.7 → pre.11 since 2026-08-21),
+     but `CHANGELOG.md` on `main` still stops at 0.7.0 and the release pages carry no notes — so
+     there is no evidence yet that 0.8 brings the dense ANN index P13's indexed clustering is
+     waiting on. Held at the exact `=0.7.2` pin (never a pre-release on an exact pin); re-check
+     when 0.8.0 goes stable and its changelog lands.
+   - Pins now: `turso =0.7.2` (exact — pre-1.0; latest stable as of 2026-09-10). The exact
+     `aegis` pin is **gone** (2026-09-10): it froze a version to dodge aegis's C build, and turso
+     already selects the pure-Rust backend itself — now named explicitly as
+     `features = ["pure-rust-crypto"]`. The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
      is gone too** — see the 2026-09-08 sweep. The only lockfile-only holds left are
      `malachite-bigint =0.9.2` and the `libc <= 0.2.186` ceiling, both gated by tests.
    - **`rten` is pinned at `0.24` by `ocrs`, not by us** *(2026-08-25)* — `cargo upgrade --incompatible`
@@ -5413,6 +5968,36 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            0.2.0 — unchanged since 2026-08-25, so the pin stays.)*
      - [ ] `criterion 0.8 → "0.7"`: `cargo upgrade --incompatible` reports this every run and it is a
            **downgrade** — 0.8.2 is what resolves and builds. Do not take it.
+     - [ ] `lopdf 0.45 → "0.42"`: **same trap, first seen 2026-09-09.** `cargo upgrade
+           --incompatible` now reports lopdf's "latest" as 0.42.0 while 0.45 is what the req holds
+           and what builds. Two crates showing this means it is a pattern, not a one-off — treat
+           any `--incompatible` row whose "latest" is *lower* than the current req as a registry
+           artifact and verify before taking it.
+     - [x] *(2026-09-09 sweep)* `cargo update` → 10 compatible bumps (`encoding_rs 0.8.41`,
+           `hybrid-array 0.4.15`, `multiversion 0.8→0.9`, `reqwest 0.13.5`, `tantivy 0.26.2`,
+           `zerocopy 0.8.57`, `target-features` dropped) and **`playwright-rs 0.17 → 0.18`**
+           (major; compiled unchanged). Both held-back crates re-asserted themselves and were
+           pinned back. The libc one is worth recording: **`cargo upgrade -p playwright-rs
+           --incompatible` runs a recursive dependency upgrade that moved `libc` to 0.2.189 as a
+           side effect**, and `held_back_crates_stay_below_their_ceiling` caught it — the ceiling
+           was re-broken by a command with nothing to do with libc, which is exactly the case a
+           remembered pin would have missed. Re-checked both retirement conditions: rustpython-
+           {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
+           GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
+           (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
+           target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
+           tokio codegen ICE and no `turso_core` depth overflow. Full gate re-run under the new
+           channel (1751 tests, clippy 0 errors), and the mirrored `toolchain:` inputs in
+           `budget-gate.yml`, `test-compile.yml` and `release-check.yml` moved with it.
+           **Caveat recorded in the pin comment:** the channel does not control cargo's
+           build-script output layout, which is what breaks the Tauri GUI build on Linux — moving
+           the pin neither caused nor fixes that.
+     - [ ] *(re-checked 2026-09-09, no re-attempt)* TypeScript 7 still blocked and **cheaply
+           confirmed without burning another migration**: npm `typescript` latest is still 7.0.2
+           (no 7.1) and `vue-tsc` is still 3.3.11 — byte-identical to the state that failed on
+           2026-08-27. Check those two version numbers before ever re-trying; if neither moved,
+           the `ERR_PACKAGE_PATH_NOT_EXPORTED` failure is guaranteed.
    - **`libc` must stay at or below 0.2.186 — above it the workspace does not build on Linux at all**
      *(2026-09-07)*. `libc 0.2.187` corrected `POSIX_SPAWN_SETSID` from `c_int` to `c_short` on
      linux-gnu (glibc genuinely stores spawn flags in a `short`, so libc is right). But
@@ -5772,6 +6357,34 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-11 sweep)* `cargo update` -> 2 compatible bumps (`toml 1.1.6`,
+     `toml_edit 0.25.15`); the rest of the lock diff is dependency edges re-resolved onto
+     versions already present (`windows-sys 0.61.2`, `getrandom 0.4.3`, `rand 0.10.2`, …) — no
+     package added or removed. Both guarded pins fired again and were pinned back
+     (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`); `rustpython-{vm,codegen}`
+     still 0.5.0 and `pymath` still 0.2.0, so both stay. `cargo upgrade --incompatible`: only
+     the two known downgrade rows (`criterion -> "0.7"`, `lopdf -> "0.42"`), rejected.
+     `tauri-build`/`tauri-codegen` still 2.6.3, so the vendored patch stays. GUI: `pnpm
+     outdated` clean except TypeScript 7 — npm `latest` still 7.0.2 (7.1 only as `next` dev
+     builds) and `vue-tsc` still 3.3.11, so not attempted. Toolchain pin `nightly-2026-09-08`
+     held (moved two runs ago). Verified on the tree merged with #318, cold on tmpfs:
+     **1790 tests pass / 0 fail / 12 ignored** (71 binaries), clippy clean of errors,
+     `cargo build --release -p nanna-daemon` green in **6m33s**.
+   - *(2026-09-10 sweep)* `cargo update` -> 17 compatible bumps (`reqwest 0.13.5`,
+     `tantivy 0.26.2`, `multiversion 0.9.0`, `uuid 1.26.1`, `zerocopy 0.8.57`, …; the stale
+     `target-features 0.1.6` drops out). Both guarded landmines fired again and were pinned back
+     with the documented commands (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`);
+     `rustpython-{vm,stdlib}` are still 0.5.0 on crates.io, so both pins stay.
+     `cargo upgrade --incompatible`: `playwright-rs 0.17 -> 0.18` taken (compiled unchanged);
+     `lopdf 0.45 -> "0.42"` rejected — the downgrade row again. GUI: `happy-dom 20.14.3`,
+     `@lucide/vue 1.44.0` (in range); `typescript 7` not attempted, blocker unchanged.
+     **Toolchain: carried the `nightly-2026-09-08` pin from the still-open 2026-09-09 PR
+     (#318) as the identical commit, instead of moving to `2026-09-09`.** One day of drift buys
+     nothing, a different pin would be a certain merge conflict, and the identical commit merges
+     as a no-op whichever PR lands first.
+     Verified cold on tmpfs (quiet host, load < 4): **1722 tests pass / 0 fail / 12 ignored**
+     (69 binaries), clippy **0 errors** (2737 warnings), `cargo build --release -p nanna-daemon
+     --locked` green in **7m23s**, 238/238 vitest, `vue-tsc --noEmit` clean.
    - *(2026-08-28 sweep)* `cargo update` -> 6 compatible bumps (`chacha20 0.10.2`,
      `cpufeatures 0.3.1`, `flate2 1.1.10`, `libredox 0.1.21`, `twox-hash 2.1.4`, `wide 1.7.0`).
      `cargo upgrade --incompatible` offered four; **two applied green, both compiled unchanged** —
@@ -5826,7 +6439,22 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      Also re-checked and left pinned on purpose: `boa` (crates.io latest is still **0.21.1**, which
      pins icu ~2.0 while the tree is on icu 2.2 / temporal_capi 0.2.6 — the git rev `4f98f644` stays),
      `turso =0.7.2`, `aegis =0.9.15`.
-     - [ ] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
+     - [x] *(2026-09-10)* **Retired — and it had been redundant since turso 0.7.** Issue #7660
+       closed 2026-09-08 via PR #7905, but that only made `simsimd` optional; the real answer was
+       already shipping: `turso 0.7.2` has a `pure-rust-crypto` feature (`turso_core` →
+       `aegis/pure-rust`, whose build.rs returns before touching `cc`), and **`turso_sdk_kit`
+       enables it by default**. `cargo tree -e features -i aegis` shows `aegis feature
+       "pure-rust"` ← `turso_core/pure-rust-crypto` on `x86_64-unknown-linux-gnu`,
+       `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` alike, and aegis's build-script out
+       dir is empty (no C objects) on this host even though clang is installed. So the pin was
+       guarding a C build that could no longer happen. Replaced the version freeze with the
+       lever turso provides — `turso = { version = "=0.7.2", features = ["pure-rust-crypto"] }`
+       — so a future turso that drops it from its defaults cannot silently bring the C build
+       back; deleted the direct `aegis` dependency (nothing imports it) and its dependabot
+       ignore rule. Lock diff: `nanna-storage` loses one dependency edge; aegis stays 0.9.15
+       (latest). No behaviour change — Nanna never enables turso encryption, and the pure-Rust
+       backend was already the one in use. 132 `nanna-storage` tests pass.
+     - [x] *(research 2026-08-26)* **Upstream may retire the `aegis` pin for us.** turso issue
        [#7660](https://github.com/tursodatabase/turso/issues/7660) asks for `aegis` and `simsimd` to
        be put behind feature flags so `turso_core` defaults to pure Rust — which is precisely the
        property the `aegis =0.9.15` pin exists to preserve (0.9.8+ mandates a clang-cl C build,
@@ -6021,11 +6649,75 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    MiniLM-class CPU sentence embedder; and `plan::pick_precision` for VRAM-aware dtype choice.
    Runner code still must NOT be written in this repo — but the *consumer glue* is now the real work,
    and it is no longer blocked:
-   - [ ] **Take Mummu as a dependency** — decide git-rev pin vs path dep, and land the `[infer]`
-         config surface (model id, device preference, precision override). A rev pin is the honest
-         default while Mummu is pre-release: it is the same reproducibility argument as the boa git
-         rev and the exact `turso`/`aegis` pins. Budget the build cost first — `burn` + `wgpu` +
-         CubeCL is a large cold compile, and `nanna-gui` already needs a sidecar and a built frontend.
+   - [~] **Take Mummu as a dependency** — *(2026-09-09)* **config surface landed; the dependency
+         itself is BLOCKED on a bundled C SQLite.** All three questions the item asked are now
+         answered with measurements rather than guesses:
+         - **Pin:** git rev. Mummu is public, so CI needs no credentials, and a rev is the same
+           reproducibility lever as the boa pin. A path dep would build only where the sibling
+           checkout happens to exist. (Rev verified to build: `e7e430c`.)
+         - **Build cost — cheaper than the item feared.** Cold, isolated, 4 jobs, `debug=0`:
+           **384 crates / 1m19s / 1.7 GB** with `default-features = false`, **1m46s / 2.3 GB** with
+           mummu's defaults (`fusion` + `vulkan-spirv`). Linked into this workspace: **74s**. The
+           "large cold compile" warning does not hold on this host.
+         - **wgpu unifies at 30.0.1** — Nanna's `nanna-gpu` and Mummu's burn-0.22-pre chain resolve
+           to one version, so the dependency adds no second graphics stack. This was the real
+           integration risk and it is clear.
+         - **BLOCKER: a bundled C SQLite, and it is upstream of Mummu.** Adding the dependency
+           fails `no_banned_database_crates_in_lockfile` — **`rusqlite 0.40` with
+           `features = ["bundled"]`**, i.e. a second SQLite statically compiled from C. The guard
+           is correct to fail: the lockfile records optional deps regardless of features, and
+           `bundled` really does compile the C engine in.
+           **Traced to the exact line (2026-09-09):** `cubecl-runtime`'s manifest declares
+           ```toml
+           [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.cubecl-environment]
+           features = ["cache"]
+           ```
+           — **unconditional on every desktop target, behind no feature flag of its own**, and
+           `cubecl-environment`'s `cache` feature is what pulls `dep:rusqlite`. Confirmed
+           empirically: `rusqlite` is in the lock even with `mummu = { default-features = false }`
+           (no `fusion`, no `vulkan-spirv`).
+           **Correction to an earlier note this same run:** this was first recorded as "`mummu`
+           enables `burn/autotune`, so ask Mummu to make the autotune cache optional". That
+           remediation is wrong. It is not Mummu's to disable and it is not autotune's doing —
+           `cubecl-runtime` is a core dependency of any cubecl/wgpu backend, so **every consumer of
+           burn's GPU backend on a desktop OS links a bundled C SQLite.** Turning off
+           `burn/autotune` would not remove it.
+           **Owner decision needed**, and the options are narrower than first thought:
+           - [ ] Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
+                 clear (it is a persistent autotune-results DB; CubeCL's own docs note the cache
+                 can be pre-built and shipped, so a no-DB mode is coherent). The only fix that
+                 keeps both the GPU backend and the Turso-only rule.
+           - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
+                 vendored GPU-autotune cache. Weakens a deliberate guard — do it with eyes open,
+                 and only if the owner accepts a C SQLite in the shipped binary (it also cuts
+                 against the "prefer pure-Rust, no-C" rule that chose native-tls over rustls).
+           - [ ] Ask Mummu to make its **GPU stack optional** so a CPU-only consumer can avoid
+                 cubecl entirely. Checked, and this does *not* work today: `burn-cubecl`, `cubecl`,
+                 `cubecl-runtime` and `wgpu` are all **non-optional** dependencies of the `mummu`
+                 crate (only `fusion`/`vulkan-spirv`/`cuda`/`jinja-template`/`flamegraph` are
+                 features), so `default-features = false` still links rusqlite. Worth asking for
+                 regardless, because the roadmap's own first local consumer — the MiniLM embedder —
+                 is CPU-only (`burn-flex`), so a `gpu` feature on Mummu would unblock P12 item 4
+                 (local embeddings) without waiting on item 5 or on upstream CubeCL.
+   - [x] **`[infer]` config surface** — *(2026-09-09)* landed in `nanna-config::infer`: `enabled`,
+         `model`, `embedding_model`, `models_root`, `device` (auto/gpu/cpu), `precision`
+         (auto/f16/f32), `vram_budget_bytes`, plus `LocalPlan` — the boot-time decision
+         `Provider::Local` reads. Model names are Mummu **catalog** names, not HF repo ids, so a
+         reference stays pinned to a repo + revision. 14 tests. Two deliberate calls: the decision
+         logic lives in `nanna-config` rather than behind a `nanna-llm` feature, because CI runs
+         `cargo test --no-run --workspace` with **default features only** and a feature-gated
+         decision table would never be compiled or tested; and Nanna does **not** re-derive VRAM
+         policy — `vram_budget_bytes` is an override forwarded verbatim, with
+         `DeviceBudget::usable_bytes()` left owning the display's share.
+   - [ ] **`InferPrecision::Auto` cannot choose f16 on Linux, and this is Mummu's gap to close.**
+         *(2026-09-09)* `plan::pick_precision` needs a `DeviceBudget`, which comes from
+         `GpuAdapter::vram_bytes` — populated **only** by Mummu's Windows DXGI walk.
+         `backend::vram_by_adapter_name()` returns an empty vec on Linux/macOS (its own comment
+         marks Vulkan memory heaps a P6 follow-up) and `video_memory()` returns `None`, so
+         `DeviceBudget::from_adapter` is `None` and the planner correctly refuses to guess. Nanna
+         handles it honestly (`PrecisionReason::Unsized` announces the remedy rather than silently
+         serving f32), but the fix belongs in Mummu: **size VRAM from Vulkan memory heaps**. File
+         it there — a silent f32 fallback reads as a Mummu perf regression, not a platform gap.
    - [ ] **Back the memory `embed_fn` with Mummu's MiniLM embedder** (P12 item 4) — this is the
          lowest-risk first consumer: CPU-only, no VRAM budget to negotiate, and it removes the last
          API dependency from the memory path. Mind the **embedding-dimension latch** (see the stale

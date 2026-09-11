@@ -7,23 +7,28 @@ impl ControlPlane {
     // Memory Handlers
     // =========================================================================
     
+    /// Does a memory in `workspace_id` belong to `scope`? `None` = every
+    /// memory, `"global"` = global memories only, a workspace id = global
+    /// memories plus that workspace's. One rule for `list` and `export`, so the
+    /// two can never disagree about what a scope contains.
+    fn memory_in_scope(scope: Option<&str>, workspace_id: Option<&str>) -> bool {
+        match scope {
+            None => true,
+            Some("global") => workspace_id.is_none(),
+            Some(workspace) => workspace_id.is_none() || workspace_id == Some(workspace),
+        }
+    }
+
     pub(super) async fn handle_memory(&self, _client_id: &str, action: MemoryAction) -> Value {
         let Some(ref memory) = self.memory else {
             return json!({ "error": "memory_unavailable", "message": "Memory service not configured" });
         };
-        
+
         match action {
             MemoryAction::List { scope } => {
                 let all_memories = memory.list_all().await;
                 let memories: Vec<_> = all_memories.into_iter()
-                    .filter(|m| {
-                        // Apply scope filter
-                        match &scope {
-                            None => true,
-                            Some(s) if s == "global" => m.workspace_id.is_none(),
-                            Some(ws_id) => m.workspace_id.is_none() || m.workspace_id.as_deref() == Some(ws_id),
-                        }
-                    })
+                    .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
                     .map(|m| {
                         // Absent provenance is "unknown" — NOT "stated". A legacy
                         // memory stored before provenance was captured must not be
@@ -60,10 +65,14 @@ impl ControlPlane {
                     _ => None,
                 };
                 let result = memory
-                    .recall_scoped_with_coverage(&query, scope_filter)
+                    .recall_scoped_with_report(&query, scope_filter)
                     .await;
                 match result {
-                    Ok((results, coverage)) => {
+                    Ok(nanna_memory::RecallReport {
+                        results,
+                        coverage,
+                        timings,
+                    }) => {
                         let memories: Vec<_> = results.into_iter()
                             .take(limit.unwrap_or(10))
                             .map(|r| json!({
@@ -105,6 +114,12 @@ impl ControlPlane {
                             "searched": coverage.comparable,
                             "total": coverage.total,
                             "note": note,
+                            // Per stage, because they are not alike: the embed
+                            // is a model call, the search an in-RAM scan.
+                            "timings": {
+                                "embed_ms": timings.embed_ms(),
+                                "search_ms": timings.search_ms(),
+                            },
                         })
                     }
                     Err(e) => json!({ "error": "search_failed", "message": e.to_string() })
@@ -216,6 +231,34 @@ impl ControlPlane {
                     }
                 }
             }
+            MemoryAction::Export { scope, format } => {
+                // Rendered here for the same reason as `session.export`: the
+                // store's owner renders once and every client gets that
+                // document. Filtered by the same rule `list` uses.
+                let records: Vec<_> = memory
+                    .export_records()
+                    .await
+                    .into_iter()
+                    .filter(|m| Self::memory_in_scope(scope.as_deref(), m.workspace_id.as_deref()))
+                    .collect();
+                match crate::export::export_memories(
+                    &records,
+                    scope.as_deref(),
+                    format,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(document) => json!({
+                        "format": format,
+                        "filename": document.filename,
+                        "content": document.content,
+                        "count": records.len(),
+                    }),
+                    Err(e) => json!({
+                        "error": "export_failed",
+                        "message": format!("Memories could not be exported: {e}"),
+                    }),
+                }
+            }
             MemoryAction::Stats => {
                 let stats = memory.stats().await;
                 json!({
@@ -224,6 +267,14 @@ impl ControlPlane {
                     "dormant": stats.dormant,
                     "silent": stats.silent,
                     "unavailable": stats.unavailable,
+                    // How long memories written without a vector stayed
+                    // unfindable by similarity search; null until one has
+                    // been filled this run.
+                    "queue_to_searchable": stats.searchable_latency.map(|l| json!({
+                        "samples": l.samples,
+                        "p50_secs": l.p50_secs,
+                        "p95_secs": l.p95_secs,
+                    })),
                 })
             }
             MemoryAction::Consolidate => {

@@ -14,6 +14,49 @@
 /// The default bind address for locally-scoped HTTP services.
 pub const LOOPBACK_HOST: &str = "127.0.0.1";
 
+/// The WebSocket IPC port every client reaches the daemon on.
+///
+/// **One definition, and it lives here rather than in `nanna-daemon`, because
+/// the GUI cannot see that crate.** `nanna-gui` deliberately links only
+/// `nanna-config`, `nanna-core`, `nanna-tools` and `nanna-proc` (P16: the GUI
+/// is a thin daemon *client*, not a daemon host), so a constant defined in
+/// `nanna-daemon` is unreachable from the one consumer most likely to drift —
+/// and it did drift: `gui/src-tauri/src/daemon_client.rs` and
+/// `nanna-client/src/connection.rs` both hardcoded `ws://127.0.0.1:5149`
+/// beside a constant they could not or did not use.
+///
+/// This is the same class of bug the constant was introduced to end: the port
+/// was once a literal repeated across the daemon, the CLI and the docs, the
+/// copies drifted (`nanna daemon start` bound `9999` while `nanna daemon
+/// status` probed `5149`), and a CLI-started daemon reported itself as not
+/// running. `nanna_daemon::ipc::DEFAULT_IPC_PORT` re-exports this.
+pub const DEFAULT_IPC_PORT: u16 = 5149;
+
+/// Largest message either end of the daemon's WebSocket IPC will READ, in
+/// bytes — and both ends must apply it.
+///
+/// tungstenite reads with a 16 MiB frame / 64 MiB message default, and a
+/// long-horizon session outgrows that: a whole-session `history`, a full run
+/// state or an export travels as one message. **A read limit protects only the
+/// side that sets it.** The daemon raised its own to 128 MiB after long sessions
+/// dropped connections; the GUI copied the number beside a comment saying it
+/// "must match"; `nanna-client` never set one, so a large reply the daemon sent
+/// the CLI still arrived as `Connection("Disconnected")` — reproduced 2026-09-11
+/// with a 20 MiB reply. The value is the daemon's existing one, kept as is.
+///
+/// One definition here, for the same reason as [`DEFAULT_IPC_PORT`]: the GUI
+/// cannot see `nanna-daemon`. `nanna_daemon::ipc::IPC_MAX_MESSAGE_BYTES`
+/// re-exports it, and a guard test keeps copies from coming back.
+pub const IPC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+
+/// The loopback WebSocket URL a client should use to reach the daemon.
+///
+/// Built from the two constants above so a URL can never be half-updated.
+#[must_use]
+pub fn default_daemon_ws_url() -> String {
+    format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}")
+}
+
 /// Does `host` keep a listener on this machine only?
 ///
 /// Recognises the IPv4 loopback block (`127.0.0.0/8` — the whole `/8`, since

@@ -78,6 +78,10 @@ function toToolCall(item: TimelineEntry) {
     output: item.output ?? '',
     success: item.success ?? false,
     duration_ms: item.duration_ms ?? 0,
+    // The card reads edit_file's before/after view from `data.diff`, the
+    // shape the live event carries. The journal stores it as its own field,
+    // so a timeline restored after a remount shows the edit too.
+    data: item.diff ? { diff: item.diff } : undefined,
   }
 }
 

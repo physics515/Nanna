@@ -252,7 +252,7 @@ function getStateClasses(state: string): string {
   }
 }
 
-function getStatusVariant(state: string): 'success' | 'warning' | 'destructive' | 'secondary' {
+function getStatusVariant(state: string): 'success' | 'warning' | 'error' | 'secondary' {
   switch (state) {
     case 'connected':
       return 'success'
@@ -261,7 +261,7 @@ function getStatusVariant(state: string): 'success' | 'warning' | 'destructive' 
       return 'warning'
     case 'unavailable':
     case 'auth_failed':
-      return 'destructive'
+      return 'error'
     default:
       return 'secondary'
   }

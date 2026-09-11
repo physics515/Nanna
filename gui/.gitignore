@@ -37,3 +37,6 @@ src-tauri/binaries/*
 # Keep e2e screenshot goldens, ignore local failure diffs
 /e2e/__snapshots__/*-diff.png
 /e2e/__snapshots__/*-actual.png
+
+# Planted and removed by scripts/typecheck.mjs; never commit it.
+app/__typecheck_canary__.ts

@@ -20,6 +20,12 @@ function reset() {
   info.value = ''
 }
 
+// `location` is not reachable from a template expression (it resolves against the
+// component instance, not `window`), so the inline handler threw on every click.
+function reloadPage() {
+  window.location.reload()
+}
+
 function forceError() {
   throw new Error('E2E forced error')
 }
@@ -71,7 +77,7 @@ onUnmounted(() => {
         <button
           type="button"
           class="px-3 py-1.5 rounded bg-white/5 hover:bg-white/10 border border-white/10 text-sm"
-          @click="() => location.reload()"
+          @click="reloadPage"
         >
           Reload
         </button>

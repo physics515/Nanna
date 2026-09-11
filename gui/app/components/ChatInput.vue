@@ -160,6 +160,7 @@ function addImageFile(file: File) {
   reader.onload = () => {
     const dataUrl = reader.result as string
     const base64 = dataUrl.split(',')[1]
+    if (base64 === undefined) return // not a data URL: nothing to attach
     pendingAttachments.value.push({
       id: crypto.randomUUID(),
       filename: file.name,

@@ -1,6 +1,6 @@
 {
   "name": "nanna-gui",
-  "version": "0.3.15",
+  "version": "0.3.17",
   "type": "module",
   "private": true,
   "scripts": {
@@ -18,12 +18,13 @@
     "tauri": "tauri",
     "tauri:dev": "pnpm build:daemon:debug && tauri dev",
     "tauri:build": "tauri build",
+    "typecheck": "node scripts/typecheck.mjs",
     "build:daemon": "node scripts/build-daemon.js",
     "build:daemon:debug": "node scripts/build-daemon.js --debug"
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.6.0",
-    "@lucide/vue": "^1.43.0",
+    "@lucide/vue": "^1.44.0",
     "@monaco-editor/loader": "^1.7.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
@@ -64,7 +65,7 @@
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/test-utils": "^2.5.0",
-    "happy-dom": "^20.14.0",
+    "happy-dom": "^20.14.3",
     "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",

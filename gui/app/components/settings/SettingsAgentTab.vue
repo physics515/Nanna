@@ -108,7 +108,7 @@
               </button>
             </div>
 
-            <UiButton @click="addRoute" variant="outline" size="sm">
+            <UiButton @click="addRoute" variant="secondary" size="sm">
               <Plus class="w-4 h-4 mr-1" />
               Add Route
             </UiButton>
@@ -332,12 +332,16 @@ function removeRoute(index: number) {
 }
 
 function updateRouteModel(index: number, model: string) {
-  modelRoutes.value[index].model = model
+  const route = modelRoutes.value[index]
+  if (!route) return
+  route.model = model
   saveRoutes()
 }
 
 function updateRouteTier(index: number, tier: string) {
-  modelRoutes.value[index].tier = tier
+  const route = modelRoutes.value[index]
+  if (!route) return
+  route.tier = tier
   saveRoutes()
 }
 

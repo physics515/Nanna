@@ -14,12 +14,8 @@ uuid.workspace = true
 
 # Turso — pure-Rust, SQLite-compatible embedded DB (the ONLY database).
 # Pinned exactly: turso is pre-1.0, so a minor/patch bump can break the build.
-turso = "=0.7.2"
-
-# Transitive-version pin (not imported directly). `turso_core` depends on aegis
-# with a caret (`0.9`), which floats to 0.9.8+ whose build.rs mandates a C build
-# via clang-cl — unavailable on a stock Windows MSVC toolchain. aegis 0.9.7 keeps
-# the pure-Rust path (matches Tiger Style "prefer pure-Rust, no-C where avoidable")
-# and builds with MSVC alone. Cargo.lock is untracked here, so this constraint is
-# the only durable lever. Revisit once the dev env ships LLVM/clang-cl.
-aegis = "=0.9.15"
+# `pure-rust-crypto` selects `aegis/pure-rust`: without it aegis's build.rs compiles
+# bundled C (clang-cl on MSVC, absent on a stock Windows toolchain). turso's defaults
+# enable it today; naming it here keeps that true if a release drops it from them.
+# It replaces the old exact `aegis` pin, which froze a version to dodge that C build.
+turso = { version = "=0.7.2", features = ["pure-rust-crypto"] }

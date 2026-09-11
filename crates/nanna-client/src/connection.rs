@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use tracing::{debug, error, info, warn};
 
 /// Client configuration
@@ -32,7 +35,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            url: "ws://127.0.0.1:5149".to_string(),
+            url: nanna_daemon::ipc::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             auto_reconnect: true,
@@ -107,7 +110,14 @@ impl Client {
     }
     
     async fn do_connect(config: &ClientConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        let connect_future = connect_async(&config.url);
+        // Read with the same limits the daemon reads with. tungstenite's
+        // default is a 16 MiB frame, and the daemon's large replies — a whole
+        // session's history, a full run state, an export — exceed it: a bare
+        // `connect_async` dropped them as `Connection("Disconnected")`.
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(nanna_daemon::ipc::IPC_MAX_MESSAGE_BYTES);
+        ws_config.max_frame_size = Some(nanna_daemon::ipc::IPC_MAX_MESSAGE_BYTES);
+        let connect_future = connect_async_with_config(&config.url, Some(ws_config), false);
         
         match tokio::time::timeout(config.connect_timeout, connect_future).await {
             Ok(Ok((ws, _))) => Ok(ws),
@@ -222,6 +232,16 @@ impl Client {
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
     }
+
+    /// Subscribe to the events of one session only.
+    ///
+    /// The daemon's IPC layer forwards every event to every connected client (a
+    /// `Subscribe` action is recorded in the session store but does not narrow what
+    /// the connection sends), so the filtering happens here, by [`Event::session_id`].
+    #[must_use]
+    pub fn subscribe_session(&self, session_id: impl Into<String>) -> SessionEvents {
+        SessionEvents::new(self.event_tx.subscribe(), session_id.into())
+    }
     
     /// Send a request and wait for response
     pub async fn request(&self, action: Action) -> Result<Value> {
@@ -308,6 +328,24 @@ impl Client {
     pub fn system(&self) -> SystemApi<'_> {
         SystemApi { client: self }
     }
+
+    /// Get scheduler API
+    #[must_use]
+    pub const fn scheduler(&self) -> SchedulerApi<'_> {
+        SchedulerApi { client: self }
+    }
+
+    /// Get workspaces API
+    #[must_use]
+    pub const fn workspaces(&self) -> WorkspacesApi<'_> {
+        WorkspacesApi { client: self }
+    }
+
+    /// Get channels API
+    #[must_use]
+    pub const fn channels(&self) -> ChannelsApi<'_> {
+        ChannelsApi { client: self }
+    }
 }
 
 // =============================================================================
@@ -353,6 +391,17 @@ impl<'a> SessionsApi<'a> {
             limit,
             before: None,
         })).await
+    }
+
+    /// Export a session as a document (Markdown or JSON), rendered by the
+    /// daemon: `{format, filename, content}`, or `{error, message}`.
+    pub async fn export(&self, id: &str, format: ExportFormat) -> Result<Value> {
+        self.client
+            .request(Action::Session(SessionAction::Export {
+                id: id.to_string(),
+                format,
+            }))
+            .await
     }
 }
 
@@ -415,6 +464,14 @@ impl<'a> MemoryApi<'a> {
     
     pub async fn stats(&self) -> Result<Value> {
         self.client.request(Action::Memory(MemoryAction::Stats)).await
+    }
+
+    /// Export memories as a document (Markdown or JSON), rendered by the
+    /// daemon: `{format, filename, content, count}`, or `{error, message}`.
+    pub async fn export(&self, scope: Option<String>, format: ExportFormat) -> Result<Value> {
+        self.client
+            .request(Action::Memory(MemoryAction::Export { scope, format }))
+            .await
     }
 }
 
@@ -492,5 +549,299 @@ impl<'a> SystemApi<'a> {
     
     pub async fn shutdown(&self) -> Result<Value> {
         self.client.request(Action::System(SystemAction::Shutdown)).await
+    }
+}
+
+/// Scheduler API: cron jobs, owned and run by the daemon.
+pub struct SchedulerApi<'a> {
+    client: &'a Client,
+}
+
+impl SchedulerApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Scheduler(SchedulerAction::List))
+            .await
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Get { id }))
+            .await
+    }
+
+    /// Add a cron job: `schedule` is a cron expression, `task` the prompt it runs.
+    pub async fn add(&self, schedule: &str, task: &str, name: Option<&str>) -> Result<Value> {
+        debug_assert!(!schedule.trim().is_empty(), "a job needs a schedule");
+        debug_assert!(!task.trim().is_empty(), "a job needs a task");
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Add {
+                schedule: schedule.to_string(),
+                task: task.to_string(),
+                name: name.map(String::from),
+            }))
+            .await
+    }
+
+    /// Change a job's schedule and/or enabled state.
+    ///
+    /// The protocol also carries a `task`, but the daemon does not apply payload
+    /// updates yet, so this wrapper does not offer an argument that would be ignored.
+    pub async fn update(
+        &self,
+        id: &str,
+        schedule: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Value> {
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Update {
+                id: id.to_string(),
+                schedule: schedule.map(String::from),
+                task: None,
+                enabled,
+            }))
+            .await
+    }
+
+    pub async fn remove(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::Remove { id }))
+            .await
+    }
+
+    pub async fn run_now(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::RunNow { id }))
+            .await
+    }
+
+    pub async fn history(&self, id: &str, limit: Option<usize>) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Scheduler(SchedulerAction::History { id, limit }))
+            .await
+    }
+}
+
+/// Workspaces API: the daemon's registry of project directories.
+pub struct WorkspacesApi<'a> {
+    client: &'a Client,
+}
+
+impl WorkspacesApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::List))
+            .await
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Get { id }))
+            .await
+    }
+
+    /// Register `path` as a workspace (the daemon creates its `.nanna` folder if absent).
+    pub async fn open(&self, path: &str) -> Result<Value> {
+        debug_assert!(!path.trim().is_empty(), "a workspace needs a path");
+        let path = path.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Open { path }))
+            .await
+    }
+
+    pub async fn close(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Close { id }))
+            .await
+    }
+
+    pub async fn set_active(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::SetActive { id }))
+            .await
+    }
+
+    pub async fn clear_active(&self) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::ClearActive))
+            .await
+    }
+
+    pub async fn reload(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::Reload { id }))
+            .await
+    }
+
+    pub async fn context(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Workspace(WorkspaceAction::GetContext { id }))
+            .await
+    }
+
+    pub async fn update_context(&self, id: &str, file: &str, content: &str) -> Result<Value> {
+        self.client
+            .request(Action::Workspace(WorkspaceAction::UpdateContext {
+                id: id.to_string(),
+                file: file.to_string(),
+                content: content.to_string(),
+            }))
+            .await
+    }
+}
+
+/// Channels API: the chat adapters (Telegram, Discord, Slack, Signal, `WhatsApp`).
+///
+/// `list` and `status` are live. The daemon still answers `enable`, `disable`, `test`
+/// and `send` with `"status": "not_implemented"`; they are wrapped so a client can
+/// already speak the whole protocol, and they start working when the daemon does.
+pub struct ChannelsApi<'a> {
+    client: &'a Client,
+}
+
+impl ChannelsApi<'_> {
+    pub async fn list(&self) -> Result<Value> {
+        self.client
+            .request(Action::Channel(ChannelAction::List))
+            .await
+    }
+
+    /// Status of one channel, or of all of them (with a summary) when `id` is `None`.
+    pub async fn status(&self, id: Option<&str>) -> Result<Value> {
+        let id = id.map(String::from);
+        self.client
+            .request(Action::Channel(ChannelAction::Status { id }))
+            .await
+    }
+
+    pub async fn enable(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Enable { id }))
+            .await
+    }
+
+    pub async fn disable(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Disable { id }))
+            .await
+    }
+
+    pub async fn test(&self, id: &str) -> Result<Value> {
+        let id = id.to_string();
+        self.client
+            .request(Action::Channel(ChannelAction::Test { id }))
+            .await
+    }
+
+    pub async fn send(&self, channel_id: &str, target: &str, content: &str) -> Result<Value> {
+        self.client
+            .request(Action::Channel(ChannelAction::Send {
+                channel_id: channel_id.to_string(),
+                target: target.to_string(),
+                content: content.to_string(),
+            }))
+            .await
+    }
+}
+
+/// The events of one session, filtered out of the client's shared event stream.
+pub struct SessionEvents {
+    receiver: broadcast::Receiver<Event>,
+    session_id: String,
+}
+
+impl SessionEvents {
+    fn new(receiver: broadcast::Receiver<Event>, session_id: String) -> Self {
+        debug_assert!(
+            !session_id.is_empty(),
+            "a session filter needs a session id"
+        );
+        Self {
+            receiver,
+            session_id,
+        }
+    }
+
+    /// The session this stream carries.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The next event for this session; other sessions' and session-less events are
+    /// skipped.
+    ///
+    /// Lag is reported, not hidden: the shared stream is a bounded broadcast, and a
+    /// slow reader that falls behind gets `RecvError::Lagged(n)` so it can decide to
+    /// resync rather than silently missing events of its own session.
+    ///
+    /// # Errors
+    ///
+    /// `Lagged` when this reader fell behind the shared stream, `Closed` when the
+    /// client shut down.
+    pub async fn recv(&mut self) -> std::result::Result<Event, broadcast::error::RecvError> {
+        loop {
+            let event = self.receiver.recv().await?;
+            if event.session_id() == Some(self.session_id.as_str()) {
+                return Ok(event);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_events_tests {
+    use super::{Event, SessionEvents};
+    use tokio::sync::broadcast;
+
+    fn delta(session_id: &str, text: &str) -> Event {
+        Event::MessageDelta {
+            session_id: session_id.to_string(),
+            message_id: "m".to_string(),
+            delta: text.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_subscribed_session_comes_through() {
+        let (tx, rx) = broadcast::channel(16);
+        let mut events = SessionEvents::new(rx, "mine".to_string());
+        tx.send(delta("other", "not for me"))
+            .expect("a receiver exists");
+        tx.send(Event::ConfigChanged).expect("a receiver exists");
+        tx.send(delta("mine", "for me")).expect("a receiver exists");
+
+        match events.recv().await.expect("an event for this session") {
+            Event::MessageDelta { delta, .. } => assert_eq!(delta, "for me"),
+            other => panic!("expected this session's delta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lagging_reader_is_told_rather_than_silently_skipping() {
+        let (tx, rx) = broadcast::channel(2);
+        let mut events = SessionEvents::new(rx, "mine".to_string());
+        for n in 0..5 {
+            tx.send(delta("mine", &n.to_string()))
+                .expect("a receiver exists");
+        }
+        assert!(
+            matches!(
+                events.recv().await,
+                Err(broadcast::error::RecvError::Lagged(3))
+            ),
+            "a bounded stream that overflowed must say how much was lost"
+        );
     }
 }
