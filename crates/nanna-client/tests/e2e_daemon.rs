@@ -515,10 +515,27 @@ async fn lifecycle_changes_by_one_client_reach_another_clients_session_stream() 
         .rename(&session_id, "after")
         .await
         .expect("sessions.rename succeeds");
-    let renamed = tokio::time::timeout(READY_HANG_CEILING, events.recv())
-        .await
-        .expect("the rename event arrives before the hang ceiling")
-        .expect("the stream is open and not lagging");
+    // The watcher's socket can still be carrying the `SessionCreated` that the
+    // create broadcast before this subscription existed: a subscription filters
+    // the live stream, it does not fence it. That one event — and only that one
+    // — may precede the rename. Observed 2026-09-11 under a parallel suite:
+    // `expected SessionRenamed, got SessionCreated { .. name: Some("before") }`.
+    let mut created_skipped = 0_usize;
+    let renamed = loop {
+        let event = tokio::time::timeout(READY_HANG_CEILING, events.recv())
+            .await
+            .expect("the rename event arrives before the hang ceiling")
+            .expect("the stream is open and not lagging");
+        if matches!(&event, nanna_client::Event::SessionCreated { id, .. } if *id == session_id) {
+            created_skipped += 1;
+            assert!(
+                created_skipped <= 1,
+                "only the one create can predate the subscription"
+            );
+            continue;
+        }
+        break event;
+    };
     match renamed {
         nanna_client::Event::SessionRenamed { id, name } => {
             assert_eq!(id, session_id);
