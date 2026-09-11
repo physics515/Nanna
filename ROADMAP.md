@@ -6101,6 +6101,19 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-11 sweep)* `cargo update` -> 2 compatible bumps (`toml 1.1.6`,
+     `toml_edit 0.25.15`); the rest of the lock diff is dependency edges re-resolved onto
+     versions already present (`windows-sys 0.61.2`, `getrandom 0.4.3`, `rand 0.10.2`, …) — no
+     package added or removed. Both guarded pins fired again and were pinned back
+     (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`); `rustpython-{vm,codegen}`
+     still 0.5.0 and `pymath` still 0.2.0, so both stay. `cargo upgrade --incompatible`: only
+     the two known downgrade rows (`criterion -> "0.7"`, `lopdf -> "0.42"`), rejected.
+     `tauri-build`/`tauri-codegen` still 2.6.3, so the vendored patch stays. GUI: `pnpm
+     outdated` clean except TypeScript 7 — npm `latest` still 7.0.2 (7.1 only as `next` dev
+     builds) and `vue-tsc` still 3.3.11, so not attempted. Toolchain pin `nightly-2026-09-08`
+     held (moved two runs ago). Verified on the tree merged with #318, cold on tmpfs:
+     **1790 tests pass / 0 fail / 12 ignored** (71 binaries), clippy clean of errors,
+     `cargo build --release -p nanna-daemon` green in **6m33s**.
    - *(2026-09-10 sweep)* `cargo update` -> 17 compatible bumps (`reqwest 0.13.5`,
      `tantivy 0.26.2`, `multiversion 0.9.0`, `uuid 1.26.1`, `zerocopy 0.8.57`, …; the stale
      `target-features 0.1.6` drops out). Both guarded landmines fired again and were pinned back
