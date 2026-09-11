@@ -1,6 +1,6 @@
 [package]
 name = "nanna"
-version = "0.3.16"
+version = "0.3.17"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
 repository = "https://github.com/physics515/Nanna"
@@ -74,7 +74,7 @@ exclude = ["vendor/tauri-build"]
 tauri-build = { path = "vendor/tauri-build" }
 
 [workspace.package]
-version = "0.3.16"
+version = "0.3.17"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

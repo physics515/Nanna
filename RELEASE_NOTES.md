@@ -1,103 +1,105 @@
-# Nanna v0.3.16-beta.25 — What Dreaming Was Actually Merging
+# Nanna v0.3.17-beta.26 — Your Data, Readable
 
-Nanna's memory consolidates: it clusters related memories and folds them into one. This release fixes
-a defect in how "related" was decided — for the commonest pair of memories in a real store, it was not
-being decided at all.
-
-## What's Fixed
-
-### Cosine similarity could not veto a merge
-
-`composite_cluster_score` blends four signals: semantic similarity, recall affinity, importance
-proximity, and age proximity. Three of those are **maximal by construction** for the most ordinary
-pair a store contains — two memories that are equally unimportant, that have both never been recalled,
-and that were written in the same session. `recall_affinity` and `importance_proximity` return 1.0
-whenever the two values are *equal*, including `0 == 0`; `age_prox` sits near 1.0 within a session.
-
-With the shipped weights that put a floor of **0.50** under every score, against a clustering threshold
-of **0.45**. The bar was cleared before similarity was consulted, so no embedding could prevent a
-merge. Measured, not inferred:
-
-```
-two orthogonal unit vectors        score 0.500  -> clustered
-two anti-correlated vectors        score 0.500  -> clustered
-four mutually unrelated memories   -> ONE cluster of four
-```
-
-A dream cycle would summarize those four into a single gist and record it as a merge. In effect the
-clusterer was grouping by *"written around the same time and equally unremarkable"*.
-
-The fix is the default, not the algorithm. The threshold is judged against the composite score, not
-against raw cosine, and the drift fixture's own 0.65 threshold always satisfied the invariant — it was
-the shipped default that demanded a cosine of **0.000**.
-
-### The bar is now 0.50, and the range up to it was free
-
-A new sweep (`cargo bench -p nanna-memory --bench clustering_threshold_sweep`) prices the trade:
-
-| threshold | cosine actually demanded | clusters | compression | recall |
-| --- | --- | --- | --- | --- |
-| 0.55 | 0.10 | 3 | 0.450 | 1.000 |
-| 0.65 | 0.30 | 3 | 0.450 | 1.000 |
-| **0.75** (shipped) | **0.50** | 3 | 0.450 | 1.000 |
-| 0.85 | 0.70 | 5 | 0.383 | 1.000 |
-
-Those first three rows are *identical* in every outcome while the cosine demanded rises five-fold, so
-the default takes the top of the flat range: a five-times stricter semantic bar at zero measured cost.
-Recall is 1.000 throughout — this trades compression against merge *precision*, never retrievability.
-
-Consolidation now **refuses to run** under a configuration where similarity has no veto, rather than
-warning about it: consolidation rewrites memories, and a warning arrives after the merge has already
-happened.
+This release lets you take a conversation — or everything Nanna remembers — out as a document you can
+read, and shows you what each edit did while you were away. Underneath, it fixes a transport limit that
+silently dropped large replies to the CLI, and it finishes Linux: the desktop app now builds there.
 
 ## What's New
 
-### `nanna doctor`
+### `nanna export` — conversations and memories as documents you own
 
 ```bash
-nanna doctor
+nanna export <session-id>                    # readable Markdown transcript
+nanna export <session-id> --format json      # the complete stored session, lossless
+nanna export --memories [--scope global]     # what Nanna remembers, with provenance
 ```
 
-Six configuration checks, each of which prints **the fix** rather than only the verdict — a missing
-tools directory, an `[infer]` section naming no model, a clustering configuration that would merge
-unrelated memories. Exits non-zero on a real fault, so it works from a script or a health probe.
+The daemon renders the document — it owns the data — so every client gets the same one. The Markdown
+transcript follows the chat page's own layout: thinking, tool calls with their input and output, each
+edit's before/after view, and the reply, which is neither dropped nor printed twice. Code fences are
+sized so a tool output that quotes Markdown cannot break out of its block. JSON is the stored record in
+a versioned envelope, proven to load back.
 
-Deliberately offline: no provider call, no network probe, no keyring read. A clean report means your
-*configuration* is sound, not that a provider is reachable.
+A memory export carries each memory's text, where it came from (`unknown` when that was never recorded —
+never a guessed "you said so"), its workspace and its full FSRS state, and **no embedding vectors**:
+they are derived data, recomputed by a re-embed, and most of the bytes. The daemon must be running;
+`nanna sessions` lists the ids.
 
-Writing it surfaced its own finding: `[server].host` is read by nothing. The bind address comes from
-the `--host` flag (default loopback), so a user setting that field to `127.0.0.1` has secured nothing,
-and the shipped `0.0.0.0` reads as exposed while binding nothing of the sort. The doctor now reports
-the effective answer instead of raising a false alarm about it.
+### See what each edit did
 
-### Local-inference configuration (`[infer]`)
+Every `edit_file` call now records a bounded before/after view of what it changed — the lines, where
+they start, and whether the view was cut. It shows in the run timeline, and it is **kept with the
+session**, so it is still there when you open the session after an unattended run, or after a restart.
+Only an edit that succeeded and actually ran carries one.
 
-The config surface for the on-device runner — model, embedding model, device, precision, VRAM budget —
-plus the boot-time decision the router will read. Inert by default.
+### The desktop app builds on Linux
 
-`InferPrecision::Auto` cannot choose f16 on Linux, and the code says so out loud rather than quietly
-serving f32: the precision planner needs a VRAM budget, and that number is only available through a
-Windows-specific path today. The remedy (`[infer].precision = "f16"`) is named in the message.
+`nanna-gui` did not build on Linux at all: `tauri-build 2.6.3` walks a fixed three directories up from
+its build output, and current cargo nests that output one level deeper, so the sidecar copy landed on a
+directory and the build panicked. This release carries the upstream fix (tauri#15831, due in
+`tauri-build` 2.7.0) as a vendored patch with a test that retires it with the next Tauri release, and
+CI now compiles the GUI on Linux too.
+
+## What's Fixed
+
+- **The CLI dropped any daemon reply over 16 MiB.** A WebSocket read limit protects only the side that
+  sets it. The daemon had raised its own to 128 MiB, but `nanna-client` still read with the 16 MiB
+  default, so a long session's history — or a large export — arrived as a dropped connection.
+  Reproduced with a 20 MiB reply before fixing; one shared limit now, applied at both ends, with a
+  guard test.
+- **`nanna server` ignored the port you chose.** `--port` defaulted to 3000 regardless of
+  `[server].port`, so the onboarding answer, the documented config key and the `PORT` variable were
+  all discarded. The flag still wins; otherwise your configured port is used.
+- **`[server].host` is gone.** Nothing ever read it — `nanna server` binds `--host`, loopback by
+  default — so it looked like a security setting while controlling nothing. Existing config files that
+  still carry it load unchanged.
+- **The long-run journal disagreed with itself.** Unattended task runs stored tool output uncapped in
+  their run record and could overwrite an earlier call's result when a model reused a call id; they now
+  share the chat path's journal writer.
+- **Webhook text no longer reaches the agent in your voice.** A generic webhook authenticates a caller,
+  not you; its payload is now framed as external data the agent must not take as your instructions.
+- **Database migrations are split by a lexer that knows comments and quotes.** They used to be split on
+  every `;`, so a semicolon inside a SQL comment would have cut a statement in half. That would not show
+  on an existing install, but would fail on a fresh one. Only a test kept that from happening. Every
+  existing migration is proven to run exactly as before.
+- **`nanna export <id> | head` no longer crashes** when the reader stops early. A message that leaves a
+  code block open no longer swallows the rest of a Markdown export either.
+- **Cost estimates now use current Claude prices.** Several were out of date:
+  - Sonnet 5 was reported 50% too high.
+  - Opus 4 and 4.1 were reported at a third of their price.
+  - Fable 5.1 cache reads were 4× too high.
+  - Mythos 5 was priced as Sonnet.
+
+  The table now matches Anthropic's published rates, checked 2026-09-11.
 
 ## Also In This Release
 
-- **Toolchain** moved to `nightly-2026-09-08`, release-verified.
-- **Dependencies** swept to latest — `playwright-rs 0.18`, `reqwest 0.13.5`, `tantivy 0.26.2` and
-  seven more. The `libc` and `malachite-bigint` ceilings still stand and are still enforced by tests.
-- **One definition of the daemon IPC port.** Two call sites still hardcoded `ws://127.0.0.1:5149`
-  beside the constant meant to prevent exactly that; a guard test now fails on any Rust source that
-  spells the port into a URL.
-- **A flaky test fixed** — the log-capture tests failed intermittently under a wide parallel run
-  because tracing's process-wide level hint drops between subscriber installs.
-- **Two new benchmarks**, `clustering_scaling` and `clustering_threshold_sweep`, with baselines
-  recorded in `bench/BASELINE.md`.
+- **Recall reports its two stages separately.** Embedding the query (a model call) and searching (an
+  in-memory scan) are timed on their own, logged once per recall and returned by `memory.search`; a
+  slow embed no longer hides behind a fast search.
+- **How long new memories stay unfindable** is now measured: the time from a memory being written
+  without a vector to receiving one, reported as p50/p95 in `memory.stats`.
+- **`nanna doctor`** now warns when chat and summarization point at two different Ollama servers — a
+  split that is easy to create by setting only one of the two keys — and **`nanna doctor --online`**
+  asks each Ollama server in use whether it is answering and has the models you configured, naming
+  any that need an `ollama pull`. It never reads the keyring or tests a provider key.
+- **1-hour prompt caching** for Anthropic (`[llm].prompt_cache_ttl = "1h"`), priced correctly at the
+  API's own 2x write rate.
+- **Session events reach every client**: a rename or delete from one window now updates the others,
+  and a client that falls behind is told how many events it missed instead of silently losing them.
+- **Typed `nanna-client` APIs** for the scheduler, workspaces and channels.
+- **GUI type-check at zero errors** (22 were left, five of them hiding real bugs), now gated in CI.
+- **Dependencies** swept to latest; the `libc` and `malachite-bigint` ceilings still stand, enforced by
+  tests. The exact `aegis` pin is retired — `turso` already builds it pure-Rust.
 
 ## Known Issues
 
-- **The Tauri GUI does not build on Linux.** `tauri-build 2.6.3` infers its target directory assuming
-  cargo's classic build-script layout; current cargo emits a nested one, and the sidecar destination
-  resolves onto a directory. Pre-existing and upstream, not caused by this release — but it means this
-  build is **unverified on Linux desktop**, and Windows builds are unaffected.
-- **`[server].host` is still a dead field.** Reported honestly by `nanna doctor`; deliberately not
-  "fixed" by wiring it, since doing so with its current `0.0.0.0` default would turn an inert field
-  into a real exposure of an unauthenticated HTTP surface.
+- **No in-app GUI verification on Linux yet.** The app builds, but the WebDriver harness needs
+  `WebKitWebDriver` (`webkit2gtk-4.1`), which is not installed on the build host. The new edit-diff view
+  is covered by unit tests only.
+- **Exporting from the app** is not there yet — `nanna export` is the way today.
+- **Two config keys name the Ollama server** (`[memory].ollama_host` for chat and embeddings,
+  `[llm].ollama_url` for summarization). `nanna doctor` flags a mismatch; which key should win is an
+  open decision.
+- **`[server].enabled` and the Agent tab's personality selector are read by nothing.** Both are open
+  decisions rather than silent fixes.
