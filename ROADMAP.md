@@ -2175,6 +2175,14 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
             per-model call formatting, not a live dependency. Source:
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
+      - [ ] *(research 2026-09-11)* **Qwen3.8-Flash-Next (2026-08-26) is not a local candidate
+            — do not chase it for the 16 GB tier.** 125B total / 6B active MoE (512 experts,
+            10+1 active), ~360 GB full precision with only an official FP8 variant; even int4
+            would be ~62 GB of weights. Its Gated DeltaNet + sparse-attention hybrid has
+            day-one support only in vLLM/SGLang, framed as a Qwen4 architecture preview, under
+            the Qwen Community License (not Apache-2.0). Relevant only to the CPU-offload item
+            below, and only once a runner supports the architecture.
+            Source: [CellCog](https://cellcog.ai/blog/qwen3-8-flash-next).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -3786,6 +3794,19 @@ asks permission or restricts her.)*:
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
+      - [ ] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
+            already ships, in the wrong place.** `write_file` parks the outgoing version at
+            `<file>.__prev__` (ONE slot, overwritten each write) plus the richest earlier version
+            at `<file>.__best__` — both *inside the user's tree*, and `edit_file` parks nothing.
+            Claude Code's checkpointing is the shape to copy: a copy of each file taken *before*
+            its edit tools change it, stored outside the workspace (`~/.claude/file-history/<session>/`),
+            the **100 most recent checkpoints** per session kept, and when an older one is
+            discarded each file's **first** snapshot is still kept as a baseline. It restores
+            only its own write/edit changes — not shell side effects — which is the honest
+            boundary for Nanna too (`exec` writes are out of scope). Bound derives from the
+            data dir's budget, not a magic count; per-session store under the daemon data dir
+            keeps user repos free of `.__prev__` litter.
+            Source: [Claude Code checkpointing guide](https://thepromptshelf.dev/blog/claude-code-checkpointing-rewind-guide-2026/).
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
@@ -5709,6 +5730,13 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            Only worth taking if it is a drop-in for the `gui.yml` typecheck job — swapping the gate
            for a less-proven checker to gain speed we do not need would be a bad trade. Decide by
            running both over `gui/` and diffing the diagnostics, not by the README claim.
+     - [ ] *(research 2026-09-11)* **TypeScript 7.1 — the release carrying the stable programmatic
+           API `vue-tsc` waits on — is targeted for around October 2026**, and framework checkers
+           are expected to ship native builds "within a release cycle or two" after it. So the
+           earliest realistic retry is Q4, and the two version numbers below (npm `typescript`
+           `latest` still 7.0.2, `vue-tsc` still 3.3.11 on 2026-09-11) remain the cheap gate.
+           Sources: [DEV Community](https://dev.to/the-modern-web/why-angular-vue-and-eslint-cant-upgrade-to-typescript-70-yet-and-why-ts-71-changes-441g),
+           [vuejs/language-tools#6121](https://github.com/vuejs/language-tools/discussions/6121).
      - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
            `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
            and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
@@ -5718,6 +5746,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-11)* `turso 0.8.0-pre.11` was published today (pre.7 → pre.11 since 2026-08-21),
+     but `CHANGELOG.md` on `main` still stops at 0.7.0 and the release pages carry no notes — so
+     there is no evidence yet that 0.8 brings the dense ANN index P13's indexed clustering is
+     waiting on. Held at the exact `=0.7.2` pin (never a pre-release on an exact pin); re-check
+     when 0.8.0 goes stable and its changelog lands.
    - Pins now: `turso =0.7.2` (exact — pre-1.0; latest stable as of 2026-09-10). The exact
      `aegis` pin is **gone** (2026-09-10): it froze a version to dodge aegis's C build, and turso
      already selects the pure-Rust backend itself — now named explicitly as
