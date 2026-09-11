@@ -1592,6 +1592,20 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             write). Both `#[must_use]`, `debug_assert`-guarded (discount only lowers; 1-h write ≥ input), 2 tests.
             Still open: making the table itself config-overridable (`[pricing]` TOML / fetched) and wiring the
             multipliers into the tracker per request-mode.
+            *(2026-09-11)* **The rates had already rotted, which is this item's case, measured.** Checked
+            against Anthropic's pricing page (`platform.claude.com/docs/en/about-claude/pricing`,
+            fetched 2026-09-11):
+            - **Sonnet 5** ($2/$10) was priced at the Sonnet 4 row ($3/$15): **+50%** on every report.
+            - **Opus 4 and 4.1** ($15/$75) matched the `claude-opus-4` row meant for 4.5–4.8
+              ($5/$25): **a third** of their price.
+            - **Fable 5.1**'s cache read (0.025×, $0.25) was billed at Fable 5's $1.00.
+            - **Mythos 5/5.1** fell through to the generic Sonnet row.
+
+            All are corrected in `PRICING_TABLE`, most-specific first, with a test per row. The two
+            `model_stats` tests that had encoded the stale Sonnet 5 rate as their expected dollars now
+            expect the real ones. Still open, and now with evidence: rates live in code, so they rot
+            between releases. A config override or a fetched table would let a user fix one without
+            waiting for a build.
       *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
       already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore

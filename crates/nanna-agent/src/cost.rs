@@ -82,27 +82,41 @@ impl ModelPricing {
 /// Tokens in one pricing unit (rates are quoted per 1M tokens).
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
-/// Reference list prices (USD per 1M tokens), captured Jan 2026. These are
-/// **public list prices**, not contract rates — update as vendors change them.
-/// Matched by family prefix in [`default_pricing`], most-specific first.
+/// Reference list prices (USD per 1M tokens); the Claude rows re-checked
+/// against the vendor's page on 2026-09-11. These are **public list prices**,
+/// not contract rates — update as vendors change them. Matched by family
+/// prefix in [`default_pricing`]: the first row whose prefix the id starts
+/// with wins, so a more specific prefix must come before a broader one.
 ///
 /// Format: `(prefix, input, output, cache_read, cache_write)`.
 const PRICING_TABLE: &[(&str, f64, f64, f64, f64)] = &[
-    // Anthropic Claude — 2026 rates (cache read = 0.1x input, cache write =
-    // 1.25x input for the 5-min TTL). Opus 4.x is $5/$25 (NOT the old Opus-3
-    // $15/$75); Haiku 4.5 is $1/$5. Source: platform.claude.com/docs pricing.
-    ("claude-opus-4", 5.00, 25.00, 0.50, 6.25),
+    // Anthropic Claude. Source: platform.claude.com/docs/en/about-claude/pricing
+    // (fetched 2026-09-11). Cache read = 0.1x input (0.025x on the 5.1
+    // frontier models); cache write = 1.25x input for the 5-minute TTL.
+    //
+    // Opus 4 and 4.1 are $15/$75 — three times Opus 4.5 and later — so their
+    // ids must match before the `claude-opus-4` row that covers 4.5–4.8.
+    ("claude-opus-4-1", 15.00, 75.00, 1.50, 18.75),
+    ("claude-opus-4-0", 15.00, 75.00, 1.50, 18.75), // the Opus 4 alias
+    ("claude-opus-4-20", 15.00, 75.00, 1.50, 18.75), // dated Opus 4, e.g. -20250514
+    ("claude-opus-4", 5.00, 25.00, 0.50, 6.25),     // Opus 4.5–4.8
+    // Sonnet 5 is $2/$10 (its launch price, made standard); Sonnet 4.x $3/$15.
+    ("claude-sonnet-5", 2.00, 10.00, 0.20, 2.50),
     ("claude-sonnet", 3.00, 15.00, 0.30, 3.75),
-    ("claude-haiku", 1.00, 5.00, 0.10, 1.25),
+    ("claude-haiku-3-5", 0.80, 4.00, 0.08, 1.00), // Haiku 3.5, newer spelling
+    ("claude-haiku", 1.00, 5.00, 0.10, 1.25),     // Haiku 4.5
     ("claude-3-5-sonnet", 3.00, 15.00, 0.30, 3.75),
     ("claude-3-5-haiku", 0.80, 4.00, 0.08, 1.00),
     ("claude-3-opus", 15.00, 75.00, 1.50, 18.75), // legacy Opus 3
-    ("claude-opus", 5.00, 25.00, 0.50, 6.25),     // generic Opus → 4.x rate
-    // Fable 5 (2026-06): $10/$50, ~2x Opus 4.8. Cache read 0.1x input ($1.00);
-    // 5-min cache write 1.25x input ($12.50). Must precede the generic "claude"
-    // fallback below, else "claude-fable-5" resolves to the Sonnet rate.
-    // Source: platform.claude.com/docs pricing; anthropic.com/claude/fable.
+    ("claude-opus", 5.00, 25.00, 0.50, 6.25),     // generic Opus (Opus 5) → $5/$25
+    // Fable and Mythos: $10/$50. The 5.1 models read cache at 0.025x ($0.25),
+    // the 5 models at the standard 0.1x ($1.00); 5-minute write 1.25x ($12.50).
+    // All must precede the generic "claude" fallback, else they resolve to the
+    // Sonnet rate.
+    ("claude-fable-5-1", 10.00, 50.00, 0.25, 12.50),
     ("claude-fable", 10.00, 50.00, 1.00, 12.50),
+    ("claude-mythos-5-1", 10.00, 50.00, 0.25, 12.50),
+    ("claude-mythos-5", 10.00, 50.00, 1.00, 12.50),
     ("claude", 3.00, 15.00, 0.30, 3.75), // generic Claude → Sonnet rate
     // OpenAI GPT (cache read ~0.5x input; no separate cache-write charge).
     ("gpt-5", 1.25, 10.00, 0.625, 1.25),
@@ -290,6 +304,54 @@ mod tests {
         // Dated id resolves the same, and is pricier than the generic claude fallback.
         let generic = default_pricing("claude-instant-xyz").unwrap();
         assert!(fable.output_usd_per_mtok > generic.output_usd_per_mtok);
+    }
+
+    /// Every Claude row against Anthropic's published rates (pricing page,
+    /// fetched 2026-09-11), by real model id so the prefix order is tested
+    /// too: `(id, input, output, cache_read, cache_write_5m)` per 1M tokens.
+    /// Until this date Sonnet 5 was billed at the Sonnet 4 rate, Opus 4 and
+    /// 4.1 at the Opus 4.5 rate, Fable 5.1's cache reads at Fable 5's, and
+    /// Mythos 5 at the generic Sonnet fallback.
+    #[test]
+    fn claude_rates_match_the_published_table() {
+        let published: &[(&str, f64, f64, f64, f64)] = &[
+            ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
+            ("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
+            ("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
+            ("claude-opus-4-1-20250805", 15.0, 75.0, 1.5, 18.75),
+            ("claude-opus-4-20250514", 15.0, 75.0, 1.5, 18.75),
+            ("claude-opus-4-0", 15.0, 75.0, 1.5, 18.75),
+            ("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+            ("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
+            ("claude-sonnet-4-5-20250929", 3.0, 15.0, 0.3, 3.75),
+            ("claude-haiku-4-5-20251001", 1.0, 5.0, 0.1, 1.25),
+            ("claude-haiku-3-5", 0.8, 4.0, 0.08, 1.0),
+            ("claude-3-5-haiku-20241022", 0.8, 4.0, 0.08, 1.0),
+            ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
+            ("claude-fable-5-1", 10.0, 50.0, 0.25, 12.5),
+            ("claude-mythos-5", 10.0, 50.0, 1.0, 12.5),
+            ("claude-mythos-5-1", 10.0, 50.0, 0.25, 12.5),
+        ];
+        for &(id, input, output, read, write) in published {
+            let p = default_pricing(id).unwrap_or_else(|| panic!("{id} must be priced"));
+            let got = (
+                p.input_usd_per_mtok,
+                p.output_usd_per_mtok,
+                p.cache_read_usd_per_mtok,
+                p.cache_write_usd_per_mtok,
+            );
+            let matches = (got.0 - input).abs() < 1e-9
+                && (got.1 - output).abs() < 1e-9
+                && (got.2 - read).abs() < 1e-9
+                && (got.3 - write).abs() < 1e-9;
+            assert!(
+                matches,
+                "{id}: got {got:?}, published ({input}, {output}, {read}, {write})"
+            );
+        }
+        // A 1-hour write is 2x input on every model; Fable 5.1's is $20.
+        let fable_5_1 = default_pricing("claude-fable-5-1").expect("priced");
+        assert!((fable_5_1.with_hour_cache_write().cache_write_usd_per_mtok - 20.0).abs() < 1e-9);
     }
 
     // Batch API halves input/output and leaves cache rates alone.

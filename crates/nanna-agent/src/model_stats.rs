@@ -724,7 +724,12 @@ mod tests {
         let claude = &report[0];
         assert_eq!(claude.model, "claude-sonnet-5");
         assert!(claude.priced);
-        assert!((claude.estimated_cost_usd - 18.0).abs() < 1e-6, "got {}", claude.estimated_cost_usd);
+        // Sonnet 5 is $2 in / $10 out per 1M (not Sonnet 4's $3/$15).
+        assert!(
+            (claude.estimated_cost_usd - 12.0).abs() < 1e-6,
+            "got {}",
+            claude.estimated_cost_usd
+        );
 
         let local = &report[1];
         assert_eq!(local.model, "ollama/llama3.2");
@@ -732,8 +737,8 @@ mod tests {
         assert!(local.estimated_cost_usd.abs() < f64::EPSILON);
     }
 
-    // total_cost_usd sums only priced models: Sonnet $18 + GPT-5 (1M in @ $1.25
-    // + 1M out @ $10 = $11.25) = $29.25; the local model contributes nothing.
+    // total_cost_usd sums only priced models: Sonnet 5 $12 + GPT-5 (1M in @ $1.25
+    // + 1M out @ $10 = $11.25) = $23.25; the local model contributes nothing.
     #[tokio::test]
     async fn total_cost_sums_priced_models_only() {
         let tracker = ModelStatsTracker::new();
@@ -747,7 +752,7 @@ mod tests {
             .record(observation_with_tokens("ollama/llama3.2", 9_000_000, 9_000_000))
             .await;
         let total = tracker.total_cost_usd().await;
-        assert!((total - 29.25).abs() < 1e-6, "got {total}");
+        assert!((total - 23.25).abs() < 1e-6, "got {total}");
     }
 }
 
