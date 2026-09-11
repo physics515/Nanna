@@ -328,7 +328,7 @@ fn timeline_append_segment(
 /// Record a tool call starting (input captured; outcome back-filled on end).
 /// `tokens` = spend of the LLM request that issued the call; `total_tokens`
 /// = run total at that moment (0 means "unknown" and is stored as None).
-fn timeline_tool_start(
+pub(crate) fn timeline_tool_start(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
     call_id: &str,
     name: &str,
@@ -368,7 +368,7 @@ fn timeline_cap_output(output: &str) -> String {
 /// A finished tool call's outcome, as the journal records it. One value
 /// instead of positional scalars: two of them (`ok`, `replayed`) are bools
 /// that would transpose silently, and the diff made it one field too many.
-struct ToolEndRecord<'a> {
+pub(crate) struct ToolEndRecord<'a> {
     output: &'a str,
     ok: bool,
     duration_ms: u64,
@@ -380,7 +380,7 @@ struct ToolEndRecord<'a> {
 
 impl<'a> ToolEndRecord<'a> {
     /// Derive the record's structured markers from the result's data.
-    fn from_result(
+    pub(crate) fn from_result(
         output: &'a str,
         ok: bool,
         duration_ms: u64,
@@ -409,7 +409,7 @@ impl<'a> ToolEndRecord<'a> {
 /// overwrite an EARLIER call's outcome with this one's. If no open match
 /// exists (start was never journaled), a fresh item records the outcome so
 /// the call can never vanish from the run record.
-fn timeline_tool_end(
+pub(crate) fn timeline_tool_end(
     timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
     call_id: &str,
     name: &str,

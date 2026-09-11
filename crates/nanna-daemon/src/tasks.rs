@@ -1608,21 +1608,10 @@ impl ChatSink {
                     started_at: chrono::Utc::now(),
                 });
             }
-            crate::agent_service::timeline_lock(&run.timeline)
-                .push(crate::session::TimelineItem::Tool {
-                    call_id: call_id.to_string(),
-                    name: name.to_string(),
-                    input: Some(input.clone()),
-                    output: None,
-                    success: None,
-                    duration_ms: None,
-                    tokens: None,
-                    total_tokens: None,
-                    // Back-filled with the rest of the outcome in `tool_end`.
-                    short_circuited: None,
-                    diff: None,
-                    at: chrono::Utc::now().to_rfc3339(),
-                });
+            // The chat path's own journal writer, not a copy of it: this sink
+            // writes to the same journal, and the two used to disagree (see
+            // `tool_end`). 0/0 tokens = unknown, stored as None as before.
+            crate::agent_service::timeline_tool_start(&run.timeline, call_id, name, input, 0, 0);
         }
     }
 
@@ -1670,32 +1659,26 @@ impl ChatSink {
                     duration_ms,
                 });
             }
-            let mut journal = crate::agent_service::timeline_lock(&run.timeline);
-            if let Some(crate::session::TimelineItem::Tool {
-                output: slot_output,
-                success: slot_success,
-                duration_ms: slot_duration,
-                short_circuited: slot_short_circuited,
-                diff: slot_diff,
-                ..
-            }) = journal
-                .iter_mut()
-                .rev()
-                .find(|item| matches!(item, crate::session::TimelineItem::Tool { call_id: id, .. } if id == call_id))
-            {
-                *slot_output = Some(output.to_string());
-                *slot_success = Some(success);
-                *slot_duration = Some(duration_ms);
-                // Stats, the liveness ledger and the live event already
-                // distinguish a replay from a failure; the run record is the
-                // last consumer that did not, which is why a timeline
-                // rebuilt after a remount showed steering as tool errors.
-                *slot_short_circuited = Some(short_circuited);
-                // An unattended task run is exactly where a user most needs
-                // to see what each edit did; same rule as the chat path.
-                *slot_diff =
-                    crate::session::EditDiff::for_outcome(success, short_circuited, data);
-            }
+            // The chat path's writer, not a second opinion. This sink used to
+            // hand-roll the back-fill and got three things wrong that the
+            // shared one gets right: it stored the output UNCAPPED (the
+            // journal's 4000-byte bound exists so a thousand-call mission's
+            // record stays shippable), it matched the newest item with this
+            // call id even when that call had already completed — Ollama
+            // reuses ids per response, so it could overwrite an EARLIER call's
+            // outcome — and an end with no journaled start vanished instead of
+            // being recorded. The replay marker and the edit diff ride along.
+            crate::agent_service::timeline_tool_end(
+                &run.timeline,
+                call_id,
+                name,
+                crate::agent_service::ToolEndRecord::from_result(
+                    output,
+                    success,
+                    duration_ms,
+                    data,
+                ),
+            );
         }
         if let Some(stats) = &self.tool_stats {
             let observation = nanna_agent::ToolObservation {
@@ -6212,6 +6195,91 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("short-circuited call was never recorded to stats");
+    }
+
+    /// The task-run sink journals through the chat path's writer, so its
+    /// record obeys the same bound: a huge tool output is capped with a
+    /// self-describing marker instead of being stored whole.
+    #[test]
+    fn a_task_runs_journal_caps_tool_output() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        let huge = "x".repeat(10_000);
+        sink.tool_start("c1", "exec", &json!({"cmd": "cat big"}), None);
+        sink.tool_end("c1", "exec", &huge, true, 3, None);
+
+        let journal = run.timeline.lock().unwrap().clone();
+        match journal.as_slice() {
+            [
+                crate::session::TimelineItem::Tool {
+                    output: Some(out), ..
+                },
+            ] => {
+                assert!(
+                    out.len() < huge.len(),
+                    "the journal must not store it whole"
+                );
+                assert!(
+                    out.contains("journal shows the first"),
+                    "…and says so: {}",
+                    out.get(4000..).unwrap_or_default()
+                );
+            }
+            other => panic!("expected one tool item, got {other:?}"),
+        }
+    }
+
+    /// Ollama reuses call ids per response. An end whose start was never
+    /// journaled must be RECORDED, not written over an earlier completed call
+    /// that happens to share the id — the old hand-rolled back-fill did the
+    /// latter, erasing the earlier call's outcome.
+    #[test]
+    fn a_reused_call_id_never_overwrites_an_earlier_outcome() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        sink.tool_start("toolu_00000000", "exec", &json!({"cmd": "ls"}), None);
+        sink.tool_end("toolu_00000000", "exec", "first", true, 1, None);
+        sink.tool_end("toolu_00000000", "exec", "second", false, 2, None);
+
+        let journal = run.timeline.lock().unwrap().clone();
+        assert_eq!(journal.len(), 2, "the orphan end is its own record");
+        assert!(
+            matches!(
+                &journal[0],
+                crate::session::TimelineItem::Tool { output: Some(out), success: Some(true), .. } if out == "first"
+            ),
+            "the earlier outcome survives"
+        );
+        assert!(matches!(
+            &journal[1],
+            crate::session::TimelineItem::Tool { output: Some(out), success: Some(false), .. } if out == "second"
+        ));
+    }
+
+    /// P18: an unattended task run is where a user most needs to see what
+    /// each edit did, so the sink journals the diff like the chat path.
+    #[test]
+    fn a_task_runs_journal_keeps_an_edits_diff() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        let data = json!({ "diff": {
+            "start_line": 4, "removed": ["old"], "added": ["new"], "truncated": false
+        }});
+        sink.tool_start("c1", "edit_file", &json!({}), None);
+        sink.tool_end("c1", "edit_file", "Edited a.txt", true, 2, Some(&data));
+
+        let journal = run.timeline.lock().unwrap().clone();
+        match journal.as_slice() {
+            [
+                crate::session::TimelineItem::Tool {
+                    diff: Some(diff), ..
+                },
+            ] => {
+                assert_eq!(diff.start_line, 4);
+                assert_eq!(diff.removed, vec!["old"]);
+            }
+            other => panic!("expected the edit with its diff, got {other:?}"),
+        }
     }
 }
 

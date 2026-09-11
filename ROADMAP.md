@@ -4882,6 +4882,20 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       (`a_runs_tool_calls_survive_daemon_restart`) gained a replay entry beside its normal
       call, so the end-to-end claim — a replay survives a restart AS a replay — is
       asserted through Turso rather than argued. 318 nanna-daemon tests green.
+- [x] **The harness sink kept its own copy of the journal writer, and the copy drifted**
+      *(found and fixed 2026-09-11, while wiring the P18 edit diff through both writers)* —
+      `tasks.rs`'s `tool_end` hand-rolled the back-fill that `agent_service::timeline_tool_end`
+      already does, and got three things wrong the shared one gets right: it stored the tool
+      output **uncapped** (the journal's 4000-byte `TIMELINE_OUTPUT_CAP` exists so a
+      thousand-call mission's record stays shippable on remount — task runs are exactly
+      those missions); it back-filled the **newest item with that call id even if it had
+      already completed**, and Ollama reuses call ids per response, so an end with no
+      journaled start overwrote an EARLIER call's outcome; and that same orphan end was
+      otherwise never recorded. Both `tool_start` and `tool_end` now call the chat path's
+      `timeline_tool_start`/`timeline_tool_end` (`pub(crate)`, with `ToolEndRecord`), the
+      same "one policy, one implementation" fix the poisoned-lock entry below applied to
+      `timeline_lock`. 3 sink tests: output capped with its marker, a reused id appends
+      instead of overwriting, and the edit diff rides through.
 - [x] **One panic under the journal lock could wedge a whole harness run** *(found and
       fixed 2026-08-27, while working the item above)* — the two writers to the run
       journal disagreed about what a poisoned mutex means. `agent_service.rs` has always
