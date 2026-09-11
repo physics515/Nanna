@@ -1839,7 +1839,8 @@ impl MemoryService {
                 MemoryState::Unavailable => stats.unavailable += 1,
             }
         }
-        
+        stats.searchable_latency = self.store.searchable_latency();
+
         stats
     }
 
@@ -2738,6 +2739,10 @@ pub struct MemoryStats {
     pub dormant: usize,
     pub silent: usize,
     pub unavailable: usize,
+    /// Queue-to-searchable latency over the recent window (see
+    /// [`crate::SearchableLatency`]); `None` until a memory written without a
+    /// vector has received one in this process.
+    pub searchable_latency: Option<crate::SearchableLatency>,
 }
 
 /// One memory as `nanna export --memories` writes it.

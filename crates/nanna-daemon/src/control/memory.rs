@@ -267,6 +267,14 @@ impl ControlPlane {
                     "dormant": stats.dormant,
                     "silent": stats.silent,
                     "unavailable": stats.unavailable,
+                    // How long memories written without a vector stayed
+                    // unfindable by similarity search; null until one has
+                    // been filled this run.
+                    "queue_to_searchable": stats.searchable_latency.map(|l| json!({
+                        "samples": l.samples,
+                        "p50_secs": l.p50_secs,
+                        "p95_secs": l.p95_secs,
+                    })),
                 })
             }
             MemoryAction::Consolidate => {

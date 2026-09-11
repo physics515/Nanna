@@ -3257,7 +3257,17 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       be bounded and measured, not assumed** — the drain's budget bound (embed only what this process
       parked) is the mechanism, and the missing half is evidence that it converges within a turn.
       Concrete, in reach:
-      - [ ] **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
+      - [~] *(2026-09-11 — the instrument landed; the live-mission number is still to take.)*
+            The whole-row vector is what makes a memory findable, and it is filled by the
+            in-memory backfill through `VectorStore::set_embedding_for_model` — the durable
+            `embedding_queue` only ever holds chunk work. So the store now records, on a
+            memory's FIRST vector ever, `now − timestamp` into a ring of the last 512 waits
+            (sized for the p95: 25 samples above it). A re-embed after a provider switch keeps
+            its old buckets and is deliberately not counted, or a days-old memory would read
+            as a days-long wait. `memory.stats` reports `queue_to_searchable {samples,
+            p50_secs, p95_secs}`. Seconds, because `timestamp` is — ample for a number that
+            lives in seconds-to-minutes. **Open:** run a live mission and record p50/p95.
+            **Measure queue-to-searchable latency** — time from `remember_deferred_vector` returning to the
             row having a vector, p50/p95, under a live mission. This is Nanna's staleness number and it does
             not exist yet.
       - [x] **Add a write-path suite to `bench/BASELINE.md`** *(2026-08-25)* — "Suite 2 (write path)",
