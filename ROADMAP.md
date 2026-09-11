@@ -4082,6 +4082,21 @@ asks permission or restricts her.)*:
         phrase layer is a small pure function over the user's message plus one per-turn
         `agent_config.thinking_mode` bump beside `apply_chat_model_override` in
         `chat_with_options` (escalate only: `Instant` stays internal-only).
+        *(research, 2026-09-11)* **Both upper-rung targets exist upstream, and nanna uses
+        neither.**
+        - **Anthropic:** `output_config.effort` (`low`/`medium`/`high` (the default)/`xhigh`/`max`;
+          Opus 4.5+, Sonnet 4.6/5, Fable, Mythos). The docs call it *the* recommended thinking-depth
+          control where adaptive thinking exists. nanna sends no `output_config` today.
+        - **Ollama:** `think` takes `"low"|"medium"|"high"|"max"` as well as a bool, on models that
+          support levels (gpt-oss). nanna sends only `think: true` (`nanna-llm` `lib.rs`).
+
+        **The design constraint for the owner call:** changing top-level effort between requests
+        invalidates the prompt cache. Only Fable 5.1, Mythos 5.1 and Opus 5 take a per-message effort
+        change that keeps it (beta header `mid-conversation-output-config-2026-07-01`). A per-turn
+        "think hard" bump would therefore cost cache hits on every other model. So either escalate
+        per message only where that is supported, or make the phrase set effort for the rest of the
+        conversation. (Sources: platform.claude.com/docs/en/build-with-claude/effort,
+        docs.ollama.com/api/chat.)
 - [~] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
       carries `model: Option<String>`, the Chat message doesn't.
       - [x] *(found done 2026-09-11 — landed 2026-08-17 in #252, "per-chat model selection")*
