@@ -159,7 +159,8 @@ nanna doctor
 
 Checks the configuration and, for anything it finds, prints the fix rather than
 just the verdict — a missing tools directory, a `[infer]` section that names no
-model, a clustering configuration that would merge unrelated memories. Exits
+model, a clustering configuration that would merge unrelated memories, chat and
+summarization pointed at two different Ollama servers by accident. Exits
 non-zero when something is actually broken, so it also works from a script or a
 health probe.
 

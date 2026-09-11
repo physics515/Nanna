@@ -3936,6 +3936,15 @@ asks permission or restricts her.)*:
             - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
                   command without surprising whoever typed it; delete it, or define it as
                   "the daemon starts the HTTP surface" and wire that.
+      - [ ] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
+            server.** Chat and embeddings reach Ollama through `[memory].ollama_host`;
+            summarization (dreaming, context compression) through `[llm].ollama_url`, which
+            defaults to localhost — so pointing the first at a GPU box leaves summaries on
+            localhost. **Owner call** on which key wins: `ollama_url` defaults to
+            `Some("http://localhost:11434")` and saved configs carry that default, so code
+            cannot tell a deliberate split from an untouched one (the `[server].host` trap
+            again). Meanwhile `nanna doctor` warns when both are in use and differ
+            (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
       - [ ] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

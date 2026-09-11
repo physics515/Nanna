@@ -110,6 +110,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     checks.push(check_server_exposure());
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
+    checks.push(check_ollama_servers(config));
 
     debug_assert!(
         checks
@@ -232,6 +233,99 @@ fn check_embeddings(config: &Config) -> Check {
         );
     }
     Check::ok("memory.embeddings", format!("provider `{provider}`"))
+}
+
+/// Ollama's own default port, which a base URL without one means.
+const OLLAMA_DEFAULT_PORT: u16 = 11434;
+
+/// What the summarizer falls back to when `[llm].ollama_url` is unset.
+const OLLAMA_DEFAULT_URL: &str = "http://localhost:11434";
+
+/// Two Ollama servers configured without meaning to.
+///
+/// Chat and embeddings reach Ollama through `[memory].ollama_host`;
+/// summarization — the model behind dreaming and context compression —
+/// through `[llm].ollama_url`, which defaults to localhost. Point the first at a
+/// GPU box and summaries still go to localhost. Found 2026-09-11 in a smoke
+/// run. Which key should win is an owner call — a saved config carries the
+/// default on disk, so code cannot tell a deliberate split from an untouched
+/// one — so this says so rather than guessing.
+fn check_ollama_servers(config: &Config) -> Check {
+    let summarizes_on_ollama = config
+        .llm
+        .summarization_priority
+        .iter()
+        .any(|m| is_ollama_spec(m));
+    let chats_on_ollama = config.llm.provider.eq_ignore_ascii_case("ollama")
+        || config.llm.model_priority.iter().any(|m| is_ollama_spec(m))
+        || config
+            .memory
+            .embedding_provider
+            .eq_ignore_ascii_case("ollama")
+        || config
+            .memory
+            .embedding_priority
+            .iter()
+            .any(|m| is_ollama_spec(m));
+    if !(summarizes_on_ollama && chats_on_ollama) {
+        return Check::ok("ollama.servers", "at most one Ollama server is in use");
+    }
+    let chat_url = config.memory.ollama_host.as_str();
+    let summary_url = config
+        .llm
+        .ollama_url
+        .as_deref()
+        .unwrap_or(OLLAMA_DEFAULT_URL);
+    if ollama_endpoint(chat_url) == ollama_endpoint(summary_url) {
+        return Check::ok(
+            "ollama.servers",
+            format!("chat, embeddings and summarization share {chat_url}"),
+        );
+    }
+    Check::warn(
+        "ollama.servers",
+        format!(
+            "chat and embeddings use `[memory].ollama_host = \"{chat_url}\"` but summarization \
+             uses `[llm].ollama_url = \"{summary_url}\"` — two different Ollama servers"
+        ),
+        "set both to the same URL, unless summarizing on a separate server is deliberate",
+    )
+}
+
+/// Does a model spec name an Ollama model? `ollama/<model>`, or a bare
+/// `name:tag` (how Ollama ids look, and how the router detects them).
+fn is_ollama_spec(model: &str) -> bool {
+    let model = model.trim();
+    model.starts_with("ollama/") || (!model.contains('/') && model.contains(':'))
+}
+
+/// `(host, port)` of an Ollama base URL, the host lowercased and every
+/// loopback spelling folded to one — `localhost`, `127.0.0.1` and `[::1]` on the
+/// same port are the same server. A missing port means Ollama's default.
+fn ollama_endpoint(url: &str) -> (String, u16) {
+    let trimmed = url.trim();
+    let rest = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or_default();
+    let (host, port) = authority.strip_prefix('[').map_or_else(
+        || match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (authority.to_string(), None),
+        },
+        |bracketed| match bracketed.split_once(']') {
+            Some((inner, tail)) => (format!("[{inner}]"), tail.strip_prefix(':')),
+            None => (authority.to_string(), None),
+        },
+    );
+    let port = port
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(OLLAMA_DEFAULT_PORT);
+    let host = if nanna_config::is_loopback_host(&host) {
+        "loopback".to_string()
+    } else {
+        host.to_ascii_lowercase()
+    };
+    debug_assert!(!host.contains('/'), "the host carries no path");
+    (host, port)
 }
 
 /// Print the report. Returns the worst severity seen, so the caller can choose
@@ -371,6 +465,86 @@ mod tests {
             check.detail
         );
         assert!(check.detail.contains("--host"));
+    }
+
+    #[test]
+    fn ollama_endpoints_fold_loopback_spellings_and_the_default_port() {
+        let local = ollama_endpoint("http://localhost:11434");
+        assert_eq!(ollama_endpoint("http://127.0.0.1:11434/"), local);
+        assert_eq!(ollama_endpoint("http://[::1]:11434"), local);
+        assert_eq!(
+            ollama_endpoint("http://localhost"),
+            local,
+            "a missing port is Ollama's default"
+        );
+        assert_ne!(ollama_endpoint("http://gpu-box:11434"), local);
+        assert_ne!(
+            ollama_endpoint("http://localhost:11435"),
+            local,
+            "a different port is a different server"
+        );
+        assert_eq!(
+            ollama_endpoint("http://GPU-Box:11434"),
+            ollama_endpoint("http://gpu-box:11434")
+        );
+    }
+
+    fn ollama_everywhere() -> Config {
+        let mut config = cfg();
+        config.llm.provider = "ollama".to_string();
+        config.llm.summarization_priority = vec!["ollama/qwen3:8b".to_string()];
+        config
+    }
+
+    fn ollama_check(config: &Config) -> Check {
+        run_checks(config, Path::new("/x"))
+            .into_iter()
+            .find(|c| c.name == "ollama.servers")
+            .expect("ollama.servers is always checked")
+    }
+
+    /// The smoke-run finding: chat on a GPU box, summaries still on localhost.
+    #[test]
+    fn two_ollama_servers_are_flagged_with_the_fix() {
+        let mut config = ollama_everywhere();
+        config.memory.ollama_host = "http://gpu-box:11434".to_string();
+        config.llm.ollama_url = None;
+        let check = ollama_check(&config);
+        assert_eq!(check.severity, Severity::Warn);
+        assert!(check.detail.contains("gpu-box"), "{}", check.detail);
+        assert!(
+            check.detail.contains(OLLAMA_DEFAULT_URL),
+            "an unset key shows the URL it actually falls back to: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .remedy
+                .as_ref()
+                .is_some_and(|r| r.contains("same URL")),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn one_ollama_server_in_any_spelling_is_fine() {
+        let mut config = ollama_everywhere();
+        config.memory.ollama_host = "http://localhost:11434".to_string();
+        config.llm.ollama_url = Some("http://127.0.0.1:11434/".to_string());
+        let check = ollama_check(&config);
+        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+
+        // Summarizing on Ollama while chat and embeddings are cloud is one
+        // Ollama server, not two.
+        let mut config = cfg();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model_priority = vec!["claude-opus-5".to_string()];
+        config.memory.embedding_provider = "openai".to_string();
+        config.memory.embedding_priority.clear();
+        config.llm.summarization_priority = vec!["ollama/qwen3:8b".to_string()];
+        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
+        let check = ollama_check(&config);
+        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
     }
 
     #[test]
