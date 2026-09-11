@@ -1283,6 +1283,57 @@ mod tests {
         let _router = server.router();
     }
 
+    /// Run the GET verification handshake of `/webhook/whatsapp` against a
+    /// host configured with `configured` and return what it answers to
+    /// `offered`.
+    async fn whatsapp_handshake(configured: Option<&str>, offered: &str) -> (StatusCode, String) {
+        let config = WebhookConfig {
+            whatsapp_verify_token: configured.map(str::to_string),
+            ..WebhookConfig::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let state = Arc::new(WebhookState::new(config, tx));
+        let params: HashMap<String, String> = [
+            ("hub.mode", "subscribe"),
+            ("hub.verify_token", offered),
+            ("hub.challenge", "challenge-123"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let response = whatsapp_verify(State(state), axum::extract::Query(params))
+            .await
+            .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("a small body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Meta's GET handshake echoes `hub.challenge` only for the configured
+    /// verify token. The fail-closed pass covered the POST routes; this pins
+    /// the GET one: a host that never configured a token, or configured an
+    /// empty one, answers nobody, rather than subscribing whoever asks.
+    #[tokio::test]
+    async fn whatsapp_verification_echoes_the_challenge_only_for_the_configured_token() {
+        assert_eq!(
+            whatsapp_handshake(Some("wa-verify"), "wa-verify").await,
+            (StatusCode::OK, "challenge-123".to_string())
+        );
+        let wrong = whatsapp_handshake(Some("wa-verify"), "wa-verif").await;
+        assert_eq!(wrong.0, StatusCode::FORBIDDEN, "a wrong token");
+        assert!(!wrong.1.contains("challenge-123"), "no echo on refusal");
+        let unconfigured = whatsapp_handshake(None, "anything").await;
+        assert_eq!(unconfigured.0, StatusCode::FORBIDDEN, "never configured");
+        let empty = whatsapp_handshake(Some(""), "").await;
+        assert_eq!(
+            empty.0,
+            StatusCode::FORBIDDEN,
+            "an empty token authenticates nobody"
+        );
+    }
+
     #[test]
     fn refusing_an_unconfigured_channel_is_distinguishable_from_a_bad_secret() {
         // 503 ("this host never armed the channel") must not be reported as

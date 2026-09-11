@@ -604,7 +604,24 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       loopback. Only a setup relying on the old `0.0.0.0` default for direct inbound webhooks needs to set
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
-- [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+- [x] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      *(ticked 2026-09-11. Each part was checked against the code, and the one untested gap was
+      closed.)* Evidence for each part the item names:
+      - **Telegram secret:** fail-closed, constant-time (2026-08-22, below).
+      - **WhatsApp POST:** the Meta `X-Hub-Signature-256` is verified (2026-07-25) and the route
+        fails closed (2026-08-22).
+      - **WhatsApp GET verification handshake:** `whatsapp_verify` echoes `hub.challenge` only
+        for the configured verify token, through the constant-time `webhook_secret_matches`.
+        Until today nothing tested it. Now
+        `whatsapp_verification_echoes_the_challenge_only_for_the_configured_token` pins it:
+        the right token → 200 plus the challenge; a wrong one, none configured, or an empty
+        configured token → 403, with no echo.
+      - **Signal bridge trust:** Signal is served by `nanna-server` (`/webhooks/signal`), and its
+        `X-Webhook-Secret` refusal is pinned in `nanna-server/tests/webhook_fail_closed.rs`.
+      - **Replay protection:** a window exists wherever the protocol signs a timestamp (Slack,
+        Discord, both tested). Telegram's secret header, Meta's HMAC and the Signal bridge's
+        shared secret sign **no** timestamp, so there is nothing to window. Replay protection
+        there would need a nonce store, which none of those protocols provides a nonce for.
       - [x] *(2026-08-22)* **The whole inbound webhook surface now fails CLOSED, and the generic route
             no longer aborts the daemon.** Every verifier in `nanna-daemon/src/webhook.rs` was correct and
             every handler *skipped* it when nothing was configured — `if let Some(secret) = …` with no
