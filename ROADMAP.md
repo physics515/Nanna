@@ -1950,6 +1950,33 @@ so neither CI nor any prior run could have caught them:
       Linux, and the machine was saturated — three uncontrolled variables at once. Re-run quiet
       before claiming any of it as an improvement or attributing it to `wide 1.7`.
 
+- [x] **Four `.rs` files in the tree had never been compiled — and that is a different thing from
+      dead code.** *(2026-09-13)* `src/daemon_launcher.rs`, `src/updater.rs`, `src/webview2.rs` and
+      `crates/nanna-gpu/src/batch_processor.rs` (32 KB between them) were named by no `mod`
+      declaration anywhere, so `cargo check`, clippy, `cargo fmt` and the test suite all skipped
+      them. Unused code at least compiles; these had drifted to **12 compile errors** — measured, by
+      declaring the modules and building: an unresolved `tauri_plugin_updater` import in a crate
+      that has never depended on it, `std::process::Output` assigned to an `Option<Child>` (plus
+      `Command::output()` used to launch a daemon, which would block until the daemon exited), a
+      call to a `regex_pattern` function that does not exist, and a `parking_lot::RwLock` in a crate
+      without `parking_lot`. The cost is not the bytes, it is that each file reads like an answer:
+      `daemon_launcher.rs` looks like the sidecar launcher (the real one is
+      `gui/src-tauri/src/daemon_manager.rs`), `updater.rs` looks like the updater (the real one is
+      `gui/src-tauri/src/lib.rs`), and `batch_processor.rs` re-proposes the batch sizing
+      `memory_manager.rs::BatchedSearch` already ships. `webview2.rs` was the repo's only mention of
+      WebView2 at all, and the host is WebKitGTK now. All four deleted; git history is the record.
+      **Made a gate, not a habit:** `crates/nanna-storage/tests/source_tree_guard.rs` walks `mod`
+      declarations from every workspace package's roots (`src/lib.rs`, `src/main.rs`, `src/bin/*`)
+      and fails if any `.rs` under that package's `src/` is unreachable, naming the files and the
+      two ways out. It sits beside `dep_guard.rs`/`dep_version_unification.rs` for their stated
+      reason (cheap crate, already in CI's `cargo test` scope) and runs in 0.26 s. Verified both
+      directions: it named exactly those four before the deletion and fires on a freshly planted
+      orphan. Three parser tests come with it, since a guard whose `mod` matcher quietly stops
+      matching is a test that always passes — a commented-out `mod` must not count as a
+      declaration (that is the direction that lets an orphan through), Rust's **nesting** block
+      comments must not swallow the declaration after them, and `pub(crate)`/`pub(super)`/`#[path]`
+      forms must all be recognised.
+
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
 consumer GPU** as the default, first-class inference backend — no Ollama, no cloud required. The
