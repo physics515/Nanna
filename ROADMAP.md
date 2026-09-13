@@ -1997,6 +1997,24 @@ so neither CI nor any prior run could have caught them:
       and the presence of `discover_tools/tool.ts` rather than the spelling of the path. 1728
       workspace tests green.
 
+- [ ] *(measured 2026-09-13)* **GUI WebDriver verification is blocked on this host, and every
+      published install instruction for it names the wrong Arch package.** The shared harness's
+      `ensure` reports `MISS WebKitWebDriver` and advises `sudo pacman -S --needed webkit2gtk-4.1` —
+      but `webkit2gtk-4.1 2.52.6-1` **is already installed here and does not contain the binary**.
+      Queried the Arch package file lists directly: `webkit2gtk-4.1` ships 416 files and no driver;
+      **`webkitgtk-6.0` ships `usr/bin/WebKitWebDriver`**. Tauri's own WebDriver docs and the
+      WebdriverIO Tauri service both print `pacman -S webkit2gtk-4.1` for Arch, and both hedge that
+      "some distributions bundle it with the regular WebKit package" — on current Arch it is not
+      bundled. So the one-line unblock is **`sudo pacman -S --needed webkitgtk-6.0`** (owner-gated;
+      nothing here can run pacman). Until it is installed, every nightly on this host must report GUI
+      verification as unavailable rather than skipped — the Linux WebDriver harness has still never
+      had a successful `exec`. Sources: [Tauri WebDriver](https://v2.tauri.app/develop/tests/webdriver/),
+      [WebdriverIO Tauri platform support](https://webdriver.io/docs/desktop-testing/tauri/platform-support/).
+- [ ] *(2026-09-13)* **Correct the harness's own remedy string** once the package above is confirmed:
+      `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the `webkit2gtk-4.1` advice, which
+      sends the reader to a package they already have. It lives outside this repo, so a run cannot
+      deliver the fix inside its one PR — recorded here so the correction is not re-derived monthly.
+
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
 consumer GPU** as the default, first-class inference backend — no Ollama, no cloud required. The
@@ -2129,6 +2147,17 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 - [ ] **Correctness gate** — parity-test each Burn port against a reference (Candle or a local Ollama run of the same model): single-forward top-k logits + a short greedy sequence must match. This is how laurelane trusts its reimplementations.
 - [ ] **Model management UX** — GUI: browse/download/select model, tier + f16 toggles, VRAM estimate, download progress; config `[infer]` section (model repo, cache dir, device override, f16).
 - [ ] Later: training/fine-tune loop (Burn supports it); LoRA adapters; quantization (int8/int4) for bigger models on the same GPU; vision/OCR models on the same runner (retire the Candle OCR path).
+
+- [ ] *(research 2026-09-13)* **Burn 0.22 deprecates the LibTorch backend — CubeCL is the supported
+      path, and that is the direction we already picked.** 0.22.0 is still pre-release (pre-tags from
+      2026-07-29 through 2026-08-25) and marks `burn-tch` deprecated for removal, pointing users at
+      the CubeCL backends (CUDA, ROCm, Metal, **Vulkan**, WebGPU). Two consequences worth recording
+      before the Mummu integration lands: the `wgpu` backend Nanna assumed is not a fallback but the
+      supported GPU path, and on this host it resolves to **Vulkan** on the proprietary NVIDIA driver
+      — so a parity harness must state which CubeCL backend produced a number, since "wgpu" alone no
+      longer identifies one. This is Mummu's migration to make (P12 here is integration-only);
+      recorded so the consumer side does not plan against `burn-tch`.
+      Source: [Burn releases](https://github.com/tracel-ai/burn).
 
 ### P13 — Memory & Dreaming: the moat (Turso-only + DSP time-series) 🌱 flagship (the pivot)
 **Goal:** make **dreaming** (cognitive consolidation) the differentiator — a multi-phase, idle-gated,
@@ -2667,6 +2696,29 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       Still open here: **corrections and tool-success/failure**, which is where the
       `UsedSuccessfully`/`CausedError` variants finally get fed — reactions only ever produce
       Helpful/Unhelpful.
+      - [ ] *(scoped 2026-09-13 — skipped deliberately this run, with the reason and the design, so
+            the next run starts from a decision)* **`UsedSuccessfully`/`CausedError` have no producer
+            anywhere in the product.** Confirmed by grep: both variants appear only inside
+            `nanna-memory/src/dreaming.rs` and its own tests. The whole apparatus around them is
+            real — `feedback_boost` prices them at ±0.5, *higher magnitude* than Helpful/Unhelpful's
+            ±0.3, `FeedbackTally` counts them, four tests exercise them — and none of it can ever
+            fire. The single producer in the tree is
+            `nanna-server/src/state.rs::record_message_feedback`, and reactions map only to
+            Helpful/Unhelpful.
+            **The blocker is plumbing, not design.** `record_feedback` hangs off `DreamingService`,
+            reached through `nanna-core`; `nanna-agent/src/loop_runner.rs` — where tool outcomes
+            actually happen — has **no reference to dreaming at all**, so wiring a producer means
+            threading a new dependency into the agent loop, and the result cannot be verified
+            unattended (it needs a live model turn). Do not half-land it.
+            **The attribution to use when it is picked up**, because it is the one that is not a
+            guess: the **memory-stub round trip**. A large tool result is already stored as a memory
+            and replaced with a `[Result stored in memory…]` stub that the agent later resolves with
+            `recall` (`loop_runner.rs` ~7132-7178). If that recall returns the stored content, the
+            memory demonstrably carried the work forward → `UsedSuccessfully`. If the stub cannot be
+            resolved, the memory was promised and could not deliver → `CausedError`. Both are facts
+            about one memory, unlike "a tool failed somewhere in a turn that also recalled things",
+            which attributes a turn-level outcome to whatever happened to be in context — the same
+            over-attribution the 2026-08-28 reaction work had to undo.
       - [ ] *(2026-08-28)* **Telegram could feed the same loop; today it cannot see reactions.**
             `crates/nanna-channels/src/listeners/telegram.rs:87` requests
             `allowed_updates = ["message","edited_message"]`, and Telegram delivers
@@ -2720,6 +2772,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Algorithm page still documents FSRS-6 only.) Sources:
             [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark),
             [fsrs-rs PR #395](https://github.com/open-spaced-repetition/fsrs-rs/pull/395).
+            - [ ] *(re-checked 2026-09-13 — still blocked, and the shape of FSRS-7 is now clear)*
+                  `fsrs-rs` still has **no stable release carrying FSRS-7**, and the work has grown
+                  from one PR to three open ones (#395, #412, #426). What they add is not a tuning
+                  pass: **FSRS-7 is a dual-trace model — 34 parameters against FSRS-6's 21, with two
+                  memory traces per item** (the familiar stability plus a second, faster-decaying
+                  one, each updated by its own block of eight weights). That is a different state
+                  vector, so `FsrsState` would change shape, not just its constants — which makes
+                  "stay on FSRS-6 until it lands" the right call for a second reason beyond
+                  availability. Re-check when a tagged `fsrs-rs` release mentions it.
       - [ ] *(research 2026-07-16)* **We ship the FSRS-6 curve with the FSRS-5 decay constant — `w20` is wrong
             by ~7.6x.** `nanna-memory/src/fsrs.rs` implements the FSRS-6 forgetting curve *exactly*
             (`R(t,S) = (1 + factor·t/S)^(-w20)` with `factor = 0.9^(-1/w20) - 1`, `power_law_retrievability`),
@@ -5414,6 +5475,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-13 sweep)* `cargo update` → 29 compatible bumps (`jiff 0.2.37`, `reqwest 0.13.5`,
+     `tantivy 0.26.2`, `uuid 1.26.1`, `zerocopy 0.8.57`, `cc 1.4.6`, `bitflags 2.13.2`,
+     `console 0.16.6`, `encoding_rs 0.8.41`, `multiversion 0.9`, `smallvec 1.16.1`, `toml 1.1.6`, …)
+     plus `ocrs 0.13.0 → 0.13.1` (published the same day; `rten` stays unified at a single 0.26.0).
+     `cargo upgrade --incompatible` offered three rows and **only one was a real bump**:
+     `playwright-rs 0.17 → 0.18` (`nanna-browser`), applied, compiled unchanged.
+     - **The pin-backs must be the LAST lockfile operation of a sweep, not a step in the middle.**
+       The standing note says "re-apply the pin after every `cargo update`" — that is not enough,
+       and this run proved it. `cargo upgrade --incompatible` **also re-resolves the lockfile**, and
+       it silently walked `libc` back up to 0.2.189 after the pin had been applied. The workspace
+       check then died exactly where the ceiling note predicts: E0308 in
+       `rustpython-vm-0.5.0/src/stdlib/posix.rs:1812`. Order the sweep
+       `update → upgrade → pin-backs → verify`, never `update → pin → upgrade`.
+     - **`lopdf 0.45 → "0.42"` is a new instance of the `criterion` downgrade trap** — `cargo-upgrade`
+       reports `latest 0.42.0` while the lock resolves 0.45. Same rule as criterion: never apply a row
+       whose "latest" is below the current req. Two of the three rows offered this run were
+       downgrades, which is worth stating plainly — the tool's "latest" column is not a version order.
+     - **`rustpython` has published nothing since 0.5.0 (2026-03-31), re-checked on crates.io
+       2026-09-13** — five and a half months. Both holds it forces (`malachite-bigint =0.9.2`, the
+       `libc <= 0.2.186` ceiling) stay, and both are enforced by
+       `dep_version_unification.rs` rather than by memory.
    - Pins now: `turso =0.7.2`, `aegis =0.9.15` (exact — pre-1.0; both at latest stable as of
      2026-09-08). The old `wgpu` pin is dropped (see the wgpu 30 note above), and **the boa git rev
      is gone too** — see the 2026-09-08 sweep. The only lockfile-only holds left are
