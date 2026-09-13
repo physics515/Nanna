@@ -2015,6 +2015,34 @@ so neither CI nor any prior run could have caught them:
       sends the reader to a package they already have. It lives outside this repo, so a run cannot
       deliver the fix inside its one PR — recorded here so the correction is not re-derived monthly.
 
+- [x] **A missing `permissions.json` grants the *widest* permissions, and `edit_tool` was missing
+      one.** *(2026-09-13)* `ScriptedTool::from_file` starts from `ToolPermissions::default()` —
+      empty read/write/net, `run: false`, `env: false` — which is the safe default. But the daemon
+      calls `ensure_permissions` **before** loading skills, and that writes
+      `DEFAULT_PERMISSIONS_JSON` (`read: ["*"], write: ["*"], run: true, net: ["*"], env: true`)
+      into any skill directory lacking one. So the safe default is never what a shipped skill gets:
+      a forgotten file fails **open**, and leaves nothing in the tree to review. `create_tool` and
+      `edit_tool` were added in one commit (`af7bdbbd`); `create_tool` shipped `read: ["~"],
+      write: ["~"]` and `edit_tool` shipped no file at all — so the tool whose whole job is
+      rewriting other tools' source ran with whole-filesystem read and write while its own sibling
+      was scoped to home. 42 of the 43 bundled skills had one; this was the 43rd. Fixed by giving
+      `edit_tool` its sibling's scope (both write into the same tools directory, which lives under
+      the data dir). Surfaced by the `dev_tools_dir` fix above: once the development skills
+      directory resolved on Linux, `ensure_permissions` wrote the wide default into the *source
+      tree* and it showed up as an untracked file. **Gated** by
+      `crates/nanna-tools/tests/default_skill_permissions.rs`: every directory holding a `tool.ts`
+      must ship a `permissions.json` that deserializes with all five fields present (a malformed
+      file is ignored by the loader, so it fails identically to a missing one), and `create_tool` /
+      `edit_tool` must agree on read and write scope. Verified in both directions — removing the
+      new file fails both tests by name. The assertion is deliberately "somebody chose", not "the
+      scope is narrow": 27 bundled skills are `~`-scoped and 13 legitimately need `*`.
+      - [ ] **Reconsider the fail-open default itself.** `DEFAULT_PERMISSIONS_JSON` is the widest
+            possible set, and `ensure_permissions` applies it to anything without a file —
+            including **user-authored** tools, where it is load-bearing rather than an accident.
+            Narrowing it is a real behaviour change for existing installs, so it needs its own
+            increment: decide whether an undeclared tool should get `~` instead of `*`, or whether
+            `ensure_permissions` should stop writing on behalf of skills that ship their own.
+
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
 consumer GPU** as the default, first-class inference backend — no Ollama, no cloud required. The
