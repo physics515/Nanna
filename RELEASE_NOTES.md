@@ -40,6 +40,27 @@ Two tests cover it, both verified to fail on the old line and pass on the new on
 against `is_dir()` rather than the spelling of the path — so they are the same test on Windows,
 Linux and macOS.
 
+### A tool that rewrites other tools had whole-filesystem write
+
+A missing `permissions.json` does not mean "no permissions" — it means the widest ones. The loader
+starts from a fully-sandboxed default, but the daemon calls `ensure_permissions` *before* loading
+skills, and that writes `read: ["*"], write: ["*"], run: true, net: ["*"], env: true` into any skill
+directory lacking a file. So the safe default is never what a shipped skill gets, and a forgotten
+file fails **open**.
+
+`create_tool` and `edit_tool` were added in one commit. `create_tool` shipped `read: ["~"],
+write: ["~"]`; `edit_tool` shipped no file at all — so the tool whose whole job is rewriting other
+tools' source ran with whole-filesystem read and write while its own sibling was scoped to home. 42
+of the 43 bundled skills had a file; this was the 43rd. It now carries its sibling's scope.
+
+A new test requires every bundled skill to declare permissions that actually deserialize, and
+requires the two tool-authoring skills to agree on their reach. The check is "somebody chose", not
+"the scope is narrow" — 27 skills are home-scoped and 13 legitimately need the whole filesystem.
+
+This one surfaced *because* of the skills fix above: once the development skills directory resolved
+on Linux, the wide default got written into the source tree, where it showed up as an untracked
+file.
+
 ### Four files that had never compiled, and a guard so it cannot happen quietly again
 
 `src/daemon_launcher.rs`, `src/updater.rs`, `src/webview2.rs` and
