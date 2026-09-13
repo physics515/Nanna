@@ -1977,6 +1977,26 @@ so neither CI nor any prior run could have caught them:
       comments must not swallow the declaration after them, and `pub(crate)`/`pub(super)`/`#[path]`
       forms must all be recognised.
 
+- [x] **A debug build on Linux or macOS loaded none of the 43 JS/TS skills — one hardcoded `\\`.**
+      *(2026-09-13)* `nanna-tools`' development fallback was
+      `concat!(env!("CARGO_MANIFEST_DIR"), "\\default-skills")`. That is a path only on Windows;
+      everywhere else the backslash is an ordinary filename character, so the constant named a file
+      that has never existed. Measured on this host before the fix: `DEV_TOOLS_DIR =
+      Some(".../crates/nanna-tools\\default-skills")`, `is_dir() = false`, `resolve_tools_dir(None)
+      = None`. Debug builds have **no other source of skills** — release builds extract the embedded
+      copies, debug builds read the source tree, and `bootstrap_default_skills` is explicitly a no-op
+      under `debug_assertions` — so a developer daemon on Linux with no `NANNA_TOOLS_DIR` and no
+      `[tools].tools_dir` ran with the Rust built-ins and nothing else, while the same commit on
+      Windows loaded all 43. Worse than missing: `setup.rs`'s `register_discover_tools` skipped
+      silently, so the system prompt kept telling the model it has `discover_tools` — one of the four
+      it names — while the tool was not registered. Arrived with the September host move, like the
+      other two Linux blockers. Fixed by joining (`Path::new(CARGO_MANIFEST_DIR).join(..)`) rather
+      than concatenating a separator, which is correct by construction on every platform; the silent
+      `None` also gained a `warn!` naming the two env/config ways out. Two tests, both verified to
+      fail on the old line and pass on the new one, and both portable because they assert `is_dir()`
+      and the presence of `discover_tools/tool.ts` rather than the spelling of the path. 1728
+      workspace tests green.
+
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
 consumer GPU** as the default, first-class inference backend — no Ollama, no cloud required. The
