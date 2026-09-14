@@ -1032,8 +1032,12 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       **`webkit2gtk-4.1` 2.52.6-1 IS installed** here and its 416-file manifest ships
       `MiniBrowser`, `WebKitGPUProcess`, `WebKitNetworkProcess`, `WebKitWebProcess` and `jsc` — and
       **no `WebKitWebDriver` at all** (`pacman -Ql webkit2gtk-4.1 | grep -i driver` is empty; the
-      binary exists nowhere on the filesystem). Arch has no `webkit2gtk-driver` package either —
-      the repo carries only `webkit2gtk-4.1` and `webkit2gtk-4.1-docs`. Upstream confirms the gap:
+      binary exists nowhere on the filesystem). Arch has no `webkit2gtk-driver` package either.
+      *(Corrected 2026-09-14: the repo does carry **one** packaged `WebKitWebDriver`, in
+      `webkitgtk-6.0` — a differently-named package this search missed. It is the WebKitGTK **6.0**
+      ABI, and the app embeds 4.1, so it does not overturn this entry's conclusion; see the
+      2026-09-14 entry under "Anthropic OAuth / Linux host blockers" for the evidence and the
+      cheap experiment worth running before the source build.)* Upstream confirms the gap:
       unlike Debian's `webkit2gtk-driver`, Arch's packages do not include the WebDriver binary, and
       the community fix is a
       [source build](https://gist.github.com/jamesmeneghello/37fc7988ec94edc962969ade428cd710).
@@ -6014,11 +6018,16 @@ keep the phases readable; promote individual items into a phase when they become
       **4.1**, and WebKitGTK's automation handshake is per-library-generation. **Whether a 6.0 driver
       can drive a 4.1 app is unproven and is the actual open question** — it is not a package the owner
       has simply not installed yet.
-      - [ ] Owner step, worth trying because it is the only candidate: `sudo pacman -S --needed
-            webkitgtk-6.0`, then let the next run take `tauri-webdriver.sh ensure` → `start` → `exec`
-            all the way to a real session. That attempt is what settles the ABI question; until it
-            happens **the Linux WebDriver harness stays UNVALIDATED** and no run may claim GUI
-            verification passed.
+      - [ ] Owner step, in this order. **(a)** `sudo pacman -S --needed webkitgtk-6.0` — seconds, and
+            the only packaged candidate; if a 6.0 driver can drive a 4.1 app the problem is over.
+            **(b)** If it cannot, the community's answer is a **source build of WebKitWebDriver
+            matched to the installed `webkit2gtk-4.1`** (`-DENABLE_WEBDRIVER=ON`), which must be
+            rebuilt whenever pacman moves webkit2gtk-4.1 — the 2026-09-08 entry above already links
+            the gist, and the version-matching requirement is exactly the ABI point. **(c)** Or an
+            alternative provider ([Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver),
+            or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
+            Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
+            GUI verification passed.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
