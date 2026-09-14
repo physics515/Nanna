@@ -6072,6 +6072,18 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
        2026-09-13** — five and a half months. Both holds it forces (`malachite-bigint =0.9.2`, the
        `libc <= 0.2.186` ceiling) stay, and both are enforced by
        `dep_version_unification.rs` rather than by memory.
+   - *(2026-09-14 sweep)* `cargo update` → 5 compatible bumps (`liblzma-sys 0.4.9`, `textwrap 0.16.4`,
+     `tinyvec 1.13.3` — which drops `tinyvec_macros` entirely — `ureq 3.4.2`, `ureq-proto 0.6.3`).
+     `cargo upgrade --incompatible` offered **two rows and both were the known downgrade traps**:
+     `criterion 0.8 → "0.7"` and `lopdf 0.45 → "0.42"`. Neither applied. The sweep order
+     `update → upgrade → pin-backs → verify` was followed, and it earned its keep again: `cargo update`
+     alone walked `libc` to 0.2.189 **and** pulled in a *second* `malachite-bigint` at 0.11.0 beside the
+     pinned 0.9.2, so the pin-back needed the disambiguated spec
+     `cargo update -p malachite-bigint@0.11.0 --precise 0.9.2` (the bare package name is ambiguous once
+     two versions are resolved — worth knowing before the next run hits it).
+   - *(2026-09-14)* **`rustpython` re-checked on crates.io: still nothing after 0.5.0 (2026-03-31)** —
+     five and a half months, queried from `/api/v1/crates/rustpython-vm/versions`. Both holds it forces
+     stay.
    - *(2026-09-11)* `turso 0.8.0-pre.11` was published today (pre.7 → pre.11 since 2026-08-21),
      but `CHANGELOG.md` on `main` still stops at 0.7.0 and the release pages carry no notes — so
      there is no evidence yet that 0.8 brings the dense ANN index P13's indexed clustering is
