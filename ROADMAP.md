@@ -5838,6 +5838,49 @@ keep the phases readable; promote individual items into a phase when they become
 
 ---
 
+### Anthropic OAuth: refresh is broken, and the failure is invisible (found live 2026-09-14)
+
+- [x] *(2026-09-14)* **`nanna doctor --online` now names an expired Anthropic credential.** Found by
+      booting the real GUI: the daemon logs `Stored OAuth token expired and refresh failed` once, at
+      WARN, at boot — and then every model request fails with
+      `No provider for model: claude-sonnet-5 (detected: Anthropic, available: [Ollama])`. That
+      sentence names the model and the provider list and says nothing about a credential, so it reads
+      as "your model name is wrong" when the truth is "your token expired". The new `auth.anthropic`
+      check connects the two, verified against the real credential:
+      `[FAIL] auth.anthropic  stored OAuth credential expired 54h ago; a refresh token is present, but
+      refresh is known to fail on this build with 400 \`Invalid request format\``.
+      Claude Code itself treats expiry as first-class — `/status` shows `Login — Expired — log in
+      again`, and it warns three days out — so this is the shape the surface should have.
+      The keyring read is short-circuited when no Anthropic model is configured: an unrelated config
+      has no business raising a libsecret unlock prompt, which unattended is a hang, not a diagnostic.
+
+- [ ] **Fix the refresh request itself. Do NOT guess the wire format — it is undocumented.**
+      *(2026-09-14)* `ClaudeCredentialManager::refresh_token` POSTs
+      `https://console.anthropic.com/v1/oauth/token` **form-encoded**, with `grant_type` and
+      `refresh_token` and **no `client_id`**, and gets back
+      `400 {"type":"error","error":{"type":"invalid_request_error","message":"Invalid request format"}}`
+      (observed live). Checked this run: Anthropic's published Claude Code authentication docs cover
+      storage, precedence, `claude setup-token` and the expiry UX, and **document no token-endpoint
+      wire format at all** — it is an internal detail. So this was deliberately NOT "fixed" by
+      guessing; a change that cannot be verified end to end would just move the failure.
+      What is known, to save the next run the search:
+      - Community reports consistently say the endpoint **moved to
+        `https://platform.claude.com/v1/oauth/token`**, with `console.anthropic.com` as the legacy
+        host, and that implementations send **JSON**, falling back to the old host. Treat as
+        unverified third-party evidence, not documentation.
+        ([hermes-agent#52630](https://github.com/NousResearch/hermes-agent/issues/52630),
+        [hermes-agent#2962](https://github.com/NousResearch/hermes-agent/issues/2962),
+        [claude-code#54443](https://github.com/anthropics/claude-code/issues/54443) — a 400 on refresh.)
+      - Nanna never performs its own authorization-code exchange, so it holds no OAuth `client_id`
+        anywhere in the tree. If the endpoint requires one, refresh cannot work by construction and
+        no amount of re-shaping the body will fix it.
+      - **Verifying a fix spends the credential.** A refresh token is single-use in most OAuth
+        deployments, so an unattended run testing this against the operator's real credential could
+        log them out. Any attempt needs a throwaway credential or the owner present.
+      - `claude setup-token` mints a **one-year** token and only PRINTS it (confirmed in the official
+        docs this run), so the practical workaround — and what the doctor's remedy says — is to
+        re-mint rather than to rely on refresh.
+
 ### Linux host blockers (found 2026-09-09)
 
 - [x] *(2026-09-11 — fixed by the 2026-09-10 run, which reached master only through this

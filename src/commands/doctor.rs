@@ -23,6 +23,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use nanna_config::Config;
+use nanna_config::credentials::{ClaudeCredentialManager, OAuthCredential};
 use nanna_llm::{OllamaProbe, probe_ollama};
 
 /// How bad a finding is.
@@ -365,12 +366,19 @@ struct OllamaServer {
 /// The network leg of `doctor`: probe every Ollama server the configuration
 /// uses, and check that each has the models configured against it.
 ///
-/// Ollama only, by design: it is the one dependency that answers without a
-/// credential. Probing a provider key would read the keyring and send the key
-/// off the machine, which a diagnostic must not do.
+/// Ollama is the only thing probed over the *network*, by design: it is the one
+/// dependency that answers without a credential. Probing a provider key would
+/// send that key off the machine, which a diagnostic must not do.
+///
+/// The Anthropic credential check reads the keyring — locally, and only for the
+/// credential's metadata (does it exist, has it expired, can it be refreshed).
+/// The token is never printed, logged, or sent anywhere. That read is why it
+/// lives behind `--online` rather than in the offline pass, whose whole promise
+/// is that it touches nothing but the config file.
 pub async fn run_online_checks(config: &Config) -> Vec<Check> {
     let servers = ollama_servers_in_use(config);
-    let mut checks = Vec::with_capacity(servers.len() * 2 + 1);
+    let mut checks = Vec::with_capacity(servers.len() * 2 + 2);
+    checks.push(check_anthropic_credential(config));
     if servers.is_empty() {
         checks.push(Check::ok(
             "ollama.online",
@@ -392,6 +400,130 @@ pub async fn run_online_checks(config: &Config) -> Vec<Check> {
         "every non-ok check must carry a remedy"
     );
     checks
+}
+
+/// Does the configuration route anything at Anthropic? Chat model, the priority
+/// lists, and the summarizer all count — any one of them makes an Anthropic
+/// credential load-bearing.
+fn anthropic_is_in_use(config: &Config) -> bool {
+    let names_anthropic = |model: &str| {
+        let model = model.trim().to_ascii_lowercase();
+        model.starts_with("claude") || model.starts_with("anthropic")
+    };
+    config.llm.provider.eq_ignore_ascii_case("anthropic")
+        || names_anthropic(&config.llm.model)
+        || config.llm.model_priority.iter().any(|m| names_anthropic(m))
+        || config
+            .llm
+            .summarization_priority
+            .iter()
+            .any(|m| names_anthropic(m))
+}
+
+/// Verdict on a stored Anthropic OAuth credential.
+///
+/// Pure, so every branch is testable without a keyring: the caller does the one
+/// read and hands the result here.
+///
+/// Why this check exists. When the credential expires, what the user actually
+/// sees is the model router's message — observed live 2026-09-14:
+/// `No provider for model: claude-sonnet-5 (detected: Anthropic, available:
+/// [Ollama])`. That sentence names the model and the provider list and says
+/// nothing about a credential, so it reads as "your model name is wrong" when
+/// the truth is "your token expired four hours ago". The daemon logs the real
+/// cause once, at WARN, at boot, and never again. This check is the place those
+/// two facts get connected.
+fn judge_anthropic_credential(
+    anthropic_in_use: bool,
+    credential: Option<&OAuthCredential>,
+    api_key_configured: bool,
+) -> Check {
+    const NAME: &str = "auth.anthropic";
+    const REMINT: &str = "re-mint it with `claude setup-token` and store it with \
+                          `nanna auth login`, or set an API key in `[llm].api_key`";
+
+    let Some(credential) = credential else {
+        if !anthropic_in_use {
+            return Check::ok(NAME, "no Anthropic model is configured");
+        }
+        if api_key_configured {
+            return Check::ok(NAME, "no stored OAuth credential; an API key is configured");
+        }
+        return Check::fail(
+            NAME,
+            "an Anthropic model is configured and there is neither a stored OAuth \
+             credential nor an API key",
+            REMINT,
+        );
+    };
+
+    // Never interpolate the token itself — not even a prefix. A diagnostic that
+    // prints half a credential is a credential in the terminal scrollback.
+    let expiry = credential.seconds_until_expiry();
+
+    if !credential.is_expired() {
+        let detail = match expiry {
+            Some(secs) => format!("stored OAuth credential valid for {}h", secs / 3600),
+            None => "stored OAuth credential carries no expiry".to_string(),
+        };
+        return Check::ok(NAME, detail);
+    }
+
+    let ago = expiry.map_or_else(
+        || "expired".to_string(),
+        |secs| format!("expired {}h ago", (-secs) / 3600),
+    );
+
+    if !credential.can_refresh() {
+        return Check::fail(
+            NAME,
+            format!("stored OAuth credential {ago} and carries no refresh token"),
+            REMINT,
+        );
+    }
+
+    // It can refresh on paper. Say what actually happens, because on this tree
+    // it does not: the refresh POST carries `grant_type` and `refresh_token`
+    // and no `client_id`, and the endpoint answers 400 `invalid_request_error:
+    // Invalid request format` (observed live 2026-09-14). Until that is fixed a
+    // refreshable credential is not a working one, and a `warn` that implied
+    // otherwise would be the same lie the router's message tells.
+    Check::fail(
+        NAME,
+        format!(
+            "stored OAuth credential {ago}; a refresh token is present, but refresh is \
+             known to fail on this build with 400 `Invalid request format`"
+        ),
+        REMINT,
+    )
+}
+
+/// Read the stored Anthropic credential and judge it. The keyring read happens
+/// here and nowhere else in this module.
+fn check_anthropic_credential(config: &Config) -> Check {
+    let anthropic_in_use = anthropic_is_in_use(config);
+
+    // Short-circuit BEFORE the read. A configuration that never routes to
+    // Anthropic has no business unlocking the user's keyring, and on a desktop
+    // running libsecret that read can raise an unlock prompt — which in a test
+    // or a headless run is a hang, not a diagnostic.
+    if !anthropic_in_use {
+        return judge_anthropic_credential(false, None, false);
+    }
+
+    let manager = ClaudeCredentialManager::new();
+    let loaded = manager.load().ok();
+    let api_key_configured = config
+        .llm
+        .api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
+
+    judge_anthropic_credential(
+        anthropic_in_use,
+        loaded.as_ref().map(|l| &l.credential),
+        api_key_configured,
+    )
 }
 
 /// Every Ollama server in use, each with the models expected there. Chat and
@@ -586,8 +718,8 @@ pub fn report(checks: &[Check], online: bool) -> Severity {
     }
     if online {
         println!(
-            "\nOllama was probed over the network. No provider key was tested and the \
-             keyring was not read."
+            "\nOllama was probed over the network. The keyring was read locally for the \
+             Anthropic credential's expiry only — no provider key was tested, printed or sent."
         );
     } else {
         println!(
@@ -605,6 +737,95 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    /// Build a credential `hours` from expiry (negative = already expired).
+    fn credential(hours: i64, refreshable: bool) -> OAuthCredential {
+        OAuthCredential {
+            access_token: "not-a-real-token".to_string(),
+            refresh_token: refreshable.then(|| "not-a-real-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + hours * 3600 * 1000),
+            subscription_type: None,
+            account_id: None,
+            organization_id: None,
+        }
+    }
+
+    #[test]
+    fn a_live_credential_is_ok_and_reports_its_remaining_hours() {
+        let check = judge_anthropic_credential(true, Some(&credential(10, true)), false);
+        assert_eq!(check.severity, Severity::Ok);
+        assert!(
+            check.detail.contains("9h") || check.detail.contains("10h"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_credential_without_a_refresh_token_is_terminal() {
+        let check = judge_anthropic_credential(true, Some(&credential(-4, false)), false);
+        assert_eq!(check.severity, Severity::Fail);
+        assert!(check.detail.contains("no refresh token"), "{check:?}");
+        assert!(check.remedy.is_some());
+    }
+
+    /// The live finding this check was written for: refreshable on paper, and
+    /// refresh does not work on this build. A `warn` here would repeat the
+    /// router's own misleading message.
+    #[test]
+    fn an_expired_but_refreshable_credential_still_fails_while_refresh_is_broken() {
+        let check = judge_anthropic_credential(true, Some(&credential(-4, true)), false);
+        assert_eq!(check.severity, Severity::Fail);
+        assert!(check.detail.contains("Invalid request format"), "{check:?}");
+    }
+
+    #[test]
+    fn no_credential_and_no_key_fails_only_when_anthropic_is_actually_used() {
+        assert_eq!(
+            judge_anthropic_credential(true, None, false).severity,
+            Severity::Fail
+        );
+        assert_eq!(
+            judge_anthropic_credential(false, None, false).severity,
+            Severity::Ok
+        );
+        // An API key is the other way to authenticate; OAuth's absence is then fine.
+        assert_eq!(
+            judge_anthropic_credential(true, None, true).severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn no_verdict_ever_contains_token_material() {
+        // Negative space: the tokens above are distinctive strings, so a check
+        // that leaked any part of them would be caught here rather than in a
+        // user's scrollback.
+        for check in [
+            judge_anthropic_credential(true, Some(&credential(10, true)), false),
+            judge_anthropic_credential(true, Some(&credential(-4, true)), false),
+            judge_anthropic_credential(true, Some(&credential(-4, false)), false),
+        ] {
+            let printed = format!("{} {:?}", check.detail, check.remedy);
+            assert!(!printed.contains("not-a-real-token"), "{printed}");
+            assert!(!printed.contains("not-a-real-refresh"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn anthropic_is_detected_from_any_of_the_places_a_model_can_be_named() {
+        let mut config = cfg();
+        config.llm.provider = "ollama".to_string();
+        config.llm.model = "qwen3.5:9b".to_string();
+        config.llm.model_priority.clear();
+        config.llm.summarization_priority.clear();
+        assert!(!anthropic_is_in_use(&config), "nothing names Anthropic");
+
+        config.llm.summarization_priority = vec!["claude-haiku-4-5".to_string()];
+        assert!(
+            anthropic_is_in_use(&config),
+            "the summarizer alone makes the credential load-bearing"
+        );
     }
 
     #[test]
@@ -933,8 +1154,12 @@ mod tests {
         config.memory.ollama_host = format!("http://127.0.0.1:{port}");
         config.llm.ollama_url = Some(format!("http://localhost:{port}"));
         let checks = run_online_checks(&config).await;
-        assert_eq!(checks.len(), 1, "one server, probed once: {checks:?}");
-        assert_eq!(checks[0].severity, Severity::Fail);
+        let probed: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name == "ollama.online")
+            .collect();
+        assert_eq!(probed.len(), 1, "one server, probed once: {checks:?}");
+        assert_eq!(probed[0].severity, Severity::Fail);
     }
 
     /// The summarizer sends any spec without a provider prefix to Ollama —
