@@ -5875,6 +5875,16 @@ keep the phases readable; promote individual items into a phase when they become
       The keyring read is short-circuited when no Anthropic model is configured: an unrelated config
       has no business raising a libsecret unlock prompt, which unattended is a hang, not a diagnostic.
 
+- [x] *(2026-09-14)* **`create_tool` said "Validate the source compiles" and compiled nothing.**
+      The line was `let _test_tool = ScriptedTool::new(&name, &source);` — a constructor that stores
+      the string — so a user- or agent-authored tool with unparseable garbage in its body was written
+      to disk, registered, and advertised to the model, and the first sign of trouble was a failed
+      call. `update_tool` had the same hole. Both now run `nanna_scripting::check_syntax` (the same
+      function the bundled-skill gate uses, so the `export default` rewrite and IIFE wrapper are
+      covered) and refuse with the engine's own line and column. A refused create leaves nothing on
+      disk and a refused edit leaves the working tool untouched; both have tests, as does the
+      accepting case so the check cannot become a constant `Err`.
+
 - [x] *(2026-09-14)* **Nothing checked that the release binary ships the skills the tree has.**
       `build.rs` embeds `default-skills/` into `DEFAULT_SKILLS`, and a RELEASE build extracts that —
       the source tree is read only in debug builds. Its walk was guarded by `if skills_dir.is_dir()`,
