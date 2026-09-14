@@ -5875,6 +5875,18 @@ keep the phases readable; promote individual items into a phase when they become
       The keyring read is short-circuited when no Anthropic model is configured: an unrelated config
       has no business raising a libsecret unlock prompt, which unattended is a hang, not a diagnostic.
 
+- [x] *(2026-09-14)* **Nothing checked that the release binary ships the skills the tree has.**
+      `build.rs` embeds `default-skills/` into `DEFAULT_SKILLS`, and a RELEASE build extracts that —
+      the source tree is read only in debug builds. Its walk was guarded by `if skills_dir.is_dir()`,
+      which on a miss fell through and emitted `DEFAULT_SKILLS: &[] = &[]`: a binary with zero tools
+      that compiles clean and says nothing. That is the release-path twin of the 2026-09-13 defect
+      where a debug build off Windows loaded none of its 43 skills. `build.rs` now asserts instead of
+      falling through, and a new gate checks the emitted catalogue against the tree in both directions
+      (nothing missing, nothing orphaned), that every embedded skill carries both its `tool.ts` and its
+      `permissions.json`, that no embedded file is empty (`include_str!` of a truncated file yields
+      `""` and registers a tool that fails at call time), and that the count matches. Proven to have
+      eyes by removing a skill: `only 43 skills are embedded; the tree shipped 44`.
+
 - [x] *(2026-09-14)* **The router's own failure now names the cause, not just the outcome.**
       `No provider for model: claude-sonnet-5 (detected: Anthropic, available: [Ollama])` was accurate
       and useless. The boot-time credential chain already knew why — it logged it once at WARN and
