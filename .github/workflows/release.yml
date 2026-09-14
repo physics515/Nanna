@@ -52,7 +52,7 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `rust-toolchain.toml` pins an exact nightly, and rustup honours that
       # file for every cargo invocation inside the repo. Asking
@@ -169,7 +169,7 @@ jobs:
     if: ${{ inputs.build_macos }}
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `universal-apple-darwin` is NOT a rustup target and installing it fails
       # outright — that is one of the two errors that killed the 2026-08-15 run
@@ -236,7 +236,7 @@ jobs:
     if: ${{ inputs.build_linux }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
@@ -312,7 +312,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
