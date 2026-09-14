@@ -66,6 +66,18 @@ enum Commands {
     /// Show configuration status
     Status,
 
+    /// Diagnose configuration problems and say how to fix each one.
+    ///
+    /// Offline by default: no provider, network or keyring probe runs, so this
+    /// is safe and fast anywhere. Exits non-zero when a check fails.
+    Doctor {
+        /// Also probe each Ollama server the configuration uses: is it
+        /// answering, and does it have the configured models? Never reads the
+        /// keyring or sends a provider key.
+        #[arg(long)]
+        online: bool,
+    },
+
     /// Start the HTTP server
     Server {
         /// Host to bind to. Defaults to loopback; pass `0.0.0.0` to expose the
@@ -73,9 +85,10 @@ enum Commands {
         #[arg(short = 'H', long, default_value = nanna_config::LOOPBACK_HOST)]
         host: String,
 
-        /// Port to listen on
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
+        /// Port to listen on. Defaults to `[server].port` in config.toml (or the
+        /// `PORT` environment variable), which itself defaults to 3000.
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 
     /// Daemon management (always-on background service)
@@ -104,6 +117,36 @@ enum Commands {
         /// Number of sessions to show
         #[arg(short, long, default_value = "10")]
         limit: i64,
+    },
+
+    /// Export a session — or, with `--memories`, the memory store — as
+    /// Markdown (readable) or JSON (lossless)
+    //
+    // Exactly one target, enforced by a group: `requires = "memories"` on
+    // `--scope` was satisfied by the bool flag's implicit `false` default, so
+    // `nanna export <id> --scope x` parsed and silently ignored the scope.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["session", "memories"])))]
+    Export {
+        /// Session ID (see `nanna sessions`); omit it with --memories
+        session: Option<String>,
+
+        /// Export the memory store instead of a session
+        #[arg(long)]
+        memories: bool,
+
+        /// With --memories: `global`, or a workspace id (global plus that
+        /// workspace). Every memory when omitted.
+        #[arg(long, conflicts_with = "session")]
+        scope: Option<String>,
+
+        /// Document format
+        #[arg(short, long, value_enum, default_value_t = commands::export::ExportFormatArg::Markdown)]
+        format: commands::export::ExportFormatArg,
+
+        /// Write here — a file, or a directory that receives the suggested
+        /// file name. Prints to stdout when omitted.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
 
     /// Run a single prompt and exit
@@ -299,6 +342,16 @@ async fn main() -> anyhow::Result<()> {
             onboarding::show_status(&config)?;
             return Ok(());
         }
+        Some(Commands::Doctor { online }) => {
+            let path = Config::default_config_path()?;
+            let worst = commands::doctor::run(&config, &path, online).await;
+            // Non-zero on a real fault so this is usable from a script or a
+            // health probe, not just by eye.
+            if worst == commands::doctor::Severity::Fail {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Commands::Config { generate }) => {
             if generate {
                 println!("{}", nanna_config::generate_default_config());
@@ -332,19 +385,23 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Server { host, port }) => {
             // Check for API key, offer quick setup if missing
             let config = ensure_api_key(config)?;
+            let port = commands::serve::server_port(port, &config);
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
-            // Check for first run
-            if onboarding::is_first_run() {
-                println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding()?;
-                run_cli(&config, session, model, stream).await?;
-            } else {
-                // Check for API key, offer quick setup if missing
-                let config = ensure_api_key(config)?;
-                run_cli(&config, session, model, stream).await?;
-            }
+            let config = interactive_config(config)?;
+            run_cli(&config, session, model, stream).await?;
+        }
+        Some(Commands::Export {
+            session,
+            memories,
+            scope,
+            format,
+            output,
+        }) => {
+            let target = commands::export::ExportTarget::from_cli(session, memories, scope)?;
+            commands::export::export(target, format, output).await?;
+            return Ok(());
         }
         Some(Commands::Sessions { limit }) => {
             list_sessions(&config, limit).await?;
@@ -354,17 +411,133 @@ async fn main() -> anyhow::Result<()> {
             run_once(&config, &prompt, model).await?;
         }
         None => {
-            // Default: check for first run, then CLI mode
-            if onboarding::is_first_run() {
-                println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding()?;
-                run_cli(&config, None, None, false).await?;
-            } else {
-                let config = ensure_api_key(config)?;
-                run_cli(&config, None, None, false).await?;
-            }
+            // Default: interactive chat.
+            let config = interactive_config(config)?;
+            run_cli(&config, None, None, false).await?;
         }
     }
 
     Ok(())
+}
+
+/// The config an interactive chat starts with: onboarding on a first run,
+/// otherwise the loaded config, with quick setup offered if no API key is set.
+fn interactive_config(config: Config) -> anyhow::Result<Config> {
+    if onboarding::is_first_run() {
+        println!("Welcome! Let's get you set up first.\n");
+        return onboarding::run_onboarding();
+    }
+    ensure_api_key(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nanna server` with no `--port` must parse to `None` so the config
+    /// decides the port: a clap `default_value` here is exactly what used to
+    /// shadow `[server].port`. The subcommand's flag must also not be
+    /// confused with the hidden global daemon `--port`.
+    #[test]
+    fn the_server_port_flag_is_optional_so_the_config_can_decide() {
+        let bare = Cli::try_parse_from(["nanna", "server"]).expect("bare `nanna server` parses");
+        match bare.command {
+            Some(Commands::Server { port, .. }) => assert_eq!(port, None),
+            _ => panic!("expected the server command"),
+        }
+        let flagged = Cli::try_parse_from(["nanna", "server", "--port", "8080"])
+            .expect("`nanna server --port 8080` parses");
+        match flagged.command {
+            Some(Commands::Server { port, .. }) => assert_eq!(port, Some(8080)),
+            _ => panic!("expected the server command"),
+        }
+        assert_eq!(
+            flagged.port, DEFAULT_IPC_PORT,
+            "the subcommand's --port does not leak into the global daemon port"
+        );
+    }
+
+    /// `doctor` stays offline unless asked: the network leg is opt-in.
+    #[test]
+    fn doctor_is_offline_unless_asked() {
+        let bare = Cli::try_parse_from(["nanna", "doctor"]).expect("`nanna doctor` parses");
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Doctor { online: false })
+        ));
+        let online =
+            Cli::try_parse_from(["nanna", "doctor", "--online"]).expect("`--online` parses");
+        assert!(matches!(
+            online.command,
+            Some(Commands::Doctor { online: true })
+        ));
+    }
+
+    #[test]
+    fn export_parses_its_session_format_and_output() {
+        let cli = Cli::try_parse_from(["nanna", "export", "abc123", "-f", "md", "-o", "out.md"])
+            .expect("`nanna export` parses");
+        match cli.command {
+            Some(Commands::Export {
+                session,
+                memories,
+                format,
+                output,
+                ..
+            }) => {
+                assert_eq!(session.as_deref(), Some("abc123"));
+                assert!(!memories, "a session export is not a memory export");
+                assert_eq!(
+                    format,
+                    commands::export::ExportFormatArg::Markdown,
+                    "`md` is an alias"
+                );
+                assert_eq!(output, Some(std::path::PathBuf::from("out.md")));
+            }
+            _ => panic!("expected the export command"),
+        }
+        let bare = Cli::try_parse_from(["nanna", "export", "abc123"]).expect("parses");
+        match bare.command {
+            Some(Commands::Export { format, output, .. }) => {
+                assert_eq!(
+                    format,
+                    commands::export::ExportFormatArg::Markdown,
+                    "markdown by default"
+                );
+                assert_eq!(output, None, "stdout by default");
+            }
+            _ => panic!("expected the export command"),
+        }
+    }
+
+    #[test]
+    fn export_memories_takes_a_scope_and_no_session() {
+        let cli = Cli::try_parse_from(["nanna", "export", "--memories", "--scope", "ws1"])
+            .expect("`nanna export --memories` parses");
+        match cli.command {
+            Some(Commands::Export {
+                session,
+                memories,
+                scope,
+                ..
+            }) => {
+                assert!(memories);
+                assert_eq!(session, None);
+                assert_eq!(scope.as_deref(), Some("ws1"));
+            }
+            _ => panic!("expected the export command"),
+        }
+        assert!(
+            Cli::try_parse_from(["nanna", "export", "abc123", "--memories"]).is_err(),
+            "a session id and --memories are one or the other"
+        );
+        assert!(
+            Cli::try_parse_from(["nanna", "export", "abc123", "--scope", "ws1"]).is_err(),
+            "--scope only means something with --memories"
+        );
+        assert!(
+            Cli::try_parse_from(["nanna", "export"]).is_err(),
+            "exporting nothing is refused"
+        );
+    }
 }

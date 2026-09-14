@@ -15,3 +15,11 @@ async-trait.workspace = true
 
 nanna-simd = { path = "../nanna-simd" }
 nanna-gpu = { path = "../nanna-gpu" }
+
+[[bench]]
+name = "clustering_scaling"
+harness = false
+
+[[bench]]
+name = "clustering_threshold_sweep"
+harness = false

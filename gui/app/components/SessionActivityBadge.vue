@@ -41,9 +41,9 @@ const hasActivity = computed(() => hasActiveWork.value)
  */
 const activityLabel = computed(() => {
   // Check for active tool calls first
-  const runningTools = (activeToolCalls.value ?? []).filter(t => t.status === 'started')
-  if (runningTools.length > 0) {
-    return `Running ${runningTools[0].name}...`
+  const firstRunning = (activeToolCalls.value ?? []).find(t => t.status === 'started')
+  if (firstRunning) {
+    return `Running ${firstRunning.name}...`
   }
 
   if (isStreaming.value) {

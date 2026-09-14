@@ -940,6 +940,11 @@ const DIALECT_SYNONYMS: &[(&str, &str)] = &[
     ("list_directory", "list_dir"),
     ("ls", "list_dir"),
     ("dir", "list_dir"),
+    // finding files by name. "find" alone is deliberately ABSENT: it could mean
+    // a filename or text inside files (code_search), and the rule above says an
+    // ambiguous name must surface as unresolved rather than be guessed.
+    ("glob", "find_files"),
+    ("find_file", "find_files"),
     // file reading
     ("cat", "read_file"),
     ("open", "read_file"),

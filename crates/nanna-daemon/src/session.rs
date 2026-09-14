@@ -86,6 +86,136 @@ pub struct ToolCallRecord {
     pub duration_ms: Option<u64>,
 }
 
+/// Per-side line bound on a journaled [`EditDiff`]. Matches what the
+/// `edit_file` skill itself emits, so the clamp is a guard against a skill
+/// that stops honouring it, not the normal path.
+pub const EDIT_DIFF_LINES_MAX: usize = 40;
+
+/// Per-side byte bound on a journaled [`EditDiff`] — the same 4000 bytes the
+/// journal allows a call's output (`TIMELINE_OUTPUT_CAP`), so an edit's view
+/// costs the run record at most what its result already may.
+pub const EDIT_DIFF_BYTES_MAX: usize = 4000;
+
+/// The before/after view `edit_file` attaches to a successful edit (P18
+/// "Diff presentation").
+///
+/// It holds the changed lines, where they start, and whether the view was
+/// cut. Journaled on the tool item so a user who opens the session after
+/// hours of unattended work can SEE each edit — the live event carries it
+/// too, but only a client that was watching ever received that.
+/// Observability, never an approval step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditDiff {
+    /// 1-based line, in the file before the edit, where the change starts.
+    pub start_line: u32,
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
+    /// The view was cut — by the skill or by the journal bound. Rendered,
+    /// never a silent cut.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl EditDiff {
+    /// The diff to journal for a finished call, if any. Kept only for a call
+    /// that succeeded AND really ran: a failed edit changed nothing, and a
+    /// breaker replay never ran at all — a diff on either would be a false
+    /// claim about the file. Both journal writers (the chat path and the
+    /// task-run sink) call this, so the rule has one home.
+    #[must_use]
+    pub fn for_outcome(
+        success: bool,
+        short_circuited: bool,
+        data: Option<&serde_json::Value>,
+    ) -> Option<Self> {
+        if !success || short_circuited {
+            return None;
+        }
+        Self::from_tool_data(data)
+    }
+
+    /// Read and bound the view out of a tool result's structured data.
+    ///
+    /// The payload comes from a JS skill, so it is validated, not trusted:
+    /// anything malformed is `None` — never a panic inside a spawned turn —
+    /// and each side is clamped to [`EDIT_DIFF_LINES_MAX`] lines and
+    /// [`EDIT_DIFF_BYTES_MAX`] bytes, with `truncated` set when that cut.
+    #[must_use]
+    pub fn from_tool_data(data: Option<&serde_json::Value>) -> Option<Self> {
+        let raw = data?.get("diff")?;
+        let parsed = Self::deserialize(raw).ok()?;
+        if parsed.start_line == 0 {
+            return None;
+        }
+        if parsed.removed.is_empty() && parsed.added.is_empty() {
+            return None;
+        }
+        let (removed, removed_cut) = clamp_diff_side(parsed.removed);
+        let (added, added_cut) = clamp_diff_side(parsed.added);
+        let diff = Self {
+            start_line: parsed.start_line,
+            removed,
+            added,
+            truncated: parsed.truncated || removed_cut || added_cut,
+        };
+        debug_assert!(
+            diff.removed.len() <= EDIT_DIFF_LINES_MAX,
+            "removed side is bounded"
+        );
+        debug_assert!(
+            diff.added.len() <= EDIT_DIFF_LINES_MAX,
+            "added side is bounded"
+        );
+        Some(diff)
+    }
+}
+
+/// Keep whole lines while they fit both bounds; the first line that would
+/// overflow the byte bound is cut at a char boundary and ends the side.
+/// Returns the kept lines and whether anything was dropped.
+fn clamp_diff_side(lines: Vec<String>) -> (Vec<String>, bool) {
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len().min(EDIT_DIFF_LINES_MAX));
+    let mut bytes_used: usize = 0;
+    let mut cut_any = false;
+    for line in lines {
+        if kept.len() == EDIT_DIFF_LINES_MAX {
+            cut_any = true;
+            break;
+        }
+        let bytes_left = EDIT_DIFF_BYTES_MAX - bytes_used;
+        if line.len() <= bytes_left {
+            bytes_used += line.len();
+            kept.push(line);
+            continue;
+        }
+        let prefix = char_floor_prefix(&line, bytes_left);
+        bytes_used += prefix.len();
+        if !prefix.is_empty() {
+            kept.push(prefix.to_string());
+        }
+        cut_any = true;
+        break;
+    }
+    debug_assert!(
+        bytes_used <= EDIT_DIFF_BYTES_MAX,
+        "a side never exceeds the byte bound"
+    );
+    debug_assert!(kept.len() <= EDIT_DIFF_LINES_MAX, "…nor the line bound");
+    (kept, cut_any)
+}
+
+/// The longest prefix of `text` of at most `bytes_max` bytes that ends on a
+/// char boundary. Never slices through a multi-byte char — this repo has lost
+/// a run to `&text[..n]` landing inside an em dash.
+fn char_floor_prefix(text: &str, bytes_max: usize) -> &str {
+    let mut end = bytes_max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    debug_assert!(end <= bytes_max, "the prefix respects the bound");
+    text.get(..end).unwrap_or_default()
+}
+
 /// One entry in a run's chronological journal. A long-horizon run is not
 /// "one thinking blob + one flat tool list + one text blob" — it is an
 /// interleaved sequence (think → call tools → think → speak → …), and for
@@ -134,6 +264,13 @@ pub enum TimelineItem {
         /// `None`, so journals written before this field deserialize as-is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         short_circuited: Option<bool>,
+        /// `edit_file`'s before/after view of what a successful edit changed,
+        /// bounded at record time (see [`EditDiff`]). Back-filled with the
+        /// rest of the outcome. Absent for every other tool, for a failed or
+        /// replayed call, and in journals written before the field existed —
+        /// omitted from the wire when `None`, so those still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<EditDiff>,
         at: String,
     },
     /// A provider fault the run healed through (stream drop, timeout, …).
@@ -1475,6 +1612,7 @@ mod tests {
                 duration_ms: Some(12),
                 tokens: None,
                 total_tokens: None,
+                diff: None,
                 short_circuited: Some(false),
                 at: at.clone(),
             },
@@ -1490,6 +1628,7 @@ mod tests {
                 duration_ms: Some(0),
                 tokens: None,
                 total_tokens: None,
+                diff: None,
                 short_circuited: Some(true),
                 at: at.clone(),
             },
@@ -1546,6 +1685,161 @@ mod tests {
                 ..
             } if call_id == "c2"
         ));
+    }
+
+    fn diff_data(start_line: u64, removed: &[&str], added: &[&str]) -> serde_json::Value {
+        serde_json::json!({ "diff": {
+            "start_line": start_line, "removed": removed, "added": added, "truncated": false
+        }})
+    }
+
+    /// P18 "Diff presentation": a well-formed view from `edit_file` reads back
+    /// exactly, and a small one is not marked cut.
+    #[test]
+    fn an_edit_diff_reads_back_exactly() {
+        let data = diff_data(2, &["line two"], &["line 2"]);
+        let diff = EditDiff::from_tool_data(Some(&data)).expect("a well-formed view parses");
+        assert_eq!(diff.start_line, 2);
+        assert_eq!(diff.removed, vec!["line two"]);
+        assert_eq!(diff.added, vec!["line 2"]);
+        assert!(!diff.truncated, "nothing was cut");
+    }
+
+    /// The payload is skill output: every malformed shape is `None`, never a
+    /// panic inside the spawned turn that journals it.
+    #[test]
+    fn a_malformed_edit_diff_is_dropped_not_trusted() {
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({ "diff": "not an object" }),
+            serde_json::json!({ "diff": { "start_line": 0, "removed": ["a"], "added": ["b"] } }),
+            serde_json::json!({ "diff": { "start_line": -3, "removed": ["a"], "added": ["b"] } }),
+            serde_json::json!({ "diff": { "start_line": 1.5, "removed": ["a"], "added": ["b"] } }),
+            serde_json::json!({ "diff": { "start_line": 1, "removed": "a", "added": ["b"] } }),
+            serde_json::json!({ "diff": { "start_line": 1, "removed": [1], "added": ["b"] } }),
+            serde_json::json!({ "diff": { "start_line": 1, "removed": [], "added": [] } }),
+        ];
+        for case in &cases {
+            assert_eq!(
+                EditDiff::from_tool_data(Some(case)),
+                None,
+                "must be dropped: {case}"
+            );
+        }
+        assert_eq!(EditDiff::from_tool_data(None), None, "no data, no diff");
+    }
+
+    /// A skill that stops honouring the bound cannot bloat the journal: the
+    /// side is cut to the line bound, and the view says it was cut.
+    #[test]
+    fn an_oversized_edit_diff_is_clamped_and_says_so() {
+        let many: Vec<String> = (0..100).map(|i| format!("old {i}")).collect();
+        let data = serde_json::json!({ "diff": {
+            "start_line": 5, "removed": many, "added": ["new"], "truncated": false
+        }});
+        let diff = EditDiff::from_tool_data(Some(&data)).expect("an oversized view still parses");
+        assert_eq!(
+            diff.removed.len(),
+            EDIT_DIFF_LINES_MAX,
+            "cut to the line bound"
+        );
+        assert_eq!(diff.removed[0], "old 0", "the head of the change is kept");
+        assert_eq!(diff.added, vec!["new"], "the other side is untouched");
+        assert!(diff.truncated, "a clamped view must say so");
+    }
+
+    /// The byte bound cuts through a line only on a char boundary: a line of
+    /// em dashes (3 bytes each) three times the bound must not panic, and
+    /// keeps as much as the boundary allows.
+    #[test]
+    fn an_edit_diff_byte_cut_never_splits_a_char() {
+        let dashes = "\u{2014}".repeat(EDIT_DIFF_BYTES_MAX);
+        let data = serde_json::json!({ "diff": {
+            "start_line": 1, "removed": [dashes], "added": ["x"]
+        }});
+        let diff = EditDiff::from_tool_data(Some(&data)).expect("parses; truncated defaults");
+        let kept = &diff.removed[0];
+        assert!(kept.len() <= EDIT_DIFF_BYTES_MAX, "within the byte bound");
+        assert!(
+            kept.len() > EDIT_DIFF_BYTES_MAX - 3,
+            "…as close as a char boundary allows"
+        );
+        assert!(
+            kept.chars().all(|c| c == '\u{2014}'),
+            "no partial char survived"
+        );
+        assert!(diff.truncated, "a cut line must say so");
+    }
+
+    /// The journal rule: a diff is kept only for a call that succeeded and
+    /// really ran — a failed edit changed nothing, a replay never ran.
+    #[test]
+    fn a_diff_is_journaled_only_for_an_edit_that_landed() {
+        let data = diff_data(1, &["a"], &["b"]);
+        assert!(EditDiff::for_outcome(true, false, Some(&data)).is_some());
+        assert_eq!(
+            EditDiff::for_outcome(false, false, Some(&data)),
+            None,
+            "a failed edit"
+        );
+        assert_eq!(
+            EditDiff::for_outcome(true, true, Some(&data)),
+            None,
+            "a breaker replay"
+        );
+    }
+
+    /// The point of journaling it: a user who opens the session after the run
+    /// — after a daemon restart, even — still sees what each edit changed.
+    #[tokio::test]
+    async fn a_journaled_edit_diff_survives_daemon_restart() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("diff-survives".to_string())).await;
+        let diff = EditDiff {
+            start_line: 7,
+            removed: vec!["let x = 1;".to_string()],
+            added: vec!["let x = 2;".to_string()],
+            truncated: false,
+        };
+        let timeline = vec![TimelineItem::Tool {
+            call_id: "c1".to_string(),
+            name: "edit_file".to_string(),
+            input: None,
+            output: Some("Edited a.rs".to_string()),
+            success: Some(true),
+            duration_ms: Some(4),
+            tokens: None,
+            total_tokens: None,
+            short_circuited: Some(false),
+            diff: Some(diff.clone()),
+            at: Utc::now().to_rfc3339(),
+        }];
+        manager
+            .add_full_message(
+                &session.id,
+                MessageRole::Assistant,
+                "done",
+                Vec::new(),
+                None,
+                timeline,
+                None,
+            )
+            .await;
+
+        let reborn = SessionManager::with_storage(storage);
+        assert!(reborn.load_from_db().await >= 1, "session loads from Turso");
+        let restored = reborn
+            .get(&session.id)
+            .await
+            .expect("session survives restart");
+        let msg = restored.messages.last().expect("message survives restart");
+        match msg.timeline.first() {
+            Some(TimelineItem::Tool {
+                diff: Some(kept), ..
+            }) => assert_eq!(*kept, diff),
+            other => panic!("expected the edit with its diff, got {other:?}"),
+        }
     }
 
     /// A session that never picked a model must be indistinguishable from one

@@ -39,6 +39,12 @@ mod bridge;
 #[cfg(feature = "boa")]
 mod boa_impl;
 
+/// Parse a tool's source exactly as the Boa runtime would, without running it.
+/// See [`boa_impl::check_syntax`] — this is the workspace's only syntax gate for
+/// shipped JS/TS skills.
+#[cfg(feature = "boa")]
+pub use boa_impl::check_syntax;
+
 #[cfg(feature = "deno")]
 mod deno_impl;
 

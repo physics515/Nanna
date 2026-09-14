@@ -8,7 +8,7 @@
 //!
 //! 1. `NANNA_TOOLS_DIR` environment variable (for development)
 //! 2. `config_tools_dir` (explicit configuration)
-//! 3. Caller-provided fallback (typically `{data_dir}/tools/`)
+//! 3. The source tree's `default-skills/` (debug builds only)
 
 use std::path::{Path, PathBuf};
 
@@ -67,14 +67,32 @@ fn extract_version_from_source(source: &str) -> Option<String> {
     None
 }
 
-/// In debug builds, fall back to the source tree's default-skills directory.
-/// This is resolved at compile time relative to the nanna-tools crate.
-#[cfg(debug_assertions)]
-pub const DEV_TOOLS_DIR: Option<&str> =
-    Some(concat!(env!("CARGO_MANIFEST_DIR"), "\\default-skills"));
+/// Directory name, under this crate, holding the bundled JS/TS skills.
+const DEV_SKILLS_DIR_NAME: &str = "default-skills";
 
+/// In debug builds, fall back to the source tree's `default-skills` directory.
+/// Resolved relative to the `nanna-tools` crate, which `CARGO_MANIFEST_DIR`
+/// pins at compile time.
+///
+/// This **joins** rather than concatenating a separator. It used to be
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "\\default-skills")`, which is a path
+/// only on Windows: on Linux and macOS the backslash is an ordinary filename
+/// character, so the constant named a file that has never existed, `is_dir()`
+/// was false, and `resolve_tools_dir` fell through to `None` — silently, in the
+/// one build profile where it is the *only* source of skills.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn dev_tools_dir() -> Option<PathBuf> {
+    Some(Path::new(env!("CARGO_MANIFEST_DIR")).join(DEV_SKILLS_DIR_NAME))
+}
+
+/// Release builds extract the embedded skills instead of reading the source
+/// tree, so there is no development directory to fall back to.
 #[cfg(not(debug_assertions))]
-pub const DEV_TOOLS_DIR: Option<&str> = None;
+#[must_use]
+pub fn dev_tools_dir() -> Option<PathBuf> {
+    None
+}
 
 /// Default permissions for built-in TS skills.
 /// These need broader permissions than typical user tools.
@@ -86,14 +104,16 @@ pub const DEFAULT_PERMISSIONS_JSON: &str = r#"{
     "env": true
 }"#;
 
-/// Resolve the tools directory from environment, config, or fallback.
+/// Resolve the tools directory from environment, config, or the dev fallback.
 ///
 /// Resolution order:
 /// 1. `NANNA_TOOLS_DIR` environment variable
 /// 2. `config_tools_dir` parameter (from config file)
-/// 3. `fallback` parameter (typically `{data_dir}/tools/`)
+/// 3. [`dev_tools_dir`] — the source tree's `default-skills/`, debug builds only
 ///
-/// Returns `None` only if no valid path can be determined.
+/// Returns `None` if none of those resolve; the caller decides the fallback
+/// (the daemon uses `{data_dir}/tools/`). There is no `fallback` parameter —
+/// the doc comment claimed one for a signature that never had it.
 pub fn resolve_tools_dir(config_tools_dir: Option<&Path>) -> Option<PathBuf> {
     // 1. Environment variable (highest priority — useful for development)
     if let Ok(env_dir) = std::env::var("NANNA_TOOLS_DIR") {
@@ -117,12 +137,16 @@ pub fn resolve_tools_dir(config_tools_dir: Option<&Path>) -> Option<PathBuf> {
     }
 
     // 3. Development fallback: source tree's default-skills directory
-    if let Some(dev_dir) = DEV_TOOLS_DIR {
-        let p = PathBuf::from(dev_dir);
-        if p.is_dir() {
-            tracing::info!("Using development tools directory: {:?}", p);
-            return Some(p);
+    if let Some(dev_dir) = dev_tools_dir() {
+        if dev_dir.is_dir() {
+            tracing::info!("Using development tools directory: {:?}", dev_dir);
+            return Some(dev_dir);
         }
+        tracing::warn!(
+            "development tools directory does not exist: {:?} — no JS/TS skills \
+             will load unless NANNA_TOOLS_DIR or [tools].tools_dir is set",
+            dev_dir
+        );
     }
 
     None
@@ -145,7 +169,7 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
         tracing::info!("Created tools directory: {:?}", tools_dir);
     }
 
-    // In debug builds, tools are loaded directly from the source tree via DEV_TOOLS_DIR.
+    // In debug builds, tools are loaded directly from the source tree via dev_tools_dir().
     // Only bootstrap in release builds where we need to populate {data_dir}/tools/.
     #[cfg(debug_assertions)]
     {
@@ -273,7 +297,7 @@ mod tests {
     /// parallel threads, so two tests touching the same variable race: without this
     /// lock, `test_resolve_tools_dir_from_config`'s `remove_var` could land between
     /// the other test's `set_var` and its `resolve_tools_dir(None)` call, which then
-    /// fell through to `DEV_TOOLS_DIR` and failed with the source-tree
+    /// fell through to `dev_tools_dir()` and failed with the source-tree
     /// `default-skills` path instead of the temp dir.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -349,6 +373,51 @@ mod tests {
 
         assert_eq!(resolved, Some(env_dir.path().to_path_buf()));
         assert_ne!(resolved, Some(config_dir.path().to_path_buf()));
+    }
+
+    /// The development fallback must name a directory that **exists**.
+    ///
+    /// It did not on Linux or macOS: the constant behind it concatenated a
+    /// literal `\\` onto `CARGO_MANIFEST_DIR`, which is a separator only on
+    /// Windows. Everywhere else it produced a filename containing a backslash,
+    /// `is_dir()` was false, and `resolve_tools_dir` returned `None` without
+    /// saying so. Debug builds have no other source of JS/TS skills — release
+    /// builds extract the embedded copies, debug builds read the source tree —
+    /// so on Linux a developer daemon with no `NANNA_TOOLS_DIR` and no
+    /// `[tools].tools_dir` ran with the Rust built-ins and nothing else, while
+    /// the same commit on Windows loaded every skill.
+    ///
+    /// Asserting `is_dir()` rather than the spelling is what makes this
+    /// portable: it is the property every platform needs and the one that was
+    /// actually false.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_tools_dir_names_a_real_directory() {
+        let dir = dev_tools_dir().expect("debug builds must have a dev tools dir");
+        assert!(
+            dir.is_dir(),
+            "dev tools dir {dir:?} does not exist — a hardcoded path separator?",
+        );
+        // Not merely *a* directory: the one holding the bundled skills.
+        assert!(
+            dir.join("discover_tools").join("tool.ts").is_file(),
+            "{dir:?} exists but holds no discover_tools skill",
+        );
+    }
+
+    /// With neither the env var nor a config path, the dev fallback is what
+    /// `resolve_tools_dir` must return — the third documented step, and the
+    /// step that silently produced `None` off Windows.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resolve_falls_back_to_the_dev_tools_dir() {
+        let _env = EnvGuard::set(None);
+        assert_eq!(resolve_tools_dir(None), dev_tools_dir());
+        assert!(
+            resolve_tools_dir(None).is_some(),
+            "debug builds resolved no tools directory at all — every JS/TS \
+             skill would be missing",
+        );
     }
 
     #[test]

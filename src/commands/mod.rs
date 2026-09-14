@@ -3,6 +3,8 @@
 pub mod cli;
 pub mod credentials;
 pub mod daemon;
+pub mod doctor;
+pub mod export;
 pub mod mcp;
 pub mod serve;
 pub mod workspace;

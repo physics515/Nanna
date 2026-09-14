@@ -324,6 +324,21 @@ pub struct CorpusParams {
     pub era_gap_days: f32,
     /// Initial FSRS stability (days) for each memory.
     pub stability_days: f32,
+    /// Half-width of the per-member jitter added to a topic's centroid, in
+    /// embedding units.
+    ///
+    /// This is the knob that decides **which dream phase does the work**, and
+    /// therefore what a fixture can measure at all. The default 0.02 puts
+    /// within-topic cosine at ~0.999 — above the `IngestAction::Reinforce`
+    /// line (0.92) — so phase (b) folds those pairs deterministically and
+    /// `clusters_formed` is 0. That is the right corpus for measuring
+    /// compression and recall, and the wrong one for measuring anything about
+    /// *clustering*: it is completely insensitive to `cluster_threshold`.
+    ///
+    /// Widen it (~0.6) to land within-topic similarity between the clustering
+    /// bar and the dedup bar, so the pairs must go through `cluster_memories`
+    /// and the composite score, and the fixture responds to the threshold.
+    pub member_spread: f32,
     /// Fixed importance for every memory, or `None` to vary it per topic
     /// (`1.0 + (topic % 3) * 0.5`). A fixed value isolates the effect of the
     /// FSRS decay exponent in the `w20` recall experiment (where importance must
@@ -340,6 +355,7 @@ impl Default for CorpusParams {
             age_days: 6.0,
             era_gap_days: 50.0,
             stability_days: 1.0,
+            member_spread: 0.02,
             importance: None,
         }
     }
@@ -382,7 +398,7 @@ impl RetentionCorpus {
                 let mut rng = SplitMix64::new(seed ^ mix_topic_member(topic as u64, member as u64));
                 let embedding: Vec<f32> = centroid
                     .iter()
-                    .map(|&c| c + (rng.next_unit() - 0.5) * 0.02)
+                    .map(|&c| c + (rng.next_unit() - 0.5) * params.member_spread)
                     .collect();
                 debug_assert_eq!(embedding.len(), params.dimension);
 
@@ -1022,6 +1038,84 @@ mod tests {
         );
     }
 
+    /// A fixture that actually exercises **clustering**, and the threshold sweep
+    /// it makes possible.
+    ///
+    /// Suite 3's corpus cannot do this. Its members sit at cosine ~0.999 —
+    /// above the `IngestAction::Reinforce` line — so dream phase (b) folds them
+    /// deterministically and `clusters_formed` is 0; the whole fixture is
+    /// insensitive to `cluster_threshold`. Widening `member_spread` drops
+    /// within-topic similarity between the clustering bar and the dedup bar, so
+    /// the pairs have to go through `cluster_memories` and the composite score.
+    ///
+    /// What this pins is the *instrument*, not a tuning target: that the
+    /// threshold is a real lever here (a low bar clusters, a high bar refuses),
+    /// so the compression-vs-fidelity trade can be measured before anyone moves
+    /// the shipped default toward the ~0.7 semantic bar the 2026 literature
+    /// uses. Choosing that target is a separate, evidence-led decision.
+    #[tokio::test]
+    async fn the_clustering_threshold_is_a_measurable_lever() {
+        let dim = 32;
+        let params = CorpusParams {
+            topic_count: 4,
+            per_topic: 8,
+            dimension: dim,
+            // Loose enough that members are related but NOT near-identical, so
+            // phase (b) cannot claim them and clustering has to decide.
+            member_spread: 0.6,
+            ..CorpusParams::default()
+        };
+
+        // Ascending bars, each a valid config (floor 0.50 < threshold).
+        let mut observed: Vec<(f32, usize, usize)> = Vec::new();
+        for &threshold in &[0.55_f32, 0.75, 0.95] {
+            let corpus = RetentionCorpus::generate(7, params);
+            let service = MemoryService::new(MemoryServiceConfig {
+                dimension: dim,
+                ..MemoryServiceConfig::default()
+            })
+            .with_embed_fn(corpus.topic_embed_fn());
+            corpus.load_into(&service).await.expect("seed");
+
+            let consolidation = ConsolidationConfig {
+                cluster_threshold: threshold,
+                min_remaining_memories: 1,
+                max_compression_ratio: 0.9,
+                ..ConsolidationConfig::default()
+            };
+            consolidation
+                .validate()
+                .expect("every swept threshold must be a valid config");
+
+            let (_report, result) =
+                run_retention_cycle(&service, &corpus.probes, 3, &consolidation, echo_summarize)
+                    .await
+                    .expect("cycle");
+
+            observed.push((threshold, result.clusters_formed, service.count().await));
+        }
+
+        // The instrument responds: raising the bar never forms MORE clusters,
+        // and the extremes differ — which is precisely what Suite 3's corpus
+        // cannot show.
+        assert!(
+            observed.windows(2).all(|w| w[1].1 <= w[0].1),
+            "clusters_formed must be monotonically non-increasing in the threshold: {observed:?}"
+        );
+        assert!(
+            observed[0].1 > 0,
+            "the low bar must actually cluster, or the fixture measures nothing: {observed:?}"
+        );
+        assert_eq!(
+            observed[2].1, 0,
+            "a 0.95 bar demands cosine 0.90 and must refuse this corpus: {observed:?}"
+        );
+        assert!(
+            observed[0].2 < observed[2].2,
+            "clustering at the low bar must leave a smaller store than refusing at the high one: {observed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dreaming_shrinks_store_while_holding_recall() {
         let dim = 48;
@@ -1039,6 +1133,7 @@ mod tests {
                 era_gap_days: 60.0,
                 stability_days: 1.0,
                 importance: Some(1.0),
+                ..CorpusParams::default()
             },
         );
         let mut service = service_for(dim);
@@ -1077,6 +1172,32 @@ mod tests {
             "store did not shrink: {report:?}"
         );
         assert!(report.compression_ratio() > 0.0);
+
+        // The committed baseline (`bench/BASELINE.md`, Suite 3) is described
+        // there as "deterministic, offline, fixed-seed — exact, reproducible
+        // values, not timing samples". Assert it as exactly that. Bounds alone
+        // let the recorded numbers drift out from under the file that quotes
+        // them: every assertion above passes just as happily at 30 memories as
+        // at 6, so a change that halved compression would still look green.
+        assert!(
+            (report.compression_ratio() - 0.90).abs() < 1e-6,
+            "BASELINE.md records compression 0.90, measured {}",
+            report.compression_ratio()
+        );
+        assert_eq!(
+            (report.before.memory_count, report.after.memory_count),
+            (60, 6),
+            "BASELINE.md records 60 -> 6 memories"
+        );
+        assert_eq!(
+            result.memories_deduped, 54,
+            "BASELINE.md records memories_deduped: 54"
+        );
+        assert_eq!(
+            result.clusters_formed, 0,
+            "BASELINE.md records clusters_formed: 0 — phase (b) folds this corpus \
+             deterministically and the summarizer is never called"
+        );
 
         // And recall must be fully retained — same-topic merges keep the topic
         // reachable at its centroid.
@@ -1163,6 +1284,7 @@ mod tests {
             era_gap_days: 0.0,
             stability_days: 1.0,
             importance: Some(1.0),
+            ..CorpusParams::default()
         };
 
         let corpus = RetentionCorpus::generate(2024, params);

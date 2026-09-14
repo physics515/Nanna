@@ -47,36 +47,25 @@ pub async fn execute(
     }
 }
 
-/// Synchronous execution (runs in blocking task)
-fn execute_sync(
-    source: &str,
-    input: &Value,
-    bridge: &Arc<NannaBridge>,
-) -> Result<Value> {
-    // Store bridge in thread-local for native function access
-    BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
-    
-    let mut context = Context::default();
+/// The exact text Boa is asked to evaluate for a tool.
+///
+/// Two things happen here and both can introduce a syntax error that the tool's
+/// own file does not contain: ES-module `export default` is rewritten to a plain
+/// assignment (Boa has no module loader), and the result is wrapped in an IIFE
+/// that locates and calls `execute`.
+///
+/// It is a named function rather than an inline `format!` so that the syntax gate
+/// in `tests/default_skills_parse.rs` can check **this** string. A gate that
+/// re-implements the wrapper proves nothing about the wrapper.
+pub(crate) fn wrap_for_boa(source: &str) -> String {
+    debug_assert!(
+        !source.is_empty(),
+        "a tool with no source should have been rejected before reaching the engine"
+    );
 
-    // Register console.log
-    register_console(&mut context)?;
-
-    // Register Nanna bridge functions
-    register_nanna_bridge(&mut context)?;
-
-    // Inject INPUT as a global
-    let input_js = json_to_js(input, &mut context)?;
-    context
-        .register_global_property(js_string!("INPUT"), input_js, Attribute::READONLY)
-        .map_err(|e| ScriptError::Execution(format!("Failed to set INPUT: {e}")))?;
-
-    // Transform ES6 "export default" to a variable assignment that Boa can handle
-    // Boa doesn't support ES modules, so we convert to CommonJS-style
+    // Boa doesn't support ES modules, so convert to CommonJS-style.
     let transformed_source = source.replace("export default", "var __exported__ =");
-    
-    tracing::debug!(target: "script", "Transformed source for Boa execution");
 
-    // Wrap source in an IIFE that calls execute()
     let wrapped = format!(
         r#"
         (function() {{
@@ -104,6 +93,60 @@ fn execute_sync(
         }})()
         "#
     );
+
+    debug_assert!(
+        wrapped.len() > source.len(),
+        "the wrapper only ever adds text; a shorter result means the format string was lost"
+    );
+    wrapped
+}
+
+/// Parse a tool's source exactly as the runtime would, **without running it**.
+///
+/// This is the whole of the syntax class: `extract_manifest` reads the manifest
+/// fields out of the source with string scanning and never parses the JavaScript,
+/// so until this existed a bundled skill could carry unparseable garbage in its
+/// body, pass every test in the workspace, and fail for the first time inside a
+/// user's session when the agent called it.
+///
+/// # Errors
+/// Returns [`ScriptError::Execution`] carrying Boa's own parse diagnostic when the
+/// wrapped source does not parse.
+pub fn check_syntax(source: &str) -> Result<()> {
+    let wrapped = wrap_for_boa(source);
+    let mut context = Context::default();
+
+    boa_engine::Script::parse(Source::from_bytes(&wrapped), None, &mut context)
+        .map(|_| ())
+        .map_err(|e| ScriptError::Execution(format!("parse failed: {e}")))
+}
+
+/// Synchronous execution (runs in blocking task)
+fn execute_sync(
+    source: &str,
+    input: &Value,
+    bridge: &Arc<NannaBridge>,
+) -> Result<Value> {
+    // Store bridge in thread-local for native function access
+    BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
+    
+    let mut context = Context::default();
+
+    // Register console.log
+    register_console(&mut context)?;
+
+    // Register Nanna bridge functions
+    register_nanna_bridge(&mut context)?;
+
+    // Inject INPUT as a global
+    let input_js = json_to_js(input, &mut context)?;
+    context
+        .register_global_property(js_string!("INPUT"), input_js, Attribute::READONLY)
+        .map_err(|e| ScriptError::Execution(format!("Failed to set INPUT: {e}")))?;
+
+    let wrapped = wrap_for_boa(source);
+
+    tracing::debug!(target: "script", "Transformed source for Boa execution");
 
     // Parse and execute
     let result = context

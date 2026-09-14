@@ -157,7 +157,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         .await;
     tools.set_session_id(Some(EVAL_SESSION.to_string())).await;
     let tools_dir = nanna_tools::skills::defaults::resolve_tools_dir(None)
-        .expect("DEV_TOOLS_DIR must resolve in debug builds");
+        .expect("dev_tools_dir() must resolve in debug builds");
     let workspace_id = Arc::new(tokio::sync::RwLock::new(None));
     // No turn baseline registered: this eval drives the harness directly, with
     // no chat turn to bound. The closed-since-turn-start guard therefore never

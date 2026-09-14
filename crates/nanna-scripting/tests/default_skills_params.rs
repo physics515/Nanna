@@ -15,10 +15,15 @@ fn skills_dir() -> PathBuf {
 #[test]
 fn every_default_skill_parameters_block_parses() {
     let dir = skills_dir();
-    if !dir.is_dir() {
-        eprintln!("skipping: {} not present", dir.display());
-        return;
-    }
+    // Not "tolerant by design" any more. A gate that no-ops when its subject is
+    // missing reports success for the one state it most needs to fail on, and
+    // `default_skills_parse.rs` and `default_skill_permissions.rs` both read the
+    // same tree without needing an escape hatch.
+    assert!(
+        dir.is_dir(),
+        "default-skills tree missing at {} — this gate cannot be skipped into passing",
+        dir.display()
+    );
 
     let mut checked = 0usize;
     let mut with_params = 0usize;
@@ -55,7 +60,20 @@ fn every_default_skill_parameters_block_parses() {
         }
     }
 
-    assert!(checked > 0, "no default skills were checked");
+    // The number checked is itself an assertion. `checked > 0` passes for a loop
+    // that saw one skill out of 43, which is the failure mode
+    // `default_skill_permissions.rs` already wrote down: a loop over a nearly
+    // empty list passes every assertion inside it for free.
+    assert!(
+        checked >= 44,
+        "only {checked} skills were checked; the tree shipped 44 on 2026-09-14, so a smaller \
+         number means skills went missing rather than that the gate got easier"
+    );
+    assert!(
+        with_params >= checked - 2,
+        "only {with_params} of {checked} skills declare parameters — a sudden drop means the \
+         `parameters:` probe stopped matching, not that the skills lost their schemas"
+    );
     eprintln!("checked {checked} skills, {with_params} with parameter schemas");
 }
 

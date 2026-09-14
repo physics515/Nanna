@@ -24,7 +24,9 @@ Get the latest installer from [Releases](https://github.com/physics515/Nanna/rel
 - **Windows:** `Nanna_x.y.z_x64-setup.exe` or `.msi`
 
 ### 3. Run It
-Launch Nanna. On first run, it seeds default tools into `%APPDATA%\nanna\data\tools`.
+Launch Nanna. On first run, it seeds its default tools into the user data directory —
+`~/.local/share/nanna/tools` on Linux, `~/Library/Application Support/nanna/tools` on macOS,
+`%APPDATA%\nanna\data\tools` on Windows.
 
 > **Note:** Binaries are not yet code-signed. Windows SmartScreen will warn — click *More info → Run anyway*.
 
@@ -78,7 +80,7 @@ A fully local run needs none.
 | **Signal Channel** | ✅ Stable | Signal CLI bridge |
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
-| **Tool System (39 tools)** | ✅ Stable | — |
+| **Tool System (44 tools)** | ✅ Stable | — |
 | **MCP Client** | ✅ Stable | MCP server |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
@@ -93,10 +95,13 @@ A fully local run needs none.
   with drift protection: what you *stated* is kept in your words and never paraphrased away, and a
   summary is never re-summarized ([measured](bench/BASELINE.md#summarization-drift-content-fidelity-not-recall))
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
-- **39 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools
+- **44 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools,
+  including `find_files` for locating a file by glob when you know its name but not its path
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
 - **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
+- **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
+- **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -148,6 +153,33 @@ sudo dpkg -i nanna_x.y.z_amd64.deb
 ---
 
 ## Troubleshooting
+
+### Start here: `nanna doctor`
+
+```bash
+nanna doctor
+```
+
+Checks the configuration and, for anything it finds, prints the fix rather than
+just the verdict — a missing tools directory, a `[infer]` section that names no
+model, a clustering configuration that would merge unrelated memories, chat and
+summarization pointed at two different Ollama servers by accident. Exits
+non-zero when something is actually broken, so it also works from a script or a
+health probe.
+
+By default it is **offline**: no provider call, no network probe, no keyring
+read. That makes it fast and safe to run anywhere, and it means a clean report
+says your *configuration* is sound — not that a provider is reachable.
+
+```bash
+nanna doctor --online
+```
+
+Adds the one probe that needs no credential: each Ollama server your
+configuration uses is asked whether it is answering and whether it has the
+models you configured, and a missing one is reported with the `ollama pull`
+that fixes it. It never tests a provider API key — that would mean reading the
+keyring and sending the key off the machine.
 
 ### API Key Invalid
 - Verify the key in **Settings → Models**
@@ -236,10 +268,11 @@ name = "Nanna"
 [llm]
 provider = "ollama"       # ollama | anthropic | openai | openrouter
 model = "qwen3.5:9b"
+# prompt_cache_ttl = "1h" # Anthropic only: "5m" (default) or "1h" — 1h keeps the prompt
+#                         # cache warm across 5-60 min gaps, at 2x the cache-write price
 
 [server]
-enabled = true
-port = 3000
+port = 3000               # `nanna server` port; the PORT env var or --port override it
 ```
 
 **Environment Variables:**
@@ -312,6 +345,9 @@ See [PRIVACY.md](PRIVACY.md) for full details.
 - Config: `config.toml`
 - Database: `nanna.db` (sessions, memory, tasks)
 - Credentials: OS keyring (encrypted)
+
+**Taking your data with you:** `nanna export <session-id>` (Markdown, or `--format json`
+for the complete stored session) and `nanna export --memories` — the daemon must be running.
 
 **What's sent externally (when configured):**
 - Chat messages → your chosen LLM provider

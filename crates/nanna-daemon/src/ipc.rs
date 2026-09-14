@@ -12,10 +12,9 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
 use tracing::{debug, error, info, warn};
 
-/// Maximum WebSocket message size (128 MB).
-/// Sessions with large tool outputs or long histories can exceed the
-/// default 16 MB tungstenite limit, crashing the connection.
-const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+/// The IPC read limit, shared with every client — see its definition for why
+/// a limit set on one end only ever protected that end.
+pub use nanna_config::bind::IPC_MAX_MESSAGE_BYTES;
 
 /// Server-initiated keepalive ping cadence. A live client answers with a pong
 /// (an incoming frame), which resets the read deadline below.
@@ -46,7 +45,7 @@ pub struct IpcServerConfig {
 /// the docs, and the copies drifted — `nanna daemon start` defaulted to `9999` while
 /// `nanna daemon status`, the GUI sidecar and the README all used `5149`, so a CLI-started daemon
 /// reported itself as not running.
-pub const DEFAULT_IPC_PORT: u16 = 5149;
+pub use nanna_config::{DEFAULT_IPC_PORT, default_daemon_ws_url};
 
 impl Default for IpcServerConfig {
     fn default() -> Self {
@@ -237,10 +236,15 @@ impl IpcServer {
         Ok(())
     }
     
-    async fn handle_connection(&self, client_id: ConnectionId, stream: TcpStream, addr: SocketAddr) {
+    async fn handle_connection(
+        &self,
+        client_id: ConnectionId,
+        stream: TcpStream,
+        addr: SocketAddr,
+    ) {
         let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
-        ws_config.max_frame_size = Some(WS_MAX_MESSAGE_SIZE);
+        ws_config.max_message_size = Some(IPC_MAX_MESSAGE_BYTES);
+        ws_config.max_frame_size = Some(IPC_MAX_MESSAGE_BYTES);
         let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
             Ok(ws) => ws,
             Err(e) => {
@@ -283,8 +287,11 @@ impl IpcServer {
                             break;
                         }
                     }
-                    // Forward broadcast events to this client
-                    Ok(event) = event_rx.recv() => {
+                    // Forward broadcast events to this client. Every receive result is
+                    // handled: an `Ok(event)` pattern let a `Lagged` error fail the match,
+                    // and the missed events vanished without the client ever knowing.
+                    received = event_rx.recv() => {
+                        let Some(event) = forwardable(received) else { break };
                         if let Ok(json) = serde_json::to_string(&event) {
                             if ws_tx.send(Message::Text(json.into())).await.is_err() {
                                 break;
@@ -393,5 +400,64 @@ mod tests {
         let config = IpcServerConfig::default();
         assert_eq!(config.port, 5149);
         assert_eq!(config.host, "127.0.0.1");
+    }
+}
+
+/// What an IPC connection forwards for one receive from the shared event broadcast:
+/// the event itself; for a connection that fell behind the bounded broadcast, an
+/// `Error` event saying how many it missed so the client can resync; `None` once the
+/// broadcast is closed.
+fn forwardable(received: Result<Event, tokio::sync::broadcast::error::RecvError>) -> Option<Event> {
+    use tokio::sync::broadcast::error::RecvError;
+    match received {
+        Ok(event) => Some(event),
+        Err(RecvError::Lagged(missed)) => {
+            debug_assert!(missed > 0, "a lag always skips at least one event");
+            warn!("IPC client fell behind the event broadcast and missed {missed} events");
+            Some(Event::Error {
+                code: "events_lagged".to_string(),
+                message: format!(
+                    "this connection fell behind and missed {missed} events; re-fetch state to resync"
+                ),
+                session_id: None,
+            })
+        }
+        Err(RecvError::Closed) => None,
+    }
+}
+
+#[cfg(test)]
+mod forwardable_tests {
+    use super::{Event, forwardable};
+    use tokio::sync::broadcast::error::RecvError;
+
+    #[test]
+    fn a_received_event_is_forwarded_as_is() {
+        let forwarded = forwardable(Ok(Event::ConfigChanged));
+        assert!(matches!(forwarded, Some(Event::ConfigChanged)));
+    }
+
+    #[test]
+    fn a_lag_becomes_an_error_event_naming_the_count() {
+        match forwardable(Err(RecvError::Lagged(7))) {
+            Some(Event::Error {
+                code,
+                message,
+                session_id,
+            }) => {
+                assert_eq!(code, "events_lagged");
+                assert!(message.contains("missed 7 events"), "{message}");
+                assert_eq!(
+                    session_id, None,
+                    "a lag belongs to the connection, not a session"
+                );
+            }
+            other => panic!("expected an events_lagged error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_closed_broadcast_ends_the_forwarder() {
+        assert!(forwardable(Err(RecvError::Closed)).is_none());
     }
 }

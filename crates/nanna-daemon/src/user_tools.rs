@@ -56,6 +56,31 @@ pub struct UserToolManager {
     tools: RwLock<HashMap<String, UserToolMeta>>,
 }
 
+/// Reject a tool whose source does not parse, before it reaches disk.
+///
+/// `extract_manifest` reads the manifest fields out of the source by scanning
+/// it as text and never parses the JavaScript, so it accepts a file whose body
+/// is unparseable garbage. This checks the body through the same engine that
+/// will run it — including the `export default` rewrite and IIFE wrapper the
+/// runtime applies, either of which can introduce a syntax error the source
+/// does not itself contain.
+///
+/// Refusing here rather than at call time is the whole point: a registered tool
+/// that cannot run costs a turn and reports as a broken tool, while a refused
+/// `create` reports as a fixable call, with the engine's own line and column.
+///
+/// # Errors
+/// Returns the parse diagnostic, addressed to whoever wrote the source.
+fn validate_tool_source(source: &str) -> Result<(), String> {
+    nanna_scripting::check_syntax(source).map_err(|e| {
+        format!(
+            "Source does not parse, so the tool was NOT created: {e}\n\
+             Nothing was written to disk. Fix the syntax and call again — the position above is \
+             from the engine that would have run it."
+        )
+    })
+}
+
 impl UserToolManager {
     /// Create a new manager with the given tools directory
     pub fn new(tools_dir: PathBuf) -> Self {
@@ -122,9 +147,15 @@ impl UserToolManager {
         // single filename component — reject path traversal before anything else.
         validate_tool_name(&name)?;
 
-        // Validate the source compiles
-        let _test_tool = ScriptedTool::new(&name, &source);
-        
+        // Validate the source PARSES. The line this replaces was
+        // `let _test_tool = ScriptedTool::new(&name, &source);` under the comment
+        // "Validate the source compiles" — and `ScriptedTool::new` compiles
+        // nothing; it stores the string. So a tool with a syntax error was
+        // written to disk, registered, and advertised to the model, and the
+        // first anyone heard of it was a failed call. This is the path where
+        // that matters most: an agent writes these.
+        validate_tool_source(&source)?;
+
         // Try to extract manifest to validate
         if extract_manifest(&source).is_none() {
             return Err("Source must export default with name and description. Example:\nexport default {\n  name: \"my_tool\",\n  description: \"Does something\",\n  execute(params) { return \"result\"; }\n}".to_string());
@@ -184,6 +215,7 @@ impl UserToolManager {
         // Validate the new source BEFORE applying any field, so a bad edit is a
         // clean no-op rather than a partial mutation.
         if let Some(ref src) = source {
+            validate_tool_source(src)?;
             if extract_manifest(src).is_none() {
                 return Err(
                     "Invalid source: must export default with name and description".to_string(),
@@ -521,6 +553,93 @@ mod tests {
         assert!(res.is_err());
         // Nothing must have been written outside the tools dir.
         assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
+
+    /// The defect this replaced: `create_tool`'s "Validate the source compiles"
+    /// was `let _test_tool = ScriptedTool::new(...)`, which compiles nothing. A
+    /// tool with unparseable garbage in its body reached disk, registered, and
+    /// was advertised to the model — the first sign of trouble was a failed call.
+    #[tokio::test]
+    async fn create_tool_refuses_source_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        let broken = "export default { name: \"broken\", description: \"d\", \
+                      execute() { var x = [;;; not javascript ((( } }";
+
+        let res = mgr
+            .create_tool(
+                "broken".to_string(),
+                "d".to_string(),
+                broken.to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = res.expect_err("a tool that cannot parse must not be created");
+        assert!(err.contains("does not parse"), "{err}");
+        assert!(err.contains("NOT created"), "{err}");
+        // Nothing on disk: a refused create is a clean no-op, not a half-write.
+        assert!(
+            !dir.path().join("broken.json").exists(),
+            "a refused tool must leave nothing behind"
+        );
+    }
+
+    /// The positive half, so the check cannot be a constant `Err`.
+    #[tokio::test]
+    async fn create_tool_still_accepts_well_formed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        let res = mgr
+            .create_tool(
+                "fine".to_string(),
+                "d".to_string(),
+                sample_source("fine"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(dir.path().join("fine.json").exists());
+    }
+
+    /// A bad edit must be a clean no-op — the tool that was working keeps working.
+    #[tokio::test]
+    async fn update_tool_refuses_a_broken_edit_without_touching_the_good_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        mgr.create_tool(
+            "keeper".to_string(),
+            "d".to_string(),
+            sample_source("keeper"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create");
+
+        let res = mgr
+            .update_tool(
+                "keeper",
+                None,
+                Some("export default { name: \"keeper\", execute() { [;;; ((( } }".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_err(), "a broken edit must be refused");
+
+        let kept = mgr.get_tool("keeper").await.expect("still registered");
+        assert_eq!(
+            kept.source,
+            sample_source("keeper"),
+            "the working source must survive a refused edit"
+        );
     }
 
     fn sample_source(name: &str) -> String {

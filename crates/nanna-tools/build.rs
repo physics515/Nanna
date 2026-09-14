@@ -21,7 +21,18 @@ fn main() {
     // Collect all skills (directories containing tool.ts)
     let mut entries: Vec<_> = Vec::new();
 
-    if skills_dir.is_dir() {
+    // Fail the BUILD, not the user's first run. An `if is_dir()` that falls
+    // through emits `DEFAULT_SKILLS: &[] = &[]` and compiles clean, so the
+    // release binary ships with zero tools and says nothing about it — the
+    // release-path twin of the debug build that loaded none of its 43 skills
+    // (2026-09-13). There is no configuration in which this crate is supposed
+    // to build without its skills, so not finding them is a build error.
+    assert!(
+        skills_dir.is_dir(),
+        "default-skills/ not found at {} — nanna-tools cannot be built without its skills",
+        skills_dir.display()
+    );
+    {
         let mut dirs: Vec<_> = fs::read_dir(skills_dir)
             .expect("cannot read default-skills/")
             .filter_map(|e| e.ok())
@@ -83,4 +94,12 @@ fn main() {
     }
 
     writeln!(out, "];").unwrap();
+
+    // Same reasoning one level down: a readable directory holding no skill is
+    // still a binary with no tools.
+    assert!(
+        !entries.is_empty(),
+        "default-skills/ at {} contains no skill files",
+        skills_dir.display()
+    );
 }

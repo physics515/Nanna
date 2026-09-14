@@ -260,6 +260,7 @@ import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/even
 import { useSessionState, type TimelineEntry } from '~/composables/useSessionState'
 import { useBackend } from '~/composables/useBackend'
 import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
+import { parseEditDiff } from '~/lib/editDiff'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {
@@ -785,6 +786,9 @@ onMounted(async () => {
         tool_call.success ?? false,
         tool_call.duration_ms || 0,
         isSteering,
+        // edit_file's before/after view: journaled only for a call that
+        // completed and really ran, the same rule the daemon applies.
+        status === 'completed' && !isSteering ? parseEditDiff(tool_call.data?.diff) : null,
       )
 
       if (isSteering) {

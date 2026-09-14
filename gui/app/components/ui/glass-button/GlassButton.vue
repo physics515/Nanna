@@ -25,7 +25,7 @@ const props = withDefaults(defineProps<{
 })
 
 // ── Mesh gradient colors for splatter (non-pill solid) ──
-const splatterColors: Record<string, [string, string, string]> = {
+const splatterColors: Record<ButtonColor, [string, string, string]> = {
   default: ['148, 163, 184', '100, 116, 139', '120, 140, 160'],
   accent:  ['139, 92, 246', '167, 139, 250', '139, 92, 246'],
   danger:  ['239, 68, 68', '220, 38, 38', '248, 113, 113'],
@@ -33,7 +33,7 @@ const splatterColors: Record<string, [string, string, string]> = {
 }
 
 // ── Glass pill configs: points randomly fade between color and transparent ──
-const glassConfigs: Record<string, {
+const glassConfigs: Record<ButtonColor, {
   colors: [string, string, string]
   opacityRanges: [[number, number], [number, number], [number, number]]
 }> = {
