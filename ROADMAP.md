@@ -5870,12 +5870,58 @@ keep the phases readable; promote individual items into a phase when they become
             track it once the GUI builds here; not added this run because an unfinished build cannot
             be trusted to have produced a complete one.
 
-- [ ] **`WebKitWebDriver` is missing (owner-gated).** `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh
-      ensure` reports every other check green — `tauri-driver` installed this run
-      (`cargo install tauri-driver`), curl/python3/base64 present, Wayland session live
-      (`WAYLAND_DISPLAY=wayland-1`). The single remaining gap needs
-      `sudo pacman -S --needed webkit2gtk-4.1`. **The Linux WebDriver harness therefore remains
-      UNVALIDATED** — no run has yet driven the real Nanna GUI on this host.
+- [x] *(2026-09-14)* **The GUI builds AND runs on this Linux host — first time.** `pnpm tauri build`
+      (the CLI vendored in `gui/node_modules`; `cargo install tauri-cli --locked` cannot be used here,
+      it pins `rustix 0.37.28` whose internal `rustc_*` attributes the pinned nightly rejects)
+      produced `<target>/release/nanna-gui` (21.5 MB) and `Nanna_0.3.18_amd64.deb` (40.9 MB). **Only the
+      AppImage step failed, and not on code:** `failed to bundle project: Disk quota exceeded (os error
+      122)` — the tmpfs `CARGO_TARGET_DIR` was at 80%. This closes the loop on the vendored
+      `tauri-build` fix: it works end to end.
+      Runtime, driving the built binary: system tray initialized, a real 3416x1390 Wayland window
+      titled `Nanna`, the **daemon sidecar** spawned and reached `Daemon ready` (config loaded, turso DB
+      opened, PID file acquired), the GUI reported `Connected to daemon`, and a connect/health/disconnect
+      probe then repeated on a clean 30s cadence with a fresh client UUID each time. Shutdown was clean
+      (`nanna-daemon.exit.json` → `"reason": "clean_shutdown"`).
+
+- [x] *(2026-09-14)* **`XDG_DATA_HOME` + `NANNA_CONFIG_PATH` isolate the GUI on Linux** — the skill's
+      smoke-run recipe is written for the daemon's `--data-dir`/`--port` flags, which the GUI binary
+      does not take, and it notes that on Windows `%APPDATA%` cannot redirect settings because
+      `directories` reads the known-folder API. On Linux `directories` reads the XDG vars, so the whole
+      app can be isolated by environment: verified this run, the scratch tree got its own
+      `nanna.db`/`tools`/`checkpoints` and the real `~/.local/share/nanna` was untouched.
+      **Use it — a first smoke run this day was launched WITHOUT it and created a fresh `nanna.db` in
+      the operator's real data directory** (that path happened to hold no data on this host yet, so
+      nothing was lost, and the daemon shut down cleanly — but the rule exists for the host where it
+      does hold data).
+
+- [ ] **`WebKitWebDriver`: the remedy written down everywhere is not achievable on Arch, and the one
+      package that ships the driver is the wrong ABI.** *(2026-09-14 — corrected with evidence; the
+      2026-09-09 entry this replaces said `sudo pacman -S --needed webkit2gtk-4.1` and that command
+      cannot work.)* Three facts, each checked rather than recalled:
+      - `webkit2gtk-4.1` is **already installed** (2.52.6-1) and ships **no `usr/bin/` entries at all**
+        — confirmed against the Arch package file list, not just the local install.
+      - The **only** official Arch package carrying `/usr/bin/WebKitWebDriver` is **`webkitgtk-6.0`**
+        (extra, 2.52.6). The AUR has no 4.1-series driver either — only the legacy `webkit2gtk` (4.0)
+        and two `imgpaste` forks.
+      - The built app embeds **4.1**: `ldd nanna-gui` → `libwebkit2gtk-4.1.so.0` and
+        `libjavascriptcoregtk-4.1.so.0`, because tauri v2 / wry target that generation.
+      So the driver Arch can supply is built against WebKitGTK **6.0** while the app it must drive is
+      **4.1**, and WebKitGTK's automation handshake is per-library-generation. **Whether a 6.0 driver
+      can drive a 4.1 app is unproven and is the actual open question** — it is not a package the owner
+      has simply not installed yet.
+      - [ ] Owner step, worth trying because it is the only candidate: `sudo pacman -S --needed
+            webkitgtk-6.0`, then let the next run take `tauri-webdriver.sh ensure` → `start` → `exec`
+            all the way to a real session. That attempt is what settles the ABI question; until it
+            happens **the Linux WebDriver harness stays UNVALIDATED** and no run may claim GUI
+            verification passed.
+      - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
+            `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
+            2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
+      - [ ] If 6.0 cannot drive a 4.1 app, the fallback is not a package at all: verify through the
+            running app instead — the daemon sidecar's own log already proves boot, IPC and shutdown,
+            and `XDG_DATA_HOME` makes that safe to do unattended. Screenshots are **not** a dependable
+            substitute here: `grim` captured one all-white frame and then hung outright (exit 124) on
+            this compositor while a fullscreen game held the screencopy path.
 
 ## Immediate next actions (top of queue)
 
