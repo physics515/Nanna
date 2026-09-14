@@ -5854,6 +5854,16 @@ keep the phases readable; promote individual items into a phase when they become
       The keyring read is short-circuited when no Anthropic model is configured: an unrelated config
       has no business raising a libsecret unlock prompt, which unattended is a hang, not a diagnostic.
 
+- [x] *(2026-09-14)* **`doctor` reported `ok` for an embedding provider its own daemon skips.**
+      The old `memory.embeddings` check asked only whether a provider was *named*, so the shipped
+      defaults — `openai` / `text-embedding-3-small` with an empty `embedding_priority` — passed on a
+      machine with no OpenAI key, while the daemon said at boot: `Embedding provider
+      'openai/text-embedding-3-small' skipped: no OpenAI API key` and `memory runs WITHOUT vectors …
+      recall is unavailable`. The check now reproduces the daemon's own resolution rules and splits
+      the verdict by whether the fault is recoverable: a missing credential is a `warn` (supply the
+      key and the queued backfill drains), a malformed or unknown spec is a `FAIL` (no credential can
+      ever help). Verified on the real binary in all three states.
+
 - [ ] **Fix the refresh request itself. Do NOT guess the wire format — it is undocumented.**
       *(2026-09-14)* `ClaudeCredentialManager::refresh_token` POSTs
       `https://console.anthropic.com/v1/oauth/token` **form-encoded**, with `grant_type` and
@@ -6161,6 +6171,18 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
        2026-09-13** — five and a half months. Both holds it forces (`malachite-bigint =0.9.2`, the
        `libc <= 0.2.186` ceiling) stay, and both are enforced by
        `dep_version_unification.rs` rather than by memory.
+   - *(2026-09-14 research)* **`burn 0.22.0` is out, and it deprecates the LibTorch backend** —
+     GPU work moves to a CubeCL backend (CUDA / ROCm / Metal / Vulkan / WebGPU) and CPU to the CubeCL
+     CPU backend or `burn-flex`. This is **Mummu's** migration, not Nanna's (P12 here is
+     integration-only), but it matters to the integration schedule: the 2026-09-10 note that
+     "Burn 0.22-pre breaks Mummu's API" is now a shipped release rather than a pre. On this host
+     Vulkan is the backend `wgpu` already picks, so a CubeCL-Vulkan Mummu would land on a path Nanna
+     has bench numbers for. File the actual port in Mummu.
+     Source: [tracel-ai/burn](https://github.com/tracel-ai/burn).
+   - *(2026-09-14 re-check)* `turso` is **still** `0.8.0-pre.11` — unchanged since 2026-09-11, no new
+     pre-release in three days, still no changelog past 0.7.0. The exact `=0.7.2` pin holds; nothing
+     to re-evaluate until 0.8.0 goes stable. `fsrs 6.6.2`, `boa_engine 0.22.0` and `tantivy 0.26.2`
+     are each the latest published, so the tree is at the frontier on all four.
    - *(2026-09-14 sweep)* `cargo update` → 5 compatible bumps (`liblzma-sys 0.4.9`, `textwrap 0.16.4`,
      `tinyvec 1.13.3` — which drops `tinyvec_macros` entirely — `ureq 3.4.2`, `ureq-proto 0.6.3`).
      `cargo upgrade --incompatible` offered **two rows and both were the known downgrade traps**:

@@ -226,12 +226,101 @@ fn check_tools_dir(config: &Config) -> Check {
 
 /// Memory without an embedding provider still stores, but cannot search — the
 /// one memory failure a person can actually fix.
+/// Split an embedding spec the way the daemon's `split_embedding_spec` does.
+/// `None` means malformed — and a malformed entry is skipped, not repaired.
+fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    match spec.split_once('/') {
+        Some((provider, model)) => {
+            let (provider, model) = (provider.trim(), model.trim());
+            if provider.is_empty() || model.is_empty() {
+                return None;
+            }
+            Some((provider.to_ascii_lowercase(), model.to_string()))
+        }
+        // A bare name means the keyless local provider.
+        None => Some(("ollama".to_string(), spec.to_string())),
+    }
+}
+
+/// Why one embedding spec cannot become a live client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpecFault {
+    /// Not `provider/model`, or a half of it is empty.
+    Malformed,
+    /// A provider the daemon has no arm for.
+    UnknownProvider(String),
+    /// A real provider whose credential is absent.
+    MissingCredential(String),
+}
+
+/// Reproduce the daemon's `embedding_provider_for` decision for one spec.
+///
+/// This mirrors `DaemonServer::embedding_provider_for` rather than calling it —
+/// the same tradeoff `check_clustering` already makes, and for the same reason:
+/// the daemon builds that decision from live state a diagnostic cannot
+/// construct. The coupling is real, so the rules are written out plainly and
+/// `the_resolution_rules_match_the_daemons` pins them.
+fn embedding_spec_fault(config: &Config, spec: &str) -> Option<SpecFault> {
+    let Some((provider, _model)) = split_embedding_spec(spec) else {
+        return Some(SpecFault::Malformed);
+    };
+    let configured = |value: &Option<String>, env: &str| {
+        value.as_deref().is_some_and(|k| !k.trim().is_empty())
+            || std::env::var(env).is_ok_and(|k| !k.trim().is_empty())
+    };
+    match provider.as_str() {
+        // Keyless and local: it always resolves. Whether it ANSWERS is
+        // `ollama.online`'s question, not this one.
+        "ollama" => None,
+        "openai" => (!configured(&config.llm.openai_api_key, "OPENAI_API_KEY"))
+            .then(|| SpecFault::MissingCredential("OpenAI".to_string())),
+        "openrouter" => (!configured(&config.llm.openrouter_api_key, "OPENROUTER_API_KEY"))
+            .then(|| SpecFault::MissingCredential("OpenRouter".to_string())),
+        other => Some(SpecFault::UnknownProvider(other.to_string())),
+    }
+}
+
+/// The specs the daemon will actually try, in its order: `embedding_priority`
+/// when set, otherwise the single `provider/model` pair.
+fn embedding_specs(config: &Config) -> Vec<String> {
+    if config.memory.embedding_priority.is_empty() {
+        vec![format!(
+            "{}/{}",
+            config.memory.embedding_provider.trim(),
+            config.memory.embedding_model.trim()
+        )]
+    } else {
+        config.memory.embedding_priority.clone()
+    }
+}
+
+/// Is memory actually going to be searchable?
+///
+/// The old check asked only whether a provider was *named*, and answered `ok`
+/// for the shipped defaults — `openai` / `text-embedding-3-small` with an empty
+/// priority list. On a machine with no OpenAI key the daemon then says, at boot
+/// and never again:
+///
+/// > Embedding provider 'openai/text-embedding-3-small' skipped: no OpenAI API key
+/// > No embedding provider available — memory runs WITHOUT vectors: writes
+/// > persist and queue for backfill, recall is unavailable
+///
+/// So the doctor was reporting `ok` for a configuration its own daemon had
+/// already announced as broken (observed live 2026-09-14). Naming a provider and
+/// being able to reach one are different questions, and only the second one
+/// matters.
 fn check_embeddings(config: &Config) -> Check {
     if !config.memory.enabled {
         return Check::ok("memory.embeddings", "memory disabled");
     }
     let provider = config.memory.embedding_provider.trim();
-    if provider.is_empty() || provider.eq_ignore_ascii_case("disabled") {
+    if config.memory.embedding_priority.is_empty()
+        && (provider.is_empty() || provider.eq_ignore_ascii_case("disabled"))
+    {
         return Check::warn(
             "memory.embeddings",
             "memory is enabled but no embedding provider is set — memories will be stored and \
@@ -239,7 +328,57 @@ fn check_embeddings(config: &Config) -> Check {
             "set `[memory].embedding_provider`, or disable memory if that is intended",
         );
     }
-    Check::ok("memory.embeddings", format!("provider `{provider}`"))
+
+    let specs = embedding_specs(config);
+    let faults: Vec<(String, SpecFault)> = specs
+        .iter()
+        .filter_map(|spec| embedding_spec_fault(config, spec).map(|f| (spec.clone(), f)))
+        .collect();
+
+    if faults.len() < specs.len() {
+        // At least one entry resolves, so the router has a primary.
+        let live = specs.len() - faults.len();
+        return Check::ok(
+            "memory.embeddings",
+            format!("{live} of {} configured embedders resolve", specs.len()),
+        );
+    }
+
+    // Nothing resolves. A typo can never resolve; a missing key resolves the
+    // moment it is supplied and the queued backfill then drains — so the first
+    // is a FAIL and the second a WARN, and the detail says which entry is which.
+    let described: Vec<String> = faults
+        .iter()
+        .map(|(spec, fault)| match fault {
+            SpecFault::Malformed => format!("`{spec}` is not `provider/model`"),
+            SpecFault::UnknownProvider(p) => format!("`{spec}` names unknown provider `{p}`"),
+            SpecFault::MissingCredential(p) => format!("`{spec}` has no {p} API key"),
+        })
+        .collect();
+    let detail = format!(
+        "no configured embedder resolves ({}) — memory will be written WITHOUT vectors and \
+         queued for backfill; recall is unavailable until one does",
+        described.join("; ")
+    );
+
+    let only_credentials = faults
+        .iter()
+        .all(|(_, f)| matches!(f, SpecFault::MissingCredential(_)));
+    if only_credentials {
+        Check::warn(
+            "memory.embeddings",
+            detail,
+            "set the provider's API key, or point `[memory].embedding_priority` at a keyless \
+             local embedder such as `ollama/nomic-embed-text`",
+        )
+    } else {
+        Check::fail(
+            "memory.embeddings",
+            detail,
+            "fix the spelling — an entry that is not `provider/model` for a known provider can \
+             never resolve, no credential will help",
+        )
+    }
 }
 
 /// Ollama's own default port, which a base URL without one means.
@@ -825,6 +964,99 @@ mod tests {
         assert!(
             anthropic_is_in_use(&config),
             "the summarizer alone makes the credential load-bearing"
+        );
+    }
+
+    /// A config whose embedders are all keyless and local, so tests never
+    /// depend on whether the developer happens to export an OpenAI key.
+    fn local_embedding_config() -> Config {
+        let mut config = cfg();
+        config.memory.embedding_priority = vec!["ollama/nomic-embed-text".to_string()];
+        config
+    }
+
+    #[test]
+    fn a_keyless_local_embedder_resolves() {
+        let check = check_embeddings(&local_embedding_config());
+        assert_eq!(check.severity, Severity::Ok, "{check:?}");
+        assert!(check.detail.contains("1 of 1"), "{check:?}");
+    }
+
+    #[test]
+    fn a_typo_can_never_resolve_and_is_a_failure() {
+        let mut config = cfg();
+        config.memory.embedding_priority = vec!["openrouter/".to_string()];
+        let check = check_embeddings(&config);
+        assert_eq!(check.severity, Severity::Fail, "{check:?}");
+        assert!(check.detail.contains("not `provider/model`"), "{check:?}");
+
+        config.memory.embedding_priority = vec!["opeanai/text-embedding-3-small".to_string()];
+        let check = check_embeddings(&config);
+        assert_eq!(check.severity, Severity::Fail, "{check:?}");
+        assert!(check.detail.contains("unknown provider"), "{check:?}");
+    }
+
+    /// One working entry is enough — the router only needs a primary.
+    #[test]
+    fn one_resolvable_entry_rescues_a_list_with_a_broken_one() {
+        let mut config = cfg();
+        config.memory.embedding_priority = vec![
+            "openai/text-embedding-3-small".to_string(),
+            "ollama/nomic-embed-text".to_string(),
+        ];
+        let check = check_embeddings(&config);
+        assert_eq!(check.severity, Severity::Ok, "{check:?}");
+    }
+
+    /// The daemon's rules, pinned. `check_embeddings` mirrors
+    /// `DaemonServer::embedding_provider_for` rather than calling it, so the
+    /// mirror is what needs a test.
+    #[test]
+    fn the_resolution_rules_match_the_daemons() {
+        let config = cfg();
+        // Keyless and local: always resolvable, regardless of any key.
+        assert_eq!(
+            embedding_spec_fault(&config, "ollama/nomic-embed-text"),
+            None
+        );
+        // A bare name means ollama, so it resolves too.
+        assert_eq!(
+            embedding_spec_fault(&config, "nomic-embed-text:latest"),
+            None
+        );
+        // Malformed halves are rejected, never repaired.
+        assert_eq!(
+            embedding_spec_fault(&config, "openrouter/"),
+            Some(SpecFault::Malformed)
+        );
+        assert_eq!(
+            embedding_spec_fault(&config, "  "),
+            Some(SpecFault::Malformed)
+        );
+        // An unknown provider is a typo, not a credential problem.
+        assert!(matches!(
+            embedding_spec_fault(&config, "cohere/embed-v3"),
+            Some(SpecFault::UnknownProvider(_))
+        ));
+    }
+
+    /// The specs the daemon will actually try: the priority list wins, and the
+    /// legacy pair is used only when it is empty.
+    #[test]
+    fn the_priority_list_replaces_the_single_pair_rather_than_extending_it() {
+        let mut config = cfg();
+        config.memory.embedding_provider = "openai".to_string();
+        config.memory.embedding_model = "text-embedding-3-small".to_string();
+        assert_eq!(
+            embedding_specs(&config),
+            vec!["openai/text-embedding-3-small".to_string()]
+        );
+
+        config.memory.embedding_priority = vec!["ollama/nomic-embed-text".to_string()];
+        assert_eq!(
+            embedding_specs(&config),
+            vec!["ollama/nomic-embed-text".to_string()],
+            "the single pair must not be appended to the list"
         );
     }
 
