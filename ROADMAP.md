@@ -5854,6 +5854,15 @@ keep the phases readable; promote individual items into a phase when they become
       The keyring read is short-circuited when no Anthropic model is configured: an unrelated config
       has no business raising a libsecret unlock prompt, which unattended is a hang, not a diagnostic.
 
+- [x] *(2026-09-14)* **The router's own failure now names the cause, not just the outcome.**
+      `No provider for model: claude-sonnet-5 (detected: Anthropic, available: [Ollama])` was accurate
+      and useless. The boot-time credential chain already knew why — it logged it once at WARN and
+      threw it away — so `ProviderCredentials` now carries an absence reason, `LlmRouter` keeps it
+      (bounded by the provider enum, replaced wholesale each rebuild so a restored provider leaves no
+      stale excuse), and the message appends it. Verified on the real daemon against the real expired
+      credential: `… — a stored OAuth login exists but could not be used (Token refresh failed: …400
+      …)`, and it propagates into the user-facing `All models exhausted` error.
+
 - [x] *(2026-09-14)* **`doctor` reported `ok` for an embedding provider its own daemon skips.**
       The old `memory.embeddings` check asked only whether a provider was *named*, so the shipped
       defaults — `openai` / `text-embedding-3-small` with an empty `embedding_priority` — passed on a

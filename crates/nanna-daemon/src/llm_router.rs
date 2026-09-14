@@ -120,6 +120,13 @@ pub struct LlmRouter {
     model_cache: Option<ModelInfoCache>,
     /// Shared model stats tracker for health-aware routing (set post-init)
     stats: Arc<tokio::sync::RwLock<Option<ModelStatsTracker>>>,
+    /// Why a provider is absent, recorded at the rebuild that left it out.
+    ///
+    /// Bounded by the provider enum — at most one short sentence per variant —
+    /// so this cannot grow with traffic. Replaced wholesale on every rebuild,
+    /// never appended to, so a provider that comes back leaves no stale excuse
+    /// behind.
+    absent_reasons: RwLock<HashMap<ProviderId, String>>,
 }
 
 impl LlmRouter {
@@ -130,6 +137,7 @@ impl LlmRouter {
             providers: RwLock::new(HashMap::new()),
             model_cache,
             stats: Arc::new(tokio::sync::RwLock::new(None)),
+            absent_reasons: RwLock::new(HashMap::new()),
         }
     }
 
@@ -164,6 +172,7 @@ impl LlmRouter {
     /// user authenticates after boot registers without a daemon restart.
     pub fn rebuild(&self, creds: &ProviderCredentials) -> (Vec<ProviderId>, Vec<ProviderId>) {
         let mut new_map: HashMap<ProviderId, Arc<LlmClient>> = HashMap::new();
+        let mut reasons: HashMap<ProviderId, String> = HashMap::new();
 
         match &creds.anthropic {
             Some(AnthropicCredential::OAuth(token)) => {
@@ -175,7 +184,14 @@ impl LlmRouter {
             Some(AnthropicCredential::ApiKey(key)) => {
                 new_map.insert(ProviderId::Anthropic, Arc::new(LlmClient::anthropic(key)));
             }
-            None => {}
+            None => {
+                // The one provider whose absence has a diagnosable cause the
+                // user can act on. The others are absent because no key was
+                // configured, which the message below already implies.
+                if let Some(reason) = creds.anthropic_absent_reason.as_deref() {
+                    reasons.insert(ProviderId::Anthropic, reason.to_string());
+                }
+            }
         }
         if let Some(ref key) = creds.openai_api_key {
             new_map.insert(ProviderId::OpenAI, Arc::new(LlmClient::openai(key)));
@@ -195,6 +211,14 @@ impl LlmRouter {
             None => LlmClient::ollama(&creds.ollama_host),
         };
         new_map.insert(ProviderId::Ollama, Arc::new(ollama));
+
+        {
+            let mut guard = self
+                .absent_reasons
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = reasons;
+        }
 
         let (mut added, mut removed) = {
             let mut guard = self
@@ -286,6 +310,19 @@ impl LlmRouter {
     }
 
     /// Check if a provider is available
+    /// Why `provider` is not registered, if the last rebuild recorded a reason.
+    ///
+    /// `None` means either the provider IS registered or its absence was simply
+    /// an unconfigured credential — nothing that needs explaining.
+    #[must_use]
+    pub fn absent_reason(&self, provider: ProviderId) -> Option<String> {
+        self.absent_reasons
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&provider)
+            .cloned()
+    }
+
     pub fn has_provider(&self, provider: ProviderId) -> bool {
         self.providers
             .read()
@@ -523,6 +560,15 @@ pub enum AnthropicCredential {
 #[derive(Debug, Clone)]
 pub struct ProviderCredentials {
     pub anthropic: Option<AnthropicCredential>,
+    /// Why `anthropic` is `None`, in one non-secret sentence.
+    ///
+    /// The resolution chain already knows this — it logs it once, at WARN, at
+    /// boot — and then throws it away. Every later request then fails with
+    /// `No provider for model: claude-sonnet-5 (detected: Anthropic, available:
+    /// [Ollama])`, which names the model and the provider list and not the
+    /// cause, so it reads as "your model name is wrong". Keeping the sentence
+    /// is what lets the failure say what actually happened.
+    pub anthropic_absent_reason: Option<String>,
     pub openai_api_key: Option<String>,
     pub openrouter_api_key: Option<String>,
     pub github_token: Option<String>,
@@ -544,6 +590,27 @@ fn store_credential(store: &SecureStore, key: &str) -> Option<String> {
     store.get(key).ok().and_then(|v| non_empty(Some(&v)))
 }
 
+/// Longest absence reason worth carrying.
+///
+/// The reason embeds a provider's own error body — third-party text of
+/// unbounded length — and it reaches a log line, `last_error`, and from there
+/// the user. Bounding it is the Tiger-Style rule, and the bound is derived, not
+/// magic: 240 bytes is a little under two 132-column terminal lines, which is
+/// what a cause sentence gets before it stops being read.
+const ABSENT_REASON_BYTES_MAX: usize = 240;
+
+/// Truncate on a char boundary, never mid-codepoint — a `&s[..n]` here would
+/// panic on the first non-ASCII byte a provider ever returns.
+fn bounded_reason(reason: String) -> String {
+    if reason.len() <= ABSENT_REASON_BYTES_MAX {
+        return reason;
+    }
+    let end = reason.floor_char_boundary(ABSENT_REASON_BYTES_MAX);
+    debug_assert!(end <= reason.len(), "a boundary cannot exceed the string");
+    debug_assert!(reason.is_char_boundary(end), "must cut on a char boundary");
+    format!("{}…", &reason[..end])
+}
+
 /// Resolve the Anthropic credential.
 ///
 /// OAuth mode: env override (`ANTHROPIC_OAUTH_TOKEN`, matching
@@ -556,25 +623,29 @@ fn store_credential(store: &SecureStore, key: &str) -> Option<String> {
 async fn resolve_anthropic(
     llm: &crate::server::LlmConfig,
     store: &SecureStore,
-) -> Option<AnthropicCredential> {
+) -> (Option<AnthropicCredential>, Option<String>) {
+    // Set by whichever step got closest to a credential; reported only if every
+    // step fails. `_` prefixed nothing: the last failure is the informative one.
+    let mut why_not: Option<String> = None;
     if llm.anthropic_use_oauth {
         if let Ok(v) = std::env::var("ANTHROPIC_OAUTH_TOKEN")
             && let Some(token) = non_empty(Some(&v))
         {
             debug!("Anthropic credential: OAuth token from env");
-            return Some(AnthropicCredential::OAuth(token));
+            return (Some(AnthropicCredential::OAuth(token)), None);
         }
         match nanna_config::resolve_anthropic_oauth(store).await {
             Ok(cred) => {
                 debug!("Anthropic credential: OAuth from durable store (refreshed if stale)");
-                return Some(AnthropicCredential::OAuth(cred.access_token));
+                return (Some(AnthropicCredential::OAuth(cred.access_token)), None);
             }
             Err(e) => {
                 if let Some(token) = non_empty(llm.anthropic_oauth_token.as_ref()) {
                     warn!("OAuth resolution failed ({e}); using config-provided token");
-                    return Some(AnthropicCredential::OAuth(token));
+                    return (Some(AnthropicCredential::OAuth(token)), None);
                 }
                 warn!("Anthropic OAuth enabled but no usable credential ({e}); trying API key");
+                why_not = Some(format!("the stored OAuth credential is unusable ({e})"));
             }
         }
     }
@@ -582,15 +653,32 @@ async fn resolve_anthropic(
         .or_else(|| store_credential(store, keys::ANTHROPIC_API_KEY))
     {
         debug!("Anthropic credential: API key from config/keyring");
-        return Some(AnthropicCredential::ApiKey(key));
+        return (Some(AnthropicCredential::ApiKey(key)), None);
     }
-    if !llm.anthropic_use_oauth
-        && let Ok(cred) = nanna_config::resolve_anthropic_oauth(store).await
-    {
-        debug!("Anthropic credential: durable OAuth fallback (nanna store / Claude CLI)");
-        return Some(AnthropicCredential::OAuth(cred.access_token));
+    if !llm.anthropic_use_oauth {
+        // The error here is the informative one for the common case: a stored
+        // login DOES exist and could not be made usable. Discarding it and
+        // falling through to "nothing is configured" is how an expired token
+        // came to be reported as a missing one.
+        match nanna_config::resolve_anthropic_oauth(store).await {
+            Ok(cred) => {
+                debug!("Anthropic credential: durable OAuth fallback (nanna store / Claude CLI)");
+                return (Some(AnthropicCredential::OAuth(cred.access_token)), None);
+            }
+            Err(e) => {
+                why_not.get_or_insert_with(|| {
+                    format!("a stored OAuth login exists but could not be used ({e})")
+                });
+            }
+        }
     }
-    None
+    (
+        None,
+        Some(bounded_reason(why_not.unwrap_or_else(|| {
+            "no Anthropic credential is configured (no API key, and no stored OAuth login)"
+                .to_string()
+        }))),
+    )
 }
 
 impl ProviderCredentials {
@@ -608,10 +696,15 @@ impl ProviderCredentials {
     pub async fn resolve(llm: &crate::server::LlmConfig) -> Self {
         let store = SecureStore::new();
 
-        let anthropic = resolve_anthropic(llm, &store).await;
+        let (anthropic, anthropic_absent_reason) = resolve_anthropic(llm, &store).await;
+        debug_assert!(
+            anthropic.is_none() || anthropic_absent_reason.is_none(),
+            "a resolved credential must not also carry a reason for its absence"
+        );
 
         Self {
             anthropic,
+            anthropic_absent_reason,
             openai_api_key: non_empty(llm.openai_api_key.as_ref())
                 .or_else(|| store_credential(&store, keys::OPENAI_API_KEY)),
             openrouter_api_key: non_empty(llm.openrouter_api_key.as_ref())
@@ -639,6 +732,7 @@ mod tests {
 
         let creds = ProviderCredentials {
             anthropic: Some(AnthropicCredential::OAuth("test-token".into())),
+            anthropic_absent_reason: None,
             openai_api_key: None,
             openrouter_api_key: Some("sk-or-test".into()),
             github_token: None,
@@ -658,8 +752,15 @@ mod tests {
         // The exact live symptom: a bare Claude model name must now route.
         assert!(router.can_handle("claude-fable-5"));
 
+        assert_eq!(
+            router.absent_reason(ProviderId::Anthropic),
+            None,
+            "a registered provider has nothing to explain"
+        );
+
         let creds = ProviderCredentials {
             anthropic: None,
+            anthropic_absent_reason: Some("the stored OAuth credential is unusable".into()),
             ..creds
         };
         let (added, removed) = router.rebuild(&creds);
@@ -668,6 +769,65 @@ mod tests {
         assert!(!router.can_handle("claude-fable-5"));
         assert!(router.has_provider(ProviderId::OpenRouter));
         assert!(router.has_provider(ProviderId::Ollama));
+        assert_eq!(
+            router.absent_reason(ProviderId::Anthropic).as_deref(),
+            Some("the stored OAuth credential is unusable"),
+            "the cause must survive the rebuild that dropped the provider"
+        );
+        // A provider that is simply not configured needs no excuse.
+        assert_eq!(router.absent_reason(ProviderId::OpenAI), None);
+    }
+
+    /// A provider that comes back must leave no stale excuse behind — the
+    /// reasons map is replaced by each rebuild, never appended to.
+    #[test]
+    fn an_absence_reason_does_not_outlive_the_absence() {
+        let router = LlmRouter::new();
+        let absent = ProviderCredentials {
+            anthropic: None,
+            anthropic_absent_reason: Some("expired 54h ago".into()),
+            openai_api_key: None,
+            openrouter_api_key: None,
+            github_token: None,
+            ollama_host: "http://localhost:11434".into(),
+            ollama_api_key: None,
+        };
+        router.rebuild(&absent);
+        assert_eq!(
+            router.absent_reason(ProviderId::Anthropic).as_deref(),
+            Some("expired 54h ago")
+        );
+
+        let restored = ProviderCredentials {
+            anthropic: Some(AnthropicCredential::ApiKey("sk-test".into())),
+            anthropic_absent_reason: None,
+            ..absent
+        };
+        router.rebuild(&restored);
+        assert!(router.has_provider(ProviderId::Anthropic));
+        assert_eq!(
+            router.absent_reason(ProviderId::Anthropic),
+            None,
+            "the old excuse must be gone once the provider is back"
+        );
+    }
+
+    /// A provider's error body is third-party text of unbounded length, and it
+    /// reaches a log line and the user. It is bounded, and bounded on a CHAR
+    /// boundary — the repo has panicked on `&s[..n]` before.
+    #[test]
+    fn an_absence_reason_is_bounded_without_splitting_a_codepoint() {
+        let short = "expired 54h ago".to_string();
+        assert_eq!(super::bounded_reason(short.clone()), short);
+
+        // Multibyte right up to the cut: every char is 3 bytes, so the limit
+        // lands mid-codepoint unless the boundary is respected.
+        let wide: String = "字".repeat(400);
+        let bounded = super::bounded_reason(wide);
+        assert!(bounded.len() <= super::ABSENT_REASON_BYTES_MAX + "…".len());
+        assert!(bounded.ends_with('…'));
+        // The real assertion: it is still valid UTF-8 with no replacement char.
+        assert!(!bounded.contains('\u{fffd}'));
     }
 
     #[test]

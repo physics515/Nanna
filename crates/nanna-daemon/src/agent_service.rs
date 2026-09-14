@@ -1039,11 +1039,25 @@ impl AgentService {
                 Some(client) => client,
                 None => {
                     let detected = crate::llm_router::ProviderId::from_model(model);
+                    // Name the CAUSE, not just the outcome. "detected: Anthropic,
+                    // available: [Ollama]" is accurate and useless — it reads as
+                    // "your model name is wrong" when the truth is usually that a
+                    // credential expired. The router keeps the reason its boot-time
+                    // resolution already knew (observed live 2026-09-14: an OAuth
+                    // token that had expired 54h earlier).
+                    let because = self
+                        .router
+                        .absent_reason(detected)
+                        .map_or_else(String::new, |reason| format!(" — {reason}"));
                     warn!(
-                        "No provider for model: {} (detected: {:?}, available: {:?})",
-                        model, detected, self.router.available_providers()
+                        "No provider for model: {} (detected: {:?}, available: {:?}){}",
+                        model,
+                        detected,
+                        self.router.available_providers(),
+                        because
                     );
-                    last_error = format!("No provider for model: {} (detected: {:?})", model, detected);
+                    last_error =
+                        format!("No provider for model: {model} (detected: {detected:?}){because}");
                     same_model_retries = 0;
                     model_index += 1;
                     continue;
