@@ -1,11 +1,15 @@
 {
-  "version": "0.3.15",
-  "notes": "Append-only episodic timeline (P13); boa git pin retired to crates.io 0.22.0; lopdf 0.45; a migration-splitter bug caught before it shipped.",
-  "pub_date": "2026-09-08T21:56:15.133Z",
+  "version": "0.3.19",
+  "notes": "Things that said they were working: a skill catalogue nothing ever parsed, a validator that validated nothing, a doctor that reported ok for a config its own daemon had given up on — plus find_files, and the first Linux build.",
+  "pub_date": "2026-09-14T16:51:12.010Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFxc1NIWmE0eUluczRDTXE4SE5ZdnhmUWRwNlp4WkdSbFlpTUtjd09ZckhsSmhEV3c2NkpQZjVLR2M2ZHJCMk9LQ09XMWtQaUcvZHZCcndxbDJrVWdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4OTA0NDgxCWZpbGU6TmFubmFfMC4zLjE1X3g2NC1zZXR1cC5leGUKbHNhaDFLZ1BlV0Q5dFdiUmZtY0hKYzlPa3MvUkE5WG5YcTU0SlAreDloUzBTOER0MGtBbkFsS1lzMHkzYk9KYTg3RUJ2ZW5VdnpIRzdjaWRnZHhOQlE9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.15-beta.24/Nanna_0.3.15_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWxHcHQ4OWZ2L2pISXRWODdTazNOY0ZCNDdPZ1RBRjhtUHF3Rm9SaTJ0a3Rna3I1ZnJ5M3l2Q3JUVDZiajVNbjNwZ20yNVhjakdFTnUydWJ6SXBhbndjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDA0NDk4CWZpbGU6TmFubmFfMC4zLjE5X3g2NC1zZXR1cC5leGUKMDdRTUVQY05YenVWU1hMYU9YREIyQjE4MEtCNTAwcVNzOXNjb0h3UitJUVpEaXFFY0dVbE9paTUwVWR2bkRtYUlwOHdIdXg4NFRlMUFJVWtMKzAyQlE9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.19-beta.28/Nanna_0.3.19_x64-setup.exe"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXIwMjlrWldSVHlVZWFqNlN1WGxMU1hNemxtcWRTVkg0VU1hZXJkK21kU2F5WE4rRDdQOGhWL3dDNTcrSHFTMGpSREFsbnFzSjhGNGRNQlp4Q2F6VGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDAyNjQ2CWZpbGU6TmFubmFfMC4zLjE5X2FtZDY0LkFwcEltYWdlCjd3Yi9UcGZHY1ZkMndMV21yNThHdmhKejNkTE80TlRMVm5tQWt2Wmx4b1dvTUo1SGtxSU83K001STF6QjR6Y0U5U2R0MVBKczFQdUNXbG1RajhQT0F3PT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.19-beta.28/Nanna_0.3.19_amd64.AppImage"
     }
   }
 }
