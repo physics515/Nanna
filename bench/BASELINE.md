@@ -644,6 +644,14 @@ toolchain and dependency versions at once, so the 2.5-2.8x at 10k/50k is not att
 one of them. Every budget holds with ≥ 5x headroom. The 2026-09-07 run's 0.040 / 0.869 / 5.20 ms
 was taken under a load average of 112 and is superseded by these rows.
 
+Re-measured after the 2026-09-14 dependency sweep, same host and bench body, **not** quiet
+(load 1.7-3.4 with a fullscreen game on one core and the household server stack alongside):
+**37.97 µs** [37.78, 38.13] @ 1k, **0.661 ms** [0.642, 0.683] @ 10k, **4.33 ms** [4.24, 4.45] @ 50k.
+The 1k row reproduces the 2026-09-10 baseline exactly; 10k and 50k are 12% and 6% slower, each just
+outside the other's CI, which is the size of the contention and not a regression — every budget still
+holds with 5x or more headroom. **The rows above were deliberately not updated:** a noisier number
+taken under load is a worse reference than the quiet-host one it would replace.
+
 Budget: SIMD p95 must not exceed the ceilings above on the reference tier (≈2× measured headroom
 for CI noise). N=100k and RAM/100k remain unbaselined until a criterion body covers them. The
 GPU half of the crossover stays in `nanna-gpu` benches (adapter-dependent) and is not a CI gate.
