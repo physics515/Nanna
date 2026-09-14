@@ -50,24 +50,70 @@ function resolveTargetDir() {
   return join(rootDir, 'target');
 }
 
-const setupName = `Nanna_${version}_x64-setup.exe`;
-const sigPath = join(resolveTargetDir(), 'release', 'bundle', 'nsis', `${setupName}.sig`);
-const signature = readFileSync(sigPath, 'utf8').trim();
+// Every platform this can publish, and where its build leaves the signed
+// installer. A platform is included only if its `.sig` is actually on disk —
+// a local Windows-only build must still produce a valid Windows manifest, and
+// inventing a Linux entry with no signature would ship a manifest that every
+// Linux client rejects.
+const PLATFORMS = [
+  {
+    key: 'windows-x86_64',
+    asset: `Nanna_${version}_x64-setup.exe`,
+    bundleDir: 'nsis',
+  },
+  {
+    key: 'linux-x86_64',
+    // The updater installs the AppImage, not the .deb — a .deb needs root and
+    // cannot be swapped under a running app.
+    asset: `Nanna_${version}_amd64.AppImage`,
+    bundleDir: 'appimage',
+  },
+];
+
+const platforms = {};
+const missing = [];
+for (const { key, asset, bundleDir } of PLATFORMS) {
+  const sigPath = join(resolveTargetDir(), 'release', 'bundle', bundleDir, `${asset}.sig`);
+  let signature;
+  try {
+    signature = readFileSync(sigPath, 'utf8').trim();
+  } catch {
+    missing.push(`${key} (no ${sigPath})`);
+    continue;
+  }
+  // The signature embeds the file it was made for. A mismatch here means a
+  // signature got paired with the wrong asset, which clients reject as
+  // tampering — and the manifest would look perfectly fine to a reader.
+  const signedFile = /file:(\S+)/.exec(Buffer.from(signature, 'base64').toString())?.[1];
+  if (signedFile && signedFile !== asset) {
+    console.error(`${key}: signature is for "${signedFile}", not "${asset}" — refusing to write.`);
+    process.exit(1);
+  }
+  platforms[key] = {
+    signature,
+    url: `https://github.com/physics515/Nanna/releases/download/${tag}/${asset}`,
+  };
+}
+
+if (Object.keys(platforms).length === 0) {
+  console.error('No signed installer found for any platform; nothing to write.');
+  console.error(missing.map((m) => `  missing: ${m}`).join('\n'));
+  process.exit(1);
+}
+for (const m of missing) console.warn(`skipping ${m}`);
 
 const manifest = {
   version,
   notes,
   pub_date: new Date().toISOString(),
-  platforms: {
-    'windows-x86_64': {
-      signature,
-      url: `https://github.com/physics515/Nanna/releases/download/${tag}/${setupName}`,
-    },
-  },
+  platforms,
 };
 
 const outDir = join(rootDir, '.updater');
 mkdirSync(outDir, { recursive: true });
 const outPath = join(outDir, 'latest.json');
 writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n');
-console.log(`Wrote ${outPath} for ${version} -> ${manifest.platforms['windows-x86_64'].url}`);
+console.log(`Wrote ${outPath} for ${version}:`);
+for (const [key, p] of Object.entries(manifest.platforms)) {
+  console.log(`  ${key} -> ${p.url}`);
+}
