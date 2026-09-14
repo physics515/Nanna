@@ -4150,9 +4150,30 @@ asks permission or restricts her.)*:
       user can teach ("how I do my invoicing") nor a user-invocable command form (`/morning`,
       `/summarize-inbox` with $ARGUMENTS from any channel). One storage/discovery mechanism serves both;
       injected procedures are exactly what small local models need for repeatable workflows.
-- [ ] **Real ripgrep + glob tools** — code_search/search_file are Boa line-scanners (1MB cap, 50-match cap, no
+- [~] **Real ripgrep + glob tools** — code_search/search_file are Boa line-scanners (1MB cap, 50-match cap, no
       gitignore). Bundle/shell to rg + add a find-files-by-glob tool; fast precise search keeps small models
       on task in long-horizon runs.
+      *(2026-09-14)* **The glob half shipped: `find_files`, the 44th bundled skill.** No new bridge
+      primitive — it filters `Nanna.listDir(root, true, …)`, which already prunes
+      node_modules/.git/target/… and stops at depth 10. Two pattern shapes, because a model that types
+      `*.rs` means "anywhere": **no slash matches the file NAME at any depth**, a slash anchors to the
+      path from the search root. `*` stays inside a segment, `**` crosses, `**/` also matches ZERO
+      directories (so `src/**/*.rs` includes `src/main.rs` — the classic glob off-by-one, pinned by a
+      test), `?` is one char, `[abc]`/`[!abc]` are classes, and every other regex metacharacter is
+      escaped so `a+b.txt` is a literal.
+      Bounds are derived: output is the same 10 memory chunks the sibling listing tools use, and the
+      **scan** bound is separate at 20 000 entries because a glob is a FILTER and must see more than it
+      prints (~120 bytes per marshalled entry ≈ 2.4 MB). **A truncated scan says so loudly** — that is
+      the load-bearing sentence, because "no matches" from a capped walk is a statement about the cap
+      and not about the tree.
+      14 behavioural tests run the skill for real through Boa. One of them caught a defect in the
+      tool's first cut, and it was `list_dir`'s documented one: a recursive walk over a FILE does not
+      throw, it returns EMPTY, so handing `path` a file answered "no file matched" — a flat falsehood
+      about a tree that was never searched.
+      Still open: the ripgrep half (`code_search`'s 1 MB / 50-match caps and no gitignore).
+      Aliases: `glob` and `find_file` only. Bare `find` is deliberately absent — it could mean a
+      filename or text inside files, and the synonym table's rule is that an ambiguous name must
+      surface as unresolved rather than be guessed.
 - [x] **Git context injection** — inject `git status --short --branch` + recent commits at run start when the
       workspace is a repo (P17 injects only README/AGENTS/CONTRIBUTING/ROADMAP). Prevents destructive edits
       and redundant discovery calls.

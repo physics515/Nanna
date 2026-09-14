@@ -65,8 +65,8 @@ fn every_default_skill_parameters_block_parses() {
     // `default_skill_permissions.rs` already wrote down: a loop over a nearly
     // empty list passes every assertion inside it for free.
     assert!(
-        checked >= 43,
-        "only {checked} skills were checked; the tree shipped 43 on 2026-09-14, so a smaller \
+        checked >= 44,
+        "only {checked} skills were checked; the tree shipped 44 on 2026-09-14, so a smaller \
          number means skills went missing rather than that the gate got easier"
     );
     assert!(

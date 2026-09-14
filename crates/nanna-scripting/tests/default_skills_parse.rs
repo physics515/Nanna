@@ -94,8 +94,8 @@ fn every_bundled_skill_parses_in_the_engine_that_runs_it() {
     // records the same lesson: a loop over an empty list passes every assertion
     // inside it for free, so the number of things checked is itself the assertion.
     assert!(
-        parsed >= 43,
-        "only {parsed} skills were parsed; the tree shipped 43 on 2026-09-14, so a \
+        parsed >= 44,
+        "only {parsed} skills were parsed; the tree shipped 44 on 2026-09-14, so a \
          smaller number means skills went missing rather than that the gate got easier"
     );
 
