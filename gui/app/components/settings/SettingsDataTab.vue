@@ -196,7 +196,23 @@ async function importConfig() {
       const file = (e.target as HTMLInputElement).files?.[0]
       if (!file) return
 
-      if (!confirm('This will replace your current configuration. Continue?')) return
+      // `confirm` is the async dialog: a bare `!confirm(...)` tested a Promise (always
+
+      // truthy), so the import replaced the configuration without waiting for an answer.
+
+      const confirmed = await confirm({
+
+        title: 'Import Configuration',
+
+        message: 'This will replace your current configuration. Continue?',
+
+        confirmLabel: 'Import',
+
+        danger: true,
+
+      })
+
+      if (!confirmed) return
 
       const content = await file.text()
       await invoke('import_config', { config: content })

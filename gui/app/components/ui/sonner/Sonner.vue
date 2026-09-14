@@ -22,12 +22,15 @@ const toasterProps = computed(() => {
   const { class: _, ...rest } = props
   return rest
 })
+
+// Toaster declares `class` as a string prop, so the array form was a type error.
+const toasterClass = computed(() => ['nanna-sonner', props.class].filter(Boolean).join(' '))
 </script>
 
 <template>
   <Sonner
     v-bind="toasterProps"
-    :class="['nanna-sonner', props.class]"
+    :class="toasterClass"
   />
 </template>
 

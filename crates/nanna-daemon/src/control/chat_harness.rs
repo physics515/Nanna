@@ -4577,6 +4577,7 @@ mod tests {
                 tokens: None,
                 total_tokens: None,
                 short_circuited: None,
+                diff: None,
                 at: at.clone(),
             },
         ];
@@ -4615,6 +4616,7 @@ mod tests {
                 tokens: None,
                 total_tokens: None,
                 short_circuited: None,
+                diff: None,
                 at: at.clone(),
             },
             TimelineItem::Fault {

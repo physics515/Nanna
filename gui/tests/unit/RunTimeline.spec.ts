@@ -19,7 +19,7 @@ const stubs = {
   },
   NuiToolCallMessage: {
     props: ['toolCall', 'status', 'timestamp', 'tokens', 'totalTokens'],
-    template: '<div data-testid="tool" :data-status="status" />',
+    template: '<div data-testid="tool" :data-status="status" :data-diff="toolCall.data?.diff?.start_line ?? \'\'" />',
   },
   NuiMessage: {
     props: ['role', 'accent', 'author'],
@@ -122,6 +122,23 @@ describe('RunTimeline', () => {
     const replay = { ...tool('read_file'), success: false, short_circuited: true } as TimelineEntry
     const wrapper = mountTimeline([replay])
     expect(wrapper.get('[data-testid="tool"]').attributes('data-status')).toBe('steering')
+  })
+
+  /**
+   * P18 "Diff presentation": the journal stores edit_file's before/after view
+   * as its own field, while the card reads it from `data.diff` — the live
+   * event's shape. A timeline restored after a remount must hand it across,
+   * or every diff vanishes on reload, which is exactly when a user returning
+   * to unattended work looks for it.
+   */
+  it('hands a journaled edit diff to the card', () => {
+    const edit = {
+      ...tool('edit_file'),
+      diff: { start_line: 7, removed: ['a'], added: ['b'], truncated: false },
+    } as TimelineEntry
+    const cards = mountTimeline([edit, tool('exec')]).findAll('[data-testid="tool"]')
+    expect(cards[0]!.attributes('data-diff')).toBe('7')
+    expect(cards[1]!.attributes('data-diff')).toBe('')
   })
 
   it('still renders a genuine tool failure as an error', () => {

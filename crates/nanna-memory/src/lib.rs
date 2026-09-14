@@ -47,8 +47,8 @@ pub use fsrs::{
 // caller overriding the exponent needs the same bounds the default is held to.
 pub use fsrs::{DECAY_MAX, DECAY_MIN, FSRS5_DEFAULT_DECAY, FSRS6_DEFAULT_DECAY};
 pub use service::{
-    MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
-    MemoryStats, MemoryListEntry, ConsolidationBands,
+    MemoryService, MemoryServiceConfig, RecallResult, RecallReport, RecallTimings, EmbedFn,
+    MemoryStats, MemoryListEntry, MemoryExportRecord, ConsolidationBands,
     // Exported so the episodic writer chunks against the same bound the merge
     // path caps against. Those two numbers drifting apart is precisely how a
     // 4096-byte ceiling ended up silently rejecting 3200-char chunks.
@@ -96,6 +96,15 @@ pub enum MemoryError {
     Serialization(#[from] serde_json::Error),
     #[error("Persistence error: {0}")]
     Persistence(String),
+    /// The clustering configuration would merge memories that are not related.
+    ///
+    /// Refusing is the conservative direction here and the only safe one:
+    /// consolidation *rewrites* memories, replacing several with one gist, so a
+    /// cycle run under a config in which cosine similarity has no veto destroys
+    /// content it had no evidence was redundant. A warning would be read after
+    /// the merge had already happened.
+    #[error("invalid clustering configuration: {0}")]
+    InvalidClusteringConfig(String),
 }
 
 /// Trait for pluggable persistence backends (Turso, etc.)
@@ -520,6 +529,66 @@ pub struct VectorStore {
     /// there is no second value that can go stale. Every write path needs it to
     /// stamp which bucket its work belongs to.
     active_model: RwLock<Option<String>>,
+    /// How long recent memories waited between being written without a vector
+    /// and receiving their first one — Nanna's staleness number (P13): until
+    /// then a memory exists but no similarity search can find it. A bounded
+    /// ring of the last [`SEARCHABLE_LATENCY_SAMPLES_MAX`] waits, in seconds.
+    searchable_latency: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+/// Samples kept for the queue-to-searchable percentiles.
+///
+/// Sized for the p95: with 512 samples the 95th percentile has 25 samples above
+/// it, so one outlier cannot move it, while the window stays recent — a busy
+/// mission defers hundreds of writes an hour. 4 KiB.
+pub const SEARCHABLE_LATENCY_SAMPLES_MAX: usize = 512;
+
+/// Queue-to-searchable latency over the recent window: how long memories
+/// written without a vector stayed unfindable by similarity search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchableLatency {
+    /// Waits in the window, at most [`SEARCHABLE_LATENCY_SAMPLES_MAX`].
+    pub samples: usize,
+    pub p50_secs: u64,
+    pub p95_secs: u64,
+}
+
+/// Append `sample`, dropping the oldest once the ring is full.
+fn push_bounded(ring: &mut std::collections::VecDeque<u64>, sample: u64) {
+    if ring.len() >= SEARCHABLE_LATENCY_SAMPLES_MAX {
+        ring.pop_front();
+    }
+    ring.push_back(sample);
+    debug_assert!(!ring.is_empty(), "the sample just pushed is there");
+    debug_assert!(
+        ring.len() <= SEARCHABLE_LATENCY_SAMPLES_MAX,
+        "the ring is bounded"
+    );
+}
+
+/// Nearest-rank percentiles over `samples`; `None` when there are none.
+fn latency_percentiles(samples: &[u64]) -> Option<SearchableLatency> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    // Nearest rank: the smallest sample with at least `percent`% of the
+    // samples at or below it.
+    let rank = |percent: usize| -> u64 {
+        let index = (sorted.len() * percent).div_ceil(100).saturating_sub(1);
+        sorted.get(index).copied().unwrap_or_default()
+    };
+    let latency = SearchableLatency {
+        samples: sorted.len(),
+        p50_secs: rank(50),
+        p95_secs: rank(95),
+    };
+    debug_assert!(
+        latency.p50_secs <= latency.p95_secs,
+        "percentiles are ordered"
+    );
+    Some(latency)
 }
 
 impl VectorStore {
@@ -534,7 +603,22 @@ impl VectorStore {
             store_health: RwLock::new(MemoryStoreHealth::default()),
             seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_model: RwLock::new(None),
+            searchable_latency: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Queue-to-searchable latency over the recent window, or `None` before any
+    /// memory written without a vector has received one in this process.
+    #[must_use]
+    pub fn searchable_latency(&self) -> Option<SearchableLatency> {
+        let samples: Vec<u64> = self
+            .searchable_latency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        latency_percentiles(&samples)
     }
 
     /// Create a vector store with GPU acceleration.
@@ -556,6 +640,9 @@ impl VectorStore {
                             store_health: RwLock::new(MemoryStoreHealth::default()),
             seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
                             active_model: RwLock::new(None),
+                            searchable_latency: std::sync::Mutex::new(
+                                std::collections::VecDeque::new(),
+                            ),
                         }
                     }
                     Err(e) => {
@@ -1290,6 +1377,20 @@ impl VectorStore {
         self.entries.read().await.clone()
     }
 
+    /// Project every entry through `project` under one read lock, without
+    /// cloning the entries themselves.
+    ///
+    /// [`Self::all_entries`] clones every vector in every model bucket — for
+    /// an export that wants content and FSRS state, that is the dominant cost
+    /// for nothing (a 1536-dim bucket is 6 KiB per memory per model). One
+    /// output per entry, so the result is bounded by the store.
+    pub async fn map_entries<T>(&self, project: impl Fn(&MemoryEntry) -> T) -> Vec<T> {
+        let entries = self.entries.read().await;
+        let projected: Vec<T> = entries.iter().map(project).collect();
+        debug_assert_eq!(projected.len(), entries.len(), "one output per entry");
+        projected
+    }
+
     /// Get total number of entries
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
@@ -1491,6 +1592,11 @@ impl VectorStore {
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
             return Err(MemoryError::NotFound(id.to_string()));
         };
+        // A memory's FIRST vector ever is the moment it becomes findable by
+        // similarity search. A re-embed after a provider switch keeps its old
+        // buckets, so it is not a wait — counting it would read a days-old
+        // memory as a days-long queue.
+        let first_vector = entry.embeddings.is_empty() && entry.embedding.is_empty();
         entry.embeddings.insert(model.to_string(), embedding.clone());
         if activate {
             entry.embedding = embedding;
@@ -1498,6 +1604,19 @@ impl VectorStore {
         }
         let snapshot = entry.clone();
         drop(entries);
+        if activate && first_vector {
+            // Seconds, because `timestamp` is; a clock that went backwards
+            // reads as no wait rather than a negative one.
+            let waited =
+                u64::try_from(chrono_timestamp().saturating_sub(snapshot.timestamp)).unwrap_or(0);
+            push_bounded(
+                &mut self
+                    .searchable_latency
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                waited,
+            );
+        }
         // Non-fatal, like every other write-through here: the in-memory cache is
         // already correct, and a backfill that fails to persist just repeats on
         // the next restart rather than losing the memory.
@@ -1935,6 +2054,106 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_of_width(width: usize) -> VectorStore {
+        VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(width),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        })
+    }
+
+    /// A row the way `store_unembedded` writes one: no vector, no buckets.
+    fn unembedded(id: &str, timestamp: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("memory {id}"),
+            embedding: Vec::new(),
+            embedding_model: None,
+            embeddings: HashMap::new(),
+            metadata: HashMap::new(),
+            timestamp,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        }
+    }
+
+    /// P13 staleness: a memory written without a vector records how long it
+    /// waited once it receives its first one.
+    #[tokio::test]
+    async fn a_first_vector_records_the_queue_to_searchable_wait() {
+        let store = store_of_width(3);
+        assert_eq!(store.searchable_latency(), None, "nothing has waited yet");
+        store
+            .add(unembedded("m", chrono_timestamp() - 7))
+            .await
+            .expect("stored unembedded");
+        store
+            .set_embedding_for_model("m", "prov:a", vec![1.0, 0.0, 0.0], true)
+            .await
+            .expect("filled");
+        let latency = store.searchable_latency().expect("one wait recorded");
+        assert_eq!(latency.samples, 1);
+        assert!(latency.p50_secs >= 7, "waited at least 7 s: {latency:?}");
+        assert_eq!(
+            latency.p50_secs, latency.p95_secs,
+            "one sample is both percentiles"
+        );
+    }
+
+    /// A re-embed after a provider switch was already findable — it keeps its
+    /// old bucket — so it is not a wait and must not skew the number.
+    #[tokio::test]
+    async fn a_re_embed_is_not_counted_as_a_wait() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        store
+            .set_embedding_for_model("m", "prov:a", vec![1.0, 0.0, 0.0], true)
+            .await
+            .expect("first vector");
+        store
+            .set_embedding_for_model("m", "prov:b", vec![0.0, 1.0, 0.0], true)
+            .await
+            .expect("provider switch");
+        assert_eq!(
+            store.searchable_latency().map(|l| l.samples),
+            Some(1),
+            "only the first vector counts"
+        );
+    }
+
+    /// A fill into a bucket that is not activated leaves the memory
+    /// unsearchable, so it does not end the wait either.
+    #[tokio::test]
+    async fn an_inactive_bucket_fill_does_not_end_the_wait() {
+        let store = store_of_width(3);
+        store.add(unembedded("m", 0)).await.expect("stored");
+        store
+            .set_embedding_for_model("m", "prov:a", vec![1.0, 0.0, 0.0], false)
+            .await
+            .expect("bucket only");
+        assert_eq!(store.searchable_latency(), None);
+    }
+
+    #[test]
+    fn latency_percentiles_use_nearest_rank() {
+        let samples: Vec<u64> = (1..=100).collect();
+        let latency = latency_percentiles(&samples).expect("samples");
+        assert_eq!(latency.samples, 100);
+        assert_eq!(latency.p50_secs, 50);
+        assert_eq!(latency.p95_secs, 95);
+        assert_eq!(latency_percentiles(&[]), None);
+    }
+
+    #[test]
+    fn the_latency_ring_is_bounded_and_keeps_the_newest() {
+        let mut ring = std::collections::VecDeque::new();
+        for sample in 0..(SEARCHABLE_LATENCY_SAMPLES_MAX as u64 + 88) {
+            push_bounded(&mut ring, sample);
+        }
+        assert_eq!(ring.len(), SEARCHABLE_LATENCY_SAMPLES_MAX);
+        assert_eq!(ring.front(), Some(&88), "the oldest were dropped");
+    }
 
     #[tokio::test]
     async fn test_vector_store() {

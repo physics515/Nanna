@@ -143,3 +143,36 @@ describe('NuiToolCallMessage write placeholders', () => {
     expect(wrapper.get('pre.text-nui-green').text()).toContain('# ROADMAP')
   })
 })
+
+/**
+ * "Diff presentation": edit_file attaches a bounded before/after view as
+ * data.diff so a user returning to unattended work can see what each edit did.
+ */
+describe('NuiToolCallMessage edit diff', () => {
+  const edit = {
+    id: 'toolu_00000003',
+    name: 'edit_file',
+    input: { file_path: 'a.txt', old_string: 'line two', new_string: 'line 2' },
+    output: 'Edited a.txt: replaced 1 occurrence(s).',
+    success: true,
+    duration_ms: 4,
+    data: { diff: { start_line: 2, removed: ['line two'], added: ['line 2'], truncated: false } },
+  }
+
+  it('shows what a completed edit changed, and where', () => {
+    const wrapper = mountCard('completed', edit)
+    expect(wrapper.text()).toContain('Changed at line 2')
+    expect(wrapper.get('[data-diff-removed]').text()).toBe('- line two')
+    expect(wrapper.get('[data-diff-added]').text()).toBe('+ line 2')
+  })
+
+  it('shows no diff for an edit that did not land', () => {
+    const wrapper = mountCard('error', { ...edit, success: false })
+    expect(wrapper.find('[data-diff]').exists()).toBe(false)
+  })
+
+  it('says so when the view was capped', () => {
+    const capped = { ...edit, data: { diff: { ...edit.data.diff, truncated: true } } }
+    expect(mountCard('completed', capped).text()).toContain('longer than shown')
+  })
+})

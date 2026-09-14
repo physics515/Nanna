@@ -57,7 +57,7 @@ const blocks = computed<ContentBlock[]>(() => {
     // Add code block
     result.push({
       type: 'code',
-      content: match[2].trim(),
+      content: (match[2] ?? '').trim(),
       language: match[1] || undefined,
     })
     

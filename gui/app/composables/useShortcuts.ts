@@ -55,7 +55,7 @@ function onKeyDown(e: KeyboardEvent) {
   if (e.key === 'Escape' && escStack.length > 0) {
     e.preventDefault()
     const top = escStack[escStack.length - 1]
-    top()
+    top?.()
     return
   }
 

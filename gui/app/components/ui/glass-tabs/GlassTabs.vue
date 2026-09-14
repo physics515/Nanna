@@ -26,7 +26,7 @@ const props = withDefaults(defineProps<{
 const model = defineModel<string>({ required: true })
 
 // ── Mesh colors per active color ──
-const glassConfigs: Record<string, {
+const glassConfigs: Record<GlassTabColor, {
   colors: [string, string, string]
   opacityRanges: [[number, number], [number, number], [number, number]]
 }> = {

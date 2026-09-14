@@ -97,8 +97,13 @@ outbound calls beyond whatever you implicitly ask for (e.g. `web_fetch`).
 4. Optionally remove channel bot registrations on the provider side
    (Telegram BotFather, Discord developer portal, …).
 
-Conversation export (Markdown/JSON) is tracked as an open GUI feature; until it
-ships, the Turso database files themselves are the export.
+To take a conversation with you, `nanna export <session-id>` writes it out as a
+readable Markdown transcript, or with `--format json` as the complete stored
+session (lossless); `nanna sessions` lists the ids. `nanna export --memories`
+exports what Nanna remembers about you — each memory's text, where it came from,
+and its FSRS state (`--scope global` or a workspace id narrows it). Export runs
+through the daemon, so start it first (`nanna daemon start`). A GUI export
+button is still open; the Turso database files remain the full-fidelity backup.
 
 ## Channels and third parties
 

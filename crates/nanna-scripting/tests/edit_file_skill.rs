@@ -517,3 +517,79 @@ async fn failure_messages_stay_small_for_small_context_models() {
         err.len()
     );
 }
+
+// "Diff presentation": a successful edit carries a bounded before/after view in
+// `data.diff`, so the timeline can show what changed while the user was away.
+
+#[tokio::test]
+async fn a_successful_edit_reports_a_before_after_diff() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "a.txt", "line one\nline two\nline three\n");
+
+    let result = run_edit(
+        json!({ "file_path": path, "old_string": "line two", "new_string": "line 2" }),
+        dir.path(),
+    )
+    .await
+    .expect("edit should succeed");
+
+    let diff = &result["data"]["diff"];
+    assert_eq!(diff["start_line"], json!(2), "got: {result}");
+    assert_eq!(diff["removed"], json!(["line two"]));
+    assert_eq!(diff["added"], json!(["line 2"]));
+    assert_eq!(diff["truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn a_crlf_file_diffs_without_carriage_returns() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "w.txt", "alpha\r\nbeta\r\ngamma\r\n");
+
+    let result = run_edit(
+        json!({ "file_path": path, "old_string": "beta", "new_string": "BETA" }),
+        dir.path(),
+    )
+    .await
+    .expect("edit should succeed");
+
+    assert_eq!(
+        read(&path),
+        "alpha\r\nBETA\r\ngamma\r\n",
+        "line endings untouched"
+    );
+    let diff = &result["data"]["diff"];
+    assert_eq!(diff["removed"], json!(["beta"]), "got: {result}");
+    assert_eq!(diff["added"], json!(["BETA"]));
+}
+
+#[tokio::test]
+async fn a_large_edit_is_capped_and_says_so() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..100).map(|i| format!("old {i}\n")).collect();
+    let path = seed(dir.path(), "big.txt", &format!("head\n{body}tail\n"));
+
+    let result = run_edit(
+        json!({ "file_path": path, "old_string": body, "new_string": body.replace("old", "new") }),
+        dir.path(),
+    )
+    .await
+    .expect("edit should succeed");
+
+    let diff = &result["data"]["diff"];
+    assert_eq!(diff["start_line"], json!(2), "got: {result}");
+    assert_eq!(
+        diff["removed"].as_array().map(Vec::len),
+        Some(40),
+        "capped per side"
+    );
+    assert_eq!(diff["truncated"], json!(true), "a capped view must say so");
+}

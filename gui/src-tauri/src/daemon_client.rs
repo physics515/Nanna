@@ -15,13 +15,12 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-/// Maximum WebSocket message size (128 MB) — must match the daemon's limit.
-const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
-
+/// Read limits for the daemon connection: the one shared
+/// [`nanna_config::bind::IPC_MAX_MESSAGE_BYTES`], not a copy that "must match".
 fn ws_config() -> WebSocketConfig {
     let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
-    config.max_frame_size = Some(WS_MAX_MESSAGE_SIZE);
+    config.max_message_size = Some(nanna_config::bind::IPC_MAX_MESSAGE_BYTES);
+    config.max_frame_size = Some(nanna_config::bind::IPC_MAX_MESSAGE_BYTES);
     config
 }
 
@@ -66,7 +65,7 @@ pub struct DaemonClientConfig {
 impl Default for DaemonClientConfig {
     fn default() -> Self {
         Self {
-            url: "ws://127.0.0.1:5149".to_string(),
+            url: nanna_config::default_daemon_ws_url(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(300), // 5 minutes for large content summarization (many chunks)
             auto_reconnect: true,

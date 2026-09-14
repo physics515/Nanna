@@ -22,6 +22,7 @@ pub mod signal;
 pub mod slack;
 pub mod status;
 pub mod telegram;
+pub mod untrusted;
 pub mod whatsapp;
 
 pub use discord::DiscordChannel;
@@ -36,6 +37,7 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use status::{ChannelStatus, ConnectionState, HealthChecker, HealthCheckResult, HealthMetrics, StatusEvent, StatusManager, StatusSummary};
 pub use telegram::TelegramChannel;
+pub use untrusted::frame_untrusted_webhook_payload;
 pub use whatsapp::WhatsAppChannel;
 
 use async_trait::async_trait;
