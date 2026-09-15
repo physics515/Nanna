@@ -9,7 +9,6 @@ description = "Workspace management for Nanna - directory-based agent context"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
 tokio = { workspace = true, features = ["fs", "process", "time"] }
 tracing = { workspace = true }
 directories = { workspace = true }

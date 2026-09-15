@@ -665,20 +665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "backoff"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62ddb9cb1ec0a098ad4bbf9344d0713fa193ae1a80af55febcff2627b6a00c1"
-dependencies = [
- "futures-core",
- "getrandom 0.2.17",
- "instant",
- "pin-project-lite",
- "rand 0.8.8",
- "tokio",
-]
-
-[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4379,15 +4365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "instant"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "interpolator"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5559,10 +5536,8 @@ name = "nanna-browser"
 version = "0.3.19"
 dependencies = [
  "async-trait",
- "base64-simd",
  "chromiumoxide",
  "futures",
- "image",
  "playwright-rs",
  "serde",
  "serde_json",
@@ -5596,7 +5571,6 @@ name = "nanna-client"
 version = "0.3.19"
 dependencies = [
  "async-trait",
- "backoff",
  "futures-util",
  "nanna-daemon",
  "serde",
@@ -5680,7 +5654,6 @@ dependencies = [
  "nanna-scripting",
  "nanna-storage",
  "nanna-tools",
- "nix 0.31.3",
  "reqwest",
  "serde",
  "serde_json",
@@ -5816,7 +5789,6 @@ dependencies = [
 name = "nanna-scripting"
 version = "0.3.19"
 dependencies = [
- "async-trait",
  "boa_engine",
  "chrono",
  "deno_ast",
@@ -5940,7 +5912,6 @@ dependencies = [
 name = "nanna-workspace"
 version = "0.3.19"
 dependencies = [
- "chrono",
  "directories",
  "serde",
  "serde_json",
@@ -6031,18 +6002,6 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
-]
-
-[[package]]
-name = "nix"
-version = "0.31.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
-dependencies = [
- "bitflags 2.13.2",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
