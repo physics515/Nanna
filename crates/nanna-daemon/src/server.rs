@@ -2774,6 +2774,7 @@ impl DaemonServer {
         )
         .with_tools_dir(tools_dir)
         .with_event_tx(self.ipc.event_sender())
+        .with_session_filters(self.ipc.session_filters())
         .with_workspace_id(workspace_id_for_services)
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)

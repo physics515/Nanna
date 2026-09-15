@@ -1824,11 +1824,53 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             They are declared in the protocol and sent nowhere. The GUI does not notice because it
             emits its own `session-renamed` Tauri event, so a session renamed from the CLI or a
             second client never reaches an open GUI. Emit them from the session control handlers.
-      - [ ] **`Subscribe` narrows nothing on the wire.** `SubscribeAction::Session` is recorded in
-            the session store, but every IPC connection forwards the whole event stream
-            (`ipc.rs` outgoing task; the per-client `_subscriptions` field is unused). Decide
-            whether server-side filtering is wanted before a chatty channel makes it matter;
-            `Event::session_id()` is the classifier either would use.
+      - [x] **`Subscribe` now narrows the wire.** *(2026-09-15)* **The decision: yes, filter
+            server-side — but opt-in.** A connection receives everything until it asks for less,
+            which makes this a **provable no-op for every shipping client**: `Subscribe` is sent by
+            nobody today (grepped `nanna-client`, `gui/src-tauri`, and the Nuxt app — the only
+            hits are two Slack/WhatsApp setup strings), and `nanna-client::subscribe_session` is
+            *local* filtering that never reaches the wire. That matters here because GUI
+            verification is unavailable on this host, and the GUI is the client a wire change would
+            hurt most: the safety argument is that its code path is bit-identical, not that it was
+            eyeballed.
+            New `SessionFilters` registry in `ipc.rs`, shared with the control plane by
+            `ControlPlane::with_session_filters`. `Subscribe{Session}` narrows (after the store
+            confirms the session exists, so a typo cannot mute a connection),
+            `Subscribe{AllSessions}` widens back, `Unsubscribe{Session}` drops one,
+            `Unsubscribe{AllSessions}` drops all, and disconnect forgets the entry. Two shapes are
+            deliberate: **narrowing never drops events that carry no session** (config, memory,
+            workspace, channel, connection), because those are not session-scoped and dropping them
+            would silently break the `System`/`ChannelStatus` topics; and **an empty narrowing is
+            not a widening** — a connection that unsubscribed every session did not ask to be
+            re-opened, and widening it there would silently restore the stream it just closed.
+            **Cost is zero until someone opts in:** a `narrowed_count` atomic, maintained inside the
+            same write guard so it cannot drift, short-circuits the lookup entirely while the
+            registry is empty — so an un-narrowed daemon pays one relaxed load per event, not a
+            contended read lock, which is what the old note meant by "before a chatty channel makes
+            it matter". **Bounded without inventing a cap**: one entry per live connection (already
+            bounded by `max_connections`, and removed on disconnect), and per entry at most the live
+            session count, because `handle_subscribe` answers `not_found` otherwise.
+            The dead `_subscriptions` field is gone. `nanna-client` gained
+            `narrow_to_session()` / `widen_to_all_sessions()` — the "typed event subscription" half
+            that was still open — kept **separate** from `subscribe_session()`, because several
+            local streams can be held over one connection and having a method named "subscribe"
+            quietly cut off the others is a trap.
+            13 unit tests on the pure decision + the registry, plus an **e2e against a real daemon
+            over a real socket**: a narrowed connection stops receiving a session it never named,
+            a connection that sent no `Subscribe` still receives everything (which also proves the
+            event was broadcast, so the silence is filtering and not a missing event), and widening
+            restores it. **Verified in both directions** — forcing `delivers` back to always-true
+            fails the e2e with the exact leak (`a narrowed connection was sent an event for a
+            session it never named`). 1928 workspace tests pass / 0 fail, clippy 0 errors, real
+            daemon binary boots clean (0 panics).
+            - [ ] **`handle_subscribe` files an IPC connection id into a `HashSet<ChannelId>`.**
+                  It calls `sessions.subscribe(&session_id, client_id)`, and `Session::subscribers`
+                  is typed as channel ids. Nothing *routes* on that set — its only consumers are
+                  `subscriber_count` in the session info reported to clients, and a single test —
+                  so the effect today is a reported count inflated by a different kind of id.
+                  Left alone here because fixing it changes a number clients already see; it wants
+                  its own increment that decides whether `subscribers` means channels, connections,
+                  or both.
       - [x] *(2026-09-10 — fixed the same run.)* The forwarder now handles every receive result
             through a pure `forwardable()`: a lag becomes an `Error` event with code
             `events_lagged` naming the count ("re-fetch state to resync"), and a closed broadcast
