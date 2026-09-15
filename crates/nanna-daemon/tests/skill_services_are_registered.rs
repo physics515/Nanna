@@ -8,11 +8,12 @@
 //! is not there, logged once at `info` among a few hundred boot lines.
 //!
 //! So the failure mode this test exists for is not a crash, it is an absence.
-//! Measured 2026-09-15: **14 of the 23 declared services are registered
-//! nowhere**, so 16 of the 44 bundled skills are withheld at every boot —
-//! including all three tool-authoring skills. Each of those has a roadmap item;
-//! what did not exist was one place that says so, or anything stopping the next
-//! skill from joining them unnoticed.
+//! Measured 2026-09-15: **14 of the 23 declared services were registered
+//! nowhere**, so 16 of the 44 bundled skills were withheld at every boot —
+//! including all three tool-authoring skills, which this run then wired
+//! (`tools.create`/`update`/`list`), leaving **11 missing and 13 withheld**.
+//! Each remaining gap has a roadmap item; what did not exist was one place that
+//! says so, or anything stopping the next skill from joining them unnoticed.
 //!
 //! This test is that place. It compares what the skills ask for against what
 //! the daemon's two service builders can ever insert, and requires every gap to
@@ -69,18 +70,6 @@ const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
     (
         "screenshot.capture",
         "P18: skill exists, service missing, Rust tool is a stub",
-    ),
-    (
-        "tools.create",
-        "P18: UserToolManager exists, no service exposes it",
-    ),
-    (
-        "tools.list",
-        "P18: UserToolManager exists, no service exposes it",
-    ),
-    (
-        "tools.update",
-        "P18: UserToolManager exists, no service exposes it",
     ),
     (
         "vision.analyze",
@@ -140,35 +129,84 @@ fn required_services_by_skill() -> BTreeMap<String, Vec<String>> {
     by_skill
 }
 
-/// Every service name the daemon's builders can ever insert.
+/// Every service name the daemon can ever insert, from anywhere in its source.
 ///
-/// Read from the source of the two `HashMap<String, ServiceFn>` builders rather
-/// than by calling them, because most inserts are conditional on an optional
-/// dependency (memory, storage, a scheduler) and a map built in a test would
-/// report a subset that changes with the test's own fixtures. The question here
-/// is "does anything, anywhere, implement this name" — which is a source fact.
+/// Read from source rather than by calling the builders, because most inserts
+/// are conditional on an optional dependency (memory, storage, a scheduler, a
+/// tools directory) and a map built inside a test would report a subset that
+/// changes with the test's own fixtures. The question here is "does anything,
+/// anywhere, implement this name" — which is a source fact.
+///
+/// It walks the **whole** `src/` tree rather than a named list of files. An
+/// earlier version scanned only `server.rs` and `tasks.rs`, and the very next
+/// service to be added lived in a new module, so the scan reported it missing
+/// and the ledger would have been wrong in the safe-looking direction. A test
+/// whose coverage has to be maintained by hand is a test that silently stops
+/// covering things.
 fn registered_service_names() -> BTreeSet<String> {
-    let src = workspace_crates_dir().join("nanna-daemon").join("src");
-    let mut names = BTreeSet::new();
-    for file in ["server.rs", "tasks.rs"] {
-        let text = std::fs::read_to_string(src.join(file))
-            .unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find("services.insert(") {
-            rest = &rest[at + "services.insert(".len()..];
-            // The key is the next string literal, which may sit on the
-            // following line: `services.insert(\n    "pdf.read".to_string(),`.
-            let Some(open) = rest.find('"') else { break };
-            let after_open = &rest[open + 1..];
-            let Some(close) = after_open.find('"') else {
-                break;
+    /// A service key: `family.action`, both lowercase snake segments. Tight
+    /// enough that an unrelated `map.insert("some.other")` cannot pass for one.
+    fn looks_like_a_service(key: &str) -> bool {
+        let Some((family, action)) = key.split_once('.') else {
+            return false;
+        };
+        let segment_ok = |segment: &str| {
+            !segment.is_empty()
+                && segment.starts_with(|c: char| c.is_ascii_lowercase())
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        segment_ok(family) && segment_ok(action)
+    }
+
+    fn walk(dir: &Path, names: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, names);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
             };
-            let key = &after_open[..close];
-            if key.contains('.') {
-                names.insert(key.to_string());
+            // Any `<map>.insert("<key>"`, so a new service module is covered
+            // without this test being told about it.
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(".insert(") {
+                rest = &rest[at + ".insert(".len()..];
+                // The key is the next string literal, which may sit on the
+                // following line: `.insert(\n    "pdf.read".to_string(),`.
+                let Some(open) = rest.find('"') else { break };
+                // ...but only if nothing but whitespace precedes it, or a
+                // `map.insert(other_variable)` would swallow the next literal
+                // on the line.
+                if !rest[..open].trim().is_empty() {
+                    continue;
+                }
+                let after_open = &rest[open + 1..];
+                let Some(close) = after_open.find('"') else {
+                    break;
+                };
+                let key = &after_open[..close];
+                if looks_like_a_service(key) {
+                    names.insert(key.to_string());
+                }
             }
         }
     }
+
+    let mut names = BTreeSet::new();
+    walk(
+        &workspace_crates_dir().join("nanna-daemon").join("src"),
+        &mut names,
+    );
     names
 }
 

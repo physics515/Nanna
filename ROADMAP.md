@@ -4088,6 +4088,45 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
               binary: `withheld_count=16 total=44`, listing all 16 skills and all 14 services,
               matching the test's finding independently.
             1931 workspace tests pass / 0 fail, clippy 0 errors.
+            - [x] **Wired the three the audit found nobody tracking: `tools.create` /
+                  `tools.update` / `tools.list`.** *(2026-09-15)* New
+                  `nanna-daemon/src/tool_authoring.rs`; **16 withheld skills → 13**, confirmed on
+                  the real daemon binary and independently by the audit test. `create_tool`,
+                  `edit_tool` and `list_user_tools` are callable, so the agent can author a tool
+                  and use it in the same run.
+                  **Storage shape is the skill-directory one** (`{tools_dir}/{name}/tool.ts` plus
+                  a `permissions.json`), which is what the skills' own text describes and what
+                  `discover_skills` reads — deliberately *not* `UserToolManager`'s `{name}.json`,
+                  a separate older store whose files the loader would never find. The roadmap's
+                  "UserToolManager exists, no service exposes it" was the wrong premise.
+                  **Containment by construction, not by filtering:** the only user-supplied path
+                  component is the tool name, and `validate_tool_name` restricts it to
+                  `^[a-z][a-z0-9_]{0,63}$` — no `/`, no `.`, no `..` — with a symlink check on top
+                  for a directory somebody else planted. An authored tool gets a `permissions.json`
+                  written **at creation**, so it carries the home scope from this run's other
+                  increment rather than waiting for `ensure_permissions` at the next boot.
+                  Two shapes worth naming: an edit applies against the **current file** and is
+                  refused on zero **or** more than one match (the caller cannot know which it
+                  changed otherwise); and source is validated with `extract_manifest` **before**
+                  disk, so a broken edit leaves the working tool intact. Live registration failure
+                  is reported as `registered: false` rather than as success, because "callable now"
+                  and "callable after a restart" are different answers to the only question asked.
+                  The authoring services load what they wrote with the **same service map** every
+                  bundled skill gets, via a `OnceLock` slot the daemon fills right after building —
+                  without it a runtime-authored tool would be the only tool in the daemon unable to
+                  call a service.
+                  15 unit tests + **7 round-trip integration tests against a real registry** that
+                  *call the tool they authored*: created-then-callable with no restart, an edit that
+                  the next call sees, create-over-existing refused with the original still working,
+                  a breaking edit refused before disk, editing an absent tool refused rather than
+                  creating one, traversing names leaving nothing on disk, and listing that skips
+                  bundled skills. 1953 workspace tests pass / 0 fail, clippy 0 errors.
+                  - [ ] **In a debug build the tools directory is the source tree**, so
+                        `tools.create` called against a dev daemon writes a new skill directory
+                        into the checkout (`resolve_tools_dir` → `dev_tools_dir`). Pre-existing —
+                        `ensure_permissions` already writes there, which is how the `edit_tool`
+                        permissions gap surfaced — but authoring makes it much easier to hit.
+                        Decide whether a debug daemon should author into the data dir instead.
 - [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
       (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
       local model, largely redundant with exec + browser).

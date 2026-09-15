@@ -617,6 +617,15 @@ fn build_script_services(
         Arc<crate::llm_router::LlmRouter>,
         Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
     )>,
+    // The tools directory and live registry the authoring services write into,
+    // plus the slot they read the finished service map back out of. `None`
+    // leaves `tools.{create,update,list}` unregistered, which withholds the
+    // three authoring skills rather than half-wiring them.
+    tool_authoring: Option<(
+        PathBuf,
+        std::sync::Weak<nanna_tools::ToolRegistry>,
+        Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
+    )>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -1099,6 +1108,16 @@ fn build_script_services(
                 })
             }),
         );
+    }
+
+    // Tool authoring. The bundled `create_tool`, `edit_tool` and
+    // `list_user_tools` skills declare `tools.create` / `tools.update` /
+    // `tools.list`, and nothing registered any of them, so all three were
+    // withheld at every boot (found by `skill_services_are_registered.rs`).
+    if let Some((tools_dir, registry, slot)) = tool_authoring {
+        services.extend(crate::tool_authoring::build_tool_authoring_services(
+            tools_dir, registry, slot,
+        ));
     }
 
     // PDF text extraction. The bundled `read_pdf` skill declares
@@ -3892,6 +3911,17 @@ impl DaemonServer {
                 None
             };
 
+            // The authoring services load a tool they just wrote with the same
+            // services every bundled skill gets. That map is the one being
+            // built, so it reaches them through a slot filled immediately
+            // below — a runtime-authored tool must not be the only one in the
+            // daemon that cannot call a service.
+            let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
+                Arc::new(std::sync::OnceLock::new());
+            let tool_authoring = tools_dir
+                .clone()
+                .map(|dir| (dir, Arc::downgrade(&tools), Arc::clone(&authoring_slot)));
+
             let services = build_script_services(
                 &memory,
                 spawner_arc,
@@ -3900,7 +3930,17 @@ impl DaemonServer {
                 self.storage.clone(),
                 turn_baselines.clone(),
                 Some((router.clone(), Arc::clone(&shared_agent_config))),
+                tool_authoring,
             );
+            // Fill the slot before any skill can be executed. `set` returning
+            // an error would mean the map was filled twice, which cannot
+            // happen here and would leave the authoring services reading a
+            // stale map if it did.
+            if authoring_slot.set(services.clone()).is_err() {
+                warn!(
+                    "tool-authoring service map was already filled; authored tools may not reach services"
+                );
+            }
 
             if let Some(ref dir) = tools_dir {
                 if dir.is_dir() {
@@ -5339,6 +5379,7 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
             Arc::new(crate::tasks::TurnBaselines::new()),
+            None,
             None,
         );
         let pdf_read = services
