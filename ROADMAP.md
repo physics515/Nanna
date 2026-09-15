@@ -4066,8 +4066,37 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       other order ships a reminder that fires into a log file.
 - [ ] **`browser.*` services** — nanna-browser (chromiumoxide + playwright, full navigate/click/type/extract
       API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
-      and registers nothing. Enable the flag, register the services. The P8 "browser relay Chrome extension"
-      (drive the user's real logged-in browser) remains the valuable second half.
+      and registers nothing. The P8 "browser relay Chrome extension" (drive the user's real logged-in
+      browser) remains the valuable second half.
+      **(2026-09-15 — investigated, deliberately NOT started, and "enable the flag, register the
+      services" is an understatement.)** The four services are not thin wrappers: **the skills and
+      `BrowserManager` were written against each other and never run together, and their vocabularies
+      disagree in five places.**
+      - `browser.evaluate` sends **`expression`**; `BrowserManager::evaluate` reads **`script`** and
+        errors `Missing script`. Registered naively, this service fails on every call.
+      - `browser.action` sends **`value`** and **`delay_ms`**; the manager reads **`text`**, **`key`**
+        and **`wait_ms`** depending on the branch.
+      - `browser.action`'s enum offers **`scroll`** and **`navigate`**; the manager implements
+        `click`/`type`/`fill`/`press`/`wait`/`wait_selector` — so **two of the five advertised actions
+        are not implemented at all**, while three the manager *does* support are not exposed.
+      - `browser.extract` sends **`attribute`** (e.g. `href`); the manager has no attribute path — only
+        `mode` (`html`/text) plus `selector`.
+      - `browser_screenshot` reports a byte count and discards the image, the same shape `audio.tts`
+        had before this run gave it a path.
+      So the real work is a translation layer at the service boundary **plus** closing two genuine
+      feature gaps **plus** correcting the skill's advertised enum. Registering the four services
+      without that ships tools the model is told it can use and that fail or silently do nothing —
+      exactly what the withholding mechanism exists to prevent.
+      **Cost, measured rather than feared:** enabling the flag adds **9 crates** to the daemon's
+      dependency tree (653 → 662), the chromiumoxide family among them. Binary-size impact is the
+      number still worth taking before committing, since P6 lists binary size as a hard guardrail and
+      `chromiumoxide_cdp` generates the whole CDP protocol as Rust types.
+      **Good news for whoever picks this up: it is the one service group that can be verified
+      end to end on this host** — `chromium` and `google-chrome-stable` are both installed, so unlike
+      `vision.analyze` and `audio.*` the real backend can be driven in a test rather than reasoned
+      about. Gate registration on a detected executable and pass it as
+      `BrowserConfig.executable_path`, so the thing that is probed and the thing that is launched are
+      the same binary by construction.
 - [x] **`audio.tts` + `audio.transcribe` registered** *(2026-09-15)* — `text_to_speech` and
       `transcribe` are live; **8 skills withheld, down from 16 at the start of the run**, confirmed
       on the real daemon binary and independently by the audit test. New
