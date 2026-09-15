@@ -41,13 +41,13 @@ pub use pdf::{OcrFn as PdfOcrFn, PageSelection, PdfExtract, PdfVisionFn, ReadPdf
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
 pub use ask_parent::AskParentTool;
 pub use task::TaskTool;
-pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
+pub use vision::{AnalyzeImageTool, IMAGE_BYTES_MAX, ScreenshotTool, VisionFn, image_media_type, read_image_as_base64};
 pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};
 
 #[cfg(feature = "browser")]
 pub use browser_wiring::{BrowserManager, create_browser_tools};
 
 #[cfg(feature = "vision")]
-pub use vision_wiring::create_vision_tool;
+pub use vision_wiring::{create_vision_fn, create_vision_tool};
 
 pub use audio_wiring::{create_tts_tool, create_tts_tool_with_dir, create_transcribe_tool, create_audio_tools};

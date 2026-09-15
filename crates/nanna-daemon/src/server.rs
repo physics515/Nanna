@@ -626,6 +626,11 @@ fn build_script_services(
         std::sync::Weak<nanna_tools::ToolRegistry>,
         Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
     )>,
+    // Router plus the configured vision-model priority list. `None`, an empty
+    // list, or a list the router cannot serve all leave `vision.analyze`
+    // unregistered, which withholds the three vision skills rather than
+    // advertising tools that can only fail.
+    vision: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -1110,6 +1115,14 @@ fn build_script_services(
         );
     }
 
+    // Vision. The bundled `analyze_image`, `describe_image` and `ocr` skills all
+    // declare `vision.analyze`, and nothing registered it.
+    if let Some((router, models)) = vision {
+        services.extend(crate::vision_service::build_vision_services(
+            &router, &models,
+        ));
+    }
+
     // Tool authoring. The bundled `create_tool`, `edit_tool` and
     // `list_user_tools` skills declare `tools.create` / `tools.update` /
     // `tools.list`, and nothing registered any of them, so all three were
@@ -1225,6 +1238,14 @@ pub struct DaemonConfig {
     pub use_script_tools: bool,
     /// Directory containing tool scripts (resolved from env/config/default)
     pub tools_dir: Option<PathBuf>,
+    /// Vision-capable models for `vision.analyze`, in priority order.
+    ///
+    /// Flattened from `[memory] ocr_model_priority` the same way the other
+    /// `memory_*` values below are — that setting already means "vision-capable
+    /// models, tried in order", so the vision service reads it rather than
+    /// introducing a second list to keep in sync. Empty (the default) leaves
+    /// `vision.analyze` unregistered and the vision skills withheld.
+    pub vision_model_priority: Vec<String>,
     /// Tool names the agent may call. `None` (or a list containing `"*"`) means
     /// "no allowlist — every tool is permitted". Mirrors `[tools] enabled`.
     pub tool_allowlist: Option<Vec<String>>,
@@ -1380,6 +1401,7 @@ impl Default for DaemonConfig {
             webhook: WebhookConfig::default(),
             use_script_tools: true,
             tools_dir: None,
+            vision_model_priority: Vec::new(),
             tool_allowlist: None,
             tool_denylist: Vec::new(),
             tool_audit_log: true,
@@ -3911,6 +3933,11 @@ impl DaemonServer {
                 None
             };
 
+            // `[memory] ocr_model_priority` already means "vision-capable
+            // models, tried in order" — an existing documented setting, so
+            // `vision.analyze` reads it rather than inventing a second one.
+            let vision_models = self.config.vision_model_priority.clone();
+
             // The authoring services load a tool they just wrote with the same
             // services every bundled skill gets. That map is the one being
             // built, so it reaches them through a slot filled immediately
@@ -3931,6 +3958,7 @@ impl DaemonServer {
                 turn_baselines.clone(),
                 Some((router.clone(), Arc::clone(&shared_agent_config))),
                 tool_authoring,
+                Some((router.clone(), vision_models)),
             );
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
@@ -4246,6 +4274,9 @@ impl DaemonBuilder {
         // Idle gate for the scheduled dream cycle (defers dreaming to a lull).
         builder.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
+        // `ocr_model_priority` already means "vision-capable models, in order";
+        // `vision.analyze` reads it rather than adding a second list.
+        builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
@@ -5379,6 +5410,7 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
             Arc::new(crate::tasks::TurnBaselines::new()),
+            None,
             None,
             None,
         );

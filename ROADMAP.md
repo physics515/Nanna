@@ -4100,6 +4100,50 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             faked in this increment: a half-wired OCR path is indistinguishable from a scanned
             document that genuinely has no text, and the extractor already says which pages yielded
             nothing.
+            **(2026-09-15) The piece it was waiting on now exists**: `vision.analyze` is registered
+            (below), which is the same model-backed OCR the `ocr` skill uses. `pdf.read`'s
+            `with_ocr_fn` can now be fed from it. Still not done here — it wants its own increment
+            that decides per-page policy (which pages to escalate, and the token cost of sending a
+            page image per empty page).
+      - [x] **`vision.analyze` is registered, and the reason it was unreachable was structural.**
+            *(2026-09-15)* `analyze_image`, `describe_image` and `ocr` all declare
+            `requires: ["vision.analyze"]` and nothing registered it. The cause was not an
+            oversight in wiring: **`vision_wiring` lives behind nanna-tools' `vision` feature, and
+            no crate in the workspace enabled it** — so `create_vision_tool` could not have had a
+            caller. Two pieces of it had **silently stopped compiling** behind that flag
+            (`AnthropicRequest` grew `context_limit`; a test lost its `Tool` import), which is the
+            cost of dead code nothing builds. Enabling the feature costs nothing new:
+            `vision = ["nanna-llm"]` and `nanna-daemon` already depends on `nanna-llm` for the
+            router.
+            New `nanna-daemon/src/vision_service.rs`. The vision call itself is **not** duplicated —
+            `create_vision_fn` was extracted from `create_vision_tool` so both go through one
+            request construction. That matters specifically because the request must run
+            `sampling_temperature_for_model`: `temperature` is rejected outright by current Claude
+            models, and a hand-rolled second copy would not know that.
+            **Registered only when a vision model is reachable**, from the existing
+            `[memory] ocr_model_priority` (already documented as "only vision-capable models" and
+            "tried in order", so its fallthrough semantics are honoured, not invented) — resolved
+            against the boot-frozen router, which is why the decision is made once at registration
+            rather than per call. Empty or unservable ⇒ not registered ⇒ the three skills stay
+            withheld, and the boot warning names `vision.analyze`, turning "three permanently dead
+            skills" into "three skills one config line away".
+            `IMAGE_BYTES_MAX` is **derived, not chosen**: the provider caps a request at 32 MB and
+            base64 inflates 4/3, so a raw image over 24 MB cannot fit however it is framed; it is
+            checked from `metadata()` before the bytes are buffered, the order `read_pdf` uses.
+            Media type comes from the extension on purpose — it is a *claim made to the provider*,
+            so a file whose bytes disagree with its name fails there with a clear error rather than
+            being silently relabelled here.
+            13 tests. **Verified on the real daemon binary in both directions**: unconfigured ⇒
+            `vision.analyze` unregistered, 13 withheld, with a log line naming the exact config key;
+            configured ⇒ `Registering vision.analyze models=anthropic/claude-opus-5`, all three
+            skills loaded, **10 withheld** — matching the audit test's count independently. Wiring
+            the `DaemonBuilder::from_nanna_config` path as well as `serve.rs` was needed and the
+            first boot caught that it was missing (`configured_count=0`).
+            **Limitation, stated rather than glossed:** no live vision *call* was made — this host
+            has no working cloud credential and no Ollama, so the LLM round trip is covered only by
+            being the same code path `create_vision_tool` always used. Everything up to the request
+            (path handling, size ceiling, media type, model selection, fallthrough, registration
+            gating) is tested. 1967 workspace tests pass / 0 fail, clippy 0 errors.
       - [x] **The audit pass ran, and the gap is far bigger than one tool.** *(2026-09-15)*
             Asked the right question — not "which Rust built-in structs have callers" (almost none
             do; the JS/TS migration is complete and the `builtin/` structs are largely vestigial)

@@ -80,10 +80,6 @@ const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
         "screenshot.capture",
         "P18: skill exists, service missing, Rust tool is a stub",
     ),
-    (
-        "vision.analyze",
-        "P18: create_vision_tool and OcrTool are complete and unreachable",
-    ),
 ];
 
 /// Fewest skills the tree can plausibly hold; below this the walk found nothing
@@ -313,6 +309,15 @@ fn no_known_missing_entry_is_stale() {
 /// scale of the gap is visible in the test output rather than having to be
 /// recounted by hand next time somebody asks how much of the tool surface is
 /// actually reachable.
+///
+/// **It counts services with no implementation anywhere, which is a lower bound
+/// on what a given daemon withholds.** Some services are registered only when
+/// something is configured — `vision.analyze` needs `[memory]
+/// ocr_model_priority` to name a model the router can serve — so on a default
+/// install the live count is higher than this one. That is the intended
+/// difference: "nobody wrote it" and "you have not configured it" are different
+/// problems with different fixes, and the daemon's own boot warning reports the
+/// second.
 #[test]
 fn report_how_many_bundled_skills_are_withheld() {
     let by_skill = required_services_by_skill();
@@ -330,7 +335,9 @@ fn report_how_many_bundled_skills_are_withheld() {
          rather than that the daemon ships nothing",
     );
     println!(
-        "{} of {} bundled skills are withheld for missing services: {:?}",
+        "{} of {} bundled skills have a service nobody implements: {:?} \
+         (a live daemon withholds at least these, plus any whose service is \
+         implemented but unconfigured)",
         withheld.len(),
         by_skill.len(),
         withheld,

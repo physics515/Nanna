@@ -52,6 +52,7 @@ pub mod service;
 pub mod session;
 pub mod tasks;
 pub mod tool_authoring;
+pub mod vision_service;
 pub mod user_tools;
 pub mod webhook;
 
