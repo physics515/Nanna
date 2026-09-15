@@ -2267,7 +2267,18 @@ so neither CI nor any prior run could have caught them:
                   keys live. A silent read of a key is the one grant in this set that cannot be
                   walked back after the fact. Different rationale, different blast radius than the
                   path scopes; do not fold it into a path-scope change.
-            - [ ] **`allows_read`/`allows_write` document a `~` they do not implement.** Their doc
+            - [x] **`allows_read`/`allows_write` now implement the `~` they document.**
+                  *(2026-09-15, same run)* Fixed rather than documented: a shared `scope_covers`
+                  expands `~` / `~/sub` against a `LazyLock` home lookup (the check runs on every
+                  file a scripted tool touches, so it is resolved once), `*` still means the whole
+                  filesystem, and an absolute scope behaves exactly as before. No home directory to
+                  expand against ⇒ deny, never widen. Changes nothing for a path the loader already
+                  expanded, which is every production path — the trap was only reachable by
+                  constructing `ToolPermissions` programmatically, which is precisely why it would
+                  have stayed invisible. The three checks also gained `#[must_use]`: ignoring the
+                  result of a permission check is a security bug, not a style question. 6 tests,
+                  verified in both directions (disabling the `~` branch fails the two that assert it).
+            - [ ] ~~**`allows_read`/`allows_write` document a `~` they do not implement.**~~ Their doc
                   comments in `nanna-scripting/src/tool.rs` say "supports ... `~` for home
                   directory", but the check is `path.starts_with(p)` against the literal `PathBuf`,
                   and `Path::starts_with` is component-wise — a literal `~` matches nothing. The
