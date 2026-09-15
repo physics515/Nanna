@@ -1126,6 +1126,20 @@ impl DaemonClient {
         })).await
     }
     
+    /// Enable or disable a tool.
+    ///
+    /// One method rather than two, because the caller always has a boolean in
+    /// hand (a toggle's new state) and never a choice of verb. The daemon's
+    /// `enable`/`disable` split is an implementation detail of the wire format,
+    /// so it is resolved here instead of at every call site.
+    pub async fn tool_set_enabled(&self, name: &str, enabled: bool) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "tool",
+            "action": if enabled { "enable" } else { "disable" },
+            "name": name
+        })).await
+    }
+
     /// Execute a tool
     pub async fn tool_execute(&self, name: &str, input: Value) -> Result<Value, String> {
         self.request(serde_json::json!({

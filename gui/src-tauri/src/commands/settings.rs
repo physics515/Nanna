@@ -187,6 +187,11 @@ pub struct ToolInfo {
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    /// A user-authored tool rather than a bundled skill. The two are toggled
+    /// through the same action but live in different stores, so the surface
+    /// labels them differently — a user tool can also be edited and deleted.
+    #[serde(default)]
+    pub is_user_tool: bool,
 }
 
 /// Get extended settings
@@ -210,6 +215,7 @@ pub async fn get_extended_settings(
                             name: t.get("name")?.as_str()?.to_string(),
                             description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                            is_user_tool: t.get("is_user_tool").and_then(|v| v.as_bool()).unwrap_or(false),
                         })
                     })
                     .collect()

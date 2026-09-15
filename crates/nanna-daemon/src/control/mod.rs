@@ -20,7 +20,7 @@ use nanna_config::Config;
 use nanna_core::{Scheduler, Workspace, WorkspaceRegistry};
 use nanna_memory::{ConsolidationConfig, MemoryService};
 use nanna_storage::{Storage, StoredModelStats};
-use nanna_tools::ToolRegistry;
+use nanna_tools::{ToolPolicy, ToolRegistry};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +61,13 @@ pub struct ControlPlane {
     log_buffer: Option<LogBuffer>,
     /// Tools directory for reading tool source files
     tools_dir: Option<PathBuf>,
+    /// Where the per-call tool audit trail is written, when one is enabled.
+    ///
+    /// Handed over by the server that built the sink rather than re-derived:
+    /// the trail hangs off `DaemonConfig::data_dir`, which `--data-dir` moves,
+    /// so deriving it here from the default data dir would serve an empty page
+    /// while the daemon was writing somewhere else entirely.
+    audit_log_path: Option<PathBuf>,
     /// Shared model stats tracker
     pub model_stats: nanna_agent::ModelStatsTracker,
     /// Shared tool stats tracker
@@ -138,6 +145,7 @@ impl ControlPlane {
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
+            audit_log_path: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
@@ -198,6 +206,7 @@ impl ControlPlane {
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
+            audit_log_path: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
@@ -260,6 +269,7 @@ impl ControlPlane {
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
+            audit_log_path: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
@@ -299,6 +309,17 @@ impl ControlPlane {
     /// Set the tools directory for reading tool source files
     pub fn with_tools_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.tools_dir = dir;
+        self
+    }
+
+    /// Point the control plane at the audit trail the daemon is writing.
+    ///
+    /// `None` means no trail is being written, which `ToolAction::Audit`
+    /// reports as such rather than as an empty history — those are different
+    /// answers, and only one of them means "Nanna has done nothing".
+    #[must_use]
+    pub fn with_audit_log_path(mut self, path: Option<PathBuf>) -> Self {
+        self.audit_log_path = path;
         self
     }
 
@@ -550,6 +571,100 @@ impl ControlPlane {
             }
             Err(e) => json!({ "error": "update_failed", "message": e }),
         }
+    }
+
+    /// Enable or disable **any** tool — a bundled skill or a user tool.
+    ///
+    /// Two durable records exist and each tool belongs to exactly one of them,
+    /// which is why this dispatches rather than doing one thing:
+    ///
+    /// * A **user tool** owns an `enabled` flag in the user-tool store. That
+    ///   store is also what `list_user` reads, so a disabled user tool stays
+    ///   visible and re-enableable even though it is unregistered from the live
+    ///   registry.
+    /// * Everything else — the bundled JS/TS skills and the Rust built-ins —
+    ///   has no per-tool store, so the record is `[tools] disabled` in the
+    ///   config file and the gate is [`ToolPolicy`]. Denial keeps the tool
+    ///   registered, which is what lets it be listed as disabled and turned
+    ///   back on; unregistering it would be a one-way door.
+    ///
+    /// Takes effect immediately, without a daemon restart.
+    async fn set_tool_enabled(&self, name: &str, enabled: bool) -> Value {
+        // A user tool's own store wins: it is that tool's durable record, and
+        // writing its name into `[tools] disabled` as well would leave two
+        // sources of truth to disagree.
+        if let Some(ref user_tools) = self.user_tools
+            && user_tools.list_tools().await.iter().any(|t| t.name == name)
+        {
+            return self.set_user_tool_enabled(name, enabled).await;
+        }
+
+        let Some(ref tools) = self.tools else {
+            return json!({
+                "error": "tools_unavailable",
+                "message": "Tool registry not configured"
+            });
+        };
+
+        // Canonicalize BEFORE writing anything.
+        //
+        // The policy gate checks *canonical* names, so a denylist entry under
+        // any other spelling is a toggle that reports success and changes
+        // nothing. This is the same alias bug the audit trail hit: `resolve_tool`
+        // returns the registry KEY, which for an alias is the alias itself
+        // (`Bash`), so it takes `canonical_name` on top to reach `exec`.
+        // Resolution also absorbs a case difference, so `Read_File` toggles
+        // `read_file` instead of silently denying a name no tool has.
+        let Some((resolved, _)) = tools.resolve_tool(name).await else {
+            return json!({ "error": "not_found", "name": name });
+        };
+        let canonical = tools.canonical_name(&resolved).await;
+
+        // Mutate the config, derive the new policy, and persist — all under one
+        // lock acquisition, then release it BEFORE awaiting the registry. The
+        // policy is computed from the same lists that were just written, so the
+        // file on disk and the live gate cannot disagree.
+        let policy = {
+            let mut config = self.config.write().await;
+            if enabled {
+                config.tools.disabled.retain(|n| n != &canonical);
+            } else if !config.tools.disabled.iter().any(|n| n == &canonical) {
+                config.tools.disabled.push(canonical.clone());
+            }
+
+            let policy = ToolPolicy::from_config_lists(
+                Some(&config.tools.enabled),
+                &config.tools.disabled,
+            );
+
+            debug_assert_eq!(
+                policy.permits(&canonical),
+                enabled,
+                "the derived policy must agree with the toggle that produced it"
+            );
+
+            if let Some(ref config_path) = self.config_path
+                && let Err(e) = config.save_to(config_path)
+            {
+                // The live gate below still applies, so the toggle is honoured
+                // for this run — it just will not survive a restart. Say which
+                // it is rather than reporting a clean success.
+                warn!("Tool toggle for {canonical} not persisted: {e}");
+            }
+
+            policy
+        };
+
+        tools.set_policy(policy).await;
+
+        // `[tools] disabled` is configuration, so every client that renders it
+        // needs to know it moved — otherwise a second window keeps showing the
+        // toggle in its old position until restart.
+        self.notify_config_changed();
+
+        let status = if enabled { "enabled" } else { "disabled" };
+        info!("{status} tool: {canonical}");
+        json!({ "status": status, "name": canonical })
     }
 
     /// Set the system prompt

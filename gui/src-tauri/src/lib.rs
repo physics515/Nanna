@@ -362,6 +362,8 @@ pub fn run() {
             commands::tools::test_user_tool,
             // All registered tools
             commands::tools::list_tools,
+            commands::tools::set_tool_enabled,
+            commands::tools::get_tool_audit,
             commands::tools::get_tool,
             // Skill directory tools
             commands::tools::list_skills,

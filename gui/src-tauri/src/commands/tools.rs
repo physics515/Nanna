@@ -174,12 +174,45 @@ pub async fn list_tools(
                         name: t.get("name")?.as_str()?.to_string(),
                         description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                        is_user_tool: t.get("is_user_tool").and_then(|v| v.as_bool()).unwrap_or(false),
                     })
                 })
                 .collect()
         })
         .ok_or("Failed to fetch tools from daemon")?;
     Ok(tools)
+}
+
+/// Enable or disable a tool.
+///
+/// Covers bundled skills and user tools alike: the daemon dispatches on which
+/// store owns the name, and canonicalizes aliases before touching the policy,
+/// so `Bash` toggles `exec` rather than writing a denylist entry that gates
+/// nothing.
+///
+/// The daemon answers with a JSON body rather than an HTTP-style status, so a
+/// refusal arrives as `{"error": ...}` with a 200-equivalent envelope. Surface
+/// it as `Err` — a toggle that silently fails to move is the failure mode this
+/// whole path exists to avoid, and the switch must snap back rather than lie.
+#[tauri::command]
+pub async fn set_tool_enabled(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let result = state_guard.backend.tool_set_enabled(&name, enabled).await?;
+
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        let detail = result
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(err);
+        return Err(format!("Failed to {} '{name}': {detail}", if enabled { "enable" } else { "disable" }));
+    }
+
+    info!("Tool '{name}' {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
 }
 
 /// Get details of a specific tool.
@@ -194,6 +227,33 @@ pub async fn get_tool(
         "action": "get",
         "name": name,
     })).await
+}
+
+/// Read the per-call tool audit trail, newest first.
+///
+/// The trail is a file in the daemon's data directory and the GUI is a pure
+/// daemon client (P16), so this goes over IPC rather than reading the disk —
+/// the GUI has no idea where `--data-dir` put it, and guessing would show an
+/// empty history on every isolated run.
+///
+/// Returns the daemon's envelope whole, including its account of itself
+/// (`unparseable`, `reached_oldest`, …). A viewer that renders only the records
+/// cannot tell a complete history from one screenful, so those fields are the
+/// difference between a log and an audit.
+#[tauri::command]
+pub async fn get_tool_audit(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard
+        .backend
+        .daemon_request(serde_json::json!({
+            "type": "tool",
+            "action": "audit",
+            "limit": limit,
+        }))
+        .await
 }
 
 // =============================================================================

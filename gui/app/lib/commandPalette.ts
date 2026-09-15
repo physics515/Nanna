@@ -23,6 +23,7 @@ export const NAV_ACTIONS: PaletteAction[] = [
   { id: 'nav-scheduler', label: 'Scheduler', group: 'Admin', keywords: ['cron', 'jobs', 'schedule'], href: '/scheduler' },
   { id: 'nav-model-stats', label: 'Model Stats', group: 'Admin', keywords: ['usage', 'tokens', 'llm'], href: '/model-stats' },
   { id: 'nav-tool-stats', label: 'Tool Stats', group: 'Admin', keywords: ['usage', 'mcp'], href: '/tool-stats' },
+  { id: 'nav-tool-audit', label: 'Tool Audit', group: 'Admin', keywords: ['audit', 'trail', 'history', 'calls', 'refused'], href: '/tool-audit' },
 ]
 
 export const QUICK_ACTIONS: PaletteAction[] = [

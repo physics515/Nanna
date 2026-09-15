@@ -34,7 +34,7 @@ impl ControlPlane {
     /// COMMITTED mutation (the in-memory config was replaced and the router
     /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
     /// error only means nobody is subscribed.
-    fn notify_config_changed(&self) {
+    pub(super) fn notify_config_changed(&self) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(Event::ConfigChanged);
         }
