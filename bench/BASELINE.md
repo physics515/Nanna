@@ -687,12 +687,27 @@ dedup inline.
 Instrument: release-binary size, idle RSS, VRAM ceiling under the reference tier, cold-start
 to first healthy `/readyz`.
 
+**Baselined 2026-09-15** on the reference host (Arch Linux, Zen 4, `x86_64-unknown-linux-gnu`),
+release profile as committed (`lto = "fat"`, `codegen-units = 1`, `strip = true`, `opt-level = 3`) —
+so the binary figure is already stripped; re-stripping it by hand moves 8 bytes.
+
 | Metric | Baseline | Source | Notes |
 | --- | --- | --- | --- |
-| Release binary size (`nanna-daemon`) | *not yet baselined* | — | stripped, fat LTO |
-| Idle RAM (daemon, no model loaded) | *not yet baselined* | — | |
-| VRAM ceiling (local model loaded) | *not yet baselined* | — | must hold the 16 GB reference / 8 GB guardrail |
-| Cold-start to `/readyz` | *not yet baselined* | — | |
+| Release binary size (`nanna-daemon`) | **70,323,360 B** (67.1 MiB) | `cargo build --release -p nanna-daemon` | stripped, fat LTO. **66,483,104 B** before the `browser` feature was enabled the same day: the chromiumoxide stack is **+3,819,648 B / +5.7%** |
+| Idle RAM (daemon, no model loaded) | **~71.8 MB RSS** | `/proc/<pid>/status` `VmRSS`, 5 s after `/readyz` | 70,756 / 72,008 / 71,784 kB over 3 runs; minimal config, no cloud key, no vision or audio model, no browser launched |
+| VRAM ceiling (local model loaded) | *not yet baselined* | — | must hold the 16 GB reference / 8 GB guardrail. Blocked: no local runner yet (P12) and no Ollama on this host |
+| Cold-start to `/readyz` | **513 ms** (median of 3) | wall clock from exec to first `200` on `/readyz` | 732 / 511 / 513 ms; the first run pays a cold page cache, so the median is the honest figure and the 732 ms is worth keeping as the cold-disk number |
+
+**Method, so a later run can reproduce rather than re-invent it.** Each run is a fresh
+`--data-dir`, `--no-pid-file`, `--no-file-log`, `--log-level warn`, an isolated
+`NANNA_CONFIG_PATH` naming no providers, and a poll of `/readyz` every 50 ms from immediately
+before `exec`. RSS is read 5 s after ready so bootstrap allocations have settled — the daemon
+extracts 89 embedded skill files on first boot, which is included here because a first boot is what
+a new install does.
+
+**These are measurements, not budgets.** No threshold is proposed: a first baseline on one host
+says what the number *is*, and a budget wants at least a second machine and a sense of the variance
+before it starts failing anyone's CI.
 
 Machine-readable rows land under `suite = "guardrails"`.
 
