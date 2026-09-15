@@ -631,6 +631,9 @@ fn build_script_services(
     // unregistered, which withholds the three vision skills rather than
     // advertising tools that can only fail.
     vision: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    // OpenAI key plus the data dir generated speech is written under. `None` or
+    // no key leaves `audio.tts` / `audio.transcribe` unregistered.
+    audio: Option<(Option<String>, PathBuf)>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -1113,6 +1116,15 @@ fn build_script_services(
                 })
             }),
         );
+    }
+
+    // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
+    // clients behind them were complete and reachable from nowhere.
+    if let Some((openai_api_key, data_dir)) = audio {
+        services.extend(crate::audio_service::build_audio_services(
+            openai_api_key.as_deref(),
+            &data_dir,
+        ));
     }
 
     // Vision. The bundled `analyze_image`, `describe_image` and `ocr` skills all
@@ -3959,6 +3971,10 @@ impl DaemonServer {
                 Some((router.clone(), Arc::clone(&shared_agent_config))),
                 tool_authoring,
                 Some((router.clone(), vision_models)),
+                Some((
+                    self.config.llm.openai_api_key.clone(),
+                    self.config.data_dir.clone(),
+                )),
             );
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
@@ -5410,6 +5426,7 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
             Arc::new(crate::tasks::TurnBaselines::new()),
+            None,
             None,
             None,
             None,

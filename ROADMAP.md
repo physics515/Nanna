@@ -4068,7 +4068,29 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
       and registers nothing. Enable the flag, register the services. The P8 "browser relay Chrome extension"
       (drive the user's real logged-in browser) remains the valuable second half.
-- [ ] **`audio.transcribe`** — Whisper client written (crates/nanna-tools/src/builtin/audio.rs); channel
+- [x] **`audio.tts` + `audio.transcribe` registered** *(2026-09-15)* — `text_to_speech` and
+      `transcribe` are live; **8 skills withheld, down from 16 at the start of the run**, confirmed
+      on the real daemon binary and independently by the audit test. New
+      `nanna-daemon/src/audio_service.rs`; `create_tts_fn` / `create_transcribe_tool_fn` extracted
+      from the tool constructors so the services and the tools share one client setup.
+      **Registered only when an OpenAI key is configured** — Whisper and the speech endpoint are
+      OpenAI's, not the chat router's, so there is no model list to fall through; without a key
+      neither service exists, both skills stay withheld, and the boot line names `[llm]
+      openai_api_key`. Verified in both directions on the real binary.
+      **`audio.tts` now writes a file and returns its path.** The skill previously reported only a
+      byte count, so the daemon spent an API call to make audio and then dropped it — audio nobody
+      can play is not a capability. Clips land in `{data_dir}/audio/tts-<nanos>.mp3`, nanosecond-named
+      because two skills can speak at once and a fixed name would have them overwrite each other
+      silently; the skill's own text was updated to report where.
+      Both ceilings are **the provider's, restated where the caller can be told**: TTS input 4096
+      **characters** (counted as characters, not bytes — a byte count would refuse a multi-byte
+      script at a quarter of the real limit, and there is a test for exactly that) and transcription
+      uploads 25 MB, checked from `metadata()` before the bytes are buffered. 10 tests, all of them
+      offline — the ceiling check was pulled out as a pure function precisely so the multi-byte test
+      stopped making a real network call.
+      **Not verified:** a live TTS or Whisper call; this host has no OpenAI credential. Everything
+      up to the request is tested.
+- [ ] ~~**`audio.transcribe`**~~ — Whisper client written (crates/nanna-tools/src/builtin/audio.rs); channel
       listeners already extract voice-note file ids, but the daemon drops non-text messages
       (crates/nanna-daemon/src/channels.rs:231). Register the service, download channel media, transcribe
       before the ignore-non-text branch. Voice note from your phone → answer is hallmark personal-daemon UX.

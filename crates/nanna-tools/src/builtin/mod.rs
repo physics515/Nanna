@@ -50,4 +50,4 @@ pub use browser_wiring::{BrowserManager, create_browser_tools};
 #[cfg(feature = "vision")]
 pub use vision_wiring::{create_vision_fn, create_vision_tool};
 
-pub use audio_wiring::{create_tts_tool, create_tts_tool_with_dir, create_transcribe_tool, create_audio_tools};
+pub use audio_wiring::{create_audio_tools, create_transcribe_tool, create_transcribe_tool_fn, create_tts_fn, create_tts_tool, create_tts_tool_with_dir};

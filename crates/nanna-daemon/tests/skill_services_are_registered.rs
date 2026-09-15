@@ -32,14 +32,6 @@ use std::path::{Path, PathBuf};
 /// [`no_known_missing_entry_is_stale`].
 const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
     (
-        "audio.transcribe",
-        "P18: Whisper client written, never wired",
-    ),
-    (
-        "audio.tts",
-        "P18: only OpenAI TTS exists, and it is unwired",
-    ),
-    (
         "browser.action",
         "P18: nanna-browser is real but registered nowhere",
     ),
