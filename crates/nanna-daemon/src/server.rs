@@ -603,47 +603,76 @@ fn opt_count(params: &serde_json::Value, key: &str) -> Result<Option<usize>, Str
         .map_err(|_| format!("{key} must be zero or a positive whole number (got {n})."))
 }
 
-fn build_script_services(
-    memory: &Option<Arc<MemoryService>>,
+/// Everything [`build_script_services`] needs, named.
+///
+/// It grew from seven positional parameters to thirteen in one run (2026-09-15),
+/// and three of the new ones are adjacent `Option<PathBuf>`s that the compiler
+/// would happily let a caller transpose. They happen to carry the same value
+/// today, which means a transposition would be silent *and* harmless — the worst
+/// combination, because it would stay wrong the moment they diverge. Named
+/// fields make that class of mistake unrepresentable, and `Default` lets a test
+/// name only the dependency it exercises.
+#[derive(Default)]
+struct ScriptServiceDeps {
+    memory: Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
     session_history: SharedSessionHistory,
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
     turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    // Router plus the LIVE config the model list is resolved from at call
-    // time. A `Vec<String>` here would be a boot snapshot, and this service
-    // outlives every `config.set` (2026-08-15).
+    /// Router plus the LIVE config the model list is resolved from at call
+    /// time. A `Vec<String>` here would be a boot snapshot, and this service
+    /// outlives every `config.set` (2026-08-15).
     summarizer: Option<(
         Arc<crate::llm_router::LlmRouter>,
         Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
     )>,
-    // The tools directory and live registry the authoring services write into,
-    // plus the slot they read the finished service map back out of. `None`
-    // leaves `tools.{create,update,list}` unregistered, which withholds the
-    // three authoring skills rather than half-wiring them.
+    /// The tools directory and live registry the authoring services write into,
+    /// plus the slot they read the finished service map back out of. `None`
+    /// leaves `tools.{create,update,list}` unregistered, which withholds the
+    /// three authoring skills rather than half-wiring them.
     tool_authoring: Option<(
         PathBuf,
         std::sync::Weak<nanna_tools::ToolRegistry>,
         Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
     )>,
-    // Router plus the configured vision-model priority list. `None`, an empty
-    // list, or a list the router cannot serve all leave `vision.analyze`
-    // unregistered, which withholds the three vision skills rather than
-    // advertising tools that can only fail.
+    /// Router plus the configured vision-model priority list. `None`, an empty
+    /// list, or a list the router cannot serve all leave `vision.analyze`
+    /// unregistered, which withholds the three vision skills rather than
+    /// advertising tools that can only fail.
     vision: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
-    // The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
-    // image-only pages unread and the response says so.
+    /// The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
+    /// image-only pages unread and the response says so.
     pdf_ocr: Option<nanna_tools::PdfOcrFn>,
-    // OpenAI key plus the data dir generated speech is written under. `None` or
-    // no key leaves `audio.tts` / `audio.transcribe` unregistered.
+    /// OpenAI key plus the data dir generated speech is written under. `None` or
+    /// no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
-    // The data dir page screenshots are written under. `None`, or no
-    // Chromium-family browser on the host, leaves `browser.*` unregistered.
+    /// The data dir page screenshots are written under. `None`, or no
+    /// Chromium-family browser on the host, leaves `browser.*` unregistered.
     browser_data_dir: Option<PathBuf>,
-    // The data dir desktop captures are written under. `None`, or no capture
-    // tool / display session, leaves `screenshot.capture` unregistered.
+    /// The data dir desktop captures are written under. `None`, or no capture
+    /// tool / display session, leaves `screenshot.capture` unregistered.
     screenshot_data_dir: Option<PathBuf>,
-) -> HashMap<String, ServiceFn> {
+}
+
+
+fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> {
+    let ScriptServiceDeps {
+        memory,
+        spawner,
+        session_history,
+        workspace_id,
+        storage,
+        turn_baselines,
+        summarizer,
+        tool_authoring,
+        vision,
+        pdf_ocr,
+        audio,
+        browser_data_dir,
+        screenshot_data_dir,
+    } = deps;
+    let memory = &memory;
     use serde_json::{Value, json};
 
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
@@ -4038,24 +4067,24 @@ impl DaemonServer {
                 Arc::clone(&authoring_slot),
             ));
 
-            let services = build_script_services(
-                &memory,
-                spawner_arc,
-                session_history.clone(),
-                workspace_id_for_services.clone(),
-                self.storage.clone(),
-                turn_baselines.clone(),
-                Some((router.clone(), Arc::clone(&shared_agent_config))),
+            let services = build_script_services(ScriptServiceDeps {
+                memory: memory.clone(),
+                spawner: spawner_arc,
+                session_history: session_history.clone(),
+                workspace_id: workspace_id_for_services.clone(),
+                storage: self.storage.clone(),
+                turn_baselines: turn_baselines.clone(),
+                summarizer: Some((router.clone(), Arc::clone(&shared_agent_config))),
                 tool_authoring,
-                Some((router.clone(), vision_models.clone())),
-                crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
-                Some((
+                vision: Some((router.clone(), vision_models.clone())),
+                pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
+                audio: Some((
                     self.config.llm.openai_api_key.clone(),
                     self.config.data_dir.clone(),
                 )),
-                Some(self.config.data_dir.clone()),
-                Some(self.config.data_dir.clone()),
-            );
+                browser_data_dir: Some(self.config.data_dir.clone()),
+                screenshot_data_dir: Some(self.config.data_dir.clone()),
+            });
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
             // happen here and would leave the authoring services reading a
@@ -5515,21 +5544,7 @@ mod tests {
     /// wired. This calls it end to end against a real document.
     #[tokio::test]
     async fn the_pdf_read_service_is_registered_and_reads_a_real_document() {
-        let services = build_script_services(
-            &None,
-            None,
-            Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            Arc::new(tokio::sync::RwLock::new(None)),
-            None,
-            Arc::new(crate::tasks::TurnBaselines::new()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-           None,
-        );
+        let services = build_script_services(ScriptServiceDeps::default());
         let pdf_read = services
             .get("pdf.read")
             .expect("the read_pdf skill's declared service must exist");
@@ -5585,21 +5600,10 @@ mod tests {
             Box::pin(async { Ok("stub ocr text".to_string()) })
         });
 
-        let services = build_script_services(
-            &None,
-            None,
-            Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            Arc::new(tokio::sync::RwLock::new(None)),
-            None,
-            Arc::new(crate::tasks::TurnBaselines::new()),
-            None,
-            None,
-            None,
-            Some(ocr_fn),
-            None,
-            None,
-           None,
-        );
+        let services = build_script_services(ScriptServiceDeps {
+            pdf_ocr: Some(ocr_fn),
+            ..ScriptServiceDeps::default()
+        });
         let pdf_read = services.get("pdf.read").expect("pdf.read is registered");
 
         let dir = tempfile::tempdir().expect("temp dir");
