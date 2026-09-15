@@ -640,6 +640,9 @@ fn build_script_services(
     // The data dir page screenshots are written under. `None`, or no
     // Chromium-family browser on the host, leaves `browser.*` unregistered.
     browser_data_dir: Option<PathBuf>,
+    // The data dir desktop captures are written under. `None`, or no capture
+    // tool / display session, leaves `screenshot.capture` unregistered.
+    screenshot_data_dir: Option<PathBuf>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -1122,6 +1125,14 @@ fn build_script_services(
                 })
             }),
         );
+    }
+
+    // Desktop capture. The `screenshot` skill declares this; the Rust tool
+    // behind it was a stub, so this is the implementation, not a registration.
+    if let Some(data_dir) = screenshot_data_dir {
+        services.extend(crate::screenshot_service::build_screenshot_services(
+            &data_dir,
+        ));
     }
 
     // Browser. The four browser_* skills declare these; nanna-browser was
@@ -4034,6 +4045,7 @@ impl DaemonServer {
                     self.config.data_dir.clone(),
                 )),
                 Some(self.config.data_dir.clone()),
+                Some(self.config.data_dir.clone()),
             );
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
@@ -5491,6 +5503,7 @@ mod tests {
             None,
             None,
             None,
+           None,
         );
         let pdf_read = services
             .get("pdf.read")
@@ -5560,6 +5573,7 @@ mod tests {
             Some(ocr_fn),
             None,
             None,
+           None,
         );
         let pdf_read = services.get("pdf.read").expect("pdf.read is registered");
 

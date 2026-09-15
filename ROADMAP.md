@@ -4311,9 +4311,28 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
                         `ensure_permissions` already writes there, which is how the `edit_tool`
                         permissions gap surfaced — but authoring makes it much easier to hit.
                         Decide whether a debug daemon should author into the data dir instead.
-- [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
-      (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
-      local model, largely redundant with exec + browser).
+- [x] **`screenshot.capture` implemented** *(2026-09-15)* — the note was right that the Rust tool is a
+      stub, so this is the implementation rather than a registration. **Only the three `schedule.*`
+      skills remain withheld, down from 16 at the start of the run.** Input synthesis stays deferred.
+      **Shells out to the desktop's own capture tool instead of taking a screen-capture dependency.**
+      Capture is not portable library work — Wayland goes through the compositor (`grim`), X11 through
+      the server (`maim`/`scrot`/`import`), macOS through `screencapture` — and each already ships
+      where it applies and speaks PNG-to-a-path, so the entire difference between them is a command
+      line. A table of six, **Wayland before X11 because an X11 tool under Wayland succeeds and
+      captures the wrong thing**, which is worse than failing (test asserts the ordering).
+      **Registered only when a tool *and* a display session both exist**; a headless daemon has
+      nothing to photograph. Success is not taken at face value either: several of these exit 0 after
+      writing nothing, so the file is stat'd and an empty one is an error.
+      **Window capture is refused, not faked.** The skill's schema advertised "a window title to
+      capture specific window", which no tool here can do — returning the whole desktop instead is a
+      wrong answer, not a degraded one. The schema is corrected to `enum: ["desktop"]` and the refusal
+      points at `browser_screenshot` for the web-page case. The skill also stops reporting a byte
+      count and dropping the image, the same correction `audio.tts` and `browser.screenshot` got.
+      6 tests. **Deliberately not verified: an actual capture.** Running `grim` here would photograph
+      the operator's real desktop, unasked, to prove plumbing — so registration was verified on the
+      real daemon (`tool="grim" executable="/usr/bin/grim"`, and the boot left the screenshot
+      directory empty) and the pixel path was not exercised. A capture is one command; someone's
+      screen is not test fixture.
 - [ ] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
       constructed nowhere and nanna-config has no `[mcp]` section. Add config + daemon boot registration +
       bearer/OAuth headers on HttpTransport (currently none) + Streamable HTTP (pinned to 2024-11-05 legacy

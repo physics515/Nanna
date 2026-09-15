@@ -54,10 +54,6 @@ const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
          reaches no channel (server.rs warns 'channel routing ... not \
          implemented'), so a reminder would fire into the log",
     ),
-    (
-        "screenshot.capture",
-        "P18: skill exists, service missing, Rust tool is a stub",
-    ),
 ];
 
 /// Fewest skills the tree can plausibly hold; below this the walk found nothing

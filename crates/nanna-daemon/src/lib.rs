@@ -55,6 +55,7 @@ pub mod tool_authoring;
 pub mod vision_service;
 pub mod audio_service;
 pub mod browser_service;
+pub mod screenshot_service;
 pub mod user_tools;
 pub mod webhook;
 
