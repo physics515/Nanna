@@ -80,7 +80,7 @@ A fully local run needs none.
 | **Signal Channel** | ✅ Stable | Signal CLI bridge |
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
-| **Tool System (44 tools)** | ✅ Stable | — |
+| **Tool System (44 tools, 41 wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
 | **MCP Client** | ✅ Stable | MCP server |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
@@ -95,8 +95,27 @@ A fully local run needs none.
   with drift protection: what you *stated* is kept in your words and never paraphrased away, and a
   summary is never re-summarized ([measured](bench/BASELINE.md#summarization-drift-content-fidelity-not-recall))
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
-- **44 filesystem tools** — File, shell, web, vision, OCR, PDF, memory, and scheduling tools,
-  including `find_files` for locating a file by glob when you know its name but not its path
+- **44 filesystem tools, 41 of them wired** — file, shell, web, code-search, memory, task and
+  curiosity tools work with no setup. A tool whose daemon-side service is missing is **withheld from
+  the model rather than offered and left to fail**, and the daemon says at boot which ones and why —
+  so the count you get is the count that works. Four groups need something present to register:
+  **vision** (`analyze_image`, `describe_image`, `ocr`, and OCR for scanned PDFs) wants a
+  vision-capable model in `[memory] ocr_model_priority`; **speech** (`text_to_speech`, `transcribe`)
+  wants an OpenAI key; **browsing** (`browser_action`, `browser_evaluate`, `browser_extract`,
+  `browser_screenshot`) wants Chromium or Chrome installed; and **`screenshot`** wants a desktop
+  capture tool (`grim`, `spectacle`, `maim`, `scrot`, `import`, or macOS `screencapture`) and a
+  display session. The three reminder tools (`remind`, `list_reminders`, `cancel_reminder`) are not
+  wired yet. Also includes `find_files` for locating a file by glob when you know its name but not
+  its path.
+- **Nanna can write its own tools** — `create_tool` authors a new JS/TS tool into the data directory
+  and registers it live, callable in the same conversation with no restart; `edit_tool` changes one,
+  refusing an edit that matches zero or several places rather than guessing, and re-registering on
+  success; `list_user_tools` shows what has been authored.
+- **Reads what it is shown** — `read_pdf` falls back to model OCR for image-only pages when a vision
+  model is configured, and reports which of four things happened (no OCR configured, OCR ran, the
+  document has no images to read, or no page was missing text) instead of returning an empty string
+  for all of them. Screenshots and generated speech are written to files and their paths returned,
+  not summarised as a byte count and discarded.
 - **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
 - **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
