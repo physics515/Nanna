@@ -24,7 +24,6 @@ tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
 # Reconnection
-backoff = { version = "0.4", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

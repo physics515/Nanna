@@ -94,15 +94,67 @@ pub fn dev_tools_dir() -> Option<PathBuf> {
     None
 }
 
-/// Default permissions for built-in TS skills.
-/// These need broader permissions than typical user tools.
+/// Scope written into a tool directory whose author declared none.
+///
+/// This is a grant made on somebody else's behalf, so it is deliberately not
+/// the widest one. It used to be `read: ["*"], write: ["*"]` — whole-filesystem
+/// access to any tool that simply forgot the file, which is how `edit_tool`
+/// (the tool whose job is rewriting other tools' source) ran unscoped while its
+/// sibling `create_tool` was confined to home.
+///
+/// `~` is the narrowest scope the reviewed corpus shows is commonly sufficient:
+/// of the 44 bundled skills, **30 declare `~` and 13 declare `*`**, so home is
+/// the modal authored choice and a tool that genuinely needs more now has to say
+/// so. `ScriptedToolWrapper::from_file` expands `~` to the real home directory
+/// at load time, so the scope is enforced, not decorative.
+///
+/// `run`, `net` and `env` are left as they were: 40 of the 44 declare exactly
+/// `run: true, net: ["*"], env: true`, so those are not over-grants relative to
+/// the corpus. (Narrowing `env` is a separate decision with a different
+/// rationale — it has no scope vocabulary, only on/off — and is tracked in the
+/// roadmap rather than ridden along here.)
+///
+/// **Existing installs are unaffected.** [`ensure_permissions`] writes only when
+/// the file is absent, and the grant it writes is persisted, so a directory that
+/// already received the old wide default keeps it until somebody edits it. The
+/// narrowing reaches newly-created undeclared tools only.
 pub const DEFAULT_PERMISSIONS_JSON: &str = r#"{
-    "read": ["*"],
-    "write": ["*"],
+    "read": ["~"],
+    "write": ["~"],
     "run": true,
     "net": ["*"],
     "env": true
 }"#;
+
+/// The scope string meaning "the whole filesystem".
+///
+/// Named because [`default_permissions_are_home_bounded`] and the test that pins
+/// the decision must check for the same thing, not two spellings of it.
+const FILESYSTEM_WILDCARD: &str = "*";
+
+/// Whether [`DEFAULT_PERMISSIONS_JSON`]'s filesystem scope stays inside home.
+///
+/// Pure and cheap, so the always-on guard in [`ensure_permissions`] and the test
+/// that pins this decision assert the identical property. A scope is home-bounded
+/// when it is non-empty (an empty list would break every undeclared tool rather
+/// than confine it) and names no [`FILESYSTEM_WILDCARD`].
+#[must_use]
+pub fn default_permissions_are_home_bounded() -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(DEFAULT_PERMISSIONS_JSON) else {
+        return false;
+    };
+    ["read", "write"].iter().all(|field| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|scopes| {
+                !scopes.is_empty()
+                    && scopes
+                        .iter()
+                        .all(|scope| scope.as_str() != Some(FILESYSTEM_WILDCARD))
+            })
+    })
+}
 
 /// Resolve the tools directory from environment, config, or the dev fallback.
 ///
@@ -243,33 +295,78 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
         }
 
         if count > 0 {
-            // Ensure permissions are set for newly created skills
-            ensure_permissions(tools_dir);
-            tracing::info!("Bootstrapped {} default skills into {:?}", count, tools_dir);
+            // Ensure permissions are set for newly created skills. Every
+            // bundled skill ships its own file, so a non-zero count here means
+            // one regressed — `ensure_permissions` announces which.
+            let granted_count = ensure_permissions(tools_dir);
+            tracing::info!(
+                granted_count,
+                "Bootstrapped {} default skills into {:?}",
+                count,
+                tools_dir
+            );
         }
 
         count
     }
 }
 
-/// Ensure a tools directory has correct permissions.json files for all subdirectories.
+/// Write [`DEFAULT_PERMISSIONS_JSON`] into every tool subdirectory lacking a
+/// `permissions.json`, and report how many grants that made.
 ///
-/// Writes `permissions.json` into any tool subdirectory that lacks one.
-pub fn ensure_permissions(tools_dir: &Path) {
+/// A directory that ships its own file is never touched, so this only ever
+/// speaks for an author who declared nothing. Each such grant is announced at
+/// `warn` naming the tool: a permission handed out on somebody's behalf has to
+/// be reviewable, and before this it was written silently with nothing but the
+/// file itself left to notice.
+///
+/// Returns the count of directories granted, so a caller can say so at boot and
+/// so the announcement is testable without scraping logs.
+pub fn ensure_permissions(tools_dir: &Path) -> usize {
+    assert!(
+        default_permissions_are_home_bounded(),
+        "DEFAULT_PERMISSIONS_JSON grants whole-filesystem read or write to a \
+         tool whose author declared nothing — exactly the fail-open this \
+         default exists to prevent",
+    );
+
     let Ok(entries) = std::fs::read_dir(tools_dir) else {
-        return;
+        return 0;
     };
+
+    let mut granted_count: usize = 0;
+    let mut directory_count: usize = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            let perms = path.join("permissions.json");
-            if !perms.exists() {
-                if let Err(e) = std::fs::write(&perms, DEFAULT_PERMISSIONS_JSON) {
-                    tracing::debug!("Could not write permissions.json to {:?}: {}", path, e);
-                }
-            }
+        if !path.is_dir() {
+            continue;
         }
+        directory_count += 1;
+
+        let perms = path.join("permissions.json");
+        if perms.exists() {
+            continue;
+        }
+
+        if let Err(e) = std::fs::write(&perms, DEFAULT_PERMISSIONS_JSON) {
+            tracing::debug!("Could not write permissions.json to {:?}: {}", path, e);
+            continue;
+        }
+
+        granted_count += 1;
+        tracing::warn!(
+            tool = ?path.file_name().unwrap_or(path.as_os_str()),
+            "Tool declared no permissions.json; wrote the home-scoped default \
+             (read/write ~, run, net *, env). Declare the file to choose a \
+             different scope.",
+        );
     }
+
+    debug_assert!(
+        granted_count <= directory_count,
+        "granted more permission files than there were tool directories",
+    );
+    granted_count
 }
 
 /// Load the `discover_tools` skill source from a tools directory.
@@ -430,10 +527,93 @@ mod tests {
         // No permissions.json yet
         assert!(!tool_dir.join("permissions.json").exists());
 
-        ensure_permissions(dir.path());
+        let granted_count = ensure_permissions(dir.path());
 
         // Now it should exist
         assert!(tool_dir.join("permissions.json").exists());
+        assert_eq!(
+            granted_count, 1,
+            "the one undeclared tool was not counted as a grant",
+        );
+    }
+
+    /// The decision this default encodes: a tool whose author declared nothing
+    /// is confined to home, not handed the filesystem.
+    ///
+    /// Asserted on the bytes actually written rather than on the constant, so
+    /// re-widening the constant fails here even if the guard is removed.
+    #[test]
+    fn undeclared_tools_are_granted_home_scope_not_the_filesystem() {
+        let dir = tempdir().unwrap();
+        let tool_dir = dir.path().join("undeclared_tool");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+
+        assert_eq!(ensure_permissions(dir.path()), 1);
+
+        let written = std::fs::read_to_string(tool_dir.join("permissions.json")).unwrap();
+        let perms: serde_json::Value = serde_json::from_str(&written)
+            .expect("the default this writes must deserialize, or the loader ignores it");
+
+        for field in ["read", "write"] {
+            let scopes = perms[field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} is not an array"));
+            assert!(
+                !scopes.is_empty(),
+                "{field} is empty, which denies an undeclared tool everything \
+                 instead of confining it",
+            );
+            assert!(
+                scopes.iter().all(|s| s.as_str() != Some("*")),
+                "{field} grants the whole filesystem to a tool that declared \
+                 nothing — the fail-open this default exists to prevent",
+            );
+        }
+
+        assert!(default_permissions_are_home_bounded());
+    }
+
+    /// A directory that ships its own file keeps it verbatim. This is what
+    /// makes the narrowing safe for existing installs: the grant is persisted,
+    /// so a directory that already holds the old wide default is not rewritten.
+    #[test]
+    fn a_declared_permissions_file_is_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let tool_dir = dir.path().join("declared_tool");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+
+        let chosen = r#"{"read":["*"],"write":[],"run":false,"net":[],"env":false}"#;
+        let perms_path = tool_dir.join("permissions.json");
+        std::fs::write(&perms_path, chosen).unwrap();
+
+        assert_eq!(
+            ensure_permissions(dir.path()),
+            0,
+            "a tool that declared its own scope was counted as a grant",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&perms_path).unwrap(),
+            chosen,
+            "an authored permissions.json was overwritten",
+        );
+    }
+
+    /// A file is a file, not a tool directory — walking it must not panic and
+    /// must not count.
+    #[test]
+    fn ensure_permissions_ignores_loose_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "not a tool").unwrap();
+
+        assert_eq!(ensure_permissions(dir.path()), 0);
+        assert!(!dir.path().join("permissions.json").exists());
+    }
+
+    /// An unreadable directory yields no grants rather than a panic.
+    #[test]
+    fn ensure_permissions_on_a_missing_directory_grants_nothing() {
+        let dir = tempdir().unwrap();
+        assert_eq!(ensure_permissions(&dir.path().join("does_not_exist")), 0);
     }
 
     #[test]

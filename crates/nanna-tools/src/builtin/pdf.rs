@@ -31,7 +31,12 @@ use std::sync::Arc;
 ///
 /// Arguments: `(base64_image_data, prompt, media_type)` → `Result<text, err_msg>`
 pub type PdfVisionFn = Arc<
-    dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+    dyn Fn(
+            String,
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -42,7 +47,12 @@ pub type PdfVisionFn = Arc<
 /// extractable text but do contain embedded image objects.  The daemon
 /// wires this to the tiered `OcrTool` pipeline.
 pub type OcrFn = Arc<
-    dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+    dyn Fn(
+            String,
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -560,6 +570,90 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
         page_count,
         pages_read,
         empty_pages,
+    })
+}
+
+/// What OCR did, and what it found.
+///
+/// Three outcomes, kept apart on purpose. "No OCR pipeline is configured" and
+/// "OCR ran and the page really is blank" produce the same empty text, and
+/// collapsing them is the failure the `read_pdf` OCR item was held back on for
+/// two runs: a caller cannot tell a scanned document it could read from one it
+/// cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdfOcrOutcome {
+    /// No page was missing text, so OCR was never needed.
+    NotNeeded,
+    /// Pages were missing text but no OCR pipeline is available.
+    Unavailable,
+    /// OCR ran over `images_read` embedded images.
+    Ran {
+        /// Recovered text, empty when the images genuinely carried none.
+        text: String,
+        /// How many embedded images were sent.
+        images_read: usize,
+    },
+    /// Pages were missing text and the document carried no embedded images to
+    /// OCR — a different problem from either of the above, and the one that
+    /// means "this PDF is not a scan".
+    NoImages,
+}
+
+/// Run OCR over a document's embedded images, if it needs it and can.
+///
+/// Structured rather than the markdown [`ReadPdfTool`] appends, so a caller
+/// that returns JSON can report the outcome instead of embedding prose in a
+/// text field.
+///
+/// # Errors
+/// Returns `ToolError` when the document cannot be parsed for images.
+pub async fn ocr_empty_pages(
+    bytes: &[u8],
+    selection: PageSelection,
+    empty_page_count: usize,
+    ocr_fn: Option<&OcrFn>,
+) -> Result<PdfOcrOutcome, ToolError> {
+    use std::fmt::Write as _;
+
+    if empty_page_count == 0 {
+        return Ok(PdfOcrOutcome::NotNeeded);
+    }
+    let Some(ocr_fn) = ocr_fn else {
+        return Ok(PdfOcrOutcome::Unavailable);
+    };
+
+    let images = extract_pdf_images(bytes, selection)?;
+    if images.is_empty() {
+        return Ok(PdfOcrOutcome::NoImages);
+    }
+
+    let images_read = images.len();
+    let mut recovered = String::new();
+    for (index, (image_data, media_type)) in images.into_iter().enumerate() {
+        let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
+        let prompt = "Extract ALL text from this image using OCR. Output the \
+                      extracted text only."
+            .to_string();
+        match ocr_fn(encoded, prompt, media_type).await {
+            Ok(text) if !text.trim().is_empty() => {
+                let _ = writeln!(recovered, "### Image {} (OCR)\n{text}\n", index + 1);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A failed image is reported, not dropped: partial OCR that
+                // silently omits a page reads as a page with no text.
+                let _ = writeln!(
+                    recovered,
+                    "### Image {} (OCR failed)\nError: {e}\n",
+                    index + 1
+                );
+            }
+        }
+    }
+    debug_assert!(images_read > 0, "reported OCR over no images");
+    Ok(PdfOcrOutcome::Ran {
+        text: recovered,
+        images_read,
     })
 }
 

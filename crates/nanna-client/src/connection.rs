@@ -233,14 +233,59 @@ impl Client {
         self.event_tx.subscribe()
     }
 
-    /// Subscribe to the events of one session only.
+    /// Subscribe to the events of one session only, filtering **locally**.
     ///
-    /// The daemon's IPC layer forwards every event to every connected client (a
-    /// `Subscribe` action is recorded in the session store but does not narrow what
-    /// the connection sends), so the filtering happens here, by [`Event::session_id`].
+    /// This narrows what this stream yields, not what the daemon sends: the
+    /// connection still receives every event and discards the rest here, by
+    /// [`Event::session_id`]. That is deliberate — several of these streams can
+    /// be held at once over one connection, which server-side narrowing would
+    /// break. To also stop the other sessions' events leaving the daemon, call
+    /// [`Self::narrow_to_session`], which affects the whole connection.
     #[must_use]
     pub fn subscribe_session(&self, session_id: impl Into<String>) -> SessionEvents {
         SessionEvents::new(self.event_tx.subscribe(), session_id.into())
+    }
+
+    /// Ask the daemon to stop sending this **connection** any session's events
+    /// but the ones it names.
+    ///
+    /// Call it once per session of interest; each call adds to the set. Events
+    /// that carry no session (config, memory, workspace, channel, connection)
+    /// keep arriving — narrowing is about sessions, not about going quiet.
+    ///
+    /// This is connection-wide, so every [`SessionEvents`] stream held over the
+    /// same connection is affected: a stream for a session that was never named
+    /// will simply stop yielding. [`Self::widen_to_all_sessions`] undoes it.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::NotConnected`] when the client has no live
+    /// connection, or [`ClientError::Request`] when the daemon does not hold
+    /// `session_id`.
+    pub async fn narrow_to_session(&self, session_id: impl Into<String>) -> Result<()> {
+        let session_id = session_id.into();
+        let response = self
+            .request(Action::Subscribe(SubscribeAction::Session {
+                session_id: session_id.clone(),
+            }))
+            .await?;
+        if response.get("error").is_some() {
+            return Err(ClientError::Request(format!(
+                "daemon refused to narrow to session {session_id}: {response}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Undo [`Self::narrow_to_session`]: this connection receives every
+    /// session's events again.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::NotConnected`] when the client has no live
+    /// connection.
+    pub async fn widen_to_all_sessions(&self) -> Result<()> {
+        self.request(Action::Subscribe(SubscribeAction::AllSessions))
+            .await?;
+        Ok(())
     }
     
     /// Send a request and wait for response

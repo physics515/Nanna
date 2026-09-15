@@ -212,6 +212,8 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         webhook: WebhookConfig::default(),
         use_script_tools: config.tools.use_script_tools,
         tools_dir: config.tools.tools_dir.clone(),
+        // `ocr_model_priority` already means "vision-capable models, in order".
+        vision_model_priority: config.memory.ocr_model_priority.clone(),
         tool_allowlist: Some(config.tools.enabled.clone()),
         tool_denylist: config.tools.disabled.clone(),
         tool_audit_log: config.tools.audit_log,

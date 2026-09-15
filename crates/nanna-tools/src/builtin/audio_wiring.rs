@@ -9,19 +9,28 @@ use std::sync::Arc;
 ///
 /// Voices: alloy, echo, fable, onyx, nova, shimmer
 pub fn create_tts_tool(api_key: impl Into<String>, default_voice: Option<&str>) -> TextToSpeechTool {
+    TextToSpeechTool::new().with_tts_fn(create_tts_fn(api_key, default_voice))
+}
+
+/// The speech call on its own, without the tool wrapper.
+///
+/// Extracted for the same reason as `create_vision_fn`: the daemon's
+/// `audio.tts` service is not a [`Tool`](crate::Tool), and a second copy of the
+/// client setup would be a second place for the default voice and the endpoint
+/// to drift.
+#[must_use]
+pub fn create_tts_fn(api_key: impl Into<String>, default_voice: Option<&str>) -> TtsFn {
     let tts_client = Arc::new(
         OpenAiTts::new(api_key)
             .with_voice(default_voice.unwrap_or("nova"))
     );
 
-    let tts_fn: TtsFn = Arc::new(move |text: String, voice: Option<String>| {
+    Arc::new(move |text: String, voice: Option<String>| {
         let client = tts_client.clone();
         Box::pin(async move {
             client.speak(&text, voice.as_deref()).await
         })
-    });
-
-    TextToSpeechTool::new().with_tts_fn(tts_fn)
+    })
 }
 
 /// Create a TTS tool with a custom output directory for saving audio files.
@@ -35,16 +44,21 @@ pub fn create_tts_tool_with_dir(
 
 /// Create a transcription tool wired to OpenAI's Whisper API.
 pub fn create_transcribe_tool(api_key: impl Into<String>) -> TranscribeTool {
+    TranscribeTool::new().with_transcribe_fn(create_transcribe_tool_fn(api_key))
+}
+
+/// The transcription call on its own, without the tool wrapper. See
+/// [`create_tts_fn`] for why.
+#[must_use]
+pub fn create_transcribe_tool_fn(api_key: impl Into<String>) -> TranscribeFn {
     let whisper_client = Arc::new(OpenAiWhisper::new(api_key));
 
-    let transcribe_fn: TranscribeFn = Arc::new(move |audio: Vec<u8>, language: Option<String>| {
+    Arc::new(move |audio: Vec<u8>, language: Option<String>| {
         let client = whisper_client.clone();
         Box::pin(async move {
             client.transcribe(&audio, language.as_deref()).await
         })
-    });
-
-    TranscribeTool::new().with_transcribe_fn(transcribe_fn)
+    })
 }
 
 /// Create both TTS and transcription tools wired to OpenAI.

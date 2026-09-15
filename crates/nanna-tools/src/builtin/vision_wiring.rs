@@ -10,6 +10,19 @@ use std::sync::Arc;
 ///
 /// The LLM client should support Anthropic's vision API (claude-3-* models).
 pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageTool {
+    AnalyzeImageTool::new().with_vision_fn(create_vision_fn(llm, model))
+}
+
+/// The vision call on its own, without the tool wrapper.
+///
+/// Extracted so a caller that is not a [`Tool`](crate::Tool) — the daemon's
+/// `vision.analyze` service, which the bundled `analyze_image` / `describe_image`
+/// / `ocr` skills call — reaches the same request construction instead of a
+/// second copy of it. That matters here specifically: the request has to run
+/// `sampling_temperature_for_model`, because `temperature` is rejected outright
+/// by current Claude models and a hand-rolled duplicate would not know that.
+#[must_use]
+pub fn create_vision_fn(llm: Arc<LlmClient>, model: String) -> VisionFn {
     let vision_fn: VisionFn = Arc::new(move |image: String, prompt: String, media_type: String| {
         let llm = llm.clone();
         let model = model.clone();
@@ -47,6 +60,12 @@ pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageToo
                 stream: None,
                 thinking: None,
                 cache_control: None,
+                // Bit-rot caught the moment the `vision` feature was first
+                // enabled (2026-09-15): `AnthropicRequest` grew this field and
+                // this file did not, because nothing in the workspace compiled
+                // it. `None` is the same value every other call site uses — it
+                // is an Ollama `num_ctx` override, not a vision setting.
+                context_limit: None,
             };
 
             let response = llm
@@ -72,12 +91,15 @@ pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageToo
         })
     });
 
-    AnalyzeImageTool::new().with_vision_fn(vision_fn)
+    vision_fn
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Same bit-rot as `context_limit` above: this test never compiled while the
+    // `vision` feature was enabled nowhere, and `definition()` needs its trait.
+    use crate::Tool;
 
     #[test]
     fn test_vision_tool_creation() {

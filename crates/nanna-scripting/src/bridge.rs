@@ -2133,3 +2133,65 @@ mod drive_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod env_containment_tests {
+    use super::{NannaBridge, ToolPermissions};
+
+    /// **A known gap, pinned so it cannot be closed by accident.**
+    ///
+    /// `permissions.env` gates exactly one thing: `NannaBridge::get_env`. It
+    /// does **not** scope the environment a spawned child inherits — nothing in
+    /// this crate calls `Command::env_clear`, so a tool with `run: true` reads
+    /// any variable the daemon holds, including provider API keys, whatever
+    /// `env` says.
+    ///
+    /// That matters because it answers a roadmap question: narrowing the
+    /// written-on-your-behalf default from `env: true` to `env: false` would
+    /// break `Nanna.getEnv` for undeclared tools while leaving this path wide
+    /// open — a compatibility cost for no containment, since the same default
+    /// also grants `run: true`.
+    ///
+    /// So this test asserts today's behaviour rather than the behaviour we
+    /// want. **If it starts failing, that is good news**: somebody scoped the
+    /// child environment, and the `env` default can then be narrowed for real.
+    /// Update it then; do not "fix" it by loosening the assertion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn env_false_does_not_stop_a_tool_reading_the_environment_through_exec() {
+        // SAFETY: single-threaded test setup before any child is spawned.
+        unsafe {
+            std::env::set_var("NANNA_ENV_CONTAINMENT_PROBE", "leaked");
+        }
+
+        let denied_env = ToolPermissions {
+            run: true,
+            env: false,
+            ..ToolPermissions::default()
+        };
+        let bridge = NannaBridge::new(denied_env);
+
+        // The gate `env: false` does enforce.
+        assert!(
+            bridge.get_env("NANNA_ENV_CONTAINMENT_PROBE").is_err(),
+            "`env: false` must deny the scripting bridge's own env accessor",
+        );
+
+        // The path it does not.
+        let result = bridge
+            .exec("printf '%s' \"$NANNA_ENV_CONTAINMENT_PROBE\"", None)
+            .await
+            .expect("exec is permitted by `run: true`");
+        assert_eq!(
+            result.stdout.trim(),
+            "leaked",
+            "this test pins a known gap: if the child no longer inherits the \
+             variable, the exec environment has been scoped and the roadmap's \
+             `env` item can move — update this test rather than relaxing it",
+        );
+
+        unsafe {
+            std::env::remove_var("NANNA_ENV_CONTAINMENT_PROBE");
+        }
+    }
+}

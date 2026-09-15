@@ -603,21 +603,76 @@ fn opt_count(params: &serde_json::Value, key: &str) -> Result<Option<usize>, Str
         .map_err(|_| format!("{key} must be zero or a positive whole number (got {n})."))
 }
 
-fn build_script_services(
-    memory: &Option<Arc<MemoryService>>,
+/// Everything [`build_script_services`] needs, named.
+///
+/// It grew from seven positional parameters to thirteen in one run (2026-09-15),
+/// and three of the new ones are adjacent `Option<PathBuf>`s that the compiler
+/// would happily let a caller transpose. They happen to carry the same value
+/// today, which means a transposition would be silent *and* harmless — the worst
+/// combination, because it would stay wrong the moment they diverge. Named
+/// fields make that class of mistake unrepresentable, and `Default` lets a test
+/// name only the dependency it exercises.
+#[derive(Default)]
+struct ScriptServiceDeps {
+    memory: Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
     session_history: SharedSessionHistory,
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
     turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    // Router plus the LIVE config the model list is resolved from at call
-    // time. A `Vec<String>` here would be a boot snapshot, and this service
-    // outlives every `config.set` (2026-08-15).
+    /// Router plus the LIVE config the model list is resolved from at call
+    /// time. A `Vec<String>` here would be a boot snapshot, and this service
+    /// outlives every `config.set` (2026-08-15).
     summarizer: Option<(
         Arc<crate::llm_router::LlmRouter>,
         Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
     )>,
-) -> HashMap<String, ServiceFn> {
+    /// The tools directory and live registry the authoring services write into,
+    /// plus the slot they read the finished service map back out of. `None`
+    /// leaves `tools.{create,update,list}` unregistered, which withholds the
+    /// three authoring skills rather than half-wiring them.
+    tool_authoring: Option<(
+        PathBuf,
+        std::sync::Weak<nanna_tools::ToolRegistry>,
+        Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
+    )>,
+    /// Router plus the configured vision-model priority list. `None`, an empty
+    /// list, or a list the router cannot serve all leave `vision.analyze`
+    /// unregistered, which withholds the three vision skills rather than
+    /// advertising tools that can only fail.
+    vision: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    /// The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
+    /// image-only pages unread and the response says so.
+    pdf_ocr: Option<nanna_tools::PdfOcrFn>,
+    /// OpenAI key plus the data dir generated speech is written under. `None` or
+    /// no key leaves `audio.tts` / `audio.transcribe` unregistered.
+    audio: Option<(Option<String>, PathBuf)>,
+    /// The data dir page screenshots are written under. `None`, or no
+    /// Chromium-family browser on the host, leaves `browser.*` unregistered.
+    browser_data_dir: Option<PathBuf>,
+    /// The data dir desktop captures are written under. `None`, or no capture
+    /// tool / display session, leaves `screenshot.capture` unregistered.
+    screenshot_data_dir: Option<PathBuf>,
+}
+
+
+fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> {
+    let ScriptServiceDeps {
+        memory,
+        spawner,
+        session_history,
+        workspace_id,
+        storage,
+        turn_baselines,
+        summarizer,
+        tool_authoring,
+        vision,
+        pdf_ocr,
+        audio,
+        browser_data_dir,
+        screenshot_data_dir,
+    } = deps;
+    let memory = &memory;
     use serde_json::{Value, json};
 
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
@@ -1101,6 +1156,47 @@ fn build_script_services(
         );
     }
 
+    // Desktop capture. The `screenshot` skill declares this; the Rust tool
+    // behind it was a stub, so this is the implementation, not a registration.
+    if let Some(data_dir) = screenshot_data_dir {
+        services.extend(crate::screenshot_service::build_screenshot_services(
+            &data_dir,
+        ));
+    }
+
+    // Browser. The four browser_* skills declare these; nanna-browser was
+    // complete and the `browser` feature was enabled nowhere.
+    if let Some(data_dir) = browser_data_dir {
+        services.extend(crate::browser_service::build_browser_services(&data_dir));
+    }
+
+    // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
+    // clients behind them were complete and reachable from nowhere.
+    if let Some((openai_api_key, data_dir)) = audio {
+        services.extend(crate::audio_service::build_audio_services(
+            openai_api_key.as_deref(),
+            &data_dir,
+        ));
+    }
+
+    // Vision. The bundled `analyze_image`, `describe_image` and `ocr` skills all
+    // declare `vision.analyze`, and nothing registered it.
+    if let Some((router, models)) = vision {
+        services.extend(crate::vision_service::build_vision_services(
+            &router, &models,
+        ));
+    }
+
+    // Tool authoring. The bundled `create_tool`, `edit_tool` and
+    // `list_user_tools` skills declare `tools.create` / `tools.update` /
+    // `tools.list`, and nothing registered any of them, so all three were
+    // withheld at every boot (found by `skill_services_are_registered.rs`).
+    if let Some((tools_dir, registry, slot)) = tool_authoring {
+        services.extend(crate::tool_authoring::build_tool_authoring_services(
+            tools_dir, registry, slot,
+        ));
+    }
+
     // PDF text extraction. The bundled `read_pdf` skill declares
     // `requires: ["pdf.read"]` and no such service existed, so the tool
     // loaded, advertised itself to the model, and failed at call time with
@@ -1108,14 +1204,17 @@ fn build_script_services(
     // been complete and tested the whole time; only this registration was
     // missing.
     //
-    // OCR fallback for image-only pages is deliberately NOT wired here: that
-    // needs the `OcrTool` pipeline, which is itself unregistered, and the
-    // extractor already states plainly when a page yielded no text. A
-    // half-wired OCR path would be indistinguishable from a scanned document
-    // that genuinely has no text.
+    // OCR fallback for image-only pages, wired 2026-09-15 to the same vision
+    // model `vision.analyze` uses. The thing that held it back for two runs was
+    // not the pipeline but the ambiguity: a half-wired OCR path is
+    // indistinguishable from a scanned document that genuinely has no text. So
+    // the response reports the outcome as one of four named cases rather than
+    // returning an empty string for all of them.
+    let pdf_ocr_fn = pdf_ocr;
     services.insert(
         "pdf.read".to_string(),
-        Arc::new(|params: Value| {
+        Arc::new(move |params: Value| {
+            let pdf_ocr_fn = pdf_ocr_fn.clone();
             Box::pin(async move {
                 let path = params
                     .get("path")
@@ -1148,22 +1247,64 @@ fn build_script_services(
 
                 // lopdf parsing is synchronous and can take real time on a
                 // large document, so it must not sit on a runtime worker.
+                let parse_bytes = bytes.clone();
                 let extracted = tokio::task::spawn_blocking(move || {
-                    nanna_tools::read_pdf_text(&bytes, selection)
+                    nanna_tools::read_pdf_text(&parse_bytes, selection)
                 })
                 .await
                 .map_err(|e| format!("PDF read task failed: {e}"))?
                 .map_err(|e| e.to_string())?;
 
+                let ocr = nanna_tools::ocr_empty_pages(
+                    &bytes,
+                    selection,
+                    extracted.empty_pages.len(),
+                    pdf_ocr_fn.as_ref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
                 // The counts ride alongside the text for the same reason
                 // `read_file` reports `total_lines`: a caller must be able to
                 // see it did not get the whole document without inferring it.
-                Ok(json!({
+                // Four named outcomes, not one empty string: "no OCR
+                // configured", "OCR ran and found nothing", "the document has
+                // no images to OCR" and "no page was missing text" are
+                // different answers, and a caller that cannot tell them apart
+                // cannot tell an unreadable scan from an empty one.
+                let mut response = json!({
                     "text": extracted.text,
                     "page_count": extracted.page_count,
                     "pages_read": extracted.pages_read,
                     "empty_pages": extracted.empty_pages.len(),
-                }))
+                });
+                match ocr {
+                    nanna_tools::PdfOcrOutcome::NotNeeded => {
+                        response["ocr"] = json!("not_needed");
+                    }
+                    nanna_tools::PdfOcrOutcome::Unavailable => {
+                        response["ocr"] = json!("unavailable");
+                        response["ocr_note"] = json!(
+                            "Pages had no extractable text and no OCR model is \
+                             configured. Set [memory] ocr_model_priority to read \
+                             image-only pages."
+                        );
+                    }
+                    nanna_tools::PdfOcrOutcome::NoImages => {
+                        response["ocr"] = json!("no_images");
+                        response["ocr_note"] = json!(
+                            "Pages had no extractable text and the document \
+                             carries no embedded images, so this is not a scan \
+                             OCR could recover."
+                        );
+                    }
+                    nanna_tools::PdfOcrOutcome::Ran { text, images_read } => {
+                        response["ocr"] = json!("ran");
+                        response["ocr_images"] = json!(images_read);
+                        response["ocr_text"] = json!(text);
+                    }
+                }
+                Ok(response)
             })
         }),
     );
@@ -1206,6 +1347,14 @@ pub struct DaemonConfig {
     pub use_script_tools: bool,
     /// Directory containing tool scripts (resolved from env/config/default)
     pub tools_dir: Option<PathBuf>,
+    /// Vision-capable models for `vision.analyze`, in priority order.
+    ///
+    /// Flattened from `[memory] ocr_model_priority` the same way the other
+    /// `memory_*` values below are — that setting already means "vision-capable
+    /// models, tried in order", so the vision service reads it rather than
+    /// introducing a second list to keep in sync. Empty (the default) leaves
+    /// `vision.analyze` unregistered and the vision skills withheld.
+    pub vision_model_priority: Vec<String>,
     /// Tool names the agent may call. `None` (or a list containing `"*"`) means
     /// "no allowlist — every tool is permitted". Mirrors `[tools] enabled`.
     pub tool_allowlist: Option<Vec<String>>,
@@ -1361,6 +1510,7 @@ impl Default for DaemonConfig {
             webhook: WebhookConfig::default(),
             use_script_tools: true,
             tools_dir: None,
+            vision_model_priority: Vec::new(),
             tool_allowlist: None,
             tool_denylist: Vec::new(),
             tool_audit_log: true,
@@ -2774,6 +2924,7 @@ impl DaemonServer {
         )
         .with_tools_dir(tools_dir)
         .with_event_tx(self.ipc.event_sender())
+        .with_session_filters(self.ipc.session_filters())
         .with_workspace_id(workspace_id_for_services)
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
@@ -3312,7 +3463,14 @@ impl DaemonServer {
             }
 
             if resolved.is_dir() {
-                nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                let granted_count = nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                if granted_count > 0 {
+                    warn!(
+                        granted_count,
+                        "Wrote the default permissions.json for {} tool(s) that declared none",
+                        granted_count
+                    );
+                }
                 info!("Tools directory: {:?}", resolved);
             } else {
                 warn!("Tools directory does not exist: {:?}", resolved);
@@ -3884,20 +4042,79 @@ impl DaemonServer {
                 None
             };
 
-            let services = build_script_services(
-                &memory,
-                spawner_arc,
-                session_history.clone(),
-                workspace_id_for_services.clone(),
-                self.storage.clone(),
-                turn_baselines.clone(),
-                Some((router.clone(), Arc::clone(&shared_agent_config))),
-            );
+            // `[memory] ocr_model_priority` already means "vision-capable
+            // models, tried in order" — an existing documented setting, so
+            // `vision.analyze` reads it rather than inventing a second one.
+            let vision_models = self.config.vision_model_priority.clone();
+
+            // The authoring services load a tool they just wrote with the same
+            // services every bundled skill gets. That map is the one being
+            // built, so it reaches them through a slot filled immediately
+            // below — a runtime-authored tool must not be the only one in the
+            // daemon that cannot call a service.
+            let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
+                Arc::new(std::sync::OnceLock::new());
+            // Author into the data dir, never into wherever skills happen to be
+            // *loaded* from. In a debug build `resolve_tools_dir` returns the
+            // source tree, so `tools.create` would have written a new skill
+            // directory into the checkout — untracked files appearing in the
+            // repo because an agent made a tool. Loading from source is
+            // deliberate and stays; writing to it is not.
+            let authoring_dir = self.config.data_dir.join("tools");
+            let tool_authoring = Some((
+                authoring_dir.clone(),
+                Arc::downgrade(&tools),
+                Arc::clone(&authoring_slot),
+            ));
+
+            let services = build_script_services(ScriptServiceDeps {
+                memory: memory.clone(),
+                spawner: spawner_arc,
+                session_history: session_history.clone(),
+                workspace_id: workspace_id_for_services.clone(),
+                storage: self.storage.clone(),
+                turn_baselines: turn_baselines.clone(),
+                summarizer: Some((router.clone(), Arc::clone(&shared_agent_config))),
+                tool_authoring,
+                vision: Some((router.clone(), vision_models.clone())),
+                pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
+                audio: Some((
+                    self.config.llm.openai_api_key.clone(),
+                    self.config.data_dir.clone(),
+                )),
+                browser_data_dir: Some(self.config.data_dir.clone()),
+                screenshot_data_dir: Some(self.config.data_dir.clone()),
+            });
+            // Fill the slot before any skill can be executed. `set` returning
+            // an error would mean the map was filled twice, which cannot
+            // happen here and would leave the authoring services reading a
+            // stale map if it did.
+            if authoring_slot.set(services.clone()).is_err() {
+                warn!(
+                    "tool-authoring service map was already filled; authored tools may not reach services"
+                );
+            }
 
             if let Some(ref dir) = tools_dir {
                 if dir.is_dir() {
                     let loaded = tools.load_skills_with_services(dir, &services).await;
                     info!("Loaded {} tools from {:?}", loaded, dir);
+                }
+            }
+
+            // Tools authored at runtime live in the data dir. In a release
+            // build that is the same directory as above and this is skipped; in
+            // a debug build it is the other half of the tool surface, and
+            // without it an authored tool would be callable for one session and
+            // gone after a restart.
+            if authoring_dir.is_dir()
+                && tools_dir.as_ref() != Some(&authoring_dir)
+            {
+                let loaded = tools
+                    .load_skills_with_services(&authoring_dir, &services)
+                    .await;
+                if loaded > 0 {
+                    info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
                 }
             }
         }
@@ -4198,6 +4415,9 @@ impl DaemonBuilder {
         // Idle gate for the scheduled dream cycle (defers dreaming to a lull).
         builder.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
+        // `ocr_model_priority` already means "vision-capable models, in order";
+        // `vision.analyze` reads it rather than adding a second list.
+        builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
@@ -5324,15 +5544,7 @@ mod tests {
     /// wired. This calls it end to end against a real document.
     #[tokio::test]
     async fn the_pdf_read_service_is_registered_and_reads_a_real_document() {
-        let services = build_script_services(
-            &None,
-            None,
-            Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            Arc::new(tokio::sync::RwLock::new(None)),
-            None,
-            Arc::new(crate::tasks::TurnBaselines::new()),
-            None,
-        );
+        let services = build_script_services(ScriptServiceDeps::default());
         let pdf_read = services
             .get("pdf.read")
             .expect("the read_pdf skill's declared service must exist");
@@ -5358,6 +5570,63 @@ mod tests {
         // A selection it cannot read is refused rather than guessed at.
         let bad = pdf_read(serde_json::json!({ "path": path_str, "pages": "5-2" })).await;
         assert!(bad.is_err(), "a backwards range must not be reinterpreted");
+
+        // Both pages are textless, and this daemon has no OCR model, so the
+        // response has to say which of those two facts it is reporting.
+        assert_eq!(whole["empty_pages"], 2);
+        assert_eq!(
+            whole["ocr"], "unavailable",
+            "a textless PDF with no OCR configured must say so, not return an \
+             empty string that looks like a blank document"
+        );
+        assert!(
+            whole["ocr_note"]
+                .as_str()
+                .is_some_and(|note| note.contains("ocr_model_priority")),
+            "the note must name what to configure: {:?}",
+            whole["ocr_note"]
+        );
+    }
+
+    /// The distinction the OCR item was held back on for two runs: "no OCR
+    /// pipeline" and "OCR ran and there was nothing to read" produce the same
+    /// empty text, so the response must name which one happened.
+    #[tokio::test]
+    async fn a_textless_pdf_distinguishes_no_ocr_from_nothing_to_ocr() {
+        let ocr_called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = ocr_called.clone();
+        let ocr_fn: nanna_tools::PdfOcrFn = Arc::new(move |_image, _prompt, _media| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("stub ocr text".to_string()) })
+        });
+
+        let services = build_script_services(ScriptServiceDeps {
+            pdf_ocr: Some(ocr_fn),
+            ..ScriptServiceDeps::default()
+        });
+        let pdf_read = services.get("pdf.read").expect("pdf.read is registered");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("textless.pdf");
+        std::fs::write(&path, minimal_two_page_pdf()).expect("write probe pdf");
+
+        let read = pdf_read(serde_json::json!({ "path": path.to_string_lossy() }))
+            .await
+            .expect("reading succeeds");
+
+        // The fixture carries no embedded images, so OCR has nothing to send —
+        // which is a different answer from "no OCR model", and from a scan it
+        // could have read.
+        assert_eq!(
+            read["ocr"], "no_images",
+            "with an OCR model configured, a textless PDF with no images must \
+             report that rather than reusing the unavailable case: {read}"
+        );
+        assert_eq!(
+            ocr_called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "OCR was called for a document with no embedded images"
+        );
     }
 
     /// A two-page PDF with no text content — enough to exercise page counting

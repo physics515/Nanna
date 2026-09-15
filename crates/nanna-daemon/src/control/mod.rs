@@ -77,6 +77,10 @@ pub struct ControlPlane {
     turn_baselines: Option<Arc<crate::tasks::TurnBaselines>>,
     /// Event broadcaster for pushing events to subscribed clients
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// Per-connection event narrowing. `None` in the constructions that
+    /// never attach an IPC server (tests, embedded uses), where a
+    /// `Subscribe` has no wire to narrow.
+    session_filters: Option<Arc<crate::ipc::SessionFilters>>,
     /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
     started_at: std::time::Instant,
     /// Live channel connection state (shared with ChannelManager listeners).
@@ -142,6 +146,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            session_filters: None,
             services_workspace_id: None,
             turn_baselines: None,
             started_at: std::time::Instant::now(),
@@ -202,6 +207,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            session_filters: None,
             services_workspace_id: None,
             turn_baselines: None,
             started_at: std::time::Instant::now(),
@@ -264,6 +270,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            session_filters: None,
             services_workspace_id: None,
             turn_baselines: None,
             started_at: std::time::Instant::now(),
@@ -305,6 +312,14 @@ impl ControlPlane {
     /// Set the event broadcaster for pushing events to clients
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Attach the IPC server's narrowing registry, so `Subscribe` and
+    /// `Unsubscribe` change what that connection is actually sent rather than
+    /// only what the daemon records about it.
+    pub fn with_session_filters(mut self, filters: Arc<crate::ipc::SessionFilters>) -> Self {
+        self.session_filters = Some(filters);
         self
     }
 
@@ -599,20 +614,39 @@ impl ControlPlane {
     // Subscription Handlers
     // =========================================================================
 
+    /// `Subscribe` narrows what this connection is sent, not just what the
+    /// daemon records about it.
+    ///
+    /// `Session` is the only topic that narrows: `AllSessions` widens back to
+    /// the whole stream, and `ChannelStatus`/`System` name event families that
+    /// carry no session id, so every connection already receives them and
+    /// narrowing on them would mean "send me less of what you already send
+    /// everyone". They stay acknowledgements until they name something the
+    /// event stream can actually be filtered by.
     async fn handle_subscribe(&self, client_id: &str, action: SubscribeAction) -> Value {
         match action {
             SubscribeAction::Session { session_id } => {
-                if self
-                    .sessions
-                    .subscribe(&session_id, client_id.to_string())
-                    .await
-                {
-                    json!({ "status": "subscribed", "session_id": session_id })
-                } else {
-                    json!({ "error": "not_found", "session_id": session_id })
+                // Narrow only after the store confirms the session exists, so a
+                // typo cannot silently cut a connection down to a session that
+                // will never emit. `exists` rather than `subscribe`: the latter
+                // files this IPC connection id into the session's `subscribers`
+                // set, which is typed as channel ids and feeds the reported
+                // `subscriber_count` — an existence check should not change what
+                // it checks.
+                if !self.sessions.exists(&session_id).await {
+                    return json!({ "error": "not_found", "session_id": session_id });
                 }
+                let narrowed = self.narrow_to_session(client_id, &session_id).await;
+                json!({
+                    "status": "subscribed",
+                    "session_id": session_id,
+                    "narrowed": narrowed,
+                })
             }
             SubscribeAction::AllSessions => {
+                if let Some(filters) = &self.session_filters {
+                    filters.widen_to_all(client_id).await;
+                }
                 json!({ "status": "subscribed", "topic": "all_sessions" })
             }
             SubscribeAction::ChannelStatus => {
@@ -624,13 +658,40 @@ impl ControlPlane {
         }
     }
 
+    /// Narrow this connection's event stream to one more session, reporting
+    /// whether there was a wire to narrow at all.
+    async fn narrow_to_session(&self, client_id: &str, session_id: &str) -> bool {
+        let Some(filters) = &self.session_filters else {
+            return false;
+        };
+        filters
+            .narrow_to_session(client_id, session_id.to_string())
+            .await;
+        debug_assert!(
+            !filters.is_empty(),
+            "narrowing a connection left the registry reporting nobody narrowed",
+        );
+        true
+    }
+
     async fn handle_unsubscribe(&self, client_id: &str, action: UnsubscribeAction) -> Value {
         match action {
             UnsubscribeAction::Session { session_id } => {
-                self.sessions.unsubscribe(&session_id, client_id).await;
+                // Deliberately no `sessions.unsubscribe` here: this connection
+                // was never added to that channel-id set (see `handle_subscribe`),
+                // and removing a connection id from it could only ever delete
+                // some channel's entry that happened to share the name.
+                if let Some(filters) = &self.session_filters {
+                    filters.drop_session(client_id, &session_id).await;
+                }
                 json!({ "status": "unsubscribed", "session_id": session_id })
             }
             UnsubscribeAction::AllSessions => {
+                // The inverse of `Subscribe{AllSessions}`: stop delivering every
+                // session, which leaves the non-session events flowing.
+                if let Some(filters) = &self.session_filters {
+                    filters.drop_all_sessions(client_id).await;
+                }
                 json!({ "status": "unsubscribed", "topic": "all_sessions" })
             }
             UnsubscribeAction::ChannelStatus => {
