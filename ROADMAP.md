@@ -4111,6 +4111,16 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       services access to the calling session id, **(2)** let a caller set `target_session` and make
       the executor honour it, **(3)** then register the three services. Any one of those alone is
       unreachable code.
+      **The hook for (1) already exists** — `agent_service.rs` populates the shared session history
+      at the top of every run (`hist.clear(); hist.extend(...)`, ~line 934) with `session_id` in
+      scope two lines later, and `workspace_id` is already threaded into `build_script_services` as
+      exactly this shape of `Arc<RwLock<Option<String>>>` cell. A `current_session_id` cell set at
+      that same point is a handful of lines, not a design problem.
+      **What makes this a next-run item rather than a this-run one is verification, not size.** The
+      blocker was always delivery, and watching a reminder actually arrive in a conversation needs a
+      live agent turn — i.e. a working model. This host has neither a cloud credential nor Ollama, so
+      the one property that distinguishes "wired" from "half-wired" here is the one property that
+      could not be checked. Build it on a host that can watch a reminder land.
 - [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
       All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
       confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's
