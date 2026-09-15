@@ -628,12 +628,12 @@ impl ControlPlane {
             SubscribeAction::Session { session_id } => {
                 // Narrow only after the store confirms the session exists, so a
                 // typo cannot silently cut a connection down to a session that
-                // will never emit.
-                if !self
-                    .sessions
-                    .subscribe(&session_id, client_id.to_string())
-                    .await
-                {
+                // will never emit. `exists` rather than `subscribe`: the latter
+                // files this IPC connection id into the session's `subscribers`
+                // set, which is typed as channel ids and feeds the reported
+                // `subscriber_count` — an existence check should not change what
+                // it checks.
+                if !self.sessions.exists(&session_id).await {
                     return json!({ "error": "not_found", "session_id": session_id });
                 }
                 let narrowed = self.narrow_to_session(client_id, &session_id).await;
@@ -677,7 +677,10 @@ impl ControlPlane {
     async fn handle_unsubscribe(&self, client_id: &str, action: UnsubscribeAction) -> Value {
         match action {
             UnsubscribeAction::Session { session_id } => {
-                self.sessions.unsubscribe(&session_id, client_id).await;
+                // Deliberately no `sessions.unsubscribe` here: this connection
+                // was never added to that channel-id set (see `handle_subscribe`),
+                // and removing a connection id from it could only ever delete
+                // some channel's entry that happened to share the name.
                 if let Some(filters) = &self.session_filters {
                     filters.drop_session(client_id, &session_id).await;
                 }

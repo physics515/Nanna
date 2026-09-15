@@ -1863,14 +1863,18 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             fails the e2e with the exact leak (`a narrowed connection was sent an event for a
             session it never named`). 1928 workspace tests pass / 0 fail, clippy 0 errors, real
             daemon binary boots clean (0 panics).
-            - [ ] **`handle_subscribe` files an IPC connection id into a `HashSet<ChannelId>`.**
-                  It calls `sessions.subscribe(&session_id, client_id)`, and `Session::subscribers`
-                  is typed as channel ids. Nothing *routes* on that set — its only consumers are
-                  `subscriber_count` in the session info reported to clients, and a single test —
-                  so the effect today is a reported count inflated by a different kind of id.
-                  Left alone here because fixing it changes a number clients already see; it wants
-                  its own increment that decides whether `subscribers` means channels, connections,
-                  or both.
+            - [x] **`handle_subscribe` no longer files an IPC connection id into a
+                  `HashSet<ChannelId>`.** *(2026-09-15, same run)* It only ever called
+                  `sessions.subscribe` to find out whether the session existed, so the answer was a
+                  new `SessionManager::exists` — an existence check should not change the thing it
+                  checks. `Unsubscribe{Session}` likewise stops calling `sessions.unsubscribe` with
+                  a connection id, where it could only ever have deleted some channel's entry that
+                  happened to share the name. `subscribers` keeps meaning channels, and
+                  `subscriber_count` stops being inflatable by a different kind of id. The worry
+                  about "changing a number clients already see" does not apply: no client sends
+                  `Subscribe` today, so the count was never actually inflated — this closes the
+                  latent bug while that is still true. The e2e narrowing test passes unchanged,
+                  which is what shows `exists` is equivalent for the gating it replaced.
       - [x] *(2026-09-10 — fixed the same run.)* The forwarder now handles every receive result
             through a pure `forwardable()`: a lag becomes an `Error` event with code
             `events_lagged` naming the count ("re-fetch state to resync"), and a closed broadcast

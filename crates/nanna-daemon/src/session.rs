@@ -1244,6 +1244,17 @@ impl SessionManager {
         }
     }
     
+    /// Whether a session exists, without loading it.
+    ///
+    /// `Subscribe{Session}` needs to know a session is real before narrowing a
+    /// connection to it, and reached for [`Self::subscribe`] to find out — which
+    /// also filed the IPC connection id into the session's `subscribers` set,
+    /// a `HashSet<ChannelId>`. Nothing routes on that set, so the only effect
+    /// was a `subscriber_count` inflated by a different kind of id.
+    pub async fn exists(&self, session_id: &str) -> bool {
+        self.sessions.read().await.contains_key(session_id)
+    }
+
     /// Subscribe a channel to a session
     pub async fn subscribe(&self, session_id: &str, channel_id: ChannelId) -> bool {
         let mut sessions = self.sessions.write().await;
