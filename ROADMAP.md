@@ -6698,6 +6698,26 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-15 sweep)* `cargo update` -> 14 compatible bumps (`clap 4.6.7` + builder/derive/lex,
+     `async-compression 0.4.47`, `compression-codecs 0.4.42`, `camino 1.2.6`, `playwright-rs 0.18.1`,
+     `rustls 0.23.45`, `wide 1.7.1`). Both guarded pins fired again and were pinned back with the
+     documented commands (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`, which also
+     dropped the `malachite-{base,nz} 0.11.0` it had dragged in); **re-checked against the registry
+     rather than assumed** — `rustpython-{vm,stdlib,common}` are all still `0.5.0`, so both pins stay.
+     `cargo upgrade --incompatible`: only the two known downgrade rows (`criterion -> "0.7"`,
+     `lopdf -> "0.42"`), both rejected and both re-verified against crates.io this run
+     (`criterion` **0.8.2**, `lopdf` **0.45.0** — cargo-edit's "latest" column is the stale one, and
+     the lock already holds the real latest of each).
+     GUI: `vitest 5.0.0 -> 5.0.1` taken (251/251 green). **TypeScript 7 attempted for the first time
+     rather than deferred, and the blocker is now measured, not assumed:** `vue-tsc 3.3.11` declares
+     `typescript: ">=5.0.0"` so pnpm installs 7.0.2 happily, but its `resolveTscPath` does
+     `require.resolve("typescript/lib/tsc")` and **TS 7's `package.json` `exports` no longer maps that
+     subpath** -> `ERR_PACKAGE_PATH_NOT_EXPORTED`, typecheck exits 1 before reading a single file.
+     Reverted to `^5.9.3` (typecheck back to 0 errors). Blocked on Volar shipping a TS 7 `vue-tsc`;
+     nothing in this repo can work around it.
+     Toolchain pin `nightly-2026-09-08` held. Verified on tmpfs: **clippy 0 errors**
+     (`--workspace --all-targets --exclude nanna-gui`, 1m44s), whole-workspace `cargo test`
+     **0 failures**, `cargo build --release -p nanna-daemon` green, 251/251 vitest, typecheck clean.
    - *(2026-09-11 sweep)* `cargo update` -> 2 compatible bumps (`toml 1.1.6`,
      `toml_edit 0.25.15`); the rest of the lock diff is dependency edges re-resolved onto
      versions already present (`windows-sys 0.61.2`, `getrandom 0.4.3`, `rand 0.10.2`, …) — no
