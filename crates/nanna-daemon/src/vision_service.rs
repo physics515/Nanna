@@ -71,6 +71,28 @@ fn bind_vision_models(router: &Arc<LlmRouter>, configured: &[String]) -> Vec<Vis
     bound
 }
 
+/// The first reachable vision model as a PDF OCR callback, if there is one.
+///
+/// `pdf.read` and `vision.analyze` want the same capability under two
+/// signatures, so this binds it once from the same configured list rather than
+/// giving the PDF path its own model setting to drift.
+///
+/// Only the first model, not the whole priority list: `ocr_empty_pages` sends
+/// one request per embedded image, and falling through a list per image turns a
+/// scanned document into a multiplied bill.
+#[must_use]
+pub fn bind_pdf_ocr_fn(
+    router: &Arc<LlmRouter>,
+    configured: &[String],
+) -> Option<nanna_tools::PdfOcrFn> {
+    let model = bind_vision_models(router, configured).into_iter().next()?;
+    let call = model.call;
+    Some(Arc::new(move |image, prompt, media_type| {
+        let call = call.clone();
+        Box::pin(async move { call(image, prompt, media_type).await })
+    }))
+}
+
 /// Build `vision.analyze`, or an empty map when no configured vision model is
 /// reachable.
 #[allow(

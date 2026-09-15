@@ -631,6 +631,9 @@ fn build_script_services(
     // unregistered, which withholds the three vision skills rather than
     // advertising tools that can only fail.
     vision: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
+    // The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
+    // image-only pages unread and the response says so.
+    pdf_ocr: Option<nanna_tools::PdfOcrFn>,
     // OpenAI key plus the data dir generated speech is written under. `None` or
     // no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
@@ -1152,14 +1155,17 @@ fn build_script_services(
     // been complete and tested the whole time; only this registration was
     // missing.
     //
-    // OCR fallback for image-only pages is deliberately NOT wired here: that
-    // needs the `OcrTool` pipeline, which is itself unregistered, and the
-    // extractor already states plainly when a page yielded no text. A
-    // half-wired OCR path would be indistinguishable from a scanned document
-    // that genuinely has no text.
+    // OCR fallback for image-only pages, wired 2026-09-15 to the same vision
+    // model `vision.analyze` uses. The thing that held it back for two runs was
+    // not the pipeline but the ambiguity: a half-wired OCR path is
+    // indistinguishable from a scanned document that genuinely has no text. So
+    // the response reports the outcome as one of four named cases rather than
+    // returning an empty string for all of them.
+    let pdf_ocr_fn = pdf_ocr;
     services.insert(
         "pdf.read".to_string(),
-        Arc::new(|params: Value| {
+        Arc::new(move |params: Value| {
+            let pdf_ocr_fn = pdf_ocr_fn.clone();
             Box::pin(async move {
                 let path = params
                     .get("path")
@@ -1192,22 +1198,64 @@ fn build_script_services(
 
                 // lopdf parsing is synchronous and can take real time on a
                 // large document, so it must not sit on a runtime worker.
+                let parse_bytes = bytes.clone();
                 let extracted = tokio::task::spawn_blocking(move || {
-                    nanna_tools::read_pdf_text(&bytes, selection)
+                    nanna_tools::read_pdf_text(&parse_bytes, selection)
                 })
                 .await
                 .map_err(|e| format!("PDF read task failed: {e}"))?
                 .map_err(|e| e.to_string())?;
 
+                let ocr = nanna_tools::ocr_empty_pages(
+                    &bytes,
+                    selection,
+                    extracted.empty_pages.len(),
+                    pdf_ocr_fn.as_ref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
                 // The counts ride alongside the text for the same reason
                 // `read_file` reports `total_lines`: a caller must be able to
                 // see it did not get the whole document without inferring it.
-                Ok(json!({
+                // Four named outcomes, not one empty string: "no OCR
+                // configured", "OCR ran and found nothing", "the document has
+                // no images to OCR" and "no page was missing text" are
+                // different answers, and a caller that cannot tell them apart
+                // cannot tell an unreadable scan from an empty one.
+                let mut response = json!({
                     "text": extracted.text,
                     "page_count": extracted.page_count,
                     "pages_read": extracted.pages_read,
                     "empty_pages": extracted.empty_pages.len(),
-                }))
+                });
+                match ocr {
+                    nanna_tools::PdfOcrOutcome::NotNeeded => {
+                        response["ocr"] = json!("not_needed");
+                    }
+                    nanna_tools::PdfOcrOutcome::Unavailable => {
+                        response["ocr"] = json!("unavailable");
+                        response["ocr_note"] = json!(
+                            "Pages had no extractable text and no OCR model is \
+                             configured. Set [memory] ocr_model_priority to read \
+                             image-only pages."
+                        );
+                    }
+                    nanna_tools::PdfOcrOutcome::NoImages => {
+                        response["ocr"] = json!("no_images");
+                        response["ocr_note"] = json!(
+                            "Pages had no extractable text and the document \
+                             carries no embedded images, so this is not a scan \
+                             OCR could recover."
+                        );
+                    }
+                    nanna_tools::PdfOcrOutcome::Ran { text, images_read } => {
+                        response["ocr"] = json!("ran");
+                        response["ocr_images"] = json!(images_read);
+                        response["ocr_text"] = json!(text);
+                    }
+                }
+                Ok(response)
             })
         }),
     );
@@ -3970,7 +4018,8 @@ impl DaemonServer {
                 turn_baselines.clone(),
                 Some((router.clone(), Arc::clone(&shared_agent_config))),
                 tool_authoring,
-                Some((router.clone(), vision_models)),
+                Some((router.clone(), vision_models.clone())),
+                crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
                 Some((
                     self.config.llm.openai_api_key.clone(),
                     self.config.data_dir.clone(),
@@ -5430,6 +5479,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let pdf_read = services
             .get("pdf.read")
@@ -5456,6 +5506,72 @@ mod tests {
         // A selection it cannot read is refused rather than guessed at.
         let bad = pdf_read(serde_json::json!({ "path": path_str, "pages": "5-2" })).await;
         assert!(bad.is_err(), "a backwards range must not be reinterpreted");
+
+        // Both pages are textless, and this daemon has no OCR model, so the
+        // response has to say which of those two facts it is reporting.
+        assert_eq!(whole["empty_pages"], 2);
+        assert_eq!(
+            whole["ocr"], "unavailable",
+            "a textless PDF with no OCR configured must say so, not return an \
+             empty string that looks like a blank document"
+        );
+        assert!(
+            whole["ocr_note"]
+                .as_str()
+                .is_some_and(|note| note.contains("ocr_model_priority")),
+            "the note must name what to configure: {:?}",
+            whole["ocr_note"]
+        );
+    }
+
+    /// The distinction the OCR item was held back on for two runs: "no OCR
+    /// pipeline" and "OCR ran and there was nothing to read" produce the same
+    /// empty text, so the response must name which one happened.
+    #[tokio::test]
+    async fn a_textless_pdf_distinguishes_no_ocr_from_nothing_to_ocr() {
+        let ocr_called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = ocr_called.clone();
+        let ocr_fn: nanna_tools::PdfOcrFn = Arc::new(move |_image, _prompt, _media| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("stub ocr text".to_string()) })
+        });
+
+        let services = build_script_services(
+            &None,
+            None,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+            Arc::new(crate::tasks::TurnBaselines::new()),
+            None,
+            None,
+            None,
+            Some(ocr_fn),
+            None,
+        );
+        let pdf_read = services.get("pdf.read").expect("pdf.read is registered");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("textless.pdf");
+        std::fs::write(&path, minimal_two_page_pdf()).expect("write probe pdf");
+
+        let read = pdf_read(serde_json::json!({ "path": path.to_string_lossy() }))
+            .await
+            .expect("reading succeeds");
+
+        // The fixture carries no embedded images, so OCR has nothing to send —
+        // which is a different answer from "no OCR model", and from a scan it
+        // could have read.
+        assert_eq!(
+            read["ocr"], "no_images",
+            "with an OCR model configured, a textless PDF with no images must \
+             report that rather than reusing the unavailable case: {read}"
+        );
+        assert_eq!(
+            ocr_called.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "OCR was called for a document with no embedded images"
+        );
     }
 
     /// A two-page PDF with no text content — enough to exercise page counting

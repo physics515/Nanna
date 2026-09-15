@@ -4161,16 +4161,32 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       get the whole document without inferring it from the prose. `lopdf` parsing is synchronous and
       runs under `spawn_blocking`, off the runtime workers.
       5 tests over the selection grammar and clamping.
-      - [ ] **Wire the OCR fallback.** `ReadPdfTool::with_ocr_fn` exists and is tested, but `OcrTool`
-            is itself registered nowhere, so image-only pages still come back empty. Deliberately not
-            faked in this increment: a half-wired OCR path is indistinguishable from a scanned
-            document that genuinely has no text, and the extractor already says which pages yielded
-            nothing.
-            **(2026-09-15) The piece it was waiting on now exists**: `vision.analyze` is registered
-            (below), which is the same model-backed OCR the `ocr` skill uses. `pdf.read`'s
-            `with_ocr_fn` can now be fed from it. Still not done here — it wants its own increment
-            that decides per-page policy (which pages to escalate, and the token cost of sending a
-            page image per empty page).
+      - [x] **OCR fallback wired, and the ambiguity that held it back is what got fixed.**
+            *(2026-09-15)* The blocker was never the pipeline — it was that "no OCR configured" and
+            "OCR ran and there was nothing to read" produce the same empty text, so a caller cannot
+            tell an unreadable scan from a blank page. `pdf.read` now reports **four named
+            outcomes** instead of one empty string: `not_needed` (no page was missing text),
+            `unavailable` (pages were, and no OCR model is configured — with a note naming
+            `[memory] ocr_model_priority`), `no_images` (pages were, and the document carries no
+            embedded images, so it is *not* a scan OCR could recover), and `ran` (with `ocr_text`
+            and `ocr_images`). The `read_pdf` skill surfaces each, including the case where OCR ran
+            and found nothing — which is the one that used to be invisible.
+            New `nanna_tools::ocr_empty_pages` returns that outcome structurally rather than the
+            markdown `ReadPdfTool` appends, so a JSON caller reports it instead of embedding prose
+            in a text field. The model is bound once from the **same** `ocr_model_priority`
+            `vision.analyze` uses (`bind_pdf_ocr_fn`) so the PDF path cannot drift onto its own
+            setting — and deliberately only the **first** model, not the priority list: OCR sends
+            one request per embedded image, and falling through a list per image turns a scanned
+            document into a multiplied bill. A failed image is reported in the output, not dropped,
+            for the same reason: a silently omitted page reads as a page with no text.
+            2 tests, and they are the pair that matters — the same textless fixture returns
+            `unavailable` without a model and `no_images` with one, proving the two cases are
+            actually distinguished, plus an assertion that OCR is **not** called for a document with
+            no images. 1984 workspace tests pass / 0 fail, clippy 0 errors, daemon boots clean.
+            - [ ] **Per-page escalation policy is still open.** `extract_pdf_images` returns the
+                  document's embedded images (capped at 20) rather than the images *on the empty
+                  pages*, so a mostly-text PDF with one scanned page sends more than it needs. The
+                  cap bounds the cost; targeting it would reduce it.
       - [x] **`vision.analyze` is registered, and the reason it was unreachable was structural.**
             *(2026-09-15)* `analyze_image`, `describe_image` and `ocr` all declare
             `requires: ["vision.analyze"]` and nothing registered it. The cause was not an
