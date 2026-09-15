@@ -4025,9 +4025,18 @@ impl DaemonServer {
             // daemon that cannot call a service.
             let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
                 Arc::new(std::sync::OnceLock::new());
-            let tool_authoring = tools_dir
-                .clone()
-                .map(|dir| (dir, Arc::downgrade(&tools), Arc::clone(&authoring_slot)));
+            // Author into the data dir, never into wherever skills happen to be
+            // *loaded* from. In a debug build `resolve_tools_dir` returns the
+            // source tree, so `tools.create` would have written a new skill
+            // directory into the checkout — untracked files appearing in the
+            // repo because an agent made a tool. Loading from source is
+            // deliberate and stays; writing to it is not.
+            let authoring_dir = self.config.data_dir.join("tools");
+            let tool_authoring = Some((
+                authoring_dir.clone(),
+                Arc::downgrade(&tools),
+                Arc::clone(&authoring_slot),
+            ));
 
             let services = build_script_services(
                 &memory,
@@ -4061,6 +4070,22 @@ impl DaemonServer {
                 if dir.is_dir() {
                     let loaded = tools.load_skills_with_services(dir, &services).await;
                     info!("Loaded {} tools from {:?}", loaded, dir);
+                }
+            }
+
+            // Tools authored at runtime live in the data dir. In a release
+            // build that is the same directory as above and this is skipped; in
+            // a debug build it is the other half of the tool surface, and
+            // without it an authored tool would be callable for one session and
+            // gone after a restart.
+            if authoring_dir.is_dir()
+                && tools_dir.as_ref() != Some(&authoring_dir)
+            {
+                let loaded = tools
+                    .load_skills_with_services(&authoring_dir, &services)
+                    .await;
+                if loaded > 0 {
+                    info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
                 }
             }
         }

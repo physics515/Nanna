@@ -4311,12 +4311,20 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
                   a breaking edit refused before disk, editing an absent tool refused rather than
                   creating one, traversing names leaving nothing on disk, and listing that skips
                   bundled skills. 1953 workspace tests pass / 0 fail, clippy 0 errors.
-                  - [ ] **In a debug build the tools directory is the source tree**, so
-                        `tools.create` called against a dev daemon writes a new skill directory
-                        into the checkout (`resolve_tools_dir` → `dev_tools_dir`). Pre-existing —
-                        `ensure_permissions` already writes there, which is how the `edit_tool`
-                        permissions gap surfaced — but authoring makes it much easier to hit.
-                        Decide whether a debug daemon should author into the data dir instead.
+                  - [x] **Authoring goes to the data dir, never to wherever skills are loaded
+                        from.** *(2026-09-15, same run)* In a debug build `resolve_tools_dir`
+                        returns the source tree, so `tools.create` would have dropped new skill
+                        directories into the checkout — untracked files appearing in the repo
+                        because an agent made a tool. Loading from source is deliberate and stays;
+                        writing to it is not. The daemon now authors into `{data_dir}/tools` and
+                        **also loads that directory**, because otherwise an authored tool would be
+                        callable for exactly one session and gone after a restart — in a release
+                        build the two are the same directory and the extra load is skipped.
+                        Verified on the real daemon (a full boot left the checkout byte-identical)
+                        and by a test that creates through the service and then loads the directory
+                        the way a fresh boot would. `ensure_permissions` still writes into the
+                        source tree in debug builds, which is the useful half of that behaviour and
+                        is test-gated.
 - [x] **`screenshot.capture` implemented** *(2026-09-15)* — the note was right that the Rust tool is a
       stub, so this is the implementation rather than a registration. **Only the three `schedule.*`
       skills remain withheld, down from 16 at the start of the run.** Input synthesis stays deferred.

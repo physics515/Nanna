@@ -308,3 +308,41 @@ async fn listing_reports_what_was_authored() {
         "the description comes from the manifest, not from the create call"
     );
 }
+
+/// An authored tool must still be there after a restart.
+///
+/// The daemon authors into `{data_dir}/tools`, which in a **debug** build is
+/// *not* where skills are loaded from — `resolve_tools_dir` returns the source
+/// tree there, so writing to it would drop new skill directories into the
+/// checkout. Loading from source is deliberate; writing to it is not. The
+/// daemon therefore loads the authoring directory as well, and without that a
+/// tool would be callable for exactly one session and gone after a restart.
+///
+/// This drives the same two steps: create through the service, then load the
+/// directory the way a fresh boot would.
+#[tokio::test]
+async fn an_authored_tool_is_loaded_again_by_a_fresh_registry() {
+    let h = Harness::new();
+    h.call(
+        "tools.create",
+        json!({ "name": "probe_tool", "description": "d", "source": probe_source("first") }),
+    )
+    .await
+    .expect("create succeeds");
+
+    // A fresh registry, as a restarted daemon would build, loading only the
+    // authoring directory.
+    let restarted = Arc::new(ToolRegistry::new());
+    let loaded = restarted
+        .load_skills_with_services(h.tools_dir.path(), &HashMap::new())
+        .await;
+    assert!(
+        loaded >= 1,
+        "a restarted daemon loaded nothing from the authoring directory, so an \
+         authored tool would survive exactly one session",
+    );
+    assert!(
+        restarted.has("probe_tool").await,
+        "the authored tool is missing after a restart",
+    );
+}
