@@ -4098,6 +4098,19 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       So the order is **delivery first, bridge second**: give the scheduler a way to reach a
       channel (or the originating session), then register the three services. Wiring them in the
       other order ships a reminder that fires into a log file.
+      **(2026-09-15, looked closer) `ScheduledTask.target_session` looks like the delivery route and
+      is dead at both ends.** It is declared, persisted (`cron_jobs.target_session`), restored by
+      `load_jobs`, and reported over IPC — but **`SchedulerAction::Add` takes only
+      `{schedule, task, name}`, so no client can set it**, and the daemon's executor always uses
+      `format!("scheduled-{{id}}")` and never reads it. Honouring it alone would therefore change
+      nothing for anybody: it would be preparing a path for a caller that does not exist.
+      **And the bridge has its own missing piece:** a `ServiceFn` receives only `params`. Services
+      have no session binding — `session.history` works off the *current run's* shared history, not
+      a session id — so `schedule.add` cannot learn which conversation asked for the reminder
+      without plumbing one through. That is the concrete shape of the remaining work: **(1)** give
+      services access to the calling session id, **(2)** let a caller set `target_session` and make
+      the executor honour it, **(3)** then register the three services. Any one of those alone is
+      unreachable code.
 - [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
       All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
       confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's
