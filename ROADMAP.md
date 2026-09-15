@@ -4018,10 +4018,25 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
 
 **A. Wire what's already built** (service registration + config, not new subsystems):
 - [ ] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
-      `Nanna.service("schedule.add"/…)` which is never registered; `TaskType::Delayed` exists
-      (crates/nanna-core/src/scheduler.rs) and nothing polls `get_due`. "Check back in 20 minutes"
+      `Nanna.service("schedule.add"/…)` which is never registered. "Check back in 20 minutes"
       self-scheduling is the difference between an agent and a chatbot; ROADMAP:1721 already says
       "wire, don't duplicate". Add absolute-timestamp one-shots (fire once, auto-disable) while in there.
+      **(2026-09-15 — investigated and deliberately NOT wired; two claims above are wrong.)**
+      `TaskType::Delayed` is not merely present, it is **fully live**: the scheduler loop fires it on
+      `created.elapsed() >= delay`, auto-disables it after one run, records it in history and
+      persists it — nothing "polls `get_due`" because nothing needs to. So the service bridge is a
+      small job, and writing it is not the blocker.
+      **The blocker is delivery, one layer down.** The executor's generic arm runs a task's payload
+      as an agent prompt in a `scheduled-{id}` session, and the result goes to the log and the run
+      history — `server.rs` warns in as many words that *"channel routing from the daemon scheduler
+      is not implemented yet"* whenever a task carries a `target_channel`. The `remind` skill
+      promises the model "the message will be injected into the conversation when the timer
+      expires". Wiring `schedule.add` today would make that promise false: the model would set a
+      reminder, the user would never hear it, and nothing would say so — the same
+      indistinguishable-from-working failure the half-wired OCR path was refused for.
+      So the order is **delivery first, bridge second**: give the scheduler a way to reach a
+      channel (or the originating session), then register the three services. Wiring them in the
+      other order ships a reminder that fires into a log file.
 - [ ] **`browser.*` services** — nanna-browser (chromiumoxide + playwright, full navigate/click/type/extract
       API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
       and registers nothing. Enable the flag, register the services. The P8 "browser relay Chrome extension"

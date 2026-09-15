@@ -57,15 +57,24 @@ const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
     ),
     (
         "schedule.add",
-        "P18: scheduler exists, the skill bridge does not",
+        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
+         already fires one-shot prompts; the blocker is that scheduler output \
+         reaches no channel (server.rs warns 'channel routing ... not \
+         implemented'), so a reminder would fire into the log",
     ),
     (
         "schedule.cancel",
-        "P18: scheduler exists, the skill bridge does not",
+        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
+         already fires one-shot prompts; the blocker is that scheduler output \
+         reaches no channel (server.rs warns 'channel routing ... not \
+         implemented'), so a reminder would fire into the log",
     ),
     (
         "schedule.list",
-        "P18: scheduler exists, the skill bridge does not",
+        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
+         already fires one-shot prompts; the blocker is that scheduler output \
+         reaches no channel (server.rs warns 'channel routing ... not \
+         implemented'), so a reminder would fire into the log",
     ),
     (
         "screenshot.capture",
