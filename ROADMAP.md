@@ -4126,8 +4126,14 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       assumed:** pointing `CHROME` at a logging wrapper recorded exactly one invocation with
       `--headless --remote-debugging-port=0`, because a 0.37 s test run is fast enough to deserve
       suspicion.
-      **Cost:** +9 crates on the daemon tree (653 → 662). Binary-size delta against the measured
-      66,483,104-byte baseline is still worth taking before a release that ships it.
+      **Cost, measured rather than feared:** +9 crates on the daemon tree (653 → 662) and
+      **+3,819,648 bytes on the release binary — 66,483,104 → 70,302,752, +5.7%**. That is an upper
+      bound for the browser stack specifically, since the same measurement window also contains this
+      run's OCR, vision, audio and screenshot work (none of which adds a crate). Far less than
+      `chromiumoxide_cdp`'s reputation for generating the whole CDP protocol suggests, and the number
+      is now on record against P6's binary-size guardrail instead of being a worry.
+      **This is the one change in the run that grows the shipped binary**, so it is the one worth
+      vetoing by not merging if 5.7% is judged too much for four skills.
 - [x] **`audio.tts` + `audio.transcribe` registered** *(2026-09-15)* — `text_to_speech` and
       `transcribe` are live; **8 skills withheld, down from 16 at the start of the run**, confirmed
       on the real daemon binary and independently by the audit test. New
