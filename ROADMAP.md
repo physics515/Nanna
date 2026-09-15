@@ -4058,10 +4058,36 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             faked in this increment: a half-wired OCR path is indistinguishable from a scanned
             document that genuinely has no text, and the extractor already says which pages yielded
             nothing.
-      - [ ] **`create_vision_tool` has no callers either.** `vision_wiring::create_vision_tool` and
-            `OcrTool` are both complete, exported, and unreachable — the same shape of gap `pdf.read`
-            had. Worth one audit pass over `nanna-tools`' built-ins asking which are actually
-            registered anywhere, rather than finding them one at a time.
+      - [x] **The audit pass ran, and the gap is far bigger than one tool.** *(2026-09-15)*
+            Asked the right question — not "which Rust built-in structs have callers" (almost none
+            do; the JS/TS migration is complete and the `builtin/` structs are largely vestigial)
+            but **"which services do the bundled skills declare that the daemon registers
+            nowhere"**, since a scripted skill reaches the daemon through `requires: [...]`.
+            **14 of the 23 declared services are registered nowhere, so 16 of the 44 bundled
+            skills are withheld from the model at every boot**: `analyze_image`, `browser_action`,
+            `browser_evaluate`, `browser_extract`, `browser_screenshot`, `cancel_reminder`,
+            `create_tool`, `describe_image`, `edit_tool`, `list_reminders`, `list_user_tools`,
+            `ocr`, `remind`, `screenshot`, `text_to_speech`, `transcribe` — a quarter of the tool
+            surface. Note **all three tool-authoring skills** are in that list (`tools.create` /
+            `tools.list` / `tools.update` have no service), which was not previously recorded
+            anywhere; the rest map to existing P18 items.
+            The **withholding itself is correct and already shipped** (registry.rs, 2026-07-26: an
+            advertised tool that can only fail is worse than an absent one). What was missing was
+            that anybody could tell. Two things fix that:
+            - **`crates/nanna-daemon/tests/skill_services_are_registered.rs`** cross-checks every
+              bundled skill's `requires` — parsed with the loader's own `extract_manifest`, not a
+              bespoke regex, so a declaration the test cannot see is one the daemon cannot see
+              either — against every name the two service builders can insert. Any gap must be
+              named in `KNOWN_MISSING_SERVICES` with its reason, and a second test fails when an
+              entry goes **stale** in either direction (the service got implemented, or no skill
+              asks for it any more) so the ledger cannot start lying. Verified in both directions:
+              a probe skill declaring `nonexistent.service` fails the gate by name.
+            - **The daemon now announces it at boot**, once, at `warn`, naming the withheld skills
+              *and* the blocking services — not just a count, because a count tells an operator
+              something is missing without telling them what to configure. Confirmed on the real
+              binary: `withheld_count=16 total=44`, listing all 16 skills and all 14 services,
+              matching the test's finding independently.
+            1931 workspace tests pass / 0 fail, clippy 0 errors.
 - [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
       (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
       local model, largely redundant with exec + browser).
