@@ -2357,6 +2357,16 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+            - [ ] *(research 2026-09-15)* **Still pre-release — re-checked against crates.io, not a
+                  search result.** The registry says `burn` **max_stable = 0.21.0** with
+                  **0.22.0-pre.3 (2026-08-25)** the newest publish, so the note below stands and the
+                  pin holds. Worth recording because secondary sources now assert "Burn 0.22.0 has
+                  been released" — they are reading the 0.22 branch docs, not a published crate.
+                  One real change in those docs to carry into Mummu when 0.22 does land: the
+                  **LibTorch backend is deprecated as of 0.22** (GPU via a CubeCL backend, CPU via
+                  the CubeCL CPU backend or `burn-flex`) — which points the CPU embedder at
+                  `burn-flex`, the same conclusion the 0.21 research reached. Mummu's call, not
+                  Nanna's. Source: [crates.io/api/v1/crates/burn](https://crates.io/crates/burn).
             - [ ] *(research 2026-09-10)* **Burn 0.22 is in pre-release and breaks the API Mummu
                   is written against** — stable is still 0.21.0, but
                   [0.22.0-pre.3](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3)
@@ -2397,6 +2407,23 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
             per-model call formatting, not a live dependency. Source:
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
+      - [ ] *(research 2026-09-15)* **A dense 16 GB candidate that needs no MoE offload:
+            Devstral-2 22B.** Every 16 GB recommendation in this section so far routes through
+            `--cpu-moe` expert offload (`Qwen 3.6-35B-A3B`), which is unbuilt and ties the tier
+            to a feature P12 has not shipped. The 2026 round-ups now name **Devstral-2 22B at
+            ~14 GB Q4, 52.3% SWE-bench Verified**, as the strongest agentic model that fits a
+            16 GB card *dense* — i.e. it fits the **reference GPU exactly** with no offload path
+            required — and **Devstral Small 24B** is described as purpose-built for tool calling
+            and multi-step workflows, which is the axis Nanna actually grades on, not coding
+            score. Worth a look **because it decouples the 16 GB tier from `--cpu-moe`**, not
+            because of the benchmark number. Caveats before believing any of it: these are
+            secondary round-ups, the quoted figure is SWE-bench (a coding metric, not this
+            project's "task success @ budget"), and ~14 GB Q4 leaves little headroom once the
+            desktop + webview take their ~5-6 GB — so the real tier test is VRAM-after-display,
+            which is the same trap the 8 GB Qwen3.5-9B footnote records. Verify the actual
+            footprint before promoting it over the Qwen line. Sources:
+            [llmconfigurator VRAM-tier ranking](https://llmconfigurator.com/en/guides/coding-agents/best-local-coding-models),
+            [promptquorum local coding LLMs](https://www.promptquorum.com/local-llms/best-local-llms-for-coding).
       - [ ] *(research 2026-09-11)* **Qwen3.8-Flash-Next (2026-08-26) is not a local candidate
             — do not chase it for the 16 GB tier.** 125B total / 6B active MoE (512 experts,
             10+1 active), ~360 GB full precision with only an official FP8 variant; even int4
@@ -6873,8 +6900,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `typescript: ">=5.0.0"` so pnpm installs 7.0.2 happily, but its `resolveTscPath` does
      `require.resolve("typescript/lib/tsc")` and **TS 7's `package.json` `exports` no longer maps that
      subpath** -> `ERR_PACKAGE_PATH_NOT_EXPORTED`, typecheck exits 1 before reading a single file.
-     Reverted to `^5.9.3` (typecheck back to 0 errors). Blocked on Volar shipping a TS 7 `vue-tsc`;
-     nothing in this repo can work around it.
+     Reverted to `^5.9.3` (typecheck back to 0 errors). Nothing in this repo can work around it.
+     **Upstream state, checked via the GitHub API this run rather than assumed:**
+     [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381) ("TypeScript
+     Native / TypeScript 7 (`tsgo`) Support") is **closed as completed** (40 comments, last touched
+     2026-08-07) — but *closed does not mean shipped here*: `vue-tsc 3.3.11` still cannot resolve
+     `typescript/lib/tsc` under TS 7, measured today. The cause is structural, not a missing flag:
+     Volar embeds `tsc` through TypeScript's **programmatic API**, and TS 7.0 shipped without a
+     stable one — Microsoft's own 7.0 announcement calls out that Vue/MDX/Astro/Svelte workflows
+     "will likely not yet be able to leverage TypeScript 7". The resolution paths named on the
+     thread are **[johnsoncodehk/typescript-native-bridge](https://github.com/johnsoncodehk/typescript-native-bridge)**
+     (Volar's own maintainer) and **[microsoft/TypeScript#63800](https://github.com/microsoft/TypeScript/issues/63800)**;
+     TS **7.1** is where the stabilized API is expected.
+     **So the re-check for the next sweep is not "is TS 7 out" — it is whether `vue-tsc` ships a
+     version whose `resolveTscPath` works under TS 7.** Testing TypeScript alone will keep giving
+     the same red.
      Toolchain pin `nightly-2026-09-08` held. Verified on tmpfs: **clippy 0 errors**
      (`--workspace --all-targets --exclude nanna-gui`, 1m44s), whole-workspace `cargo test`
      **0 failures**, `cargo build --release -p nanna-daemon` green, 251/251 vitest, typecheck clean.
@@ -7204,10 +7244,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            burn's GPU backend on a desktop OS links a bundled C SQLite.** Turning off
            `burn/autotune` would not remove it.
            **Owner decision needed**, and the options are narrower than first thought:
-           - [ ] Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
-                 clear (it is a persistent autotune-results DB; CubeCL's own docs note the cache
-                 can be pre-built and shipped, so a no-DB mode is coherent). The only fix that
-                 keeps both the GPU backend and the Turso-only rule.
+           - [x] **Upstream is already fixing it, and better than this item asked for.**
+                 *(research 2026-09-15)* **[tracel-ai/cubecl#1608 — "Replace rusqlite with Turso
+                 in cubecl-environment's persistence layer"](https://github.com/tracel-ai/cubecl/issues/1608)**,
+                 opened 2026-09-04 by **antimora** (Tracel/Burn), assigned to **jwric**, marked
+                 *In Progress*, last touched **2026-09-14** — verified open via the GitHub API,
+                 not inferred from a search snippet. It replaces the bundled C SQLite with
+                 **Turso**, and notes "a similar migration was completed in the burn project".
+                 This is strictly better than the flag this item wanted: a flag would have left
+                 the C engine linkable, whereas this removes it.
+                 **If it lands, the owner decision below evaporates.** Nanna's
+                 `no_banned_database_crates_in_lockfile` guard bans `rusqlite`/`libsql`/`sqlx`
+                 and Turso is the database Nanna already uses, so `mummu` becomes addable with
+                 **no guard change, no C SQLite in the shipped binary, and nothing to decide**.
+                 Stated tradeoffs in the issue: dependency count 153 → 276, Turso is WAL-only
+                 (`PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL for shipping), and no
+                 URI/immutable read-only mode.
+                 **So: watch #1608 before spending the owner's decision on the two options below.**
+                 Re-check it at the top of each run — this is now the cheapest thing standing
+                 between P12 and its first real consumer.
+           - [ ] ~~Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
+                 clear.~~ **Superseded by #1608 above** — removing the C engine beats gating it.
            - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
                  vendored GPU-autotune cache. Weakens a deliberate guard — do it with eyes open,
                  and only if the owner accepts a C SQLite in the shipped binary (it also cuts
