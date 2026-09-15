@@ -141,6 +141,7 @@ const railItems = computed<NuiRailItem[]>(() => [
   { id: '/scheduler', icon: 'scheduler', label: 'Scheduler' },
   { id: '/model-stats', icon: 'model-stats', label: 'Model Stats' },
   { id: '/tool-stats', icon: 'tool-stats', label: 'Tool Stats' },
+  { id: '/tool-audit', icon: 'circle-check', label: 'Tool Audit' },
 ])
 
 const bottomRailItems: NuiRailItem[] = [

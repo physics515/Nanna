@@ -14,30 +14,74 @@ impl ControlPlane {
         
         match action {
             ToolAction::List => {
-                let definitions = tools.definitions().await;
-                let tool_list: Vec<_> = definitions.into_iter()
-                    .map(|t| json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "enabled": true,
-                    }))
+                // `inventory()`, NOT `definitions()`. The latter hides
+                // policy-denied tools — correct for the model, which must not be
+                // offered a tool the gate would refuse, but fatal for a
+                // management surface: a disabled tool would vanish from the only
+                // list the GUI can see, and disabling would be a one-way door.
+                let entries = tools.inventory().await;
+
+                // A disabled user tool is unregistered from the live registry, so
+                // it is absent from the inventory above and has to be merged back
+                // in from its own store, or it would be missing for the same
+                // reason. Its store carries the authoritative flag.
+                let user_tools = match self.user_tools {
+                    Some(ref ut) => ut.list_tools().await,
+                    None => Vec::new(),
+                };
+                let user_names: std::collections::HashSet<&str> =
+                    user_tools.iter().map(|t| t.name.as_str()).collect();
+
+                let mut tool_list: Vec<_> = entries
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "enabled": t.enabled,
+                            "is_user_tool": user_names.contains(t.name.as_str()),
+                        })
+                    })
                     .collect();
+
+                let listed: std::collections::HashSet<&str> =
+                    entries.iter().map(|t| t.name.as_str()).collect();
+                tool_list.extend(
+                    user_tools
+                        .iter()
+                        .filter(|t| !listed.contains(t.name.as_str()))
+                        .map(|t| {
+                            json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "enabled": t.enabled,
+                                "is_user_tool": true,
+                            })
+                        }),
+                );
+
                 json!({ "tools": tool_list })
             }
             ToolAction::Get { name } => {
-                let definitions = tools.definitions().await;
-                if let Some(tool) = definitions.into_iter().find(|t| t.name == name) {
+                // `get` rather than `definitions()` for the same reason as the
+                // listing above: a disabled tool must still be inspectable, or
+                // its detail panel reports "not found" the moment it is switched
+                // off.
+                if let Some(tool) = tools.get(&name).await {
+                    let definition = tool.definition();
+                    let canonical = tools.canonical_name(&name).await;
                     json!({ "tool": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
+                        "name": definition.name,
+                        "description": definition.description,
+                        "parameters": definition.parameters,
+                        "enabled": tools.policy().await.permits(&canonical),
                     }})
                 } else {
                     json!({ "error": "not_found", "name": name })
                 }
             }
-            ToolAction::Enable { name } => self.set_user_tool_enabled(&name, true).await,
-            ToolAction::Disable { name } => self.set_user_tool_enabled(&name, false).await,
+            ToolAction::Enable { name } => self.set_tool_enabled(&name, true).await,
+            ToolAction::Disable { name } => self.set_tool_enabled(&name, false).await,
             ToolAction::Execute { name, input } => {
                 use nanna_tools::ToolCall;
                 
@@ -212,6 +256,36 @@ impl ControlPlane {
                     }))
                     .collect();
                 json!({ "tools": tool_list })
+            }
+            ToolAction::Audit { limit } => {
+                // No trail configured is not an empty trail. Saying "0 records"
+                // here would answer "what has Nanna been doing?" with silence
+                // that reads as "nothing", when the truth is that nobody was
+                // writing it down.
+                let Some(ref path) = self.audit_log_path else {
+                    return json!({
+                        "enabled": false,
+                        "records": [],
+                        "message": "The tool audit trail is off. Set `[tools] audit_log = true` \
+                                    and restart the daemon to begin recording tool calls.",
+                    });
+                };
+
+                let page =
+                    nanna_tools::read_recent_audit(path, limit.unwrap_or(nanna_tools::AUDIT_PAGE_DEFAULT));
+                json!({
+                    "enabled": true,
+                    "path": path.display().to_string(),
+                    "records": page.records,
+                    // Everything below is the reader's account of itself. A
+                    // viewer that shows records without them cannot tell a
+                    // complete history from a screenful, or a clean file from
+                    // one it partly failed to read.
+                    "unparseable": page.unparseable,
+                    "scanned": page.scanned,
+                    "generations_read": page.generations_read,
+                    "reached_oldest": page.reached_oldest,
+                })
             }
         }
     }

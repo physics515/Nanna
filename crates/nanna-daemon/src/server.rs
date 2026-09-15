@@ -1488,6 +1488,21 @@ impl Default for LlmConfig {
     }
 }
 
+impl DaemonConfig {
+    /// Where the per-call tool audit trail is written.
+    ///
+    /// One definition, because two consumers need it and they are built in
+    /// different places: `init_services` hands it to the [`JsonlAuditSink`], and
+    /// the control plane needs it to serve the trail back to a client. Deriving
+    /// it twice is how the reader ends up looking somewhere the writer never
+    /// wrote — and note this hangs off `data_dir`, which `--data-dir` moves, so
+    /// re-deriving from `Config::default_data_dir()` would read an empty trail
+    /// on every isolated run.
+    pub fn tool_audit_path(&self) -> PathBuf {
+        self.data_dir.join("logs").join("tool-audit.jsonl")
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         let data_dir = nanna_config::project_dirs()
@@ -2923,6 +2938,11 @@ impl DaemonServer {
             Some(router),
         )
         .with_tools_dir(tools_dir)
+        .with_audit_log_path(
+            self.config
+                .tool_audit_log
+                .then(|| self.config.tool_audit_path()),
+        )
         .with_event_tx(self.ipc.event_sender())
         .with_session_filters(self.ipc.session_filters())
         .with_workspace_id(workspace_id_for_services)
@@ -4193,7 +4213,7 @@ impl DaemonServer {
         // the registry directly), and an audit that saw only one of them would
         // be worse than none — it would read as a complete account.
         if self.config.tool_audit_log {
-            let path = self.config.data_dir.join("logs").join("tool-audit.jsonl");
+            let path = self.config.tool_audit_path();
             let sink = nanna_tools::JsonlAuditSink::new(
                 path.clone(),
                 nanna_tools::ToolAuditConfig {

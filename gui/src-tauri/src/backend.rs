@@ -485,6 +485,8 @@ daemon_proxies! {
     // --- Tool operations ---
     /// List all tools
     tool_list();
+    /// Enable or disable a tool
+    tool_set_enabled(name: &str, enabled: bool);
     /// Execute a tool
     tool_execute(name: &str, input: Value);
     /// Create a user tool

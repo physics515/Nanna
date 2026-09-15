@@ -488,6 +488,16 @@ pub enum ToolAction {
     ListUser,
     /// Get source code for a tool (reads from tools directory)
     GetSource { name: String },
+    /// Read the per-call audit trail, newest first.
+    ///
+    /// The trail is a file in the daemon's data directory, and clients — the
+    /// GUI included — are pure daemon clients that cannot reach it. Serving it
+    /// over the control plane is what makes the record reviewable rather than
+    /// merely written.
+    Audit {
+        /// How many records to return. Clamped to the reader's ceiling.
+        limit: Option<usize>,
+    },
 }
 
 // =============================================================================

@@ -294,7 +294,8 @@ impl JsonlAuditSink {
         &self.config
     }
 
-    /// Roll `<path>` aside to `<path>.1` when it has reached the ceiling.
+    /// Roll `<path>` aside to the previous generation when it has reached the
+    /// ceiling.
     ///
     /// A missing file is not an error — it is the first call.
     fn roll_if_full(&self) {
@@ -304,9 +305,7 @@ impl JsonlAuditSink {
         if meta.len() < self.config.file_bytes_max {
             return;
         }
-        let mut rolled = self.path.clone().into_os_string();
-        rolled.push(".1");
-        if let Err(e) = std::fs::rename(&self.path, PathBuf::from(rolled)) {
+        if let Err(e) = std::fs::rename(&self.path, rolled_path(&self.path)) {
             warn!(path = %self.path.display(), error = %e, "Could not roll the tool audit log");
         }
     }
@@ -392,6 +391,141 @@ impl ToolAuditSink for TracingAuditSink {
             "tool call"
         );
     }
+}
+
+// =============================================================================
+// Reading the trail back
+// =============================================================================
+
+/// The path the previous generation rolls aside to.
+///
+/// One definition, used by the sink that creates it *and* the reader that looks
+/// for it. Keeping the reader in this module is the point: a rollover naming
+/// scheme that lived in two places would drift, and the failure would be silent
+/// — a viewer that simply never finds the older half of the history.
+#[must_use]
+pub fn rolled_path(path: &Path) -> PathBuf {
+    let mut rolled = path.to_path_buf().into_os_string();
+    rolled.push(".1");
+    PathBuf::from(rolled)
+}
+
+/// Largest page [`read_recent`] will return.
+///
+/// At roughly 300 bytes per record this is ~300 KB on the wire: enough for a
+/// viewer to scroll a working session, and small enough that one request cannot
+/// turn the whole 8 MB trail into a single control-plane response.
+pub const AUDIT_PAGE_MAX: usize = 1000;
+
+/// Page size when a caller does not ask for one.
+pub const AUDIT_PAGE_DEFAULT: usize = 200;
+
+/// One page of the trail, plus an honest account of what producing it cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPage {
+    /// Records, **newest first**.
+    pub records: Vec<ToolAuditRecord>,
+    /// Lines that did not parse and were skipped.
+    ///
+    /// Reported rather than swallowed. A trail is evidence, and a reader that
+    /// silently drops what it cannot read presents a partial history as a
+    /// complete one — the exact dishonesty the audit exists to prevent. A
+    /// non-zero count here means the file was truncated mid-write, hand-edited,
+    /// or written by a different version.
+    pub unparseable: usize,
+    /// Total non-empty lines examined across every generation read.
+    pub scanned: usize,
+    /// How many files were read: `1` for the live trail alone, `2` when the
+    /// rolled generation was needed to fill the page.
+    pub generations_read: usize,
+    /// True when this page reaches the oldest record that still exists — the
+    /// whole retained history, not a window into more.
+    ///
+    /// Without this a viewer cannot tell "that is everything Nanna has done"
+    /// from "that is the most recent screenful", and those are very different
+    /// answers to the question an audit gets asked.
+    pub reached_oldest: bool,
+}
+
+/// Parse one generation's text into records in file order (oldest first),
+/// accumulating the scan counters into `page`.
+fn parse_generation(body: &str, page: &mut AuditPage) -> Vec<ToolAuditRecord> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        page.scanned += 1;
+        match serde_json::from_str::<ToolAuditRecord>(line) {
+            Ok(record) => out.push(record),
+            Err(_) => page.unparseable += 1,
+        }
+    }
+    out
+}
+
+/// Read the most recent records from an audit trail, newest first.
+///
+/// Reads the live file and — only when that alone cannot fill the page — the
+/// rolled generation as well. That fallback is not a nicety: the sink rolls at
+/// a byte ceiling, so a viewer opened just after a rollover would otherwise show
+/// a handful of records and present them as the entire history.
+///
+/// A missing file is an empty page, not an error: a daemon that has not yet run
+/// a tool has nothing to show, and that is a legitimate answer.
+///
+/// Bounded without needing its own byte cap: [`JsonlAuditSink`] holds each
+/// generation under [`ToolAuditConfig::file_bytes_max`], so the most this can
+/// read is two generations of an already-capped file.
+#[must_use]
+pub fn read_recent(path: &Path, limit: usize) -> AuditPage {
+    let limit = limit.clamp(1, AUDIT_PAGE_MAX);
+    let mut page = AuditPage::default();
+
+    let mut chronological = match std::fs::read_to_string(path) {
+        Ok(body) => {
+            page.generations_read += 1;
+            parse_generation(&body, &mut page)
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // Only pay for the rolled generation when the live one cannot fill the
+    // page. On a long-running trail it never can't, so the common case reads
+    // one file.
+    let rolled = rolled_path(path);
+    let mut rolled_read = false;
+    if chronological.len() < limit
+        && let Ok(body) = std::fs::read_to_string(&rolled)
+    {
+        rolled_read = true;
+        page.generations_read += 1;
+        // The rolled generation is strictly older, so it goes in front.
+        let mut older = parse_generation(&body, &mut page);
+        older.append(&mut chronological);
+        chronological = older;
+    }
+
+    // "Oldest" means nothing older is retained anywhere: this page holds every
+    // record we found, and there is no unread generation hiding more.
+    let unread_generation = !rolled_read && rolled.exists();
+    page.reached_oldest = !unread_generation && chronological.len() <= limit;
+
+    if chronological.len() > limit {
+        chronological.drain(..chronological.len() - limit);
+    }
+    chronological.reverse();
+    page.records = chronological;
+
+    debug_assert!(
+        page.records.len() <= limit,
+        "a page may never exceed the limit it was asked for"
+    );
+    debug_assert!(
+        page.records.len() + page.unparseable <= page.scanned,
+        "every returned record and every skipped line must have been scanned"
+    );
+    page
 }
 
 #[cfg(test)]
@@ -569,5 +703,189 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].requested, "Bash");
         assert_eq!(seen[0].resolved.as_deref(), Some("exec"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Reading the trail back
+    // -------------------------------------------------------------------------
+
+    /// A record tagged with `id`, so ordering assertions name a specific call
+    /// rather than counting anonymous rows.
+    fn rec_id(id: &str) -> ToolAuditRecord {
+        ToolAuditRecord {
+            call_id: id.to_string(),
+            ..rec(ToolAuditOutcome::Succeeded)
+        }
+    }
+
+    fn ids(page: &AuditPage) -> Vec<&str> {
+        page.records.iter().map(|r| r.call_id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_page_is_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        let sink = JsonlAuditSink::new(&path, ToolAuditConfig::default());
+        for id in ["a", "b", "c"] {
+            sink.record(&rec_id(id));
+        }
+
+        let page = read_recent(&path, 10);
+        assert_eq!(
+            ids(&page),
+            vec!["c", "b", "a"],
+            "the most recent call must be the first thing a reviewer sees"
+        );
+        assert_eq!(page.scanned, 3);
+        assert_eq!(page.unparseable, 0);
+        assert!(
+            page.reached_oldest,
+            "three records under a limit of ten is the whole history"
+        );
+    }
+
+    #[test]
+    fn a_malformed_line_is_skipped_and_counted_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        let good = serde_json::to_string(&rec_id("good")).unwrap();
+        // A line torn by a crash mid-write, between two intact records.
+        std::fs::write(&path, format!("{good}\n{{\"requested\":\"tru\n{good}\n")).unwrap();
+
+        let page = read_recent(&path, 10);
+        assert_eq!(
+            page.records.len(),
+            2,
+            "one bad line must not cost the records around it"
+        );
+        assert_eq!(
+            page.unparseable, 1,
+            "and it must be reported, or a partial history reads as a complete one"
+        );
+        assert_eq!(page.scanned, 3);
+    }
+
+    #[test]
+    fn a_missing_trail_reads_as_an_empty_page_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = read_recent(&dir.path().join("never-written.jsonl"), 10);
+        assert!(page.records.is_empty());
+        assert_eq!(page.generations_read, 0);
+        assert_eq!(page.scanned, 0);
+        assert!(
+            page.reached_oldest,
+            "a daemon that has run no tools has shown its entire history"
+        );
+    }
+
+    /// The property the rolled-generation fallback exists for: the sink rolls at
+    /// a byte ceiling, so a viewer opened just afterwards would otherwise see
+    /// only the handful of records written since — and present them as
+    /// everything that ever happened.
+    #[test]
+    fn a_page_reaches_into_the_rolled_generation_when_the_live_file_is_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        let sink = JsonlAuditSink::new(
+            &path,
+            ToolAuditConfig {
+                include_values: false,
+                // One record exceeds this, so every write after the first rolls.
+                file_bytes_max: 16,
+            },
+        );
+        sink.record(&rec_id("older"));
+        sink.record(&rec_id("newer"));
+
+        let live = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(live.lines().count(), 1, "the live file really did roll");
+
+        let page = read_recent(&path, 10);
+        assert_eq!(
+            ids(&page),
+            vec!["newer", "older"],
+            "history spans the rollover, newest first"
+        );
+        assert_eq!(page.generations_read, 2);
+        assert!(page.reached_oldest);
+    }
+
+    #[test]
+    fn a_full_page_skips_the_rolled_generation_and_says_it_is_not_the_whole_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        std::fs::write(
+            rolled_path(&path),
+            format!("{}\n", serde_json::to_string(&rec_id("ancient")).unwrap()),
+        )
+        .unwrap();
+        let sink = JsonlAuditSink::new(&path, ToolAuditConfig::default());
+        for id in ["x", "y"] {
+            sink.record(&rec_id(id));
+        }
+
+        let page = read_recent(&path, 2);
+        assert_eq!(ids(&page), vec!["y", "x"]);
+        assert_eq!(
+            page.generations_read, 1,
+            "a page the live file can fill must not pay to read the older one"
+        );
+        assert!(
+            !page.reached_oldest,
+            "older records exist unread, and the viewer must not claim otherwise"
+        );
+    }
+
+    #[test]
+    fn a_page_is_clamped_to_its_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        let sink = JsonlAuditSink::new(&path, ToolAuditConfig::default());
+        for i in 0..5 {
+            sink.record(&rec_id(&format!("r{i}")));
+        }
+
+        let page = read_recent(&path, 2);
+        assert_eq!(
+            ids(&page),
+            vec!["r4", "r3"],
+            "a bounded page keeps the newest, not the first written"
+        );
+        assert!(!page.reached_oldest);
+
+        // A caller asking for more than the ceiling gets the ceiling, not a
+        // refusal and not an unbounded response.
+        assert!(read_recent(&path, usize::MAX).records.len() <= AUDIT_PAGE_MAX);
+    }
+
+    /// The reason the reader lives in this module: the sink names the rolled
+    /// generation and the reader looks for it, and if those two ever disagree
+    /// the older half of the history simply stops existing — silently. This
+    /// drives the real sink's rollover and then asks the real reader to find it.
+    #[test]
+    fn the_reader_finds_what_the_sink_actually_rolled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-audit.jsonl");
+        let sink = JsonlAuditSink::new(
+            &path,
+            ToolAuditConfig {
+                include_values: false,
+                file_bytes_max: 16,
+            },
+        );
+        sink.record(&rec_id("rolled-away"));
+        sink.record(&rec_id("still-live"));
+
+        assert!(
+            rolled_path(&path).exists(),
+            "the sink must have produced the generation the reader looks for"
+        );
+        let page = read_recent(&path, 10);
+        assert!(
+            ids(&page).contains(&"rolled-away"),
+            "a record the sink rolled aside must still be readable: {:?}",
+            ids(&page)
+        );
     }
 }

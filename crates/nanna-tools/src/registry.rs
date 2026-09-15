@@ -36,6 +36,21 @@ tokio::task_local! {
     static RUN_SESSION_ID: String;
 }
 
+/// One canonical tool and whether the active policy lets it run.
+///
+/// The management-surface counterpart to [`ToolDefinition`], which is the
+/// model-facing shape. Carrying `enabled` as a field rather than expressing it
+/// by absence is the whole point: a disabled tool has to be *listed as
+/// disabled* for anything to turn it back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInventoryEntry {
+    /// Canonical name — the identity the policy gate speaks.
+    pub name: String,
+    pub description: String,
+    /// False when the active [`ToolPolicy`] would refuse this tool.
+    pub enabled: bool,
+}
+
 /// Registry of available tools
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
@@ -506,6 +521,46 @@ impl ToolRegistry {
                 def
             })
             .collect()
+    }
+
+    /// Every canonical tool, each carrying whether the active policy permits it.
+    ///
+    /// Deliberately NOT filtered by policy, which is what separates this from
+    /// [`Self::definitions`]. That method answers "what may the model call?", so
+    /// hiding a denied tool is right there — an offer the gate would refuse is a
+    /// lie to the model. This one answers "what does this installation have, and
+    /// what is its state?", which a management surface needs in order to show a
+    /// disabled tool *as disabled*.
+    ///
+    /// The distinction is load-bearing rather than cosmetic: a control surface
+    /// built on `definitions()` cannot re-enable anything, because the moment a
+    /// tool is disabled it disappears from the only list that surface can see.
+    /// Disabling would be a one-way door.
+    ///
+    /// Aliases are excluded (the canonical entry they point at is already here),
+    /// so each tool appears exactly once under the name the policy gate speaks.
+    /// Sorted by name so a caller rendering a list gets a stable order rather
+    /// than `HashMap` iteration order, which reshuffles between calls.
+    pub async fn inventory(&self) -> Vec<ToolInventoryEntry> {
+        let tools = self.tools.read().await;
+        let aliases = self.aliases.read().await;
+        let policy = self.policy.read().await;
+        let mut entries: Vec<ToolInventoryEntry> = tools
+            .iter()
+            .filter(|(name, _)| !aliases.contains(name.as_str()))
+            .map(|(name, tool)| ToolInventoryEntry {
+                enabled: policy.permits(name.as_str()),
+                description: tool.definition().description,
+                name: name.clone(),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].name < w[1].name),
+            "inventory must list each canonical tool exactly once, in order"
+        );
+        entries
     }
 
     /// Get tool definitions for a specific set of tool names.
@@ -1720,6 +1775,53 @@ mod tests {
         assert!(
             reg.definitions().await.is_empty(),
             "a denied tool must not be offered to the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_stays_visible_in_inventory_as_disabled() {
+        // The two listings answer different questions, and this is the case
+        // where they MUST disagree: the model is not offered a denied tool,
+        // but a management surface has to keep showing it or disabling it
+        // would be a one-way door — nothing could ever turn it back on.
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+
+        let before = reg.inventory().await;
+        assert_eq!(before.len(), 1);
+        assert!(before[0].enabled, "an ungated tool reports enabled");
+
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        assert!(
+            reg.definitions().await.is_empty(),
+            "the model must not be offered a denied tool"
+        );
+        let after = reg.inventory().await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the denied tool must still be listed, or it cannot be re-enabled"
+        );
+        assert_eq!(after[0].name, "echo");
+        assert!(!after[0].enabled, "and it must be listed AS disabled");
+    }
+
+    /// An allowlist denies by omission rather than by naming, so a tool can be
+    /// disabled without ever appearing on a denylist. The inventory reports the
+    /// policy's verdict, not the shape of the configuration that produced it.
+    #[tokio::test]
+    async fn inventory_reports_allowlist_exclusion_as_disabled() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.set_policy(ToolPolicy::allow_only(["something_else"]))
+            .await;
+
+        let entries = reg.inventory().await;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].enabled,
+            "a tool outside the allowlist is disabled, though it is on no denylist"
         );
     }
 

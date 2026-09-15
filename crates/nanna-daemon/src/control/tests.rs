@@ -263,6 +263,174 @@ async fn enable_disable_reconciles_live_registry() {
 }
 
 // ---------------------------------------------------------------------------
+// Universal per-tool toggle (bundled skills, not just user tools)
+// ---------------------------------------------------------------------------
+
+/// A stand-in for a bundled skill: registered in the registry, with no entry in
+/// the user-tool store. That combination is the whole point — it is the class
+/// the toggle used to be unable to touch.
+struct DemoBundledTool;
+
+#[async_trait::async_trait]
+impl nanna_tools::Tool for DemoBundledTool {
+    fn definition(&self) -> nanna_tools::ToolDefinition {
+        nanna_tools::ToolDefinition {
+            name: "demo_builtin".to_string(),
+            description: "a bundled demo tool".to_string(),
+            parameters: Vec::new(),
+            output_schema: None,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _params: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<nanna_tools::ToolResult, nanna_tools::ToolError> {
+        Ok(nanna_tools::ToolResult::success("ok"))
+    }
+}
+
+/// The defect this closes: `Enable`/`Disable` routed to the user-tool store, so
+/// for a bundled skill it answered `update_failed` and changed nothing. The 44
+/// shipped skills could not be turned off from any client.
+#[tokio::test]
+async fn a_bundled_tool_can_be_toggled_and_the_gate_really_stops_it() {
+    use nanna_tools::{ToolCall, ToolRegistry};
+
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(DemoBundledTool).await;
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(registry.clone());
+    // No user-tool manager: this tool has no per-tool store, which is exactly
+    // the case the old path could not serve.
+
+    let call = || ToolCall {
+        id: "c".to_string(),
+        name: "demo_builtin".to_string(),
+        parameters: std::collections::HashMap::new(),
+    };
+    assert!(
+        registry.execute(call()).await.result.success,
+        "the tool runs before anything is toggled"
+    );
+
+    let resp = cp.set_tool_enabled("demo_builtin", false).await;
+    assert_eq!(resp["status"], "disabled");
+    assert_eq!(resp["name"], "demo_builtin");
+
+    // The verdict has to be the gate refusing, not merely a flag somewhere.
+    assert!(
+        !registry.execute(call()).await.result.success,
+        "a disabled tool must actually stop executing"
+    );
+
+    let resp = cp.set_tool_enabled("demo_builtin", true).await;
+    assert_eq!(resp["status"], "enabled");
+    assert!(
+        registry.execute(call()).await.result.success,
+        "re-enabling must restore it without a restart"
+    );
+}
+
+/// Disabling must not hide the tool from the listing that turns it back on.
+/// `definitions()` drops a denied tool on purpose, so a `List` built on it made
+/// disabling a one-way door: the tool vanished and no client could reach it.
+#[tokio::test]
+async fn a_disabled_bundled_tool_is_still_listed_so_it_can_be_re_enabled() {
+    use nanna_tools::ToolRegistry;
+
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(DemoBundledTool).await;
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(registry.clone());
+    let cp = Arc::new(cp);
+
+    cp.set_tool_enabled("demo_builtin", false).await;
+
+    let resp = cp.handle("test", Action::Tool(ToolAction::List)).await;
+    let listed = resp["tools"]
+        .as_array()
+        .expect("list must return an array")
+        .iter()
+        .find(|t| t["name"] == "demo_builtin")
+        .expect("a disabled tool must remain listed, or nothing can re-enable it");
+    assert_eq!(
+        listed["enabled"], false,
+        "and it must be reported AS disabled, not silently claimed enabled"
+    );
+
+    // Its detail view must survive being switched off too.
+    let resp = cp
+        .handle(
+            "test",
+            Action::Tool(ToolAction::Get {
+                name: "demo_builtin".to_string(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["tool"]["name"], "demo_builtin",
+        "a disabled tool must still be inspectable"
+    );
+    assert_eq!(resp["tool"]["enabled"], false);
+}
+
+/// The alias lesson the audit trail already paid for, now on the toggle path.
+/// `resolve_tool` returns the registry KEY, which for an alias is the alias
+/// itself — so writing that into the denylist would produce a toggle that
+/// reports success while the gate, which speaks canonical names, keeps letting
+/// the tool run.
+#[tokio::test]
+async fn toggling_an_alias_disables_the_tool_it_points_at() {
+    use nanna_tools::{ToolCall, ToolRegistry};
+
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(DemoBundledTool).await;
+    registry.register_alias("DemoAlias", "demo_builtin").await;
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(registry.clone());
+
+    let resp = cp.set_tool_enabled("DemoAlias", false).await;
+    assert_eq!(
+        resp["name"], "demo_builtin",
+        "the toggle must report the canonical identity it actually acted on"
+    );
+
+    let blocked = registry
+        .execute(ToolCall {
+            id: "c".to_string(),
+            name: "demo_builtin".to_string(),
+            parameters: std::collections::HashMap::new(),
+        })
+        .await;
+    assert!(
+        !blocked.result.success,
+        "disabling via an alias must stop the canonical tool, not a name nothing checks"
+    );
+}
+
+/// A name no tool answers to must be refused, not silently written into the
+/// denylist where it would sit forever gating nothing.
+#[tokio::test]
+async fn toggling_an_unknown_tool_is_refused() {
+    use nanna_tools::ToolRegistry;
+
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(DemoBundledTool).await;
+
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.tools = Some(registry.clone());
+
+    let resp = cp
+        .set_tool_enabled("zzzz_no_such_tool_at_all", false)
+        .await;
+    assert_eq!(resp["error"], "not_found");
+}
+
+// ---------------------------------------------------------------------------
 // ChatRunRegistry admission gate (P22 Tier 4)
 // ---------------------------------------------------------------------------
 

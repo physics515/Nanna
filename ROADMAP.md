@@ -523,7 +523,7 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       is a pure function whose 26 tests already assert against a real DOM, so the marginal value was low
       next to a full release build of the whole workspace on a contended shared target dir. Worth doing
       on a run that is building the GUI anyway.
-- [~] Per-tool toggles visible in GUI; audit log for every tool call.
+- [x] **Per-tool toggles visible in GUI; audit log for every tool call.**
       *(2026-08-24)* **The audit half shipped.** New `nanna-tools::audit` records **one structured JSON
       line per tool call** at the single chokepoint every caller funnels through — `ToolRegistry::execute`.
       Two things were wrong before, and both are the reason this could not just be "add a log line":
@@ -573,7 +573,51 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       alias-canonicalization fix, proven live rather than argued. And note what is *absent*: the `exec`
       call carried `command: "echo hi"` and the `list_dir` call carried `path: "."`, and neither value
       appears anywhere in the trail — only the key names, which is the default posture working.
-      **Still open on this line:** the GUI per-tool toggles, and an audit *viewer* in the GUI.
+      *(2026-09-15)* **Both remaining halves landed and are verified against the real binary, which
+      is the bar the audit work itself set.** The toggles: `ToolAction::Enable/Disable` routed only
+      to the user-tool store, so toggling any of the 44 bundled skills answered `update_failed` and
+      changed nothing; and `List` hardcoded `"enabled": true` while building from `definitions()`,
+      which *deliberately* filters policy-denied tools — together a one-way door, since disabling a
+      tool would have removed it from the only list a client can see. Fixed with
+      `ToolRegistry::inventory()` (every canonical tool, the policy verdict as a *field*, unfiltered)
+      and a `set_tool_enabled` that canonicalizes first — the same alias bug the trail already paid
+      for, since writing `Bash` into the denylist would report success and gate nothing. The viewer:
+      `ToolAction::Audit { limit }` + `get_tool_audit` + `pages/tool-audit.vue`. One real discrepancy
+      fell out: the sink writes to `DaemonConfig::data_dir` (which `--data-dir` moves) while the
+      control plane would have re-derived from `Config::default_data_dir()` — every isolated run
+      would have shown an empty trail while the daemon wrote elsewhere. Now one `tool_audit_path()`,
+      handed to the control plane rather than re-derived.
+      **Driven live against a freshly built `nanna-daemon` on an isolated `--data-dir`** (scratch
+      config, port 51997). `tool.audit` returned the trail with its honesty fields —
+      `enabled: true`, `scanned: 4`, `generations_read: 1`, `reached_oldest: true`,
+      `unparseable: 0` — and `path` reported the **`--data-dir`-relative** file, which is the
+      path-discrepancy fix proven rather than argued. Three outcome classes were recorded and read
+      back over the socket: `succeeded`, `refused` (a real policy denial, one of the early-return
+      exits an appended-at-the-end record would have missed) and `not_found`. Two caller classes
+      appear: a **scheduled heartbeat** (`session_id: "scheduled-heartbeat-…"`, the exact class the
+      2026-08-24 work says left no trace at all) and direct IPC (`session_id: null`). The value-free
+      posture held throughout — `param_keys: ["path"]` and `["action","limit"]`, key names only,
+      with the written config showing the shipped defaults `audit_log = true` /
+      `audit_log_values = false`. The toggle round-trip worked on a **bundled** skill: `disable` →
+      `{"status":"disabled"}`, the next call refused, `list_dir` **still present** in `tool.list`
+      (no one-way door), `enable` → `{"status":"enabled"}`. Containment checked rather than assumed:
+      `disabled = ["list_dir"]` landed in the scratch config while the operator's real
+      `~/.config/nanna/config.toml` still read `disabled = []`. Daemon exited
+      `"reason": "clean_shutdown"`, no stray process.
+      **Not verified, and not claimed:** the GUI *rendering* of the toggle and the viewer page. This
+      host has no `WebKitWebDriver` (see the P4/P11 entries — it is a packaging gap on Arch, not an
+      uninstalled package), so the ceiling here is the static guards, which do hold:
+      `invokeCommands` proves `set_tool_enabled` and `get_tool_audit` resolve to registered handlers,
+      and `componentResolution` / `packageComponentExports` prove every component and lucide import
+      on the new page really exists. `pnpm typecheck` 0 errors with its canary confirming it reads
+      `app/`; 251 vitest; nanna-tools 153 and nanna-daemon 367 tests green.
+      - [ ] **One defect found while driving this, left unfixed as out of scope.** A `tool.execute`
+            request missing the non-optional `input` field gets **silence** — the client times out
+            rather than being told the request was malformed. Measured: the same call *with*
+            `input: {}` answers correctly with a `not_found` outcome, so this is the request-decode
+            path, not the tool path. A control plane that drops an undeserializable request without
+            answering is the same honesty failure the audit work was about; it deserves its own
+            increment.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via

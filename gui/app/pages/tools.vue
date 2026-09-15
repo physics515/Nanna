@@ -50,7 +50,14 @@
             >
               <Wrench class="w-4 h-4 flex-shrink-0" />
               <span class="text-sm truncate flex-1">{{ tool.name }}</span>
-              <UiBadge v-if="!tool.enabled" variant="secondary" size="xs">disabled</UiBadge>
+              <span @click.stop>
+                <UiSwitch
+                  :model-value="tool.enabled"
+                  :disabled="togglingTools.has(tool.name)"
+                  :label="`${tool.enabled ? 'Disable' : 'Enable'} ${tool.name}`"
+                  @update:model-value="setToolEnabled(tool, $event)"
+                />
+              </span>
             </div>
           </template>
         </VirtualList>
@@ -66,14 +73,21 @@
           >
             <Wrench class="w-4 h-4 flex-shrink-0" />
             <span class="text-sm truncate flex-1">{{ tool.name }}</span>
-            <UiBadge v-if="!tool.enabled" variant="secondary" size="xs">disabled</UiBadge>
+            <span @click.stop>
+              <UiSwitch
+                :model-value="tool.enabled"
+                :disabled="togglingTools.has(tool.name)"
+                :label="`${tool.enabled ? 'Disable' : 'Enable'} ${tool.name}`"
+                @update:model-value="setToolEnabled(tool, $event)"
+              />
+            </span>
           </div>
         </div>
       </div>
 
       <!-- Tool count -->
       <footer class="px-3 py-2 border-t border-white/[0.04] text-[10px] text-nanna-text-dim">
-        {{ tools.length }} tools available
+        {{ enabledCount }} of {{ tools.length }} tools enabled
       </footer>
     </aside>
 
@@ -112,8 +126,20 @@
                 </span>
               </div>
               <UiBadge v-if="hasChanges" variant="warning" size="sm">unsaved</UiBadge>
+              <UiBadge v-if="selectedTool?.is_user_tool" variant="secondary" size="sm">user tool</UiBadge>
             </div>
             <div class="flex items-center gap-2">
+              <div v-if="selectedTool && !creating" class="flex items-center gap-2 mr-1">
+                <span class="text-xs text-nanna-text-muted">
+                  {{ selectedTool.enabled ? 'Enabled' : 'Disabled' }}
+                </span>
+                <UiSwitch
+                  :model-value="selectedTool.enabled"
+                  :disabled="togglingTools.has(selectedTool.name)"
+                  :label="`${selectedTool.enabled ? 'Disable' : 'Enable'} ${selectedTool.name}`"
+                  @update:model-value="setToolEnabled(selectedTool, $event)"
+                />
+              </div>
               <UiButton @click="testTool" variant="ghost" size="sm" :disabled="!canTest">
                 <Play class="w-4 h-4 mr-1" /> Test
               </UiButton>
@@ -352,7 +378,11 @@ interface Tool {
   name: string
   description: string
   enabled: boolean
-  isUserTool?: boolean
+  // Snake_case because that is what the daemon and the Tauri command emit
+  // verbatim (no serde rename anywhere in the chain), matching how every other
+  // daemon-sourced field is read in this app. It was previously declared as
+  // `isUserTool`, which no payload has ever carried, so it read `undefined`.
+  is_user_tool?: boolean
 }
 
 interface ToolDetails {
@@ -383,6 +413,8 @@ const deleting = ref(false)
 const testing = ref(false)
 const searchQuery = ref('')
 const tools = ref<Tool[]>([])
+/** Names with a toggle in flight, so a switch cannot be double-fired. */
+const togglingTools = ref<Set<string>>(new Set())
 const selectedTool = ref<Tool | null>(null)
 const toolDetails = ref<ToolDetails | null>(null)
 const creating = ref(false)
@@ -520,6 +552,9 @@ const filteredTools = computed(() => {
   return tools.value.filter(t => t.name.toLowerCase().includes(query))
 })
 
+/** A disabled tool is not available, so the footer must not count it as one. */
+const enabledCount = computed(() => tools.value.filter(t => t.enabled).length)
+
 const editorTabs = computed(() => [
   { id: 'details', label: 'Details' },
   { id: 'code', label: editingTool.value.toolType === 'manifest' ? 'Manifest' : 'Code' },
@@ -572,6 +607,41 @@ async function refreshTools() {
   } finally {
     refreshing.value = false
     loading.value = false
+  }
+}
+
+/**
+ * Enable or disable a tool.
+ *
+ * Optimistic, then reverted if the daemon refuses. A switch that does not move
+ * under the finger reads as broken, but a switch that stays moved after a
+ * failed write is worse: it would report a state the daemon does not hold, and
+ * the whole point of this control is to show what the agent can actually call.
+ *
+ * `tool` is the same object the list and `selectedTool` both hold, so mutating
+ * `enabled` updates the sidebar row and the detail header together without a
+ * refetch.
+ */
+async function setToolEnabled(tool: Tool, enabled: boolean) {
+  if (togglingTools.value.has(tool.name)) return
+
+  const previous = tool.enabled
+  tool.enabled = enabled
+  togglingTools.value = new Set(togglingTools.value).add(tool.name)
+
+  try {
+    await invoke('set_tool_enabled', { name: tool.name, enabled })
+    toast.success(`${tool.name} ${enabled ? 'enabled' : 'disabled'}`)
+  } catch (e: any) {
+    tool.enabled = previous
+    toast.error(
+      `Could not ${enabled ? 'enable' : 'disable'} ${tool.name}`,
+      e instanceof Error ? e.message : String(e),
+    )
+  } finally {
+    const next = new Set(togglingTools.value)
+    next.delete(tool.name)
+    togglingTools.value = next
   }
 }
 
