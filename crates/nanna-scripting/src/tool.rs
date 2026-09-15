@@ -132,6 +132,7 @@ impl ToolPermissions {
     }
 
     /// Check if network access to a host is allowed
+    #[must_use]
     pub fn allows_net(&self, host: &str) -> bool {
         self.net
             .iter()
@@ -140,19 +141,55 @@ impl ToolPermissions {
 
     /// Check if reading a path is allowed.
     /// Supports `*` wildcard for unrestricted access and `~` for home directory.
+    #[must_use]
     pub fn allows_read(&self, path: &std::path::Path) -> bool {
-        self.read
-            .iter()
-            .any(|p| p.to_string_lossy() == "*" || path.starts_with(p))
+        self.read.iter().any(|scope| scope_covers(scope, path))
     }
 
     /// Check if writing a path is allowed.
     /// Supports `*` wildcard for unrestricted access and `~` for home directory.
+    #[must_use]
     pub fn allows_write(&self, path: &std::path::Path) -> bool {
-        self.write
-            .iter()
-            .any(|p| p.to_string_lossy() == "*" || path.starts_with(p))
+        self.write.iter().any(|scope| scope_covers(scope, path))
     }
+}
+
+/// The home directory, resolved once.
+///
+/// `allows_read` runs on every file a scripted tool touches, so the lookup is
+/// cached rather than repeated per check.
+static HOME_DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+    directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+});
+
+/// Whether one declared scope covers `path`.
+///
+/// `*` is the whole filesystem and `~` is the home directory — which the doc
+/// comments above have always promised and the check did **not** honour:
+/// `Path::starts_with` is component-wise, so a literal `PathBuf("~")` matched
+/// nothing and a `~`-scoped permission silently denied everything.
+///
+/// That was invisible in practice because `ScriptedToolWrapper::from_file`
+/// expands `~` when it loads a `permissions.json`, one crate away — so every
+/// production path arrived here already expanded, and only a caller
+/// constructing `ToolPermissions` **programmatically** with `"~"` would have hit
+/// the silent deny the comment said was supported. Honouring it here removes
+/// the trap instead of documenting it, and changes nothing for an
+/// already-expanded path.
+fn scope_covers(scope: &std::path::Path, path: &std::path::Path) -> bool {
+    let text = scope.to_string_lossy();
+    if text == "*" {
+        return true;
+    }
+    if text == "~" || text.starts_with("~/") {
+        let Some(home) = HOME_DIR.as_ref() else {
+            // No home directory to expand against: refuse rather than widen.
+            return false;
+        };
+        let expanded = home.join(text.strip_prefix("~/").unwrap_or(""));
+        return path.starts_with(expanded);
+    }
+    path.starts_with(scope)
 }
 
 /// Where a tool's output should be routed after execution.
@@ -949,5 +986,66 @@ export default {
             params["properties"]["tpl"]["description"],
             "use {curly} braces }"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::ToolPermissions;
+    use std::path::{Path, PathBuf};
+
+    fn home() -> PathBuf {
+        directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .expect("the test host has a home directory")
+    }
+
+    #[test]
+    fn a_wildcard_scope_covers_everything() {
+        let perms = ToolPermissions::none().with_read(["*"]);
+        assert!(perms.allows_read(Path::new("/etc/passwd")));
+        assert!(perms.allows_read(&home().join("notes.md")));
+    }
+
+    /// The documented behaviour that was not implemented: a literal `~` in a
+    /// programmatically-built `ToolPermissions` used to match nothing.
+    #[test]
+    fn a_tilde_scope_covers_the_home_directory() {
+        let perms = ToolPermissions::none().with_read(["~"]);
+        assert!(
+            perms.allows_read(&home().join("notes.md")),
+            "a `~` scope denied a file inside home, which the doc comment \
+             promised it would allow",
+        );
+    }
+
+    #[test]
+    fn a_tilde_scope_does_not_cover_outside_home() {
+        let perms = ToolPermissions::none().with_read(["~"]);
+        assert!(
+            !perms.allows_read(Path::new("/etc/passwd")),
+            "a `~` scope reached outside the home directory",
+        );
+    }
+
+    #[test]
+    fn a_tilde_subpath_scope_covers_only_that_subtree() {
+        let perms = ToolPermissions::none().with_write(["~/projects"]);
+        assert!(perms.allows_write(&home().join("projects").join("a.txt")));
+        assert!(!perms.allows_write(&home().join("secrets.txt")));
+    }
+
+    #[test]
+    fn an_absolute_scope_is_unchanged_by_the_tilde_handling() {
+        let perms = ToolPermissions::none().with_read(["/tmp"]);
+        assert!(perms.allows_read(Path::new("/tmp/file.txt")));
+        assert!(!perms.allows_read(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn an_empty_scope_list_allows_nothing() {
+        let perms = ToolPermissions::none();
+        assert!(!perms.allows_read(Path::new("/tmp/file.txt")));
+        assert!(!perms.allows_write(&home().join("notes.md")));
     }
 }

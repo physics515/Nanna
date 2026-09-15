@@ -4,9 +4,10 @@
 
 use crate::protocol::{Event, Request, Response};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
@@ -63,13 +64,160 @@ struct ClientConnection {
     _id: ConnectionId,
     _addr: SocketAddr,
     tx: mpsc::Sender<Message>,
-    _subscriptions: Vec<String>,
+}
+
+/// Whether one connection should be sent one event.
+///
+/// The whole narrowing decision, as a pure function over the connection's
+/// declared interest, so the policy is testable without a socket, a broadcast,
+/// or a lock.
+///
+/// * `narrowed_to == None` — the connection never asked for less, so it gets
+///   everything. This is every shipping client today.
+/// * `narrowed_to == Some(set)` — the connection declared which sessions it
+///   wants. It gets those, plus every event that carries **no** session at all
+///   (config, memory, workspace, connection and channel events), because those
+///   are not session-scoped and dropping them would silently break the
+///   `System` and `ChannelStatus` topics.
+///
+/// An empty `set` therefore means "non-session events only", not "everything":
+/// a connection that narrowed and then unsubscribed each session has not asked
+/// to be widened again, and widening it there would silently re-open the very
+/// stream it closed. `Subscribe{AllSessions}` is the explicit way back.
+fn delivers(narrowed_to: Option<&HashSet<String>>, event: &Event) -> bool {
+    let Some(sessions) = narrowed_to else {
+        return true;
+    };
+    event
+        .session_id()
+        .is_none_or(|session_id| sessions.contains(session_id))
+}
+
+/// Per-connection event narrowing for the shared event broadcast.
+///
+/// `Subscribe{Session}` used to be recorded and then ignored: every connection
+/// was forwarded the entire event stream, so one attached client saw every
+/// other session's message deltas, tool calls and errors on the wire. Clients
+/// filtered locally, which does nothing about the bytes having already left the
+/// daemon — and with the North Star's phone-plus-desktop shape, "every client
+/// sees every session" is a leak, not a convenience.
+///
+/// Narrowing is **opt-in**: a connection receives everything until it asks for
+/// less. No shipping client sends `Subscribe` today, so this changes nothing
+/// for any of them — and [`Self::is_empty`] makes that literal, short-circuiting
+/// the lookup entirely while nobody has narrowed.
+///
+/// **Bounded** on both axes without inventing a cap: one entry per live
+/// connection (the IPC server already bounds those by `max_connections`, and
+/// [`Self::forget`] removes the entry on disconnect), and per entry at most the
+/// number of live sessions, because `handle_subscribe` answers `not_found` for
+/// a session the store does not hold.
+#[derive(Debug, Default)]
+pub struct SessionFilters {
+    narrowed: RwLock<HashMap<ConnectionId, HashSet<String>>>,
+    /// `narrowed.len()`, maintained inside the same write guard so it cannot
+    /// drift, and read without the lock so an un-narrowed daemon pays one
+    /// relaxed atomic load per event instead of a contended read lock.
+    narrowed_count: AtomicUsize,
+}
+
+impl SessionFilters {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether no connection has narrowed itself — the fast path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.narrowed_count.load(Ordering::Relaxed) == 0
+    }
+
+    /// Narrow `client_id` to `session_id`, in addition to any it already named.
+    ///
+    /// The write guard deliberately spans the `narrowed_count` update in this
+    /// and every sibling below: releasing it first would let two writers
+    /// compute their lengths and then store them out of order, which is exactly
+    /// the drift the counter exists to be free of.
+    ///
+    /// # Panics
+    /// Panics on an empty `session_id` — a caller that narrows to nothing has a
+    /// bug, and silently narrowing to `""` would mute the connection instead.
+    #[allow(clippy::significant_drop_tightening, reason = "see the doc above")]
+    pub async fn narrow_to_session(&self, client_id: &str, session_id: String) {
+        assert!(!session_id.is_empty(), "narrowed to an empty session id");
+        let mut narrowed = self.narrowed.write().await;
+        narrowed
+            .entry(client_id.to_string())
+            .or_default()
+            .insert(session_id);
+        self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
+        debug_assert!(!narrowed.is_empty(), "narrowing left no entry behind");
+    }
+
+    /// Stop delivering `session_id` to `client_id`.
+    ///
+    /// A connection that has never narrowed stays un-narrowed: unsubscribing
+    /// from one session is not a request to be cut off from the rest.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
+    pub async fn drop_session(&self, client_id: &str, session_id: &str) {
+        let mut narrowed = self.narrowed.write().await;
+        if let Some(sessions) = narrowed.get_mut(client_id) {
+            sessions.remove(session_id);
+        }
+        self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
+    }
+
+    /// Widen `client_id` back to the whole stream.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
+    pub async fn widen_to_all(&self, client_id: &str) {
+        let mut narrowed = self.narrowed.write().await;
+        narrowed.remove(client_id);
+        self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
+    }
+
+    /// Narrow `client_id` to nothing session-scoped — the inverse of
+    /// [`Self::widen_to_all`], and what `Unsubscribe{AllSessions}` means.
+    ///
+    /// # Panics
+    /// Panics if the entry did not land, which would leave the connection
+    /// silently receiving every session it just asked to stop receiving.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
+    pub async fn drop_all_sessions(&self, client_id: &str) {
+        let mut narrowed = self.narrowed.write().await;
+        narrowed.insert(client_id.to_string(), HashSet::new());
+        self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
+        assert!(
+            !narrowed.is_empty(),
+            "dropping all sessions left no filter entry, so the connection \
+             would silently keep receiving every session",
+        );
+    }
+
+    /// Forget a disconnected connection, so the map is bounded by live
+    /// connections rather than by every connection the daemon has ever seen.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
+    pub async fn forget(&self, client_id: &str) {
+        let mut narrowed = self.narrowed.write().await;
+        narrowed.remove(client_id);
+        self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
+    }
+
+    /// Whether `event` should reach `client_id`.
+    pub async fn delivers(&self, client_id: &str, event: &Event) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let narrowed = self.narrowed.read().await;
+        delivers(narrowed.get(client_id), event)
+    }
 }
 
 /// IPC Server for daemon communication
 pub struct IpcServer {
     config: IpcServerConfig,
     clients: Arc<RwLock<HashMap<ConnectionId, ClientConnection>>>,
+    session_filters: Arc<SessionFilters>,
     request_tx: mpsc::Sender<(ConnectionId, Request)>,
     request_rx: Arc<RwLock<Option<mpsc::Receiver<(ConnectionId, Request)>>>>,
     event_tx: broadcast::Sender<Event>,
@@ -88,6 +236,7 @@ impl IpcServer {
             clients: Arc::new(RwLock::new(HashMap::new())),
             request_tx,
             request_rx: Arc::new(RwLock::new(Some(request_rx))),
+            session_filters: Arc::new(SessionFilters::new()),
             event_tx,
             shutdown_tx,
         }
@@ -150,6 +299,13 @@ impl IpcServer {
     
     /// Get the request receiver (for the daemon to process requests)
     /// Can only be called once - returns None if already taken
+    /// The per-connection narrowing registry, so the control plane's
+    /// `Subscribe`/`Unsubscribe` handlers can drive what this server forwards.
+    #[must_use]
+    pub fn session_filters(&self) -> Arc<SessionFilters> {
+        self.session_filters.clone()
+    }
+
     pub async fn take_request_receiver(&self) -> Option<mpsc::Receiver<(ConnectionId, Request)>> {
         let mut rx_lock = self.request_rx.write().await;
         rx_lock.take()
@@ -263,7 +419,6 @@ impl IpcServer {
                 _id: client_id.clone(),
                 _addr: addr,
                 tx: msg_tx.clone(),
-                _subscriptions: vec![],
             });
         }
         
@@ -274,6 +429,8 @@ impl IpcServer {
         let request_tx = self.request_tx.clone();
         let event_rx = self.event_tx.subscribe();
         let client_id_clone = client_id.clone();
+        let session_filters = self.session_filters.clone();
+        let filtered_client_id = client_id.clone();
         
         // Spawn task to handle outgoing messages
         let outgoing_task = tokio::spawn(async move {
@@ -292,6 +449,12 @@ impl IpcServer {
                     // and the missed events vanished without the client ever knowing.
                     received = event_rx.recv() => {
                         let Some(event) = forwardable(received) else { break };
+                        // A connection that narrowed itself gets only what it
+                        // asked for. Until one does, this is a relaxed atomic
+                        // load and nothing else.
+                        if !session_filters.delivers(&filtered_client_id, &event).await {
+                            continue;
+                        }
                         if let Ok(json) = serde_json::to_string(&event) {
                             if ws_tx.send(Message::Text(json.into())).await.is_err() {
                                 break;
@@ -383,6 +546,7 @@ impl IpcServer {
             let mut clients_guard = clients.write().await;
             clients_guard.remove(&client_id_clone);
         }
+        self.session_filters.forget(&client_id_clone).await;
         
         // Broadcast disconnect event
         let _ = self.event_tx.send(Event::Disconnected { client_id: client_id_clone.clone() });
@@ -423,6 +587,169 @@ fn forwardable(received: Result<Event, tokio::sync::broadcast::error::RecvError>
             })
         }
         Err(RecvError::Closed) => None,
+    }
+}
+
+#[cfg(test)]
+mod session_filter_tests {
+    use super::{Event, SessionFilters, delivers};
+    use std::collections::HashSet;
+
+    fn session_event(session_id: &str) -> Event {
+        Event::MessageStart {
+            session_id: session_id.to_string(),
+            message_id: "m1".to_string(),
+        }
+    }
+
+    // --- the pure decision ------------------------------------------------
+
+    #[test]
+    fn an_un_narrowed_connection_receives_everything() {
+        assert!(delivers(None, &session_event("a")));
+        assert!(delivers(None, &Event::ConfigChanged));
+    }
+
+    #[test]
+    fn a_narrowed_connection_receives_only_its_sessions() {
+        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(delivers(Some(&wanted), &session_event("a")));
+        assert!(
+            !delivers(Some(&wanted), &session_event("b")),
+            "another session's events reached a connection that never asked \
+             for them — the leak this filter exists to close",
+        );
+    }
+
+    #[test]
+    fn narrowing_never_drops_events_that_carry_no_session() {
+        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(delivers(Some(&wanted), &Event::ConfigChanged));
+        assert!(delivers(Some(&wanted), &Event::WorkspacesChanged));
+    }
+
+    #[test]
+    fn an_empty_narrowing_is_not_a_widening() {
+        let none_wanted: HashSet<String> = HashSet::new();
+        assert!(
+            !delivers(Some(&none_wanted), &session_event("a")),
+            "unsubscribing every session silently re-opened the whole stream",
+        );
+        assert!(delivers(Some(&none_wanted), &Event::ConfigChanged));
+    }
+
+    // --- the registry -----------------------------------------------------
+
+    #[tokio::test]
+    async fn nobody_narrowed_means_the_fast_path_and_full_delivery() {
+        let filters = SessionFilters::new();
+        assert!(filters.is_empty());
+        assert!(filters.delivers("client-1", &session_event("a")).await);
+        assert!(filters.delivers("client-2", &session_event("b")).await);
+    }
+
+    #[tokio::test]
+    async fn one_connection_narrowing_does_not_narrow_another() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("client-1", "a".to_string()).await;
+
+        assert!(!filters.is_empty());
+        assert!(filters.delivers("client-1", &session_event("a")).await);
+        assert!(!filters.delivers("client-1", &session_event("b")).await);
+        assert!(
+            filters.delivers("client-2", &session_event("b")).await,
+            "a second connection was narrowed by the first one's Subscribe",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_can_narrow_to_several_sessions() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("client-1", "a".to_string()).await;
+        filters.narrow_to_session("client-1", "b".to_string()).await;
+
+        assert!(filters.delivers("client-1", &session_event("a")).await);
+        assert!(filters.delivers("client-1", &session_event("b")).await);
+        assert!(!filters.delivers("client-1", &session_event("c")).await);
+    }
+
+    #[tokio::test]
+    async fn widening_restores_the_whole_stream_and_the_fast_path() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("client-1", "a".to_string()).await;
+        assert!(!filters.delivers("client-1", &session_event("b")).await);
+
+        filters.widen_to_all("client-1").await;
+        assert!(
+            filters.is_empty(),
+            "the last narrowing left the slow path armed"
+        );
+        assert!(filters.delivers("client-1", &session_event("b")).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_one_session_keeps_the_rest() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("client-1", "a".to_string()).await;
+        filters.narrow_to_session("client-1", "b".to_string()).await;
+
+        filters.drop_session("client-1", "a").await;
+        assert!(!filters.delivers("client-1", &session_event("a")).await);
+        assert!(filters.delivers("client-1", &session_event("b")).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_never_narrows_a_connection_that_had_not() {
+        let filters = SessionFilters::new();
+        // Keep the registry non-empty so `delivers` takes the slow path and
+        // this asserts the lookup, not the short-circuit.
+        filters.narrow_to_session("other", "z".to_string()).await;
+
+        filters.drop_session("client-1", "a").await;
+        assert!(
+            filters.delivers("client-1", &session_event("a")).await,
+            "unsubscribing one session cut a connection off from every session",
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_all_sessions_leaves_only_the_session_less_events() {
+        let filters = SessionFilters::new();
+        filters.drop_all_sessions("client-1").await;
+
+        assert!(!filters.is_empty());
+        assert!(!filters.delivers("client-1", &session_event("a")).await);
+        assert!(filters.delivers("client-1", &Event::ConfigChanged).await);
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_connection_is_forgotten() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("client-1", "a".to_string()).await;
+        assert!(!filters.is_empty());
+
+        filters.forget("client-1").await;
+        assert!(
+            filters.is_empty(),
+            "a disconnected connection's filter outlived it, so the map grows \
+             with every connection the daemon has ever seen",
+        );
+    }
+
+    /// The reason this change is safe to ship without driving the GUI: a
+    /// connection that never sends `Subscribe` follows the identical path it
+    /// followed before, and no shipping client sends one.
+    #[tokio::test]
+    async fn a_silent_connection_is_unaffected_by_another_narrowing() {
+        let filters = SessionFilters::new();
+        filters.narrow_to_session("cli", "a".to_string()).await;
+
+        for event in [session_event("a"), session_event("b"), Event::ConfigChanged] {
+            assert!(
+                filters.delivers("gui-never-subscribed", &event).await,
+                "a client that never subscribed lost an event",
+            );
+        }
     }
 }
 

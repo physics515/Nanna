@@ -1,13 +1,19 @@
 //! Every bundled skill must declare its own `permissions.json`.
 //!
-//! A missing file does not mean "no permissions" — it means the widest ones.
-//! `ScriptedTool::from_file` starts from `ToolPermissions::default()` (empty
-//! read/write/net, `run: false`, `env: false`), but the daemon calls
+//! A missing file does not mean "no permissions" — it means a scope somebody
+//! else chose. `ScriptedTool::from_file` starts from `ToolPermissions::default()`
+//! (empty read/write/net, `run: false`, `env: false`), but the daemon calls
 //! `ensure_permissions` *before* loading skills, and that writes
-//! `DEFAULT_PERMISSIONS_JSON` — `read: ["*"], write: ["*"], run: true,
-//! net: ["*"], env: true` — into any skill directory lacking one. So the safe
-//! default is never what a shipped skill actually gets: a forgotten file fails
-//! **open**, silently, with nothing in the tree left to review.
+//! `DEFAULT_PERMISSIONS_JSON` into any skill directory lacking one. So the safe
+//! in-code default is never what a shipped skill actually gets.
+//!
+//! That written default used to be `read: ["*"], write: ["*"]` — whole-filesystem
+//! access to anything that simply forgot the file, failing **open** and silently.
+//! Since 2026-09-15 it is home-scoped (`read: ["~"], write: ["~"]`, `run: true`,
+//! `net: ["*"]`, `env: true`) and every grant is announced at `warn` naming the
+//! tool. A forgotten file is now confined and visible rather than unbounded and
+//! silent — but it is still not the author's own choice, which is what this test
+//! exists to require.
 //!
 //! Not hypothetical. `create_tool` and `edit_tool` were added in one commit.
 //! `create_tool` shipped `read: ["~"], write: ["~"]`; `edit_tool` shipped no
@@ -15,8 +21,9 @@
 //! whole-filesystem read and write while its own sibling was scoped to home.
 //!
 //! The assertion is deliberately "the file exists and parses", not "the scopes
-//! are narrow": 27 bundled skills are `~`-scoped and 13 legitimately need `*`,
-//! so the reviewable property is that somebody chose, not which way they chose.
+//! are narrow": 30 bundled skills are `~`-scoped and 13 legitimately need `*`
+//! (census 2026-09-15), so the reviewable property is that somebody chose, not
+//! which way they chose.
 
 use std::path::{Path, PathBuf};
 

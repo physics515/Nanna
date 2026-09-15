@@ -581,3 +581,113 @@ async fn lifecycle_changes_by_one_client_reach_another_clients_session_stream() 
     actor.disconnect().await;
     daemon.stop();
 }
+
+/// `Subscribe{Session}` used to be recorded and then ignored: every connection
+/// was forwarded every session's events, so one attached client saw another
+/// session's traffic on the wire whether it wanted it or not.
+///
+/// Proven against the real daemon rather than the registry: a narrowed
+/// connection stops receiving a session it never named, while a connection that
+/// sent no `Subscribe` at all keeps receiving everything — which is what makes
+/// the change a no-op for every shipping client.
+#[tokio::test]
+async fn narrowing_a_connection_stops_another_sessions_events_on_the_wire() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let narrowed = daemon.connect_client().await;
+    let unfiltered = daemon.connect_client().await;
+    let actor = daemon.connect_client().await;
+
+    let watched = session_id_of(
+        &actor
+            .sessions()
+            .create(Some("watched".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let unwatched = session_id_of(
+        &actor
+            .sessions()
+            .create(Some("unwatched".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+
+    narrowed
+        .narrow_to_session(watched.clone())
+        .await
+        .expect("the daemon narrows to a session it holds");
+
+    // Both connections watch the session that was NOT named. Only the narrowed
+    // one should go quiet.
+    let mut narrowed_stream = narrowed.subscribe_session(unwatched.clone());
+    let mut unfiltered_stream = unfiltered.subscribe_session(unwatched.clone());
+
+    actor
+        .sessions()
+        .rename(&unwatched, "renamed")
+        .await
+        .expect("sessions.rename succeeds");
+
+    // The connection that never subscribed still gets it: this is the
+    // no-regression half, and it also proves the rename really was broadcast,
+    // so the silence asserted below is filtering rather than a missing event.
+    let seen = tokio::time::timeout(READY_HANG_CEILING, unfiltered_stream.recv())
+        .await
+        .expect("the rename reaches the unfiltered client before the ceiling")
+        .expect("the stream is open and not lagging");
+    assert!(
+        matches!(&seen, nanna_client::Event::SessionRenamed { id, .. } if *id == unwatched),
+        "expected SessionRenamed for {unwatched}, got {seen:?}"
+    );
+
+    // The narrowed connection must not have been sent it. Its socket may still
+    // carry the two `SessionCreated`s that predate the narrowing — a narrowing
+    // filters the live stream, it does not fence it — so drain those and insist
+    // nothing else arrives.
+    let mut predating_creates = 0_usize;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), narrowed_stream.recv()).await {
+            Err(_) => break,
+            Ok(Ok(nanna_client::Event::SessionCreated { id, .. })) if id == unwatched => {
+                predating_creates += 1;
+                assert!(
+                    predating_creates <= 1,
+                    "only the one create can predate the narrowing"
+                );
+            }
+            Ok(other) => panic!(
+                "a narrowed connection was sent an event for a session it never \
+                 named — the leak this filter exists to close: {other:?}"
+            ),
+        }
+    }
+
+    // Widening restores it, so the narrowing is reversible rather than a
+    // one-way door for the connection.
+    narrowed
+        .widen_to_all_sessions()
+        .await
+        .expect("widening back to every session succeeds");
+    let mut widened_stream = narrowed.subscribe_session(unwatched.clone());
+    actor
+        .sessions()
+        .rename(&unwatched, "renamed-again")
+        .await
+        .expect("sessions.rename succeeds");
+    let after_widening = tokio::time::timeout(READY_HANG_CEILING, widened_stream.recv())
+        .await
+        .expect("the rename reaches the widened client before the ceiling")
+        .expect("the stream is open and not lagging");
+    assert!(
+        matches!(
+            &after_widening,
+            nanna_client::Event::SessionRenamed { id, name } if *id == unwatched && name == "renamed-again"
+        ),
+        "expected the widened connection to receive SessionRenamed, got {after_widening:?}"
+    );
+
+    narrowed.disconnect().await;
+    unfiltered.disconnect().await;
+    actor.disconnect().await;
+    daemon.stop();
+}

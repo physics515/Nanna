@@ -1865,11 +1865,57 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
             They are declared in the protocol and sent nowhere. The GUI does not notice because it
             emits its own `session-renamed` Tauri event, so a session renamed from the CLI or a
             second client never reaches an open GUI. Emit them from the session control handlers.
-      - [ ] **`Subscribe` narrows nothing on the wire.** `SubscribeAction::Session` is recorded in
-            the session store, but every IPC connection forwards the whole event stream
-            (`ipc.rs` outgoing task; the per-client `_subscriptions` field is unused). Decide
-            whether server-side filtering is wanted before a chatty channel makes it matter;
-            `Event::session_id()` is the classifier either would use.
+      - [x] **`Subscribe` now narrows the wire.** *(2026-09-15)* **The decision: yes, filter
+            server-side — but opt-in.** A connection receives everything until it asks for less,
+            which makes this a **provable no-op for every shipping client**: `Subscribe` is sent by
+            nobody today (grepped `nanna-client`, `gui/src-tauri`, and the Nuxt app — the only
+            hits are two Slack/WhatsApp setup strings), and `nanna-client::subscribe_session` is
+            *local* filtering that never reaches the wire. That matters here because GUI
+            verification is unavailable on this host, and the GUI is the client a wire change would
+            hurt most: the safety argument is that its code path is bit-identical, not that it was
+            eyeballed.
+            New `SessionFilters` registry in `ipc.rs`, shared with the control plane by
+            `ControlPlane::with_session_filters`. `Subscribe{Session}` narrows (after the store
+            confirms the session exists, so a typo cannot mute a connection),
+            `Subscribe{AllSessions}` widens back, `Unsubscribe{Session}` drops one,
+            `Unsubscribe{AllSessions}` drops all, and disconnect forgets the entry. Two shapes are
+            deliberate: **narrowing never drops events that carry no session** (config, memory,
+            workspace, channel, connection), because those are not session-scoped and dropping them
+            would silently break the `System`/`ChannelStatus` topics; and **an empty narrowing is
+            not a widening** — a connection that unsubscribed every session did not ask to be
+            re-opened, and widening it there would silently restore the stream it just closed.
+            **Cost is zero until someone opts in:** a `narrowed_count` atomic, maintained inside the
+            same write guard so it cannot drift, short-circuits the lookup entirely while the
+            registry is empty — so an un-narrowed daemon pays one relaxed load per event, not a
+            contended read lock, which is what the old note meant by "before a chatty channel makes
+            it matter". **Bounded without inventing a cap**: one entry per live connection (already
+            bounded by `max_connections`, and removed on disconnect), and per entry at most the live
+            session count, because `handle_subscribe` answers `not_found` otherwise.
+            The dead `_subscriptions` field is gone. `nanna-client` gained
+            `narrow_to_session()` / `widen_to_all_sessions()` — the "typed event subscription" half
+            that was still open — kept **separate** from `subscribe_session()`, because several
+            local streams can be held over one connection and having a method named "subscribe"
+            quietly cut off the others is a trap.
+            13 unit tests on the pure decision + the registry, plus an **e2e against a real daemon
+            over a real socket**: a narrowed connection stops receiving a session it never named,
+            a connection that sent no `Subscribe` still receives everything (which also proves the
+            event was broadcast, so the silence is filtering and not a missing event), and widening
+            restores it. **Verified in both directions** — forcing `delivers` back to always-true
+            fails the e2e with the exact leak (`a narrowed connection was sent an event for a
+            session it never named`). 1928 workspace tests pass / 0 fail, clippy 0 errors, real
+            daemon binary boots clean (0 panics).
+            - [x] **`handle_subscribe` no longer files an IPC connection id into a
+                  `HashSet<ChannelId>`.** *(2026-09-15, same run)* It only ever called
+                  `sessions.subscribe` to find out whether the session existed, so the answer was a
+                  new `SessionManager::exists` — an existence check should not change the thing it
+                  checks. `Unsubscribe{Session}` likewise stops calling `sessions.unsubscribe` with
+                  a connection id, where it could only ever have deleted some channel's entry that
+                  happened to share the name. `subscribers` keeps meaning channels, and
+                  `subscriber_count` stops being inflatable by a different kind of id. The worry
+                  about "changing a number clients already see" does not apply: no client sends
+                  `Subscribe` today, so the count was never actually inflated — this closes the
+                  latent bug while that is still true. The e2e narrowing test passes unchanged,
+                  which is what shows `exists` is equivalent for the gating it replaced.
       - [x] *(2026-09-10 — fixed the same run.)* The forwarder now handles every receive result
             through a pure `forwardable()`: a lag becomes an `Error` event with code
             `events_lagged` naming the count ("re-fetch state to resync"), and a closed broadcast
@@ -2231,12 +2277,80 @@ so neither CI nor any prior run could have caught them:
       `edit_tool` must agree on read and write scope. Verified in both directions — removing the
       new file fails both tests by name. The assertion is deliberately "somebody chose", not "the
       scope is narrow": 27 bundled skills are `~`-scoped and 13 legitimately need `*`.
-      - [ ] **Reconsider the fail-open default itself.** `DEFAULT_PERMISSIONS_JSON` is the widest
-            possible set, and `ensure_permissions` applies it to anything without a file —
-            including **user-authored** tools, where it is load-bearing rather than an accident.
-            Narrowing it is a real behaviour change for existing installs, so it needs its own
-            increment: decide whether an undeclared tool should get `~` instead of `*`, or whether
-            `ensure_permissions` should stop writing on behalf of skills that ship their own.
+      - [x] **The fail-open default is now home-scoped, and every grant announces itself.**
+            *(2026-09-15)* `DEFAULT_PERMISSIONS_JSON` goes `read/write: ["*"]` -> `["~"]`;
+            `run: true`, `net: ["*"]` and `env: true` are unchanged. The scope was **derived from
+            a census of the 44 bundled skills, not picked**: 30 declare `~` and 13 declare `*`, so
+            home is the modal authored choice and the narrowest one the corpus shows is commonly
+            sufficient — while 40 of 44 declare exactly `run: true, net: ["*"], env: true`, which
+            makes those three not over-grants relative to the same corpus. `~` is enforced, not
+            decorative: `ScriptedToolWrapper::from_file` expands it to the real home directory at
+            load time (`skills/scripted.rs`).
+            **The "real behaviour change for existing installs" this item worried about does not
+            exist**, and that is a checkable fact rather than a hope: `ensure_permissions` writes
+            only when the file is **absent**, and the grant it writes is **persisted**, so a
+            directory that already received the old wide default keeps it untouched. The narrowing
+            reaches newly-created undeclared tools only.
+            The second half of the item — "stop writing on behalf of skills that ship their own" —
+            was **already the behaviour** (`if perms.exists() { continue; }`), so what was actually
+            missing was not restraint but **visibility**: the grant was written silently, with
+            nothing but the file itself left to notice. `ensure_permissions` now returns the count
+            it granted and logs each one at `warn` naming the tool, and the daemon repeats the
+            aggregate at boot. Guarded by an always-on `assert!` (a security guard, per doctrine)
+            that the constant's filesystem scope stays home-bounded, plus 5 unit tests asserting
+            **the bytes actually written** rather than the constant, so re-widening fails even if
+            the guard is deleted. **Verified in both directions** — re-widening the constant to
+            `["*"]` fails all five by name and trips the assert. Also verified on the **real
+            daemon binary** against a scratch config + `NANNA_TOOLS_DIR` fixture: an undeclared
+            tool received the `~` scope and produced
+            `WARN ... Tool declared no permissions.json ... tool="undeclared_tool"` +
+            `WARN ... granted_count=1`, while a sibling shipping its own file came back
+            byte-identical. 148 `nanna-tools` tests green, 0 panics.
+            - [x] **Decided: do NOT narrow `env` on the written default — it is not the lever it
+                  looks like.** *(2026-09-15)* The question assumed `env: false` would stop an
+                  undeclared tool reading provider API keys. **Measured, and it would not.**
+                  `permissions.env` gates exactly one thing, `NannaBridge::get_env`; **nothing in
+                  `nanna-scripting` or `nanna-proc` ever calls `Command::env_clear`**, so a spawned
+                  child inherits the daemon's whole environment. The same written default also
+                  grants `run: true`, so a tool refused `Nanna.getEnv("ANTHROPIC_API_KEY")` reads
+                  it with `exec("printf %s \"$ANTHROPIC_API_KEY\"")`.
+                  Narrowing `env` would therefore break `Nanna.getEnv` for undeclared tools and buy
+                  **no containment at all** — a compatibility cost for security theatre.
+                  Pinned by `bridge.rs::env_containment_tests`, which drives the real `exec` path
+                  and asserts both halves: `env: false` denies the bridge accessor, and the child
+                  reads the same variable anyway. It documents today's behaviour deliberately —
+                  **if it starts failing, that is good news** and the `env` default can move.
+            - [ ] **The real item: scope the child environment, or treat `env` and `run` as one
+                  permission.** Until a spawned child's environment is filtered, `env` is a gate on
+                  one accessor rather than a boundary, and the two fields describe the same
+                  capability while pretending to be independent. Two shapes worth weighing: give
+                  `env` a scope vocabulary it currently lacks (a name allowlist, serde-compatible
+                  with today's `true`/`false` via an untagged enum) **and** apply it to the child's
+                  environment; or state plainly that `run: true` implies `env: true` and stop
+                  offering a knob that does not hold. The first is the real fix; **note that
+                  filtering a child's environment is a genuine behaviour change** — `PATH` alone
+                  means a naive allowlist breaks every tool that shells out — so it needs its own
+                  increment with real runtime verification, not a ride-along.
+            - [x] **`allows_read`/`allows_write` now implement the `~` they document.**
+                  *(2026-09-15, same run)* Fixed rather than documented: a shared `scope_covers`
+                  expands `~` / `~/sub` against a `LazyLock` home lookup (the check runs on every
+                  file a scripted tool touches, so it is resolved once), `*` still means the whole
+                  filesystem, and an absolute scope behaves exactly as before. No home directory to
+                  expand against ⇒ deny, never widen. Changes nothing for a path the loader already
+                  expanded, which is every production path — the trap was only reachable by
+                  constructing `ToolPermissions` programmatically, which is precisely why it would
+                  have stayed invisible. The three checks also gained `#[must_use]`: ignoring the
+                  result of a permission check is a security bug, not a style question. 6 tests,
+                  verified in both directions (disabling the `~` branch fails the two that assert it).
+            - [ ] ~~**`allows_read`/`allows_write` document a `~` they do not implement.**~~ Their doc
+                  comments in `nanna-scripting/src/tool.rs` say "supports ... `~` for home
+                  directory", but the check is `path.starts_with(p)` against the literal `PathBuf`,
+                  and `Path::starts_with` is component-wise — a literal `~` matches nothing. The
+                  expansion lives in `ScriptedToolWrapper::from_file` (`nanna-tools`), one crate
+                  away, so anything constructing `ToolPermissions` **programmatically** with `"~"`
+                  gets a silent deny that the doc comment promised would work. Harmless today
+                  (every production path loads through the wrapper), but it is a trap laid for the
+                  next caller. Fix the comment, or move the expansion into the checker.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
@@ -2318,6 +2432,16 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+            - [ ] *(research 2026-09-15)* **Still pre-release — re-checked against crates.io, not a
+                  search result.** The registry says `burn` **max_stable = 0.21.0** with
+                  **0.22.0-pre.3 (2026-08-25)** the newest publish, so the note below stands and the
+                  pin holds. Worth recording because secondary sources now assert "Burn 0.22.0 has
+                  been released" — they are reading the 0.22 branch docs, not a published crate.
+                  One real change in those docs to carry into Mummu when 0.22 does land: the
+                  **LibTorch backend is deprecated as of 0.22** (GPU via a CubeCL backend, CPU via
+                  the CubeCL CPU backend or `burn-flex`) — which points the CPU embedder at
+                  `burn-flex`, the same conclusion the 0.21 research reached. Mummu's call, not
+                  Nanna's. Source: [crates.io/api/v1/crates/burn](https://crates.io/crates/burn).
             - [ ] *(research 2026-09-10)* **Burn 0.22 is in pre-release and breaks the API Mummu
                   is written against** — stable is still 0.21.0, but
                   [0.22.0-pre.3](https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3)
@@ -2358,6 +2482,23 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             Hermes-Function-Calling has had **no updates since 2025-12**, so it is a reference for
             per-model call formatting, not a live dependency. Source:
             [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/).
+      - [ ] *(research 2026-09-15)* **A dense 16 GB candidate that needs no MoE offload:
+            Devstral-2 22B.** Every 16 GB recommendation in this section so far routes through
+            `--cpu-moe` expert offload (`Qwen 3.6-35B-A3B`), which is unbuilt and ties the tier
+            to a feature P12 has not shipped. The 2026 round-ups now name **Devstral-2 22B at
+            ~14 GB Q4, 52.3% SWE-bench Verified**, as the strongest agentic model that fits a
+            16 GB card *dense* — i.e. it fits the **reference GPU exactly** with no offload path
+            required — and **Devstral Small 24B** is described as purpose-built for tool calling
+            and multi-step workflows, which is the axis Nanna actually grades on, not coding
+            score. Worth a look **because it decouples the 16 GB tier from `--cpu-moe`**, not
+            because of the benchmark number. Caveats before believing any of it: these are
+            secondary round-ups, the quoted figure is SWE-bench (a coding metric, not this
+            project's "task success @ budget"), and ~14 GB Q4 leaves little headroom once the
+            desktop + webview take their ~5-6 GB — so the real tier test is VRAM-after-display,
+            which is the same trap the 8 GB Qwen3.5-9B footnote records. Verify the actual
+            footprint before promoting it over the Qwen line. Sources:
+            [llmconfigurator VRAM-tier ranking](https://llmconfigurator.com/en/guides/coding-agents/best-local-coding-models),
+            [promptquorum local coding LLMs](https://www.promptquorum.com/local-llms/best-local-llms-for-coding).
       - [ ] *(research 2026-09-11)* **Qwen3.8-Flash-Next (2026-08-26) is not a local candidate
             — do not chase it for the 16 GB tier.** 125B total / 6B active MoE (512 experts,
             10+1 active), ~360 GB full precision with only an official FP8 variant; even int4
@@ -3979,15 +4120,107 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
 
 **A. Wire what's already built** (service registration + config, not new subsystems):
 - [ ] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
-      `Nanna.service("schedule.add"/…)` which is never registered; `TaskType::Delayed` exists
-      (crates/nanna-core/src/scheduler.rs) and nothing polls `get_due`. "Check back in 20 minutes"
+      `Nanna.service("schedule.add"/…)` which is never registered. "Check back in 20 minutes"
       self-scheduling is the difference between an agent and a chatbot; ROADMAP:1721 already says
       "wire, don't duplicate". Add absolute-timestamp one-shots (fire once, auto-disable) while in there.
-- [ ] **`browser.*` services** — nanna-browser (chromiumoxide + playwright, full navigate/click/type/extract
-      API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
-      and registers nothing. Enable the flag, register the services. The P8 "browser relay Chrome extension"
-      (drive the user's real logged-in browser) remains the valuable second half.
-- [ ] **`audio.transcribe`** — Whisper client written (crates/nanna-tools/src/builtin/audio.rs); channel
+      **(2026-09-15 — investigated and deliberately NOT wired; two claims above are wrong.)**
+      `TaskType::Delayed` is not merely present, it is **fully live**: the scheduler loop fires it on
+      `created.elapsed() >= delay`, auto-disables it after one run, records it in history and
+      persists it — nothing "polls `get_due`" because nothing needs to. So the service bridge is a
+      small job, and writing it is not the blocker.
+      **The blocker is delivery, one layer down.** The executor's generic arm runs a task's payload
+      as an agent prompt in a `scheduled-{id}` session, and the result goes to the log and the run
+      history — `server.rs` warns in as many words that *"channel routing from the daemon scheduler
+      is not implemented yet"* whenever a task carries a `target_channel`. The `remind` skill
+      promises the model "the message will be injected into the conversation when the timer
+      expires". Wiring `schedule.add` today would make that promise false: the model would set a
+      reminder, the user would never hear it, and nothing would say so — the same
+      indistinguishable-from-working failure the half-wired OCR path was refused for.
+      So the order is **delivery first, bridge second**: give the scheduler a way to reach a
+      channel (or the originating session), then register the three services. Wiring them in the
+      other order ships a reminder that fires into a log file.
+      **(2026-09-15, looked closer) `ScheduledTask.target_session` looks like the delivery route and
+      is dead at both ends.** It is declared, persisted (`cron_jobs.target_session`), restored by
+      `load_jobs`, and reported over IPC — but **`SchedulerAction::Add` takes only
+      `{schedule, task, name}`, so no client can set it**, and the daemon's executor always uses
+      `format!("scheduled-{{id}}")` and never reads it. Honouring it alone would therefore change
+      nothing for anybody: it would be preparing a path for a caller that does not exist.
+      **And the bridge has its own missing piece:** a `ServiceFn` receives only `params`. Services
+      have no session binding — `session.history` works off the *current run's* shared history, not
+      a session id — so `schedule.add` cannot learn which conversation asked for the reminder
+      without plumbing one through. That is the concrete shape of the remaining work: **(1)** give
+      services access to the calling session id, **(2)** let a caller set `target_session` and make
+      the executor honour it, **(3)** then register the three services. Any one of those alone is
+      unreachable code.
+      **The hook for (1) already exists** — `agent_service.rs` populates the shared session history
+      at the top of every run (`hist.clear(); hist.extend(...)`, ~line 934) with `session_id` in
+      scope two lines later, and `workspace_id` is already threaded into `build_script_services` as
+      exactly this shape of `Arc<RwLock<Option<String>>>` cell. A `current_session_id` cell set at
+      that same point is a handful of lines, not a design problem.
+      **What makes this a next-run item rather than a this-run one is verification, not size.** The
+      blocker was always delivery, and watching a reminder actually arrive in a conversation needs a
+      live agent turn — i.e. a working model. This host has neither a cloud credential nor Ollama, so
+      the one property that distinguishes "wired" from "half-wired" here is the one property that
+      could not be checked. Build it on a host that can watch a reminder land.
+- [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
+      All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
+      confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's
+      real logged-in browser) remains the valuable second half.
+      The skills and `BrowserManager` had been written against each other and never run together.
+      All five disagreements are fixed rather than papered over:
+      `evaluate` now accepts the **`expression`** the skill sends (it read only `script`, so every
+      call answered `Missing script`); `extract` honours **`attribute`** via `BrowserPage::get_attribute`
+      (there was no path at all, so asking for an `href` silently returned the element's text);
+      **`scroll`** and **`navigate`** — two of the five actions the skill advertises and neither
+      implemented — are now real arms, built on `page.evaluate` and `page.goto`; and `action`'s
+      `value`/`delay_ms` are translated to the manager's `text`/`wait_ms` **at the service boundary**,
+      so the skill keeps speaking its own documented vocabulary.
+      `browser.screenshot` writes a PNG to `{data_dir}/screenshots/` and returns the path, the same
+      correction `audio.tts` got: the skill previously reported a byte count and dropped the image,
+      so the daemon drove a browser to take a screenshot nobody could look at.
+      **Registered only when a browser is present**, and the detected executable is passed as
+      `BrowserConfig.executable_path` so the binary that is probed and the binary that is launched
+      are the same one **by construction** — a gate that tests something other than what it guards
+      is not a gate. `CHROME`/`CHROME_PATH` override the search and are honoured only if they point
+      at something that exists.
+      **This is the one service group verified end to end.** `vision.analyze` and `audio.*` could
+      only be tested up to the request; here `tests/browser_services_drive_a_real_browser.rs` serves
+      a page on loopback, launches Chromium, and asserts the extraction, the attribute, the
+      evaluated expression, the scroll, and a real PNG on disk. **The launch itself was proved, not
+      assumed:** pointing `CHROME` at a logging wrapper recorded exactly one invocation with
+      `--headless --remote-debugging-port=0`, because a 0.37 s test run is fast enough to deserve
+      suspicion.
+      **Cost, measured rather than feared:** +9 crates on the daemon tree (653 → 662) and
+      **+3,819,648 bytes on the release binary — 66,483,104 → 70,302,752, +5.7%**. That is an upper
+      bound for the browser stack specifically, since the same measurement window also contains this
+      run's OCR, vision, audio and screenshot work (none of which adds a crate). Far less than
+      `chromiumoxide_cdp`'s reputation for generating the whole CDP protocol suggests, and the number
+      is now on record against P6's binary-size guardrail instead of being a worry.
+      **This is the one change in the run that grows the shipped binary**, so it is the one worth
+      vetoing by not merging if 5.7% is judged too much for four skills.
+- [x] **`audio.tts` + `audio.transcribe` registered** *(2026-09-15)* — `text_to_speech` and
+      `transcribe` are live; **8 skills withheld, down from 16 at the start of the run**, confirmed
+      on the real daemon binary and independently by the audit test. New
+      `nanna-daemon/src/audio_service.rs`; `create_tts_fn` / `create_transcribe_tool_fn` extracted
+      from the tool constructors so the services and the tools share one client setup.
+      **Registered only when an OpenAI key is configured** — Whisper and the speech endpoint are
+      OpenAI's, not the chat router's, so there is no model list to fall through; without a key
+      neither service exists, both skills stay withheld, and the boot line names `[llm]
+      openai_api_key`. Verified in both directions on the real binary.
+      **`audio.tts` now writes a file and returns its path.** The skill previously reported only a
+      byte count, so the daemon spent an API call to make audio and then dropped it — audio nobody
+      can play is not a capability. Clips land in `{data_dir}/audio/tts-<nanos>.mp3`, nanosecond-named
+      because two skills can speak at once and a fixed name would have them overwrite each other
+      silently; the skill's own text was updated to report where.
+      Both ceilings are **the provider's, restated where the caller can be told**: TTS input 4096
+      **characters** (counted as characters, not bytes — a byte count would refuse a multi-byte
+      script at a quarter of the real limit, and there is a test for exactly that) and transcription
+      uploads 25 MB, checked from `metadata()` before the bytes are buffered. 10 tests, all of them
+      offline — the ceiling check was pulled out as a pure function precisely so the multi-byte test
+      stopped making a real network call.
+      **Not verified:** a live TTS or Whisper call; this host has no OpenAI credential. Everything
+      up to the request is tested.
+- [ ] ~~**`audio.transcribe`**~~ — Whisper client written (crates/nanna-tools/src/builtin/audio.rs); channel
       listeners already extract voice-note file ids, but the daemon drops non-text messages
       (crates/nanna-daemon/src/channels.rs:231). Register the service, download channel media, transcribe
       before the ignore-non-text branch. Voice note from your phone → answer is hallmark personal-daemon UX.
@@ -4014,18 +4247,170 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       get the whole document without inferring it from the prose. `lopdf` parsing is synchronous and
       runs under `spawn_blocking`, off the runtime workers.
       5 tests over the selection grammar and clamping.
-      - [ ] **Wire the OCR fallback.** `ReadPdfTool::with_ocr_fn` exists and is tested, but `OcrTool`
-            is itself registered nowhere, so image-only pages still come back empty. Deliberately not
-            faked in this increment: a half-wired OCR path is indistinguishable from a scanned
-            document that genuinely has no text, and the extractor already says which pages yielded
-            nothing.
-      - [ ] **`create_vision_tool` has no callers either.** `vision_wiring::create_vision_tool` and
-            `OcrTool` are both complete, exported, and unreachable — the same shape of gap `pdf.read`
-            had. Worth one audit pass over `nanna-tools`' built-ins asking which are actually
-            registered anywhere, rather than finding them one at a time.
-- [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
-      (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
-      local model, largely redundant with exec + browser).
+      - [x] **OCR fallback wired, and the ambiguity that held it back is what got fixed.**
+            *(2026-09-15)* The blocker was never the pipeline — it was that "no OCR configured" and
+            "OCR ran and there was nothing to read" produce the same empty text, so a caller cannot
+            tell an unreadable scan from a blank page. `pdf.read` now reports **four named
+            outcomes** instead of one empty string: `not_needed` (no page was missing text),
+            `unavailable` (pages were, and no OCR model is configured — with a note naming
+            `[memory] ocr_model_priority`), `no_images` (pages were, and the document carries no
+            embedded images, so it is *not* a scan OCR could recover), and `ran` (with `ocr_text`
+            and `ocr_images`). The `read_pdf` skill surfaces each, including the case where OCR ran
+            and found nothing — which is the one that used to be invisible.
+            New `nanna_tools::ocr_empty_pages` returns that outcome structurally rather than the
+            markdown `ReadPdfTool` appends, so a JSON caller reports it instead of embedding prose
+            in a text field. The model is bound once from the **same** `ocr_model_priority`
+            `vision.analyze` uses (`bind_pdf_ocr_fn`) so the PDF path cannot drift onto its own
+            setting — and deliberately only the **first** model, not the priority list: OCR sends
+            one request per embedded image, and falling through a list per image turns a scanned
+            document into a multiplied bill. A failed image is reported in the output, not dropped,
+            for the same reason: a silently omitted page reads as a page with no text.
+            2 tests, and they are the pair that matters — the same textless fixture returns
+            `unavailable` without a model and `no_images` with one, proving the two cases are
+            actually distinguished, plus an assertion that OCR is **not** called for a document with
+            no images. 1984 workspace tests pass / 0 fail, clippy 0 errors, daemon boots clean.
+            - [ ] **Per-page escalation policy is still open.** `extract_pdf_images` returns the
+                  document's embedded images (capped at 20) rather than the images *on the empty
+                  pages*, so a mostly-text PDF with one scanned page sends more than it needs. The
+                  cap bounds the cost; targeting it would reduce it.
+      - [x] **`vision.analyze` is registered, and the reason it was unreachable was structural.**
+            *(2026-09-15)* `analyze_image`, `describe_image` and `ocr` all declare
+            `requires: ["vision.analyze"]` and nothing registered it. The cause was not an
+            oversight in wiring: **`vision_wiring` lives behind nanna-tools' `vision` feature, and
+            no crate in the workspace enabled it** — so `create_vision_tool` could not have had a
+            caller. Two pieces of it had **silently stopped compiling** behind that flag
+            (`AnthropicRequest` grew `context_limit`; a test lost its `Tool` import), which is the
+            cost of dead code nothing builds. Enabling the feature costs nothing new:
+            `vision = ["nanna-llm"]` and `nanna-daemon` already depends on `nanna-llm` for the
+            router.
+            New `nanna-daemon/src/vision_service.rs`. The vision call itself is **not** duplicated —
+            `create_vision_fn` was extracted from `create_vision_tool` so both go through one
+            request construction. That matters specifically because the request must run
+            `sampling_temperature_for_model`: `temperature` is rejected outright by current Claude
+            models, and a hand-rolled second copy would not know that.
+            **Registered only when a vision model is reachable**, from the existing
+            `[memory] ocr_model_priority` (already documented as "only vision-capable models" and
+            "tried in order", so its fallthrough semantics are honoured, not invented) — resolved
+            against the boot-frozen router, which is why the decision is made once at registration
+            rather than per call. Empty or unservable ⇒ not registered ⇒ the three skills stay
+            withheld, and the boot warning names `vision.analyze`, turning "three permanently dead
+            skills" into "three skills one config line away".
+            `IMAGE_BYTES_MAX` is **derived, not chosen**: the provider caps a request at 32 MB and
+            base64 inflates 4/3, so a raw image over 24 MB cannot fit however it is framed; it is
+            checked from `metadata()` before the bytes are buffered, the order `read_pdf` uses.
+            Media type comes from the extension on purpose — it is a *claim made to the provider*,
+            so a file whose bytes disagree with its name fails there with a clear error rather than
+            being silently relabelled here.
+            13 tests. **Verified on the real daemon binary in both directions**: unconfigured ⇒
+            `vision.analyze` unregistered, 13 withheld, with a log line naming the exact config key;
+            configured ⇒ `Registering vision.analyze models=anthropic/claude-opus-5`, all three
+            skills loaded, **10 withheld** — matching the audit test's count independently. Wiring
+            the `DaemonBuilder::from_nanna_config` path as well as `serve.rs` was needed and the
+            first boot caught that it was missing (`configured_count=0`).
+            **Limitation, stated rather than glossed:** no live vision *call* was made — this host
+            has no working cloud credential and no Ollama, so the LLM round trip is covered only by
+            being the same code path `create_vision_tool` always used. Everything up to the request
+            (path handling, size ceiling, media type, model selection, fallthrough, registration
+            gating) is tested. 1967 workspace tests pass / 0 fail, clippy 0 errors.
+      - [x] **The audit pass ran, and the gap is far bigger than one tool.** *(2026-09-15)*
+            Asked the right question — not "which Rust built-in structs have callers" (almost none
+            do; the JS/TS migration is complete and the `builtin/` structs are largely vestigial)
+            but **"which services do the bundled skills declare that the daemon registers
+            nowhere"**, since a scripted skill reaches the daemon through `requires: [...]`.
+            **14 of the 23 declared services are registered nowhere, so 16 of the 44 bundled
+            skills are withheld from the model at every boot**: `analyze_image`, `browser_action`,
+            `browser_evaluate`, `browser_extract`, `browser_screenshot`, `cancel_reminder`,
+            `create_tool`, `describe_image`, `edit_tool`, `list_reminders`, `list_user_tools`,
+            `ocr`, `remind`, `screenshot`, `text_to_speech`, `transcribe` — a quarter of the tool
+            surface. Note **all three tool-authoring skills** are in that list (`tools.create` /
+            `tools.list` / `tools.update` have no service), which was not previously recorded
+            anywhere; the rest map to existing P18 items.
+            The **withholding itself is correct and already shipped** (registry.rs, 2026-07-26: an
+            advertised tool that can only fail is worse than an absent one). What was missing was
+            that anybody could tell. Two things fix that:
+            - **`crates/nanna-daemon/tests/skill_services_are_registered.rs`** cross-checks every
+              bundled skill's `requires` — parsed with the loader's own `extract_manifest`, not a
+              bespoke regex, so a declaration the test cannot see is one the daemon cannot see
+              either — against every name the two service builders can insert. Any gap must be
+              named in `KNOWN_MISSING_SERVICES` with its reason, and a second test fails when an
+              entry goes **stale** in either direction (the service got implemented, or no skill
+              asks for it any more) so the ledger cannot start lying. Verified in both directions:
+              a probe skill declaring `nonexistent.service` fails the gate by name.
+            - **The daemon now announces it at boot**, once, at `warn`, naming the withheld skills
+              *and* the blocking services — not just a count, because a count tells an operator
+              something is missing without telling them what to configure. Confirmed on the real
+              binary: `withheld_count=16 total=44`, listing all 16 skills and all 14 services,
+              matching the test's finding independently.
+            1931 workspace tests pass / 0 fail, clippy 0 errors.
+            - [x] **Wired the three the audit found nobody tracking: `tools.create` /
+                  `tools.update` / `tools.list`.** *(2026-09-15)* New
+                  `nanna-daemon/src/tool_authoring.rs`; **16 withheld skills → 13**, confirmed on
+                  the real daemon binary and independently by the audit test. `create_tool`,
+                  `edit_tool` and `list_user_tools` are callable, so the agent can author a tool
+                  and use it in the same run.
+                  **Storage shape is the skill-directory one** (`{tools_dir}/{name}/tool.ts` plus
+                  a `permissions.json`), which is what the skills' own text describes and what
+                  `discover_skills` reads — deliberately *not* `UserToolManager`'s `{name}.json`,
+                  a separate older store whose files the loader would never find. The roadmap's
+                  "UserToolManager exists, no service exposes it" was the wrong premise.
+                  **Containment by construction, not by filtering:** the only user-supplied path
+                  component is the tool name, and `validate_tool_name` restricts it to
+                  `^[a-z][a-z0-9_]{0,63}$` — no `/`, no `.`, no `..` — with a symlink check on top
+                  for a directory somebody else planted. An authored tool gets a `permissions.json`
+                  written **at creation**, so it carries the home scope from this run's other
+                  increment rather than waiting for `ensure_permissions` at the next boot.
+                  Two shapes worth naming: an edit applies against the **current file** and is
+                  refused on zero **or** more than one match (the caller cannot know which it
+                  changed otherwise); and source is validated with `extract_manifest` **before**
+                  disk, so a broken edit leaves the working tool intact. Live registration failure
+                  is reported as `registered: false` rather than as success, because "callable now"
+                  and "callable after a restart" are different answers to the only question asked.
+                  The authoring services load what they wrote with the **same service map** every
+                  bundled skill gets, via a `OnceLock` slot the daemon fills right after building —
+                  without it a runtime-authored tool would be the only tool in the daemon unable to
+                  call a service.
+                  15 unit tests + **7 round-trip integration tests against a real registry** that
+                  *call the tool they authored*: created-then-callable with no restart, an edit that
+                  the next call sees, create-over-existing refused with the original still working,
+                  a breaking edit refused before disk, editing an absent tool refused rather than
+                  creating one, traversing names leaving nothing on disk, and listing that skips
+                  bundled skills. 1953 workspace tests pass / 0 fail, clippy 0 errors.
+                  - [x] **Authoring goes to the data dir, never to wherever skills are loaded
+                        from.** *(2026-09-15, same run)* In a debug build `resolve_tools_dir`
+                        returns the source tree, so `tools.create` would have dropped new skill
+                        directories into the checkout — untracked files appearing in the repo
+                        because an agent made a tool. Loading from source is deliberate and stays;
+                        writing to it is not. The daemon now authors into `{data_dir}/tools` and
+                        **also loads that directory**, because otherwise an authored tool would be
+                        callable for exactly one session and gone after a restart — in a release
+                        build the two are the same directory and the extra load is skipped.
+                        Verified on the real daemon (a full boot left the checkout byte-identical)
+                        and by a test that creates through the service and then loads the directory
+                        the way a fresh boot would. `ensure_permissions` still writes into the
+                        source tree in debug builds, which is the useful half of that behaviour and
+                        is test-gated.
+- [x] **`screenshot.capture` implemented** *(2026-09-15)* — the note was right that the Rust tool is a
+      stub, so this is the implementation rather than a registration. **Only the three `schedule.*`
+      skills remain withheld, down from 16 at the start of the run.** Input synthesis stays deferred.
+      **Shells out to the desktop's own capture tool instead of taking a screen-capture dependency.**
+      Capture is not portable library work — Wayland goes through the compositor (`grim`), X11 through
+      the server (`maim`/`scrot`/`import`), macOS through `screencapture` — and each already ships
+      where it applies and speaks PNG-to-a-path, so the entire difference between them is a command
+      line. A table of six, **Wayland before X11 because an X11 tool under Wayland succeeds and
+      captures the wrong thing**, which is worse than failing (test asserts the ordering).
+      **Registered only when a tool *and* a display session both exist**; a headless daemon has
+      nothing to photograph. Success is not taken at face value either: several of these exit 0 after
+      writing nothing, so the file is stat'd and an empty one is an error.
+      **Window capture is refused, not faked.** The skill's schema advertised "a window title to
+      capture specific window", which no tool here can do — returning the whole desktop instead is a
+      wrong answer, not a degraded one. The schema is corrected to `enum: ["desktop"]` and the refusal
+      points at `browser_screenshot` for the web-page case. The skill also stops reporting a byte
+      count and dropping the image, the same correction `audio.tts` and `browser.screenshot` got.
+      6 tests. **Deliberately not verified: an actual capture.** Running `grim` here would photograph
+      the operator's real desktop, unasked, to prove plumbing — so registration was verified on the
+      real daemon (`tool="grim" executable="/usr/bin/grim"`, and the boot left the screenshot
+      directory empty) and the pixel path was not exercised. A capture is one command; someone's
+      screen is not test fixture.
 - [ ] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
       constructed nowhere and nanna-config has no `[mcp]` section. Add config + daemon boot registration +
       bearer/OAuth headers on HttpTransport (currently none) + Streamable HTTP (pinned to 2024-11-05 legacy
@@ -6739,6 +7124,39 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-15 sweep)* `cargo update` -> 14 compatible bumps (`clap 4.6.7` + builder/derive/lex,
+     `async-compression 0.4.47`, `compression-codecs 0.4.42`, `camino 1.2.6`, `playwright-rs 0.18.1`,
+     `rustls 0.23.45`, `wide 1.7.1`). Both guarded pins fired again and were pinned back with the
+     documented commands (`libc 0.2.189 -> 0.2.186`, `malachite-bigint 0.11.0 -> 0.9.2`, which also
+     dropped the `malachite-{base,nz} 0.11.0` it had dragged in); **re-checked against the registry
+     rather than assumed** — `rustpython-{vm,stdlib,common}` are all still `0.5.0`, so both pins stay.
+     `cargo upgrade --incompatible`: only the two known downgrade rows (`criterion -> "0.7"`,
+     `lopdf -> "0.42"`), both rejected and both re-verified against crates.io this run
+     (`criterion` **0.8.2**, `lopdf` **0.45.0** — cargo-edit's "latest" column is the stale one, and
+     the lock already holds the real latest of each).
+     GUI: `vitest 5.0.0 -> 5.0.1` taken (251/251 green). **TypeScript 7 attempted for the first time
+     rather than deferred, and the blocker is now measured, not assumed:** `vue-tsc 3.3.11` declares
+     `typescript: ">=5.0.0"` so pnpm installs 7.0.2 happily, but its `resolveTscPath` does
+     `require.resolve("typescript/lib/tsc")` and **TS 7's `package.json` `exports` no longer maps that
+     subpath** -> `ERR_PACKAGE_PATH_NOT_EXPORTED`, typecheck exits 1 before reading a single file.
+     Reverted to `^5.9.3` (typecheck back to 0 errors). Nothing in this repo can work around it.
+     **Upstream state, checked via the GitHub API this run rather than assumed:**
+     [vuejs/language-tools#5381](https://github.com/vuejs/language-tools/issues/5381) ("TypeScript
+     Native / TypeScript 7 (`tsgo`) Support") is **closed as completed** (40 comments, last touched
+     2026-08-07) — but *closed does not mean shipped here*: `vue-tsc 3.3.11` still cannot resolve
+     `typescript/lib/tsc` under TS 7, measured today. The cause is structural, not a missing flag:
+     Volar embeds `tsc` through TypeScript's **programmatic API**, and TS 7.0 shipped without a
+     stable one — Microsoft's own 7.0 announcement calls out that Vue/MDX/Astro/Svelte workflows
+     "will likely not yet be able to leverage TypeScript 7". The resolution paths named on the
+     thread are **[johnsoncodehk/typescript-native-bridge](https://github.com/johnsoncodehk/typescript-native-bridge)**
+     (Volar's own maintainer) and **[microsoft/TypeScript#63800](https://github.com/microsoft/TypeScript/issues/63800)**;
+     TS **7.1** is where the stabilized API is expected.
+     **So the re-check for the next sweep is not "is TS 7 out" — it is whether `vue-tsc` ships a
+     version whose `resolveTscPath` works under TS 7.** Testing TypeScript alone will keep giving
+     the same red.
+     Toolchain pin `nightly-2026-09-08` held. Verified on tmpfs: **clippy 0 errors**
+     (`--workspace --all-targets --exclude nanna-gui`, 1m44s), whole-workspace `cargo test`
+     **0 failures**, `cargo build --release -p nanna-daemon` green, 251/251 vitest, typecheck clean.
    - *(2026-09-11 sweep)* `cargo update` -> 2 compatible bumps (`toml 1.1.6`,
      `toml_edit 0.25.15`); the rest of the lock diff is dependency edges re-resolved onto
      versions already present (`windows-sys 0.61.2`, `getrandom 0.4.3`, `rand 0.10.2`, …) — no
@@ -7065,10 +7483,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            burn's GPU backend on a desktop OS links a bundled C SQLite.** Turning off
            `burn/autotune` would not remove it.
            **Owner decision needed**, and the options are narrower than first thought:
-           - [ ] Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
-                 clear (it is a persistent autotune-results DB; CubeCL's own docs note the cache
-                 can be pre-built and shipped, so a no-DB mode is coherent). The only fix that
-                 keeps both the GPU backend and the Turso-only rule.
+           - [x] **Upstream is already fixing it, and better than this item asked for.**
+                 *(research 2026-09-15)* **[tracel-ai/cubecl#1608 — "Replace rusqlite with Turso
+                 in cubecl-environment's persistence layer"](https://github.com/tracel-ai/cubecl/issues/1608)**,
+                 opened 2026-09-04 by **antimora** (Tracel/Burn), assigned to **jwric**, marked
+                 *In Progress*, last touched **2026-09-14** — verified open via the GitHub API,
+                 not inferred from a search snippet. It replaces the bundled C SQLite with
+                 **Turso**, and notes "a similar migration was completed in the burn project".
+                 This is strictly better than the flag this item wanted: a flag would have left
+                 the C engine linkable, whereas this removes it.
+                 **If it lands, the owner decision below evaporates.** Nanna's
+                 `no_banned_database_crates_in_lockfile` guard bans `rusqlite`/`libsql`/`sqlx`
+                 and Turso is the database Nanna already uses, so `mummu` becomes addable with
+                 **no guard change, no C SQLite in the shipped binary, and nothing to decide**.
+                 Stated tradeoffs in the issue: dependency count 153 → 276, Turso is WAL-only
+                 (`PRAGMA wal_checkpoint(TRUNCATE)` folds the WAL for shipping), and no
+                 URI/immutable read-only mode.
+                 **So: watch #1608 before spending the owner's decision on the two options below.**
+                 Re-check it at the top of each run — this is now the cheapest thing standing
+                 between P12 and its first real consumer.
+           - [ ] ~~Upstream: get CubeCL to put that `cache` feature behind a flag consumers can
+                 clear.~~ **Superseded by #1608 above** — removing the C engine beats gating it.
            - [ ] Narrow `dep_guard`'s ban to Nanna's *own* storage path, explicitly permitting a
                  vendored GPU-autotune cache. Weakens a deliberate guard — do it with eyes open,
                  and only if the owner accepts a C SQLite in the shipped binary (it also cuts

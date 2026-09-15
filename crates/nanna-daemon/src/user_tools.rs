@@ -433,7 +433,7 @@ const TOOL_NAME_LEN_MAX: usize = 64;
 /// # Errors
 /// Returns a human-readable message if the name is empty, too long, or contains
 /// a disallowed character.
-fn validate_tool_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_tool_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > TOOL_NAME_LEN_MAX {
         return Err(format!(
             "tool name must be 1..={TOOL_NAME_LEN_MAX} chars, got {} ({name:?})",

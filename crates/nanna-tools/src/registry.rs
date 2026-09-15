@@ -7,7 +7,7 @@ use crate::{
     format_tool_output,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -904,6 +904,9 @@ impl ToolRegistry {
         let discovered = discover_skills(skills_dir);
         let total = discovered.len();
         let mut loaded = 0;
+        // Which services the withheld skills were waiting on, so the aggregate
+        // below names the cause and not just the count.
+        let mut withheld: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for skill in discovered {
             // A tool that declares `requires: [...]` is only registered when
@@ -920,6 +923,10 @@ impl ToolRegistry {
                     missing = %missing.join(", "),
                     "Skill not registered: required services unavailable"
                 );
+                withheld
+                    .entry(skill.name.clone())
+                    .or_default()
+                    .extend(missing);
                 continue;
             }
             match load_skill_with_services(&skill.path, services, Some(Arc::downgrade(self))).await
@@ -935,6 +942,31 @@ impl ToolRegistry {
                 }
             }
         }
+
+        // Withholding a skill whose services are missing is correct (see
+        // above), but one `info` line per skill among a few hundred boot lines
+        // is not the same as saying so. Measured 2026-09-15: 16 of 44 bundled
+        // skills are withheld on a default build, which is a quarter of the
+        // tool surface the model never learns exists. Announce it once, loudly,
+        // naming the services rather than only the count — the count alone
+        // tells an operator that something is missing without telling them
+        // what to install or configure.
+        if !withheld.is_empty() {
+            let blocking: BTreeSet<&str> =
+                withheld.values().flatten().map(String::as_str).collect();
+            warn!(
+                withheld_count = withheld.len(),
+                total,
+                skills = %withheld.keys().cloned().collect::<Vec<_>>().join(", "),
+                services = %blocking.into_iter().collect::<Vec<_>>().join(", "),
+                "Skills withheld from the model: their declared services are \
+                 not registered on this daemon"
+            );
+        }
+        debug_assert!(
+            loaded + withheld.len() <= total,
+            "more skills were loaded and withheld than were discovered",
+        );
 
         info!(loaded, total, "Skills loaded from {:?}", skills_dir);
         loaded

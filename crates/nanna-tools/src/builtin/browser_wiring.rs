@@ -107,6 +107,22 @@ impl BrowserManager {
 
         let selector = params.get("selector").and_then(|v| v.as_str());
 
+        // `attribute` (e.g. `href`, `src`) is in the `browser_extract` skill's
+        // parameter schema and had no path here at all, so asking for one
+        // silently returned the element's text instead.
+        if let Some(attribute) = params.get("attribute").and_then(|v| v.as_str()) {
+            let Some(sel) = selector else {
+                return Err(
+                    "extracting an attribute needs a `selector` to read it from".to_string()
+                );
+            };
+            return page
+                .get_attribute(sel, attribute)
+                .await
+                .map(Option::unwrap_or_default)
+                .map_err(|e| e.to_string());
+        }
+
         if let Some(sel) = selector {
             // Extract from specific selector
             let script = match mode {
@@ -204,6 +220,33 @@ impl BrowserManager {
                 page.wait_for_selector(selector).await.map_err(|e| e.to_string())?;
                 Ok(format!("Found '{}'", selector))
             }
+            // `scroll` and `navigate` are both in the `browser_action` skill's
+            // advertised enum and neither was implemented, so the model was
+            // told it could use two actions that always answered
+            // "Unknown action".
+            "scroll" => {
+                // `value` is the skill's field for an action's argument; here
+                // it is pixels, defaulting to one viewport-ish jump.
+                let pixels = params
+                    .get("value")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
+                    .unwrap_or(600);
+                let script = format!("window.scrollBy(0, {pixels}); window.scrollY");
+                page.evaluate(&script)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("Scrolled {pixels}px"))
+            }
+            "navigate" => {
+                // The skill documents `value` as "URL (for 'navigate')".
+                let target = params
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or("Navigate requires 'value' to be the URL to go to")?;
+                page.goto(target).await.map_err(|e| e.to_string())?;
+                Ok(format!("Navigated to '{target}'"))
+            }
             _ => Err(format!("Unknown action: {}", action)),
         }
     }
@@ -216,10 +259,14 @@ impl BrowserManager {
     ) -> Result<Value, String> {
         let page = self.get_page(url).await.map_err(|e| e.to_string())?;
 
+        // The `browser_evaluate` skill sends `expression`; this read only
+        // `script`, so every call answered "Missing script". Accept the name
+        // the skill documents, and keep the old one working.
         let script = params
-            .get("script")
+            .get("expression")
+            .or_else(|| params.get("script"))
             .and_then(|v| v.as_str())
-            .ok_or("Missing script")?;
+            .ok_or("evaluate requires an `expression` (the JavaScript to run)")?;
 
         page.evaluate(script).await.map_err(|e| e.to_string())
     }
