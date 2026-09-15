@@ -5753,7 +5753,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "uuid",
 ]
@@ -5912,7 +5911,6 @@ dependencies = [
 name = "nanna-workspace"
 version = "0.3.20"
 dependencies = [
- "directories",
  "serde",
  "serde_json",
  "tempfile",

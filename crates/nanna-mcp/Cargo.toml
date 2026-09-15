@@ -7,7 +7,9 @@ description = "MCP (Model Context Protocol) client for Nanna"
 [features]
 default = ["stdio", "http", "tools-integration"]
 stdio = ["tokio/process"]
-http = ["reqwest", "tokio-tungstenite"]
+# SSE over reqwest. `tokio-tungstenite` used to be here for a WebSocket
+# transport that was never written, and no file ever imported it.
+http = ["reqwest"]
 tools-integration = ["nanna-tools"]
 
 [dependencies]
@@ -20,7 +22,6 @@ async-trait.workspace = true
 
 # HTTP transport (optional)
 reqwest = { workspace = true, optional = true }
-tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
 
 # For stdio line reading
 futures = "0.3"
