@@ -3312,7 +3312,14 @@ impl DaemonServer {
             }
 
             if resolved.is_dir() {
-                nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                let granted_count = nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                if granted_count > 0 {
+                    warn!(
+                        granted_count,
+                        "Wrote the default permissions.json for {} tool(s) that declared none",
+                        granted_count
+                    );
+                }
                 info!("Tools directory: {:?}", resolved);
             } else {
                 warn!("Tools directory does not exist: {:?}", resolved);

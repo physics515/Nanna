@@ -2190,12 +2190,50 @@ so neither CI nor any prior run could have caught them:
       `edit_tool` must agree on read and write scope. Verified in both directions — removing the
       new file fails both tests by name. The assertion is deliberately "somebody chose", not "the
       scope is narrow": 27 bundled skills are `~`-scoped and 13 legitimately need `*`.
-      - [ ] **Reconsider the fail-open default itself.** `DEFAULT_PERMISSIONS_JSON` is the widest
-            possible set, and `ensure_permissions` applies it to anything without a file —
-            including **user-authored** tools, where it is load-bearing rather than an accident.
-            Narrowing it is a real behaviour change for existing installs, so it needs its own
-            increment: decide whether an undeclared tool should get `~` instead of `*`, or whether
-            `ensure_permissions` should stop writing on behalf of skills that ship their own.
+      - [x] **The fail-open default is now home-scoped, and every grant announces itself.**
+            *(2026-09-15)* `DEFAULT_PERMISSIONS_JSON` goes `read/write: ["*"]` -> `["~"]`;
+            `run: true`, `net: ["*"]` and `env: true` are unchanged. The scope was **derived from
+            a census of the 44 bundled skills, not picked**: 30 declare `~` and 13 declare `*`, so
+            home is the modal authored choice and the narrowest one the corpus shows is commonly
+            sufficient — while 40 of 44 declare exactly `run: true, net: ["*"], env: true`, which
+            makes those three not over-grants relative to the same corpus. `~` is enforced, not
+            decorative: `ScriptedToolWrapper::from_file` expands it to the real home directory at
+            load time (`skills/scripted.rs`).
+            **The "real behaviour change for existing installs" this item worried about does not
+            exist**, and that is a checkable fact rather than a hope: `ensure_permissions` writes
+            only when the file is **absent**, and the grant it writes is **persisted**, so a
+            directory that already received the old wide default keeps it untouched. The narrowing
+            reaches newly-created undeclared tools only.
+            The second half of the item — "stop writing on behalf of skills that ship their own" —
+            was **already the behaviour** (`if perms.exists() { continue; }`), so what was actually
+            missing was not restraint but **visibility**: the grant was written silently, with
+            nothing but the file itself left to notice. `ensure_permissions` now returns the count
+            it granted and logs each one at `warn` naming the tool, and the daemon repeats the
+            aggregate at boot. Guarded by an always-on `assert!` (a security guard, per doctrine)
+            that the constant's filesystem scope stays home-bounded, plus 5 unit tests asserting
+            **the bytes actually written** rather than the constant, so re-widening fails even if
+            the guard is deleted. **Verified in both directions** — re-widening the constant to
+            `["*"]` fails all five by name and trips the assert. Also verified on the **real
+            daemon binary** against a scratch config + `NANNA_TOOLS_DIR` fixture: an undeclared
+            tool received the `~` scope and produced
+            `WARN ... Tool declared no permissions.json ... tool="undeclared_tool"` +
+            `WARN ... granted_count=1`, while a sibling shipping its own file came back
+            byte-identical. 148 `nanna-tools` tests green, 0 panics.
+            - [ ] **Decide `env: true` separately.** It rode along untouched above because the
+                  census justifies it, but it is the one axis with **no scope vocabulary** — only
+                  on/off — so "narrow env" can only mean `false`, and it is where provider API
+                  keys live. A silent read of a key is the one grant in this set that cannot be
+                  walked back after the fact. Different rationale, different blast radius than the
+                  path scopes; do not fold it into a path-scope change.
+            - [ ] **`allows_read`/`allows_write` document a `~` they do not implement.** Their doc
+                  comments in `nanna-scripting/src/tool.rs` say "supports ... `~` for home
+                  directory", but the check is `path.starts_with(p)` against the literal `PathBuf`,
+                  and `Path::starts_with` is component-wise — a literal `~` matches nothing. The
+                  expansion lives in `ScriptedToolWrapper::from_file` (`nanna-tools`), one crate
+                  away, so anything constructing `ToolPermissions` **programmatically** with `"~"`
+                  gets a silent deny that the doc comment promised would work. Harmless today
+                  (every production path loads through the wrapper), but it is a trap laid for the
+                  next caller. Fix the comment, or move the expansion into the checker.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
