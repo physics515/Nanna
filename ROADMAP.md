@@ -2265,12 +2265,31 @@ so neither CI nor any prior run could have caught them:
             `WARN ... Tool declared no permissions.json ... tool="undeclared_tool"` +
             `WARN ... granted_count=1`, while a sibling shipping its own file came back
             byte-identical. 148 `nanna-tools` tests green, 0 panics.
-            - [ ] **Decide `env: true` separately.** It rode along untouched above because the
-                  census justifies it, but it is the one axis with **no scope vocabulary** — only
-                  on/off — so "narrow env" can only mean `false`, and it is where provider API
-                  keys live. A silent read of a key is the one grant in this set that cannot be
-                  walked back after the fact. Different rationale, different blast radius than the
-                  path scopes; do not fold it into a path-scope change.
+            - [x] **Decided: do NOT narrow `env` on the written default — it is not the lever it
+                  looks like.** *(2026-09-15)* The question assumed `env: false` would stop an
+                  undeclared tool reading provider API keys. **Measured, and it would not.**
+                  `permissions.env` gates exactly one thing, `NannaBridge::get_env`; **nothing in
+                  `nanna-scripting` or `nanna-proc` ever calls `Command::env_clear`**, so a spawned
+                  child inherits the daemon's whole environment. The same written default also
+                  grants `run: true`, so a tool refused `Nanna.getEnv("ANTHROPIC_API_KEY")` reads
+                  it with `exec("printf %s \"$ANTHROPIC_API_KEY\"")`.
+                  Narrowing `env` would therefore break `Nanna.getEnv` for undeclared tools and buy
+                  **no containment at all** — a compatibility cost for security theatre.
+                  Pinned by `bridge.rs::env_containment_tests`, which drives the real `exec` path
+                  and asserts both halves: `env: false` denies the bridge accessor, and the child
+                  reads the same variable anyway. It documents today's behaviour deliberately —
+                  **if it starts failing, that is good news** and the `env` default can move.
+            - [ ] **The real item: scope the child environment, or treat `env` and `run` as one
+                  permission.** Until a spawned child's environment is filtered, `env` is a gate on
+                  one accessor rather than a boundary, and the two fields describe the same
+                  capability while pretending to be independent. Two shapes worth weighing: give
+                  `env` a scope vocabulary it currently lacks (a name allowlist, serde-compatible
+                  with today's `true`/`false` via an untagged enum) **and** apply it to the child's
+                  environment; or state plainly that `run: true` implies `env: true` and stop
+                  offering a knob that does not hold. The first is the real fix; **note that
+                  filtering a child's environment is a genuine behaviour change** — `PATH` alone
+                  means a naive allowlist breaks every tool that shells out — so it needs its own
+                  increment with real runtime verification, not a ride-along.
             - [x] **`allows_read`/`allows_write` now implement the `~` they document.**
                   *(2026-09-15, same run)* Fixed rather than documented: a shared `scope_covers`
                   expands `~` / `~/sub` against a `LazyLock` home lookup (the check runs on every
