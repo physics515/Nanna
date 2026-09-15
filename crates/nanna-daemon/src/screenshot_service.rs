@@ -203,6 +203,12 @@ pub fn build_screenshot_services(data_dir: &Path) -> HashMap<String, ServiceFn> 
                     std::time::Duration::from_secs(CAPTURE_TIMEOUT_SECS),
                     tokio::process::Command::new(&executable)
                         .args(capture_args(tool, &path))
+                        // Without this the timeout below drops the future and
+                        // leaves the child running: tokio's default is to
+                        // detach, and the tool most likely to time out is one
+                        // sitting on an interactive selection that will never
+                        // come. This repo has paid for orphaned children before.
+                        .kill_on_drop(true)
                         .status(),
                 )
                 .await
