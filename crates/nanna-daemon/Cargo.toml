@@ -22,7 +22,7 @@ nanna-agent = { path = "../nanna-agent" }
 # workspace enabled it — which is the structural reason `create_vision_tool`
 # had no callers anywhere. It costs nothing to turn on: `vision = ["nanna-llm"]`
 # and this crate already depends on nanna-llm directly for the router.
-nanna-tools = { path = "../nanna-tools", features = ["scripting", "python", "vision"] }
+nanna-tools = { path = "../nanna-tools", features = ["scripting", "python", "vision", "browser"] }
 nanna-channels = { path = "../nanna-channels" }
 nanna-config = { path = "../nanna-config" }
 nanna-storage = { path = "../nanna-storage" }

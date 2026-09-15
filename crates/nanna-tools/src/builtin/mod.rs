@@ -46,6 +46,8 @@ pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};
 
 #[cfg(feature = "browser")]
 pub use browser_wiring::{BrowserManager, create_browser_tools};
+#[cfg(feature = "browser")]
+pub use nanna_browser::{BrowserConfig, BrowserType};
 
 #[cfg(feature = "vision")]
 pub use vision_wiring::{create_vision_fn, create_vision_tool};

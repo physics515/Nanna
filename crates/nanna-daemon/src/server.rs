@@ -637,6 +637,9 @@ fn build_script_services(
     // OpenAI key plus the data dir generated speech is written under. `None` or
     // no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
+    // The data dir page screenshots are written under. `None`, or no
+    // Chromium-family browser on the host, leaves `browser.*` unregistered.
+    browser_data_dir: Option<PathBuf>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -1119,6 +1122,12 @@ fn build_script_services(
                 })
             }),
         );
+    }
+
+    // Browser. The four browser_* skills declare these; nanna-browser was
+    // complete and the `browser` feature was enabled nowhere.
+    if let Some(data_dir) = browser_data_dir {
+        services.extend(crate::browser_service::build_browser_services(&data_dir));
     }
 
     // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
@@ -4024,6 +4033,7 @@ impl DaemonServer {
                     self.config.llm.openai_api_key.clone(),
                     self.config.data_dir.clone(),
                 )),
+                Some(self.config.data_dir.clone()),
             );
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
@@ -5480,6 +5490,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let pdf_read = services
             .get("pdf.read")
@@ -5547,6 +5558,7 @@ mod tests {
             None,
             None,
             Some(ocr_fn),
+            None,
             None,
         );
         let pdf_read = services.get("pdf.read").expect("pdf.read is registered");

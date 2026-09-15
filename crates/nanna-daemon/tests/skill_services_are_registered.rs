@@ -11,7 +11,9 @@
 //! Measured 2026-09-15: **14 of the 23 declared services were registered
 //! nowhere**, so 16 of the 44 bundled skills were withheld at every boot —
 //! including all three tool-authoring skills, which this run then wired
-//! (`tools.create`/`update`/`list`), leaving **11 missing and 13 withheld**.
+//! (`tools.create`/`update`/`list`), then `vision.analyze`, `audio.*` and the
+//! four `browser.*`, leaving **4 missing** — the three `schedule.*`, blocked on
+//! delivery rather than on a bridge, and `screenshot.capture`.
 //! Each remaining gap has a roadmap item; what did not exist was one place that
 //! says so, or anything stopping the next skill from joining them unnoticed.
 //!
@@ -31,22 +33,6 @@ use std::path::{Path, PathBuf};
 /// implemented is the point — a stale entry is caught by
 /// [`no_known_missing_entry_is_stale`].
 const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
-    (
-        "browser.action",
-        "P18: nanna-browser is real but registered nowhere",
-    ),
-    (
-        "browser.evaluate",
-        "P18: nanna-browser is real but registered nowhere",
-    ),
-    (
-        "browser.extract",
-        "P18: nanna-browser is real but registered nowhere",
-    ),
-    (
-        "browser.screenshot",
-        "P18: nanna-browser is real but registered nowhere",
-    ),
     (
         "schedule.add",
         "P18: NOT the missing bridge it looks like — TaskType::Delayed \

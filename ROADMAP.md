@@ -4098,39 +4098,36 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       So the order is **delivery first, bridge second**: give the scheduler a way to reach a
       channel (or the originating session), then register the three services. Wiring them in the
       other order ships a reminder that fires into a log file.
-- [ ] **`browser.*` services** — nanna-browser (chromiumoxide + playwright, full navigate/click/type/extract
-      API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
-      and registers nothing. The P8 "browser relay Chrome extension" (drive the user's real logged-in
-      browser) remains the valuable second half.
-      **(2026-09-15 — investigated, deliberately NOT started, and "enable the flag, register the
-      services" is an understatement.)** The four services are not thin wrappers: **the skills and
-      `BrowserManager` were written against each other and never run together, and their vocabularies
-      disagree in five places.**
-      - `browser.evaluate` sends **`expression`**; `BrowserManager::evaluate` reads **`script`** and
-        errors `Missing script`. Registered naively, this service fails on every call.
-      - `browser.action` sends **`value`** and **`delay_ms`**; the manager reads **`text`**, **`key`**
-        and **`wait_ms`** depending on the branch.
-      - `browser.action`'s enum offers **`scroll`** and **`navigate`**; the manager implements
-        `click`/`type`/`fill`/`press`/`wait`/`wait_selector` — so **two of the five advertised actions
-        are not implemented at all**, while three the manager *does* support are not exposed.
-      - `browser.extract` sends **`attribute`** (e.g. `href`); the manager has no attribute path — only
-        `mode` (`html`/text) plus `selector`.
-      - `browser_screenshot` reports a byte count and discards the image, the same shape `audio.tts`
-        had before this run gave it a path.
-      So the real work is a translation layer at the service boundary **plus** closing two genuine
-      feature gaps **plus** correcting the skill's advertised enum. Registering the four services
-      without that ships tools the model is told it can use and that fail or silently do nothing —
-      exactly what the withholding mechanism exists to prevent.
-      **Cost, measured rather than feared:** enabling the flag adds **9 crates** to the daemon's
-      dependency tree (653 → 662), the chromiumoxide family among them. Binary-size impact is the
-      number still worth taking before committing, since P6 lists binary size as a hard guardrail and
-      `chromiumoxide_cdp` generates the whole CDP protocol as Rust types.
-      **Good news for whoever picks this up: it is the one service group that can be verified
-      end to end on this host** — `chromium` and `google-chrome-stable` are both installed, so unlike
-      `vision.analyze` and `audio.*` the real backend can be driven in a test rather than reasoned
-      about. Gate registration on a detected executable and pass it as
-      `BrowserConfig.executable_path`, so the thing that is probed and the thing that is launched are
-      the same binary by construction.
+- [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
+      All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
+      confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's
+      real logged-in browser) remains the valuable second half.
+      The skills and `BrowserManager` had been written against each other and never run together.
+      All five disagreements are fixed rather than papered over:
+      `evaluate` now accepts the **`expression`** the skill sends (it read only `script`, so every
+      call answered `Missing script`); `extract` honours **`attribute`** via `BrowserPage::get_attribute`
+      (there was no path at all, so asking for an `href` silently returned the element's text);
+      **`scroll`** and **`navigate`** — two of the five actions the skill advertises and neither
+      implemented — are now real arms, built on `page.evaluate` and `page.goto`; and `action`'s
+      `value`/`delay_ms` are translated to the manager's `text`/`wait_ms` **at the service boundary**,
+      so the skill keeps speaking its own documented vocabulary.
+      `browser.screenshot` writes a PNG to `{data_dir}/screenshots/` and returns the path, the same
+      correction `audio.tts` got: the skill previously reported a byte count and dropped the image,
+      so the daemon drove a browser to take a screenshot nobody could look at.
+      **Registered only when a browser is present**, and the detected executable is passed as
+      `BrowserConfig.executable_path` so the binary that is probed and the binary that is launched
+      are the same one **by construction** — a gate that tests something other than what it guards
+      is not a gate. `CHROME`/`CHROME_PATH` override the search and are honoured only if they point
+      at something that exists.
+      **This is the one service group verified end to end.** `vision.analyze` and `audio.*` could
+      only be tested up to the request; here `tests/browser_services_drive_a_real_browser.rs` serves
+      a page on loopback, launches Chromium, and asserts the extraction, the attribute, the
+      evaluated expression, the scroll, and a real PNG on disk. **The launch itself was proved, not
+      assumed:** pointing `CHROME` at a logging wrapper recorded exactly one invocation with
+      `--headless --remote-debugging-port=0`, because a 0.37 s test run is fast enough to deserve
+      suspicion.
+      **Cost:** +9 crates on the daemon tree (653 → 662). Binary-size delta against the measured
+      66,483,104-byte baseline is still worth taking before a release that ships it.
 - [x] **`audio.tts` + `audio.transcribe` registered** *(2026-09-15)* — `text_to_speech` and
       `transcribe` are live; **8 skills withheld, down from 16 at the start of the run**, confirmed
       on the real daemon binary and independently by the audit test. New
