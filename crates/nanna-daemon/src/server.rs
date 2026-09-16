@@ -4453,10 +4453,30 @@ impl DaemonBuilder {
         // the daemon never received the secrets it checks against.
         apply_channel_webhook_secrets(&mut builder.config.webhook, &config.channels);
 
-        // Set data directory from Nanna config (same location as GUI)
-        match nanna_config::Config::default_data_dir() {
+        // Set data directory from Nanna config (same location as GUI).
+        //
+        // `resolve_data_dir` — not `default_data_dir`: the latter ignores
+        // `[general] data_dir` entirely, which is what made that setting inert
+        // (it parsed, validated and round-tripped while changing nothing).
+        // This is the single place the override is honoured; the daemon's
+        // `--data-dir` flag is applied *after* the builder is constructed, in
+        // `nanna-daemon/src/main.rs`, so an isolated run still wins.
+        match config.resolve_data_dir() {
             Ok(data_dir) => {
-                info!("Using Nanna data directory: {:?}", data_dir);
+                if config.has_custom_data_dir() {
+                    // Say it out loud. Pointing this at a new folder does not
+                    // move an existing store — the daemon opens whatever is
+                    // there and creates an empty one if nothing is — and an
+                    // empty store looks exactly like data loss to the person it
+                    // happens to.
+                    info!(
+                        "Using CONFIGURED data directory: {:?} (set by [general] data_dir; \
+                         the platform default is not in use)",
+                        data_dir
+                    );
+                } else {
+                    info!("Using Nanna data directory: {:?}", data_dir);
+                }
                 builder.config.data_dir = data_dir.clone();
                 builder.memory_path = Some(data_dir.join("memories.json"));
             }

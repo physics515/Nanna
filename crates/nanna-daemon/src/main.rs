@@ -127,9 +127,23 @@ fn file_log_writer(
         return None;
     }
 
-    // Resolve the data dir the same way `run_daemon` does so logs land beside
-    // the daemon's data; fall back to the cwd only if that lookup fails.
-    let data_dir = nanna_config::Config::default_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Logs belong beside the data they describe, so this must resolve the data
+    // dir the same way the daemon itself will: `--data-dir` wins, then
+    // `[general] data_dir` from the config file, then the platform default.
+    //
+    // Both of the first two were previously ignored here — `--data-dir /tmp/x`
+    // put the store in /tmp/x and the logs in the default location, and a
+    // relocated install split them the same way.
+    //
+    // Reading the config deliberately does NOT go through `Config::load`: that
+    // hydrates secrets from the OS keyring, which can block on an unlock
+    // prompt, and this runs *before* the tracing subscriber is installed — so a
+    // daemon parked there would say nothing at all about why it never started.
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .or_else(|| nanna_config::Config::data_dir_from_disk().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let log_dir = nanna_daemon::log_file::resolve_log_dir(cli.log_dir.as_deref(), &data_dir);
     debug_assert!(
         !log_dir.as_os_str().is_empty(),

@@ -229,48 +229,30 @@ user-initiated auto-update (`tauri-plugin-updater`) all ship.
 **Deferred by design, tracked under P0.3:** code signing / macOS notarization in CI, and
 launch-at-login.
 
-#### P0.1 - First Run UX
-- [ ] Create public facing website / Github Pages
-- [x] Build GUI onboarding wizard (replaces CLI-centric onboarding).
-      *(2026-08-15)* 3-step `OnboardingWizard.vue`: intro → backend/key → health check → chat.
-      Triggered on first run when no API key is set; persists `nanna.onboarding.done` to localStorage.
-- [x] Plain-language intro screen explaining what Nanna is.
-      *(2026-08-15)* Step 1 of wizard: "Nanna is a calm personal agent — chat, tools, and memory
-      that stay on your machine."
-- [ ] Data storage location selection.
-- [x] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
-      *(2026-08-15)* Step 2 of wizard: provider dropdown with all four options; Ollama shows
-      "runs locally — no API key needed" message.
-- [~] API key entry with validation; ~~fix has_api_key to check all provider keys, not only Anthropic~~
-      **(the provider check is fixed, 2026-07-25)**: the GUI `get_config` command's `api_key_set` looked
-      only at `config.llm.api_key` (the Anthropic slot) + the `ANTHROPIC_API_KEY` env var, so a user with
-      only an OpenAI/OpenRouter/GitHub-Models key, or Anthropic OAuth, was wrongly told they had no key and
-      re-nagged in onboarding. Added a pure, unit-tested `LlmConfig::has_configured_api_key()` in
-      `nanna-config` (checks `api_key` / `anthropic_oauth_token` / `openai_api_key` / `openrouter_api_key`
-      / `github_token`, treating blank/whitespace as unset; Ollama excluded on purpose — it is keyless and
-      handled by the onboarding's separate `needsKey`), and the command now ORs it with the env vars for all
-      four providers. 3 config tests (none→false, each provider alone→true, blank/empty→false); 20
-      nanna-config tests green. *Remaining on this line: the "entry with validation" (live key check) part,
-      and the nanna-gui compile of the 4-line command wiring was not run this pass (a fresh worktree needs
-      the sidecar + built frontend before `nanna-gui` compiles — the fixed logic itself is in the
-      unit-tested `nanna-config` helper).*
-- [ ] Ollama detection (is server running? is a model pulled?).
-- [x] Memory/privacy explanation with opt-in toggle for auto-remembering.
-      *(2026-08-15)* **Config exists** — `auto_remember_messages` in `[memory]` config (default true).
-      *(2026-08-15)* **GUI toggle added** — Settings → Memory now has "Auto-Remember Messages" switch
-      that persists to config and pushes to daemon. `PRIVACY.md` documents the feature.
-- [x] Daemon/embedded backend auto-start.
-      *(2026-08-15)* The daemon launches as a managed sidecar via `tauri-plugin-shell` on app start.
-      `daemon_manager.rs` spawns `nanna-daemon` automatically; reconnection loop handles transient
-      disconnects. No manual start required.
-- [x] Health check screen with helpful, non-technical error messages (API key invalid, Ollama not running, port conflict, etc.).
-      *(2026-08-15)* Step 3 of onboarding wizard: calls `get_backend_status`, shows friendly
-      "Backend ready" or soft error with option to continue and fix in Settings.
-- [x] Emergency stop / pause-memory button visible in main UI.
-      *(2026-08-15)* **Stop button implemented** — `ChatInput.vue` shows a red "Stop" button during
-      streaming that emits `stop` event. Keyboard shortcut `Mod+.` also triggers stop.
-      *(2026-08-15)* **Pause-memory implemented** — Settings → Memory "Auto-Remember Messages" toggle
-      controls `auto_remember_messages` config, persisted and pushed to daemon.
+#### P0.1 - First Run UX — ✅ complete (2026-09-15)
+A fresh install reaches a working chat without touching a terminal. `OnboardingWizard.vue` runs three
+steps on first launch — plain-language intro ("a calm personal agent — chat, tools, and memory that stay
+on your machine") → backend chooser (Anthropic / OpenAI / OpenRouter / Ollama, with Ollama marked keyless)
+plus API-key entry → health check whose errors are readable rather than technical — and persists
+`nanna.onboarding.done`. The daemon starts itself as a managed Tauri sidecar (`daemon_manager.rs`, with a
+reconnect loop), so there is no manual-start step to get wrong. Memory is explained and **opt-in**:
+`[memory] auto_remember_messages` defaults off, the Settings → Memory switch doubles as the pause control,
+and `PRIVACY.md` documents both. A running turn is always interruptible — `ChatInput.vue`'s Stop button
+and `Mod+.`.
+The key check stopped being Anthropic-only *(2026-07-25)*: a pure, unit-tested
+`LlmConfig::has_configured_api_key()` in `nanna-config` reads every provider slot (`api_key` /
+`anthropic_oauth_token` / `openai_api_key` / `openrouter_api_key` / `github_token`), treats blank or
+whitespace as unset, and **excludes Ollama on purpose** — it is keyless, and onboarding handles it through
+its own `needsKey`. Before that, the GUI's `api_key_set` read only the Anthropic slot and the
+`ANTHROPIC_API_KEY` env var, so an OpenAI-only, OpenRouter-only, GitHub-Models or Anthropic-OAuth user was
+told they had no key and re-nagged on every launch. 3 config tests (none→false, each provider alone→true,
+blank/empty→false).
+**Relocated rather than dropped** — four items this section listed are not first-run blockers and are
+tracked under P0.3 and P18 with their evidence: a public website / GitHub Pages, data-storage-location
+selection, Ollama detection in the wizard (the *probe* ships — `nanna_llm::probe_ollama` reports
+reachability and which configured models are missing, and `nanna doctor --online` consumes it; the GUI is
+simply not a caller yet), and live API-key validation (P18's doctor network leg, where the
+keyring-read-and-send question it raises already lives).
 
 #### P0.2 - Documentation — ✅ complete (2026-08-19)
 All documentation shipped: README rewritten user-first (pitch, download links, system requirements,
@@ -283,7 +265,37 @@ set (description + `agent`/`ai-assistant`/`llm`/`local-first`/`personal-ai`/`rus
 Remaining: capture real screenshots to replace the README placeholders.
 
 #### P0.3 - Stronger Public Release (can follow 0.1)
-- [ ] Local Ollama setup assistant in GUI.
+- [ ] Local Ollama setup assistant in GUI. *(from P0.1)* The detection half already exists and is
+      proven: `nanna_llm::probe_ollama` answers reachability + missing models over one unauthenticated
+      `GET /api/tags`, and `nanna doctor --online` is its only caller. The wizard should ask it instead of
+      assuming a local server is up.
+      - [ ] *(measured 2026-09-15 — two corrections before anyone starts)* **"The wizard should ask
+            it" is not reachable as written, and a second unhardened probe already exists.**
+            **(a) The GUI cannot call `probe_ollama`.** `gui/src-tauri/Cargo.toml` links only
+            `nanna-core`, `nanna-config`, `nanna-tools` (+ Windows-only `nanna-proc`), under an
+            explicit `# links only:` comment — the P16 pruning, deliberate. `nanna-llm` is not in
+            that list, and `nanna-daemon` (line 25 of its manifest) is where `nanna-llm` lives. So
+            the route is a **daemon IPC action** (a `SystemAction` variant; the enum is at
+            `crates/nanna-daemon/src/protocol.rs:587`), matching "the daemon owns all state, the
+            GUI is a client" — **not** adding `nanna-llm` back as a GUI dependency, which would
+            undo P16 for one probe.
+            **(b) A second probe is already shipping, and it is the unhardened one.**
+            `gui/src-tauri/src/commands/settings.rs:922` `get_ollama_models` does its own
+            `GET {ollama_host}/api/tags` with a 5 s timeout and `response.json()`. Against
+            `probe_ollama` it lacks: the 4 MiB bounded body read, the 4096-model cap, the separate
+            connect timeout, and the "answered 200 but is not Ollama" case (a captive-portal or
+            router login page surfaces as `Failed to parse Ollama response` rather than *that is
+            not Ollama*). Worse for this item specifically, it returns `Result<Vec<_>, String>`, so
+            **"server down" and "server up, model missing" collapse into one error string** — which
+            is exactly the distinction the onboarding question "is the server running? is a model
+            pulled?" is asking for. `nanna-daemon` references `probe_ollama` **nowhere**
+            (grep-clean), so today the daemon has no probe either.
+            Net: this is the same shape as the `data_dir` finding — the hardened mechanism exists
+            and its intended consumer uses a private copy. Wire the IPC action, then have
+            `get_ollama_models` answer from it so there is one implementation, not two that drift.
+- [ ] Create public facing website / GitHub Pages. *(from P0.1)*
+- [ ] Data storage location selection. *(from P0.1 — the daemon already takes `--data-dir` and honours
+      `NANNA_CONFIG_PATH`; what is missing is a place to choose it that is not an argv flag.)*
 - [ ] Model/backend status dashboard.
 - [~] Cost tracking for cloud models.
       *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,

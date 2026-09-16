@@ -204,6 +204,13 @@ impl ControlPlane {
                     json!({ "entries": [], "error": "Storage not available" })
                 }
             }
+            SystemAction::ProbeOllama { base_url } => {
+                let probe = nanna_llm::probe_ollama(&base_url, std::time::Duration::from_secs(5)).await;
+                match &probe {
+                    nanna_llm::OllamaProbe::Reachable { models } => json!({ "reachable": true, "models": models }),
+                    nanna_llm::OllamaProbe::Unreachable { reason } => json!({ "reachable": false, "reason": reason }),
+                }
+            }
         }
     }
 }

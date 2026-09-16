@@ -635,6 +635,15 @@ pub enum SystemAction {
         tool_name: Option<String>,
         limit: Option<u32>,
     },
+    /// Probe an Ollama server reachability and which models it has.
+    /// The GUI cannot call `probe_ollama` directly (it would duplicate the
+    /// unhardened logic in `get_ollama_models`); instead it sends this action
+    /// to the daemon which uses the hardened `nanna_llm::probe_ollama`.
+    ProbeOllama {
+        /// Base URL of the Ollama server (e.g. http://localhost:11434).
+        /// The daemon resolves this from the config it was started with.
+        base_url: String,
+    },
 }
 
 // =============================================================================

@@ -39,12 +39,37 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            // Build outputs, vendored code, and the test/fixture trees whose
-            // literals are assertions rather than configuration.
+            // Build outputs, vendored code, agent scratch space, and the
+            // test/fixture trees whose literals are assertions rather than
+            // configuration.
             if matches!(
                 name.as_ref(),
-                "target" | "node_modules" | ".git" | "tests" | "benches" | "e2e" | "dist" | ".nuxt"
+                "target"
+                    | "node_modules"
+                    | ".git"
+                    | ".claude"
+                    | "tests"
+                    | "benches"
+                    | "e2e"
+                    | "dist"
+                    | ".nuxt"
             ) {
+                continue;
+            }
+            // A nested checkout is a *different* tree that happens to sit
+            // inside this one — a git worktree, or a clone someone dropped in.
+            // Its sources are policed by its own run of this test, and they are
+            // usually stale, so scanning them reports drift that does not exist
+            // here. Found 2026-09-15: three worktrees under `.claude/worktrees`
+            // failed both guards with six-year-old copies of files this tree
+            // had already fixed, which is exactly the false alarm that teaches
+            // people to skip a red guard.
+            //
+            // `.git` is a directory in a clone and a *file* in a worktree, so
+            // test for either. The workspace root is passed to this function
+            // directly rather than reached through this loop, so it is never
+            // skipped by its own `.git`.
+            if path.join(".git").exists() {
                 continue;
             }
             rust_sources(&path, out);

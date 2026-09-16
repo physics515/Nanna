@@ -100,6 +100,26 @@ pub struct GeneralConfig {
     pub name: String,
     pub log_level: String,
     pub workspace: Option<PathBuf>,
+    /// Where Nanna keeps its data: the Turso database, the tools directory,
+    /// logs, screenshots and generated audio. `None` (the default) means the
+    /// platform location from [`project_dirs`].
+    ///
+    /// This lives in `config.toml` rather than in the data dir itself for the
+    /// obvious reason — a pointer stored inside the thing it points at cannot
+    /// be read before you know where it is. Config and data are separate
+    /// directories under [`project_dirs`], so there is no circularity.
+    ///
+    /// Changing this does **not** move an existing store. The daemon opens
+    /// whatever is at the new path and creates an empty one if nothing is
+    /// there; the old directory is left untouched. Callers that surface this
+    /// setting must say so — silently starting empty looks exactly like data
+    /// loss to the person it happens to.
+    ///
+    /// The daemon's `--data-dir` flag still wins over this value, so an
+    /// isolated run (`NANNA_DEV_DATA_DIR`, a test harness) is never captured by
+    /// the operator's configured location.
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for GeneralConfig {
@@ -108,8 +128,32 @@ impl Default for GeneralConfig {
             name: "Nanna".to_string(),
             log_level: "info".to_string(),
             workspace: None,
+            data_dir: None,
         }
     }
+}
+
+/// Why a proposed data directory was refused.
+///
+/// Separate from [`ConfigError`] because every variant here is shown directly
+/// to a person choosing a folder, so each one has to name the actual problem
+/// and not "IO error". A `ConfigError::Io` tells a user nothing they can act on.
+#[derive(Debug, thiserror::Error)]
+pub enum DataDirError {
+    #[error("No folder was given")]
+    Empty,
+    #[error(
+        "'{0}' is a relative path. Use an absolute path — the daemon and the app \
+         run from different working directories, so a relative path would mean two \
+         different folders."
+    )]
+    NotAbsolute(String),
+    #[error("'{0}' is a file, not a folder")]
+    NotADirectory(String),
+    #[error("'{path}' could not be created: {reason}")]
+    CannotCreate { path: String, reason: String },
+    #[error("'{path}' is not writable: {reason}")]
+    NotWritable { path: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -844,6 +888,149 @@ impl Config {
         Ok(dirs.data_dir().to_path_buf())
     }
 
+    /// The data directory this configuration actually selects.
+    ///
+    /// `[general] data_dir` when the user set one, otherwise the platform
+    /// default. A blank or whitespace-only value counts as unset — a text input
+    /// that submits `""` must not redirect the whole store to a path of `""`,
+    /// which is the same policy [`Self::config_path_override`] applies.
+    ///
+    /// This is the single place the override is honoured, so every consumer
+    /// that already funnels through the daemon's `data_dir` picks it up at
+    /// once. The daemon's `--data-dir` flag is applied *after* this and still
+    /// wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::NoDirFound` only in the fallback case, when no
+    /// override is set and the system data directory cannot be determined.
+    pub fn resolve_data_dir(&self) -> Result<PathBuf, ConfigError> {
+        if let Some(dir) = Self::meaningful_data_dir(self.general.data_dir.as_deref()) {
+            return Ok(dir);
+        }
+        Self::default_data_dir()
+    }
+
+    /// The configured override, if it is one. Pure, so the blank-is-unset
+    /// policy is testable without touching the filesystem or the environment.
+    #[must_use]
+    fn meaningful_data_dir(configured: Option<&Path>) -> Option<PathBuf> {
+        let path = configured?;
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        // A path that is only whitespace is a half-filled form, not a location.
+        if path.to_str().is_some_and(|s| s.trim().is_empty()) {
+            return None;
+        }
+        Some(path.to_path_buf())
+    }
+
+    /// Whether `[general] data_dir` selects somewhere other than the platform
+    /// default — i.e. whether this install has been deliberately relocated.
+    #[must_use]
+    pub fn has_custom_data_dir(&self) -> bool {
+        Self::meaningful_data_dir(self.general.data_dir.as_deref()).is_some()
+    }
+
+    /// The data directory this install selects, read straight off disk
+    /// **without touching the OS keyring**.
+    ///
+    /// Exists for one caller shape: code that must know where data lives
+    /// *before* it is safe to do anything expensive or blocking — the daemon
+    /// resolves its log directory from this at startup, before the tracing
+    /// subscriber is installed.
+    ///
+    /// [`Self::load`] is deliberately not used here. It calls
+    /// [`Self::load_secrets_from_store`], which reads the OS keyring, and a
+    /// keyring read can block on a desktop unlock prompt. A daemon parked on
+    /// that prompt during logging setup would emit **nothing at all** to say
+    /// why, because the subscriber does not exist yet — a silent hang, which
+    /// is the worst possible failure for a background service.
+    ///
+    /// Best-effort by design: a missing, unreadable or malformed config file
+    /// falls through to the platform default rather than failing. The real
+    /// parse error still surfaces moments later, with logging up, when the
+    /// daemon loads the config properly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::NoDirFound` only in the fallback case, when no
+    /// override is readable and the system data directory cannot be determined.
+    pub fn data_dir_from_disk() -> Result<PathBuf, ConfigError> {
+        if let Ok(path) = Self::default_config_path()
+            && let Ok(content) = fs::read_to_string(&path)
+            && let Ok(parsed) = toml::from_str::<Self>(&content)
+            && let Some(dir) = Self::meaningful_data_dir(parsed.general.data_dir.as_deref())
+        {
+            return Ok(dir);
+        }
+        Self::default_data_dir()
+    }
+}
+
+/// Check that `path` can serve as a data directory, creating it if it does not
+/// exist yet, and report precisely why not when it cannot.
+///
+/// Writability is settled by **writing a file**, not by reading permission
+/// bits: `metadata().permissions().readonly()` says nothing useful about a
+/// directory on Windows and ignores ACLs, mount flags and a full disk. The only
+/// honest answer to "can Nanna write here" is to try, which is what the daemon
+/// will do seconds later anyway — better to fail in a dialog the user is
+/// looking at than at the next boot.
+///
+/// Creating the directory is deliberate: picking a not-yet-existing folder in a
+/// file dialog is an ordinary thing to do, and refusing it would send the user
+/// out to a file manager to do it by hand.
+///
+/// # Errors
+///
+/// Returns the [`DataDirError`] naming the specific problem: empty, relative,
+/// an existing file, uncreatable, or unwritable.
+pub fn validate_data_dir(path: &Path) -> Result<(), DataDirError> {
+    let display = path.display().to_string();
+
+    if path.as_os_str().is_empty() || path.to_str().is_some_and(|s| s.trim().is_empty()) {
+        return Err(DataDirError::Empty);
+    }
+
+    // A relative path resolves against the process working directory, and the
+    // GUI-spawned sidecar does not share one with a daemon started from a
+    // terminal — so the same setting would silently mean two different stores.
+    if !path.is_absolute() {
+        return Err(DataDirError::NotAbsolute(display));
+    }
+
+    if path.exists() && !path.is_dir() {
+        return Err(DataDirError::NotADirectory(display));
+    }
+
+    fs::create_dir_all(path).map_err(|e| DataDirError::CannotCreate {
+        path: display.clone(),
+        reason: e.to_string(),
+    })?;
+
+    // Probe with a uniquely-named file so two concurrent probes cannot collide,
+    // and remove it whether or not the write succeeded.
+    let probe = path.join(format!(
+        ".nanna-write-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let write_result = fs::write(&probe, b"nanna");
+    let _ = fs::remove_file(&probe);
+    write_result.map_err(|e| DataDirError::NotWritable {
+        path: display,
+        reason: e.to_string(),
+    })?;
+
+    Ok(())
+}
+
+impl Config {
+
     /// Copy config.toml from the legacy `bot/clawd/Nanna` tree into the
     /// canonical `com/nanna/nanna` tree when the latter does not yet exist.
     /// Best-effort and silent on failure — a failed migrate leaves the user on
@@ -1168,9 +1355,280 @@ webhook_secret = "s3cret"
         assert!(!server.contains("host"), "no host key is written: {server}");
     }
 
+    // -----------------------------------------------------------------
+    // Data storage location (`[general] data_dir`)
+    // -----------------------------------------------------------------
+
     #[test]
-    fn project_dirs_uses_canonical_identity() {
-        let dirs = project_dirs().expect("home dir");
+    fn no_configured_data_dir_means_the_platform_default() {
+        let config = Config::default();
+        assert!(
+            !config.has_custom_data_dir(),
+            "a stock install is not relocated"
+        );
+        assert_eq!(
+            config.resolve_data_dir().ok(),
+            Config::default_data_dir().ok(),
+            "with nothing configured, resolution must agree with the platform default"
+        );
+    }
+
+    #[test]
+    fn a_configured_data_dir_wins_over_the_platform_default() {
+        let mut config = Config::default();
+        let chosen = PathBuf::from(if cfg!(windows) {
+            r"D:\nanna-store"
+        } else {
+            "/srv/nanna-store"
+        });
+        config.general.data_dir = Some(chosen.clone());
+
+        assert!(config.has_custom_data_dir());
+        assert_eq!(
+            config.resolve_data_dir().expect("an explicit path resolves"),
+            chosen,
+            "an explicit override is returned verbatim"
+        );
+        assert_ne!(
+            config.resolve_data_dir().ok(),
+            Config::default_data_dir().ok(),
+            "and it must not collapse back to the platform location"
+        );
+    }
+
+    #[test]
+    fn a_blank_data_dir_is_treated_as_unset() {
+        // A text input that submits "" must not redirect the entire store to a
+        // path of "" — the same policy the config-path override applies.
+        for blank in ["", "   ", "\t\n"] {
+            let mut config = Config::default();
+            config.general.data_dir = Some(PathBuf::from(blank));
+            assert!(
+                !config.has_custom_data_dir(),
+                "{blank:?} is a half-filled form, not a location"
+            );
+            assert_eq!(
+                config.resolve_data_dir().ok(),
+                Config::default_data_dir().ok(),
+                "{blank:?} must fall through to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_written_before_the_field_existed_still_loads() {
+        // Every install that predates this setting has no `data_dir` key, and a
+        // config that refuses to parse is a dead app.
+        let legacy = r#"
+[general]
+name = "Nanna"
+log_level = "info"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.general.name, "Nanna");
+        assert_eq!(
+            config.general.data_dir, None,
+            "an absent key means the platform default, not a panic"
+        );
+        assert!(!config.has_custom_data_dir());
+    }
+
+    #[test]
+    fn a_data_dir_survives_a_save_load_round_trip() {
+        // It is not a secret, so unlike the API keys it must still be on disk
+        // after `save_to` — otherwise the setting silently forgets itself.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let chosen = dir.path().join("store");
+
+        let mut cfg = Config::default();
+        cfg.general.data_dir = Some(chosen.clone());
+        cfg.save_to(&path).unwrap();
+
+        let reloaded: Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("round-trips");
+        assert_eq!(reloaded.general.data_dir, Some(chosen));
+    }
+
+    /// The keyring-free reader must agree with the full config load about
+    /// where data lives — otherwise the daemon writes its logs somewhere other
+    /// than its database, which is precisely the split this reader exists to
+    /// close.
+    ///
+    /// Env mutation is kept in ONE `#[test]` on purpose: `std::env` is
+    /// process-wide and Rust runs tests in threads, so splitting these would
+    /// let a sibling observe the variable mid-mutation.
+    #[test]
+    fn the_keyring_free_reader_agrees_with_a_full_load() {
+        let restore = std::env::var(Config::CONFIG_PATH_ENV).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let chosen = dir.path().join("relocated-store");
+
+        // A config that names a data dir: the reader must find it.
+        let mut cfg = Config::default();
+        cfg.general.data_dir = Some(chosen.clone());
+        cfg.save_to(&cfg_path).unwrap();
+
+        // SAFETY: single-threaded section; the variable is restored below.
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, &cfg_path) };
+        assert_eq!(
+            Config::data_dir_from_disk().ok(),
+            Some(chosen),
+            "the override on disk must be honoured without a keyring read"
+        );
+
+        // A config that names none: fall through to the platform default,
+        // matching `resolve_data_dir` on a stock install.
+        let plain = dir.path().join("plain.toml");
+        Config::default().save_to(&plain).unwrap();
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, &plain) };
+        assert_eq!(
+            Config::data_dir_from_disk().ok(),
+            Config::default_data_dir().ok(),
+            "no override means the platform default, not an empty path"
+        );
+
+        // Malformed TOML must not take the daemon down during logging setup;
+        // the real parse error surfaces later, with logging up.
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "this is not = = valid toml [[[").unwrap();
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, &broken) };
+        assert_eq!(
+            Config::data_dir_from_disk().ok(),
+            Config::default_data_dir().ok(),
+            "an unparseable config falls back rather than failing"
+        );
+
+        // A config file that does not exist at all — a fresh install.
+        unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, dir.path().join("absent.toml")) };
+        assert_eq!(
+            Config::data_dir_from_disk().ok(),
+            Config::default_data_dir().ok(),
+            "a missing config means defaults, not an error"
+        );
+
+        match restore {
+            Some(prev) => unsafe { std::env::set_var(Config::CONFIG_PATH_ENV, prev) },
+            None => unsafe { std::env::remove_var(Config::CONFIG_PATH_ENV) },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Data-directory validation — each refusal names its own reason
+    // -----------------------------------------------------------------
+    #[test]
+    fn validation_accepts_a_writable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        validate_data_dir(dir.path()).expect("a fresh temp dir is writable");
+    }
+
+    #[test]
+    fn validation_creates_a_directory_that_does_not_exist_yet() {
+        // Picking a not-yet-existing folder in a file dialog is ordinary;
+        // refusing it would send the user out to a file manager.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("does").join("not").join("exist");
+        assert!(!fresh.exists());
+
+        validate_data_dir(&fresh).expect("a creatable path is accepted");
+        assert!(fresh.is_dir(), "and it really exists afterwards");
+    }
+
+    #[test]
+    fn validation_leaves_no_probe_file_behind() {
+        // The probe proves writability by writing; if it did not clean up, every
+        // validation would litter the user's chosen folder.
+        let dir = tempfile::tempdir().unwrap();
+        validate_data_dir(dir.path()).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the write probe must clean up after itself, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn validation_refuses_an_empty_path() {
+        for blank in ["", "   "] {
+            let err = validate_data_dir(Path::new(blank))
+                .expect_err("an empty choice is not a location");
+            assert!(
+                matches!(err, DataDirError::Empty),
+                "{blank:?} should report Empty, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_refuses_a_relative_path() {
+        // The GUI sidecar and a terminal daemon have different working
+        // directories, so a relative path means two different stores.
+        let err = validate_data_dir(Path::new("nanna-data"))
+            .expect_err("a relative path is ambiguous and must be refused");
+        assert!(
+            matches!(err, DataDirError::NotAbsolute(_)),
+            "expected NotAbsolute, got {err}"
+        );
+        assert!(
+            err.to_string().contains("absolute"),
+            "the message tells the user what to do instead: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_refuses_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("i-am-a-file.txt");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        let err = validate_data_dir(&file).expect_err("a file cannot hold the store");
+        assert!(
+            matches!(err, DataDirError::NotADirectory(_)),
+            "expected NotADirectory, got {err}"
+        );
+    }
+
+    /// The writability probe must actually probe. A permission bit check would
+    /// pass here on many platforms; only a real write catches it.
+    #[cfg(unix)]
+    #[test]
+    fn validation_refuses_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("read-only");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Does the mode bit actually bite on this host? Running as root (or on a
+        // filesystem that ignores modes) defeats it, and asserting there would
+        // be asserting a falsehood about the code under test.
+        let mode_bits_apply = std::fs::write(locked.join(".probe"), b"x").is_err();
+        let _ = std::fs::remove_file(locked.join(".probe"));
+
+        let result = validate_data_dir(&locked);
+
+        // Restore before asserting so the tempdir can always clean itself up.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        if !mode_bits_apply {
+            return;
+        }
+        let err = result.expect_err("a directory we cannot write to must be refused");
+        assert!(
+            matches!(err, DataDirError::NotWritable { .. }),
+            "expected NotWritable, got {err}"
+        );
+    }
+
+    #[test]
+    fn project_dirs_uses_canonical_identity() {        let dirs = project_dirs().expect("home dir");
         let cfg = dirs.config_dir().to_string_lossy().to_lowercase();
         // Windows: .../nanna/nanna ; Unix: .../nanna
         assert!(

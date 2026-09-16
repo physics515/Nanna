@@ -1907,7 +1907,7 @@ fn hour_share(split: Option<&CacheCreation>, total: u32) -> u32 {
 // ============================================================================
 
 /// Claude Code version to mimic (update as needed)
-const CLAUDE_CODE_VERSION: &str = "2.1.2";
+const CLAUDE_CODE_VERSION: &str = "2.1.273";
 
 /// Claude Code canonical tool names (case-sensitive)
 /// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
