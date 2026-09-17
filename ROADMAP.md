@@ -4832,10 +4832,14 @@ asks permission or restricts her.)*:
             10.3 (2026-08-24) added `can_stop`/`keep_on_stop`, a user-facing stop button that maps
             directly onto `/stop`. Sketch: throttle `MessageDelta`s per session into draft updates
             (text so far, tail-truncated to 4096 with a marker), keep `sendMessage` at `message_end`
-            as today; groups keep "typing…". Open: how the stop press is delivered to the bot (not
-            confirmed in the docs read), and whether the 30 s lifetime needs a refresh during tool
-            calls. Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
-            [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft). Follow-up the same day: a clear —
+            as today; groups keep "typing…". The stop press arrives as an Update with a
+            `stopped_message_generation` field — the listener must add it to `allowed_updates` and
+            route it to the same arm as `/stop`; `keep_on_stop` only keeps the draft briefly, so a
+            stopped answer should be sent as a real message if it is to stay. Open: whether the ~30 s
+            lifetime needs a refresh during long tool calls, and the update's exact payload (not
+            confirmed in the docs read). Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
+            [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft),
+            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html). Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
