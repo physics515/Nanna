@@ -742,618 +742,607 @@ struct ScriptServiceDeps {
     feedback: Option<DreamingSlot>,
 }
 
-
-fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> {
+/// `memory.store` and its `memory.embed` alias: the two names a script can
+/// write a memory under.
+///
+/// Both go through [`tags_with_provenance`], because provenance is what decides
+/// whether a dream cycle may paraphrase the result, and a `remember` that
+/// reached only one of these two entry points would be unprotected.
+fn memory_write_services(
+    mem: &Arc<MemoryService>,
+    workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
+) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
-
-    let ScriptServiceDeps {
-        memory,
-        spawner,
-        session_history,
-        workspace_id,
-        storage,
-        turn_baselines,
-        summarizer,
-        tool_authoring,
-        vision,
-        pdf_ocr,
-        audio,
-        browser_data_dir,
-        screenshot_data_dir,
-        reminders,
-        ask_user,
-        feedback,
-    } = deps;
-    let memory = &memory;
 
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
-    // Task store services (P15): the todo skill's backend. Only available
-    // with storage — the skill falls back to its JSON file otherwise.
-    if let Some(storage) = storage {
-        services.extend(crate::tasks::build_task_services(
-            storage,
-            workspace_id.clone(),
-            turn_baselines,
-        ));
-    }
+    let mem_store = mem.clone();
+    let ws_store = workspace_id.clone();
+    services.insert(
+        "memory.store".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_store.clone();
+            let ws = ws_store.clone();
+            Box::pin(async move {
+                let content = params
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tags: HashMap<String, String> = params
+                    .get("tags")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let importance = crate::numeric::f32_from_f64(
+                    params
+                        .get("importance")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(1.0),
+                );
+                // Provenance is what decides whether a dream cycle may
+                // paraphrase this memory, so it is written at the one place
+                // every `remember` call passes through — both this service
+                // and its `memory.embed` alias.
+                let tags = tags_with_provenance(tags, &params);
+                let workspace = ws.read().await.clone();
+                match mem
+                    .remember_scoped(&content, tags, importance, workspace)
+                    .await
+                {
+                    Ok((id, _)) => Ok(json!({"id": id})),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }),
+    );
 
-    // Memory services
-    if let Some(mem) = memory {
-        let mem_store = mem.clone();
-        let ws_store = workspace_id.clone();
-        services.insert(
-            "memory.store".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_store.clone();
-                let ws = ws_store.clone();
-                Box::pin(async move {
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tags: HashMap<String, String> = params
-                        .get("tags")
-                        .and_then(|v| v.as_object())
-                        .map(|obj| {
-                            obj.iter()
-                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let importance = crate::numeric::f32_from_f64(
-                        params
-                            .get("importance")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(1.0),
-                    );
-                    // Provenance is what decides whether a dream cycle may
-                    // paraphrase this memory, so it is written at the one place
-                    // every `remember` call passes through — both this service
-                    // and its `memory.embed` alias.
-                    let tags = tags_with_provenance(tags, &params);
-                    let workspace = ws.read().await.clone();
-                    match mem
-                        .remember_scoped(&content, tags, importance, workspace)
-                        .await
-                    {
-                        Ok((id, _)) => Ok(json!({"id": id})),
-                        Err(e) => Err(e.to_string()),
-                    }
-                })
-            }),
-        );
+    // Alias: some tool scripts may call memory.embed instead of memory.store
+    let mem_embed = mem.clone();
+    // Last reader of `workspace_id` in this function, so it moves.
+    let ws_embed = workspace_id;
+    services.insert(
+        "memory.embed".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_embed.clone();
+            let ws = ws_embed.clone();
+            Box::pin(async move {
+                let content = params
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tags: HashMap<String, String> = params
+                    .get("tags")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let importance = crate::numeric::f32_from_f64(
+                    params
+                        .get("importance")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(1.0),
+                );
+                // Provenance is what decides whether a dream cycle may
+                // paraphrase this memory, so it is written at the one place
+                // every `remember` call passes through — both this service
+                // and its `memory.embed` alias.
+                let tags = tags_with_provenance(tags, &params);
+                let workspace = ws.read().await.clone();
+                match mem
+                    .remember_scoped(&content, tags, importance, workspace)
+                    .await
+                {
+                    Ok((id, _)) => Ok(json!({"id": id})),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }),
+    );
 
-        let mem_search = mem.clone();
-        let ws_search = workspace_id.clone();
-        services.insert(
-            "memory.search".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_search.clone();
-                let ws = ws_search.clone();
-                Box::pin(async move {
-                    let query = params
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let limit = crate::numeric::usize_saturating(
-                        params
-                            .get("limit")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(10),
-                    );
-                    // Per-result page budget. Storage is unbounded now, so a
-                    // recall that returned whole memories would put an
-                    // arbitrarily large payload into a fixed context window —
-                    // `limit` times over. The default is one embedding chunk's
-                    // worth of text: the same unit the memory was indexed in,
-                    // so a page corresponds to something the retrieval actually
-                    // reasoned about rather than to a round number of bytes.
-                    let page_chars = params
-                        .get("page_chars")
+    services
+}
+
+/// `memory.search`: scoped similarity recall, one page of each hit.
+fn memory_search_services(
+    mem: &Arc<MemoryService>,
+    workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
+) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let mem_search = mem.clone();
+    // The only service registered here, so the binding moves rather than clones.
+    let ws_search = workspace_id;
+    services.insert(
+        "memory.search".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_search.clone();
+            let ws = ws_search.clone();
+            Box::pin(async move {
+                let query = params
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let limit = crate::numeric::usize_saturating(
+                    params
+                        .get("limit")
                         .and_then(serde_json::Value::as_u64)
-                        .map_or(
-                            nanna_memory::MEMORY_CHUNK_TARGET_CHARS,
-                            crate::numeric::usize_saturating,
-                        );
-                    let offset = crate::numeric::usize_saturating(
-                        params
-                            .get("offset")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0),
+                        .unwrap_or(10),
+                );
+                // Per-result page budget. Storage is unbounded now, so a
+                // recall that returned whole memories would put an
+                // arbitrarily large payload into a fixed context window —
+                // `limit` times over. The default is one embedding chunk's
+                // worth of text: the same unit the memory was indexed in,
+                // so a page corresponds to something the retrieval actually
+                // reasoned about rather than to a round number of bytes.
+                let page_chars = params
+                    .get("page_chars")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(
+                        nanna_memory::MEMORY_CHUNK_TARGET_CHARS,
+                        crate::numeric::usize_saturating,
                     );
-                    let workspace = ws.read().await;
-                    match mem.recall_scoped(&query, workspace.as_deref()).await {
-                        Ok(results) => {
-                            let items: Vec<Value> = results
-                                .into_iter()
-                                .take(limit)
-                                .map(|r| {
-                                    let (content, start, total) = r.excerpt(offset, page_chars);
-                                    let returned = content.chars().count();
-                                    json!({
-                                        "id": r.id,
-                                        "content": content,
-                                        "score": r.score,
-                                        // Always present, never inferred from
-                                        // whether `content` "looks" cut off. A
-                                        // page that does not announce itself is
-                                        // indistinguishable from a whole
-                                        // memory, and a reader that believes it
-                                        // has the whole thing stops looking.
-                                        "offset": start,
-                                        "returned": returned,
-                                        "total": total,
-                                        "truncated": start + returned < total,
-                                        "best_chunk": r.best_chunk,
-                                    })
+                let offset = crate::numeric::usize_saturating(
+                    params
+                        .get("offset")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+                let workspace = ws.read().await;
+                match mem.recall_scoped(&query, workspace.as_deref()).await {
+                    Ok(results) => {
+                        let items: Vec<Value> = results
+                            .into_iter()
+                            .take(limit)
+                            .map(|r| {
+                                let (content, start, total) = r.excerpt(offset, page_chars);
+                                let returned = content.chars().count();
+                                json!({
+                                    "id": r.id,
+                                    "content": content,
+                                    "score": r.score,
+                                    // Always present, never inferred from
+                                    // whether `content` "looks" cut off. A
+                                    // page that does not announce itself is
+                                    // indistinguishable from a whole
+                                    // memory, and a reader that believes it
+                                    // has the whole thing stops looking.
+                                    "offset": start,
+                                    "returned": returned,
+                                    "total": total,
+                                    "truncated": start + returned < total,
+                                    "best_chunk": r.best_chunk,
                                 })
-                                .collect();
-                            Ok(Value::Array(items))
-                        }
-                        Err(e) => {
-                            // If embedding is not configured, return empty results
-                            // instead of an error so the agent can continue gracefully
-                            let msg = e.to_string();
-                            if msg.contains("embedding") || msg.contains("No embedding function") {
-                                tracing::debug!("Memory search skipped: {}", msg);
-                                Ok(Value::Array(vec![]))
-                            } else {
-                                Err(msg)
-                            }
-                        }
-                    }
-                })
-            }),
-        );
-
-        // Alias: some tool scripts may call memory.embed instead of memory.store
-        let mem_embed = mem.clone();
-        // Last reader of `workspace_id` in this function, so it moves.
-        let ws_embed = workspace_id;
-        services.insert(
-            "memory.embed".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_embed.clone();
-                let ws = ws_embed.clone();
-                Box::pin(async move {
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tags: HashMap<String, String> = params
-                        .get("tags")
-                        .and_then(|v| v.as_object())
-                        .map(|obj| {
-                            obj.iter()
-                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let importance = crate::numeric::f32_from_f64(
-                        params
-                            .get("importance")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(1.0),
-                    );
-                    // Provenance is what decides whether a dream cycle may
-                    // paraphrase this memory, so it is written at the one place
-                    // every `remember` call passes through — both this service
-                    // and its `memory.embed` alias.
-                    let tags = tags_with_provenance(tags, &params);
-                    let workspace = ws.read().await.clone();
-                    match mem
-                        .remember_scoped(&content, tags, importance, workspace)
-                        .await
-                    {
-                        Ok((id, _)) => Ok(json!({"id": id})),
-                        Err(e) => Err(e.to_string()),
-                    }
-                })
-            }),
-        );
-
-        let mem_delete = mem.clone();
-        services.insert(
-            "memory.delete".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_delete.clone();
-                Box::pin(async move {
-                    let id = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    match mem.forget(&id).await {
-                        Ok(()) => Ok(json!({"deleted": true})),
-                        Err(e) => Err(e.to_string()),
-                    }
-                })
-            }),
-        );
-
-        let mem_list = mem.clone();
-        services.insert(
-            "memory.list".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_list.clone();
-                Box::pin(async move {
-                    let limit = opt_count(&params, "limit")?.unwrap_or(20);
-                    let all = mem.list_all().await;
-                    let items: Vec<Value> = all
-                        .into_iter()
-                        .take(limit)
-                        .map(|e| json!({"id": e.id, "content": e.content, "weight": e.weight}))
-                        .collect();
-                    Ok(Value::Array(items))
-                })
-            }),
-        );
-    }
-
-    // memory.get — read ONE memory by id, with a byte range.
-    //
-    // The store had only "search by similarity" and "list everything", which
-    // is why a tool result kept in memory could not be pointed at from
-    // context: a stub naming an id had no way to dereference it. This is the
-    // first piece of a file-like surface (read a range, later append/replace)
-    // so "the full result lives in memory, a stub lives in context" actually
-    // has a retrieval path.
-    if let Some(mem) = memory {
-        let mem_get = mem.clone();
-        let feedback_for_get = feedback;
-        services.insert(
-            "memory.get".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_get.clone();
-                let feedback = feedback_for_get.clone();
-                Box::pin(async move {
-                    let id = req_text(&params, "id")?;
-                    let offset = opt_count(&params, "offset")?.unwrap_or(0);
-                    // Default cap keeps a huge tool result from re-flooding
-                    // the context the stub existed to protect.
-                    let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
-
-                    let entry = resolve_memory_handle(&mem, &id).await?;
-                    let content = assemble_handle_content(&mem, &entry).await;
-                    if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
-                        let served = served_row_ids(&mem, &entry).await;
-                        for (memory_id, signal) in recall_feedback(offset, &served) {
-                            dreaming.record_feedback(&memory_id, signal).await;
-                        }
-                    }
-
-                    let total = content.len();
-                    // Never split a UTF-8 char, and index the same text the
-                    // range was measured against: every field below reports on
-                    // the assembled content, so that is what the page cuts.
-                    let (s, e) = handle_page_range(&content, offset, limit);
-
-                    // If the handle forwarded, SAY SO. Silently returning a
-                    // consolidated narration where raw output was asked for
-                    // is how a model concludes its data was corrupted; the
-                    // note explains that dreaming folded the original in and
-                    // that nothing was lost, only generalised.
-                    let forwarded = entry.id != id
-                        && entry.metadata.get("source_id").is_none_or(|s| s != &id);
-                    let mut out = json!({
-                        "id": entry.id,
-                        "content": &content[s..e],
-                        "offset": s,
-                        "returned": e - s,
-                        "total": total,
-                        "truncated": e < total,
-                    });
-                    if forwarded {
-                        out["forwarded_from"] = json!(id);
-                        out["note"] = json!(format!(
-                            "'{id}' was consolidated during dreaming; this is the memory that \
-                             absorbed it ({}). The original text was generalised into this one, \
-                             not deleted.",
-                            entry.id
-                        ));
-                    }
-                    Ok(out)
-                })
-            }),
-        );
-    }
-
-    // memory.append / memory.replace — the write half of the file-like
-    // surface. Without them a memory can only be created or forgotten, so a
-    // record that has become WRONG (an action narrated as a fact, e.g.
-    // "creating minidb.sh at D:\…" nine hours after that file stopped
-    // existing) can only be duplicated or destroyed, never corrected. Append
-    // gives a running record per subject instead of N disconnected islands.
-    if let Some(mem) = memory {
-        let mem_append = mem.clone();
-        services.insert(
-            "memory.append".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_append.clone();
-                Box::pin(async move {
-                    let handle = req_text(&params, "id")?;
-                    let addition = req_text(&params, "content")?;
-                    let entry = resolve_memory_handle(&mem, &handle).await?;
-                    let combined = format!("{}\n{addition}", entry.content);
-                    mem.update_content(&entry.id, &combined)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok(json!({ "id": entry.id, "total": combined.len() }))
-                })
-            }),
-        );
-
-        let mem_replace = mem.clone();
-        services.insert(
-            "memory.replace".to_string(),
-            Arc::new(move |params: Value| {
-                let mem = mem_replace.clone();
-                Box::pin(async move {
-                    let handle = req_text(&params, "id")?;
-                    let old = req_text(&params, "old")?;
-                    let new = opt_text(&params, "new")?.unwrap_or_default();
-                    let entry = resolve_memory_handle(&mem, &handle).await?;
-                    let hits = entry.content.matches(&old).count();
-                    if hits == 0 {
-                        // Same contract as edit_file: refuse rather than
-                        // guess, and say what is actually there.
-                        let preview: String = entry.content.chars().take(160).collect();
-                        return Err(format!(
-                            "'{old}' does not appear in memory {}. Nothing was changed. It \
-                             begins: {preview}",
-                            entry.id
-                        ));
-                    }
-                    let updated = entry.content.replace(&old, &new);
-                    mem.update_content(&entry.id, &updated)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok(json!({
-                        "id": entry.id,
-                        "replaced": hits,
-                        "total": updated.len(),
-                    }))
-                })
-            }),
-        );
-    }
-
-    // memory.summarize — concatenate texts and summarize them with the
-    // summarization model chain. The `day_dream` tool is the model-facing
-    // half: dreaming already does this on a schedule, and this lets the model
-    // ask for it deliberately when it notices related fragments piling up.
-    if let Some((router, summarizer_config)) = summarizer {
-        services.insert(
-            "memory.summarize".to_string(),
-            Arc::new(move |params: Value| {
-                let router = router.clone();
-                let summarizer_config = Arc::clone(&summarizer_config);
-                Box::pin(async move {
-                    let texts: Vec<String> = params
-                        .get("texts")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if texts.is_empty() {
-                        return Err("texts must be a non-empty array".to_string());
-                    }
-                    let joined = texts.join("
-
----
-
-");
-                    // Resolved per call: whichever summarization list the
-                    // user has set right now is the one that answers.
-                    let models = {
-                        let live = summarizer_config.read().await;
-                        crate::dream_summarizer::summarization_models(
-                            &live.summarization_priority,
-                            std::slice::from_ref(&live.model),
-                        )
-                    };
-                    let summarize =
-                        crate::dream_summarizer::summarize_with_failover(router, models);
-                    let summary = summarize(joined).await?;
-                    Ok(json!({ "summary": summary }))
-                })
-            }),
-        );
-    }
-
-    // Agent spawner service
-    if let Some(spawner) = spawner {
-        services.insert(
-            "agent.spawn".to_string(),
-            Arc::new(move |params: Value| {
-                let spawner = spawner.clone();
-                Box::pin(async move {
-                    let prompt = params
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let description = params
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("sub-task")
-                        .to_string();
-                    let max_iterations = params
-                        .get("max_iterations")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(crate::numeric::usize_saturating);
-                    match spawner.spawn(&prompt, &description, max_iterations).await {
-                        Ok(result) => Ok(json!({
-                            "text": result.text,
-                            "iterations": result.iterations,
-                            "tool_calls": result.tool_calls,
-                            "model": result.model,
-                        })),
-                        Err(e) => Err(e),
-                    }
-                })
-            }),
-        );
-    }
-
-    // Embedded Python interpreter (no system Python required)
-    {
-        use nanna_scripting::python::PythonEngine;
-        let python_engine = Arc::new(PythonEngine::new());
-        services.insert(
-            "python.exec".to_string(),
-            Arc::new(move |params: Value| {
-                let engine = python_engine.clone();
-                Box::pin(async move {
-                    let code = params
-                        .get("code")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let timeout = params
-                        .get("timeout")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(30);
-                    let workdir = params
-                        .get("workdir")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-
-                    match engine.execute(&code, workdir.as_deref(), timeout).await {
-                        Ok(result) => Ok(json!({
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                            "success": result.success,
-                            "error": result.error,
-                            "duration_ms": result.duration_ms,
-                        })),
-                        Err(e) => Err(e.to_string()),
-                    }
-                })
-            }),
-        );
-    }
-
-    // Session history service — returns recent messages from the current session.
-    // The SharedSessionHistory is populated before each agent run.
-    {
-        let history = session_history;
-        services.insert(
-            "session.history".to_string(),
-            Arc::new(move |params: Value| {
-                let history = history.clone();
-                Box::pin(async move {
-                    let limit = crate::numeric::usize_saturating(
-                        params
-                            .get("limit")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(20),
-                    );
-                    let history = history.read().await;
-                    let start = if history.len() > limit {
-                        history.len() - limit
-                    } else {
-                        0
-                    };
-                    let messages: Vec<Value> = history[start..]
-                        .iter()
-                        .map(|msg| {
-                            json!({
-                                "role": format!("{:?}", msg.role).to_lowercase(),
-                                "content": msg.content,
-                                "timestamp": msg.timestamp.to_rfc3339(),
                             })
+                            .collect();
+                        Ok(Value::Array(items))
+                    }
+                    Err(e) => {
+                        // If embedding is not configured, return empty results
+                        // instead of an error so the agent can continue gracefully
+                        let msg = e.to_string();
+                        if msg.contains("embedding") || msg.contains("No embedding function") {
+                            tracing::debug!("Memory search skipped: {}", msg);
+                            Ok(Value::Array(vec![]))
+                        } else {
+                            Err(msg)
+                        }
+                    }
+                }
+            })
+        }),
+    );
+
+    services
+}
+
+/// `memory.delete` and `memory.list`: the unscoped housekeeping pair.
+fn memory_index_services(mem: &Arc<MemoryService>) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let mem_delete = mem.clone();
+    services.insert(
+        "memory.delete".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_delete.clone();
+            Box::pin(async move {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match mem.forget(&id).await {
+                    Ok(()) => Ok(json!({"deleted": true})),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }),
+    );
+
+    let mem_list = mem.clone();
+    services.insert(
+        "memory.list".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_list.clone();
+            Box::pin(async move {
+                let limit = opt_count(&params, "limit")?.unwrap_or(20);
+                let all = mem.list_all().await;
+                let items: Vec<Value> = all
+                    .into_iter()
+                    .take(limit)
+                    .map(|e| json!({"id": e.id, "content": e.content, "weight": e.weight}))
+                    .collect();
+                Ok(Value::Array(items))
+            })
+        }),
+    );
+
+    services
+}
+
+/// `memory.get`: read ONE memory by id, with a byte range.
+///
+/// The store had only "search by similarity" and "list everything", which is
+/// why a tool result kept in memory could not be pointed at from context: a
+/// stub naming an id had no way to dereference it. This is the first piece of a
+/// file-like surface (read a range, later append/replace) so "the full result
+/// lives in memory, a stub lives in context" actually has a retrieval path.
+fn memory_read_services(
+    mem: &Arc<MemoryService>,
+    feedback: Option<DreamingSlot>,
+) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let mem_get = mem.clone();
+    let feedback_for_get = feedback;
+    services.insert(
+        "memory.get".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_get.clone();
+            let feedback = feedback_for_get.clone();
+            Box::pin(async move {
+                let id = req_text(&params, "id")?;
+                let offset = opt_count(&params, "offset")?.unwrap_or(0);
+                // Default cap keeps a huge tool result from re-flooding
+                // the context the stub existed to protect.
+                let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
+
+                let entry = resolve_memory_handle(&mem, &id).await?;
+                let content = assemble_handle_content(&mem, &entry).await;
+                if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
+                    let served = served_row_ids(&mem, &entry).await;
+                    for (memory_id, signal) in recall_feedback(offset, &served) {
+                        dreaming.record_feedback(&memory_id, signal).await;
+                    }
+                }
+
+                let total = content.len();
+                // Never split a UTF-8 char, and index the same text the
+                // range was measured against: every field below reports on
+                // the assembled content, so that is what the page cuts.
+                let (s, e) = handle_page_range(&content, offset, limit);
+
+                // If the handle forwarded, SAY SO. Silently returning a
+                // consolidated narration where raw output was asked for
+                // is how a model concludes its data was corrupted; the
+                // note explains that dreaming folded the original in and
+                // that nothing was lost, only generalised.
+                let forwarded = entry.id != id
+                    && entry.metadata.get("source_id").is_none_or(|s| s != &id);
+                let mut out = json!({
+                    "id": entry.id,
+                    "content": &content[s..e],
+                    "offset": s,
+                    "returned": e - s,
+                    "total": total,
+                    "truncated": e < total,
+                });
+                if forwarded {
+                    out["forwarded_from"] = json!(id);
+                    out["note"] = json!(format!(
+                        "'{id}' was consolidated during dreaming; this is the memory that \
+                         absorbed it ({}). The original text was generalised into this one, \
+                         not deleted.",
+                        entry.id
+                    ));
+                }
+                Ok(out)
+            })
+        }),
+    );
+
+    services
+}
+
+/// `memory.append` / `memory.replace`: the write half of the file-like surface.
+///
+/// Without them a memory can only be created or forgotten, so a record that has
+/// become WRONG (an action narrated as a fact, e.g. "creating minidb.sh at
+/// D:\…" nine hours after that file stopped existing) can only be duplicated or
+/// destroyed, never corrected. Append gives a running record per subject instead
+/// of N disconnected islands.
+fn memory_edit_services(mem: &Arc<MemoryService>) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let mem_append = mem.clone();
+    services.insert(
+        "memory.append".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_append.clone();
+            Box::pin(async move {
+                let handle = req_text(&params, "id")?;
+                let addition = req_text(&params, "content")?;
+                let entry = resolve_memory_handle(&mem, &handle).await?;
+                let combined = format!("{}\n{addition}", entry.content);
+                mem.update_content(&entry.id, &combined)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({ "id": entry.id, "total": combined.len() }))
+            })
+        }),
+    );
+
+    let mem_replace = mem.clone();
+    services.insert(
+        "memory.replace".to_string(),
+        Arc::new(move |params: Value| {
+            let mem = mem_replace.clone();
+            Box::pin(async move {
+                let handle = req_text(&params, "id")?;
+                let old = req_text(&params, "old")?;
+                let new = opt_text(&params, "new")?.unwrap_or_default();
+                let entry = resolve_memory_handle(&mem, &handle).await?;
+                let hits = entry.content.matches(&old).count();
+                if hits == 0 {
+                    // Same contract as edit_file: refuse rather than
+                    // guess, and say what is actually there.
+                    let preview: String = entry.content.chars().take(160).collect();
+                    return Err(format!(
+                        "'{old}' does not appear in memory {}. Nothing was changed. It \
+                         begins: {preview}",
+                        entry.id
+                    ));
+                }
+                let updated = entry.content.replace(&old, &new);
+                mem.update_content(&entry.id, &updated)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "id": entry.id,
+                    "replaced": hits,
+                    "total": updated.len(),
+                }))
+            })
+        }),
+    );
+
+    services
+}
+
+/// `memory.summarize`: concatenate texts and summarize them with the
+/// summarization model chain.
+///
+/// The `day_dream` tool is the model-facing half: dreaming already does this on
+/// a schedule, and this lets the model ask for it deliberately when it notices
+/// related fragments piling up.
+fn memory_summarize_services(
+    router: Arc<crate::llm_router::LlmRouter>,
+    summarizer_config: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
+) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    services.insert(
+        "memory.summarize".to_string(),
+        Arc::new(move |params: Value| {
+            let router = router.clone();
+            let summarizer_config = Arc::clone(&summarizer_config);
+            Box::pin(async move {
+                let texts: Vec<String> = params
+                    .get("texts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if texts.is_empty() {
+                    return Err("texts must be a non-empty array".to_string());
+                }
+                let joined = texts.join("\n\n---\n\n");
+                // Resolved per call: whichever summarization list the
+                // user has set right now is the one that answers.
+                let models = {
+                    let live = summarizer_config.read().await;
+                    crate::dream_summarizer::summarization_models(
+                        &live.summarization_priority,
+                        std::slice::from_ref(&live.model),
+                    )
+                };
+                let summarize =
+                    crate::dream_summarizer::summarize_with_failover(router, models);
+                let summary = summarize(joined).await?;
+                Ok(json!({ "summary": summary }))
+            })
+        }),
+    );
+
+    services
+}
+
+/// `agent.spawn`: hand a prompt to a sub-agent and wait for its final text.
+fn agent_spawn_services(
+    spawner: Arc<dyn AgentSpawner + Send + Sync>,
+) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    services.insert(
+        "agent.spawn".to_string(),
+        Arc::new(move |params: Value| {
+            let spawner = spawner.clone();
+            Box::pin(async move {
+                let prompt = params
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = params
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("sub-task")
+                    .to_string();
+                let max_iterations = params
+                    .get("max_iterations")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(crate::numeric::usize_saturating);
+                match spawner.spawn(&prompt, &description, max_iterations).await {
+                    Ok(result) => Ok(json!({
+                        "text": result.text,
+                        "iterations": result.iterations,
+                        "tool_calls": result.tool_calls,
+                        "model": result.model,
+                    })),
+                    Err(e) => Err(e),
+                }
+            })
+        }),
+    );
+
+    services
+}
+
+/// `python.exec`: the embedded interpreter (no system Python required).
+fn python_exec_services() -> HashMap<String, ServiceFn> {
+    use nanna_scripting::python::PythonEngine;
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let python_engine = Arc::new(PythonEngine::new());
+    services.insert(
+        "python.exec".to_string(),
+        Arc::new(move |params: Value| {
+            let engine = python_engine.clone();
+            Box::pin(async move {
+                let code = params
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let timeout = params
+                    .get("timeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(30);
+                let workdir = params
+                    .get("workdir")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                match engine.execute(&code, workdir.as_deref(), timeout).await {
+                    Ok(result) => Ok(json!({
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "success": result.success,
+                        "error": result.error,
+                        "duration_ms": result.duration_ms,
+                    })),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }),
+    );
+
+    services
+}
+
+/// `session.history`: recent messages from the current session.
+///
+/// The [`SharedSessionHistory`] is populated before each agent run.
+fn session_history_services(session_history: SharedSessionHistory) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    let history = session_history;
+    services.insert(
+        "session.history".to_string(),
+        Arc::new(move |params: Value| {
+            let history = history.clone();
+            Box::pin(async move {
+                let limit = crate::numeric::usize_saturating(
+                    params
+                        .get("limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(20),
+                );
+                let history = history.read().await;
+                let start = if history.len() > limit {
+                    history.len() - limit
+                } else {
+                    0
+                };
+                let messages: Vec<Value> = history[start..]
+                    .iter()
+                    .map(|msg| {
+                        json!({
+                            "role": format!("{:?}", msg.role).to_lowercase(),
+                            "content": msg.content,
+                            "timestamp": msg.timestamp.to_rfc3339(),
                         })
-                        .collect();
-                    // The snapshot is taken; nothing below reads the history, so
-                    // the read guard is released before the JSON is built.
-                    drop(history);
-                    Ok(json!(messages))
-                })
-            }),
-        );
-    }
+                    })
+                    .collect();
+                // The snapshot is taken; nothing below reads the history, so
+                // the read guard is released before the JSON is built.
+                drop(history);
+                Ok(json!(messages))
+            })
+        }),
+    );
 
-    // File history. The bridge snapshots before every script write once a
-    // store is installed; these let the `file_history` skill list and restore.
-    services.extend(crate::file_history_service::build_file_history_services(
-        nanna_scripting::file_history::installed(),
-    ));
+    services
+}
 
-    // Clarifying questions, answered by the user's next message to a live turn.
-    if let Some(deps) = ask_user {
-        services.extend(crate::ask_user_service::build_ask_user_services(deps));
-    }
+/// `pdf.read`: text extraction, with an OCR fallback for image-only pages.
+///
+/// The bundled `read_pdf` skill declares `requires: ["pdf.read"]` and no such
+/// service existed, so the tool loaded, advertised itself to the model, and
+/// failed at call time with "PDF reading service not available". The Rust
+/// extractor behind it has been complete and tested the whole time; only this
+/// registration was missing.
+///
+/// OCR fallback for image-only pages, wired 2026-09-15 to the same vision model
+/// `vision.analyze` uses. The thing that held it back for two runs was not the
+/// pipeline but the ambiguity: a half-wired OCR path is indistinguishable from a
+/// scanned document that genuinely has no text. So the response reports the
+/// outcome as one of four named cases rather than returning an empty string for
+/// all of them.
+fn pdf_read_services(pdf_ocr: Option<nanna_tools::PdfOcrFn>) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
 
-    // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
-    // these; the scheduler is built after this map, so it arrives by slot.
-    if let Some((scheduler, sessions)) = reminders {
-        services.extend(crate::reminder_service::build_reminder_services(
-            scheduler, sessions,
-        ));
-    }
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
-    // Desktop capture. The `screenshot` skill declares this; the Rust tool
-    // behind it was a stub, so this is the implementation, not a registration.
-    if let Some(data_dir) = screenshot_data_dir {
-        services.extend(crate::screenshot_service::build_screenshot_services(
-            &data_dir,
-        ));
-    }
-
-    // Browser. The four browser_* skills declare these; nanna-browser was
-    // complete and the `browser` feature was enabled nowhere.
-    if let Some(data_dir) = browser_data_dir {
-        services.extend(crate::browser_service::build_browser_services(&data_dir));
-    }
-
-    // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
-    // clients behind them were complete and reachable from nowhere.
-    if let Some((openai_api_key, data_dir)) = audio {
-        services.extend(crate::audio_service::build_audio_services(
-            openai_api_key.as_deref(),
-            &data_dir,
-        ));
-    }
-
-    // Vision. The bundled `analyze_image`, `describe_image` and `ocr` skills all
-    // declare `vision.analyze`, and nothing registered it.
-    if let Some((router, models)) = vision {
-        services.extend(crate::vision_service::build_vision_services(
-            &router, &models,
-        ));
-    }
-
-    // Tool authoring. The bundled `create_tool`, `edit_tool` and
-    // `list_user_tools` skills declare `tools.create` / `tools.update` /
-    // `tools.list`, and nothing registered any of them, so all three were
-    // withheld at every boot (found by `skill_services_are_registered.rs`).
-    if let Some((tools_dir, registry, slot)) = tool_authoring {
-        services.extend(crate::tool_authoring::build_tool_authoring_services(
-            tools_dir, registry, slot,
-        ));
-    }
-
-    // PDF text extraction. The bundled `read_pdf` skill declares
-    // `requires: ["pdf.read"]` and no such service existed, so the tool
-    // loaded, advertised itself to the model, and failed at call time with
-    // "PDF reading service not available". The Rust extractor behind it has
-    // been complete and tested the whole time; only this registration was
-    // missing.
-    //
-    // OCR fallback for image-only pages, wired 2026-09-15 to the same vision
-    // model `vision.analyze` uses. The thing that held it back for two runs was
-    // not the pipeline but the ambiguity: a half-wired OCR path is
-    // indistinguishable from a scanned document that genuinely has no text. So
-    // the response reports the outcome as one of four named cases rather than
-    // returning an empty string for all of them.
     let pdf_ocr_fn = pdf_ocr;
     services.insert(
         "pdf.read".to_string(),
@@ -1452,6 +1441,167 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
             })
         }),
     );
+
+    services
+}
+
+fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> {
+    let ScriptServiceDeps {
+        memory,
+        spawner,
+        session_history,
+        workspace_id,
+        storage,
+        turn_baselines,
+        summarizer,
+        tool_authoring,
+        vision,
+        pdf_ocr,
+        audio,
+        browser_data_dir,
+        screenshot_data_dir,
+        reminders,
+        ask_user,
+        feedback,
+    } = deps;
+    let memory = &memory;
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    // Task store services (P15): the todo skill's backend. Only available
+    // with storage — the skill falls back to its JSON file otherwise.
+    if let Some(storage) = storage {
+        services.extend(crate::tasks::build_task_services(
+            storage,
+            workspace_id.clone(),
+            turn_baselines,
+        ));
+    }
+
+    // Memory services
+    if let Some(mem) = memory {
+        services.extend(memory_write_services(mem, workspace_id.clone()));
+        // Last reader of `workspace_id` in this function, so it moves.
+        services.extend(memory_search_services(mem, workspace_id));
+        services.extend(memory_index_services(mem));
+    }
+
+    // memory.get — read ONE memory by id, with a byte range.
+    //
+    // The store had only "search by similarity" and "list everything", which
+    // is why a tool result kept in memory could not be pointed at from
+    // context: a stub naming an id had no way to dereference it. This is the
+    // first piece of a file-like surface (read a range, later append/replace)
+    // so "the full result lives in memory, a stub lives in context" actually
+    // has a retrieval path.
+    if let Some(mem) = memory {
+        services.extend(memory_read_services(mem, feedback));
+    }
+
+    // memory.append / memory.replace — the write half of the file-like
+    // surface. Without them a memory can only be created or forgotten, so a
+    // record that has become WRONG (an action narrated as a fact, e.g.
+    // "creating minidb.sh at D:\…" nine hours after that file stopped
+    // existing) can only be duplicated or destroyed, never corrected. Append
+    // gives a running record per subject instead of N disconnected islands.
+    if let Some(mem) = memory {
+        services.extend(memory_edit_services(mem));
+    }
+
+    // memory.summarize — concatenate texts and summarize them with the
+    // summarization model chain. The `day_dream` tool is the model-facing
+    // half: dreaming already does this on a schedule, and this lets the model
+    // ask for it deliberately when it notices related fragments piling up.
+    if let Some((router, summarizer_config)) = summarizer {
+        services.extend(memory_summarize_services(router, summarizer_config));
+    }
+
+    // Agent spawner service
+    if let Some(spawner) = spawner {
+        services.extend(agent_spawn_services(spawner));
+    }
+
+    // Embedded Python interpreter (no system Python required)
+    services.extend(python_exec_services());
+
+    // Session history service — returns recent messages from the current session.
+    // The SharedSessionHistory is populated before each agent run.
+    services.extend(session_history_services(session_history));
+
+    // File history. The bridge snapshots before every script write once a
+    // store is installed; these let the `file_history` skill list and restore.
+    services.extend(crate::file_history_service::build_file_history_services(
+        nanna_scripting::file_history::installed(),
+    ));
+
+    // Clarifying questions, answered by the user's next message to a live turn.
+    if let Some(deps) = ask_user {
+        services.extend(crate::ask_user_service::build_ask_user_services(deps));
+    }
+
+    // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
+    // these; the scheduler is built after this map, so it arrives by slot.
+    if let Some((scheduler, sessions)) = reminders {
+        services.extend(crate::reminder_service::build_reminder_services(
+            scheduler, sessions,
+        ));
+    }
+
+    // Desktop capture. The `screenshot` skill declares this; the Rust tool
+    // behind it was a stub, so this is the implementation, not a registration.
+    if let Some(data_dir) = screenshot_data_dir {
+        services.extend(crate::screenshot_service::build_screenshot_services(
+            &data_dir,
+        ));
+    }
+
+    // Browser. The four browser_* skills declare these; nanna-browser was
+    // complete and the `browser` feature was enabled nowhere.
+    if let Some(data_dir) = browser_data_dir {
+        services.extend(crate::browser_service::build_browser_services(&data_dir));
+    }
+
+    // Audio. `text_to_speech` and `transcribe` declare these; the OpenAI
+    // clients behind them were complete and reachable from nowhere.
+    if let Some((openai_api_key, data_dir)) = audio {
+        services.extend(crate::audio_service::build_audio_services(
+            openai_api_key.as_deref(),
+            &data_dir,
+        ));
+    }
+
+    // Vision. The bundled `analyze_image`, `describe_image` and `ocr` skills all
+    // declare `vision.analyze`, and nothing registered it.
+    if let Some((router, models)) = vision {
+        services.extend(crate::vision_service::build_vision_services(
+            &router, &models,
+        ));
+    }
+
+    // Tool authoring. The bundled `create_tool`, `edit_tool` and
+    // `list_user_tools` skills declare `tools.create` / `tools.update` /
+    // `tools.list`, and nothing registered any of them, so all three were
+    // withheld at every boot (found by `skill_services_are_registered.rs`).
+    if let Some((tools_dir, registry, slot)) = tool_authoring {
+        services.extend(crate::tool_authoring::build_tool_authoring_services(
+            tools_dir, registry, slot,
+        ));
+    }
+
+    // PDF text extraction. The bundled `read_pdf` skill declares
+    // `requires: ["pdf.read"]` and no such service existed, so the tool
+    // loaded, advertised itself to the model, and failed at call time with
+    // "PDF reading service not available". The Rust extractor behind it has
+    // been complete and tested the whole time; only this registration was
+    // missing.
+    //
+    // OCR fallback for image-only pages, wired 2026-09-15 to the same vision
+    // model `vision.analyze` uses. The thing that held it back for two runs was
+    // not the pipeline but the ambiguity: a half-wired OCR path is
+    // indistinguishable from a scanned document that genuinely has no text. So
+    // the response reports the outcome as one of four named cases rather than
+    // returning an empty string for all of them.
+    services.extend(pdf_read_services(pdf_ocr));
 
     services
 }
@@ -4818,53 +4968,72 @@ impl DaemonBuilder {
         // the control-plane reload path so both derive providers identically)
         builder.config.llm = LlmConfig::from_nanna(&config);
 
+        // Split into one applier per `[section]` of the config file, called in
+        // the order the sections used to appear inline. Each is a pure
+        // field-for-field copy, so the sequence carries no dependency — but it
+        // is kept anyway, because `apply_data_dir` logs before
+        // `apply_agent_settings` does and a reordered boot log is a worse
+        // diff to read than a reordered function.
+        builder.apply_memory_settings(&config);
+        builder.apply_scheduler_settings(&config);
+        builder.apply_data_dir(&config);
+        builder.apply_agent_settings(&config);
+        builder.apply_tool_and_channel_settings(&config);
+        builder.log_resolved_config();
+
+        Ok(builder)
+    }
+
+    /// `[memory]`: the embedding binding, the dream cycle's compression and
+    /// idle settings, the vision-model list and the MCP server list.
+    fn apply_memory_settings(&mut self, config: &nanna_config::Config) {
         // Set embedding configuration from Nanna memory config
-        builder
-            .embedding
+        self.embedding
             .provider
             .clone_from(&config.memory.embedding_provider);
-        builder
-            .embedding
-            .model
-            .clone_from(&config.memory.embedding_model);
-        builder
-            .embedding
+        self.embedding.model.clone_from(&config.memory.embedding_model);
+        self.embedding
             .ollama_host
             .clone_from(&config.memory.ollama_host);
-        builder
-            .embedding
+        self.embedding
             .priority
             .clone_from(&config.memory.embedding_priority);
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
-        builder.config.memory_max_compression_ratio = config.memory.max_compression_ratio;
-        builder.config.memory_min_remaining_memories = config.memory.min_remaining_memories;
+        self.config.memory_max_compression_ratio = config.memory.max_compression_ratio;
+        self.config.memory_min_remaining_memories = config.memory.min_remaining_memories;
         // Idle gate for the scheduled dream cycle (defers dreaming to a lull).
-        builder.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
-        builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
+        self.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
+        self.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
         // `ocr_model_priority` already means "vision-capable models, in order";
         // `vision.analyze` reads it rather than adding a second list.
-        builder
-            .config
+        self.config
             .vision_model_priority
             .clone_from(&config.memory.ocr_model_priority);
-        builder.config.mcp = config.mcp.clone();
+        self.config.mcp = config.mcp.clone();
+    }
 
+    /// `[scheduler]`, plus the webhook signature secrets that live under
+    /// `[channels]` but are only ever read by the webhook server.
+    fn apply_scheduler_settings(&mut self, config: &nanna_config::Config) {
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
         // unconditional — which is how it kept stealing the local model's one
         // slot mid-chat.
-        builder.config.scheduler.enabled = config.scheduler.enabled;
-        builder.config.scheduler.heartbeat_enabled = config.scheduler.heartbeat_enabled;
-        builder.config.heartbeat_interval_secs = config.scheduler.heartbeat_interval_secs;
+        self.config.scheduler.enabled = config.scheduler.enabled;
+        self.config.scheduler.heartbeat_enabled = config.scheduler.heartbeat_enabled;
+        self.config.heartbeat_interval_secs = config.scheduler.heartbeat_interval_secs;
 
         // Wire webhook signature-verification secrets from the user's channel
         // config. Without this the inbound webhook server always ran with the
         // all-None default, so every provider's verification silently no-op'd —
         // the daemon never received the secrets it checks against.
-        apply_channel_webhook_secrets(&mut builder.config.webhook, &config.channels);
+        apply_channel_webhook_secrets(&mut self.config.webhook, &config.channels);
+    }
 
+    /// `[general] data_dir`, and the legacy `memories.json` path under it.
+    fn apply_data_dir(&mut self, config: &nanna_config::Config) {
         // Set data directory from Nanna config (same location as GUI).
         //
         // `resolve_data_dir` — not `default_data_dir`: the latter ignores
@@ -4889,49 +5058,48 @@ impl DaemonBuilder {
                 } else {
                     info!("Using Nanna data directory: {:?}", data_dir);
                 }
-                builder.config.data_dir.clone_from(&data_dir);
-                builder.memory_path = Some(data_dir.join("memories.json"));
+                self.config.data_dir.clone_from(&data_dir);
+                self.memory_path = Some(data_dir.join("memories.json"));
             }
             Err(e) => {
                 warn!("Could not determine Nanna data dir: {}, using default", e);
             }
         }
+    }
 
+    /// `[llm]` + `[agent]`: the model chain, summarization, the loop's
+    /// iteration policy and the routing/sub-agent settings.
+    fn apply_agent_settings(&mut self, config: &nanna_config::Config) {
         // Set agent configuration from loaded config
         // Use user-configured model priority list for fallback
-        builder
-            .config
+        self.config
             .agent
             .model_priority
             .clone_from(&config.llm.model_priority);
         info!("Model priority list: {:?}", config.llm.model_priority);
 
         if let Some(model) = config.llm.model_priority.first() {
-            builder.config.agent.model.clone_from(model);
+            self.config.agent.model.clone_from(model);
         } else {
-            builder.config.agent.model.clone_from(&config.llm.model);
+            self.config.agent.model.clone_from(&config.llm.model);
         }
 
         // Set summarization configuration
-        builder
-            .config
+        self.config
             .agent
             .summarization_priority
             .clone_from(&config.llm.summarization_priority);
-        builder
-            .config
+        self.config
             .agent
             .summarization_ollama_url
             .clone_from(&config.llm.ollama_url);
 
         // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
-        builder
-            .config
+        self.config
             .agent
             .openrouter_api_key
             .clone_from(&config.llm.openrouter_api_key);
-        builder
-            .config
+        self.config
             .agent
             .openai_api_key
             .clone_from(&config.llm.openai_api_key);
@@ -4943,55 +5111,51 @@ impl DaemonBuilder {
 
         // Agent-loop iteration policy: unbounded by default (long-horizon worker),
         // with late escalating soft nudges. All three are user-configurable.
-        builder.config.agent.max_iterations = config.agent.max_iterations;
-        builder.config.agent.nudge_after_iterations = config.agent.nudge_after_iterations;
-        builder.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
+        self.config.agent.max_iterations = config.agent.max_iterations;
+        self.config.agent.nudge_after_iterations = config.agent.nudge_after_iterations;
+        self.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
 
         // Set model routing configuration
-        builder
-            .config
+        self.config
             .agent
             .model_routing
             .clone_from(&config.llm.model_routing);
-        builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
-        builder
-            .config
+        self.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
+        self.config
             .agent
             .sub_agent_model
             .clone_from(&config.llm.sub_agent_model);
         // Resolved here (list > legacy single > main chat list) so every
         // consumer sees one authoritative, never-empty chain.
-        builder.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
-        builder.config.agent.prompt_cache_ttl =
+        self.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
+        self.config.agent.prompt_cache_ttl =
             crate::agent_service::cache_ttl_from(config.llm.prompt_cache_ttl);
         if !config.llm.model_routing.is_empty() {
             info!("Model routing enabled: {:?}", config.llm.model_routing);
         }
         if !config.llm.sub_agent_models.is_empty() || config.llm.sub_agent_model.is_some() {
-            info!(
-                "Sub-agent models: {:?}",
-                builder.config.agent.sub_agent_models
-            );
+            info!("Sub-agent models: {:?}", self.config.agent.sub_agent_models);
         }
+    }
 
+    /// `[tools]` + `[channels]`: the Brave key, the script-tool surface, the
+    /// allow/deny policy, the audit trail and the configured chat channels.
+    fn apply_tool_and_channel_settings(&mut self, config: &nanna_config::Config) {
         // Set Brave API key for web search
-        builder.brave_api_key.clone_from(&config.tools.brave_api_key);
+        self.brave_api_key.clone_from(&config.tools.brave_api_key);
 
         // Set script tools flag and tools directory
-        builder.config.use_script_tools = config.tools.use_script_tools;
-        builder.config.tools_dir.clone_from(&config.tools.tools_dir);
+        self.config.use_script_tools = config.tools.use_script_tools;
+        self.config.tools_dir.clone_from(&config.tools.tools_dir);
 
         // Tool allow/deny policy — `[tools] enabled` is the allowlist ("*" = all),
         // `[tools] disabled` is the denylist. This is the wiring that makes a
         // disabled tool actually stop executing (the lists were previously
         // parsed into config but never enforced).
-        builder.config.tool_allowlist = Some(config.tools.enabled.clone());
-        builder
-            .config
-            .tool_denylist
-            .clone_from(&config.tools.disabled);
-        builder.config.tool_audit.log = config.tools.audit_log;
-        builder.config.tool_audit.log_values = config.tools.audit_log_values;
+        self.config.tool_allowlist = Some(config.tools.enabled.clone());
+        self.config.tool_denylist.clone_from(&config.tools.disabled);
+        self.config.tool_audit.log = config.tools.audit_log;
+        self.config.tool_audit.log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -5000,42 +5164,44 @@ impl DaemonBuilder {
             || config.channels.signal.is_some()
             || config.channels.whatsapp.is_some();
         if has_channels {
-            builder.config.channels = Some(config.channels.clone());
+            self.config.channels = Some(config.channels.clone());
             info!("Channel configuration loaded");
         }
+    }
 
+    /// The one-line boot summary: which providers resolved, and what the
+    /// daemon is about to run on.
+    fn log_resolved_config(&self) {
         // Log configured providers
         let mut providers = Vec::new();
-        if builder.config.llm.anthropic_api_key.is_some()
-            || builder.config.llm.anthropic_oauth_token.is_some()
+        if self.config.llm.anthropic_api_key.is_some()
+            || self.config.llm.anthropic_oauth_token.is_some()
         {
             providers.push("anthropic");
         }
-        if builder.config.llm.openai_api_key.is_some() {
+        if self.config.llm.openai_api_key.is_some() {
             providers.push("openai");
         }
-        if builder.config.llm.openrouter_api_key.is_some() {
+        if self.config.llm.openrouter_api_key.is_some() {
             providers.push("openrouter");
         }
-        if builder.config.llm.github_token.is_some() {
+        if self.config.llm.github_token.is_some() {
             providers.push("github");
         }
         providers.push("ollama"); // Always available
 
         info!(
             "Daemon config loaded: model={}, embedding={}:{}, providers=[{}], brave_key={}",
-            builder.config.agent.model,
-            builder.embedding.provider,
-            builder.embedding.model,
+            self.config.agent.model,
+            self.embedding.provider,
+            self.embedding.model,
             providers.join(", "),
-            if builder.brave_api_key.is_some() {
+            if self.brave_api_key.is_some() {
                 "set"
             } else {
                 "none"
             }
         );
-
-        Ok(builder)
     }
 
     #[must_use]
