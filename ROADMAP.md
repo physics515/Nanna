@@ -1631,9 +1631,19 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             on *every* attempt is a configuration fault, not a transient one, and deserves to
             surface (health endpoint degradation, or a once-per-boot loud notice) rather than
             scroll past. Needs a decision on where operator-visible faults belong.
-- [ ] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
+- [~] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
+      *(2026-09-17)* **`GET /metrics` landed on the health server (5148), no new crate or
+      dependency** — the text format is a line format, and the numbers already existed in the tool
+      and model stats trackers. Series: `nanna_up`, `uptime_seconds`, `sessions`,
+      `chat_runs_active`, `memory_entries`, `reminders_pending`, `tool_calls_total{tool,outcome}`,
+      `tool_latency_p95_milliseconds`, `model_requests_total`, `model_tokens_total{model,kind}`,
+      `model_healthy`, `mcp_server_up{server,state}`, `mcp_server_tools`. Every label comes from a
+      registered tool, configured model or configured MCP server — never a session or message — so
+      series count is bounded by configuration. Verified by scraping the live debug daemon.
+      Remaining from the original list: request-duration histograms (the trackers keep p95, not
+      buckets) and channel message/error counters (the channel path has no counters yet).
 - [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by

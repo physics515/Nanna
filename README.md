@@ -326,7 +326,7 @@ MCP servers inherit the daemon's environment; there is deliberately no `env` tab
 | `DISCORD_BOT_TOKEN` | Discord channel |
 | `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
-**Ports:** Health HTTP `5148` · WebSocket IPC `5149`
+**Ports:** Health HTTP `5148` (`/health`, `/status`, and Prometheus `/metrics`) · WebSocket IPC `5149`
 
 `NANNA_CONFIG_PATH` is useful for running a second instance, or for trying a
 configuration without touching the one you use day to day — pair it with the

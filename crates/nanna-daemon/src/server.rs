@@ -3188,6 +3188,13 @@ impl DaemonServer {
                 state = state
                     .with_memory_rebuild(report.memories_recovered, report.memories_expected);
             }
+            let control_for_metrics = Arc::clone(&control);
+            state = state.with_metrics(Arc::new(move || {
+                let control = Arc::clone(&control_for_metrics);
+                Box::pin(async move {
+                    crate::metrics::render_metrics(&control.metrics_snapshot().await)
+                })
+            }));
             let health_state = Arc::new(state);
 
             // Update session count

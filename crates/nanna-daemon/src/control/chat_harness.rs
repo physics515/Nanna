@@ -285,6 +285,11 @@ impl ChatRunRegistry {
         !self.active.read().await.is_empty()
     }
 
+    /// How many sessions have a harness run live — the `/metrics` gauge.
+    pub async fn active_count(&self) -> usize {
+        self.active.read().await.len()
+    }
+
     /// Claim the run slot. Returns false when one is already live — the
     /// caller must then interject instead of starting a second run.
     pub async fn try_claim(&self, session_id: &str) -> bool {

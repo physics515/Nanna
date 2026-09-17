@@ -3,6 +3,38 @@
 use super::*;
 
 impl ControlPlane {
+    /// Gather everything `GET /metrics` reports, in one pass.
+    pub async fn metrics_snapshot(&self) -> crate::metrics::MetricsSnapshot {
+        let memory_entries = match self.memory {
+            Some(ref memory) => Some(memory.count().await),
+            None => None,
+        };
+        let reminders_pending = match self.scheduler {
+            Some(ref scheduler) => {
+                let tasks = scheduler.read().await.list_tasks().await;
+                let pending = tasks.iter().filter(|task| {
+                    task.name == crate::reminder_service::REMINDER_TASK_NAME && task.enabled
+                });
+                Some(pending.count())
+            }
+            None => None,
+        };
+        let mcp_servers = match self.mcp_status {
+            Some(ref status) => status.read().await.clone(),
+            None => Vec::new(),
+        };
+        crate::metrics::MetricsSnapshot {
+            uptime_secs: self.uptime_secs(),
+            sessions: self.sessions.count().await,
+            chat_runs_active: self.chat_runs.active_count().await,
+            memory_entries,
+            reminders_pending,
+            tools: self.tool_stats.summaries().await,
+            models: self.model_stats.summaries().await,
+            mcp_servers,
+        }
+    }
+
     // =========================================================================
     // System Handlers
     // =========================================================================
