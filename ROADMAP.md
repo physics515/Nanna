@@ -5315,9 +5315,14 @@ lfm2.5 2/42.** What the series surfaced and fixed:
       staging debris beside the specs). Lock the dir for future series.
 - [ ] **GUI stale pane on workspace switch** — selecting a workspace keeps rendering the previous
       session's chat until a new chat is created.
-- [ ] **Killed runs orphan `llama-server`** — holds GB of VRAM invisibly (`ollama ps` stops listing
+- [x] **Killed runs orphan `llama-server`** — holds GB of VRAM invisibly (`ollama ps` stops listing
       it; `keep_alive=0` doesn't reclaim it); wrote off gemma for a day. Sweep by process name
       before sizing anything.
+      *(ticked 2026-09-17 — the fix shipped 2026-08-10 in PR #206 and this box was never closed.)*
+      The leak was the restart heal killing only `ollama.exe`: `restart_ollama_server`
+      (`nanna-daemon/src/tasks.rs`) now takes the whole tree (`taskkill /F /T`) and then sweeps
+      `llama-server` by image name (`pkill -x` off Windows), which cannot hit a live server's runner
+      because every server is dead at that point.
 
 ---
 
