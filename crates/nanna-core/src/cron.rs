@@ -62,6 +62,15 @@ impl CronExpr {
     /// // Special strings
     /// let expr = CronExpr::parse("@hourly").unwrap();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CronError::Invalid`] when the expression (after expanding an
+    /// `@hourly`-style alias) does not have exactly five whitespace-separated
+    /// fields, [`CronError::InvalidField`] when a field's value, range or step is
+    /// not a number or is malformed (a `*/0` step included), and
+    /// [`CronError::OutOfRange`] when a value or range bound lies outside its
+    /// field (minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6).
     pub fn parse(expr: &str) -> Result<Self, CronError> {
         let expr = expr.trim();
 
@@ -151,12 +160,11 @@ impl CronExpr {
         if self.minutes.len() == 60 {
             parts.push("every minute".to_string());
         } else if self.minutes.len() == 1 {
-            let m = *self.minutes.iter().next().unwrap();
-            if m == 0 {
-                // Don't mention "at minute 0"
-            } else {
-                parts.push(format!("at minute {m}"));
-            }
+            // Don't mention "at minute 0"
+            if let Some(&m) = self.minutes.iter().next()
+                && m != 0 {
+                    parts.push(format!("at minute {m}"));
+                }
         } else {
             // `minutes` is a HashSet (unordered) — sort before differencing so the
             // reported step is deterministic and actually the smallest interval.
@@ -172,18 +180,18 @@ impl CronExpr {
             if self.minutes.len() != 60 {
                 parts.push("every hour".to_string());
             }
-        } else if self.hours.len() == 1 {
-            let h = *self.hours.iter().next().unwrap();
-            let period = if h < 12 { "AM" } else { "PM" };
-            let h12 = if h == 0 {
-                12
-            } else if h > 12 {
-                h - 12
-            } else {
-                h
-            };
-            parts.push(format!("at {h12} {period}"));
-        }
+        } else if self.hours.len() == 1
+            && let Some(&h) = self.hours.iter().next() {
+                let period = if h < 12 { "AM" } else { "PM" };
+                let h12 = if h == 0 {
+                    12
+                } else if h > 12 {
+                    h - 12
+                } else {
+                    h
+                };
+                parts.push(format!("at {h12} {period}"));
+            }
 
         // Weekdays
         if self.weekdays.len() < 7 {

@@ -247,6 +247,7 @@ impl Workspace {
     }
 
     /// Create with explicit name
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
@@ -618,7 +619,8 @@ impl WorkspaceRegistry {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        // Seconds since the epoch exceed i64::MAX only ~292 billion years from now.
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

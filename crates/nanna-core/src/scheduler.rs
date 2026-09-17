@@ -34,7 +34,9 @@ pub enum TaskType {
     /// Cron job with parsed schedule
     Cron {
         schedule: String,
-        parsed: Option<CronExpr>,
+        /// Boxed: five field sets make a `CronExpr` several times larger than
+        /// every other variant.
+        parsed: Option<Box<CronExpr>>,
         next_run: Option<DateTime<Utc>>,
     },
     /// One-shot delayed task
@@ -284,10 +286,15 @@ impl Scheduler {
     }
 
     /// Load persisted cron jobs from storage.
+    ///
+    /// Returns 0 without touching anything when no storage is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when listing the persisted cron jobs fails.
     pub async fn load_jobs(&self) -> Result<usize, nanna_storage::StorageError> {
-        let storage = match &self.storage {
-            Some(s) => s,
-            None => return Ok(0),
+        let Some(storage) = &self.storage else {
+            return Ok(0);
         };
 
         let jobs = storage.cron_jobs().list_all().await?;
@@ -298,6 +305,7 @@ impl Scheduler {
             let task = self.job_to_task(&job);
             tasks.insert(job.job_id, task);
         }
+        drop(tasks);
 
         info!("Loaded {} cron jobs from storage", count);
         Ok(count)
@@ -318,8 +326,8 @@ impl Scheduler {
             }
         } else {
             // Try to parse as cron expression
-            let parsed = CronExpr::parse(&job.schedule).ok();
-            let next_run = parsed.as_ref().and_then(super::cron::CronExpr::next_from_now);
+            let parsed = CronExpr::parse(&job.schedule).ok().map(Box::new);
+            let next_run = parsed.as_deref().and_then(super::cron::CronExpr::next_from_now);
             TaskType::Cron {
                 schedule: job.schedule.clone(),
                 parsed,
@@ -377,9 +385,8 @@ impl Scheduler {
 
     /// Save a task to persistent storage.
     async fn persist_task(&self, task: &ScheduledTask) -> Result<(), nanna_storage::StorageError> {
-        let storage = match &self.storage {
-            Some(s) => s,
-            None => return Ok(()),
+        let Some(storage) = &self.storage else {
+            return Ok(());
         };
 
         let schedule = match &task.task_type {
@@ -426,6 +433,11 @@ impl Scheduler {
     }
 
     /// Create a cron task from a schedule expression
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
+    /// a valid cron expression.
     pub fn cron_task(
         name: &str,
         schedule: &str,
@@ -439,7 +451,7 @@ impl Scheduler {
             name: name.to_string(),
             task_type: TaskType::Cron {
                 schedule: schedule.to_string(),
-                parsed: Some(parsed),
+                parsed: Some(Box::new(parsed)),
                 next_run,
             },
             payload: payload.to_string(),
@@ -477,6 +489,14 @@ impl Scheduler {
     }
 
     /// Update a task's schedule
+    ///
+    /// Returns `Ok(false)` when no task has `task_id`. The storage update is
+    /// best-effort and its failure is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
+    /// a valid cron expression; the task is left unchanged.
     pub async fn update_schedule(
         &self,
         task_id: &str,
@@ -489,7 +509,7 @@ impl Scheduler {
         if let Some(task) = tasks.get_mut(task_id) {
             task.task_type = TaskType::Cron {
                 schedule: schedule.to_string(),
-                parsed: Some(parsed),
+                parsed: Some(Box::new(parsed)),
                 next_run,
             };
 
@@ -575,10 +595,12 @@ impl Scheduler {
             matching.sort_by(|a, b| a.id.cmp(&b.id));
 
             // Skip the first one, return the rest for deletion
-            matching.into_iter()
+            let ids = matching.into_iter()
                 .skip(1)
                 .map(|t| t.id.clone())
-                .collect()
+                .collect();
+            drop(tasks);
+            ids
         };
 
         let count = task_ids.len();
@@ -599,23 +621,7 @@ impl Scheduler {
 
     /// Record a job run
     async fn record_run(&self, result: &TaskResult) {
-        let mut history = self.history.write().await;
-        let runs = history.entry(result.task_id.clone()).or_default();
-
-        runs.push(JobRun {
-            id: runs.len() as i64 + 1,
-            job_id: result.task_id.clone(),
-            started_at: result.started_at,
-            finished_at: Some(result.finished_at),
-            success: result.success,
-            output: result.output.clone(),
-            error: result.error.clone(),
-        });
-
-        // Keep only last 100 runs per job
-        if runs.len() > 100 {
-            runs.remove(0);
-        }
+        record_job_run(&self.history, &result.task_id, result).await;
     }
 
     /// Run a task immediately (bypass schedule)
@@ -699,22 +705,7 @@ impl Scheduler {
                             let result = executor(task).await;
 
                             // Record heartbeat run
-                            {
-                                let mut hist = history.write().await;
-                                let runs = hist.entry("heartbeat".to_string()).or_default();
-                                runs.push(JobRun {
-                                    id: runs.len() as i64 + 1,
-                                    job_id: "heartbeat".to_string(),
-                                    started_at: result.started_at,
-                                    finished_at: Some(result.finished_at),
-                                    success: result.success,
-                                    output: result.output.clone(),
-                                    error: result.error.clone(),
-                                });
-                                if runs.len() > 100 {
-                                    runs.remove(0);
-                                }
-                            }
+                            record_job_run(&history, "heartbeat", &result).await;
 
                             if !result.success {
                                 warn!("Heartbeat failed: {:?}", result.error);
@@ -752,101 +743,14 @@ impl Scheduler {
                                 continue;
                             }
 
-                            let should_run = match &task.task_type {
-                                TaskType::Cron { next_run, .. } => {
-                                    next_run.is_some_and(|nr| nr <= now)
-                                }
-                                TaskType::Recurring { interval: task_interval } => {
-                                    task.last_run.is_none_or(|lr| {
-                                        let elapsed = now.signed_duration_since(lr);
-                                        elapsed >= chrono::Duration::from_std(*task_interval).unwrap_or_default()
-                                    })
-                                }
-                                TaskType::Delayed { delay, created } => {
-                                    task.run_count == 0 && created.elapsed() >= *delay
-                                }
-                                TaskType::Heartbeat => false, // Handled separately
-                            };
-
-                            if should_run {
+                            if task_is_due(&task, now) {
                                 let executor = executor.clone();
                                 let tasks = tasks.clone();
                                 let storage = storage.clone();
                                 let history = history.clone();
                                 let task_id = task.id.clone();
 
-                                tokio::spawn(async move {
-                                    debug!("Running task: {} ({})", task.name, task_id);
-                                    let result = executor(task).await;
-
-                                    // Record run in history
-                                    {
-                                        let mut hist = history.write().await;
-                                        let runs = hist.entry(task_id.clone()).or_default();
-                                        runs.push(JobRun {
-                                            id: runs.len() as i64 + 1,
-                                            job_id: task_id.clone(),
-                                            started_at: result.started_at,
-                                            finished_at: Some(result.finished_at),
-                                            success: result.success,
-                                            output: result.output.clone(),
-                                            error: result.error.clone(),
-                                        });
-                                        if runs.len() > 100 {
-                                            runs.remove(0);
-                                        }
-                                    }
-
-                                    // Update task state
-                                    {
-                                        let mut tasks_guard = tasks.write().await;
-                                        if let Some(t) = tasks_guard.get_mut(&task_id) {
-                                            t.last_run = Some(result.finished_at);
-                                            t.run_count += 1;
-
-                                            // Update next_run for cron tasks
-                                            if let TaskType::Cron {
-                                                parsed: Some(ref p),
-                                                ref mut next_run,
-                                                ..
-                                            } = t.task_type
-                                            {
-                                                *next_run = p.next_from_now();
-                                            }
-
-                                            // Disable one-shot tasks after running
-                                            if matches!(t.task_type, TaskType::Delayed { .. }) {
-                                                t.enabled = false;
-                                            }
-                                        }
-                                    }
-
-                                    // Update storage
-                                    if let Some(storage) = storage {
-                                        let next_run = {
-                                            let tasks = tasks.read().await;
-                                            tasks.get(&task_id).and_then(|t| {
-                                                if let TaskType::Cron { next_run, .. } = &t.task_type {
-                                                    next_run.map(|dt| dt.to_rfc3339())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                        };
-
-                                        let _ = storage.cron_jobs().update_last_run(
-                                            &task_id,
-                                            &result.finished_at.to_rfc3339(),
-                                            next_run.as_deref(),
-                                        ).await;
-                                    }
-
-                                    if result.success {
-                                        info!("Task {} completed in {}ms", task_id, result.duration_ms);
-                                    } else {
-                                        error!("Task {} failed: {:?}", task_id, result.error);
-                                    }
-                                });
+                                tokio::spawn(run_due_task(executor, tasks, storage, history, task_id, task));
                             }
                         }
                     }
@@ -860,6 +764,123 @@ impl Scheduler {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+    }
+}
+
+/// Most recent runs kept in memory per job.
+const MAX_RUNS_PER_JOB: usize = 100;
+
+/// Append `result` to `job_id`'s in-memory run history, keeping only the last
+/// [`MAX_RUNS_PER_JOB`] runs.
+async fn record_job_run(
+    history: &RwLock<HashMap<String, Vec<JobRun>>>,
+    job_id: &str,
+    result: &TaskResult,
+) {
+    let mut hist = history.write().await;
+    let runs = hist.entry(job_id.to_string()).or_default();
+    // The history never holds more than MAX_RUNS_PER_JOB runs when a new one
+    // is pushed, so the count always fits an i64.
+    let id = i64::try_from(runs.len()).map_or(i64::MAX, |n| n + 1);
+    runs.push(JobRun {
+        id,
+        job_id: job_id.to_string(),
+        started_at: result.started_at,
+        finished_at: Some(result.finished_at),
+        success: result.success,
+        output: result.output.clone(),
+        error: result.error.clone(),
+    });
+    if runs.len() > MAX_RUNS_PER_JOB {
+        runs.remove(0);
+    }
+    drop(hist);
+}
+
+/// Whether a (enabled) task should fire at `now`. Heartbeats never are: the
+/// loop fires them from their own timer.
+fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    match &task.task_type {
+        TaskType::Cron { next_run, .. } => {
+            next_run.is_some_and(|nr| nr <= now)
+        }
+        TaskType::Recurring { interval: task_interval } => {
+            task.last_run.is_none_or(|lr| {
+                let elapsed = now.signed_duration_since(lr);
+                elapsed >= chrono::Duration::from_std(*task_interval).unwrap_or_default()
+            })
+        }
+        TaskType::Delayed { delay, created } => {
+            task.run_count == 0 && created.elapsed() >= *delay
+        }
+        TaskType::Heartbeat => false, // Handled separately
+    }
+}
+
+/// Run one due task to completion: execute it, record the run, advance its
+/// schedule (disabling one-shot tasks) and persist the new run times.
+async fn run_due_task(
+    executor: TaskExecutor,
+    tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    storage: Option<Arc<Storage>>,
+    history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    task_id: String,
+    task: ScheduledTask,
+) {
+    debug!("Running task: {} ({})", task.name, task_id);
+    let result = executor(task).await;
+
+    // Record run in history
+    record_job_run(&history, &task_id, &result).await;
+
+    // Update task state
+    {
+        let mut tasks_guard = tasks.write().await;
+        if let Some(t) = tasks_guard.get_mut(&task_id) {
+            t.last_run = Some(result.finished_at);
+            t.run_count += 1;
+
+            // Update next_run for cron tasks
+            if let TaskType::Cron {
+                parsed: Some(ref p),
+                ref mut next_run,
+                ..
+            } = t.task_type
+            {
+                *next_run = p.next_from_now();
+            }
+
+            // Disable one-shot tasks after running
+            if matches!(t.task_type, TaskType::Delayed { .. }) {
+                t.enabled = false;
+            }
+        }
+    }
+
+    // Update storage
+    if let Some(storage) = storage {
+        let next_run = {
+            let tasks = tasks.read().await;
+            tasks.get(&task_id).and_then(|t| {
+                if let TaskType::Cron { next_run, .. } = &t.task_type {
+                    next_run.map(|dt| dt.to_rfc3339())
+                } else {
+                    None
+                }
+            })
+        };
+
+        let _ = storage.cron_jobs().update_last_run(
+            &task_id,
+            &result.finished_at.to_rfc3339(),
+            next_run.as_deref(),
+        ).await;
+    }
+
+    if result.success {
+        info!("Task {} completed in {}ms", task_id, result.duration_ms);
+    } else {
+        error!("Task {} failed: {:?}", task_id, result.error);
     }
 }
 
