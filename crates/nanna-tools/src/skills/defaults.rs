@@ -322,6 +322,13 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
 ///
 /// Returns the count of directories granted, so a caller can say so at boot and
 /// so the announcement is testable without scraping logs.
+///
+/// # Panics
+///
+/// Panics if [`DEFAULT_PERMISSIONS_JSON`] is not home-bounded (see
+/// [`default_permissions_are_home_bounded`]) — a defect in this build's
+/// constant, never in the directory. The check stays on in release builds so a
+/// fail-open default can never be written to disk.
 pub fn ensure_permissions(tools_dir: &Path) -> usize {
     assert!(
         default_permissions_are_home_bounded(),
@@ -409,7 +416,7 @@ mod tests {
         fn set(value: Option<&std::path::Path>) -> Self {
             // A poisoned lock only means some other test panicked; the env is still
             // ours to restore, so recover rather than cascade the failure.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous = std::env::var_os("NANNA_TOOLS_DIR");
             match value {
                 // SAFETY: every writer of this variable holds ENV_LOCK, so no other
@@ -673,10 +680,10 @@ mod tests {
             Some("0.1.0".to_string())
         );
 
-        let source_single = r#"export default {
+        let source_single = r"export default {
   name: 'exec',
   version: '1.2.3',
-}"#;
+}";
         assert_eq!(
             extract_version_from_source(source_single),
             Some("1.2.3".to_string())

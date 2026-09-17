@@ -6,6 +6,7 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// Web search tool using Brave Search API
 pub struct WebSearchTool {
@@ -118,13 +119,14 @@ impl Tool for WebSearchTool {
         // Format results as readable text
         let mut output = String::new();
         for (i, result) in results.iter().take(count).enumerate() {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "{}. {}\n   {}\n   {}\n\n",
                 i + 1,
                 result.title,
                 result.url,
                 result.description.as_deref().unwrap_or("No description")
-            ));
+            );
         }
 
         let structured: Vec<serde_json::Value> = results
@@ -265,15 +267,16 @@ impl Tool for WebSearchBatchTool {
         // Format combined results
         let mut output = String::new();
         for (query, results) in &all_results {
-            output.push_str(&format!("=== Query: \"{query}\" ===\n"));
+            let _ = writeln!(output, "=== Query: \"{query}\" ===");
             for (i, result) in results.iter().take(results_per).enumerate() {
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "{}. {}\n   {}\n   {}\n\n",
                     i + 1,
                     result.title,
                     result.url,
                     result.description.as_deref().unwrap_or("No description")
-                ));
+                );
             }
             output.push('\n');
         }
@@ -331,10 +334,12 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("Missing 'url' parameter".to_string()))?;
 
-        let max_chars = params
-            .get("max_chars")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(50000) as usize;
+        let max_chars = crate::u64_to_usize(
+            params
+                .get("max_chars")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(50000),
+        );
 
         // Validate URL
         if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -464,11 +469,10 @@ fn extract_text_from_element(element: &scraper::ElementRef) -> String {
             scraper::node::Node::Text(t) => {
                 // Check if any ancestor is a skip tag
                 let should_skip = node.ancestors().any(|ancestor| {
-                    if let Some(el) = ancestor.value().as_element() {
-                        skip_tags.contains(&el.name())
-                    } else {
-                        false
-                    }
+                    ancestor
+                        .value()
+                        .as_element()
+                        .is_some_and(|el| skip_tags.contains(&el.name()))
                 });
 
                 if !should_skip {

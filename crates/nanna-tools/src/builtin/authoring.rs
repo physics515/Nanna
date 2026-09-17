@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -61,6 +62,12 @@ impl ToolStore {
     }
 
     /// Add a tool to the store.
+    ///
+    /// # Errors
+    ///
+    /// When the store has a storage path, returns [`ToolError::ExecutionFailed`]
+    /// if the tools cannot be serialised or the file cannot be written. The tool
+    /// stays added in memory either way.
     pub async fn add(&self, tool: ScriptTool) -> Result<(), ToolError> {
         let name = tool.name.clone();
         self.tools.write().await.insert(name.clone(), tool);
@@ -75,6 +82,13 @@ impl ToolStore {
     }
 
     /// Remove a tool from the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::NotFound`] if no tool has that name. When the store
+    /// has a storage path, returns [`ToolError::ExecutionFailed`] if the
+    /// remaining tools cannot be serialised or the file cannot be written; the
+    /// tool stays removed in memory either way.
     pub async fn remove(&self, name: &str) -> Result<(), ToolError> {
         let mut tools = self.tools.write().await;
         if tools.remove(name).is_some() {
@@ -111,10 +125,20 @@ impl ToolStore {
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to save tools: {e}")))?;
 
         debug!("Saved {} tools to {:?}", tools.len(), path);
+        // Held across the write: an `add`/`remove` that lands meanwhile waits,
+        // so its own save writes after this one instead of racing it to disk.
+        drop(tools);
         Ok(())
     }
 
     /// Load tools from file.
+    ///
+    /// A missing file is not an error and leaves the store unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::ExecutionFailed`] if the file exists but cannot be
+    /// read or does not parse as a map of tools; the store is left unchanged.
     pub async fn load(&self, path: &PathBuf) -> Result<(), ToolError> {
         if !path.exists() {
             return Ok(());
@@ -189,13 +213,16 @@ impl Tool for CreateToolTool {
         let parameters: Vec<ScriptToolParam> = params
             .get("parameters")
             .and_then(|v| {
-                if let Some(s) = v.as_str() {
-                    serde_json::from_str(s).ok()
-                } else if v.is_array() {
-                    serde_json::from_value(v.clone()).ok()
-                } else {
-                    None
-                }
+                v.as_str().map_or_else(
+                    || {
+                        if v.is_array() {
+                            serde_json::from_value(v.clone()).ok()
+                        } else {
+                            None
+                        }
+                    },
+                    |s| serde_json::from_str(s).ok(),
+                )
             })
             .unwrap_or_default();
 
@@ -243,10 +270,11 @@ impl Tool for ListToolsTool {
 
         let mut output = format!("Custom tools ({}):\n\n", tools.len());
         for tool in &tools {
-            output.push_str(&format!(
-                "• {} ({})\n  {}\n",
+            let _ = writeln!(
+                output,
+                "• {} ({})\n  {}",
                 tool.name, tool.script_type, tool.description
-            ));
+            );
         }
 
         Ok(ToolResult::success(output))

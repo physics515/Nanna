@@ -98,6 +98,7 @@ impl Browser for CdpBrowser {
         });
 
         *browser_guard = Some(browser);
+        drop(browser_guard);
         info!("CDP browser launched successfully");
         Ok(())
     }
@@ -112,6 +113,7 @@ impl Browser for CdpBrowser {
             .new_page("about:blank")
             .await
             .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
+        drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
     }
@@ -130,13 +132,21 @@ impl Browser for CdpBrowser {
         page.wait_for_navigation()
             .await
             .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
+        // Held until navigation settles, as it always was: a concurrent
+        // `close()` (which takes the write side) waits for the page to load
+        // instead of tearing the browser down underneath it.
+        drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
     }
 
     async fn close(&self) -> Result<(), BrowserError> {
         let mut browser_guard = self.browser.write().await;
-        if browser_guard.take().is_some() {
+        // The taken browser is dropped inside this statement, so it is still
+        // torn down under the write lock, before any `launch()` can proceed.
+        let was_open = browser_guard.take().is_some();
+        drop(browser_guard);
+        if was_open {
             info!("CDP browser closed");
         }
         Ok(())

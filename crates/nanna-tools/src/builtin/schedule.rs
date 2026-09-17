@@ -60,7 +60,7 @@ impl ReminderStore {
 
         for reminder in &mut self.reminders {
             if !reminder.triggered {
-                let trigger_at = reminder.created_at + reminder.delay_secs as i64;
+                let trigger_at = reminder.created_at + reminder.delay_secs.cast_signed();
                 if now >= trigger_at {
                     reminder.triggered = true;
                     due.push(reminder.clone());
@@ -75,7 +75,7 @@ impl ReminderStore {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 /// Tool to set a reminder
@@ -113,8 +113,7 @@ impl Tool for RemindTool {
 
         let delay_secs = minutes * 60;
 
-        let mut state = self.state.write().await;
-        let id = state.add(message.to_string(), delay_secs);
+        let id = self.state.write().await.add(message.to_string(), delay_secs);
 
         info!("Reminder set: '{}' in {} minutes (id: {})", message, minutes, &id[..8]);
 
@@ -145,8 +144,7 @@ impl Tool for ListRemindersTool {
     }
 
     async fn execute(&self, _params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
-        let state = self.state.read().await;
-        let reminders = state.list();
+        let reminders = self.state.read().await.list();
 
         if reminders.is_empty() {
             Ok(ToolResult::success("No pending reminders."))
@@ -155,7 +153,7 @@ impl Tool for ListRemindersTool {
             let output = reminders
                 .iter()
                 .map(|r| {
-                    let trigger_at = r.created_at + r.delay_secs as i64;
+                    let trigger_at = r.created_at + r.delay_secs.cast_signed();
                     let remaining = (trigger_at - now).max(0);
                     format!("[{}] in {}m: {}", &r.id[..8], remaining / 60, r.message)
                 })
@@ -195,20 +193,17 @@ impl Tool for CancelReminderTool {
 
         let mut state = self.state.write().await;
         
-        // Find by prefix
+        // Find by prefix, and cancel under the same guard
         let full_id = state.reminders
             .iter()
             .find(|r| r.id.starts_with(id_prefix))
             .map(|r| r.id.clone());
+        let cancelled = full_id.filter(|id| state.cancel(id));
+        drop(state);
 
-        if let Some(id) = full_id {
-            if state.cancel(&id) {
-                Ok(ToolResult::success(format!("Reminder {} cancelled.", &id[..8])))
-            } else {
-                Ok(ToolResult::success("Reminder not found."))
-            }
-        } else {
-            Ok(ToolResult::success("Reminder not found."))
-        }
+        Ok(cancelled.map_or_else(
+            || ToolResult::success("Reminder not found."),
+            |id| ToolResult::success(format!("Reminder {} cancelled.", &id[..8])),
+        ))
     }
 }

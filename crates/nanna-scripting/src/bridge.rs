@@ -688,6 +688,11 @@ impl NannaBridge {
     }
 
     /// Call a registered service by name
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if no service named `name` is registered, or the
+    /// service's own error message if the call fails.
     pub async fn call_service(&self, name: &str, params: Value) -> std::result::Result<Value, String> {
         let service = self.services.get(name)
             .ok_or_else(|| format!("Service not found: {name}"))?;
@@ -697,11 +702,25 @@ impl NannaBridge {
     /// Execute a shell command (if permitted)
     ///
     /// `timeout_secs`: optional override for the execution timeout (default: 30s).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::exec_with_timeout`].
     pub async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecResponse> {
         self.exec_with_timeout(command, workdir, None).await
     }
 
     /// Execute a shell command with an optional timeout override.
+    ///
+    /// A command that overruns its deadline is not an error: it is killed and
+    /// returned with `timed_out: true` and whatever it had printed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the tool lacks the `run`
+    /// permission or the platform (Android, iOS) has no shell, and
+    /// [`ScriptError::Bridge`] if the command cannot be spawned or waiting on
+    /// it fails.
     pub async fn exec_with_timeout(&self, command: &str, workdir: Option<&str>, timeout_secs: Option<u64>) -> Result<ExecResponse> {
         tracing::debug!(target: "bridge", "exec called: command={}, run_permission={}", command, self.permissions.run);
         
@@ -857,9 +876,26 @@ impl NannaBridge {
         // directly comparable.
         let started = std::time::Instant::now();
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+        Self::collect_exec(child, started, timeout).await
+    }
+
+    /// Wait for a spawned exec child under its deadline and collect its output.
+    ///
+    /// `started` is the wall clock taken before the spawn; `timeout` is the
+    /// deadline in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Bridge`] if waiting on the child fails. An
+    /// overrun is reported in the response, not as an error.
+    async fn collect_exec(
+        mut child: tokio::process::Child,
+        started: std::time::Instant,
+        timeout: u64,
+    ) -> Result<ExecResponse> {
         // Capture the pid *before* the wait future consumes the child, so a timeout
         // can kill the whole process tree rooted here (not just the shell).
         let pid = child.id();
@@ -989,6 +1025,13 @@ impl NannaBridge {
     }
 
     /// Fetch a URL (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if network access to the URL's host
+    /// is not permitted, and [`ScriptError::Bridge`] if the URL does not parse,
+    /// the method is not one of GET/POST/PUT/DELETE/PATCH, the request fails, or
+    /// the response body cannot be read.
     pub async fn fetch(&self, url: &str, options: Option<FetchOptions>) -> Result<FetchResponse> {
         // Parse URL to check host
         let parsed = url::Url::parse(url)
@@ -1050,6 +1093,12 @@ impl NannaBridge {
     }
 
     /// Read a file (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope, and [`ScriptError::Bridge`] if the file cannot be read
+    /// (including when its contents are not valid UTF-8).
     pub async fn read_file(&self, path: &str) -> Result<String> {
         let path = self.resolve_path(path);
         
@@ -1066,7 +1115,24 @@ impl NannaBridge {
     }
 
     /// Write a file (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Bridge`] if another write to the same path is in
+    /// progress in this process or the write itself fails, and
+    /// [`ScriptError::Permission`] if the resolved path is outside the tool's
+    /// write scope.
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+        // Ensure lock is released even on error
+        struct FileGuard(std::path::PathBuf);
+        impl Drop for FileGuard {
+            fn drop(&mut self) {
+                if let Ok(mut locks) = FILE_WRITE_LOCKS.lock() {
+                    locks.remove(&self.0);
+                }
+            }
+        }
+
         // Advisory file lock: prevent concurrent writes to the same path
         let canonical = self.resolve_path(path).canonicalize().unwrap_or_else(|_| self.resolve_path(path));
         {
@@ -1077,15 +1143,6 @@ impl NannaBridge {
                 ));
             }
             locks.insert(canonical.clone());
-        }
-        // Ensure lock is released even on error
-        struct FileGuard(std::path::PathBuf);
-        impl Drop for FileGuard {
-            fn drop(&mut self) {
-                if let Ok(mut locks) = FILE_WRITE_LOCKS.lock() {
-                    locks.remove(&self.0);
-                }
-            }
         }
         let _guard = FileGuard(canonical);
 
@@ -1149,12 +1206,24 @@ impl NannaBridge {
     /// engine one JS object at a time; unbounded listings of real workspaces
     /// (hundreds of thousands of entries under `node_modules/.git/target`) blow
     /// the 30s script deadline before the script runs a single line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope. A flat listing returns [`ScriptError::Bridge`] if the
+    /// directory or one of its entries cannot be read; a recursive walk skips
+    /// entries it cannot read.
     pub async fn list_dir(
         &self,
         path: &str,
         recursive: bool,
         max_entries: Option<usize>,
     ) -> Result<Vec<DirEntry>> {
+        const IGNORE_DIRS: &[&str] = &[
+            "node_modules", "target", ".git", "__pycache__", ".venv",
+            "venv", "dist", "build", ".next", ".nuxt", ".cache",
+        ];
+
         let path = self.resolve_path(path);
 
         if !self.permissions.allows_read(&path) {
@@ -1163,11 +1232,6 @@ impl NannaBridge {
                 path.display()
             )));
         }
-
-        const IGNORE_DIRS: &[&str] = &[
-            "node_modules", "target", ".git", "__pycache__", ".venv",
-            "venv", "dist", "build", ".next", ".nuxt", ".cache",
-        ];
 
         let cap = max_entries.unwrap_or(usize::MAX);
         let mut entries = Vec::new();
@@ -1185,9 +1249,8 @@ impl NannaBridge {
                 if entries.len() >= cap {
                     break;
                 }
-                let entry = match result {
-                    Ok(e) => e,
-                    Err(_) => continue,
+                let Ok(entry) = result else {
+                    continue;
                 };
                 // Skip the root directory itself
                 if entry.depth() == 0 {
@@ -1234,6 +1297,12 @@ impl NannaBridge {
     }
 
     /// Get file/directory metadata (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope, and [`ScriptError::Bridge`] if its metadata cannot be
+    /// read (for example, it does not exist).
     pub async fn stat(&self, path: &str) -> Result<FileStat> {
         let path = self.resolve_path(path);
 
@@ -1263,6 +1332,11 @@ impl NannaBridge {
     }
 
     /// Get environment variable (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the tool lacks the `env`
+    /// permission. An unset (or non-UTF-8) variable is `Ok(None)`.
     pub fn get_env(&self, key: &str) -> Result<Option<String>> {
         if !self.permissions.env {
             return Err(ScriptError::Permission(

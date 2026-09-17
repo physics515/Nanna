@@ -158,7 +158,7 @@ impl GpuVectorStore {
     /// # Errors
     ///
     /// Returns error if GPU memory is insufficient.
-    pub async fn sync(&mut self, ctx: &GpuContext) -> Result<(), MemoryError> {
+    pub fn sync(&mut self, ctx: &GpuContext) -> Result<(), MemoryError> {
         let active_count = self.vectors.len() - self.removed_indices.len();
         let required_bytes = active_count as u64 * self.bytes_per_vector;
 
@@ -246,7 +246,9 @@ impl GpuVectorStore {
         let bytes_used = vectors_resident as u64 * self.bytes_per_vector;
         let bytes_available = ctx.device.limits().max_storage_buffer_binding_size;
         let batches_required = if bytes_used > 0 {
-            bytes_used.div_ceil(self.max_buffer_size) as usize
+            // Saturates only where `usize` is narrower than `u64` and the count
+            // exceeds it; on 64-bit targets the conversion is always exact.
+            usize::try_from(bytes_used.div_ceil(self.max_buffer_size)).unwrap_or(usize::MAX)
         } else {
             0
         };
@@ -313,11 +315,11 @@ impl BatchedSearch {
         let bytes_per_vector = (vector_dim * std::mem::size_of::<f32>()) as u64;
         
         // Batch size: how many vectors fit in 80% of max buffer
-        let batch_size = if bytes_per_vector > 0 {
-            ((max_buffer_size * 80 / 100) / bytes_per_vector).max(1) as usize
-        } else {
-            1
-        };
+        // Zero-width vectors get a batch size of 1. The saturation applies only
+        // where `usize` is narrower than `u64`; on 64-bit targets it is exact.
+        let batch_size = (max_buffer_size * 80 / 100)
+            .checked_div(bytes_per_vector)
+            .map_or(1, |per_batch| usize::try_from(per_batch.max(1)).unwrap_or(usize::MAX));
 
         Self {
             batch_size,
