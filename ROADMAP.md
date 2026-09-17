@@ -6780,8 +6780,12 @@ keep the phases readable; promote individual items into a phase when they become
       *(same day)* The five API keys no longer go through `set_var`: `set_provider_api_key` writes the
       secure store and the GUI reads `config` (refilled from it). That also fixed a restart bug —
       `get_openai_models` and the Brave "key set" badge read **only** env, so a stored key vanished
-      from them after the GUI restarted. Still on `set_var`: the Claude proxy URL/flag (env is its
-      only store — it needs a config field) and `OLLAMA_HOST`. Precedence note: an `OPENAI_API_KEY`
+      from them after the GUI restarted. Still on `set_var`: `OLLAMA_HOST`, and the Claude proxy
+      URL/flag — which turned out to be **a setting nothing consumes**: no crate reads
+      `CLAUDE_PROXY_ENABLED`/`CLAUDE_PROXY_URL`, so the Settings → Models "Claude Proxy" toggle changes
+      the GUI's own environment, drives its health check, and routes no request through the proxy
+      (it is also forgotten on restart). **Owner decision:** wire it into the router as a provider, or
+      remove the toggle — not guessed at in a nightly run. Precedence note: an `OPENAI_API_KEY`
       exported before launch now wins over a key typed into Settings in the GUI process, as it
       already did in the daemon (`load_secrets_from_store` prefers env).
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
