@@ -57,8 +57,8 @@ pub fn f32_to_usize(x: f32) -> usize {
 }
 
 /// `x as u32` for an `f32`: truncates toward zero, saturates at `0` and
-/// `u32::MAX`, and maps NaN to `0` — the same as `x as u32`, because the
-/// `usize` it goes through is at least 32 bits wide.
+/// `u32::MAX`, and maps NaN to `0`. Identical to `x as u32` wherever `usize`
+/// is at least 32 bits wide — every target this crate (and tokio) builds for.
 pub fn f32_to_u32(x: f32) -> u32 {
     u32::try_from(f32_to_usize(x)).unwrap_or(u32::MAX)
 }
