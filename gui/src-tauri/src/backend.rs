@@ -183,6 +183,12 @@ impl Backend {
     }
 
     /// Send a raw request to the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A refused action comes back inside the
+    /// `Ok` reply.
     pub async fn daemon_request(&self, action: Value) -> Result<Value, String> {
         self.daemon_client.request(action).await
     }
@@ -206,155 +212,15 @@ impl Backend {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                match &event {
-                    DaemonEvent::MessageDelta { session_id, delta, .. } => {
-                        let _ = app.emit("stream-chunk", serde_json::json!({
-                            "session_id": session_id,
-                            "chunk": delta,
-                            "done": false,
-                        }));
+                if let DaemonEvent::ModelSwitch { model, .. } = &event {
+                    // Keep AppState's active_model in sync so get_model_status agrees.
+                    if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
+                        let active_model = Arc::clone(&state.read().await.active_model);
+                        active_model.write().await.clone_from(model);
                     }
-                    DaemonEvent::MessageEnd { session_id, .. } => {
-                        let _ = app.emit("stream-chunk", serde_json::json!({
-                            "session_id": session_id,
-                            "chunk": "",
-                            "done": true,
-                        }));
-                    }
-                    DaemonEvent::ThinkingDelta { session_id, delta, .. } => {
-                        let _ = app.emit("thinking-chunk", serde_json::json!({
-                            "session_id": session_id,
-                            "delta": delta,
-                        }));
-                    }
-                    DaemonEvent::ToolStart { session_id, call_id, name, input, model, tokens, total_tokens } => {
-                        let mut tool_call = serde_json::json!({
-                            "id": call_id,
-                            "name": name,
-                            "input": input,
-                            "output": "",
-                            "success": false,
-                            "duration_ms": 0,
-                        });
-                        if let Some(m) = &model {
-                            tool_call["model"] = serde_json::json!(m);
-                        }
-                        if let Some(t) = tokens {
-                            tool_call["tokens"] = serde_json::json!(t);
-                        }
-                        if let Some(t) = total_tokens {
-                            tool_call["total_tokens"] = serde_json::json!(t);
-                        }
-                        let _ = app.emit("tool-call", serde_json::json!({
-                            "session_id": session_id,
-                            "tool_call": tool_call,
-                            "status": "started",
-                        }));
-                    }
-                    DaemonEvent::ToolEnd { session_id, call_id, output, success, duration_ms, data } => {
-                        let mut tool_call = serde_json::json!({
-                            "id": call_id,
-                            "output": output,
-                            "success": success,
-                            "duration_ms": duration_ms.unwrap_or(0),
-                        });
-                        if let Some(d) = data {
-                            tool_call["data"] = d.clone();
-                        }
-                        let _ = app.emit("tool-call", serde_json::json!({
-                            "session_id": session_id,
-                            "tool_call": tool_call,
-                            "status": if *success { "completed" } else { "error" },
-                        }));
-                    }
-                    DaemonEvent::ModelSwitch { model, reason } => {
-                        // Keep AppState's active_model in sync so get_model_status agrees.
-                        if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
-                            let state_guard = state.read().await;
-                            let mut active = state_guard.active_model.write().await;
-                            *active = model.clone();
-                        }
-                        let _ = app.emit("model-status", serde_json::json!({
-                            "active_model": model,
-                            "fallback_reason": reason,
-                            "rate_limited_models": [],
-                        }));
-                    }
-                    DaemonEvent::Error { code, message, session_id } => {
-                        let _ = app.emit("error", serde_json::json!({
-                            "code": code,
-                            "message": message,
-                            "session_id": session_id,
-                        }));
-                    }
-                    DaemonEvent::WorkspacesChanged => {
-                        // The frontend re-fetches; `list_workspaces` reads
-                        // through to the daemon, so no payload is needed and
-                        // this client's own active selection is untouched.
-                        let _ = app.emit("workspaces-changed", ());
-                    }
-                    DaemonEvent::ConfigChanged => {
-                        // Same shape as workspaces-changed: payload-free, each
-                        // view re-fetches the config slice it renders instead
-                        // of showing whatever it read at mount.
-                        let _ = app.emit("config-changed", ());
-                    }
-                    DaemonEvent::ContextUsage { session_id, used, window } => {
-                        let _ = app.emit("context-usage", serde_json::json!({
-                            "session_id": session_id,
-                            "used": used,
-                            "window": window,
-                        }));
-                    }
-                    DaemonEvent::LivenessBeat {
-                        session_id, elapsed_s, phase, awaiting, quiet_s, step_index, last_tool, beat,
-                    } => {
-                        // Forwarded whole rather than reduced to a spinner
-                        // flag: the badge's job is to say what the turn is
-                        // waiting on, and every field here is part of that
-                        // sentence. Nulls stay null — "not reported" and
-                        // "zero seconds" are different claims.
-                        let _ = app.emit("liveness-beat", serde_json::json!({
-                            "session_id": session_id,
-                            "elapsed_s": elapsed_s,
-                            "phase": phase,
-                            "awaiting": awaiting,
-                            "quiet_s": quiet_s,
-                            "step_index": step_index,
-                            "last_tool": last_tool,
-                            "beat": beat,
-                        }));
-                    }
-                    DaemonEvent::TaskRunStarted { scope, scope_id, goal } => {
-                        let _ = app.emit("task-event", serde_json::json!({
-                            "kind": "run_started",
-                            "scope": scope,
-                            "scope_id": scope_id,
-                            "goal": goal,
-                        }));
-                    }
-                    DaemonEvent::TaskRunProgress { scope, scope_id, task_id, kind, detail } => {
-                        // The daemon's own `kind` (started/completed/replanned/...)
-                        // is forwarded as `progress_kind`; the payload's `kind` is
-                        // the task-event discriminator.
-                        let _ = app.emit("task-event", serde_json::json!({
-                            "kind": "run_progress",
-                            "scope": scope,
-                            "scope_id": scope_id,
-                            "task_id": task_id,
-                            "progress_kind": kind,
-                            "detail": detail,
-                        }));
-                    }
-                    DaemonEvent::TaskRunCompleted { scope, scope_id, report } => {
-                        let _ = app.emit("task-event", serde_json::json!({
-                            "kind": "run_completed",
-                            "scope": scope,
-                            "scope_id": scope_id,
-                            "report": report,
-                        }));
-                    }
-                    _ => {}
+                }
+                if let Some((name, payload)) = tauri_event_for(&event) {
+                    let _ = app.emit(name, payload);
                 }
             }
         });
@@ -365,12 +231,24 @@ impl Backend {
     // =========================================================================
 
     /// Cancel an active chat.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A reply whose `status` is anything but
+    /// `cancelled` (no turn was running) is `Ok(false)`, not an error.
     pub async fn chat_cancel(&self, session_id: &str) -> Result<bool, String> {
         let val = self.daemon_client.chat_cancel(session_id).await?;
         Ok(val.get("status").and_then(|s| s.as_str()) == Some("cancelled"))
     }
 
     /// Get daemon logs.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A reply without a `logs` array is an
+    /// empty list.
     pub async fn get_logs(&self, limit: Option<usize>) -> Result<Vec<Value>, String> {
         let val = self.daemon_client.system_logs(limit).await?;
         Ok(val
@@ -381,8 +259,161 @@ impl Backend {
     }
 
     /// Get system status.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request.
     pub async fn system_status(&self) -> Result<Value, String> {
         self.daemon_client.system_status().await
+    }
+}
+
+/// The Tauri window event a daemon event is forwarded as — its name and JSON
+/// payload — or `None` for daemon events the frontend does not consume.
+///
+/// Payload-free events carry JSON `null`, which is what emitting `()` sends.
+fn tauri_event_for(event: &DaemonEvent) -> Option<(&'static str, Value)> {
+    let forwarded = match event {
+        DaemonEvent::MessageDelta { session_id, delta, .. } => ("stream-chunk", serde_json::json!({
+            "session_id": session_id,
+            "chunk": delta,
+            "done": false,
+        })),
+        DaemonEvent::MessageEnd { session_id, .. } => ("stream-chunk", serde_json::json!({
+            "session_id": session_id,
+            "chunk": "",
+            "done": true,
+        })),
+        DaemonEvent::ThinkingDelta { session_id, delta, .. } => ("thinking-chunk", serde_json::json!({
+            "session_id": session_id,
+            "delta": delta,
+        })),
+        DaemonEvent::ToolStart { .. } | DaemonEvent::ToolEnd { .. } => ("tool-call", tool_call_payload(event)?),
+        DaemonEvent::ModelSwitch { model, reason } => ("model-status", serde_json::json!({
+            "active_model": model,
+            "fallback_reason": reason,
+            "rate_limited_models": [],
+        })),
+        DaemonEvent::Error { code, message, session_id } => ("error", serde_json::json!({
+            "code": code,
+            "message": message,
+            "session_id": session_id,
+        })),
+        // The frontend re-fetches; `list_workspaces` reads through to the
+        // daemon, so no payload is needed and this client's own active
+        // selection is untouched.
+        DaemonEvent::WorkspacesChanged => ("workspaces-changed", Value::Null),
+        // Same shape as workspaces-changed: payload-free, each view re-fetches
+        // the config slice it renders instead of showing whatever it read at
+        // mount.
+        DaemonEvent::ConfigChanged => ("config-changed", Value::Null),
+        DaemonEvent::ContextUsage { session_id, used, window } => ("context-usage", serde_json::json!({
+            "session_id": session_id,
+            "used": used,
+            "window": window,
+        })),
+        DaemonEvent::LivenessBeat {
+            session_id, elapsed_s, phase, awaiting, quiet_s, step_index, last_tool, beat,
+        } => {
+            // Forwarded whole rather than reduced to a spinner flag: the
+            // badge's job is to say what the turn is waiting on, and every
+            // field here is part of that sentence. Nulls stay null — "not
+            // reported" and "zero seconds" are different claims.
+            ("liveness-beat", serde_json::json!({
+                "session_id": session_id,
+                "elapsed_s": elapsed_s,
+                "phase": phase,
+                "awaiting": awaiting,
+                "quiet_s": quiet_s,
+                "step_index": step_index,
+                "last_tool": last_tool,
+                "beat": beat,
+            }))
+        }
+        DaemonEvent::TaskRunStarted { .. }
+        | DaemonEvent::TaskRunProgress { .. }
+        | DaemonEvent::TaskRunCompleted { .. } => ("task-event", task_event_payload(event)?),
+        _ => return None,
+    };
+    Some(forwarded)
+}
+
+/// The `tool-call` payload for a tool start or end; `None` for any other event.
+fn tool_call_payload(event: &DaemonEvent) -> Option<Value> {
+    match event {
+        DaemonEvent::ToolStart { session_id, call_id, name, input, model, tokens, total_tokens } => {
+            let mut tool_call = serde_json::json!({
+                "id": call_id,
+                "name": name,
+                "input": input,
+                "output": "",
+                "success": false,
+                "duration_ms": 0,
+            });
+            if let Some(m) = model {
+                tool_call["model"] = serde_json::json!(m);
+            }
+            if let Some(t) = tokens {
+                tool_call["tokens"] = serde_json::json!(t);
+            }
+            if let Some(t) = total_tokens {
+                tool_call["total_tokens"] = serde_json::json!(t);
+            }
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "tool_call": tool_call,
+                "status": "started",
+            }))
+        }
+        DaemonEvent::ToolEnd { session_id, call_id, output, success, duration_ms, data } => {
+            let mut tool_call = serde_json::json!({
+                "id": call_id,
+                "output": output,
+                "success": success,
+                "duration_ms": duration_ms.unwrap_or(0),
+            });
+            if let Some(d) = data {
+                tool_call["data"] = d.clone();
+            }
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "tool_call": tool_call,
+                "status": if *success { "completed" } else { "error" },
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// The `task-event` payload for a task-run lifecycle event; `None` for any
+/// other event.
+fn task_event_payload(event: &DaemonEvent) -> Option<Value> {
+    match event {
+        DaemonEvent::TaskRunStarted { scope, scope_id, goal } => Some(serde_json::json!({
+            "kind": "run_started",
+            "scope": scope,
+            "scope_id": scope_id,
+            "goal": goal,
+        })),
+        // The daemon's own `kind` (started/completed/replanned/...) is
+        // forwarded as `progress_kind`; the payload's `kind` is the task-event
+        // discriminator.
+        DaemonEvent::TaskRunProgress { scope, scope_id, task_id, kind, detail } => Some(serde_json::json!({
+            "kind": "run_progress",
+            "scope": scope,
+            "scope_id": scope_id,
+            "task_id": task_id,
+            "progress_kind": kind,
+            "detail": detail,
+        })),
+        DaemonEvent::TaskRunCompleted { scope, scope_id, report } => Some(serde_json::json!({
+            "kind": "run_completed",
+            "scope": scope,
+            "scope_id": scope_id,
+            "report": report,
+        })),
+        _ => None,
     }
 }
 
@@ -405,6 +436,12 @@ macro_rules! daemon_proxies {
         impl Backend {
             $(
                 $(#[$meta])*
+                ///
+                /// # Errors
+                ///
+                /// Fails as the identically named [`DaemonClient`] method
+                /// does: no daemon connection, or a dropped or timed-out
+                /// request. A refused action comes back inside the `Ok` reply.
                 pub async fn $name(&self $(, $arg: $ty )* ) -> Result<Value, String> {
                     self.daemon_client.$name( $( $arg ),* ).await
                 }
@@ -562,5 +599,104 @@ daemon_proxies! {
 impl Default for Backend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Payload-free events used to be emitted with `()`; the table carries JSON
+    /// `null` instead, which is the same bytes on the wire.
+    #[test]
+    fn payload_free_events_forward_null() {
+        assert_eq!(
+            tauri_event_for(&DaemonEvent::WorkspacesChanged),
+            Some(("workspaces-changed", Value::Null))
+        );
+        assert_eq!(
+            tauri_event_for(&DaemonEvent::ConfigChanged),
+            Some(("config-changed", Value::Null))
+        );
+        assert_eq!(
+            serde_json::to_string(&()).expect("unit serializes"),
+            serde_json::to_string(&Value::Null).expect("null serializes")
+        );
+    }
+
+    /// A tool start without model/token figures must not grow those keys: the
+    /// frontend reads their presence as "reported".
+    #[test]
+    fn tool_start_carries_only_the_reported_figures() {
+        let event = DaemonEvent::ToolStart {
+            session_id: "s".to_string(),
+            call_id: "c".to_string(),
+            name: "exec".to_string(),
+            input: None,
+            model: None,
+            tokens: Some(7),
+            total_tokens: None,
+        };
+        let (name, payload) = tauri_event_for(&event).expect("tool start is forwarded");
+        assert_eq!(name, "tool-call");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "session_id": "s",
+                "tool_call": {
+                    "id": "c",
+                    "name": "exec",
+                    "input": null,
+                    "output": "",
+                    "success": false,
+                    "duration_ms": 0,
+                    "tokens": 7,
+                },
+                "status": "started",
+            })
+        );
+    }
+
+    /// A failed tool end reports `error`, and its missing duration reads as 0.
+    #[test]
+    fn failed_tool_end_reports_error_status() {
+        let event = DaemonEvent::ToolEnd {
+            session_id: "s".to_string(),
+            call_id: "c".to_string(),
+            output: "boom".to_string(),
+            success: false,
+            duration_ms: None,
+            data: None,
+        };
+        let (_, payload) = tauri_event_for(&event).expect("tool end is forwarded");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["tool_call"]["duration_ms"], 0);
+        assert!(payload["tool_call"].get("data").is_none());
+    }
+
+    /// Progress keeps the daemon's own kind under `progress_kind`.
+    #[test]
+    fn task_progress_moves_the_daemon_kind_aside() {
+        let event = DaemonEvent::TaskRunProgress {
+            scope: "session".to_string(),
+            scope_id: None,
+            task_id: Some(3),
+            kind: "replanned".to_string(),
+            detail: serde_json::json!({}),
+        };
+        let (name, payload) = tauri_event_for(&event).expect("progress is forwarded");
+        assert_eq!(name, "task-event");
+        assert_eq!(payload["kind"], "run_progress");
+        assert_eq!(payload["progress_kind"], "replanned");
+    }
+
+    #[test]
+    fn events_the_window_does_not_consume_are_not_forwarded() {
+        assert_eq!(tauri_event_for(&DaemonEvent::Unknown), None);
+        let start = DaemonEvent::MessageStart {
+            session_id: "s".to_string(),
+            message_id: "m".to_string(),
+        };
+        assert_eq!(tauri_event_for(&start), None);
     }
 }

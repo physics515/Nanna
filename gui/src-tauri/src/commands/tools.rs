@@ -62,35 +62,63 @@ fn parse_user_tools(result: &serde_json::Value) -> Result<Vec<UserToolMeta>, Str
         .map_err(|e| format!("Failed to parse daemon response: {e}"))
 }
 
+/// List the user-authored tools the daemon knows.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.list_user` request is
+/// dropped or times out. Fails with `Failed to parse daemon response: …` when
+/// the reply's `tools` entries do not match [`UserToolMeta`]; a reply without
+/// `tools` lists none.
 #[tauri::command]
 pub async fn list_user_tools_cmd(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<UserToolMeta>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.tool_list_user().await?;
+    let result = backend_handle(&state).await.tool_list_user().await?;
     parse_user_tools(&result)
 }
 
+/// Look up one user-authored tool by name.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.list_user` request is
+/// dropped or times out. Fails with `Failed to parse daemon response: …` when
+/// the reply's `tools` entries do not match [`UserToolMeta`]; a reply without
+/// `tools` lists none. An unknown name is `Ok(None)`.
 #[tauri::command]
 pub async fn get_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<Option<UserToolMeta>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.tool_list_user().await?;
+    let result = backend_handle(&state).await.tool_list_user().await?;
     let tools = parse_user_tools(&result)?;
     Ok(tools.into_iter().find(|t| t.name == name))
 }
 
+/// Fetch a tool's source code from the daemon.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.get_source` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn get_tool_source(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.tool_get_source(&name).await
+    backend_handle(&state).await.tool_get_source(&name).await
 }
 
+/// Create a user-authored tool from its source.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.create` request is
+/// dropped or times out. Fails with `Failed to parse daemon response: …` when
+/// neither the reply's `tool` object nor the reply itself parses as
+/// [`UserToolMeta`] — which is how a refusal reported in the reply surfaces.
 #[tauri::command]
 pub async fn create_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -101,13 +129,20 @@ pub async fn create_user_tool(
     parameters: Option<serde_json::Value>,
 ) -> Result<UserToolMeta, String> {
     let _ = (language, parameters); // daemon derives language/params from source
-    let state_guard = state.read().await;
     // Daemon tool_create uses (name, description, code, needs_shell).
-    let result = state_guard.backend.tool_create(&name, &description, &source, None).await?;
+    let result = backend_handle(&state).await.tool_create(&name, &description, &source, None).await?;
     let tool = result.get("tool").cloned().unwrap_or(result);
     serde_json::from_value(tool).map_err(|e| format!("Failed to parse daemon response: {e}"))
 }
 
+/// Update a user-authored tool's description and/or source.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.update` request is
+/// dropped or times out. Fails with `Failed to parse daemon response: …` when
+/// neither the reply's `tool` object nor the reply itself parses as
+/// [`UserToolMeta`] — which is how a refusal reported in the reply surfaces.
 #[tauri::command]
 pub async fn update_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -118,34 +153,47 @@ pub async fn update_user_tool(
     enabled: Option<bool>,
 ) -> Result<UserToolMeta, String> {
     let _ = (parameters, enabled); // not exposed over the daemon tool_update action
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .tool_update(&name, description.as_deref(), source.as_deref(), None)
         .await?;
     let tool = result.get("tool").cloned().unwrap_or(result);
     serde_json::from_value(tool).map_err(|e| format!("Failed to parse daemon response: {e}"))
 }
 
+/// Delete a user-authored tool.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.delete` request is
+/// dropped or times out. A refusal the daemon reports in its reply (an unknown
+/// name, say) is not checked and still returns `Ok`.
 #[tauri::command]
 pub async fn delete_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard.backend.tool_delete(&name).await?;
+    backend_handle(&state).await.tool_delete(&name).await?;
     Ok(())
 }
 
+/// Run tool source against sample input without saving it.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.test` request is
+/// dropped or times out. Fails with `Invalid response from daemon` when the
+/// reply has no `output` string, a refusal reported in the reply included.
 #[tauri::command]
 pub async fn test_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     source: String,
-    input: std::collections::HashMap<String, serde_json::Value>,
+    input: serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, String> {
-    let state_guard = state.read().await;
-    let input_value = serde_json::to_value(&input).map_err(|e| format!("Failed to serialize input: {e}"))?;
-    let result = state_guard.backend.tool_test(&source, input_value).await?;
+    let result = backend_handle(&state)
+        .await
+        .tool_test(&source, serde_json::Value::Object(input))
+        .await?;
     result
         .get("output")
         .and_then(|v| v.as_str())
@@ -158,27 +206,18 @@ pub async fn test_user_tool(
 // =============================================================================
 
 /// List all registered tools.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.list` request is
+/// dropped or times out. Fails with `Failed to fetch tools from daemon` when
+/// the reply has no `tools` array.
 #[tauri::command]
 pub async fn list_tools(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ToolInfo>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.tool_list().await?;
-    let tools = result
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| {
-                    Some(ToolInfo {
-                        name: t.get("name")?.as_str()?.to_string(),
-                        description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        enabled: t.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
-                        is_user_tool: t.get("is_user_tool").and_then(serde_json::Value::as_bool).unwrap_or(false),
-                    })
-                })
-                .collect()
-        })
+    let result = backend_handle(&state).await.tool_list().await?;
+    let tools = crate::commands::settings::tool_infos(&result)
         .ok_or("Failed to fetch tools from daemon")?;
     Ok(tools)
 }
@@ -194,14 +233,19 @@ pub async fn list_tools(
 /// refusal arrives as `{"error": ...}` with a 200-equivalent envelope. Surface
 /// it as `Err` — a toggle that silently fails to move is the failure mode this
 /// whole path exists to avoid, and the switch must snap back rather than lie.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.enable` /
+/// `tool.disable` request is dropped or times out. Fails with `Failed to enable
+/// '<name>': …` (or `disable`) when the daemon refuses the toggle.
 #[tauri::command]
 pub async fn set_tool_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.tool_set_enabled(&name, enabled).await?;
+    let result = backend_handle(&state).await.tool_set_enabled(&name, enabled).await?;
 
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
         let detail = result
@@ -216,13 +260,18 @@ pub async fn set_tool_enabled(
 }
 
 /// Get details of a specific tool.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.get` request is dropped
+/// or times out. A refusal the daemon reports in its reply is passed through
+/// inside `Ok`.
 #[tauri::command]
 pub async fn get_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "tool",
         "action": "get",
         "name": name,
@@ -240,14 +289,19 @@ pub async fn get_tool(
 /// (`unparseable`, `reached_oldest`, …). A viewer that renders only the records
 /// cannot tell a complete history from one screenful, so those fields are the
 /// difference between a log and an audit.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `tool.audit` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn get_tool_audit(
     state: State<'_, Arc<RwLock<AppState>>>,
     limit: Option<usize>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .daemon_request(serde_json::json!({
             "type": "tool",
             "action": "audit",
@@ -289,12 +343,16 @@ pub(crate) async fn get_skills_path(state: &AppState) -> std::path::PathBuf {
 }
 
 /// List all skills in the workspace `skills/` directory.
+///
+/// # Errors
+///
+/// Never returns `Err`: a skills directory that cannot be created is logged and
+/// lists no skills, and a skill whose file cannot be read lists without code.
 #[tauri::command]
 pub async fn list_skills(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<SkillListResult, String> {
-    let state_guard = state.read().await;
-    let skills_path = get_skills_path(&state_guard).await;
+    let skills_path = get_skills_path(&*state.read().await).await;
 
     if !skills_path.exists()
         && let Err(e) = std::fs::create_dir_all(&skills_path) {
@@ -338,6 +396,14 @@ pub async fn list_skills(
 }
 
 /// Create a new skill in the workspace.
+///
+/// # Errors
+///
+/// Fails when `name` has characters other than lowercase ASCII letters, digits,
+/// `_` and `-`; when a skill of that name already exists; when the skill
+/// directory cannot be created; when `skill_type` is neither `manifest` nor
+/// `script` (checked after the directory is created, which is then left empty);
+/// and when the skill file cannot be written.
 #[tauri::command]
 pub async fn create_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -345,13 +411,11 @@ pub async fn create_skill(
     skill_type: String,
     code: String,
 ) -> Result<SkillInfo, String> {
-    let state_guard = state.read().await;
-
     if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
         return Err("Skill name must be lowercase alphanumeric with underscores or hyphens".to_string());
     }
 
-    let skills_path = get_skills_path(&state_guard).await;
+    let skills_path = get_skills_path(&*state.read().await).await;
     let skill_dir = skills_path.join(&name);
     if skill_dir.exists() {
         return Err(format!("Skill '{name}' already exists"));
@@ -379,14 +443,19 @@ pub async fn create_skill(
 }
 
 /// Update an existing skill's code.
+///
+/// # Errors
+///
+/// Fails when no skill directory named `name` exists, when it holds none of
+/// `tool.ts`, `tool.js`, `tool.yaml` and `tool.yml`, and when that file cannot
+/// be written.
 #[tauri::command]
 pub async fn update_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
     code: String,
 ) -> Result<SkillInfo, String> {
-    let state_guard = state.read().await;
-    let skills_path = get_skills_path(&state_guard).await;
+    let skills_path = get_skills_path(&*state.read().await).await;
 
     let skill_dir = skills_path.join(&name);
     if !skill_dir.exists() {
@@ -425,13 +494,20 @@ pub async fn update_skill(
 /// Hardens the delete path against symlink escapes: the skill name is sanitized
 /// so `$skills_path/<name>` cannot resolve outside the skills root, and
 /// symlinked skill directories (or symlink children) are refused.
+///
+/// # Errors
+///
+/// Fails when `name` is empty after trimming, contains `/`, `\` or `..`, or has
+/// characters other than ASCII letters, digits, `-`, `_` and `.`; when the
+/// skills directory does not exist or cannot be resolved; when no such skill
+/// exists or it is not a directory; when it or any direct child is a symlink,
+/// or it resolves outside the skills directory; and when reading or removing it
+/// fails.
 #[tauri::command]
 pub async fn delete_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-
     let name = name.trim();
     if name.is_empty() {
         return Err("Skill name must be non-empty".into());
@@ -447,12 +523,12 @@ pub async fn delete_skill(
         ));
     }
 
-    let skills_path = get_skills_path(&state_guard).await;
+    let skills_path = get_skills_path(&*state.read().await).await;
     let skills_root = if skills_path.exists() {
         std::fs::canonicalize(&skills_path)
             .map_err(|e| format!("Failed to resolve skills directory: {e}"))?
     } else {
-        return Err(format!("Skills directory {skills_path:?} does not exist"));
+        return Err(format!("Skills directory \"{}\" does not exist", skills_path.display()));
     };
 
     let skill_dir = skills_root.join(name);
@@ -482,8 +558,8 @@ pub async fn delete_skill(
         let ft = entry.file_type().map_err(|e| format!("Failed to stat skill entry: {e}"))?;
         if ft.is_symlink() {
             return Err(format!(
-                "Refusing to delete skill '{name}': contains symlink child '{:?}'",
-                entry.file_name()
+                "Refusing to delete skill '{name}': contains symlink child '{}'",
+                entry.file_name().display()
             ));
         }
     }
@@ -494,20 +570,28 @@ pub async fn delete_skill(
 }
 
 /// Test a skill with sample input.
+///
+/// # Errors
+///
+/// For a `script`: fails when the daemon cannot be reached or the `tool.test`
+/// request is dropped or times out. It also fails with `Invalid response from
+/// daemon` when the reply has no `output` string. For a `manifest`: fails with
+/// `Invalid YAML: …` when `code` does not parse. Any other `skill_type` fails
+/// with `Unknown skill type: …`.
 #[tauri::command]
 pub async fn test_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     code: String,
     skill_type: String,
-    input: std::collections::HashMap<String, serde_json::Value>,
+    input: serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, String> {
     match skill_type.as_str() {
         "script" => {
             // Run the script through the daemon's tool sandbox.
-            let state_guard = state.read().await;
-            let input_value =
-                serde_json::to_value(&input).map_err(|e| format!("Failed to serialize input: {e}"))?;
-            let result = state_guard.backend.tool_test(&code, input_value).await?;
+            let result = backend_handle(&state)
+                .await
+                .tool_test(&code, serde_json::Value::Object(input))
+                .await?;
             result
                 .get("output")
                 .and_then(|v| v.as_str())

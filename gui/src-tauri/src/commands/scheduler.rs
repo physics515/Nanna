@@ -12,7 +12,7 @@
 use crate::*;
 
 /// Persist the `[scheduler]` section and make the daemon adopt it live.
-async fn save_scheduler_config(state: &mut AppState) -> Result<(), String> {
+async fn save_scheduler_config(state: &AppState) -> Result<(), String> {
     state.config.save().map_err(|e| {
         warn!("Failed to save scheduler settings to config: {e}");
         format!("Failed to save scheduler settings: {e}")
@@ -29,6 +29,13 @@ async fn save_scheduler_config(state: &mut AppState) -> Result<(), String> {
 }
 
 /// Enable/disable the whole scheduler (heartbeat, cron, consolidation, sweeps).
+///
+/// # Errors
+///
+/// Returns `Failed to save scheduler settings: …` when `config.toml` cannot be
+/// written, and `Saved, but the daemon did not pick it up: …` when the daemon
+/// cannot be reached or the `config.reload` request is dropped or times out —
+/// the setting is then on disk but not yet live.
 #[tauri::command]
 pub async fn set_scheduler_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -36,12 +43,20 @@ pub async fn set_scheduler_enabled(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.scheduler.enabled = enabled;
-    save_scheduler_config(&mut state_guard).await?;
+    save_scheduler_config(&state_guard).await?;
+    drop(state_guard);
     info!("Scheduler enabled: {enabled}");
     Ok(())
 }
 
 /// Enable/disable the periodic heartbeat.
+///
+/// # Errors
+///
+/// Returns `Failed to save scheduler settings: …` when `config.toml` cannot be
+/// written, and `Saved, but the daemon did not pick it up: …` when the daemon
+/// cannot be reached or the `config.reload` request is dropped or times out —
+/// the setting is then on disk but not yet live.
 #[tauri::command]
 pub async fn set_heartbeat_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -49,12 +64,18 @@ pub async fn set_heartbeat_enabled(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.scheduler.heartbeat_enabled = enabled;
-    save_scheduler_config(&mut state_guard).await?;
+    save_scheduler_config(&state_guard).await?;
+    drop(state_guard);
     info!("Heartbeat enabled: {enabled}");
     Ok(())
 }
 
 /// Set the heartbeat interval, in seconds.
+///
+/// # Errors
+///
+/// Rejects an interval below `nanna_core::MIN_HEARTBEAT_INTERVAL_SECS` without
+/// saving anything. Otherwise fails as [`set_scheduler_enabled`] does.
 #[tauri::command]
 pub async fn set_heartbeat_interval(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -70,7 +91,8 @@ pub async fn set_heartbeat_interval(
     }
     let mut state_guard = state.write().await;
     state_guard.config.scheduler.heartbeat_interval_secs = seconds;
-    save_scheduler_config(&mut state_guard).await?;
+    save_scheduler_config(&state_guard).await?;
+    drop(state_guard);
     info!("Heartbeat interval: {seconds}s");
     Ok(())
 }
@@ -132,12 +154,16 @@ pub(crate) fn cron_job_info_from_daemon(job: &serde_json::Value) -> Option<CronJ
 }
 
 /// Get all scheduled jobs.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.list` request is
+/// dropped or times out. A reply without a `jobs` array lists nothing.
 #[tauri::command]
 pub async fn list_cron_jobs(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<CronJobInfo>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.scheduler_list().await?;
+    let result = backend_handle(&state).await.scheduler_list().await?;
     let jobs = result
         .get("jobs")
         .and_then(|v| v.as_array())
@@ -147,6 +173,14 @@ pub async fn list_cron_jobs(
 }
 
 /// Create a new cron job.
+///
+/// # Errors
+///
+/// Fails with the parser's message when `schedule` is not a valid cron
+/// expression, before the daemon is contacted. Fails when the daemon cannot be
+/// reached or the `scheduler.add` request is dropped or times out. Fails with
+/// `Daemon failed to create cron job: …` when the reply reports an `error`, and
+/// with `Daemon returned no job id` when it has no `id`.
 #[tauri::command]
 pub async fn create_cron_job(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -161,9 +195,8 @@ pub async fn create_cron_job(
     let parsed = CronExpr::parse(&schedule).map_err(|e| e.to_string())?;
     let next_run = parsed.next_from_now();
 
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .scheduler_add(&schedule, &payload, Some(&name))
         .await?;
     if result.get("error").is_some() {
@@ -192,15 +225,20 @@ pub async fn create_cron_job(
 }
 
 /// Update a cron job's schedule.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.update` request is
+/// dropped or times out. Also fails with the daemon's `message` when its reply
+/// reports an error other than `not_found`; an unknown job is `Ok(false)`.
 #[tauri::command]
 pub async fn update_cron_job(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
     schedule: String,
 ) -> Result<bool, String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .scheduler_update(&job_id, Some(&schedule), None, None)
         .await?;
     match result.get("error").and_then(|v| v.as_str()) {
@@ -215,40 +253,56 @@ pub async fn update_cron_job(
 }
 
 /// Enable or disable a cron job.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.update` request is
+/// dropped or times out. A refusal the daemon reports in its reply (an unknown
+/// id, say) is not checked and still returns `Ok`.
 #[tauri::command]
 pub async fn set_cron_job_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .scheduler_update(&job_id, None, None, Some(enabled))
         .await?;
     Ok(())
 }
 
 /// Delete a cron job.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.remove` request is
+/// dropped or times out. A job the daemon does not report `deleted` is
+/// `Ok(false)`.
 #[tauri::command]
 pub async fn delete_cron_job(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
 ) -> Result<bool, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.scheduler_remove(&job_id).await?;
+    let result = backend_handle(&state).await.scheduler_remove(&job_id).await?;
     Ok(result.get("status").and_then(|v| v.as_str()) == Some("deleted"))
 }
 
 /// Delete all cron jobs with a given name (useful for cleanup).
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.list` request, or
+/// any `scheduler.remove` that follows it, is dropped or times out. Removals
+/// made before such a failure stand.
 #[tauri::command]
 pub async fn delete_cron_jobs_by_name(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<usize, String> {
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
     // No by-name removal over IPC — list, filter, remove each.
-    let result = state_guard.backend.scheduler_list().await?;
+    let result = backend.scheduler_list().await?;
     let ids: Vec<String> = result
         .get("jobs")
         .and_then(|v| v.as_array())
@@ -261,7 +315,7 @@ pub async fn delete_cron_jobs_by_name(
         .unwrap_or_default();
     let mut removed = 0;
     for id in &ids {
-        let result = state_guard.backend.scheduler_remove(id).await?;
+        let result = backend.scheduler_remove(id).await?;
         if result.get("status").and_then(|v| v.as_str()) == Some("deleted") {
             removed += 1;
         }
@@ -270,13 +324,17 @@ pub async fn delete_cron_jobs_by_name(
 }
 
 /// Run a cron job immediately.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.run_now` request
+/// is dropped or times out. A refusal reported in the reply is `Ok(None)`.
 #[tauri::command]
 pub async fn run_cron_job_now(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
 ) -> Result<Option<JobRunInfo>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.scheduler_run_now(&job_id).await?;
+    let result = backend_handle(&state).await.scheduler_run_now(&job_id).await?;
     if result.get("error").is_some() {
         return Ok(None);
     }
@@ -294,14 +352,19 @@ pub async fn run_cron_job_now(
 }
 
 /// Get job run history.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `scheduler.history` request
+/// is dropped or times out. A reply without a `history` array is an empty
+/// history.
 #[tauri::command]
 pub async fn get_cron_job_history(
     state: State<'_, Arc<RwLock<AppState>>>,
     job_id: String,
     limit: Option<usize>,
 ) -> Result<Vec<JobRunInfo>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.scheduler_history(&job_id, limit).await?;
+    let result = backend_handle(&state).await.scheduler_history(&job_id, limit).await?;
     let runs = result
         .get("history")
         .and_then(|v| v.as_array())
@@ -324,6 +387,10 @@ pub async fn get_cron_job_history(
 }
 
 /// Validate a cron expression.
+///
+/// # Errors
+///
+/// Never returns `Err`: an invalid expression is `Ok((false, reason))`.
 #[tauri::command]
 pub async fn validate_cron_expression(expression: String) -> Result<(bool, String), String> {
     use nanna_core::CronExpr;
