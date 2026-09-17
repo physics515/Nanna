@@ -57,6 +57,8 @@ conversation plus each file's first version, 256 MiB per conversation, 1 GiB ove
 (cancel what Nanna is doing in that chat), `/model <name>` to pin that conversation's model
 (`/model default` undoes it), `/help`.
 
+**Export a chat** to Markdown or JSON from the session menu.
+
 **Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet
 heartbeat posts nothing.
 
