@@ -4,6 +4,11 @@
 use crate::*;
 
 /// Show the main window (called from system tray)
+///
+/// # Errors
+///
+/// Returns the window error's text when showing or focusing the main window
+/// fails. A missing main window is not an error.
 #[tauri::command]
 pub async fn show_window(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
@@ -14,6 +19,11 @@ pub async fn show_window(app: AppHandle) -> Result<(), String> {
 }
 
 /// Hide the main window to tray
+///
+/// # Errors
+///
+/// Returns the window error's text when hiding the main window fails. A missing
+/// main window is not an error.
 #[tauri::command]
 pub async fn hide_to_tray(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
@@ -27,6 +37,11 @@ pub async fn hide_to_tray(app: AppHandle) -> Result<(), String> {
 // =============================================================================
 
 /// Send a native notification
+///
+/// # Errors
+///
+/// Returns `Failed to send notification: …` when the notification plugin cannot
+/// show the notification on this platform.
 #[tauri::command]
 pub async fn send_notification(
     app: AppHandle,
@@ -47,6 +62,11 @@ pub async fn send_notification(
 }
 
 /// Request notification permission (needed on some platforms)
+///
+/// # Errors
+///
+/// Returns `Failed to request permission: …` when the notification plugin
+/// cannot ask the platform. A refusal is `Ok(false)`.
 #[tauri::command]
 pub async fn request_notification_permission(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_notification::NotificationExt;
@@ -59,6 +79,11 @@ pub async fn request_notification_permission(app: AppHandle) -> Result<bool, Str
 }
 
 /// Check if notifications are permitted
+///
+/// # Errors
+///
+/// Returns `Failed to check permission: …` when the notification plugin cannot
+/// read the platform's permission state.
 #[tauri::command]
 pub async fn check_notification_permission(app: AppHandle) -> Result<String, String> {
     use tauri_plugin_notification::NotificationExt;
@@ -79,6 +104,11 @@ pub async fn check_notification_permission(app: AppHandle) -> Result<String, Str
 // =============================================================================
 
 /// Get current model status (active model, rate-limited models)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_model_status(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -94,6 +124,8 @@ pub async fn get_model_status(
         .filter(|(_, until)| now < **until)
         .map(|(model, _)| model.clone())
         .collect();
+    drop(rate_limited);
+    drop(state_guard);
 
     Ok(ModelStatusEvent {
         active_model: active,
@@ -103,19 +135,25 @@ pub async fn get_model_status(
 }
 
 /// Clear rate limit for a specific model (or all if model is None)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn clear_rate_limit(
     state: State<'_, Arc<RwLock<AppState>>>,
     model: Option<String>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    let mut rate_limited = state_guard.rate_limited_models.write().await;
+    // Only this map is mutated, and its own lock serializes that; nothing
+    // else needs the app-state lock held meanwhile.
+    let rate_limited_models = Arc::clone(&state.read().await.rate_limited_models);
 
     if let Some(model_id) = model {
-        rate_limited.remove(&model_id);
+        rate_limited_models.write().await.remove(&model_id);
         info!("Cleared rate limit for model: {}", model_id);
     } else {
-        rate_limited.clear();
+        rate_limited_models.write().await.clear();
         info!("Cleared all rate limits");
     }
 
@@ -123,14 +161,19 @@ pub async fn clear_rate_limit(
 }
 
 /// Get detailed model performance statistics
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.model_stats` request then fails in transport (the connection
+/// dropped, or the request timed out). Without a connected daemon it returns an
+/// empty placeholder, not an error.
 #[tauri::command]
 pub async fn get_model_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-
     // Try daemon mode first
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         return backend.daemon_request(serde_json::json!({
@@ -147,13 +190,18 @@ pub async fn get_model_stats(
 }
 
 /// Get per-tool performance statistics
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.tool_stats` request then fails in transport (the connection dropped,
+/// or the request timed out). Without a connected daemon it returns an empty
+/// placeholder, not an error.
 #[tauri::command]
 pub async fn get_tool_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         let result = backend.daemon_request(serde_json::json!({
@@ -177,13 +225,18 @@ pub async fn get_tool_stats(
 }
 
 /// Get global tool + session dashboard stats
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.global_stats` request then fails in transport (the connection
+/// dropped, or the request timed out). Without a connected daemon it returns
+/// zeroed placeholder totals, not an error.
 #[tauri::command]
 pub async fn get_global_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         let result = backend.daemon_request(serde_json::json!({
@@ -220,14 +273,20 @@ pub async fn get_global_stats(
 }
 
 /// Get hourly tool stats time-series for graphs
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.tool_stats_hourly` request then fails in transport (the connection
+/// dropped, or the request timed out). Without a connected daemon it returns no
+/// buckets, not an error.
 #[tauri::command]
 pub async fn get_tool_stats_hourly(
     state: State<'_, Arc<RwLock<AppState>>>,
     tool_name: Option<String>,
     hours: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         return backend.daemon_request(serde_json::json!({
@@ -243,14 +302,20 @@ pub async fn get_tool_stats_hourly(
 }
 
 /// Get daily tool stats time-series for graphs
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.tool_stats_daily` request then fails in transport (the connection
+/// dropped, or the request timed out). Without a connected daemon it returns no
+/// buckets, not an error.
 #[tauri::command]
 pub async fn get_tool_stats_daily(
     state: State<'_, Arc<RwLock<AppState>>>,
     tool_name: Option<String>,
     days: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         return backend.daemon_request(serde_json::json!({
@@ -266,14 +331,20 @@ pub async fn get_tool_stats_daily(
 }
 
 /// Get recent tool call log entries
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the
+/// `system.tool_call_log` request then fails in transport (the connection
+/// dropped, or the request timed out). Without a connected daemon it returns no
+/// entries, not an error.
 #[tauri::command]
 pub async fn get_tool_call_log(
     state: State<'_, Arc<RwLock<AppState>>>,
     tool_name: Option<String>,
     limit: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    let backend = &state_guard.backend;
+    let backend = backend_handle(&state).await;
     let status = backend.status().await;
     if status.connected {
         return backend.daemon_request(serde_json::json!({
@@ -291,12 +362,16 @@ pub async fn get_tool_call_log(
 // =============================================================================
 
 /// Get current backend status (daemon or embedded mode)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_backend_status(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<backend::BackendStatus, String> {
-    let state = state.read().await;
-    Ok(state.backend.status().await)
+    Ok(backend_handle(&state).await.status().await)
 }
 
 /// The version the RUNNING daemon reports about itself.
@@ -310,12 +385,19 @@ pub async fn get_backend_status(
 ///
 /// `None` means no daemon is connected to ask — a distinct state from "asked
 /// and it did not say", which surfaces as an error.
+///
+/// # Errors
+///
+/// Fails when the daemon passes the connection check but the `system.version`
+/// request then fails in transport — which is also how a daemon too old to know
+/// that request answers, after the full request timeout, because its
+/// parse-error reply carries no request id. A reply without a `version` string
+/// is `Ok(None)`.
 #[tauri::command]
 pub async fn get_daemon_version(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Option<String>, String> {
-    let state = state.read().await;
-    let backend = &state.backend;
+    let backend = backend_handle(&state).await;
     if !backend.status().await.connected {
         return Ok(None);
     }
@@ -332,16 +414,21 @@ pub async fn get_daemon_version(
 }
 
 /// Initialize the backend - starts the daemon sidecar and connects.
+///
+/// # Errors
+///
+/// Never returns `Err`: a daemon that cannot be started or reached is reported
+/// as `"disconnected"`.
 #[tauri::command]
 pub async fn init_backend(
     app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
-    let state = state.read().await;
-    if state.backend.is_connected().await {
+    let backend = backend_handle(&state).await;
+    if backend.is_connected().await {
         return Ok("daemon".to_string());
     }
-    let mode = state.backend.init(&app).await;
+    let mode = backend.init(&app).await;
     Ok(match mode {
         BackendMode::Daemon => "daemon".to_string(),
         BackendMode::Disconnected => "disconnected".to_string(),
@@ -365,13 +452,22 @@ const DEFAULT_LOG_LINES: usize = 1000;
 /// each entry tagged (`source: "embedded" | "daemon"`) rather than picking one.
 /// In embedded mode there is no daemon to ask, and the answer is just our buffer —
 /// which is the whole reason this page used to be empty.
+///
+/// # Errors
+///
+/// Fails when a daemon is connected but the `system.logs` request fails in
+/// transport (the connection dropped, or the request timed out); this process's
+/// own lines are not returned then either.
 #[tauri::command]
 pub async fn get_daemon_logs(
     state: State<'_, Arc<RwLock<AppState>>>,
     limit: Option<usize>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(DEFAULT_LOG_LINES).min(MAX_LOG_LINES);
-    let state_guard = state.read().await;
+    let (backend, log_buffer) = {
+        let state_guard = state.read().await;
+        (Arc::clone(&state_guard.backend), state_guard.log_buffer.clone())
+    };
 
     let mut entries: Vec<LogEntry> = Vec::new();
 
@@ -379,8 +475,8 @@ pub async fn get_daemon_logs(
     // field sends untagged entries; serde defaults those to `daemon`, which is
     // where they came from. A malformed entry is skipped rather than failing the
     // whole page.
-    if state_guard.backend.is_connected().await {
-        let raw = state_guard.backend.get_logs(Some(limit)).await?;
+    if backend.is_connected().await {
+        let raw = backend.get_logs(Some(limit)).await?;
         entries.extend(
             raw.into_iter()
                 .filter_map(|value| serde_json::from_value::<LogEntry>(value).ok()),
@@ -388,7 +484,7 @@ pub async fn get_daemon_logs(
     }
 
     // This process's own lines — present in both modes.
-    entries.extend(state_guard.log_buffer.get_recent(limit));
+    entries.extend(log_buffer.get_recent(limit));
 
     Ok(merge_log_entries(entries, limit))
 }
@@ -417,12 +513,16 @@ fn merge_log_entries(mut entries: Vec<LogEntry>, limit: usize) -> Vec<serde_json
 // =============================================================================
 
 /// Get current close mode preference
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_close_mode(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
-    let state = state.read().await;
-    let mode = *state.close_mode.read().await;
+    let mode = *state.read().await.close_mode.read().await;
     Ok(match mode {
         CloseMode::Ask => "ask".to_string(),
         CloseMode::MinimizeToTray => "minimize_to_tray".to_string(),
@@ -431,6 +531,11 @@ pub async fn get_close_mode(
 }
 
 /// Set close mode preference
+///
+/// # Errors
+///
+/// Returns `Unknown close mode: …` for anything but `ask`, `minimize_to_tray`
+/// or `quit_completely`.
 #[tauri::command]
 pub async fn set_close_mode(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -451,13 +556,17 @@ pub async fn set_close_mode(
 
 /// Handle window close - returns what action to take
 /// Called from frontend before actual close
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`. Hiding the window to the tray is best-effort.
 #[tauri::command]
 pub async fn handle_window_close(
     app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
-    let state_guard = state.read().await;
-    let mode = *state_guard.close_mode.read().await;
+    let mode = *state.read().await.close_mode.read().await;
 
     match mode {
         CloseMode::Ask => {
@@ -487,26 +596,37 @@ pub async fn handle_window_close(
 /// app attached to the old server instead of starting its own (2026-09-17).
 /// Called after the download succeeds, so a failed download never costs the
 /// user their daemon; a failed install is recovered with `init_backend`.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`. A daemon that does not stop gracefully is killed;
+/// failures are logged.
 #[tauri::command]
 pub async fn stop_backend_for_update(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
     info!("Stopping the daemon before installing an update...");
-    state.read().await.backend.shutdown().await;
+    backend_handle(&state).await.shutdown().await;
     Ok(())
 }
 
 /// Perform actual quit (called after user confirms or preference is quit)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn perform_quit(
     app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
 
     // Stop the daemon sidecar. Memory/session persistence is the daemon's job.
     info!("Performing quit - shutting down backend...");
-    state_guard.backend.shutdown().await;
+    backend.shutdown().await;
 
     app.exit(0);
     Ok(())
