@@ -201,6 +201,18 @@ impl DaemonManager {
     }
     
     /// Start the daemon sidecar
+    ///
+    /// Returns `Ok` straight away when the daemon is already `Running` or
+    /// `Starting`.
+    ///
+    /// # Errors
+    ///
+    /// - `"Failed to create sidecar command: …"` when the bundled
+    ///   `nanna-daemon` sidecar cannot be resolved;
+    /// - `"Failed to spawn daemon: …"` when its process fails to start;
+    /// - `"Daemon startup timeout"` when nothing answers on the daemon port
+    ///   within `startup_timeout` (90 s by default). The spawned child is
+    ///   killed first so it cannot hold the port and the database lock.
     pub async fn start(&self, app: &AppHandle) -> Result<(), String> {
         let current_state = *self.state.read().await;
         if current_state == DaemonState::Running || current_state == DaemonState::Starting {
@@ -220,25 +232,7 @@ impl DaemonManager {
                 format!("Failed to create sidecar command: {e}")
             })?;
         
-        // A dev build must never share the installed app's store: the daemon
-        // takes an exclusive lock on nanna.db and runs migrations at startup,
-        // so two builds pointed at one file is unsupported and unsafe.
-        // NANNA_DEV_DATA_DIR isolates a dev run; unset in production, where
-        // the daemon resolves its own default data dir as before.
-        let port = self.config.port.to_string();
-        let mut args: Vec<String> = vec![
-            "--port".into(),
-            port,
-            "--host".into(),
-            self.config.host.clone(),
-        ];
-        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR")
-            && !dev_data_dir.trim().is_empty() {
-                info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
-                args.push("--data-dir".into());
-                args.push(dev_data_dir);
-            }
-        args.push("run".into());
+        let args = self.sidecar_args();
         info!("Spawning daemon with args: {:?}", args);
         let (mut rx, child) = sidecar
             .args(args)
@@ -316,7 +310,12 @@ impl DaemonManager {
             // Kill the spawned child: an orphaned daemon would keep running,
             // holding the nanna.db file lock (and port 5149) — which would make
             // the embedded fallback unable to open storage at all.
-            if let Some(child) = self.child.write().await.take() {
+            // The child slot stays locked until the kill finishes, exactly as
+            // long as the guard used to live in the `if let`: a concurrent
+            // `stop()` waits for this kill instead of reporting `Stopped`
+            // while it is still in flight.
+            let mut child_slot = self.child.write().await;
+            if let Some(child) = child_slot.take() {
                 warn!("Killing unresponsive daemon child so it cannot orphan the DB lock");
                 // Tree-kill only a sidecar that is still alive: a dead one's
                 // PID may already belong to an unrelated process.
@@ -327,10 +326,36 @@ impl DaemonManager {
                     warn!("Failed to kill unresponsive daemon: {}", e);
                 }
             }
+            drop(child_slot);
             Err("Daemon startup timeout".to_string())
         }
     }
     
+    /// The sidecar's command line: the bind address, the optional dev-store
+    /// isolation, then `run`.
+    fn sidecar_args(&self) -> Vec<String> {
+        // A dev build must never share the installed app's store: the daemon
+        // takes an exclusive lock on nanna.db and runs migrations at startup,
+        // so two builds pointed at one file is unsupported and unsafe.
+        // NANNA_DEV_DATA_DIR isolates a dev run; unset in production, where
+        // the daemon resolves its own default data dir as before.
+        let port = self.config.port.to_string();
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port,
+            "--host".into(),
+            self.config.host.clone(),
+        ];
+        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR")
+            && !dev_data_dir.trim().is_empty() {
+                info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
+                args.push("--data-dir".into());
+                args.push(dev_data_dir);
+            }
+        args.push("run".into());
+        args
+    }
+
     /// Shut down a daemon from a different release that is holding our port.
     ///
     /// An app update replaces the GUI and its sidecar binary, but a daemon
@@ -416,6 +441,12 @@ impl DaemonManager {
     }
     
     /// Stop the daemon
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` today: an undeliverable or ignored shutdown request
+    /// falls back to a tree-kill, a failed kill is logged, and the manager
+    /// always ends `Stopped`.
     pub async fn stop(&self) -> Result<(), String> {
         let current_state = *self.state.read().await;
         if current_state == DaemonState::Stopped || current_state == DaemonState::Stopping {
@@ -425,7 +456,11 @@ impl DaemonManager {
         *self.state.write().await = DaemonState::Stopping;
         info!("Stopping nanna-daemon...");
 
-        if let Some(child) = self.child.write().await.take() {
+        // Held until the shutdown below completes, exactly as long as the guard
+        // used to live in the `if let`: a racing `start()` can neither store a
+        // new child nor kill one while this shutdown is in progress.
+        let mut child_slot = self.child.write().await;
+        if let Some(child) = child_slot.take() {
             if self.sidecar_exited.load(std::sync::atomic::Ordering::SeqCst) {
                 // The sidecar died earlier — usually its AlreadyRunning exit
                 // after attaching to a standalone daemon. That daemon isn't
@@ -454,6 +489,7 @@ impl DaemonManager {
                 }
             }
         }
+        drop(child_slot);
 
         *self.state.write().await = DaemonState::Stopped;
         info!("Daemon stopped");
@@ -497,6 +533,10 @@ impl DaemonManager {
     }
     
     /// Restart the daemon
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::start`]'s error; the stop half does not fail.
     pub async fn restart(&self, app: &AppHandle) -> Result<(), String> {
         self.stop().await?;
         sleep(Duration::from_millis(500)).await;

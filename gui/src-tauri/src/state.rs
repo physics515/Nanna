@@ -49,6 +49,19 @@ pub struct AppState {
     pub(crate) log_buffer: LogBuffer,
 }
 
+/// The daemon backend handle, cloned out of the shared state.
+///
+/// [`AppState::backend`] is set once when the state is built and never
+/// replaced, so the state lock guards nothing a daemon call needs. Commands
+/// take the handle and release the lock *before* the round-trip: a chat turn
+/// lasts as long as the daemon works on it, and a read lock held that long
+/// stalls every settings write — and, because tokio's `RwLock` queues new
+/// readers behind a waiting writer, every command after that write too,
+/// Stop included.
+pub(crate) async fn backend_handle(state: &RwLock<AppState>) -> Arc<Backend> {
+    Arc::clone(&state.read().await.backend)
+}
+
 /// Model status event for frontend
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelStatusEvent {
