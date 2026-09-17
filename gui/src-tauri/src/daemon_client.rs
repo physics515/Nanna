@@ -547,7 +547,13 @@ impl DaemonClient {
     ///   closed"` if the reply slot is discarded without an answer;
     /// - `"Request timeout"` when no reply arrives within the configured
     ///   `request_timeout` (5 minutes by default);
-    /// - otherwise the `message` of the daemon's own error response.
+    /// - the `message` of an error response.
+    ///
+    /// A refused action is *not* an error here: the daemon answers every
+    /// request it parsed with a successful reply and reports the refusal
+    /// inside it (`{"error": …, "message": …}`). Its only error response is
+    /// for a request it could not parse, and that carries no request id, so
+    /// such a request ends in `"Request timeout"`.
     pub async fn request(&self, action: Value) -> Result<Value, String> {
         self.request_with_timeout(action, self.config.request_timeout).await
     }
@@ -730,9 +736,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does for connection problems and for an error
-    /// response to `chat.send`, with one difference: there is no fixed request
-    /// timeout. Instead it fails with `"Daemon unresponsive (N missed health
+    /// Fails as [`Self::request`] does, with one difference: there is no fixed
+    /// request timeout. Instead it fails with `"Daemon unresponsive (N missed health
     /// pings)"` once three consecutive `session.get_run_state` pings (one every
     /// 30 s, each allowed 15 s) go unanswered. A run the daemon reports as
     /// finished whose reply then never arrives within the 60 s grace period is
@@ -754,8 +759,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `chat.cancel` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `chat.cancel` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn chat_cancel(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "chat",
@@ -768,8 +773,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `system.logs` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `system.logs` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn system_logs(&self, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",
@@ -783,8 +788,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -796,8 +801,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.list_by_workspace` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.list_by_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_list_by_workspace(&self, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -810,8 +815,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.create` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_create(&self, name: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -824,8 +829,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.create_in_workspace` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.create_in_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_create_in_workspace(&self, name: Option<&str>, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -839,8 +844,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.set_workspace` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -854,8 +859,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.set_model` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_model` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_model(&self, session_id: &str, model: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -873,8 +878,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.set_tools` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_tools` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_tools(&self, session_id: &str, tools: Vec<String>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -888,8 +893,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.history` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -906,8 +911,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.get_run_state` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.get_run_state` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_get_run_state(&self, session_id: &str, light: bool) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -921,8 +926,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `system.status` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `system.status` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn system_status(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",
@@ -938,8 +943,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.delete` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_delete(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -952,8 +957,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.delete_all` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.delete_all` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_delete_all(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -965,8 +970,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.rename` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.rename` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_rename(&self, session_id: &str, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -980,8 +985,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `session.clear` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.clear` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_clear(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -998,8 +1003,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_list(&self, scope: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1012,8 +1017,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.search` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.search` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_search(&self, query: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1027,8 +1032,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.get` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1041,8 +1046,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.create` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_create(&self, content: &str, tags: Option<Vec<String>>, importance: Option<u8>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1057,8 +1062,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.update` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_update(&self, id: &str, content: Option<&str>, tags: Option<Vec<String>>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1073,8 +1078,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.delete` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_delete(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1087,8 +1092,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.clear` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.clear` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_clear(&self, scope: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1101,8 +1106,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.stats` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.stats` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_stats(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1114,8 +1119,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `memory.consolidate` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.consolidate` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_consolidate(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1131,8 +1136,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1144,8 +1149,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.get` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1158,8 +1163,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.add` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.add` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_add(&self, schedule: &str, task: &str, name: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1174,8 +1179,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.update` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_update(&self, id: &str, schedule: Option<&str>, task: Option<&str>, enabled: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1191,8 +1196,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.remove` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.remove` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_remove(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1205,8 +1210,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.run_now` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.run_now` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_run_now(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1219,8 +1224,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `scheduler.history` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_history(&self, id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1238,8 +1243,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1256,8 +1261,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.enable` / `tool.disable` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.enable` / `tool.disable` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_set_enabled(&self, name: &str, enabled: bool) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1270,8 +1275,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.execute` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.execute` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_execute(&self, name: &str, input: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1285,8 +1290,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.create` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_create(&self, name: &str, description: &str, code: &str, needs_shell: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1302,8 +1307,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.update` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_update(&self, name: &str, description: Option<&str>, code: Option<&str>, needs_shell: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1319,8 +1324,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.delete` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_delete(&self, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1333,8 +1338,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.test` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.test` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_test(&self, code: &str, input: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1348,8 +1353,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.list_user` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.list_user` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_list_user(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1361,8 +1366,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `tool.get_source` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.get_source` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_get_source(&self, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1379,8 +1384,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.get` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_get(&self, path: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1393,8 +1398,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.set` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.set` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_set(&self, path: &str, value: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1408,8 +1413,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.reset` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.reset` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_reset(&self, path: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1422,8 +1427,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.reload` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.reload` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_reload(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1435,8 +1440,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.export` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.export` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_export(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1448,8 +1453,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `config.import` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.import` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_import(&self, config: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1466,8 +1471,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1479,8 +1484,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.get` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1493,8 +1498,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.open` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.open` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_open(&self, path: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1507,8 +1512,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.close` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.close` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_close(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1521,8 +1526,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.set_active` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.set_active` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_set_active(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1535,8 +1540,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.clear_active` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.clear_active` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_clear_active(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1548,8 +1553,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.reload` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.reload` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_reload(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1562,8 +1567,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.get_context` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.get_context` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_get_context(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1576,8 +1581,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `workspace.update_context` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.update_context` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_update_context(&self, id: &str, file: &str, content: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1596,8 +1601,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `channel.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `channel.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn channel_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "channel",
@@ -1609,8 +1614,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `channel.status` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `channel.status` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn channel_status(&self, id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "channel",
@@ -1625,8 +1630,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.list` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1641,8 +1646,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.create` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_create(
         &self,
         title: &str,
@@ -1668,8 +1673,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.update` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_update(&self, id: i64, patch: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1683,8 +1688,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.done` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.done` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_done(&self, id: i64, workdir: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1698,8 +1703,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.delete` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_delete(&self, id: i64) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1712,8 +1717,8 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does, including when the daemon answers the
-    /// `task.update` request with an error response.
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_reorder(&self, id: i64, new_priority: i64) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",

@@ -9,6 +9,12 @@
 use crate::*;
 
 /// List tasks in a scope ("session" | "workspace" | "global").
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.list` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn list_tasks(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -16,14 +22,19 @@ pub async fn list_tasks(
     session_id: Option<String>,
     include_closed: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .task_list(&scope, session_id.as_deref(), include_closed)
         .await
 }
 
 /// Create a new task.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.create` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn create_task(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -34,9 +45,8 @@ pub async fn create_task(
     description: Option<String>,
     priority: Option<i64>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .task_create(
             &title,
             &scope,
@@ -49,44 +59,64 @@ pub async fn create_task(
 }
 
 /// Update a task with a partial patch.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.update` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn update_task(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: i64,
     patch: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.task_update(id, patch).await
+    backend_handle(&state).await.task_update(id, patch).await
 }
 
 /// Mark a task as done (with optional acceptance check).
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.done` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn complete_task(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: i64,
     workdir: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.task_done(id, workdir.as_deref()).await
+    backend_handle(&state).await.task_done(id, workdir.as_deref()).await
 }
 
 /// Delete a task and its subtree.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.delete` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn delete_task(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: i64,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.task_delete(id).await
+    backend_handle(&state).await.task_delete(id).await
 }
 
 /// Reorder a task by updating its priority.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `task.update` request is
+/// dropped or times out. A refusal the daemon reports in its reply is passed
+/// through inside `Ok`.
 #[tauri::command]
 pub async fn reorder_task(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: i64,
     new_priority: i64,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.task_reorder(id, new_priority).await
+    backend_handle(&state).await.task_reorder(id, new_priority).await
 }

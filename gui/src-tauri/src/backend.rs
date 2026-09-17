@@ -186,8 +186,9 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// Fails as [`DaemonClient::request`] does, including when the daemon
-    /// answers `action` with an error response.
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A refused action comes back inside the
+    /// `Ok` reply.
     pub async fn daemon_request(&self, action: Value) -> Result<Value, String> {
         self.daemon_client.request(action).await
     }
@@ -233,9 +234,9 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// Fails as [`DaemonClient::request`] does, including an error response to
-    /// `chat.cancel`. A reply whose `status` is anything but `cancelled` (no
-    /// turn was running) is `Ok(false)`, not an error.
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A reply whose `status` is anything but
+    /// `cancelled` (no turn was running) is `Ok(false)`, not an error.
     pub async fn chat_cancel(&self, session_id: &str) -> Result<bool, String> {
         let val = self.daemon_client.chat_cancel(session_id).await?;
         Ok(val.get("status").and_then(|s| s.as_str()) == Some("cancelled"))
@@ -245,8 +246,9 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// Fails as [`DaemonClient::request`] does, including an error response to
-    /// `system.logs`. A reply without a `logs` array is an empty list.
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A reply without a `logs` array is an
+    /// empty list.
     pub async fn get_logs(&self, limit: Option<usize>) -> Result<Vec<Value>, String> {
         let val = self.daemon_client.system_logs(limit).await?;
         Ok(val
@@ -260,8 +262,8 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// Fails as [`DaemonClient::request`] does, including an error response to
-    /// `system.status`.
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request.
     pub async fn system_status(&self) -> Result<Value, String> {
         self.daemon_client.system_status().await
     }
@@ -438,8 +440,8 @@ macro_rules! daemon_proxies {
                 /// # Errors
                 ///
                 /// Fails as the identically named [`DaemonClient`] method
-                /// does: no daemon connection, a dropped or timed-out request,
-                /// or the daemon's own error response.
+                /// does: no daemon connection, or a dropped or timed-out
+                /// request. A refused action comes back inside the `Ok` reply.
                 pub async fn $name(&self $(, $arg: $ty )* ) -> Result<Value, String> {
                     self.daemon_client.$name( $( $arg ),* ).await
                 }
