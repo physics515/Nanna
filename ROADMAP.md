@@ -253,6 +253,18 @@ selection, Ollama detection in the wizard (the *probe* ships — `nanna_llm::pro
 reachability and which configured models are missing, and `nanna doctor --online` consumes it; the GUI is
 simply not a caller yet), and live API-key validation (P18's doctor network leg, where the
 keyring-read-and-send question it raises already lives).
+*(2026-09-16)* Two of those have since landed daemon-side and are ticked under P0.3: the Ollama probe
+is `SystemAction::ProbeOllama`, and live key validation is the `system.validate_api_key` verb
+(`SystemAction::ValidateApiKey { provider, key }` → `nanna-daemon/src/validate_api_key.rs`): one
+bounded, timeout-capped request per provider against a cheap authenticated endpoint, answering
+`valid` / `invalid` / `unreachable` with the key never logged and the provider's error detail
+truncated on a char boundary. It validates a key the *caller* supplies, so it does not read the
+keyring — which is how it sidesteps the question above. Tests:
+`an_unexpected_status_is_unreachable_and_named`, `a_network_error_is_unreachable_with_its_cause`,
+`a_blank_key_is_invalid_without_a_request`, `provider_names_parse_as_the_config_spells_them`,
+`the_verdict_serializes_as_the_documented_envelope`, `body_detail_never_slices_inside_a_char`,
+`the_handler_refuses_a_provider_it_cannot_check`, `the_report_carries_provider_verdict_and_the_boolean`.
+The GUI's `ApiKeyInput` is not yet a caller of the verb.
 
 #### P0.2 - Documentation — ✅ complete (2026-08-19)
 All documentation shipped: README rewritten user-first (pitch, download links, system requirements,
@@ -265,7 +277,20 @@ set (description + `agent`/`ai-assistant`/`llm`/`local-first`/`personal-ai`/`rus
 Remaining: capture real screenshots to replace the README placeholders.
 
 #### P0.3 - Stronger Public Release (can follow 0.1)
-- [ ] Local Ollama setup assistant in GUI. *(from P0.1)* The detection half already exists and is
+- [x] Local Ollama setup assistant in GUI. *(from P0.1)*
+      *(2026-09-16)* **The daemon half landed:** `SystemAction::ProbeOllama { base_url, models }`
+      (`protocol.rs`, handled in `control/system.rs`) answers over the hardened
+      `nanna_llm::probe_ollama` and reports the two states the wizard needs separately —
+      unreachable vs. reachable-but-missing-models, each missing model with its `ollama pull`.
+      `models` defaults to the configured chat-priority + embedding Ollama specs
+      (`configured_ollama_models`). Tests: `a_dead_server_is_unreachable_and_claims_nothing_about_models`,
+      `a_live_server_names_each_missing_model_with_its_pull_command`,
+      `a_live_server_with_every_wanted_model_reports_nothing_missing`,
+      `the_probe_action_parses_with_both_fields_absent`,
+      `configured_ollama_models_collects_chat_priority_and_embeddings_once`. **Still open:** the
+      GUI's `get_ollama_models` has not yet been re-pointed at the IPC action (the "one
+      implementation, not two" half below), and the onboarding wizard is not yet a caller.
+      The detection half already exists and is
       proven: `nanna_llm::probe_ollama` answers reachability + missing models over one unauthenticated
       `GET /api/tags`, and `nanna doctor --online` is its only caller. The wizard should ask it instead of
       assuming a local server is up.
@@ -294,8 +319,16 @@ Remaining: capture real screenshots to replace the README placeholders.
             and its intended consumer uses a private copy. Wire the IPC action, then have
             `get_ollama_models` answer from it so there is one implementation, not two that drift.
 - [ ] Create public facing website / GitHub Pages. *(from P0.1)*
-- [ ] Data storage location selection. *(from P0.1 — the daemon already takes `--data-dir` and honours
+- [x] Data storage location selection. *(from P0.1 — the daemon already takes `--data-dir` and honours
       `NANNA_CONFIG_PATH`; what is missing is a place to choose it that is not an argv flag.)*
+      *(2026-09-16)* **Landed as a config field:** `[general] data_dir` in `nanna-config`, honoured at
+      the single funnel `Config::resolve_data_dir()` (blank/whitespace is unset; the daemon's
+      `--data-dir` flag still wins), with `has_custom_data_dir()`, `data_dir_from_disk()` and a
+      `validate_data_dir()` guard for the GUI's `get_data_dir` / `set_data_dir` commands
+      (`gui/src-tauri/src/commands/settings.rs`, registered in `generate_handler!`). Tests:
+      `no_configured_data_dir_means_the_platform_default`,
+      `a_configured_data_dir_wins_over_the_platform_default`, `a_blank_data_dir_is_treated_as_unset`,
+      `a_data_dir_survives_a_save_load_round_trip`.
 - [ ] Model/backend status dashboard.
 - [~] Cost tracking for cloud models.
       *(See P6)* Core shipped — `CostTracker` with per-model pricing table, `estimate_cost_usd`,
