@@ -1,6 +1,6 @@
 //! Scheduler handlers for the [`ControlPlane`].
 
-use super::{json, info, ControlPlane, SchedulerAction, Value, Scheduler};
+use super::{json, info, ControlPlane, RwLock, SchedulerAction, Value, Scheduler};
 
 impl ControlPlane {
     // =========================================================================
@@ -14,52 +14,16 @@ impl ControlPlane {
         
         match action {
             SchedulerAction::List => {
-                let scheduler = scheduler.read().await;
-                let tasks = scheduler.list_tasks().await;
-                let jobs: Vec<_> = tasks.into_iter()
-                    .map(|t| {
-                        let schedule = t.task_type.schedule_label();
-                        let next_run = t.task_type.next_run().map(|dt| dt.to_rfc3339());
-                        json!({
-                            "id": t.id,
-                            "name": t.name,
-                            "schedule": schedule,
-                            "payload": t.payload,
-                            "enabled": t.enabled,
-                            "last_run": t.last_run.map(|dt| dt.to_rfc3339()),
-                            "next_run": next_run,
-                            "run_count": t.run_count,
-                            "timezone": t.timezone,
-                            "target_channel": t.target_channel,
-                            "target_session": t.target_session,
-                        })
-                    })
-                    .collect();
+                let tasks = scheduler.read().await.list_tasks().await;
+                let jobs: Vec<_> = tasks.iter().map(Self::scheduler_job_json).collect();
                 json!({ "jobs": jobs })
             }
             SchedulerAction::Get { id } => {
-                let scheduler = scheduler.read().await;
-                if let Some(task) = scheduler.get_task(&id).await {
-                    let schedule = task.task_type.schedule_label();
-                    let next_run = task.task_type.next_run().map(|dt| dt.to_rfc3339());
-                    json!({
-                        "job": {
-                            "id": task.id,
-                            "name": task.name,
-                            "schedule": schedule,
-                            "payload": task.payload,
-                            "enabled": task.enabled,
-                            "last_run": task.last_run.map(|dt| dt.to_rfc3339()),
-                            "next_run": next_run,
-                            "run_count": task.run_count,
-                            "timezone": task.timezone,
-                            "target_channel": task.target_channel,
-                            "target_session": task.target_session,
-                        }
-                    })
-                } else {
-                    json!({ "error": "not_found", "id": id })
-                }
+                let task = scheduler.read().await.get_task(&id).await;
+                task.as_ref().map_or_else(
+                    || json!({ "error": "not_found", "id": id }),
+                    |task| json!({ "job": Self::scheduler_job_json(task) }),
+                )
             }
             SchedulerAction::Add {
                 schedule,
@@ -67,33 +31,8 @@ impl ControlPlane {
                 name,
                 session_id,
             } => {
-                // A result posted into a conversation that does not exist would
-                // be dropped on every run; refuse it now instead.
-                if let Some(ref id) = session_id
-                    && !self.sessions.exists(id).await
-                {
-                    return json!({
-                        "error": "session_not_found",
-                        "message": format!("Session {id} not found; the job was not added"),
-                    });
-                }
-                // Try to parse as cron expression
-                match Scheduler::cron_task(
-                    name.as_deref().unwrap_or("unnamed"),
-                    &schedule,
-                    &task,
-                ) {
-                    Ok(mut scheduled_task) => {
-                        scheduled_task.target_session = session_id;
-                        let id = scheduled_task.id.clone();
-                        scheduler.read().await.add_task(scheduled_task).await;
-                        info!("Added scheduled job: {}", id);
-                        json!({ "status": "created", "id": id })
-                    }
-                    Err(e) => {
-                        json!({ "error": "invalid_schedule", "message": e.to_string() })
-                    }
-                }
+                self.scheduler_add(scheduler, schedule, task, name, session_id)
+                    .await
             }
             SchedulerAction::Update { id, schedule, task: _, enabled } => {
                 let scheduler = scheduler.read().await;
@@ -156,6 +95,40 @@ impl ControlPlane {
                     }))
                     .collect();
                 json!({ "history": history, "job_id": id })
+            }
+        }
+    }
+
+    /// `SchedulerAction::Add`: parse `schedule` as cron and store the job.
+    async fn scheduler_add(
+        &self,
+        scheduler: &RwLock<Scheduler>,
+        schedule: String,
+        task: String,
+        name: Option<String>,
+        session_id: Option<String>,
+    ) -> Value {
+        // A result posted into a conversation that does not exist would
+        // be dropped on every run; refuse it now instead.
+        if let Some(ref id) = session_id
+            && !self.sessions.exists(id).await
+        {
+            return json!({
+                "error": "session_not_found",
+                "message": format!("Session {id} not found; the job was not added"),
+            });
+        }
+        // Try to parse as cron expression
+        match Scheduler::cron_task(name.as_deref().unwrap_or("unnamed"), &schedule, &task) {
+            Ok(mut scheduled_task) => {
+                scheduled_task.target_session = session_id;
+                let id = scheduled_task.id.clone();
+                scheduler.read().await.add_task(scheduled_task).await;
+                info!("Added scheduled job: {}", id);
+                json!({ "status": "created", "id": id })
+            }
+            Err(e) => {
+                json!({ "error": "invalid_schedule", "message": e.to_string() })
             }
         }
     }

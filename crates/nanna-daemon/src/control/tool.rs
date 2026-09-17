@@ -38,38 +38,7 @@ impl ControlPlane {
                 name,
                 input,
                 session_id,
-            } => {
-                use nanna_tools::ToolCall;
-                
-                let params: std::collections::HashMap<String, Value> = match input {
-                    Value::Object(map) => map.into_iter().collect(),
-                    _ => std::collections::HashMap::new(),
-                };
-                
-                let call = ToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: name.clone(),
-                    parameters: params,
-                };
-                
-                let result = match session_id {
-                    Some(session_id) => {
-                        nanna_tools::ToolRegistry::with_run_session(session_id, tools.execute(call))
-                            .await
-                    }
-                    None => tools.execute(call).await,
-                };
-                
-                json!({
-                    "name": name,
-                    "success": result.result.success,
-                    "output": result.result.content,
-                    // A failed tool's explanation lives here, not in `output`;
-                    // without it a direct call that failed answered only
-                    // `success: false` with an empty string.
-                    "error": result.result.error,
-                })
-            }
+            } => Self::tool_execute(tools, name, input, session_id).await,
             ToolAction::Create { name, description, code, needs_shell } => self.tool_create(name, description, code, needs_shell).await,
             ToolAction::Update { name, description, code, needs_shell } => self.tool_update(name, description, code, needs_shell).await,
             ToolAction::Delete { name } => {
@@ -179,6 +148,47 @@ impl ControlPlane {
         );
 
         json!({ "tools": tool_list })
+    }
+
+    /// `ToolAction::Execute`: run one tool directly, outside an agent turn.
+    ///
+    /// `session_id` binds the call to that session for the tools that read it
+    /// (file history, workspace cwd); without one the call runs unattributed.
+    async fn tool_execute(
+        tools: &ToolRegistry,
+        name: String,
+        input: Value,
+        session_id: Option<String>,
+    ) -> Value {
+        use nanna_tools::ToolCall;
+
+        let params: std::collections::HashMap<String, Value> = match input {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => std::collections::HashMap::new(),
+        };
+
+        let call = ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.clone(),
+            parameters: params,
+        };
+
+        let result = match session_id {
+            Some(session_id) => {
+                nanna_tools::ToolRegistry::with_run_session(session_id, tools.execute(call)).await
+            }
+            None => tools.execute(call).await,
+        };
+
+        json!({
+            "name": name,
+            "success": result.result.success,
+            "output": result.result.content,
+            // A failed tool's explanation lives here, not in `output`;
+            // without it a direct call that failed answered only
+            // `success: false` with an empty string.
+            "error": result.result.error,
+        })
     }
 
     /// `ToolAction::Create`: write a user tool and register it live.

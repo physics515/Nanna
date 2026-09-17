@@ -1151,15 +1151,15 @@ impl From<ControlAction> for Action {
             ControlAction::SetConfig { path, value } => {
                 Self::Config(ConfigAction::Set { path, value })
             }
-            ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => Action::Tool(ToolAction::Execute {
+            ControlAction::ListTools => Self::Tool(ToolAction::List),
+            ControlAction::RunTool { name, input } => Self::Tool(ToolAction::Execute {
                 name,
                 input,
                 session_id: None,
             }),
-            ControlAction::Status => Action::System(SystemAction::Status),
-            ControlAction::Restart => Action::System(SystemAction::Restart),
-            ControlAction::Shutdown => Action::System(SystemAction::Shutdown),
+            ControlAction::Status => Self::System(SystemAction::Status),
+            ControlAction::Restart => Self::System(SystemAction::Restart),
+            ControlAction::Shutdown => Self::System(SystemAction::Shutdown),
         }
     }
 }

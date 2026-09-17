@@ -310,38 +310,12 @@ impl ControlPlane {
                 }
             }
             SessionAction::FileHistory { id, path, limit } => {
-                let Some(history) = nanna_scripting::file_history::installed() else {
-                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
-                };
-                let params = json!({ "session_id": id, "path": path, "limit": limit });
-                match crate::file_history_service::list(history, &params).await {
-                    Ok(listed) => listed,
-                    Err(message) => json!({ "error": "file_history_failed", "message": message }),
-                }
+                Self::session_file_history(id, path, limit).await
             }
             SessionAction::RestoreFile { id, checkpoint } => {
-                let Some(history) = nanna_scripting::file_history::installed() else {
-                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
-                };
-                let params = json!({ "session_id": id, "checkpoint": checkpoint });
-                match crate::file_history_service::restore(history, &params).await {
-                    Ok(restored) => json!({ "ok": true, "restored": restored }),
-                    Err(message) => json!({ "error": "restore_failed", "message": message }),
-                }
+                Self::session_restore_file(id, checkpoint).await
             }
-            SessionAction::Fork { id, name } => {
-                if let Some(original) = self.sessions.get(&id).await {
-                    let mut forked = self.sessions.create(
-                        name.or_else(|| original.name.as_ref().map(|n| format!("{} (copy)", n)))
-                    ).await;
-                    // Copy messages
-                    forked.messages = original.messages.clone();
-                    self.sessions.update(forked.clone()).await;
-                    json!({ "session": forked })
-                } else {
-                    json!({ "error": "not_found", "message": format!("Session {} not found", id) })
-                }
-            }
+            SessionAction::Fork { id, name } => self.fork_session(id, name).await,
 
             // --- Sub-Agent Sessions (#72) ---
 
@@ -687,6 +661,31 @@ Your task: {task}")
             }
         } else {
             json!({ "error": "not_found", "message": format!("Sub-session '{}' not found", target) })
+        }
+    }
+
+    /// `SessionAction::FileHistory`: the recorded writes for a session, newest
+    /// first, optionally narrowed to one path.
+    async fn session_file_history(id: String, path: Option<String>, limit: Option<usize>) -> Value {
+        let Some(history) = nanna_scripting::file_history::installed() else {
+            return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+        };
+        let params = json!({ "session_id": id, "path": path, "limit": limit });
+        match crate::file_history_service::list(history, &params).await {
+            Ok(listed) => listed,
+            Err(message) => json!({ "error": "file_history_failed", "message": message }),
+        }
+    }
+
+    /// `SessionAction::RestoreFile`: put one recorded checkpoint back on disk.
+    async fn session_restore_file(id: String, checkpoint: u64) -> Value {
+        let Some(history) = nanna_scripting::file_history::installed() else {
+            return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+        };
+        let params = json!({ "session_id": id, "checkpoint": checkpoint });
+        match crate::file_history_service::restore(history, &params).await {
+            Ok(restored) => json!({ "ok": true, "restored": restored }),
+            Err(message) => json!({ "error": "restore_failed", "message": message }),
         }
     }
 
