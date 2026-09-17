@@ -5,8 +5,10 @@
 //! a task checklist sidebar on the chat page, plus full CRUD operations
 //! for manual task management.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState};
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::RwLock;
 
 /// List tasks in a scope ("session" | "workspace" | "global").
 ///

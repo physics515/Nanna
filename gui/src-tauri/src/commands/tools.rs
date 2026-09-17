@@ -5,8 +5,13 @@
 //! `skills/` directory and are edited directly on disk here; the daemon loads
 //! them from its `tools_dir` at startup.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::commands::settings::ToolInfo;
+use crate::state::{backend_handle, AppState};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 // =============================================================================
 // User tool metadata (self-contained; mirrors the daemon's user-tool JSON)

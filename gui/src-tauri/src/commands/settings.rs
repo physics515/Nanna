@@ -5,8 +5,13 @@
 //! `config.toml` (which the daemon also reads); model/tool listings that need
 //! live state are fetched from the daemon.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::Backend;
+use crate::state::{backend_handle, AppConfig, AppState, ModelStatusEvent};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 /// Tool names as seen by the daemon's registry (empty if the daemon is down).
 async fn daemon_tool_names(backend: &Backend) -> Vec<String> {

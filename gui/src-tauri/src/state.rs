@@ -5,8 +5,14 @@
 //! what a thin client needs — a config cache, the backend (daemon) handle, a
 //! workspace-registry cache, UI-model state, and its own log buffer.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::Backend;
+use nanna_config::Config;
+use nanna_core::log_buffer::LogBuffer;
+use nanna_core::WorkspaceRegistry;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// What happens when user closes the main window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

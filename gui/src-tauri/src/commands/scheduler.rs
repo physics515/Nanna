@@ -8,8 +8,11 @@
 //! turn on the same local model chat uses, so it would steal the single Ollama
 //! slot mid-conversation and cancel the in-flight generation.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState};
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// Persist the `[scheduler]` section and make the daemon adopt it live.
 async fn save_scheduler_config(state: &AppState) -> Result<(), String> {

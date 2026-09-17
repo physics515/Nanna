@@ -1,8 +1,12 @@
 //! Channel configuration and status commands.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
-use std::collections::BTreeMap;
+use crate::state::AppState;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
+use tracing::info;
 
 /// Save channel configuration
 ///
