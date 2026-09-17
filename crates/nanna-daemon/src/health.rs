@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -34,7 +34,7 @@ pub struct PidFile {
 impl PidFile {
     /// Create a new PID file manager
     #[must_use]
-    pub fn new(data_dir: &PathBuf) -> Self {
+    pub fn new(data_dir: &Path) -> Self {
         Self {
             path: data_dir.join("nanna-daemon.pid"),
         }
@@ -49,6 +49,14 @@ impl PidFile {
     
     /// Try to acquire the PID file lock
     /// Returns Ok(()) if successful, Err with existing PID if another instance is running
+    ///
+    /// # Errors
+    ///
+    /// [`PidFileError::AlreadyRunning`] when the file names a process that is
+    /// still alive; [`PidFileError::Io`] when the parent directory cannot be
+    /// created, an existing file cannot be read, or our PID cannot be written.
+    /// A file naming a dead process, or holding no parseable PID, is
+    /// overwritten.
     pub fn acquire(&self) -> Result<(), PidFileError> {
         // Create parent directory if needed
         if let Some(parent) = self.path.parent() {
@@ -152,7 +160,7 @@ pub(crate) fn is_process_running(pid: u32) -> bool {
 fn is_process_running(pid: u32) -> bool {
     // On Unix, we can use kill with signal 0 to check if process exists
     unsafe {
-        libc::kill(pid as i32, 0) == 0
+        libc::kill(pid.cast_signed(), 0) == 0
     }
 }
 
@@ -174,22 +182,38 @@ pub struct HealthState {
     pub session_count: Arc<RwLock<usize>>,
     /// Number of connected clients
     pub client_count: Arc<RwLock<usize>>,
-    /// Memory service status
-    pub memory_available: bool,
-    /// Durable memory store degraded (a corrupt row was skipped on load).
-    pub memory_degraded: bool,
-    /// Number of memory rows that were unreadable (corrupt) at load.
-    pub memory_corrupt_rows: usize,
-    /// The store was quarantined and rebuilt after page-level corruption.
-    pub memory_rebuilt: bool,
-    /// Memories salvaged into the rebuilt store (0 unless `memory_rebuilt`).
-    pub memory_recovered_rows: usize,
-    /// Memories the corrupt store held, when countable (None = unknown loss).
-    pub memory_expected_rows: Option<usize>,
+    /// Memory service and durable-store status
+    pub memory: MemoryHealth,
     /// Agent service status
     pub agent_available: bool,
     /// Last error message (if any)
     pub last_error: Arc<RwLock<Option<String>>>,
+}
+
+/// Memory service and durable-store status.
+///
+/// Flattened into [`StatusResponse`], so each field serializes under its
+/// `memory_`-prefixed key exactly where the response always carried it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryHealth {
+    /// Memory service status
+    #[serde(rename = "memory_available")]
+    pub available: bool,
+    /// Durable memory store degraded (a corrupt row was skipped on load).
+    #[serde(rename = "memory_degraded")]
+    pub degraded: bool,
+    /// Number of memory rows that were unreadable (corrupt) at load.
+    #[serde(rename = "memory_corrupt_rows")]
+    pub corrupt_rows: usize,
+    /// The store was quarantined and rebuilt after page-level corruption.
+    #[serde(rename = "memory_rebuilt")]
+    pub rebuilt: bool,
+    /// Memories salvaged into the rebuilt store (0 unless `rebuilt`).
+    #[serde(rename = "memory_recovered_rows")]
+    pub recovered_rows: usize,
+    /// Memories the corrupt store held, when countable (None = unknown loss).
+    #[serde(rename = "memory_expected_rows")]
+    pub expected_rows: Option<usize>,
 }
 
 impl HealthState {
@@ -199,12 +223,10 @@ impl HealthState {
             start_time: Instant::now(),
             session_count: Arc::new(RwLock::new(0)),
             client_count: Arc::new(RwLock::new(0)),
-            memory_available,
-            memory_degraded: false,
-            memory_corrupt_rows: 0,
-            memory_rebuilt: false,
-            memory_recovered_rows: 0,
-            memory_expected_rows: None,
+            memory: MemoryHealth {
+                available: memory_available,
+                ..MemoryHealth::default()
+            },
             agent_available,
             last_error: Arc::new(RwLock::new(None)),
         }
@@ -215,8 +237,8 @@ impl HealthState {
     /// instead of only a boot `error!` log.
     #[must_use]
     pub const fn with_memory_health(mut self, degraded: bool, corrupt_rows: usize) -> Self {
-        self.memory_degraded = degraded;
-        self.memory_corrupt_rows = corrupt_rows;
+        self.memory.degraded = degraded;
+        self.memory.corrupt_rows = corrupt_rows;
         self
     }
 
@@ -225,9 +247,9 @@ impl HealthState {
     /// that connect after boot never saw the `MemoryStoreRebuilt` event.
     #[must_use]
     pub const fn with_memory_rebuild(mut self, recovered: usize, expected: Option<usize>) -> Self {
-        self.memory_rebuilt = true;
-        self.memory_recovered_rows = recovered;
-        self.memory_expected_rows = expected;
+        self.memory.rebuilt = true;
+        self.memory.recovered_rows = recovered;
+        self.memory.expected_rows = expected;
         self
     }
 
@@ -260,12 +282,8 @@ pub struct StatusResponse {
     pub uptime_secs: u64,
     pub sessions: usize,
     pub clients: usize,
-    pub memory_available: bool,
-    pub memory_degraded: bool,
-    pub memory_corrupt_rows: usize,
-    pub memory_rebuilt: bool,
-    pub memory_recovered_rows: usize,
-    pub memory_expected_rows: Option<usize>,
+    #[serde(flatten)]
+    pub memory: MemoryHealth,
     pub agent_available: bool,
     pub last_error: Option<String>,
 }
@@ -306,12 +324,7 @@ async fn status(State(state): State<Arc<HealthState>>) -> Json<StatusResponse> {
         uptime_secs: state.start_time.elapsed().as_secs(),
         sessions,
         clients,
-        memory_available: state.memory_available,
-        memory_degraded: state.memory_degraded,
-        memory_corrupt_rows: state.memory_corrupt_rows,
-        memory_rebuilt: state.memory_rebuilt,
-        memory_recovered_rows: state.memory_recovered_rows,
-        memory_expected_rows: state.memory_expected_rows,
+        memory: state.memory,
         agent_available: state.agent_available,
         last_error,
     })
@@ -372,6 +385,12 @@ impl HealthServer {
     }
     
     /// Run the health server
+    ///
+    /// # Errors
+    ///
+    /// Returns an `InvalidInput` error when `host:port` is not a socket
+    /// address, the error from binding the listener (after the Windows
+    /// retries), or the error that ends serving.
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
@@ -379,44 +398,45 @@ impl HealthServer {
         
         info!("Health server listening on http://{}", addr);
         
+        #[cfg(unix)]
+        let listener = Self::bind_reuse_address(addr)?;
+        #[cfg(windows)]
         let listener = Self::bind_with_retry(addr).await?;
+        #[cfg(not(any(unix, windows)))]
+        let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, self.router()).await
     }
 
-    /// Bind with retry for Windows port conflicts.
-    /// On Unix, uses `SO_REUSEADDR`. On Windows, retries with delay.
+    /// Bind with `SO_REUSEADDR` (Unix), so a restart does not trip over the
+    /// previous listener's `TIME_WAIT`.
+    #[cfg(unix)]
+    fn bind_reuse_address(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+        tokio::net::TcpListener::from_std(socket.into())
+    }
+
+    /// Bind with retry for Windows port conflicts: retries with delay.
+    #[cfg(windows)]
     async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
-        #[cfg(unix)]
-        {
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(addr),
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            socket.set_reuse_address(true)?;
-            socket.set_nonblocking(true)?;
-            socket.bind(&addr.into())?;
-            socket.listen(128)?;
-            tokio::net::TcpListener::from_std(socket.into())
-        }
-
-        #[cfg(windows)]
-        {
-            for attempt in 0..5 {
-                match tokio::net::TcpListener::bind(addr).await {
-                    Ok(listener) => return Ok(listener),
-                    Err(e) if attempt < 4 => {
-                        tracing::warn!("Health bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    Err(e) => return Err(e),
+        for attempt in 0..5 {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => return Ok(listener),
+                Err(e) if attempt < 4 => {
+                    tracing::warn!("Health bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
+                Err(e) => return Err(e),
             }
-            unreachable!()
         }
-
-        #[cfg(not(any(unix, windows)))]
-        tokio::net::TcpListener::bind(addr).await
+        unreachable!()
     }
     
     /// Spawn the health server as a background task
@@ -441,7 +461,7 @@ mod tests {
     #[test]
     fn test_pid_file_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
+        let pid_file = PidFile::new(temp_dir.path());
         
         // Should acquire successfully
         assert!(pid_file.acquire().is_ok());
@@ -457,7 +477,7 @@ mod tests {
     #[test]
     fn test_pid_file_release() {
         let temp_dir = TempDir::new().unwrap();
-        let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
+        let pid_file = PidFile::new(temp_dir.path());
         
         pid_file.acquire().unwrap();
         assert!(pid_file.path().exists());
@@ -480,7 +500,7 @@ mod tests {
         // Our own PID is definitionally alive.
         std::fs::write(&path, std::process::id().to_string()).unwrap();
 
-        let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
+        let pid_file = PidFile::new(temp_dir.path());
         assert!(matches!(
             pid_file.acquire(),
             Err(PidFileError::AlreadyRunning(pid)) if pid == std::process::id()
@@ -498,7 +518,7 @@ mod tests {
         // Write a fake PID that definitely doesn't exist
         std::fs::write(&path, "999999999").unwrap();
         
-        let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
+        let pid_file = PidFile::new(temp_dir.path());
 
         // Should succeed because the old process doesn't exist
         assert!(pid_file.acquire().is_ok());
@@ -532,15 +552,15 @@ mod tests {
         let shared = Arc::new(HealthState::new(true, true).with_memory_health(true, 2));
         let server = HealthServer::from_shared(shared, "127.0.0.1", 0);
         let Json(s) = status(State(server.state())).await;
-        assert!(s.memory_degraded);
-        assert_eq!(s.memory_corrupt_rows, 2);
+        assert!(s.memory.degraded);
+        assert_eq!(s.memory.corrupt_rows, 2);
 
         // A healthy store reports the negative.
         let clean = Arc::new(HealthState::new(true, true));
         let server2 = HealthServer::from_shared(clean, "127.0.0.1", 0);
         let Json(s2) = status(State(server2.state())).await;
-        assert!(!s2.memory_degraded);
-        assert_eq!(s2.memory_corrupt_rows, 0);
+        assert!(!s2.memory.degraded);
+        assert_eq!(s2.memory.corrupt_rows, 0);
     }
 
     #[tokio::test]
@@ -551,17 +571,48 @@ mod tests {
             Arc::new(HealthState::new(true, true).with_memory_rebuild(42, Some(50)));
         let server = HealthServer::from_shared(shared, "127.0.0.1", 0);
         let Json(s) = status(State(server.state())).await;
-        assert!(s.memory_rebuilt);
-        assert_eq!(s.memory_recovered_rows, 42);
-        assert_eq!(s.memory_expected_rows, Some(50));
+        assert!(s.memory.rebuilt);
+        assert_eq!(s.memory.recovered_rows, 42);
+        assert_eq!(s.memory.expected_rows, Some(50));
 
         // Without a rebuild the fields stay quiet.
         let clean = Arc::new(HealthState::new(true, true));
         let server2 = HealthServer::from_shared(clean, "127.0.0.1", 0);
         let Json(s2) = status(State(server2.state())).await;
-        assert!(!s2.memory_rebuilt);
-        assert_eq!(s2.memory_recovered_rows, 0);
-        assert_eq!(s2.memory_expected_rows, None);
+        assert!(!s2.memory.rebuilt);
+        assert_eq!(s2.memory.recovered_rows, 0);
+        assert_eq!(s2.memory.expected_rows, None);
+    }
+
+    #[test]
+    fn status_response_keeps_its_flat_wire_shape() {
+        // `memory` is a nested struct in Rust only: on the wire its fields stay
+        // flat, `memory_`-prefixed, and in their original position.
+        let response = StatusResponse {
+            status: "running".to_string(),
+            version: "1.2.3".to_string(),
+            uptime_secs: 7,
+            sessions: 2,
+            clients: 1,
+            memory: MemoryHealth {
+                available: true,
+                degraded: true,
+                corrupt_rows: 3,
+                rebuilt: true,
+                recovered_rows: 40,
+                expected_rows: Some(50),
+            },
+            agent_available: true,
+            last_error: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            "{\"status\":\"running\",\"version\":\"1.2.3\",\"uptime_secs\":7,\
+             \"sessions\":2,\"clients\":1,\"memory_available\":true,\
+             \"memory_degraded\":true,\"memory_corrupt_rows\":3,\"memory_rebuilt\":true,\
+             \"memory_recovered_rows\":40,\"memory_expected_rows\":50,\
+             \"agent_available\":true,\"last_error\":null}"
+        );
     }
 
     #[tokio::test]

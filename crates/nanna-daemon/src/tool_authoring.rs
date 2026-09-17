@@ -53,12 +53,12 @@ fn resolve_tool_dir(tools_dir: &Path, name: &str) -> Result<PathBuf, String> {
 
     // A validated name cannot traverse, but the directory it points at can
     // still be a symlink somebody else planted.
-    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "'{name}' is a symlink; refusing to write through it"
-            ));
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(&dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "'{name}' is a symlink; refusing to write through it"
+        ));
     }
     Ok(dir)
 }

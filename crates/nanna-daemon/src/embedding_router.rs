@@ -72,12 +72,22 @@ pub struct EmbeddingRouter {
     demoted_until: RwLock<Vec<Option<Instant>>>,
     /// Per-provider input window, memoized. Same length as `providers`.
     ///
-    /// Three states, and the difference between the last two matters: `None` is
-    /// "never asked", `Some(None)` is "asked, the provider publishes no limit",
-    /// `Some(Some(n))` is a real limit. Collapsing the middle case into the
-    /// first would re-probe a provider that will never answer, once per
-    /// embedding call.
-    windows: RwLock<Vec<Option<Option<usize>>>>,
+    /// Three states, and the difference between the last two matters — see
+    /// [`WindowMemo`].
+    windows: RwLock<Vec<WindowMemo>>,
+}
+
+/// What is known about one provider's input window.
+///
+/// `Probed(None)` ("asked, the provider publishes no limit") must stay distinct
+/// from `Unprobed`: collapsing the two would re-probe a provider that will never
+/// answer, once per embedding call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowMemo {
+    /// Never asked.
+    Unprobed,
+    /// Asked: `Some(n)` is a real limit, `None` means no published limit.
+    Probed(Option<usize>),
 }
 
 impl EmbeddingRouter {
@@ -89,7 +99,7 @@ impl EmbeddingRouter {
             active_index: RwLock::new(0),
             generation: AtomicU64::new(0),
             demoted_until: RwLock::new(vec![None]),
-            windows: RwLock::new(vec![None]),
+            windows: RwLock::new(vec![WindowMemo::Unprobed]),
         }
     }
 
@@ -98,7 +108,7 @@ impl EmbeddingRouter {
     pub fn with_fallback(mut self, info: EmbeddingProviderInfo, client: Arc<EmbeddingClient>) -> Self {
         self.providers.push(EmbeddingProviderEntry { info, client });
         self.demoted_until.get_mut().push(None);
-        self.windows.get_mut().push(None);
+        self.windows.get_mut().push(WindowMemo::Unprobed);
         self
     }
 
@@ -122,11 +132,12 @@ impl EmbeddingRouter {
     /// nothing.
     pub async fn context_window_for(&self, info: &EmbeddingProviderInfo) -> Option<usize> {
         let idx = self.providers.iter().position(|e| &e.info == info)?;
-        if let Some(memoized) = self.windows.read().await[idx] {
+        let memo = self.windows.read().await[idx];
+        if let WindowMemo::Probed(memoized) = memo {
             return memoized;
         }
         let probed = self.providers[idx].client.context_window().await;
-        self.windows.write().await[idx] = Some(probed);
+        self.windows.write().await[idx] = WindowMemo::Probed(probed);
         if let Some(window) = probed { debug!("Embedding provider {info} accepts {window} tokens per input") } else { debug!(
             "Embedding provider {info} publishes no input limit; chunking falls back to the \
              retrieval-granularity default"
@@ -195,6 +206,13 @@ impl EmbeddingRouter {
     /// caller can rebind its store to a consistent `(model, width)` pair —
     /// reading the active provider back after the fact can race a second
     /// switch and tear the pair apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider produced a vector: every provider is
+    /// benched after deterministic failures, every non-benched provider failed
+    /// without merely being congested (the message carries the last error), or
+    /// providers were still congested after the whole `BACKOFF_SECS` schedule.
     pub async fn embed_one(
         &self,
         text: &str,
@@ -381,7 +399,7 @@ impl EmbeddingRouter {
     // switch alongside the vector that produced it, and cannot be forgotten.
 
     /// Number of configured providers (primary + fallbacks)
-    pub fn provider_count(&self) -> usize {
+    pub const fn provider_count(&self) -> usize {
         self.providers.len()
     }
 }

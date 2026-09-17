@@ -30,11 +30,16 @@ impl ControlPlane {
                 Ok(("session".to_string(), Some(session_id.to_string())))
             }
             "workspace" => {
-                let workspaces = self.workspaces.read().await;
-                let active = workspaces
+                // The guard only resolves the active id; nothing after it
+                // needs the registry locked.
+                let active_id = self
+                    .workspaces
+                    .read()
+                    .await
                     .active()
+                    .map(|ws| ws.id.clone())
                     .ok_or_else(|| "workspace scope requires an active workspace".to_string())?;
-                Ok(("workspace".to_string(), Some(active.id.clone())))
+                Ok(("workspace".to_string(), Some(active_id)))
             }
             "global" => Ok(("global".to_string(), None)),
             other => Err(format!("unknown scope '{other}'")),

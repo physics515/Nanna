@@ -219,7 +219,10 @@ fn main() {
         Commands::Start => start_service(&cli),
         Commands::Stop => stop_service(&cli),
         Commands::Restart => restart_service(&cli),
-        Commands::Status => show_status(&cli),
+        Commands::Status => {
+            show_status(&cli);
+            Ok(())
+        }
         Commands::Install => install_service(&cli),
         Commands::Uninstall => uninstall_service(&cli),
         #[cfg(windows)]
@@ -316,26 +319,24 @@ fn start_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     if manager.status() == ServiceStatus::Running {
         println!("Daemon is already running");
-        Ok(())
     } else {
         println!("Starting daemon...");
         manager.start()?;
         println!("Daemon started");
-        Ok(())
     }
+    Ok(())
 }
 
 fn stop_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     if manager.status() == ServiceStatus::Stopped {
         println!("Daemon is not running");
-        Ok(())
     } else {
         println!("Stopping daemon...");
         manager.stop()?;
         println!("Daemon stopped");
-        Ok(())
     }
+    Ok(())
 }
 
 fn restart_service(cli: &Cli) -> Result<(), String> {
@@ -351,7 +352,7 @@ fn restart_service(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn show_status(cli: &Cli) -> Result<(), String> {
+fn show_status(cli: &Cli) {
     let status = get_service_manager(cli).status();
 
     println!("Nanna Daemon Status");
@@ -406,8 +407,6 @@ fn show_status(cli: &Cli) -> Result<(), String> {
             }
         }
     }
-    
-    Ok(())
 }
 
 fn install_service(cli: &Cli) -> Result<(), String> {

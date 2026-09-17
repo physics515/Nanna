@@ -155,10 +155,10 @@ fn required_url(params: &Value) -> Result<String, String> {
 fn passthrough(params: &Value, keys: &[&str]) -> HashMap<String, Value> {
     let mut out = HashMap::new();
     for key in keys {
-        if let Some(value) = params.get(*key) {
-            if !value.is_null() {
-                out.insert((*key).to_string(), value.clone());
-            }
+        if let Some(value) = params.get(*key)
+            && !value.is_null()
+        {
+            out.insert((*key).to_string(), value.clone());
         }
     }
     out

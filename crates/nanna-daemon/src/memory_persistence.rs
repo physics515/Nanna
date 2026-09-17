@@ -75,12 +75,11 @@ fn attach_buckets(entry: &mut MemoryEntry, buckets: Vec<(String, Vec<f32>)>) {
         // active vector and its bucket differ for the same model.
         entry.embeddings.entry(model).or_insert(vector);
     }
-    if entry.embedding.is_empty() {
-        if let Some(model) = entry.embedding_model.clone() {
-            if let Some(vector) = entry.embeddings.get(&model) {
-                entry.embedding = vector.clone();
-            }
-        }
+    if entry.embedding.is_empty()
+        && let Some(model) = entry.embedding_model.clone()
+        && let Some(vector) = entry.embeddings.get(&model)
+    {
+        entry.embedding = vector.clone();
     }
 }
 
@@ -122,7 +121,6 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
             // Try Turso datetime format 'YYYY-MM-DD HH:MM:SS'
             chrono::NaiveDateTime::parse_from_str(&mem.created_at, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc().fixed_offset())
-                .map_err(|e| e)
         })
         .map_or(0, |dt| dt.timestamp());
 
@@ -130,10 +128,10 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
         stability: mem.fsrs_stability,
         difficulty: mem.fsrs_difficulty,
         last_access: mem.fsrs_last_access,
-        access_count: mem.fsrs_access_count as u32,
+        access_count: crate::numeric::u32_clamped(mem.fsrs_access_count),
         importance: mem.fsrs_importance,
         storage_strength: mem.fsrs_storage_strength,
-        generation: mem.fsrs_generation as u32,
+        generation: crate::numeric::u32_clamped(mem.fsrs_generation),
     };
 
     MemoryEntry {
@@ -276,14 +274,13 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     }
                 }
                 _ => {
-                    if let Some(model) = active_model {
-                        if let Err(e) = self
+                    if let Some(model) = active_model
+                        && let Err(e) = self
                             .repo
                             .enqueue_embedding(memory_id, c.ordinal, model)
                             .await
-                        {
-                            warn!("Could not queue chunk {memory_id}#{} : {e}", c.ordinal);
-                        }
+                    {
+                        warn!("Could not queue chunk {memory_id}#{} : {e}", c.ordinal);
                     }
                 }
             }
@@ -392,7 +389,7 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     // once, at the boundary, is the only place that cannot be
                     // forgotten by a later caller.
                     .map(|(memory_id, ordinal, distance)| {
-                        (memory_id, ordinal, 1.0 - distance as f32)
+                        (memory_id, ordinal, 1.0 - crate::numeric::f32_from_f64(distance))
                     })
                     .collect()
             })
@@ -630,7 +627,7 @@ mod tests {
     #[test]
     fn an_empty_stored_vector_is_not_bucketed_under_its_model() {
         let entry = db_memory_to_entry(stored_row("m2", Some(Vec::new()), Some("ollama:nomic")));
-        assert!(entry.embedding.is_empty());
+        assert_eq!(entry.embedding, Vec::<f32>::new());
         assert!(
             entry.embeddings.is_empty(),
             "an empty vector claims no model, whatever the column says"

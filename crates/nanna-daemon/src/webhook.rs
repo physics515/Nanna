@@ -96,10 +96,12 @@ const MAX_TIMESTAMP_HEADER_LEN: usize = 20;
 fn signed_timestamp_is_fresh(timestamp: &str) -> bool {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    debug_assert!(
-        MAX_SIGNED_TIMESTAMP_AGE_SECS > 0,
-        "a zero window would reject every request, including legitimate ones"
-    );
+    const {
+        assert!(
+            MAX_SIGNED_TIMESTAMP_AGE_SECS > 0,
+            "a zero window would reject every request, including legitimate ones"
+        );
+    }
     debug_assert!(
         MAX_TIMESTAMP_HEADER_LEN >= u64::MAX.to_string().len(),
         "the header bound must still admit every representable u64 second"
@@ -569,7 +571,7 @@ async fn discord_webhook(
     
     let webhook_message = user.and_then(|u| {
         let content = interaction.data.as_ref().and_then(|d| {
-            d.name.clone().or(d.custom_id.clone())
+            d.name.clone().or_else(|| d.custom_id.clone())
         })?;
         
         Some(WebhookMessage {
@@ -717,11 +719,11 @@ async fn slack_webhook(
     };
     
     // Handle URL verification challenge
-    if event_wrapper.event_type == "url_verification" {
-        if let Some(challenge) = event_wrapper.challenge {
-            info!("Slack webhook: responding to URL verification");
-            return (StatusCode::OK, challenge).into_response();
-        }
+    if event_wrapper.event_type == "url_verification"
+        && let Some(challenge) = event_wrapper.challenge
+    {
+        info!("Slack webhook: responding to URL verification");
+        return (StatusCode::OK, challenge).into_response();
     }
     
     debug!("Slack webhook: received event type {}", event_wrapper.event_type);
@@ -771,13 +773,12 @@ async fn whatsapp_verify(
     let token = params.get("hub.verify_token").map(std::string::String::as_str);
     let challenge = params.get("hub.challenge");
     
-    if mode == Some("subscribe") {
-        if let Some(ref verify_token) = state.config.whatsapp_verify_token {
-            if webhook_secret_matches(verify_token, token) {
-                info!("WhatsApp webhook: verification successful");
-                return (StatusCode::OK, challenge.cloned().unwrap_or_default()).into_response();
-            }
-        }
+    if mode == Some("subscribe")
+        && let Some(ref verify_token) = state.config.whatsapp_verify_token
+        && webhook_secret_matches(verify_token, token)
+    {
+        info!("WhatsApp webhook: verification successful");
+        return (StatusCode::OK, challenge.cloned().unwrap_or_default()).into_response();
     }
     
     warn!("WhatsApp webhook: verification failed");
@@ -1037,7 +1038,7 @@ fn extract_generic_message(payload: &Value, webhook_id: &str) -> Option<WebhookM
                 .map(String::from),
             chat_id: payload
                 .get("channel")
-                .or(payload.get("chat_id"))
+                .or_else(|| payload.get("chat_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(webhook_id)
                 .to_string(),
@@ -1131,6 +1132,12 @@ impl WebhookServer {
     }
     
     /// Run the webhook server
+    ///
+    /// # Errors
+    ///
+    /// Returns an `InvalidInput` error when `host:port` is not a socket
+    /// address, the error from binding the listener, or the error that ends
+    /// serving.
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let addr: SocketAddr = format!("{}:{}", self.config.host, self.config.port)
             .parse()
