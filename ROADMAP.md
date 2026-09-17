@@ -1813,6 +1813,15 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       - [ ] `nanna-server`'s own Telegram/Discord/Slack handlers were not audited for the same
             ack-as-reply assumption — check whether that server is still reachable in daemon mode
             before spending time on it.
+      - [ ] **The daemon's generic `/webhook/{id}` refuses every call, and its refusal names a
+            setting that cannot fix it.** *(found 2026-09-17)* `WebhookConfig::generic_secrets` is
+            populated by nothing outside `webhook.rs` and its fail-closed test — no config key, no IPC
+            verb, no keyring entry — so every id is "unregistered". The 401/503 text points at
+            `server.webhook_secret (per webhook id)`, which is `nanna serve`'s single shared secret
+            and never reaches the daemon. Fail-closed is the safe failure; the dead field and the
+            misleading remedy are the defects. Needs a decision on WHERE per-hook secrets live
+            (the P1 rule is "secrets leave config.toml", so keyring-backed with a create/revoke verb
+            is the likely shape) — product-level, not taken unattended.
 - [~] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
       *(2026-08-23)* **The headline was stale; the hole it hid was real and is now fixed.** Both live
