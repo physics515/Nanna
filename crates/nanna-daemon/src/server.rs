@@ -1161,6 +1161,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         );
     }
 
+    // File history. The bridge snapshots before every script write once a
+    // store is installed; these let the `file_history` skill list and restore.
+    services.extend(crate::file_history_service::build_file_history_services(
+        nanna_scripting::file_history::installed(),
+    ));
+
     // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
     // these; the scheduler is built after this map, so it arrives by slot.
     if let Some((scheduler, sessions)) = reminders {
@@ -4150,6 +4156,16 @@ impl DaemonServer {
                 Arc::downgrade(&tools),
                 Arc::clone(&authoring_slot),
             ));
+
+            // Before any skill runs: the bridge snapshots into this store on
+            // every script write from here on.
+            let file_history_root = self.config.data_dir.join("file-history");
+            if nanna_scripting::file_history::install(file_history_root.clone()) {
+                info!(
+                    "File history (pre-write snapshots) at {}",
+                    file_history_root.display()
+                );
+            }
 
             let services = build_script_services(ScriptServiceDeps {
                 memory: memory.clone(),

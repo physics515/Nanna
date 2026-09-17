@@ -4563,7 +4563,7 @@ asks permission or restricts her.)*:
       and the run resumes when the answer arrives. Sub-agents already have exactly this shape toward their
       parent (`ask_parent`, crates/nanna-tools/src/builtin/ask_parent.rs) — the user-facing analog is the
       missing piece. Her choice to ask, about intent — never a required checkpoint before acting.
-- [ ] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
+- [x] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
@@ -4580,6 +4580,29 @@ asks permission or restricts her.)*:
             data dir's budget, not a magic count; per-session store under the daemon data dir
             keeps user repos free of `.__prev__` litter.
             Source: [Claude Code checkpointing guide](https://thepromptshelf.dev/blog/claude-code-checkpointing-rewind-guide-2026/).
+      *(2026-09-17) File-state checkpointing landed, at the one chokepoint every script write
+      shares.* `nanna_scripting::file_history` snapshots a file's bytes (or its absence) inside
+      `NannaBridge::write_file`, before the write, into `{data_dir}/file-history/<session>/` — so
+      `write_file`, `edit_file`, `file_buffer` and user-authored tools are all covered by
+      construction, and nothing lands in the user's tree. Bounds, each stated with its reason in
+      the module: 100 recent checkpoints per session (Claude Code's number) + each file's first
+      checkpoint kept as a baseline (≤400), 256 MiB per session, **1 GiB across all sessions**
+      (least recently written sessions pruned when a new one starts — per-session bounds alone grow
+      with session count), files over 8 MiB not snapshotted (logged). Identical content is not
+      re-snapshotted; a snapshot failure never blocks the write. `files.history` / `files.restore`
+      services + a `file_history` skill let Nanna list and restore her own writes; a restore
+      snapshots the current state first, so it is undoable; restoring a creation removes the file.
+      **Found on the real daemon, not in tests:** one `write_file` produced three checkpoints, two of
+      them the skills' own `.nanna/write_hiwater.json`/`read_marks.json` bookkeeping — now excluded
+      with the `.__prev__`/`.__best__` parks. Verified over IPC (write → destructive overwrite →
+      edit → list → restore → file byte-identical to the original; unknown checkpoint refused by
+      name). 8 store/service tests incl. eviction order and cross-session pruning.
+      - [ ] **Retire the in-tree `.__prev__`/`.__best__` parks** now that an out-of-tree history
+            exists — but `write_file`'s verdict sentences and P22 Tier 3 recovery guidance name
+            those files to the model, so it is a coordinated change to the skill's messages, not a
+            deletion; measure on a mission leg before and after.
+      - [ ] **GUI rewind** — list a session's checkpoints in the run timeline and restore one with
+            a click (the services exist; needs an IPC verb pair and a view).
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
