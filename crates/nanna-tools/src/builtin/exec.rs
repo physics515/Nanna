@@ -144,7 +144,7 @@ impl Tool for ExecTool {
             } else {
                 format!("{stdout}\n\nStderr:\n{stderr}")
             };
-            ToolResult::success(content).with_data(data.clone())
+            ToolResult::success(content).with_data(data)
         } else {
             let error_msg = if stderr.is_empty() {
                 format!("Command failed with exit code: {:?}", output.status.code())

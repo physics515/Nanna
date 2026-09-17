@@ -115,7 +115,7 @@ impl CronExpr {
     where
         Tz::Offset: Copy,
     {
-        let mut dt = from.clone() + chrono::Duration::minutes(1);
+        let mut dt = *from + chrono::Duration::minutes(1);
         // Reset seconds
         dt = dt
             .timezone()
@@ -130,18 +130,20 @@ impl CronExpr {
             }
 
             // Advance by 1 minute
-            dt = dt + chrono::Duration::minutes(1);
+            dt += chrono::Duration::minutes(1);
         }
 
         None
     }
 
     /// Find the next datetime that matches, starting from now (UTC)
+    #[must_use]
     pub fn next_from_now(&self) -> Option<DateTime<Utc>> {
         self.next(&Utc::now())
     }
 
     /// Get human-readable description
+    #[must_use]
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
 

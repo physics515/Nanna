@@ -173,8 +173,8 @@ pub async fn list_tools(
                     Some(ToolInfo {
                         name: t.get("name")?.as_str()?.to_string(),
                         description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-                        is_user_tool: t.get("is_user_tool").and_then(|v| v.as_bool()).unwrap_or(false),
+                        enabled: t.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                        is_user_tool: t.get("is_user_tool").and_then(serde_json::Value::as_bool).unwrap_or(false),
                     })
                 })
                 .collect()
@@ -285,9 +285,7 @@ pub(crate) async fn get_skills_path(state: &AppState) -> std::path::PathBuf {
             return ws.path.join("skills");
         }
     }
-    nanna_config::project_dirs()
-        .map(|p| p.data_dir().join("skills"))
-        .unwrap_or_else(|| std::path::PathBuf::from("skills"))
+    nanna_config::project_dirs().map_or_else(|| std::path::PathBuf::from("skills"), |p| p.data_dir().join("skills"))
 }
 
 /// List all skills in the workspace `skills/` directory.
@@ -298,11 +296,10 @@ pub async fn list_skills(
     let state_guard = state.read().await;
     let skills_path = get_skills_path(&state_guard).await;
 
-    if !skills_path.exists() {
-        if let Err(e) = std::fs::create_dir_all(&skills_path) {
+    if !skills_path.exists()
+        && let Err(e) = std::fs::create_dir_all(&skills_path) {
             warn!("Failed to create skills directory: {e}");
         }
-    }
 
     let discovered = nanna_tools::skills::discover_skills(&skills_path);
 
@@ -313,8 +310,7 @@ pub async fn list_skills(
                 let lang = p
                     .extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| if e == "ts" { "typescript" } else { "javascript" })
-                    .unwrap_or("javascript");
+                    .map_or("javascript", |e| if e == "ts" { "typescript" } else { "javascript" });
                 ("script".to_string(), Some(lang.to_string()))
             }
             nanna_tools::skills::SkillSource::Manifest(_) => ("manifest".to_string(), None),

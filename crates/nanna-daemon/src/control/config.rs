@@ -1,6 +1,6 @@
 //! Config handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, warn, info, ControlPlane, Config, Event, ConfigAction, Value};
 
 impl ControlPlane {
     /// Push `[scheduler]` settings onto the **running** scheduler loop.

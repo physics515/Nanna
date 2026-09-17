@@ -95,11 +95,13 @@ pub enum ResponseResult {
 }
 
 impl Response {
-    pub fn is_error(&self) -> bool {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
     
-    pub fn data(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn data(&self) -> Option<&Value> {
         match &self.result {
             ResponseResult::Success { data } => Some(data),
             ResponseResult::Error { .. } => None,
@@ -196,6 +198,7 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Create a new daemon client
+    #[must_use]
     pub fn new(config: DaemonClientConfig) -> Self {
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(100);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -235,7 +238,7 @@ impl DaemonClient {
             Ok(Err(e)) => {
                 *self.state.write().await = ConnectionState::Disconnected;
                 warn!("Failed to connect to daemon: {}", e);
-                Err(format!("Connection failed: {}", e))
+                Err(format!("Connection failed: {e}"))
             }
             Err(_) => {
                 *self.state.write().await = ConnectionState::Disconnected;
@@ -383,7 +386,7 @@ impl DaemonClient {
 
                 // Wait before attempting reconnection
                 tokio::select! {
-                    _ = tokio::time::sleep(reconnect_interval) => {}
+                    () = tokio::time::sleep(reconnect_interval) => {}
                     _ = shutdown_rx.recv() => {
                         info!("Reconnection loop stopped by shutdown signal");
                         break;
@@ -562,6 +565,7 @@ impl DaemonClient {
     }
     
     /// Subscribe to daemon events
+    #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.event_tx.subscribe()
     }
@@ -569,6 +573,7 @@ impl DaemonClient {
     /// Sender side of the event bus. Used in embedded mode to inject events
     /// from the in-process `AgentService` so the same subscribers (the single
     /// Tauri event-forwarding task) see them exactly like daemon events.
+    #[must_use]
     pub fn event_sender(&self) -> broadcast::Sender<DaemonEvent> {
         self.event_tx.clone()
     }
@@ -593,7 +598,7 @@ impl DaemonClient {
         let request = Request { id: id.clone(), action };
 
         let json = serde_json::to_string(&request)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+            .map_err(|e| format!("Serialization error: {e}"))?;
 
         // Create response channel
         let (tx, rx) = oneshot::channel();
@@ -606,7 +611,7 @@ impl DaemonClient {
 
         // Send request
         msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Wait for response with timeout
         match tokio::time::timeout(timeout, rx).await {
@@ -650,7 +655,7 @@ impl DaemonClient {
         };
 
         let json = serde_json::to_string(&request)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+            .map_err(|e| format!("Serialization error: {e}"))?;
 
         // Create response channel
         let (tx, rx) = oneshot::channel();
@@ -665,7 +670,7 @@ impl DaemonClient {
         msg_tx
             .send(Message::Text(json.into()))
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Health-check polling loop
         let mut rx = rx;
@@ -675,18 +680,15 @@ impl DaemonClient {
             tokio::select! {
                 // Branch A: response arrives
                 result = &mut rx => {
-                    return match result {
-                        Ok(result) => result,
-                        Err(_) => {
-                            let mut pending = self.pending.write().await;
-                            pending.remove(&id);
-                            Err("Response channel closed".to_string())
-                        }
+                    return if let Ok(result) = result { result } else {
+                        let mut pending = self.pending.write().await;
+                        pending.remove(&id);
+                        Err("Response channel closed".to_string())
                     };
                 }
 
                 // Branch B: health-check interval fires
-                _ = tokio::time::sleep(HEALTH_POLL_INTERVAL) => {
+                () = tokio::time::sleep(HEALTH_POLL_INTERVAL) => {
                     let ping_payload = serde_json::json!({
                         "type": "session",
                         "action": "get_run_state",
@@ -698,7 +700,7 @@ impl DaemonClient {
                             missed_pings = 0;
                             let is_running = state
                                 .get("is_running")
-                                .and_then(|v| v.as_bool())
+                                .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
 
                             if !is_running {
@@ -760,8 +762,7 @@ impl DaemonClient {
                                 let mut pending = self.pending.write().await;
                                 pending.remove(&id);
                                 return Err(format!(
-                                    "Daemon unresponsive ({} missed health pings)",
-                                    missed_pings
+                                    "Daemon unresponsive ({missed_pings} missed health pings)"
                                 ));
                             }
                         }

@@ -1,7 +1,7 @@
 //! Channel Listeners - Inbound message receivers
 //!
 //! Each listener connects to a messaging platform and pushes incoming
-//! messages to the MessageRouter for processing.
+//! messages to the `MessageRouter` for processing.
 //!
 //! # Available Listeners
 //!
@@ -9,7 +9,7 @@
 //! - `DiscordListener` - WebSocket via Discord Gateway
 //! - `SlackListener` - WebSocket via Slack Socket Mode
 //! - `SignalListener` - signal-cli-rest-api (SSE or polling)
-//! - `WhatsAppWebListener` - WhatsApp Web bridge (WebSocket, SSE, or polling)
+//! - `WhatsAppWebListener` - `WhatsApp` Web bridge (WebSocket, SSE, or polling)
 
 pub mod circuit_breaker;
 pub mod discord;
@@ -54,7 +54,8 @@ pub struct ListenerHandle {
 
 impl ListenerHandle {
     /// Create a new listener handle
-    pub fn new(shutdown_tx: mpsc::Sender<()>, join_handle: tokio::task::JoinHandle<()>) -> Self {
+    #[must_use]
+    pub const fn new(shutdown_tx: mpsc::Sender<()>, join_handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             shutdown_tx,
             join_handle,
@@ -70,6 +71,7 @@ impl ListenerHandle {
     }
 
     /// Check if the listener is still running
+    #[must_use]
     pub fn is_running(&self) -> bool {
         !self.join_handle.is_finished()
     }
@@ -103,6 +105,7 @@ pub struct ListenerManager {
 
 impl ListenerManager {
     /// Create a new listener manager
+    #[must_use]
     pub fn new(buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         Self {
@@ -113,12 +116,13 @@ impl ListenerManager {
     }
 
     /// Get the message sender (for adding listeners)
+    #[must_use]
     pub fn sender(&self) -> mpsc::Sender<IncomingMessage> {
         self.message_tx.clone()
     }
 
     /// Take the message receiver (can only be called once)
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<IncomingMessage>> {
+    pub const fn take_receiver(&mut self) -> Option<mpsc::Receiver<IncomingMessage>> {
         self.message_rx.take()
     }
 
@@ -152,6 +156,7 @@ impl ListenerManager {
     }
 
     /// List running listeners
+    #[must_use]
     pub fn list(&self) -> Vec<&str> {
         self.listeners
             .iter()

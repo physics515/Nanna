@@ -110,7 +110,7 @@ pub async fn open_workspace(
     // Create and load new workspace
     let mut workspace = Workspace::new(&path);
     workspace.load_context().await
-        .map_err(|e| format!("Failed to load workspace: {}", e))?;
+        .map_err(|e| format!("Failed to load workspace: {e}"))?;
 
     // The daemon owns persistence (nanna.db): open the workspace there first and
     // adopt ITS id locally, so both registries agree and it survives a restart.
@@ -163,7 +163,7 @@ pub async fn set_active_workspace(
         }
         Ok(())
     } else {
-        Err(format!("Workspace not found: {}", id))
+        Err(format!("Workspace not found: {id}"))
     }
 }
 
@@ -206,7 +206,7 @@ pub async fn get_workspace_context(
     let registry = state_guard.workspaces.read().await;
 
     let ws = registry.get(&id)
-        .ok_or_else(|| format!("Workspace not found: {}", id))?;
+        .ok_or_else(|| format!("Workspace not found: {id}"))?;
 
     Ok(ws.context.build_system_prompt_injection())
 }
@@ -224,9 +224,9 @@ pub async fn reload_workspace(
     let info = {
         let mut registry = state_guard.workspaces.write().await;
         let ws = registry.get_mut(&id)
-            .ok_or_else(|| format!("Workspace not found: {}", id))?;
+            .ok_or_else(|| format!("Workspace not found: {id}"))?;
         ws.load_context().await
-            .map_err(|e| format!("Failed to reload workspace: {}", e))?;
+            .map_err(|e| format!("Failed to reload workspace: {e}"))?;
         info!("Reloaded workspace: {}", ws.name);
         WorkspaceInfo::from(&*ws)
     };
@@ -286,9 +286,9 @@ pub async fn save_workspace_file(
     {
         let registry = state_guard.workspaces.read().await;
         let ws = registry.get(&workspace_id)
-            .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
         ws.save_context_file(&filename, &content).await
-            .map_err(|e| format!("Failed to save file: {}", e))?;
+            .map_err(|e| format!("Failed to save file: {e}"))?;
     }
     if let Err(e) = state_guard
         .backend

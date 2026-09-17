@@ -1,7 +1,7 @@
 //! Signal channel implementation via signald
 //!
 //! Communicates with signald daemon over Unix socket (or TCP on Windows).
-//! See: https://signald.org/
+//! See: <https://signald.org>/
 
 use crate::{
     Channel, ChannelCapabilities, ChannelError, ChannelFeatures, IncomingMessage, MessageContent,
@@ -208,15 +208,12 @@ impl SignalChannel {
             // Check if this is an incoming message
             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
             
-            if msg_type == "IncomingMessage" {
-                if let Some(ref tx) = incoming_tx {
-                    if let Some(incoming) = Self::parse_incoming_message(&msg, &account) {
-                        if tx.send(incoming).await.is_err() {
+            if msg_type == "IncomingMessage"
+                && let Some(ref tx) = incoming_tx
+                    && let Some(incoming) = Self::parse_incoming_message(&msg, &account)
+                        && tx.send(incoming).await.is_err() {
                             warn!("Failed to send incoming message to channel");
                         }
-                    }
-                }
-            }
         }
 
         info!("signald reader task ended");

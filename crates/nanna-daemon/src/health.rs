@@ -33,6 +33,7 @@ pub struct PidFile {
 
 impl PidFile {
     /// Create a new PID file manager
+    #[must_use]
     pub fn new(data_dir: &PathBuf) -> Self {
         Self {
             path: data_dir.join("nanna-daemon.pid"),
@@ -40,12 +41,9 @@ impl PidFile {
     }
     
     /// Get the default PID file path
+    #[must_use]
     pub fn default_path() -> PathBuf {
-        nanna_config::project_dirs()
-            .map(|d| d.runtime_dir()
-                .map(|r| r.to_path_buf())
-                .unwrap_or_else(|| d.data_dir().to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."))
+        nanna_config::project_dirs().map_or_else(|| PathBuf::from("."), |d| d.runtime_dir().map_or_else(|| d.data_dir().to_path_buf(), std::path::Path::to_path_buf))
             .join("nanna-daemon.pid")
     }
     
@@ -95,7 +93,8 @@ impl PidFile {
     }
     
     /// Get the path to the PID file
-    pub fn path(&self) -> &PathBuf {
+    #[must_use]
+    pub const fn path(&self) -> &PathBuf {
         &self.path
     }
 }
@@ -194,6 +193,7 @@ pub struct HealthState {
 }
 
 impl HealthState {
+    #[must_use]
     pub fn new(memory_available: bool, agent_available: bool) -> Self {
         Self {
             start_time: Instant::now(),
@@ -214,7 +214,7 @@ impl HealthState {
     /// Builder-style so a corrupt store is visible on `/status` and `/health`
     /// instead of only a boot `error!` log.
     #[must_use]
-    pub fn with_memory_health(mut self, degraded: bool, corrupt_rows: usize) -> Self {
+    pub const fn with_memory_health(mut self, degraded: bool, corrupt_rows: usize) -> Self {
         self.memory_degraded = degraded;
         self.memory_corrupt_rows = corrupt_rows;
         self
@@ -224,7 +224,7 @@ impl HealthState {
     /// `RecoveryReport`) so `/status` keeps reporting the rebuild — clients
     /// that connect after boot never saw the `MemoryStoreRebuilt` event.
     #[must_use]
-    pub fn with_memory_rebuild(mut self, recovered: usize, expected: Option<usize>) -> Self {
+    pub const fn with_memory_rebuild(mut self, recovered: usize, expected: Option<usize>) -> Self {
         self.memory_rebuilt = true;
         self.memory_recovered_rows = recovered;
         self.memory_expected_rows = expected;
@@ -326,6 +326,7 @@ pub struct HealthServer {
 
 impl HealthServer {
     /// Create a new health server
+    #[must_use]
     pub fn new(state: HealthState, host: &str, port: u16) -> Self {
         Self {
             state: Arc::new(state),
@@ -340,6 +341,7 @@ impl HealthServer {
     /// (session/client counts, `last_error`) after the server is spawned: the
     /// server then reflects those live updates instead of serving a throwaway
     /// copy whose counters never move.
+    #[must_use]
     pub fn from_shared(state: Arc<HealthState>, host: &str, port: u16) -> Self {
         Self {
             state,
@@ -349,6 +351,7 @@ impl HealthServer {
     }
 
     /// Get a reference to the state (for updating from daemon)
+    #[must_use]
     pub fn state(&self) -> Arc<HealthState> {
         self.state.clone()
     }
@@ -381,7 +384,7 @@ impl HealthServer {
     }
 
     /// Bind with retry for Windows port conflicts.
-    /// On Unix, uses SO_REUSEADDR. On Windows, retries with delay.
+    /// On Unix, uses `SO_REUSEADDR`. On Windows, retries with delay.
     async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
         #[cfg(unix)]
         {
@@ -394,7 +397,7 @@ impl HealthServer {
             socket.set_nonblocking(true)?;
             socket.bind(&addr.into())?;
             socket.listen(128)?;
-            return tokio::net::TcpListener::from_std(socket.into());
+            tokio::net::TcpListener::from_std(socket.into())
         }
 
         #[cfg(windows)]
@@ -417,6 +420,7 @@ impl HealthServer {
     }
     
     /// Spawn the health server as a background task
+    #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(e) = self.run().await {

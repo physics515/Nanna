@@ -36,9 +36,9 @@ pub const FILTER_DEPTH_MAX: usize = 32;
 /// Parsed filter expression tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterExpr {
-    And(Box<FilterExpr>, Box<FilterExpr>),
-    Or(Box<FilterExpr>, Box<FilterExpr>),
-    Not(Box<FilterExpr>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Not(Box<Self>),
     Atom(FilterAtom),
 }
 
@@ -372,7 +372,7 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterError> {
     Ok(tokens)
 }
 
-fn skip_ws(chars: &[char], start: usize) -> usize {
+const fn skip_ws(chars: &[char], start: usize) -> usize {
     let mut i = start;
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;

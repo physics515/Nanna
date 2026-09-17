@@ -2,11 +2,11 @@
 //!
 //! The bundled `text_to_speech` and `transcribe` skills declare these and
 //! nothing registered them, so both were withheld at every boot (found by
-//! `tests/skill_services_are_registered.rs`). The OpenAI clients behind them —
+//! `tests/skill_services_are_registered.rs`). The `OpenAI` clients behind them —
 //! `OpenAiTts`, `OpenAiWhisper` — have been complete and unreachable.
 //!
-//! **Both are registered only when an OpenAI key is configured.** Whisper and
-//! the TTS endpoint are OpenAI's, not the chat router's, so there is no model
+//! **Both are registered only when an `OpenAI` key is configured.** Whisper and
+//! the TTS endpoint are `OpenAI`'s, not the chat router's, so there is no model
 //! list to fall through; without a key the services do not exist and the two
 //! skills stay withheld, with the boot warning naming what is missing.
 //!
@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 /// Ceiling on one `audio.tts` request, in characters.
 ///
-/// OpenAI's speech endpoint rejects input over 4096 characters, so this is the
+/// `OpenAI`'s speech endpoint rejects input over 4096 characters, so this is the
 /// provider's limit restated where the caller can be told about it, rather than
 /// a number chosen here. Refusing locally costs nothing; sending spends a
 /// request to be told the same thing less clearly.
@@ -35,7 +35,7 @@ pub const TTS_INPUT_CHARS_MAX: usize = 4096;
 
 /// Ceiling on an audio file sent to `audio.transcribe`, in bytes.
 ///
-/// OpenAI's transcription endpoint caps uploads at 25 MB. Same reasoning as
+/// `OpenAI`'s transcription endpoint caps uploads at 25 MB. Same reasoning as
 /// above: the bound is the provider's, and it is checked from `metadata()`
 /// before the bytes are buffered so an oversized file is refused rather than
 /// read and then refused.
@@ -44,7 +44,7 @@ pub const TRANSCRIBE_BYTES_MAX: u64 = 25 * 1024 * 1024;
 /// Subdirectory of the data dir that generated speech is written to.
 const AUDIO_DIR_NAME: &str = "audio";
 
-/// Extension for generated speech. OpenAI's speech endpoint returns MP3 unless
+/// Extension for generated speech. `OpenAI`'s speech endpoint returns MP3 unless
 /// another format is requested, and nothing here requests one.
 const TTS_FILE_EXTENSION: &str = "mp3";
 

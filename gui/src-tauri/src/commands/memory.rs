@@ -148,7 +148,7 @@ pub async fn get_memory_stats(
     for session in &sessions {
         total_messages += session
             .get("message_count")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
         if let Some(created) = session.get("created_at").and_then(|v| v.as_str()) {
             timestamps.push(created.to_string());
@@ -261,14 +261,14 @@ pub async fn get_cognitive_memory_stats(
         .map_err(|e| format!("Failed to get memory stats: {e}"))?;
 
     Ok(CognitiveMemoryStats {
-        total_memories: result.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        active: result.get("active").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        dormant: result.get("dormant").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        silent: result.get("silent").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        unavailable: result.get("unavailable").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        total_memories: result.get("total").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        active: result.get("active").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        dormant: result.get("dormant").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        silent: result.get("silent").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        unavailable: result.get("unavailable").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
         consolidation_enabled: result
             .get("consolidation_enabled")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
         last_consolidation: result
             .get("last_consolidation")
@@ -300,10 +300,10 @@ pub async fn trigger_consolidation(
         .map_err(|e| format!("Consolidation failed: {e}"))?;
 
     Ok(ConsolidationResultInfo {
-        memories_processed: result.get("memories_processed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        clusters_formed: result.get("clusters_formed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        memories_merged: result.get("memories_merged").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        memories_expanded: result.get("memories_expanded").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        memories_processed: result.get("memories_processed").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        clusters_formed: result.get("clusters_formed").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        memories_merged: result.get("memories_merged").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        memories_expanded: result.get("memories_expanded").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
         errors: result
             .get("errors")
             .and_then(|v| v.as_array())

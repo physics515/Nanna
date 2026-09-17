@@ -407,7 +407,7 @@ impl Tool for ReadPdfTool {
 
         let extract_images = params
             .get("extract_images")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // `pages` is what the read_pdf skill has always sent; `max_pages` is
@@ -418,7 +418,7 @@ impl Tool for ReadPdfTool {
             Some(spec) => parse_page_selection(spec).map_err(ToolError::InvalidParams)?,
             None => params
                 .get("max_pages")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map_or(PageSelection::All, |n| PageSelection::First(n as usize)),
         };
 
@@ -430,14 +430,13 @@ impl Tool for ReadPdfTool {
         // OCR fallback is on by default when an OCR function is configured
         let ocr_fallback = params
             .get("ocr_fallback")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
 
         let path = Path::new(path_str);
         if !path.exists() {
             return Err(ToolError::ExecutionFailed(format!(
-                "File not found: {}",
-                path_str
+                "File not found: {path_str}"
             )));
         }
 
@@ -457,14 +456,14 @@ impl Tool for ReadPdfTool {
         // Read PDF bytes
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {e}")))?;
 
         // ------------------------------------------------------------------
         // Tier 1: lopdf text extraction
         // ------------------------------------------------------------------
         let extracted = read_pdf_text(&bytes, selection)?;
         let (text, empty_pages) = (extracted.text, extracted.empty_pages);
-        let mut result = format!("# PDF Content: {}\n\n{}", path_str, text);
+        let mut result = format!("# PDF Content: {path_str}\n\n{text}");
 
         // Both optional stages live in their own methods: `execute` is the
         // one place a reader looks to see what a call does, and it should not
@@ -666,12 +665,12 @@ fn extract_pdf_images(
     use lopdf::{Document, Object};
 
     let doc = Document::load_mem(bytes)
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse PDF: {}", e)))?;
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse PDF: {e}")))?;
 
     let mut images = Vec::new();
 
     // Iterate through objects looking for images
-    for (_obj_id, object) in doc.objects.iter() {
+    for object in doc.objects.values() {
         if images.len() >= 20 {
             // Limit to 20 images
             break;
@@ -683,8 +682,7 @@ fn extract_pdf_images(
             // Check if this is an image
             let is_image = dict
                 .get(b"Subtype")
-                .map(|o| matches!(o, Object::Name(n) if n == b"Image"))
-                .unwrap_or(false);
+                .is_ok_and(|o| matches!(o, Object::Name(n) if n == b"Image"));
 
             if is_image {
                 // Try to get the image data
@@ -692,13 +690,12 @@ fn extract_pdf_images(
                     // Determine image type from filter
                     let media_type = dict
                         .get(b"Filter")
-                        .map(|f| match f {
+                        .map_or("image/png", |f| match f {
                             Object::Name(n) if n == b"DCTDecode" => "image/jpeg",
                             Object::Name(n) if n == b"FlateDecode" => "image/png",
                             Object::Name(n) if n == b"JPXDecode" => "image/jp2",
                             _ => "image/png",
-                        })
-                        .unwrap_or("image/png");
+                        });
 
                     images.push((data, media_type.to_string()));
                 }

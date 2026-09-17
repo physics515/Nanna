@@ -304,8 +304,8 @@ pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSea
         for term in &terms {
             let Some(&tf) = d.tf.get(term) else { continue };
             let df = df(term) as f64;
-            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            let norm = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * d.len / avgdl);
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+            let norm = BM25_K1.mul_add(1.0 - BM25_B + BM25_B * d.len / avgdl, tf);
             score += idf * (tf * (BM25_K1 + 1.0)) / norm;
         }
         if score > 0.0 {

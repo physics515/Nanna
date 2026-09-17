@@ -132,12 +132,12 @@ pub async fn save_channel_config(
                 allowed_contacts,
             });
         }
-        _ => return Err(format!("Unknown channel: {}", channel)),
+        _ => return Err(format!("Unknown channel: {channel}")),
     }
 
     // Save to disk
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Saved {} channel configuration", channel);
     Ok(())
@@ -168,7 +168,7 @@ pub async fn test_channel_connection(
                         let username = data["result"]["username"].as_str().unwrap_or("unknown");
                         Ok(TestConnectionResult {
                             success: true,
-                            message: format!("Connected to @{}", username),
+                            message: format!("Connected to @{username}"),
                         })
                     } else {
                         Ok(TestConnectionResult {
@@ -179,7 +179,7 @@ pub async fn test_channel_connection(
                 }
                 Err(e) => Ok(TestConnectionResult {
                     success: false,
-                    message: format!("Connection failed: {}", e),
+                    message: format!("Connection failed: {e}"),
                 }),
             }
         }
@@ -203,7 +203,7 @@ pub async fn test_channel_connection(
                         let username = data["username"].as_str().unwrap_or("unknown");
                         Ok(TestConnectionResult {
                             success: true,
-                            message: format!("Connected as {}", username),
+                            message: format!("Connected as {username}"),
                         })
                     } else {
                         Ok(TestConnectionResult {
@@ -214,13 +214,13 @@ pub async fn test_channel_connection(
                 }
                 Err(e) => Ok(TestConnectionResult {
                     success: false,
-                    message: format!("Connection failed: {}", e),
+                    message: format!("Connection failed: {e}"),
                 }),
             }
         }
         _ => Ok(TestConnectionResult {
             success: false,
-            message: format!("Testing not implemented for {}", channel),
+            message: format!("Testing not implemented for {channel}"),
         }),
     }
 }
@@ -305,7 +305,7 @@ pub async fn get_channel_status(
             } else {
                 "***".to_string()
             };
-            format!("Bot token: {}", token_preview)
+            format!("Bot token: {token_preview}")
         }),
     });
 
@@ -386,7 +386,7 @@ pub async fn get_enhanced_channel_status(
                 } else {
                     "***".to_string()
                 };
-                format!("Bot token: {}", token_preview)
+                format!("Bot token: {token_preview}")
             }),
             "discord" => config.channels.discord.as_ref().map(|d| {
                 format!("App ID: {}", d.application_id)
@@ -450,7 +450,7 @@ pub async fn test_all_channels(
                     let username = data["result"]["username"].as_str().unwrap_or("unknown");
                     TestConnectionResult {
                         success: true,
-                        message: format!("Connected to @{}", username),
+                        message: format!("Connected to @{username}"),
                     }
                 } else if response.status().as_u16() == 429 {
                     TestConnectionResult {
@@ -466,7 +466,7 @@ pub async fn test_all_channels(
             }
             Err(e) => TestConnectionResult {
                 success: false,
-                message: format!("Connection failed: {}", e),
+                message: format!("Connection failed: {e}"),
             },
         };
         results.insert("telegram".to_string(), result);
@@ -486,7 +486,7 @@ pub async fn test_all_channels(
                     let username = data["username"].as_str().unwrap_or("unknown");
                     TestConnectionResult {
                         success: true,
-                        message: format!("Connected as {}", username),
+                        message: format!("Connected as {username}"),
                     }
                 } else if response.status().as_u16() == 429 {
                     TestConnectionResult {
@@ -502,7 +502,7 @@ pub async fn test_all_channels(
             }
             Err(e) => TestConnectionResult {
                 success: false,
-                message: format!("Connection failed: {}", e),
+                message: format!("Connection failed: {e}"),
             },
         };
         results.insert("discord".to_string(), result);
@@ -524,13 +524,13 @@ pub async fn test_all_channels(
                         let user = data["user"].as_str().unwrap_or("unknown");
                         TestConnectionResult {
                             success: true,
-                            message: format!("Connected to {} as {}", team, user),
+                            message: format!("Connected to {team} as {user}"),
                         }
                     } else {
                         let error = data["error"].as_str().unwrap_or("unknown error");
                         TestConnectionResult {
                             success: false,
-                            message: format!("Slack error: {}", error),
+                            message: format!("Slack error: {error}"),
                         }
                     }
                 } else {
@@ -542,7 +542,7 @@ pub async fn test_all_channels(
             }
             Err(e) => TestConnectionResult {
                 success: false,
-                message: format!("Connection failed: {}", e),
+                message: format!("Connection failed: {e}"),
             },
         };
         results.insert("slack".to_string(), result);
@@ -551,12 +551,12 @@ pub async fn test_all_channels(
     // Signal - test signald or REST API
     if let Some(signal) = &config.channels.signal {
         let api_url = signal.api_url.as_deref().unwrap_or("http://localhost:8080");
-        let result = match client.get(format!("{}/v1/about", api_url)).send().await {
+        let result = match client.get(format!("{api_url}/v1/about")).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     TestConnectionResult {
                         success: true,
-                        message: format!("Signal API available at {}", api_url),
+                        message: format!("Signal API available at {api_url}"),
                     }
                 } else {
                     TestConnectionResult {
@@ -567,7 +567,7 @@ pub async fn test_all_channels(
             }
             Err(e) => TestConnectionResult {
                 success: false,
-                message: format!("Signal API not reachable: {}", e),
+                message: format!("Signal API not reachable: {e}"),
             },
         };
         results.insert("signal".to_string(), result);
@@ -578,12 +578,11 @@ pub async fn test_all_channels(
         let result = if whatsapp.connection_method == "cloud_api" {
             if let (Some(phone_id), Some(token)) = (&whatsapp.phone_number_id, &whatsapp.access_token) {
                 let url = format!(
-                    "https://graph.facebook.com/v18.0/{}/",
-                    phone_id
+                    "https://graph.facebook.com/v18.0/{phone_id}/"
                 );
                 match client
                     .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Authorization", format!("Bearer {token}"))
                     .send()
                     .await
                 {
@@ -602,7 +601,7 @@ pub async fn test_all_channels(
                     }
                     Err(e) => TestConnectionResult {
                         success: false,
-                        message: format!("Connection failed: {}", e),
+                        message: format!("Connection failed: {e}"),
                     },
                 }
             } else {
@@ -676,7 +675,7 @@ pub async fn subscribe_channel_status(
                         details: None,
                         connection_state: status.to_string(),
                         last_healthy: if status == "connected" { Some(chrono::Utc::now().timestamp_millis()) } else { None },
-                        consecutive_failures: if status == "connected" { 0 } else { 1 },
+                        consecutive_failures: u32::from(status != "connected"),
                         avg_response_ms: response_ms,
                         messages_sent_hour: 0,
                         messages_failed_hour: 0,

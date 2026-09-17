@@ -93,9 +93,9 @@ pub struct AgentServiceConfig {
     /// wins). Resolved at config load — empty here means the resolver already
     /// defaulted it to the main chat list, so consumers may use it verbatim.
     pub sub_agent_models: Vec<String>,
-    /// OpenRouter API key (passed to agents for summarization/extraction)
+    /// `OpenRouter` API key (passed to agents for summarization/extraction)
     pub openrouter_api_key: Option<String>,
-    /// OpenAI API key (passed to agents for summarization/extraction)
+    /// `OpenAI` API key (passed to agents for summarization/extraction)
     pub openai_api_key: Option<String>,
     /// Anthropic prompt-cache lifetime for every breakpoint of a request.
     pub prompt_cache_ttl: CacheTtl,
@@ -236,9 +236,9 @@ struct ActiveChat {
     /// loop-boundary check.
     cancel: CancelToken,
     started_at: chrono::DateTime<chrono::Utc>,
-    /// Accumulated streamed text (shared with on_text callback)
+    /// Accumulated streamed text (shared with `on_text` callback)
     accumulated_text: Arc<tokio::sync::RwLock<String>>,
-    /// Accumulated thinking/reasoning text (shared with on_thinking callback)
+    /// Accumulated thinking/reasoning text (shared with `on_thinking` callback)
     accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
     /// Tool calls currently in progress
     active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
@@ -250,8 +250,8 @@ struct ActiveChat {
     /// client that remounts mid-run (or reads the persisted message later)
     /// sees the WHOLE run, not just the slice since the last 502.
     ///
-    /// A std::sync::Mutex, deliberately: the journal is the primary render
-    /// source, so appends must be INFALLIBLE. An earlier try_write design
+    /// A `std::sync::Mutex`, deliberately: the journal is the primary render
+    /// source, so appends must be INFALLIBLE. An earlier `try_write` design
     /// silently dropped items whenever a snapshot clone held the lock —
     /// which fused text across healed attempts (the Fault seam vanished)
     /// and lost stream deltas. Every critical section here is a short
@@ -548,7 +548,7 @@ pub struct AgentService {
     memory: Option<Arc<MemoryService>>,
     /// Event broadcaster for streaming to clients
     event_tx: broadcast::Sender<Event>,
-    /// Currently active chats (session_id -> state)
+    /// Currently active chats (`session_id` -> state)
     active_chats: Arc<RwLock<HashMap<SessionId, ActiveChat>>>,
     // Reserved for future model caching optimization
     _model_cache: Option<ModelInfoCache>,
@@ -602,7 +602,7 @@ impl AgentService {
 
         // Set up checkpoint directory
         let checkpoint_dir = data_dir
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join("checkpoints");
         if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
             warn!("Failed to create checkpoint directory {:?}: {}", checkpoint_dir, e);
@@ -627,6 +627,7 @@ impl AgentService {
     }
 
     /// Set the database storage for checkpoint persistence.
+    #[must_use]
     pub fn with_storage(mut self, storage: Arc<nanna_storage::Storage>) -> Self {
         self.storage = Some(storage);
         self
@@ -656,7 +657,8 @@ impl AgentService {
     }
 
     /// Get a reference to the tool registry
-    pub fn tools(&self) -> &Arc<ToolRegistry> {
+    #[must_use]
+    pub const fn tools(&self) -> &Arc<ToolRegistry> {
         &self.tools
     }
 
@@ -840,8 +842,7 @@ impl AgentService {
         let queues = self.session_queues.read().await;
         queues
             .get(session_id)
-            .map(|q| q.depth.load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |q| q.depth.load(Ordering::Relaxed))
     }
 
     /// Run a chat completion with automatic model fallback.
@@ -872,7 +873,7 @@ impl AgentService {
         self.chat_with_options(session_id, message, system_prompt, history, None, None, workspace_id, attachments, false).await
     }
 
-    /// Chat with optional model and max_iterations overrides (used by sub-sessions).
+    /// Chat with optional model and `max_iterations` overrides (used by sub-sessions).
     pub async fn chat_with_options(
         &self,
         session_id: &str,
@@ -993,7 +994,7 @@ impl AgentService {
             let provider = crate::llm_router::ProviderId::from_model(model);
             if rate_limited_providers.contains(&provider) {
                 info!("Skipping {} — provider {:?} is rate-limited", model, provider);
-                tried_models.push(format!("{} (skipped: provider rate-limited)", model));
+                tried_models.push(format!("{model} (skipped: provider rate-limited)"));
                 model_index += 1;
                 continue;
             }
@@ -1035,33 +1036,30 @@ impl AgentService {
             }
 
             // Get the correct LLM client for this model from the router
-            let llm_client = match self.router.client_for_model(model) {
-                Some(client) => client,
-                None => {
-                    let detected = crate::llm_router::ProviderId::from_model(model);
-                    // Name the CAUSE, not just the outcome. "detected: Anthropic,
-                    // available: [Ollama]" is accurate and useless — it reads as
-                    // "your model name is wrong" when the truth is usually that a
-                    // credential expired. The router keeps the reason its boot-time
-                    // resolution already knew (observed live 2026-09-14: an OAuth
-                    // token that had expired 54h earlier).
-                    let because = self
-                        .router
-                        .absent_reason(detected)
-                        .map_or_else(String::new, |reason| format!(" — {reason}"));
-                    warn!(
-                        "No provider for model: {} (detected: {:?}, available: {:?}){}",
-                        model,
-                        detected,
-                        self.router.available_providers(),
-                        because
-                    );
-                    last_error =
-                        format!("No provider for model: {model} (detected: {detected:?}){because}");
-                    same_model_retries = 0;
-                    model_index += 1;
-                    continue;
-                }
+            let llm_client = if let Some(client) = self.router.client_for_model(model) { client } else {
+                let detected = crate::llm_router::ProviderId::from_model(model);
+                // Name the CAUSE, not just the outcome. "detected: Anthropic,
+                // available: [Ollama]" is accurate and useless — it reads as
+                // "your model name is wrong" when the truth is usually that a
+                // credential expired. The router keeps the reason its boot-time
+                // resolution already knew (observed live 2026-09-14: an OAuth
+                // token that had expired 54h earlier).
+                let because = self
+                    .router
+                    .absent_reason(detected)
+                    .map_or_else(String::new, |reason| format!(" — {reason}"));
+                warn!(
+                    "No provider for model: {} (detected: {:?}, available: {:?}){}",
+                    model,
+                    detected,
+                    self.router.available_providers(),
+                    because
+                );
+                last_error =
+                    format!("No provider for model: {model} (detected: {detected:?}){because}");
+                same_model_retries = 0;
+                model_index += 1;
+                continue;
             };
 
             // Create agent config with this model
@@ -1196,7 +1194,7 @@ impl AgentService {
                         call_id: call_id.to_string(),
                         name: name.to_string(),
                         input: input.clone(),
-                        model: model.map(|m| m.to_string()),
+                        model: model.map(std::string::ToString::to_string),
                         tokens: (action_tokens > 0).then_some(action_tokens),
                         total_tokens: (total_tokens > 0).then_some(total_tokens),
                     });
@@ -1641,7 +1639,7 @@ impl AgentService {
                         info!("Rate limited on {} (provider {:?}). Waiting {}s before trying next model...", model, provider, wait_secs);
                         let _ = self.event_tx.send(Event::Error {
                             code: "rate_limit".to_string(),
-                            message: format!("Rate limited on {}. Waiting {}s...", model, wait_secs),
+                            message: format!("Rate limited on {model}. Waiting {wait_secs}s..."),
                             session_id: Some(session_id.to_string()),
                         });
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
@@ -1661,7 +1659,7 @@ impl AgentService {
                     // Emit error as a warning so it's visible, but continue trying
                     let _ = self.event_tx.send(Event::Error {
                         code: "model_error".to_string(),
-                        message: format!("Model {} failed: {}. Trying next model...", model, last_error),
+                        message: format!("Model {model} failed: {last_error}. Trying next model..."),
                         session_id: Some(session_id.to_string()),
                     });
 
@@ -1685,7 +1683,7 @@ impl AgentService {
         let completed = completed_tools.read().await.clone();
         let full_timeline = timeline_lock(&timeline).clone();
 
-        let error_msg = format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error);
+        let error_msg = format!("All models exhausted. Tried: {tried_models:?}. Last error: {last_error}");
 
         // All models failed
         let _ = self.event_tx.send(Event::Error {
@@ -1717,8 +1715,7 @@ impl AgentService {
             Some(ChatResult {
                 message_id: message_id.clone(),
                 content: format!(
-                    "{}\n\n---\n⚠️ *This response is incomplete — the run failed after producing the above. Error: {}*",
-                    partial_text, last_error
+                    "{partial_text}\n\n---\n⚠️ *This response is incomplete — the run failed after producing the above. Error: {last_error}*"
                 ),
                 tool_calls: tool_records,
                 input_tokens: 0,
@@ -1803,7 +1800,7 @@ impl AgentService {
                 // Digits are ASCII, so reading them from `lower` is equivalent.
                 let after = &lower[pos + prefix.len()..];
                 // Extract digits
-                let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let num_str: String = after.chars().take_while(char::is_ascii_digit).collect();
                 if let Ok(secs) = num_str.parse::<u64>() {
                     return Some(secs);
                 }
@@ -1831,9 +1828,10 @@ impl AgentService {
     /// Check if a checkpoint exists for a session (indicates a crashed run).
     /// Note: This only checks legacy file-based checkpoints. DB checkpoints are
     /// checked at startup via `list_checkpoints()` which is async.
+    #[must_use]
     pub fn has_checkpoint(&self, session_id: &str) -> bool {
         // Legacy fallback: check file
-        let path = self.checkpoint_dir.join(format!("checkpoint-{}.json", session_id));
+        let path = self.checkpoint_dir.join(format!("checkpoint-{session_id}.json"));
         path.exists()
     }
 
@@ -1842,7 +1840,7 @@ impl AgentService {
         let checkpoint: serde_json::Value = serde_json::from_str(data).ok()?;
 
         let text = checkpoint.get("accumulated_text")?.as_str()?.to_string();
-        let iteration = checkpoint.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+        let iteration = checkpoint.get("iteration").and_then(serde_json::Value::as_u64).unwrap_or(0);
         let timestamp = checkpoint.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
 
         let tool_calls: Vec<ToolCallRecord> = checkpoint.get("tool_calls")
@@ -1883,8 +1881,7 @@ impl AgentService {
         Some(ChatResult {
             message_id: uuid::Uuid::new_v4().to_string(),
             content: format!(
-                "{}\n\n---\n⚠️ *This response was recovered from iteration {} of a crashed run (checkpoint: {}). The run did not complete normally.*",
-                text, iteration, timestamp
+                "{text}\n\n---\n⚠️ *This response was recovered from iteration {iteration} of a crashed run (checkpoint: {timestamp}). The run did not complete normally.*"
             ),
             tool_calls,
             input_tokens: 0,
@@ -1901,9 +1898,10 @@ impl AgentService {
     /// Returns the partial content and tool calls, or None if no checkpoint exists.
     /// The checkpoint file is consumed (deleted) only AFTER a successful
     /// parse — deleting before parsing made any recovery failure permanent.
+    #[must_use]
     pub fn recover_checkpoint(&self, session_id: &str) -> Option<ChatResult> {
         // Legacy file-based checkpoint
-        let path = self.checkpoint_dir.join(format!("checkpoint-{}.json", session_id));
+        let path = self.checkpoint_dir.join(format!("checkpoint-{session_id}.json"));
         let data = std::fs::read_to_string(&path).ok()?;
         let recovered = self.recover_checkpoint_from_data(&data);
         if recovered.is_some() {
@@ -1939,7 +1937,7 @@ impl AgentService {
     }
 
     /// Get a snapshot of the current run state for a session.
-    /// Includes sync metadata (message_count, last_message_id) from SessionManager.
+    /// Includes sync metadata (`message_count`, `last_message_id`) from `SessionManager`.
     /// `include_timeline: false` skips cloning the run journal — periodic
     /// polls that only need counters must not pay for (or contend on) a
     /// multi-hour run's full record.

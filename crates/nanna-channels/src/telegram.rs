@@ -520,7 +520,7 @@ impl Channel for TelegramChannel {
                 // Send as document for now
                 self.send_document(chat_id, &url, caption.as_deref(), reply_to).await?
             }
-            MessageContent::Sticker { id: _, .. } => {
+            MessageContent::Sticker { .. } => {
                 // Would need sendSticker API
                 warn!("Sticker sending not yet implemented");
                 return Err(ChannelError::Send("Stickers not yet supported".to_string()));
@@ -673,7 +673,7 @@ impl Channel for TelegramChannel {
             .parse()
             .map_err(|_| ChannelError::Send("Invalid chat ID".to_string()))?;
 
-        let result = TelegramChannel::send_poll(self, chat_id, question, options, multiple).await?;
+        let result = Self::send_poll(self, chat_id, question, options, multiple).await?;
         Ok(result.message_id.to_string())
     }
 }

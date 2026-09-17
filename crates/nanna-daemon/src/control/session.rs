@@ -1,6 +1,6 @@
 //! Session and sub-session handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, info, warn, debug, ControlPlane, Event, SessionAction, Value, SubSessionState, Arc, SubSessionInfo, ToolRegistry};
 
 impl ControlPlane {
     // =========================================================================
@@ -216,7 +216,7 @@ impl ControlPlane {
             SessionAction::Fork { id, name } => {
                 if let Some(original) = self.sessions.get(&id).await {
                     let mut forked = self.sessions.create(
-                        name.or_else(|| original.name.as_ref().map(|n| format!("{} (copy)", n)))
+                        name.or_else(|| original.name.as_ref().map(|n| format!("{n} (copy)")))
                     ).await;
                     // Copy messages
                     forked.messages = original.messages.clone();
@@ -283,8 +283,7 @@ impl ControlPlane {
                 if let Some(info) = self.sessions.resolve_sub_session(&target).await {
                     // Also get session message count
                     let msg_count = self.sessions.get(&info.session_id).await
-                        .map(|s| s.messages.len())
-                        .unwrap_or(0);
+                        .map_or(0, |s| s.messages.len());
                     // Non-destructive peek: a status check must never consume the
                     // session's pending inter-session messages.
                     let mailbox_count = self.sessions.peek_mailbox(&info.session_id).await.len();
@@ -478,7 +477,7 @@ Your task: {task}")
                 ).await {
                     Ok(r) => r,
                     Err(_) => Err(crate::agent_service::ChatError {
-                        message: format!("Sub-session timed out after {}s", timeout),
+                        message: format!("Sub-session timed out after {timeout}s"),
                         partial_result: None,
                     }),
                 }

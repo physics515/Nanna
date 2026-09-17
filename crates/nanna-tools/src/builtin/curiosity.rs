@@ -180,8 +180,7 @@ impl Tool for StatusTool {
         // Time
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         status.push_str(&format!("🕐 Current time: {now} (unix)\n"));
 
         // Environment hints

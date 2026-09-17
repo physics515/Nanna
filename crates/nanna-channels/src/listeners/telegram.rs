@@ -109,7 +109,7 @@ impl TelegramListener {
         Ok(body.result.unwrap_or_default())
     }
 
-    /// Convert a Telegram update to an IncomingMessage
+    /// Convert a Telegram update to an `IncomingMessage`
     fn convert_update(&self, update: &TelegramUpdate) -> Option<IncomingMessage> {
         let message = update.message.as_ref().or(update.edited_message.as_ref())?;
 
@@ -158,14 +158,13 @@ impl TelegramListener {
         }
 
         // Photo
-        if let Some(photos) = &message.photo {
-            if let Some(largest) = photos.last() {
+        if let Some(photos) = &message.photo
+            && let Some(largest) = photos.last() {
                 return Some(MessageContent::Image {
                     url: largest.file_id.clone(), // Will need to be resolved via getFile
                     caption: message.caption.clone(),
                 });
             }
-        }
 
         // Document
         if let Some(doc) = &message.document {
@@ -288,7 +287,7 @@ impl TelegramListener {
 
 #[async_trait]
 impl Listener for TelegramListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "telegram"
     }
 
@@ -347,7 +346,7 @@ struct TelegramMessage {
     video: Option<TelegramVideo>,
     location: Option<TelegramLocation>,
     sticker: Option<TelegramSticker>,
-    reply_to_message: Option<Box<TelegramMessage>>,
+    reply_to_message: Option<Box<Self>>,
 }
 
 #[derive(Debug, Deserialize)]

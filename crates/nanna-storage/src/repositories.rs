@@ -104,7 +104,7 @@ impl SessionRepository {
         Ok(sessions)
     }
 
-    /// List sessions for a specific workspace (or global if workspace_id is None)
+    /// List sessions for a specific workspace (or global if `workspace_id` is None)
     pub async fn list_by_workspace(&self, workspace_id: Option<&str>, limit: i64) -> Result<Vec<Session>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -274,9 +274,9 @@ pub struct MemoryRepository {
 
 /// Helper to decode FSRS columns from row index 9..16
 /// Expected column order after the base 9:
-/// 9=workspace_id, 10=fsrs_stability, 11=fsrs_difficulty,
-/// 12=fsrs_last_access, 13=fsrs_access_count, 14=fsrs_importance,
-/// 15=fsrs_storage_strength, 16=fsrs_generation
+/// `9=workspace_id`, `10=fsrs_stability`, `11=fsrs_difficulty`,
+/// `12=fsrs_last_access`, `13=fsrs_access_count`, `14=fsrs_importance`,
+/// `15=fsrs_storage_strength`, `16=fsrs_generation`
 fn decode_memory_row(
     row: &turso::Row,
     embedding: Option<Vec<f32>>,
@@ -308,7 +308,7 @@ fn decode_memory_row(
 fn decode_embedding(bytes: Option<Vec<u8>>) -> Option<Vec<f32>> {
     bytes.map(|bytes| {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     })
@@ -335,11 +335,10 @@ pub struct BulkLoadReport {
 /// (the enum variant isn't visible there). Pure, unit-testable.
 #[must_use]
 pub fn is_corruption_error(err: &StorageError) -> bool {
-    if let StorageError::Database(e) = err {
-        if matches!(e, turso::Error::Corrupt(_) | turso::Error::NotAdb(_)) {
+    if let StorageError::Database(e) = err
+        && matches!(e, turso::Error::Corrupt(_) | turso::Error::NotAdb(_)) {
             return true;
         }
-    }
     let s = err.to_string().to_lowercase();
     s.contains("overflow chain")
         || s.contains("corrupt")
@@ -1220,7 +1219,7 @@ impl MemoryRepository {
     fn decode_chunk_row(row: &turso::Row) -> Result<MemoryChunk, StorageError> {
         let embedding = match row.get_value(6)? {
             turso::Value::Blob(b) => Some(
-                b.chunks_exact(4)
+                b.as_chunks::<4>().0.iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             ),
@@ -1280,12 +1279,12 @@ impl MemoryRepository {
                 mem.session_id.as_deref(),
                 metadata_json.as_deref(),
                 mem.workspace_id.as_deref(),
-                mem.fsrs_stability as f64,
-                mem.fsrs_difficulty as f64,
+                f64::from(mem.fsrs_stability),
+                f64::from(mem.fsrs_difficulty),
                 mem.fsrs_last_access,
                 mem.fsrs_access_count,
-                mem.fsrs_importance as f64,
-                mem.fsrs_storage_strength as f64,
+                f64::from(mem.fsrs_importance),
+                f64::from(mem.fsrs_storage_strength),
                 mem.fsrs_generation,
             ],
         )
@@ -1477,7 +1476,7 @@ impl MemoryRepository {
         }
     }
 
-    /// Update FSRS state for a memory entry identified by memory_id.
+    /// Update FSRS state for a memory entry identified by `memory_id`.
     pub async fn update_fsrs(
         &self,
         memory_id: &str,
@@ -1499,12 +1498,12 @@ impl MemoryRepository {
                     updated_at = datetime('now')
                  WHERE memory_id = ?8",
                 turso::params![
-                    stability as f64,
-                    difficulty as f64,
+                    f64::from(stability),
+                    f64::from(difficulty),
                     last_access,
                     access_count,
-                    importance as f64,
-                    storage_strength as f64,
+                    f64::from(importance),
+                    f64::from(storage_strength),
                     generation,
                     memory_id,
                 ],
@@ -2286,7 +2285,7 @@ pub struct WorkspaceRepository {
 }
 
 impl WorkspaceRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
@@ -2345,7 +2344,7 @@ impl WorkspaceRepository {
         let id = record.id.clone();
         let name = record.name.clone();
         let path = record.path.clone();
-        let active = record.active as i64;
+        let active = i64::from(record.active);
         conn.execute(
             "INSERT INTO workspaces (id, name, path, active, last_accessed)
              VALUES (?1, ?2, ?3, ?4, datetime('now'))

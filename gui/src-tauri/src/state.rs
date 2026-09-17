@@ -72,7 +72,7 @@ pub struct ChatMessage {
     /// raw JSON — the daemon owns the schema; the frontend renders it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline: Option<serde_json::Value>,
-    /// Run benchmark totals {input_tokens, output_tokens, duration_ms, model}.
+    /// Run benchmark totals {`input_tokens`, `output_tokens`, `duration_ms`, model}.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
 }

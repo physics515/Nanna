@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 /// Configuration for a workspace (local non-md state in `.nanna/config.toml`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct WorkspaceConfig {
     /// Workspace name (defaults to directory name)
     pub name: Option<String>,
@@ -23,15 +24,6 @@ pub struct WorkspaceConfig {
     pub file_priority: Option<Vec<String>>,
 }
 
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            name: None,
-            max_context_tokens: None,
-            file_priority: None,
-        }
-    }
-}
 
 /// A loaded workspace with its files and configuration
 #[derive(Debug, Clone)]
@@ -54,8 +46,7 @@ impl Workspace {
         }
 
         let marker = find_workspace_root(&root)
-            .map(|(_, m)| m)
-            .unwrap_or(WorkspaceMarker::AgentsFile);
+            .map_or(WorkspaceMarker::AgentsFile, |(_, m)| m);
 
         let files = WorkspaceFiles::load(&root).await;
         let config = Self::load_config(&root).await.unwrap_or_default();
@@ -102,9 +93,7 @@ impl Workspace {
     pub fn name(&self) -> String {
         self.config.name.clone().unwrap_or_else(|| {
             self.root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "workspace".to_string())
+                .file_name().map_or_else(|| "workspace".to_string(), |n| n.to_string_lossy().to_string())
         })
     }
 

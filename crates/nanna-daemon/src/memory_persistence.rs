@@ -1,4 +1,4 @@
-//! Turso-backed MemoryPersistence adapter
+//! Turso-backed `MemoryPersistence` adapter
 //!
 //! Bridges `nanna_memory::MemoryPersistence` ↔ `nanna_storage::MemoryRepository`,
 //! converting between `MemoryEntry` (in-memory type) and `Memory`/`NewMemory`
@@ -16,7 +16,8 @@ pub struct TursoMemoryPersistence {
 }
 
 impl TursoMemoryPersistence {
-    pub fn new(repo: MemoryRepository) -> Self {
+    #[must_use]
+    pub const fn new(repo: MemoryRepository) -> Self {
         Self { repo }
     }
 }
@@ -100,6 +101,7 @@ fn attach_buckets(entry: &mut MemoryEntry, buckets: Vec<(String, Vec<f32>)>) {
 /// loaded entries — never backfilled either. The row stayed in the database
 /// forever, invisible. The log line said "skipped", which reads as "nothing to
 /// see", not "this memory is now unreachable for good".
+#[must_use]
 pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
     let embedding = mem.embedding.unwrap_or_default();
 
@@ -122,8 +124,7 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
                 .map(|ndt| ndt.and_utc().fixed_offset())
                 .map_err(|e| e)
         })
-        .map(|dt| dt.timestamp())
-        .unwrap_or(0);
+        .map_or(0, |dt| dt.timestamp());
 
     let fsrs = FsrsState {
         stability: mem.fsrs_stability,

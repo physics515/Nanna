@@ -400,7 +400,7 @@ impl CosineSimilaritySearch {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             // Dispatch with ceiling division for workgroups
-            let workgroups = (num_vectors + 63) / 64;
+            let workgroups = num_vectors.div_ceil(64);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
@@ -500,7 +500,7 @@ mod tests {
             Err(GpuError::NoAdapter) => {
                 println!("No GPU adapter found, skipping test");
             }
-            Err(e) => panic!("Unexpected error: {}", e),
+            Err(e) => panic!("Unexpected error: {e}"),
         }
     }
 }

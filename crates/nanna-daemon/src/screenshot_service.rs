@@ -63,7 +63,7 @@ enum SessionKind {
 /// Capture tools in preference order.
 ///
 /// Wayland first because that is what a modern Linux desktop runs and an X11
-/// tool under it captures nothing (or an XWayland surface, which is worse:
+/// tool under it captures nothing (or an `XWayland` surface, which is worse:
 /// it succeeds and returns the wrong thing).
 const CAPTURE_TOOLS: &[CaptureTool] = &[
     CaptureTool {

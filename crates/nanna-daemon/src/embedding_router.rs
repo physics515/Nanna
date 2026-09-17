@@ -82,6 +82,7 @@ pub struct EmbeddingRouter {
 
 impl EmbeddingRouter {
     /// Create a new router with a primary provider.
+    #[must_use]
     pub fn new(info: EmbeddingProviderInfo, client: Arc<EmbeddingClient>) -> Self {
         Self {
             providers: vec![EmbeddingProviderEntry { info, client }],
@@ -126,13 +127,10 @@ impl EmbeddingRouter {
         }
         let probed = self.providers[idx].client.context_window().await;
         self.windows.write().await[idx] = Some(probed);
-        match probed {
-            Some(window) => debug!("Embedding provider {info} accepts {window} tokens per input"),
-            None => debug!(
-                "Embedding provider {info} publishes no input limit; chunking falls back to the \
-                 retrieval-granularity default"
-            ),
-        }
+        if let Some(window) = probed { debug!("Embedding provider {info} accepts {window} tokens per input") } else { debug!(
+            "Embedding provider {info} publishes no input limit; chunking falls back to the \
+             retrieval-granularity default"
+        ); }
         probed
     }
 

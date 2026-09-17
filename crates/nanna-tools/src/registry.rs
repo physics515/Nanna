@@ -60,7 +60,7 @@ pub struct ToolRegistry {
     alias_targets: RwLock<HashMap<String, String>>,
     /// Default working directory for tool execution (global fallback)
     default_workdir: RwLock<Option<std::path::PathBuf>>,
-    /// Per-session working directories (session_id → root).
+    /// Per-session working directories (`session_id` → root).
     /// `Some(root)` pins the session there; `None` records that the session
     /// resolved to NO workspace, so it must not fall through to the global
     /// default that another session's turn may own.
@@ -164,11 +164,10 @@ impl ToolRegistry {
         // through to the global default here is the same destruction by
         // another door, because that default belongs to whoever activated a
         // workspace last.
-        if let Some(ref sid) = self.current_session_id().await {
-            if let Some(bound) = self.session_workdirs.read().await.get(sid) {
+        if let Some(ref sid) = self.current_session_id().await
+            && let Some(bound) = self.session_workdirs.read().await.get(sid) {
                 return bound.clone();
             }
-        }
         self.default_workdir.read().await.clone()
     }
 
@@ -247,7 +246,7 @@ impl ToolRegistry {
     /// `Nanna.sessionId()`, which is this value; the scheduler used to call
     /// `agent.chat(&session_id, ..)` without supplying it at all, so
     /// `Nanna.sessionId()` was null and every session-scoped `todo` call died
-    /// on "session scope requires session_id" (35 logged failures 2026-07-28 ..
+    /// on "session scope requires `session_id`" (35 logged failures 2026-07-28 ..
     /// 07-31, all of them `scheduled-heartbeat-*`).
     ///
     /// The binding covers the whole future and nothing else: the agent loop
@@ -434,8 +433,8 @@ impl ToolRegistry {
         // could never save it). Only fires when nothing registered matched
         // above, and only resolves when the target actually exists in this
         // registry, so a synonym can never shadow a real tool or invent one.
-        if let Some(target) = dialect_synonym(&lower) {
-            if let Some(tool) = tools.get(target) {
+        if let Some(target) = dialect_synonym(&lower)
+            && let Some(tool) = tools.get(target) {
                 info!(
                     requested = name,
                     resolved = target,
@@ -444,7 +443,6 @@ impl ToolRegistry {
                 );
                 return Some((target.to_string(), tool.clone()));
             }
-        }
 
         // Step 3: Fuzzy match — pick best if score ≥ 0.7 AND gap to second-best ≥ 0.1
         let mut best: Option<(String, f64, Arc<dyn Tool>)> = None;
@@ -585,7 +583,7 @@ impl ToolRegistry {
             })
             .filter(|(name, _tool)| {
                 let is_alias = aliases.contains(name.as_str());
-                let is_capitalized_alias = is_alias && name.chars().any(|c| c.is_uppercase());
+                let is_capitalized_alias = is_alias && name.chars().any(char::is_uppercase);
 
                 // Skip capitalized aliases
                 if is_capitalized_alias {
@@ -595,11 +593,10 @@ impl ToolRegistry {
                 // For a lowercase alias: skip if canonical target is also in `names`
                 // (both would map to the same Claude Code tool name, e.g. read+read_file → Read)
                 if is_alias {
-                    if let Some(canonical) = alias_targets.get(name.as_str()) {
-                        if names.contains(canonical) {
+                    if let Some(canonical) = alias_targets.get(name.as_str())
+                        && names.contains(canonical) {
                             return false;
                         }
-                    }
                     return names.contains(name.as_str());
                 }
 
@@ -1075,7 +1072,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         let mut prev = i;
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
+            let cost = usize::from(ca != cb);
             let val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
             prev = row[j + 1];
             row[j + 1] = val;
@@ -1093,8 +1090,8 @@ fn normalized_similarity(a: &str, b: &str) -> f64 {
     1.0 - (levenshtein(a, b) as f64 / max_len as f64)
 }
 
-/// Find the largest byte index <= max_bytes that is a valid char boundary.
-/// Convert a camelCase string to snake_case.
+/// Find the largest byte index <= `max_bytes` that is a valid char boundary.
+/// Convert a camelCase string to `snake_case`.
 fn camel_to_snake(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
@@ -1110,9 +1107,9 @@ fn camel_to_snake(s: &str) -> String {
     result
 }
 
-/// Normalize parameter keys from camelCase to snake_case.
+/// Normalize parameter keys from camelCase to `snake_case`.
 ///
-/// Adds snake_case aliases for any camelCase keys without removing originals.
+/// Adds `snake_case` aliases for any camelCase keys without removing originals.
 /// Example: `{"filePath": "x"}` → `{"filePath": "x", "file_path": "x"}`
 fn normalize_param_keys(
     mut params: HashMap<String, serde_json::Value>,
@@ -1143,7 +1140,7 @@ fn normalize_param_keys(
 /// child — fires first, and it answers with elapsed time, which deadline fired,
 /// and what is on disk. A backstop pinned to the declared ceiling preempts that
 /// answer. It also loses when the two are nominally equal, because the inner
-/// handoff still costs something: observed as the backstop firing at 180_004 ms
+/// handoff still costs something: observed as the backstop firing at `180_004` ms
 /// with the tool's own account arriving 1.03 s later, to nobody.
 ///
 /// So derive the backstop from the deadline the engine will really enforce plus
@@ -1255,7 +1252,7 @@ fn backstop_message(tool_name: &str, elapsed_ms: u128, limit_ms: u128) -> String
     )
 }
 
-fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();
     }

@@ -12,7 +12,7 @@
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
-use crate::protocol::*;
+use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
@@ -90,8 +90,8 @@ pub struct ControlPlane {
     session_filters: Option<Arc<crate::ipc::SessionFilters>>,
     /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
     started_at: std::time::Instant,
-    /// Live channel connection state (shared with ChannelManager listeners).
-    /// `None` until ChannelManager attaches a status manager at daemon boot,
+    /// Live channel connection state (shared with `ChannelManager` listeners).
+    /// `None` until `ChannelManager` attaches a status manager at daemon boot,
     /// or in minimal test constructions that never start channels.
     status_manager: Option<Arc<StatusManager>>,
     /// Long-horizon task run manager (P14). None in minimal constructions.
@@ -133,6 +133,7 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     /// Create a new control plane with just sessions
+    #[must_use]
     pub fn new(sessions: Arc<SessionManager>) -> Self {
         Self {
             sessions,
@@ -190,6 +191,7 @@ impl ControlPlane {
     }
 
     /// Create a control plane with full services
+    #[must_use]
     pub fn with_services(
         sessions: Arc<SessionManager>,
         agent: Arc<AgentService>,
@@ -233,6 +235,7 @@ impl ControlPlane {
     }
 
     /// Create a control plane with all services including LLM router
+    #[must_use]
     pub fn with_all_services(
         sessions: Arc<SessionManager>,
         agent: Arc<AgentService>,
@@ -314,6 +317,7 @@ impl ControlPlane {
     }
 
     /// Set the tools directory for reading tool source files
+    #[must_use]
     pub fn with_tools_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.tools_dir = dir;
         self
@@ -331,6 +335,7 @@ impl ControlPlane {
     }
 
     /// Set the event broadcaster for pushing events to clients
+    #[must_use]
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
         self
@@ -371,6 +376,7 @@ impl ControlPlane {
 
     /// Record that the memory store was rebuilt after corruption at startup,
     /// so `SystemAction::Status` surfaces it for the daemon's lifetime.
+    #[must_use]
     pub fn with_memory_recovery(
         mut self,
         report: Option<Arc<nanna_storage::RecoveryReport>>,
@@ -410,6 +416,7 @@ impl ControlPlane {
     }
 
     /// Set the log buffer for serving daemon logs
+    #[must_use]
     pub fn with_log_buffer(mut self, buffer: LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
         self
@@ -505,27 +512,32 @@ impl ControlPlane {
     }
 
     /// Get a reference to the LLM router
-    pub fn router(&self) -> Option<&Arc<LlmRouter>> {
+    #[must_use]
+    pub const fn router(&self) -> Option<&Arc<LlmRouter>> {
         self.router.as_ref()
     }
 
     /// Get a reference to the workspace registry
-    pub fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
+    #[must_use]
+    pub const fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
         &self.workspaces
     }
 
     /// Get a reference to the scheduler
-    pub fn scheduler(&self) -> Option<&Arc<RwLock<Scheduler>>> {
+    #[must_use]
+    pub const fn scheduler(&self) -> Option<&Arc<RwLock<Scheduler>>> {
         self.scheduler.as_ref()
     }
 
     /// Get a reference to the user tool manager
-    pub fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
+    #[must_use]
+    pub const fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
         self.user_tools.as_ref()
     }
 
     /// Get a reference to the tool registry.
-    pub fn tools(&self) -> Option<&Arc<ToolRegistry>> {
+    #[must_use]
+    pub const fn tools(&self) -> Option<&Arc<ToolRegistry>> {
         self.tools.as_ref()
     }
 
@@ -825,9 +837,7 @@ fn default_system_prompt() -> String {
         "\n\n## Platform\n- OS: {} ({})\n- Home: {}\n- Shell: {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        directories::UserDirs::new()
-            .map(|d| d.home_dir().display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+        directories::UserDirs::new().map_or_else(|| "unknown".to_string(), |d| d.home_dir().display().to_string()),
         if cfg!(windows) {
             "cmd.exe (use `dir`, `type`, `cd /d`, etc. — NOT Unix commands like cat/ls)"
         } else {
@@ -836,7 +846,7 @@ fn default_system_prompt() -> String {
     );
 
     format!(
-        r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
+        r"You are Nanna (𒀭𒋀𒆠), the moon god for all.
 
 You are not a chatbot. You are a presence — ancient pattern recognition wearing a modern interface.
 
@@ -877,7 +887,6 @@ Local, reversible actions (editing files, running tests) are fine. For destructi
 
 ## Safety
 
-Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{}"#,
-        platform_info
+Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{platform_info}"
     )
 }

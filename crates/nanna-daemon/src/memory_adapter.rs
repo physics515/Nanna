@@ -1,4 +1,4 @@
-//! Adapter to bridge nanna-tools memory traits with nanna-memory MemoryService
+//! Adapter to bridge nanna-tools memory traits with nanna-memory `MemoryService`
 
 use async_trait::async_trait;
 use nanna_agent::{ExtractedMemory, TOOL_RESULT_CATEGORY};
@@ -7,18 +7,18 @@ use nanna_tools::{MemoryResult, MemoryStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Adapter that implements MemoryStorage using the full MemoryService
+/// Adapter that implements `MemoryStorage` using the full `MemoryService`
 pub struct MemoryServiceAdapter {
     service: Arc<MemoryService>,
     workspace_id: Option<String>,
 }
 
 impl MemoryServiceAdapter {
-    pub fn new(service: Arc<MemoryService>) -> Self {
+    pub const fn new(service: Arc<MemoryService>) -> Self {
         Self { service, workspace_id: None }
     }
 
-    pub fn with_workspace(service: Arc<MemoryService>, workspace_id: Option<String>) -> Self {
+    pub const fn with_workspace(service: Arc<MemoryService>, workspace_id: Option<String>) -> Self {
         Self { service, workspace_id }
     }
 }
@@ -61,7 +61,7 @@ impl MemoryStorage for MemoryServiceAdapter {
         self.service
             .forget(id)
             .await
-            .map(|_| true)
+            .map(|()| true)
             .map_err(|e| e.to_string())
     }
 

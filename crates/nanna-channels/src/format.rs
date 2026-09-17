@@ -236,7 +236,7 @@ pub fn split_for_length(text: &str, max_chars: usize) -> Vec<String> {
     }
 
     debug_assert!(chunks.iter().all(|c| c.chars().count() <= max_chars));
-    debug_assert!(!chunks.is_empty());
+    debug_assert_ne!(chunks, [] as [std::string::String; 0]);
     chunks
 }
 

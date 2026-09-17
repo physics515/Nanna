@@ -55,6 +55,7 @@ pub struct Backend {
 
 impl Backend {
     /// Create a new backend.
+    #[must_use]
     pub fn new() -> Self {
         let manager_config = DaemonManagerConfig::default();
         let client_config = DaemonClientConfig {
@@ -74,6 +75,7 @@ impl Backend {
     /// Sender side of the shared [`DaemonEvent`] bus. The WebSocket client
     /// publishes deserialized daemon events here; [`Backend::start_event_forwarding`]
     /// is the single place that translates them into Tauri window events.
+    #[must_use]
     pub fn daemon_event_sender(&self) -> broadcast::Sender<DaemonEvent> {
         self.daemon_client.event_sender()
     }

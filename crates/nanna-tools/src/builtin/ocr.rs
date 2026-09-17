@@ -62,7 +62,7 @@ impl OcrTool {
 
     /// Enable or disable the embedded `ocrs` tier.
     #[must_use]
-    pub fn with_embedded_ocr(mut self, enabled: bool) -> Self {
+    pub const fn with_embedded_ocr(mut self, enabled: bool) -> Self {
         self.use_embedded_ocr = enabled;
         self
     }
@@ -97,7 +97,7 @@ impl Default for OcrTool {
     }
 }
 
-const OCR_PROMPT: &str = r#"Extract ALL text from this image using OCR.
+const OCR_PROMPT: &str = r"Extract ALL text from this image using OCR.
 
 Instructions:
 - Transcribe every piece of text you can see, exactly as written
@@ -108,7 +108,7 @@ Instructions:
 - For tables, use markdown table format
 - For multi-column layouts, process left-to-right, top-to-bottom
 
-Output the extracted text only, no additional commentary."#;
+Output the extracted text only, no additional commentary.";
 
 #[async_trait]
 impl Tool for OcrTool {
@@ -181,7 +181,7 @@ impl Tool for OcrTool {
         }
 
         let prompt = if let Some(lang) = language {
-            format!("{}\n\nLanguage hint: {}", OCR_PROMPT, lang)
+            format!("{OCR_PROMPT}\n\nLanguage hint: {lang}")
         } else {
             OCR_PROMPT.to_string()
         };
@@ -216,9 +216,7 @@ impl Tool for OcrTool {
 /// `%LOCALAPPDATA%\ocrs\` on Windows).
 fn ocrs_cache_dir() -> PathBuf {
     use directories::BaseDirs;
-    BaseDirs::new()
-        .map(|d| d.cache_dir().join("ocrs"))
-        .unwrap_or_else(|| PathBuf::from(".ocrs_cache"))
+    BaseDirs::new().map_or_else(|| PathBuf::from(".ocrs_cache"), |d| d.cache_dir().join("ocrs"))
 }
 
 const DETECTION_MODEL_URL: &str =
@@ -233,14 +231,14 @@ async fn download_if_missing(url: &str, dest: &Path) -> Result<(), String> {
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create cache dir: {}", e))?;
+            .map_err(|e| format!("Failed to create cache dir: {e}"))?;
     }
 
     info!("Downloading OCR model from {} → {:?}", url, dest);
 
     let response = reqwest::get(url)
         .await
-        .map_err(|e| format!("Failed to download {}: {}", url, e))?;
+        .map_err(|e| format!("Failed to download {url}: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {} when downloading {}", response.status(), url));
@@ -249,11 +247,11 @@ async fn download_if_missing(url: &str, dest: &Path) -> Result<(), String> {
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| format!("Failed to read model bytes: {}", e))?;
+        .map_err(|e| format!("Failed to read model bytes: {e}"))?;
 
     tokio::fs::write(dest, &bytes)
         .await
-        .map_err(|e| format!("Failed to write model to {:?}: {}", dest, e))?;
+        .map_err(|e| format!("Failed to write model to {dest:?}: {e}"))?;
 
     info!("OCR model saved to {:?} ({} bytes)", dest, bytes.len());
     Ok(())
@@ -286,7 +284,7 @@ async fn embedded_ocr(image_bytes: &[u8]) -> Result<String, String> {
         run_ocrs_sync(&image_bytes, &detection_path, &recognition_path)
     })
     .await
-    .map_err(|e| format!("OCR task panicked: {}", e))?
+    .map_err(|e| format!("OCR task panicked: {e}"))?
 }
 
 /// Synchronous OCR extraction using ocrs.
@@ -300,9 +298,9 @@ fn run_ocrs_sync(
 
     // Load models
     let detection_model = Model::load_file(detection_path)
-        .map_err(|e| format!("Failed to load detection model: {}", e))?;
+        .map_err(|e| format!("Failed to load detection model: {e}"))?;
     let recognition_model = Model::load_file(recognition_path)
-        .map_err(|e| format!("Failed to load recognition model: {}", e))?;
+        .map_err(|e| format!("Failed to load recognition model: {e}"))?;
 
     // Construct engine
     let engine = OcrEngine::new(OcrEngineParams {
@@ -310,26 +308,26 @@ fn run_ocrs_sync(
         recognition_model: Some(recognition_model),
         ..Default::default()
     })
-    .map_err(|e| format!("Failed to create OcrEngine: {}", e))?;
+    .map_err(|e| format!("Failed to create OcrEngine: {e}"))?;
 
     // Decode image using the `image` crate
     let img = image::load_from_memory(image_bytes)
-        .map(|img| img.into_rgb8())
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
+        .map(image::DynamicImage::into_rgb8)
+        .map_err(|e| format!("Failed to decode image: {e}"))?;
 
     // Create ImageSource from raw pixels
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
-        .map_err(|e| format!("Failed to create ImageSource: {}", e))?;
+        .map_err(|e| format!("Failed to create ImageSource: {e}"))?;
 
     // Prepare input
     let ocr_input = engine
         .prepare_input(img_source)
-        .map_err(|e| format!("Failed to prepare OCR input: {}", e))?;
+        .map_err(|e| format!("Failed to prepare OCR input: {e}"))?;
 
     // Run detection + recognition (convenience API)
     let text = engine
         .get_text(&ocr_input)
-        .map_err(|e| format!("OCR text extraction failed: {}", e))?;
+        .map_err(|e| format!("OCR text extraction failed: {e}"))?;
 
     Ok(text)
 }
@@ -363,7 +361,7 @@ impl Default for DescribeImageTool {
     }
 }
 
-const DESCRIBE_PROMPT: &str = r#"Provide a comprehensive description of this image.
+const DESCRIBE_PROMPT: &str = r"Provide a comprehensive description of this image.
 
 Include:
 1. **Overview**: What type of image is this? (photo, diagram, chart, screenshot, etc.)
@@ -374,7 +372,7 @@ Include:
 6. **Text Content**: If there's any text, summarize what it says
 7. **Quality/Style**: Image quality, artistic style, or technical aspects if relevant
 
-Be thorough but organized. Use clear structure."#;
+Be thorough but organized. Use clear structure.";
 
 #[async_trait]
 impl Tool for DescribeImageTool {
@@ -401,7 +399,7 @@ impl Tool for DescribeImageTool {
 
         let brief = params
             .get("brief")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let vision_fn = self.vision_fn.as_ref().ok_or_else(|| {
@@ -416,14 +414,14 @@ impl Tool for DescribeImageTool {
             "Describe this image in 1-2 sentences. Be concise but capture the essential content."
                 .to_string()
         } else if let Some(f) = focus {
-            format!("{}\n\nFocus especially on: {}", DESCRIBE_PROMPT, f)
+            format!("{DESCRIBE_PROMPT}\n\nFocus especially on: {f}")
         } else {
             DESCRIBE_PROMPT.to_string()
         };
 
         let result = vision_fn(image_data, prompt, actual_media_type)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Image description failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Image description failed: {e}")))?;
 
         Ok(ToolResult::success(result))
     }
@@ -446,11 +444,11 @@ async fn prepare_image(
     if path.exists() && path.is_file() {
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read image file: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read image file: {e}")))?;
 
         // Detect media type from extension
         let media_type = match path.extension().and_then(|e| e.to_str()) {
-            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("jpg" | "jpeg") => "image/jpeg",
             Some("png") => "image/png",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",

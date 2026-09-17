@@ -59,7 +59,8 @@ pub struct ServiceManager {
 }
 
 impl ServiceManager {
-    pub fn new(config: ServiceConfig) -> Self {
+    #[must_use]
+    pub const fn new(config: ServiceConfig) -> Self {
         Self { config }
     }
     
@@ -124,6 +125,7 @@ impl ServiceManager {
     }
     
     /// Get service status
+    #[must_use]
     pub fn status(&self) -> ServiceStatus {
         #[cfg(windows)]
         return self.status_windows();
@@ -386,7 +388,7 @@ impl ServiceManager {
         let exe = self.config.executable.display();
         let args = self.config.arguments.join(" ");
         
-        format!(r#"[Unit]
+        format!(r"[Unit]
 Description={}
 After=network.target
 
@@ -398,7 +400,7 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target
-"#, self.config.description, exe, args)
+", self.config.description, exe, args)
     }
 }
 

@@ -125,7 +125,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            heartbeat_interval: Duration::from_secs(1800), // 30 minutes
+            heartbeat_interval: Duration::from_mins(30), // 30 minutes
             heartbeat_enabled: true,
             // Do not command a `Read HEARTBEAT.md` here — that drove a read_file
             // tool call that hard-errored on a missing file (resolved to ~ with
@@ -319,7 +319,7 @@ impl Scheduler {
         } else {
             // Try to parse as cron expression
             let parsed = CronExpr::parse(&job.schedule).ok();
-            let next_run = parsed.as_ref().and_then(|p| p.next_from_now());
+            let next_run = parsed.as_ref().and_then(super::cron::CronExpr::next_from_now);
             TaskType::Cron {
                 schedule: job.schedule.clone(),
                 parsed,
@@ -467,11 +467,10 @@ impl Scheduler {
     /// Remove a task (from memory and storage)
     pub async fn remove_task(&self, task_id: &str) -> bool {
         // Remove from storage
-        if let Some(storage) = &self.storage {
-            if let Err(e) = storage.cron_jobs().delete(task_id).await {
+        if let Some(storage) = &self.storage
+            && let Err(e) = storage.cron_jobs().delete(task_id).await {
                 warn!("Failed to delete task {} from storage: {}", task_id, e);
             }
-        }
 
         let mut tasks = self.tasks.write().await;
         tasks.remove(task_id).is_some()
@@ -512,11 +511,10 @@ impl Scheduler {
     /// Enable/disable a task (persisted)
     pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) {
         // Update storage
-        if let Some(storage) = &self.storage {
-            if let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
+        if let Some(storage) = &self.storage
+            && let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
                 warn!("Failed to update task {} enabled state: {}", task_id, e);
             }
-        }
 
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(task_id) {
@@ -843,10 +841,10 @@ impl Scheduler {
                                         ).await;
                                     }
 
-                                    if !result.success {
-                                        error!("Task {} failed: {:?}", task_id, result.error);
-                                    } else {
+                                    if result.success {
                                         info!("Task {} completed in {}ms", task_id, result.duration_ms);
+                                    } else {
+                                        error!("Task {} failed: {:?}", task_id, result.error);
                                     }
                                 });
                             }
@@ -865,7 +863,7 @@ impl Scheduler {
     }
 }
 
-/// Parse interval string like "every_300s" into seconds
+/// Parse interval string like "`every_300s`" into seconds
 fn parse_interval(schedule: &str) -> Option<u64> {
     if schedule.starts_with("every_") && schedule.ends_with('s') {
         let num_str = &schedule[6..schedule.len() - 1];
@@ -875,7 +873,7 @@ fn parse_interval(schedule: &str) -> Option<u64> {
     }
 }
 
-/// Parse delay string like "delay_60s" into seconds
+/// Parse delay string like "`delay_60s`" into seconds
 fn parse_delay(schedule: &str) -> Option<u64> {
     if schedule.starts_with("delay_") && schedule.ends_with('s') {
         let num_str = &schedule[6..schedule.len() - 1];

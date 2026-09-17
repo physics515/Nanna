@@ -206,7 +206,7 @@ impl McpIntegration {
 
     /// Get the tool manager
     #[must_use]
-    pub fn manager(&self) -> &McpToolsManager<StdioTransport> {
+    pub const fn manager(&self) -> &McpToolsManager<StdioTransport> {
         &self.manager
     }
 
@@ -265,7 +265,7 @@ pub struct McpIntegrationBuilder {
 impl McpIntegrationBuilder {
     /// Create a new builder
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             configs: Vec::new(),
         }

@@ -17,8 +17,10 @@ use tracing::warn;
 /// Connection state for a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConnectionState {
     /// Not configured
+    #[default]
     Unconfigured,
     /// Configured but not connected
     Disconnected,
@@ -36,25 +38,23 @@ pub enum ConnectionState {
     Unavailable,
 }
 
-impl Default for ConnectionState {
-    fn default() -> Self {
-        Self::Unconfigured
-    }
-}
 
 impl ConnectionState {
     /// Check if the state represents a connected channel
-    pub fn is_connected(&self) -> bool {
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected | Self::Degraded | Self::RateLimited)
     }
 
     /// Check if the state represents a healthy channel
-    pub fn is_healthy(&self) -> bool {
+    #[must_use]
+    pub const fn is_healthy(&self) -> bool {
         matches!(self, Self::Connected)
     }
 
     /// Get a human-readable status string
-    pub fn status_text(&self) -> &'static str {
+    #[must_use]
+    pub const fn status_text(&self) -> &'static str {
         match self {
             Self::Unconfigured => "Not configured",
             Self::Disconnected => "Disconnected",
@@ -153,6 +153,7 @@ pub struct StatusManager {
 
 impl StatusManager {
     /// Create a new status manager
+    #[must_use]
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
@@ -164,12 +165,14 @@ impl StatusManager {
     }
 
     /// Set the health check interval
-    pub fn with_health_check_interval(mut self, interval: Duration) -> Self {
+    #[must_use]
+    pub const fn with_health_check_interval(mut self, interval: Duration) -> Self {
         self.health_check_interval = interval;
         self
     }
 
     /// Subscribe to status events
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StatusEvent> {
         self.event_tx.subscribe()
     }
@@ -207,10 +210,10 @@ impl StatusManager {
                 return;
             };
 
-            let previous_state = if status.state != state {
-                Some(status.state)
-            } else {
+            let previous_state = if status.state == state {
                 None
+            } else {
+                Some(status.state)
             };
 
             status.state = state;
@@ -307,10 +310,10 @@ impl StatusManager {
                 return;
             };
 
-            let previous_state = if status.state != ConnectionState::RateLimited {
-                Some(status.state)
-            } else {
+            let previous_state = if status.state == ConnectionState::RateLimited {
                 None
+            } else {
+                Some(status.state)
             };
 
             status.state = ConnectionState::RateLimited;
@@ -473,6 +476,7 @@ pub struct HealthChecker {
 
 impl HealthChecker {
     /// Create a new health checker
+    #[must_use]
     pub fn new(status_manager: Arc<StatusManager>, interval: Duration) -> Self {
         Self {
             status_manager,

@@ -39,7 +39,7 @@ pub struct UserToolPermissions {
 
 impl From<UserToolPermissions> for ToolPermissions {
     fn from(p: UserToolPermissions) -> Self {
-        let mut perms = ToolPermissions::none()
+        let mut perms = Self::none()
             .with_net(p.net)
             .with_read(p.read.into_iter().map(PathBuf::from))
             .with_write(p.write.into_iter().map(PathBuf::from));
@@ -105,7 +105,7 @@ impl UserToolManager {
         let entries = std::fs::read_dir(&self.tools_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         match serde_json::from_str::<UserToolMeta>(&content) {
@@ -334,7 +334,7 @@ impl UserToolManager {
     }
 }
 
-/// Wrapper to make UserToolMeta implement Tool trait
+/// Wrapper to make `UserToolMeta` implement Tool trait
 struct UserToolWrapper {
     meta: UserToolMeta,
     tool: ScriptedTool,
@@ -375,11 +375,11 @@ impl Tool for UserToolWrapper {
                     .unwrap_or("")
                     .to_string();
                 let s = map.get("success")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true);
                 // Pass through extra fields as structured data (e.g. "written" for write_file)
                 let mut extra = serde_json::Map::new();
-                for (k, v) in map.iter() {
+                for (k, v) in map {
                     if k != "content" && k != "success" {
                         extra.insert(k.clone(), v.clone());
                     }

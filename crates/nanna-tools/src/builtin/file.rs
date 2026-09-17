@@ -332,14 +332,13 @@ impl Tool for ListDirTool {
             .iter()
             .map(|e| {
                 // entries are formatted as "[kind] name"
-                if let Some(rest) = e.strip_prefix('[') {
-                    if let Some((kind, name)) = rest.split_once("] ") {
+                if let Some(rest) = e.strip_prefix('[')
+                    && let Some((kind, name)) = rest.split_once("] ") {
                         return serde_json::json!({
                             "name": name,
                             "kind": kind,
                         });
                     }
-                }
                 serde_json::json!({ "name": e, "kind": "other" })
             })
             .collect();

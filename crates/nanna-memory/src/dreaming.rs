@@ -198,7 +198,7 @@ pub struct DreamOutcome {
 pub struct DreamingService {
     config: DreamingConfig,
     memory: Arc<MemoryService>,
-    /// Pending feedback to apply (memory_id -> per-variant signal tally)
+    /// Pending feedback to apply (`memory_id` -> per-variant signal tally)
     pending_feedback: RwLock<HashMap<String, FeedbackTally>>,
     /// Monotonic record of the most recent user/agent activity, driving the idle
     /// gate in [`DreamingService::dream_if_idle`]. An `Arc` so the host (the
@@ -695,7 +695,7 @@ where
     }
 }
 
-/// Trait for LLM summarization (implemented by LlmClient)
+/// Trait for LLM summarization (implemented by `LlmClient`)
 ///
 /// This is a simple trait that any LLM client can implement for memory consolidation.
 pub trait LlmSummarizer: Send + Sync {

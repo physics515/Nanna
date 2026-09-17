@@ -87,7 +87,7 @@ impl SlackListener {
 
         let response = self
             .client
-            .post(format!("{}/apps.connections.open", SLACK_API_BASE))
+            .post(format!("{SLACK_API_BASE}/apps.connections.open"))
             .header("Authorization", format!("Bearer {}", self.app_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send()
@@ -121,7 +121,7 @@ impl SlackListener {
 
         let response = self
             .client
-            .post(format!("{}/auth.test", SLACK_API_BASE))
+            .post(format!("{SLACK_API_BASE}/auth.test"))
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send()
@@ -136,7 +136,7 @@ impl SlackListener {
         }
     }
 
-    /// Convert Slack event to IncomingMessage
+    /// Convert Slack event to `IncomingMessage`
     fn convert_event(&self, event: &Value, self_id: &Option<String>) -> Option<IncomingMessage> {
         let event_type = event.get("type")?.as_str()?;
 
@@ -164,12 +164,11 @@ impl SlackListener {
         let channel_id = event.get("channel")?.as_str()?;
 
         // Check if channel is allowed
-        if !self.allowed_channels.is_empty() {
-            if !self.allowed_channels.iter().any(|c| c == channel_id) {
+        if !self.allowed_channels.is_empty()
+            && !self.allowed_channels.iter().any(|c| c == channel_id) {
                 debug!("Ignoring message from non-allowed channel {}", channel_id);
                 return None;
             }
-        }
 
         let text = event.get("text")?.as_str()?.to_string();
         if text.is_empty() {
@@ -182,7 +181,7 @@ impl SlackListener {
         let thread_ts = event.get("thread_ts").and_then(|v| v.as_str()).map(String::from);
 
         Some(IncomingMessage {
-            id: format!("{}:{}", channel_id, ts),
+            id: format!("{channel_id}:{ts}"),
             channel: ChannelId::new("slack", channel_id.to_string()),
             sender: Sender {
                 id: user_id.to_string(),
@@ -191,7 +190,7 @@ impl SlackListener {
             },
             content: MessageContent::Text { text },
             timestamp,
-            reply_to: thread_ts.map(|t| format!("{}:{}", channel_id, t)),
+            reply_to: thread_ts.map(|t| format!("{channel_id}:{t}")),
         })
     }
 
@@ -248,7 +247,7 @@ impl SlackListener {
             let (ws_stream, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = match connect_async(&ws_url).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let detail = format!("WebSocket connect failed: {}", e);
+                    let detail = format!("WebSocket connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -320,8 +319,8 @@ impl SlackListener {
                                 }
 
                                 // Process the event
-                                if let Some(event_payload) = &payload.payload {
-                                    if let Some(event) = event_payload.get("event") {
+                                if let Some(event_payload) = &payload.payload
+                                    && let Some(event) = event_payload.get("event") {
                                         let self_id = self.self_id.read().await.clone();
                                         if let Some(message) = self.convert_event(event, &self_id) {
                                             debug!("Slack message: {:?}", message.id);
@@ -331,7 +330,6 @@ impl SlackListener {
                                             }
                                         }
                                     }
-                                }
                             }
                             "interactive" => {
                                 // Acknowledge interactive payloads
@@ -367,7 +365,7 @@ impl SlackListener {
 
 #[async_trait]
 impl Listener for SlackListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "slack"
     }
 

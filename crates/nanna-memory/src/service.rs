@@ -296,7 +296,7 @@ impl MemoryService {
 
     /// Get FSRS parameters
     #[must_use]
-    pub fn fsrs_params(&self) -> &FsrsParameters {
+    pub const fn fsrs_params(&self) -> &FsrsParameters {
         &self.config.fsrs
     }
 
@@ -545,7 +545,7 @@ impl MemoryService {
                             &pending.memory_id,
                             pending.ordinal,
                             model,
-                            &e.to_string(),
+                            &e.clone(),
                         )
                         .await;
                     warn!("Chunk backfill for '{model}' stopped after {embedded}: {e}");
@@ -658,11 +658,10 @@ impl MemoryService {
     /// Get the minimum similarity score threshold for recall
     pub fn get_min_score(&self) -> f32 {
         // Check for runtime override first
-        if let Ok(guard) = self.min_score_override.try_read() {
-            if let Some(score) = *guard {
+        if let Ok(guard) = self.min_score_override.try_read()
+            && let Some(score) = *guard {
                 return score;
             }
-        }
         self.config.min_score
     }
 
@@ -2230,7 +2229,7 @@ impl MemoryService {
                         removal_budget = removal_budget.saturating_sub(would_remove);
                     }
                     Err(e) => {
-                        result.errors.push(format!("Cluster consolidation failed: {}", e));
+                        result.errors.push(format!("Cluster consolidation failed: {e}"));
                         result.memories_processed += cluster_memories.len();
                     }
                 }

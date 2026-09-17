@@ -133,7 +133,7 @@ pub enum TaskAction {
         #[serde(default)]
         assignee: Option<String>,
     },
-    /// Partial update (status accepts pending|in_progress|cancelled)
+    /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,
         #[serde(default)]
@@ -640,7 +640,7 @@ pub enum SystemAction {
     /// unhardened logic in `get_ollama_models`); instead it sends this action
     /// to the daemon which uses the hardened `nanna_llm::probe_ollama`.
     ProbeOllama {
-        /// Base URL of the Ollama server (e.g. http://localhost:11434).
+        /// Base URL of the Ollama server (e.g. <http://localhost:11434>).
         /// The daemon resolves this from the config it was started with.
         base_url: String,
     },
@@ -711,12 +711,14 @@ impl Response {
     }
 
     /// Check if this response is an error
-    pub fn is_error(&self) -> bool {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
 
     /// Get the data if successful
-    pub fn data(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn data(&self) -> Option<&Value> {
         match &self.result {
             ResponseResult::Success { data } => Some(data),
             ResponseResult::Error { .. } => None,
@@ -724,6 +726,7 @@ impl Response {
     }
 
     /// Get the error message if failed
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         match &self.result {
             ResponseResult::Error { message, .. } => Some(message),
@@ -808,7 +811,7 @@ pub enum Event {
         session_id: String,
         /// Seconds since this turn started.
         elapsed_s: u64,
-        /// Coarse phase: planning | step_pending | streaming | thinking | tool.
+        /// Coarse phase: planning | `step_pending` | streaming | thinking | tool.
         phase: String,
         /// What the turn is waiting on right now, human-readable
         /// (e.g. "model output (ollama/qwen3.5:9b): last token 41s ago").
@@ -977,7 +980,7 @@ pub enum Event {
         scope: String,
         scope_id: Option<String>,
         task_id: Option<i64>,
-        /// started | completed | abandoned | acceptance_checked | replanned | ...
+        /// started | completed | abandoned | `acceptance_checked` | replanned | ...
         kind: String,
         detail: serde_json::Value,
     },
@@ -1070,27 +1073,27 @@ pub enum ControlAction {
 impl From<ControlAction> for Action {
     fn from(action: ControlAction) -> Self {
         match action {
-            ControlAction::ListSessions => Action::Session(SessionAction::List),
+            ControlAction::ListSessions => Self::Session(SessionAction::List),
             ControlAction::CreateSession { name } => {
-                Action::Session(SessionAction::Create { name })
+                Self::Session(SessionAction::Create { name })
             }
-            ControlAction::SwitchSession { id } => Action::Session(SessionAction::Switch { id }),
-            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search {
+            ControlAction::SwitchSession { id } => Self::Session(SessionAction::Switch { id }),
+            ControlAction::MemorySearch { query, limit } => Self::Memory(MemoryAction::Search {
                 query,
                 limit,
                 scope: None,
             }),
-            ControlAction::GetConfig => Action::Config(ConfigAction::Get { path: None }),
+            ControlAction::GetConfig => Self::Config(ConfigAction::Get { path: None }),
             ControlAction::SetConfig { path, value } => {
-                Action::Config(ConfigAction::Set { path, value })
+                Self::Config(ConfigAction::Set { path, value })
             }
-            ControlAction::ListTools => Action::Tool(ToolAction::List),
+            ControlAction::ListTools => Self::Tool(ToolAction::List),
             ControlAction::RunTool { name, input } => {
-                Action::Tool(ToolAction::Execute { name, input })
+                Self::Tool(ToolAction::Execute { name, input })
             }
-            ControlAction::Status => Action::System(SystemAction::Status),
-            ControlAction::Restart => Action::System(SystemAction::Restart),
-            ControlAction::Shutdown => Action::System(SystemAction::Shutdown),
+            ControlAction::Status => Self::System(SystemAction::Status),
+            ControlAction::Restart => Self::System(SystemAction::Restart),
+            ControlAction::Shutdown => Self::System(SystemAction::Shutdown),
         }
     }
 }

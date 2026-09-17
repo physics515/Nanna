@@ -51,7 +51,7 @@ impl Default for DreamingRuntimeConfig {
     }
 }
 
-/// Integrated dreaming runtime that combines DreamingService with LLM
+/// Integrated dreaming runtime that combines `DreamingService` with LLM
 pub struct DreamingRuntime {
     service: DreamingService,
     llm: Arc<LlmClient>,
@@ -65,6 +65,7 @@ impl DreamingRuntime {
     /// * `config` - Runtime configuration
     /// * `llm` - LLM client for summarization
     /// * `embed` - Embedding client for generating vector embeddings
+    #[must_use]
     pub fn new(
         config: DreamingRuntimeConfig,
         llm: Arc<LlmClient>,
@@ -90,6 +91,7 @@ impl DreamingRuntime {
     ///
     /// This is useful when you don't have an embedding client configured.
     /// Memory recall and smart ingest will not work without embeddings.
+    #[must_use]
     pub fn new_without_embeddings(config: DreamingRuntimeConfig, llm: Arc<LlmClient>) -> Self {
         let service = DreamingService::new(config.dreaming);
 
@@ -128,7 +130,7 @@ impl DreamingRuntime {
 
     /// Get reference to the underlying dreaming service
     #[must_use]
-    pub fn service(&self) -> &DreamingService {
+    pub const fn service(&self) -> &DreamingService {
         &self.service
     }
 
@@ -272,7 +274,7 @@ pub fn create_dreaming_executor(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[tokio::test]
     async fn test_dreaming_runtime_creation() {

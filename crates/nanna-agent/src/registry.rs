@@ -800,18 +800,16 @@ impl AgentRegistry {
             for id in &to_remove {
                 if let Some(agent) = agents.remove(id) {
                     // Remove from workspace tracking
-                    if let Some(ws) = &agent.workspace {
-                        if let Some(ws_list) = ws_agents.get_mut(ws) {
+                    if let Some(ws) = &agent.workspace
+                        && let Some(ws_list) = ws_agents.get_mut(ws) {
                             ws_list.retain(|i| i != id);
                         }
-                    }
 
                     // Remove from children tracking
-                    if let Some(parent_id) = &agent.parent_id {
-                        if let Some(child_list) = children.get_mut(parent_id) {
+                    if let Some(parent_id) = &agent.parent_id
+                        && let Some(child_list) = children.get_mut(parent_id) {
                             child_list.retain(|i| i != id);
                         }
-                    }
 
                     // Remove this agent's children entry
                     children.remove(id);

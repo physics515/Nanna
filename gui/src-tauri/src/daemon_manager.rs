@@ -170,7 +170,7 @@ pub struct DaemonManager {
     child: Arc<RwLock<Option<CommandChild>>>,
     /// Whether the spawned sidecar process has terminated. Distinguishes a
     /// live sidecar we own (stop = graceful shutdown, then tree-kill) from a
-    /// dead one whose PID may have been recycled — e.g. the AlreadyRunning
+    /// dead one whose PID may have been recycled — e.g. the `AlreadyRunning`
     /// exit when we merely attached to a standalone daemon, which is not
     /// ours to stop.
     sidecar_exited: Arc<std::sync::atomic::AtomicBool>,
@@ -178,6 +178,7 @@ pub struct DaemonManager {
 
 impl DaemonManager {
     /// Create a new daemon manager
+    #[must_use]
     pub fn new(config: DaemonManagerConfig) -> Self {
         Self {
             config,
@@ -189,6 +190,7 @@ impl DaemonManager {
     }
     
     /// Get the daemon WebSocket URL
+    #[must_use]
     pub fn ws_url(&self) -> String {
         format!("ws://{}:{}", self.config.host, self.config.port)
     }
@@ -215,7 +217,7 @@ impl DaemonManager {
         let sidecar = shell.sidecar("nanna-daemon")
             .map_err(|e| {
                 error!("Failed to create sidecar command: {}", e);
-                format!("Failed to create sidecar command: {}", e)
+                format!("Failed to create sidecar command: {e}")
             })?;
         
         // A dev build must never share the installed app's store: the daemon
@@ -230,13 +232,12 @@ impl DaemonManager {
             "--host".into(),
             self.config.host.clone(),
         ];
-        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR") {
-            if !dev_data_dir.trim().is_empty() {
+        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR")
+            && !dev_data_dir.trim().is_empty() {
                 info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
                 args.push("--data-dir".into());
                 args.push(dev_data_dir);
             }
-        }
         args.push("run".into());
         info!("Spawning daemon with args: {:?}", args);
         let (mut rx, child) = sidecar
@@ -244,7 +245,7 @@ impl DaemonManager {
             .spawn()
             .map_err(|e| {
                 error!("Failed to spawn daemon: {}", e);
-                format!("Failed to spawn daemon: {}", e)
+                format!("Failed to spawn daemon: {e}")
             })?;
         
         // Store the child handle

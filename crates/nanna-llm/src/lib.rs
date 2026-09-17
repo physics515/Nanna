@@ -171,7 +171,7 @@ pub enum LlmError {
 
 impl From<std::io::Error> for LlmError {
     fn from(e: std::io::Error) -> Self {
-        LlmError::Io(e.to_string())
+        Self::Io(e.to_string())
     }
 }
 
@@ -338,8 +338,7 @@ impl ModelInfo {
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Universal context floor when no provider has reported limits for a model.
@@ -373,11 +372,10 @@ pub fn model_context_window(model: &str) -> usize {
 /// derived from the stale claim overflow every subsequent prompt.
 #[must_use]
 pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInfo {
-    if let Some(cache) = ModelInfoCache::default_location() {
-        if let Some(info) = cache.get(model) {
+    if let Some(cache) = ModelInfoCache::default_location()
+        && let Some(info) = cache.get(model) {
             return clamp_model_info_to_effective_window(model, info);
         }
-    }
     clamp_model_info_to_effective_window(model, unknown_model_info(model, provider))
 }
 
@@ -591,6 +589,7 @@ impl ModelInfoCache {
     }
 
     /// Create cache in the default location (user's cache directory)
+    #[must_use]
     pub fn default_location() -> Option<Self> {
         directories::ProjectDirs::from("com", "nanna", "nanna")
             .map(|dirs| Self::new(dirs.cache_dir().join("model_info")))
@@ -658,22 +657,22 @@ impl ModelInfoCache {
 
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
-        LlmError::Http(e.to_string())
+        Self::Http(e.to_string())
     }
 }
 
 impl From<serde_json::Error> for LlmError {
     fn from(e: serde_json::Error) -> Self {
-        LlmError::Json(e.to_string())
+        Self::Json(e.to_string())
     }
 }
 
 impl LlmError {
     /// Check if this error is a rate limit error (429)
     #[must_use]
-    pub fn is_rate_limit(&self) -> bool {
-        matches!(self, LlmError::RateLimit { .. })
-            || matches!(self, LlmError::Api { status: 429, .. })
+    pub const fn is_rate_limit(&self) -> bool {
+        matches!(self, Self::RateLimit { .. })
+            || matches!(self, Self::Api { status: 429, .. })
     }
 
     /// An input-level rejection: this request's INPUT was too long for the
@@ -703,8 +702,8 @@ impl LlmError {
     pub fn should_fallback(&self) -> bool {
         match self {
             // Rate limits - definitely fallback
-            LlmError::RateLimit { .. } => true,
-            LlmError::Api { status, message } => {
+            Self::RateLimit { .. } => true,
+            Self::Api { status, message } => {
                 // 429 = rate limit
                 // 529 = overloaded (Anthropic)
                 // 503 = service unavailable
@@ -720,15 +719,16 @@ impl LlmError {
             // into the 502 arm above. It is still exactly that fault — keep it
             // falling back, or splitting the variant out would silently stop
             // the router trying another model.
-            LlmError::WedgedRunner { .. } => true,
+            Self::WedgedRunner { .. } => true,
             // Network errors - might be transient
-            LlmError::Http(_) => true,
+            Self::Http(_) => true,
             // Don't fallback on auth errors, JSON errors, etc.
             _ => false,
         }
     }
 
     /// Parse an API error response to extract rate limit info
+    #[must_use]
     pub fn from_api_response(status: u16, message: String) -> Self {
         // Both spellings are real: OpenAI-style bodies say "rate_limit_exceeded",
         // OpenRouter's human-form message says "Rate limit exceeded". Matching
@@ -739,16 +739,16 @@ impl LlmError {
         if status == 429 || lowered.contains("rate_limit") || lowered.contains("rate limit") {
             // Try to extract retry-after from the message
             let retry_after = Self::parse_retry_after(&message);
-            return LlmError::RateLimit { message, retry_after };
+            return Self::RateLimit { message, retry_after };
         }
 
-        LlmError::Api { status, message }
+        Self::Api { status, message }
     }
 
     /// Try to parse retry-after seconds from an error message.
     ///
     /// Providers say when they will be ready and we were throwing it away —
-    /// OpenRouter's 429 body carries `"X-RateLimit-Reset":"1785222060000"`, a
+    /// `OpenRouter`'s 429 body carries `"X-RateLimit-Reset":"1785222060000"`, a
     /// millisecond epoch, and every caller was backing off on a guessed
     /// schedule instead. Reading it turns "wait a made-up interval and hope"
     /// into "wait exactly as long as they asked".
@@ -970,7 +970,7 @@ pub async fn pace_provider_requests(provider: Provider) {
 
 /// Teach the pacing gate what a response's rate-limit headers said.
 ///
-/// Reads `x-ratelimit-remaining` and `x-ratelimit-reset` (OpenRouter sends the
+/// Reads `x-ratelimit-remaining` and `x-ratelimit-reset` (`OpenRouter` sends the
 /// reset as an epoch in milliseconds, GitHub in seconds — disambiguated by
 /// magnitude, same rule as [`LlmError::parse_retry_after`]). Uses `try_lock`
 /// rather than awaiting: losing one update to contention is fine — the next
@@ -1033,7 +1033,7 @@ impl Provider {
     ///   The free `:free` models are what this codebase configures.
     /// - `GitHubModels`: free tier publishes 15 requests/minute → 60s/15 = 4s.
     /// - `Anthropic` / `OpenAI`: limits are ACCOUNT-TIER dependent (Anthropic
-    ///   tier 1 is 50 RPM, tier 4 is 4000; OpenAI similar). Pacing everyone to
+    ///   tier 1 is 50 RPM, tier 4 is 4000; `OpenAI` similar). Pacing everyone to
     ///   the lowest tier would throttle paid accounts in the chat hot path for
     ///   no reason; both providers answer bursts with 429 + retry-after, which
     ///   the reactive layer honors. Proactive pacing here would need the
@@ -1043,9 +1043,9 @@ impl Provider {
     #[must_use]
     pub const fn min_request_spacing(self) -> Option<tokio::time::Duration> {
         match self {
-            Provider::OpenRouter => Some(tokio::time::Duration::from_secs(3)),
-            Provider::GitHubModels => Some(tokio::time::Duration::from_secs(4)),
-            Provider::Anthropic | Provider::OpenAI | Provider::ClaudeProxy | Provider::Ollama => {
+            Self::OpenRouter => Some(tokio::time::Duration::from_secs(3)),
+            Self::GitHubModels => Some(tokio::time::Duration::from_secs(4)),
+            Self::Anthropic | Self::OpenAI | Self::ClaudeProxy | Self::Ollama => {
                 None
             }
         }
@@ -1115,11 +1115,10 @@ impl AnthropicMessage {
         tool_input: serde_json::Value,
     ) -> Self {
         let mut content = Vec::new();
-        if let Some(t) = text {
-            if !t.is_empty() {
+        if let Some(t) = text
+            && !t.is_empty() {
                 content.push(ContentBlock::Text { text: t });
             }
-        }
         content.push(ContentBlock::ToolUse {
             id: tool_id.into(),
             name: tool_name.into(),
@@ -1234,7 +1233,7 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     pub stream: bool,
     pub tools: Vec<serde_json::Value>,
-    /// Context window limit (for Ollama num_ctx). If set, limits the context
+    /// Context window limit (for Ollama `num_ctx`). If set, limits the context
     /// window to reduce VRAM usage and allow more model layers on GPU.
     pub context_limit: Option<u32>,
     /// Extended thinking configuration (passed through to Anthropic API)
@@ -1260,7 +1259,7 @@ impl Default for CompletionRequest {
 impl CompletionRequest {
     /// Set extended thinking configuration
     #[must_use]
-    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+    pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
@@ -1668,7 +1667,7 @@ pub struct AnthropicRequest {
     pub thinking: Option<ThinkingConfig>,
     /// Prompt caching: automatic mode caches the longest prefix up to the last cacheable block.
     /// Set to `Some(CacheControl::ephemeral())` to enable automatic prompt caching.
-    /// Cached input tokens cost 90% less on Anthropic, 50% less on OpenAI.
+    /// Cached input tokens cost 90% less on Anthropic, 50% less on `OpenAI`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
@@ -1798,7 +1797,7 @@ struct OAuthAnthropicRequest {
 }
 
 impl OAuthAnthropicRequest {
-    /// Convert from a standard AnthropicRequest, prepending Claude Code identity
+    /// Convert from a standard `AnthropicRequest`, prepending Claude Code identity
     fn from_request(request: &AnthropicRequest, prepend_identity: bool) -> Self {
         let mut system = Vec::new();
 
@@ -1806,21 +1805,19 @@ impl OAuthAnthropicRequest {
             system.push(SystemBlock::text(CLAUDE_CODE_IDENTITY));
         }
 
-        if let Some(ref sys) = request.system {
-            if !sys.is_empty() {
+        if let Some(ref sys) = request.system
+            && !sys.is_empty() {
                 system.push(SystemBlock::text(sys));
             }
-        }
 
         // Place explicit cache breakpoint on the last system block, so the system prompt
         // prefix is cached server-side. It carries the request's own marker rather than a
         // fresh default: a 5-minute breakpoint ahead of a 1-hour top-level one is a 400
         // (longer TTLs must come first), so one request gets exactly one TTL.
-        if let Some(ref control) = request.cache_control {
-            if let Some(last) = system.last_mut() {
+        if let Some(ref control) = request.cache_control
+            && let Some(last) = system.last_mut() {
                 last.cache_control = Some(control.clone());
             }
-        }
         debug_assert!(
             system
                 .iter()
@@ -1910,7 +1907,7 @@ fn hour_share(split: Option<&CacheCreation>, total: u32) -> u32 {
 const CLAUDE_CODE_VERSION: &str = "2.1.273";
 
 /// Claude Code canonical tool names (case-sensitive)
-/// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
+/// Source: <https://cchistory.mariozechner.at/data/prompts-2.1.11.md>
 const CLAUDE_CODE_TOOLS: &[(&str, &str)] = &[
     ("read", "Read"),
     ("read_file", "Read"),
@@ -2441,11 +2438,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let cache = CACHE.get_or_init(Default::default);
         let name = model.strip_prefix("ollama/").unwrap_or(model).to_string();
 
-        if let Ok(guard) = cache.lock() {
-            if let Some(hit) = guard.get(&name) {
+        if let Ok(guard) = cache.lock()
+            && let Some(hit) = guard.get(&name) {
                 return *hit;
             }
-        }
 
         let looked_up = (|| {
             let out = std::process::Command::new("curl")
@@ -2481,7 +2477,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .unwrap_or_else(|_| Client::new())
     }
 
-    /// Pin an Ollama base URL to IPv4 loopback. "localhost" resolves to ::1
+    /// Pin an Ollama base URL to IPv4 loopback. "localhost" resolves to `::1`
     /// first on Windows, and the chat stream was the ONLY component talking
     /// to Ollama over v6 loopback (health probes and runner surgery already
     /// use 127.0.0.1) — the same v6 path where streams were cut
@@ -2544,7 +2540,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Create a new `Claude Proxy` client for claude-max-api-proxy
     /// This proxies requests through a local server that uses Claude Code CLI credentials
-    /// Default URL is http://localhost:3456
+    /// Default URL is <http://localhost:3456>
     pub fn claude_proxy(base_url: impl Into<String>) -> Self {
         Self {
             http: Self::build_http_client(),
@@ -2555,6 +2551,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     /// Create a Claude Proxy client with default localhost URL
+    #[must_use]
     pub fn claude_proxy_default() -> Self {
         Self::claude_proxy("http://localhost:3456")
     }
@@ -2580,6 +2577,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     /// Create an Ollama client with default localhost URL
+    #[must_use]
     pub fn ollama_default() -> Self {
         Self::ollama("http://localhost:11434")
     }
@@ -2623,10 +2621,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// Apply Ollama auth header if an API key is configured.
     fn apply_ollama_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if !self.api_key.is_empty() {
-            builder.header("Authorization", format!("Bearer {}", self.api_key))
-        } else {
+        if self.api_key.is_empty() {
             builder
+        } else {
+            builder.header("Authorization", format!("Bearer {}", self.api_key))
         }
     }
 
@@ -2665,7 +2663,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Get the provider for this client
     #[must_use]
-    pub fn provider(&self) -> Provider {
+    pub const fn provider(&self) -> Provider {
         self.provider
     }
 
@@ -2679,11 +2677,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// Returns `LlmError` if both cache and API fail (uses defaults as final fallback).
     pub async fn get_model_info(&self, model: &str, cache: Option<&ModelInfoCache>) -> ModelInfo {
         // Check cache first
-        if let Some(cache) = cache {
-            if let Some(info) = cache.get(model) {
+        if let Some(cache) = cache
+            && let Some(info) = cache.get(model) {
                 return clamp_model_info_to_effective_window(model, info);
             }
-        }
 
         // Fetch from API
         let info = match self.fetch_model_info(model).await {
@@ -2729,11 +2726,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // static facts about the model; the effective-window clamp below is
         // live per-process state (the Ollama num_ctx latch) and must never be
         // persisted as if the model itself shrank.
-        if let Some(cache) = cache {
-            if let Err(e) = cache.set(&info) {
+        if let Some(cache) = cache
+            && let Err(e) = cache.set(&info) {
                 warn!(model = %model, error = %e, "Failed to cache model info");
             }
-        }
 
         clamp_model_info_to_effective_window(model, info)
     }
@@ -2834,7 +2830,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         })
     }
 
-    /// Fetch model info from OpenAI API
+    /// Fetch model info from `OpenAI` API
     async fn fetch_openai_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
         let url = format!("{}/v1/models/{}", self.base_url, model);
 
@@ -2909,7 +2905,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         })
     }
 
-    /// Fetch model info from OpenRouter API
+    /// Fetch model info from `OpenRouter` API
     async fn fetch_openrouter_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
         // OpenRouter has a models endpoint that lists all models
         let url = format!("{}/v1/models", self.base_url);
@@ -2986,7 +2982,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// Dispatches to the appropriate provider backend:
     /// - Anthropic: Native Anthropic API (`/v1/messages`)
-    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to OpenAI chat completions format
+    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to `OpenAI` chat completions format
     /// - Ollama: Converts to Ollama `/api/chat` format
     ///
     /// # Errors
@@ -3006,7 +3002,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         }
     }
 
-    /// Native Anthropic API implementation for complete_anthropic
+    /// Native Anthropic API implementation for `complete_anthropic`
     async fn complete_anthropic_native(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
         pace_provider_requests(self.provider).await;
         let is_oauth = self.is_oauth();
@@ -3083,7 +3079,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Ok(result)
     }
 
-    /// Convert AnthropicRequest → OpenAI chat completions and execute
+    /// Convert `AnthropicRequest` → `OpenAI` chat completions and execute
     async fn complete_anthropic_via_openai(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
         pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_openai_request(request);
@@ -3132,7 +3128,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Ok(response)
     }
 
-    /// Convert AnthropicRequest → Ollama /api/chat and execute
+    /// Convert `AnthropicRequest` → Ollama /api/chat and execute
     async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
         pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_ollama_request(request);
@@ -3343,7 +3339,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// shape.
     ///
     /// A blind `response.json::<T>()` here reported every mismatch as reqwest's
-    /// opaque "error decoding response body", and OpenRouter produces three
+    /// opaque "error decoding response body", and `OpenRouter` produces three
     /// legitimate mismatches: whitespace keep-alive padding ahead of the JSON
     /// while a reasoning model thinks, `content: null` with the text in a
     /// `reasoning` field, and — the expensive one — **HTTP 200 whose body is an
@@ -3401,11 +3397,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 // Reasoning models sometimes put everything in `reasoning` and
                 // leave `content` empty; a summary built from the reasoning is
                 // better than reporting an empty success.
-                if let Some(reasoning) = &choice.message.reasoning {
-                    if !reasoning.trim().is_empty() {
+                if let Some(reasoning) = &choice.message.reasoning
+                    && !reasoning.trim().is_empty() {
                         return Ok(reasoning.clone());
                     }
-                }
             }
             return Err(LlmError::from_api_response(
                 status,
@@ -3639,7 +3634,7 @@ pub fn estimate_tokens_for_family(text: &str, family: TokenContentFamily) -> usi
     (ascii_tokens + wide_tokens).max(1)
 }
 
-/// Exact OpenAI BPE tokenization via `tiktoken-rs` when the `tiktoken` feature
+/// Exact `OpenAI` BPE tokenization via `tiktoken-rs` when the `tiktoken` feature
 /// is enabled. Falls back to the heuristic when tokenization fails or the
 /// feature is off.
 ///
@@ -3698,11 +3693,10 @@ fn tiktoken_count_for_model(text: &str, model: &str) -> Option<usize> {
         || lower.starts_with('o')
         || lower.contains("codex")
         || lower.contains("chatgpt");
-    if o200k {
-        if let Ok(bpe) = tiktoken_rs::o200k_base() {
+    if o200k
+        && let Ok(bpe) = tiktoken_rs::o200k_base() {
             return Some(bpe.encode_with_special_tokens(text).len());
         }
-    }
     if let Ok(bpe) = tiktoken_rs::cl100k_base() {
         return Some(bpe.encode_with_special_tokens(text).len());
     }
@@ -3796,7 +3790,7 @@ pub struct RateLimitHeaders {
 
 impl RateLimitHeaders {
     /// Parse rate limit headers from an HTTP response.
-    /// Handles both Anthropic and OpenAI header formats.
+    /// Handles both Anthropic and `OpenAI` header formats.
     #[must_use]
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
         let get_u32 = |name: &str| -> Option<u32> {
@@ -3823,7 +3817,7 @@ impl RateLimitHeaders {
         }
     }
 
-    /// Convert to ModelLimits, using defaults where headers are missing
+    /// Convert to `ModelLimits`, using defaults where headers are missing
     #[must_use]
     pub fn to_model_limits(&self, defaults: &ModelLimits) -> ModelLimits {
         ModelLimits {
@@ -3897,12 +3891,12 @@ impl ModelLimits {
 
     /// Check if a request would likely exceed rate limits
     #[must_use]
-    pub fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
+    pub const fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
         estimated_input_tokens as u32 > self.input_tokens_per_minute
     }
 
     /// Update limits from API response headers
-    pub fn update_from_headers(&mut self, headers: &RateLimitHeaders) {
+    pub const fn update_from_headers(&mut self, headers: &RateLimitHeaders) {
         if let Some(limit) = headers.limit_tokens {
             self.input_tokens_per_minute = limit;
         }
@@ -3954,11 +3948,11 @@ impl RequestBuilder for CompletionRequest {
 }
 
 impl CompletionRequest {
-    /// Set context window limit (for Ollama num_ctx).
+    /// Set context window limit (for Ollama `num_ctx`).
     /// This reduces VRAM usage by limiting the KV cache size,
     /// allowing more model layers to fit on GPU.
     #[must_use]
-    pub fn with_context_limit(mut self, limit: u32) -> Self {
+    pub const fn with_context_limit(mut self, limit: u32) -> Self {
         self.context_limit = Some(limit);
         self
     }
@@ -4024,6 +4018,7 @@ impl EmbeddingClient {
     }
 
     /// Create Ollama embedding client with default localhost URL
+    #[must_use]
     pub fn ollama_default() -> Self {
         Self::ollama("http://localhost:11434")
     }
@@ -4158,13 +4153,11 @@ impl EmbeddingClient {
             let resp: Option<NewResp> = serde_json::from_str(&raw)
                 .ok()
                 .or_else(|| heal::heal_json(&raw).and_then(|v| serde_json::from_value(v).ok()));
-            if let Some(resp) = resp {
-                if let Some(emb) = resp.embeddings.into_iter().next() {
-                    if !emb.is_empty() {
+            if let Some(resp) = resp
+                && let Some(emb) = resp.embeddings.into_iter().next()
+                    && !emb.is_empty() {
                         return Ok(emb);
                     }
-                }
-            }
         }
 
         // Fall back to legacy API: POST /api/embeddings { model, prompt }
@@ -4333,9 +4326,9 @@ pub enum StreamEvent {
     ContentBlockStart {
         index: usize,
         content_type: String,
-        /// Tool use ID (only for tool_use blocks)
+        /// Tool use ID (only for `tool_use` blocks)
         tool_id: Option<String>,
-        /// Tool name (only for tool_use blocks)
+        /// Tool name (only for `tool_use` blocks)
         tool_name: Option<String>,
     },
     /// Text delta within a content block
@@ -4365,7 +4358,7 @@ pub enum StreamEvent {
         error: LlmError,
         /// Text accumulated before the error
         partial_text: String,
-        /// In-progress tool calls (id, name, partial_json)
+        /// In-progress tool calls (id, name, `partial_json`)
         partial_tool_calls: Vec<(String, String, String)>,
     },
     /// Rate limit headers received (allows updating limits cache)
@@ -4385,7 +4378,7 @@ pub struct StreamAccumulator {
     pub thinking: String,
     /// Accumulated signature for the thinking block (required by Anthropic in multi-turn)
     pub thinking_signature: String,
-    /// Tool calls in progress: (index, id, name, partial_json)
+    /// Tool calls in progress: (index, id, name, `partial_json`)
     pub tool_calls: Vec<(usize, String, String, String)>,
 }
 
@@ -4409,11 +4402,10 @@ impl StreamAccumulator {
                 self.thinking_signature.push_str(signature);
             }
             StreamEvent::ContentBlockStart { index, content_type, tool_id, tool_name } => {
-                if content_type == "tool_use" {
-                    if let (Some(id), Some(name)) = (tool_id, tool_name) {
+                if content_type == "tool_use"
+                    && let (Some(id), Some(name)) = (tool_id, tool_name) {
                         self.tool_calls.push((*index, id.clone(), name.clone(), String::new()));
                     }
-                }
             }
             StreamEvent::ToolUseDelta { index, partial_json } => {
                 if let Some((_, _, _, json)) = self.tool_calls.iter_mut().find(|(i, _, _, _)| i == index) {
@@ -4434,7 +4426,7 @@ impl StreamAccumulator {
 
     /// Check if there's any accumulated content
     #[must_use]
-    pub fn has_content(&self) -> bool {
+    pub const fn has_content(&self) -> bool {
         !self.text.is_empty() || !self.thinking.is_empty() || !self.tool_calls.is_empty()
     }
 }
@@ -4520,7 +4512,7 @@ impl LlmClient {
     /// Stream an Anthropic-format request, dispatching to the appropriate provider.
     ///
     /// - Anthropic: Native SSE streaming via `/v1/messages`
-    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to OpenAI SSE streaming
+    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to `OpenAI` SSE streaming
     /// - Ollama: Converts to Ollama streaming via `/api/chat`
     pub fn stream_anthropic(
         &self,
@@ -4627,7 +4619,7 @@ impl LlmClient {
                 is_oauth = is_oauth,
                 model = %request.model,
                 has_system = request.system.is_some(),
-                tools_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                tools_count = request.tools.as_ref().map_or(0, std::vec::Vec::len),
                 "Sending Anthropic streaming request"
             );
 
@@ -4716,34 +4708,31 @@ impl LlmClient {
 
                 while let Some(event_str) = extract_sse_event(&mut buffer) {
                     if let Some(mut stream_event) = parse_sse_event(&event_str) {
-                        if is_oauth {
-                            if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
+                        if is_oauth
+                            && let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
                                 *name = from_claude_code_tool_name(name, &original_tools);
                             }
-                        }
                         accumulator.process(&stream_event);
                         yield Ok(stream_event);
                     }
                 }
             }
 
-            if !buffer.trim().is_empty() {
-                if let Some(mut stream_event) = parse_sse_event(&buffer) {
-                    if is_oauth {
-                        if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
+            if !buffer.trim().is_empty()
+                && let Some(mut stream_event) = parse_sse_event(&buffer) {
+                    if is_oauth
+                        && let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
                             *name = from_claude_code_tool_name(name, &original_tools);
                         }
-                    }
                     accumulator.process(&stream_event);
                     yield Ok(stream_event);
                 }
-            }
         }
     }
 
-    /// Stream an AnthropicRequest via OpenAI-compatible SSE streaming.
-    /// Converts the request to OpenAI format, streams via /v1/chat/completions,
-    /// and converts events back to Anthropic StreamEvent format.
+    /// Stream an `AnthropicRequest` via OpenAI-compatible SSE streaming.
+    /// Converts the request to `OpenAI` format, streams via /v1/chat/completions,
+    /// and converts events back to Anthropic `StreamEvent` format.
     fn stream_anthropic_via_openai(
         &self,
         request: &AnthropicRequest,
@@ -4868,8 +4857,8 @@ impl LlmClient {
                     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in chunk.choices {
                             if let Some(delta) = choice.delta {
-                                if let Some(text) = delta.content {
-                                    if !text.is_empty() {
+                                if let Some(text) = delta.content
+                                    && !text.is_empty() {
                                         if !text_block_started {
                                             text_block_started = true;
                                             yield Ok(StreamEvent::ContentBlockStart {
@@ -4881,13 +4870,12 @@ impl LlmClient {
                                         }
                                         yield Ok(StreamEvent::TextDelta { index: 0, text });
                                     }
-                                }
 
                                 if let Some(tool_calls) = delta.tool_calls {
                                     for tc in tool_calls {
                                         let block_index = tc.index + 1;
-                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function) {
-                                            if let Some(name) = &func.name {
+                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function)
+                                            && let Some(name) = &func.name {
                                                 if text_block_started {
                                                     yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                                                     text_block_started = false;
@@ -4900,17 +4888,14 @@ impl LlmClient {
                                                     tool_name: Some(name.clone()),
                                                 });
                                             }
-                                        }
-                                        if let Some(func) = &tc.function {
-                                            if let Some(args) = &func.arguments {
-                                                if !args.is_empty() {
+                                        if let Some(func) = &tc.function
+                                            && let Some(args) = &func.arguments
+                                                && !args.is_empty() {
                                                     yield Ok(StreamEvent::ToolUseDelta {
                                                         index: block_index,
                                                         partial_json: args.clone(),
                                                     });
                                                 }
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -4950,7 +4935,7 @@ impl LlmClient {
         }
     }
 
-    /// Stream an AnthropicRequest via Ollama `/api/chat` with `stream: true`.
+    /// Stream an `AnthropicRequest` via Ollama `/api/chat` with `stream: true`.
     /// Ollama streams NDJSON (one JSON object per line, not SSE).
     fn stream_anthropic_via_ollama(
         &self,
@@ -5111,8 +5096,7 @@ impl LlmClient {
                     if let Some(frag) = obj["message"]["thinking"]
                         .as_str()
                         .or_else(|| obj["message"]["content"].as_str())
-                    {
-                        if let Some(run) = repeat_watch.observe(frag) {
+                        && let Some(run) = repeat_watch.observe(frag) {
                             if thinking_block_started || text_block_started {
                                 yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
                             }
@@ -5123,10 +5107,9 @@ impl LlmClient {
                             });
                             return;
                         }
-                    }
 
-                    if let Some(thinking) = obj["message"]["thinking"].as_str() {
-                        if !thinking.is_empty() {
+                    if let Some(thinking) = obj["message"]["thinking"].as_str()
+                        && !thinking.is_empty() {
                             if !thinking_block_started {
                                 thinking_block_started = true;
                                 yield Ok(StreamEvent::ContentBlockStart {
@@ -5138,7 +5121,6 @@ impl LlmClient {
                             }
                             yield Ok(StreamEvent::ThinkingDelta { index: next_block_index, thinking: thinking.to_string() });
                         }
-                    }
 
                     // Stream text content.
                     // When text starts arriving and thinking was active, close the thinking block first.
@@ -5191,8 +5173,8 @@ impl LlmClient {
                     // Tool calls: Ollama emits these in a message with done=false,
                     // followed by a separate done=true message with empty content.
                     // Process tool_calls from ANY message, not just the done message.
-                    if let Some(tool_calls) = obj["message"]["tool_calls"].as_array() {
-                        if !tool_calls.is_empty() {
+                    if let Some(tool_calls) = obj["message"]["tool_calls"].as_array()
+                        && !tool_calls.is_empty() {
                             // Close any open thinking/text blocks before tool calls
                             if thinking_block_started {
                                 yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
@@ -5211,9 +5193,7 @@ impl LlmClient {
                                 next_block_index += 1;
                                 let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                                 let args = tc["function"]["arguments"].to_string();
-                                let id = tc["id"].as_str()
-                                    .map(String::from)
-                                    .unwrap_or_else(|| format!("toolu_{:08x}", tool_block_count));
+                                let id = tc["id"].as_str().map_or_else(|| format!("toolu_{tool_block_count:08x}"), String::from);
                                 yield Ok(StreamEvent::ContentBlockStart {
                                     index: block_idx,
                                     content_type: "tool_use".to_string(),
@@ -5227,7 +5207,6 @@ impl LlmClient {
                                 yield Ok(StreamEvent::ContentBlockStop { index: block_idx });
                             }
                         }
-                    }
 
                     if done {
                         // Close any remaining open blocks
@@ -5277,8 +5256,8 @@ impl LlmClient {
             // would otherwise sit in `buffer` unparsed and be reported as an
             // aborted generation. Cheap to honour, and it can only ever turn
             // a false 502 into the success it actually was.
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim()) {
-                if obj["done"].as_bool().unwrap_or(false) {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
+                && obj["done"].as_bool().unwrap_or(false) {
                     if thinking_block_started || text_block_started {
                         yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
                     }
@@ -5286,7 +5265,6 @@ impl LlmClient {
                     yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
                     return;
                 }
-            }
 
             // A sentinel-terminated stream is a COMPLETE turn.
             //
@@ -5357,7 +5335,7 @@ impl LlmClient {
         }
     }
 
-    /// Stream using OpenAI-compatible API (for OpenAI, OpenRouter, GitHub Models, Claude Proxy)
+    /// Stream using OpenAI-compatible API (for `OpenAI`, `OpenRouter`, GitHub Models, Claude Proxy)
     /// Supports both text responses and tool calls.
     pub fn stream_openai(
         &self,
@@ -5560,8 +5538,8 @@ impl LlmClient {
                         for choice in chunk.choices {
                             if let Some(delta) = choice.delta {
                                 // Handle text content
-                                if let Some(text) = delta.content {
-                                    if !text.is_empty() {
+                                if let Some(text) = delta.content
+                                    && !text.is_empty() {
                                         if !text_block_started {
                                             text_block_started = true;
                                             yield Ok(StreamEvent::ContentBlockStart {
@@ -5573,7 +5551,6 @@ impl LlmClient {
                                         }
                                         yield Ok(StreamEvent::TextDelta { index: 0, text });
                                     }
-                                }
 
                                 // Handle tool calls
                                 if let Some(tool_calls) = delta.tool_calls {
@@ -5582,8 +5559,8 @@ impl LlmClient {
                                         let block_index = tc.index + 1;
 
                                         // Check if this is a new tool call
-                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function) {
-                                            if let Some(name) = &func.name {
+                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function)
+                                            && let Some(name) = &func.name {
                                                 // Close text block if open (tool calls come after text)
                                                 if text_block_started {
                                                     yield Ok(StreamEvent::ContentBlockStop { index: 0 });
@@ -5599,19 +5576,16 @@ impl LlmClient {
                                                     tool_name: Some(name.clone()),
                                                 });
                                             }
-                                        }
 
                                         // Stream tool arguments
-                                        if let Some(func) = &tc.function {
-                                            if let Some(args) = &func.arguments {
-                                                if !args.is_empty() {
+                                        if let Some(func) = &tc.function
+                                            && let Some(args) = &func.arguments
+                                                && !args.is_empty() {
                                                     yield Ok(StreamEvent::ToolUseDelta {
                                                         index: block_index,
                                                         partial_json: args.clone(),
                                                     });
                                                 }
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -5654,7 +5628,7 @@ impl LlmClient {
         }
     }
 
-    /// Convenience method to stream a CompletionRequest.
+    /// Convenience method to stream a `CompletionRequest`.
     /// Converts to provider-specific format automatically.
     ///
     /// Returns `StreamEvent` directly (errors converted to `Error` or `RecoverableError` events).
@@ -5662,7 +5636,7 @@ impl LlmClient {
         &self,
         request: &CompletionRequest,
     ) -> impl Stream<Item = StreamEvent> + '_ {
-        let provider = self.provider.clone();
+        let provider = self.provider;
         let request = request.clone();
 
         stream! {
@@ -5865,20 +5839,20 @@ impl LlmClient {
 /// the string contains valid JSON (verified live against Ollama 0.31.2).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolArgsWire {
-    /// `"arguments": "{\"path\": ...}"` — OpenAI convention
+    /// `"arguments": "{\"path\": ...}"` — `OpenAI` convention
     JsonString,
     /// `"arguments": {"path": ...}` — Ollama native convention
     JsonObject,
 }
 
-/// Convert an AnthropicRequest into OpenAI-compatible messages and tools JSON.
-/// Returns (messages_json_array, tools_json_array_or_none).
+/// Convert an `AnthropicRequest` into OpenAI-compatible messages and tools JSON.
+/// Returns (`messages_json_array`, `tools_json_array_or_none`).
 fn anthropic_to_openai_request(request: &AnthropicRequest) -> (serde_json::Value, Option<serde_json::Value>) {
     anthropic_to_wire_request(request, ToolArgsWire::JsonString)
 }
 
-/// Convert an AnthropicRequest for Ollama's NATIVE /api/chat endpoint.
-/// Identical to the OpenAI conversion except tool-call arguments stay a JSON
+/// Convert an `AnthropicRequest` for Ollama's NATIVE /api/chat endpoint.
+/// Identical to the `OpenAI` conversion except tool-call arguments stay a JSON
 /// object — the string form 400s every request that echoes tool history.
 fn anthropic_to_ollama_request(request: &AnthropicRequest) -> (serde_json::Value, Option<serde_json::Value>) {
     anthropic_to_wire_request(request, ToolArgsWire::JsonObject)
@@ -5891,14 +5865,13 @@ fn anthropic_to_wire_request(
     let mut messages = Vec::new();
 
     // System prompt → system message
-    if let Some(ref system) = request.system {
-        if !system.is_empty() {
+    if let Some(ref system) = request.system
+        && !system.is_empty() {
             messages.push(serde_json::json!({
                 "role": "system",
                 "content": system,
             }));
         }
-    }
 
     // Convert Anthropic messages to OpenAI messages
     for msg in &request.messages {
@@ -6015,7 +5988,7 @@ fn anthropic_to_wire_request(
     (serde_json::json!(messages), tools_json)
 }
 
-/// Convert an OpenAI chat completion response JSON to AnthropicResponse
+/// Convert an `OpenAI` chat completion response JSON to `AnthropicResponse`
 fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
     let choice = response["choices"]
         .as_array()
@@ -6026,11 +5999,10 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
     let mut content = Vec::new();
 
     // Text content
-    if let Some(text) = message["content"].as_str() {
-        if !text.is_empty() {
+    if let Some(text) = message["content"].as_str()
+        && !text.is_empty() {
             content.push(ContentBlock::Text { text: text.to_string() });
         }
-    }
 
     // Tool calls
     if let Some(tool_calls) = message["tool_calls"].as_array() {
@@ -6074,7 +6046,7 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
     })
 }
 
-/// Convert an Ollama /api/chat response JSON to AnthropicResponse
+/// Convert an Ollama /api/chat response JSON to `AnthropicResponse`
 /// Extract content inside `<think>...</think>` tags.
 fn extract_think_content(text: &str) -> Option<String> {
     let start = text.find("<think>")?;
@@ -6120,23 +6092,20 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
 
     // Thinking content (qwen3 and other thinking models — Ollama separates this
     // into a `thinking` field when `think: true` is set in the request)
-    if let Some(thinking) = message["thinking"].as_str() {
-        if !thinking.is_empty() {
+    if let Some(thinking) = message["thinking"].as_str()
+        && !thinking.is_empty() {
             content.push(ContentBlock::Thinking { thinking: thinking.to_string(), signature: None });
         }
-    }
 
     // Text content — strip embedded <think>...</think> tags (fallback for when
     // Ollama doesn't separate thinking, e.g. older versions or models that embed tags)
     if let Some(raw_text) = message["content"].as_str() {
         // Extract thinking from tags if we didn't get it from the dedicated field
-        if !content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
-            if let Some(thinking) = extract_think_content(raw_text) {
-                if !thinking.is_empty() {
+        if !content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. }))
+            && let Some(thinking) = extract_think_content(raw_text)
+                && !thinking.is_empty() {
                     content.push(ContentBlock::Thinking { thinking, signature: None });
                 }
-            }
-        }
         let text = strip_think_tags(raw_text);
         if !text.is_empty() {
             content.push(ContentBlock::Text { text });
@@ -6149,7 +6118,7 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let input = tc["function"]["arguments"].clone();
             // Ollama doesn't provide tool call IDs, generate one
-            let id = format!("toolu_{:08x}", i);
+            let id = format!("toolu_{i:08x}");
             content.push(ContentBlock::ToolUse { id, name, input });
         }
     }
@@ -6567,8 +6536,8 @@ mod tests {
     }
 
     /// Model info served to budget derivation must carry the LIVE window:
-    /// context clamps to the latch and max_output re-bounds to half of it, so
-    /// hard_input_limit_for / effective_output_budget stay consistent with
+    /// context clamps to the latch and `max_output` re-bounds to half of it, so
+    /// `hard_input_limit_for` / `effective_output_budget` stay consistent with
     /// what the runner will actually honour.
     #[test]
     fn model_info_clamps_to_the_demoted_window() {
@@ -6611,7 +6580,7 @@ mod tests {
     /// the environment is process-global.
     #[test]
     fn an_explicit_override_beats_the_vram_heuristic() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: edition 2024 requires this; the lock above keeps the two
         // env-touching tests from overlapping, and nothing else reads this key.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "16384") };
@@ -6633,7 +6602,7 @@ mod tests {
     /// unusable values fall through to sizing rather than to a wrong constant.
     #[test]
     fn an_absent_or_junk_override_falls_through_to_sizing() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: see above.
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
         assert_eq!(LlmClient::env_num_ctx(), None);
@@ -6660,7 +6629,7 @@ mod tests {
     /// Ollama's tags, so the VRAM probe abstains deterministically here.
     #[test]
     fn the_env_pin_is_the_starting_latch_in_both_directions() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut request = request_with_tool_history(serde_json::json!({}));
         request.context_limit = None;
 
@@ -6691,7 +6660,7 @@ mod tests {
     /// explicit per-request `context_limit` keeps outranking both.
     #[test]
     fn demotion_still_walks_below_the_env_pin() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: see above.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
 
@@ -6725,7 +6694,7 @@ mod tests {
     /// window was deliberate, not measured.
     #[test]
     fn the_env_pin_announces_itself_at_info() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: see above.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
 
@@ -6761,7 +6730,7 @@ mod tests {
     /// hunting for a setting nobody made.
     #[test]
     fn an_unset_env_neither_pins_nor_announces() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: see above.
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
 
@@ -6844,7 +6813,7 @@ mod tests {
 
     fn capture_info_logs(f: impl FnOnce()) -> String {
         pin_global_log_level();
-        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         #[derive(Clone, Default)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -6852,7 +6821,7 @@ mod tests {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 self.0
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(buf);
                 Ok(buf.len())
             }
@@ -6861,7 +6830,7 @@ mod tests {
             }
         }
         impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
+            type Writer = Self;
             fn make_writer(&'a self) -> Self::Writer {
                 self.clone()
             }
@@ -6874,7 +6843,7 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, f);
-        let bytes = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = sink.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -7170,7 +7139,7 @@ mod tests {
                 assert_eq!(index, 1);
                 assert!(matches!(delta, DeltaData::SignatureDelta { .. }));
             }
-            other => panic!("Expected ContentBlockDelta, got {:?}", other),
+            other => panic!("Expected ContentBlockDelta, got {other:?}"),
         }
     }
 
@@ -7184,7 +7153,7 @@ mod tests {
                 assert_eq!(index, 2);
                 assert!(matches!(delta, DeltaData::Unknown));
             }
-            other => panic!("Expected ContentBlockDelta, got {:?}", other),
+            other => panic!("Expected ContentBlockDelta, got {other:?}"),
         }
     }
 
@@ -7715,7 +7684,7 @@ mod gemma_sentinel_tests {
     // while diagnosing why a stored, WORKING key produced 386 straight
     // "error decoding response body" failures and zero successful dreams.
 
-    /// OpenRouter pads a slow reasoning model's response with whitespace
+    /// `OpenRouter` pads a slow reasoning model's response with whitespace
     /// keep-alive before the JSON — observed live on nemotron-3-ultra.
     #[test]
     fn decodes_whitespace_padded_completion() {
@@ -7741,7 +7710,7 @@ mod gemma_sentinel_tests {
         );
     }
 
-    /// The expensive one: OpenRouter returns HTTP 200 whose body is an error
+    /// The expensive one: `OpenRouter` returns HTTP 200 whose body is an error
     /// envelope (free-tier rate limits, moderation). This must surface as an
     /// error carrying the API's message — swallowing it as a decode failure is
     /// what made a working key look absent for two days.
@@ -7832,8 +7801,8 @@ mod gemma_sentinel_tests {
     /// to remove.
     ///
     /// Measured on `GitHubModels`, which no OTHER test touches — the clocks
-    /// are process-global and the paced-spacing test stamps OpenRouter's, so
-    /// measuring OpenRouter here would depend on test ordering.
+    /// are process-global and the paced-spacing test stamps `OpenRouter`'s, so
+    /// measuring `OpenRouter` here would depend on test ordering.
     #[tokio::test(start_paused = true)]
     async fn provider_clocks_are_independent() {
         pace_provider_requests(Provider::OpenRouter).await;

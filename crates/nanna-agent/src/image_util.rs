@@ -23,6 +23,7 @@ fn max_image_bytes(provider: &str) -> usize {
 
 /// Extract the provider prefix from a model spec like `"anthropic/claude-sonnet-4-20250514"`.
 /// Returns `""` if there is no slash (which will map to the safe default).
+#[must_use]
 pub fn provider_from_model(model: &str) -> &str {
     model.split_once('/').map_or("", |(p, _)| p)
 }

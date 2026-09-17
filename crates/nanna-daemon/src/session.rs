@@ -4,7 +4,7 @@
 //! can subscribe to the same session.
 //!
 //! All session and message data is persisted to Turso via nanna-storage.
-//! The in-memory HashMap serves as a hot cache for fast access.
+//! The in-memory `HashMap` serves as a hot cache for fast access.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,8 @@ pub enum MessageRole {
 
 impl MessageRole {
     /// Convert to the string format used in the database.
-    pub fn as_db_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_db_str(&self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
@@ -65,6 +66,7 @@ impl MessageRole {
     }
 
     /// Parse from the string format used in the database.
+    #[must_use]
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "user" => Self::User,
@@ -361,6 +363,7 @@ pub struct Session {
 
 impl Session {
     /// Create a new session
+    #[must_use]
     pub fn new(name: Option<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -429,7 +432,7 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Add a message to the session (in-memory only — use SessionManager for persistence)
+    /// Add a message to the session (in-memory only — use `SessionManager` for persistence)
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
@@ -485,6 +488,7 @@ impl Session {
     }
     
     /// Check if a channel is subscribed
+    #[must_use]
     pub fn is_subscribed(&self, channel_id: &str) -> bool {
         self.subscribers.contains(channel_id)
     }
@@ -522,6 +526,7 @@ impl Session {
     }
 
     /// Get display name (name or truncated ID)
+    #[must_use]
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
             format!("Session {}", &self.id[..floor_boundary(&self.id, 8)])
@@ -529,6 +534,7 @@ impl Session {
     }
     
     /// Get message count
+    #[must_use]
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -621,7 +627,7 @@ pub struct MailboxMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Serialize a SessionMessage's extra fields (tool_calls, attachments, reasoning, timeline, usage) to JSON metadata.
+/// Serialize a `SessionMessage`'s extra fields (`tool_calls`, attachments, reasoning, timeline, usage) to JSON metadata.
 fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     let has_tool_calls = !msg.tool_calls.is_empty();
     let has_attachments = !msg.attachments.is_empty();
@@ -652,7 +658,7 @@ fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     Some(serde_json::Value::Object(meta).to_string())
 }
 
-/// Deserialize a DB message row back into a SessionMessage.
+/// Deserialize a DB message row back into a `SessionMessage`.
 fn db_message_to_session_message(
     message_id: &str,
     role: &str,
@@ -737,7 +743,7 @@ pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
     /// Default session ID (for new clients)
     default_session: Arc<RwLock<Option<SessionId>>>,
-    /// Sub-session registry (session_id -> info)
+    /// Sub-session registry (`session_id` -> info)
     sub_sessions: Arc<RwLock<HashMap<SessionId, SubSessionInfo>>>,
     /// Per-session mailbox for inter-session messaging
     mailboxes: Arc<RwLock<HashMap<SessionId, Vec<MailboxMessage>>>>,
@@ -747,6 +753,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Create a new session manager (no persistence)
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -758,6 +765,7 @@ impl SessionManager {
     }
 
     /// Create a new session manager backed by Turso storage
+    #[must_use]
     pub fn with_storage(storage: Arc<nanna_storage::Storage>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1337,11 +1345,13 @@ impl SessionManager {
     }
     
     /// Get the internal sessions map (for legacy code that needs it)
+    #[must_use]
     pub fn sessions_map(&self) -> Arc<RwLock<HashMap<SessionId, Session>>> {
         self.sessions.clone()
     }
     
     /// Get the default session ID holder
+    #[must_use]
     pub fn default_session_id(&self) -> Arc<RwLock<Option<SessionId>>> {
         self.default_session.clone()
     }
@@ -1404,7 +1414,7 @@ impl SessionManager {
             .cloned()
     }
 
-    /// Resolve a sub-session target (label or ID) to a SubSessionInfo
+    /// Resolve a sub-session target (label or ID) to a `SubSessionInfo`
     pub async fn resolve_sub_session(&self, target: &str) -> Option<SubSessionInfo> {
         let subs = self.sub_sessions.read().await;
         if let Some(info) = subs.get(target) {
@@ -1484,7 +1494,7 @@ impl SessionManager {
         let to_remove: Vec<String> = subs.iter()
             .filter(|(_, info)| {
                 matches!(info.state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed)
-                    && info.finished_at.map(|t| t < cutoff).unwrap_or(false)
+                    && info.finished_at.is_some_and(|t| t < cutoff)
             })
             .map(|(id, _)| id.clone())
             .collect();

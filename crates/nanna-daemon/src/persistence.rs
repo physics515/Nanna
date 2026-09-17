@@ -27,7 +27,7 @@ pub struct PersistedSession {
 
 impl From<PersistedSession> for Session {
     fn from(persisted: PersistedSession) -> Self {
-        Session {
+        Self {
             id: persisted.id,
             name: persisted.name,
             created_at: persisted.created_at,

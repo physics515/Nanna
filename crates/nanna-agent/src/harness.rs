@@ -349,7 +349,7 @@ impl AcceptanceCheck {
     #[must_use]
     pub fn references_path(&self, touched: &str) -> bool {
         let normalized = touched.replace('\\', "/");
-        let Some(file_name) = normalized.split('/').filter(|c| !c.is_empty()).next_back() else {
+        let Some(file_name) = normalized.split('/').rfind(|c| !c.is_empty()) else {
             return false;
         };
         let mentions = |s: &str| s.replace('\\', "/").contains(file_name);
@@ -592,9 +592,7 @@ fn fingerprint_paths(paths: Vec<String>, workdir: &Path) -> Vec<EvidenceFile> {
 /// matches: relative and absolute spellings of one file must collide.
 fn final_component(path: &str) -> String {
     path.replace('\\', "/")
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .next_back()
+        .split('/').rfind(|c| !c.is_empty())
         .unwrap_or("")
         .to_string()
 }
@@ -1323,7 +1321,7 @@ pub struct LongHorizonConfig {
 impl Default for LongHorizonConfig {
     fn default() -> Self {
         Self {
-            max_wall_clock: Duration::from_secs(4 * 3600),
+            max_wall_clock: Duration::from_hours(4),
             max_total_tokens: None,
             max_steps_per_item: 5,
             max_replans_per_item: 2,
@@ -1535,12 +1533,11 @@ pub fn build_step_prompt(
     let mut prompt = stable_prefix(goal);
     prompt.push_str("== CURRENT TASK ==\n");
     prompt.push_str(&format!("Task #{}: {}\n", step.id, step.title));
-    if let Some(description) = &step.description {
-        if !description.is_empty() {
+    if let Some(description) = &step.description
+        && !description.is_empty() {
             prompt.push_str(description);
             prompt.push('\n');
         }
-    }
     match &step.acceptance {
         Some(check) => {
             prompt.push_str(&format!(
@@ -1575,20 +1572,18 @@ pub fn build_step_prompt(
             prompt.push_str(&format!("- {note}\n"));
         }
     }
-    if let Some(last) = last_result {
-        if !last.is_empty() {
+    if let Some(last) = last_result
+        && !last.is_empty() {
             prompt.push_str(&format!("\n== LAST RESULT ==\n{last}\n"));
         }
-    }
     // Beside the last result, in the same recent-attention band: what must
     // survive this step. The digest is deliberately NOT part of the stable
     // prefix — it is state, it changes as work is verified, and it belongs
     // where a small model actually looks.
-    if let Some(digest) = verified_digest {
-        if !digest.is_empty() {
+    if let Some(digest) = verified_digest
+        && !digest.is_empty() {
             prompt.push_str(&format!("\n== VERIFIED WORKING (do not regress) ==\n{digest}"));
         }
-    }
     prompt.push_str(&format!("\n{budget_line}\n"));
     prompt
 }

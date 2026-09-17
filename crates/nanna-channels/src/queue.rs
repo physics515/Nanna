@@ -15,10 +15,12 @@ use tracing::{debug, error, warn};
 
 /// Message priority levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default)]
 pub enum MessagePriority {
     /// Background messages (e.g., scheduled notifications)
     Low = 0,
     /// Normal conversation messages
+    #[default]
     Normal = 1,
     /// Time-sensitive messages (e.g., alerts)
     High = 2,
@@ -26,11 +28,6 @@ pub enum MessagePriority {
     Urgent = 3,
 }
 
-impl Default for MessagePriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 /// Queued message with metadata
 #[derive(Debug, Clone)]
@@ -92,6 +89,7 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Create a new rate limiter
+    #[must_use]
     pub fn new(max_tokens: f64, refill_rate: f64) -> Self {
         Self {
             tokens: max_tokens,
@@ -103,6 +101,7 @@ impl RateLimiter {
     }
 
     /// Create with provider-specific defaults
+    #[must_use]
     pub fn for_provider(provider: &str) -> Self {
         match provider {
             "telegram" => Self::new(30.0, 1.0),      // 30 msg/min
@@ -118,7 +117,7 @@ impl RateLimiter {
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.tokens = elapsed.mul_add(self.refill_rate, self.tokens).min(self.max_tokens);
         self.last_refill = now;
     }
 
@@ -282,6 +281,7 @@ pub enum QueueEvent {
 
 impl MessageQueue {
     /// Create a new message queue
+    #[must_use]
     pub fn new(config: QueueConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(1000);
         Self {
@@ -293,6 +293,7 @@ impl MessageQueue {
     }
 
     /// Get the event receiver
+    #[must_use]
     pub fn events(&self) -> Arc<RwLock<mpsc::Receiver<QueueEvent>>> {
         self.event_rx.clone()
     }
@@ -375,15 +376,15 @@ impl MessageQueue {
                 // Get highest priority message that's ready
                 let now = Instant::now();
                 let ready_idx = queue.messages.iter().position(|m| {
-                    m.retry_after.map_or(true, |t| now >= t)
+                    m.retry_after.is_none_or(|t| now >= t)
                 });
 
-                if let Some(_) = ready_idx {
+                if ready_idx.is_some() {
                     // Pop the top message (highest priority that's ready)
                     let mut temp = Vec::new();
                     let mut found = None;
                     while let Some(m) = queue.messages.pop() {
-                        if found.is_none() && m.retry_after.map_or(true, |t| now >= t) {
+                        if found.is_none() && m.retry_after.is_none_or(|t| now >= t) {
                             found = Some(m);
                         } else {
                             temp.push(m);
@@ -405,13 +406,12 @@ impl MessageQueue {
             // Acquire rate limit token
             {
                 let mut queues = self.queues.write().await;
-                if let Some(queue) = queues.get_mut(provider) {
-                    if !queue.rate_limiter.try_acquire() {
+                if let Some(queue) = queues.get_mut(provider)
+                    && !queue.rate_limiter.try_acquire() {
                         // Put message back
                         queue.messages.push(msg);
                         break;
                     }
-                }
             }
 
             // Send the message

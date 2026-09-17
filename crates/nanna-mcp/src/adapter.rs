@@ -30,7 +30,7 @@ pub struct McpToolResult {
 
 #[cfg(feature = "tools-integration")]
 mod tools_impl {
-    use super::*;
+    use super::{debug, warn, Transport, Arc, McpClient, McpTool, HashMap, ToolContent, RwLock, McpError};
     use async_trait::async_trait;
     use nanna_tools::{ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolResult};
     use serde_json::Value;
@@ -312,7 +312,7 @@ mod tools_impl {
             Ok(wrappers)
         }
 
-        /// Register all tools with a ToolRegistry
+        /// Register all tools with a `ToolRegistry`
         ///
         /// # Errors
         ///
@@ -494,7 +494,7 @@ pub struct McpToolAdapter<T: Transport + 'static> {
 
 impl<T: Transport + 'static> McpToolAdapter<T> {
     /// Create a new adapter for an MCP tool
-    pub fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
+    pub const fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
         Self { client, tool }
     }
 
@@ -512,7 +512,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
 
     /// Get the input schema
     #[must_use]
-    pub fn input_schema(&self) -> &serde_json::Value {
+    pub const fn input_schema(&self) -> &serde_json::Value {
         &self.tool.input_schema
     }
 
@@ -687,7 +687,7 @@ pub fn to_anthropic_format(tool: &McpTool) -> serde_json::Value {
     })
 }
 
-/// Convert an MCP tool to OpenAI tool format
+/// Convert an MCP tool to `OpenAI` tool format
 #[must_use]
 pub fn to_openai_format(tool: &McpTool) -> serde_json::Value {
     serde_json::json!({

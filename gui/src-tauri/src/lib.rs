@@ -36,8 +36,8 @@ use tracing::{error, info, warn};
 
 // Re-export moved items at the crate root so sibling modules that `use crate::*`
 // keep resolving their existing paths.
-pub(crate) use commands::settings::*;
-pub(crate) use state::*;
+pub(crate) use commands::settings::ToolInfo;
+pub(crate) use state::{AppState, ChatMessage, ToolCallInfo, SessionInfo, AppConfig, ModelStatusEvent, CloseMode};
 
 // =============================================================================
 // App Setup

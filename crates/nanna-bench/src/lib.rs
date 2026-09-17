@@ -194,7 +194,7 @@ pub fn fixture_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 			(0..dim)
 				.map(|_| {
 					#[allow(clippy::cast_precision_loss)]
-					let unit = (next() >> 40) as f32 / f32::from(1_u16 << 8 | 0x00) / 96.0;
+					let unit = (next() >> 40) as f32 / f32::from(1_u16 << 8) / 96.0;
 					unit.mul_add(2.0, -1.0)
 				})
 				.collect()

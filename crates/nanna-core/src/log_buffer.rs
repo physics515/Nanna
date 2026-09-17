@@ -96,7 +96,7 @@ impl LogBuffer {
 
     /// Add a log entry
     pub fn push(&self, entry: LogEntry) {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.push(entry);
 
         // Keep only the last N entries
@@ -111,16 +111,18 @@ impl LogBuffer {
     }
 
     /// Get all entries
+    #[must_use]
     pub fn get_all(&self) -> Vec<LogEntry> {
         self.entries
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
     /// Get last N entries
+    #[must_use]
     pub fn get_recent(&self, limit: usize) -> Vec<LogEntry> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries
             .iter()
             .rev()
@@ -136,7 +138,7 @@ impl LogBuffer {
     pub fn clear(&self) {
         self.entries
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
 }
@@ -154,7 +156,7 @@ struct MessageVisitor {
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.message = format!("{:?}", value);
+            self.message = format!("{value:?}");
         }
     }
 
@@ -165,13 +167,14 @@ impl Visit for MessageVisitor {
     }
 }
 
-/// Tracing layer that captures events into a LogBuffer
+/// Tracing layer that captures events into a `LogBuffer`
 pub struct LogBufferLayer {
     buffer: LogBuffer,
 }
 
 impl LogBufferLayer {
-    pub fn new(buffer: LogBuffer) -> Self {
+    #[must_use]
+    pub const fn new(buffer: LogBuffer) -> Self {
         Self { buffer }
     }
 }

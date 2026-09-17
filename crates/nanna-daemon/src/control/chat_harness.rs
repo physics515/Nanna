@@ -14,7 +14,7 @@
 //! 1. **Plan.** The turn's message becomes a plan. Conversation and questions
 //!    yield one task with no acceptance check, which the harness runs as
 //!    exactly one step — the same cost as the old path.
-//! 2. **Run — fire and forget.** The Send is ACKed immediately and the run is
+//! 2. **Run — fire and forget.** The Send is `ACKed` immediately and the run is
 //!    driven by a spawned task; a run can last hours, and holding the IPC
 //!    request open that long was observed to outlive the GUI client's grace
 //!    period ("Received response for unknown request"). Every step streams
@@ -113,7 +113,7 @@ const CONTINUATION_ERROR_ROUNDS: usize = 3;
 ///
 /// Genuine multi-round missions are untouched: writing a file or closing an
 /// item the run actually did resets the counter exactly as before.
-fn round_made_progress(round: &nanna_agent::harness::LongHorizonReport) -> bool {
+const fn round_made_progress(round: &nanna_agent::harness::LongHorizonReport) -> bool {
     round.side_effect_tool_calls > 0 || round.items_completed > round.items_already_satisfied
 }
 
@@ -177,7 +177,7 @@ impl MissionEnd {
     /// because it finished? These endings are always announced: the goal is
     /// not verified complete and the user is the only one who can decide what
     /// to do next.
-    fn gave_up(&self) -> bool {
+    const fn gave_up(&self) -> bool {
         matches!(
             self,
             Self::ErrorRoundsExhausted
@@ -1208,12 +1208,12 @@ impl ControlPlane {
                                             // failed for any other reason has no
                                             // orphaned effects to warn about.
                                             if let Some(msg) = stop_message(&report.stop)
-                                                && crate::tasks::is_transient_llm_error(&msg)
+                                                && crate::tasks::is_transient_llm_error(msg)
                                             {
                                                 transient_note =
                                                     Some(crate::tasks::transient_retry_note(
                                                         error_rounds,
-                                                        crate::tasks::transient_fault_kind(&msg),
+                                                        crate::tasks::transient_fault_kind(msg),
                                                     ));
                                             }
                                             if error_rounds <= CONTINUATION_ERROR_ROUNDS {

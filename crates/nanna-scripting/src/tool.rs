@@ -44,10 +44,8 @@ impl ScriptedTool {
         let path = path.into();
         let source = std::fs::read_to_string(&path)?;
         let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unnamed".to_string());
-        let is_typescript = path.extension().map_or(false, |e| e == "ts" || e == "tsx");
+            .file_stem().map_or_else(|| "unnamed".to_string(), |s| s.to_string_lossy().to_string());
+        let is_typescript = path.extension().is_some_and(|e| e == "ts" || e == "tsx");
 
         Ok(Self {
             name,
@@ -236,6 +234,7 @@ pub struct ToolManifest {
 }
 
 /// Extract manifest from tool source (looks for default export)
+#[must_use]
 pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
     // Simple regex-free extraction for common patterns
     // export default { name: "...", description: "...", ... }
@@ -317,12 +316,12 @@ pub fn extract_parameters_schema(source: &str) -> Option<Value> {
 }
 
 #[inline]
-fn is_ident_start(b: u8) -> bool {
+const fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$'
 }
 
 #[inline]
-fn is_ident_char(b: u8) -> bool {
+const fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
@@ -570,7 +569,7 @@ fn next_significant_is_colon(block: &str, i: usize) -> bool {
 /// True if the next non-whitespace, non-comment byte from `i` closes a
 /// container (`}` or `]`) — i.e. the preceding comma was trailing.
 fn next_significant_is_close(block: &str, i: usize) -> bool {
-    matches!(peek_significant(block, i), Some(b'}') | Some(b']'))
+    matches!(peek_significant(block, i), Some(b'}' | b']'))
 }
 
 /// Peek the next significant byte (skipping whitespace and comments).
@@ -643,9 +642,9 @@ fn extract_string_field(source: &str, field: &str) -> Option<String> {
     // Match: name: "value" or name: 'value'
     let patterns = [
         format!(r#"{field}: ""#),
-        format!(r#"{field}: '"#),
+        format!(r"{field}: '"),
         format!(r#"{field}:""#),
-        format!(r#"{field}:'"#),
+        format!(r"{field}:'"),
     ];
 
     for pattern in &patterns {

@@ -119,7 +119,7 @@ impl Plan {
 
     /// True when this is the degenerate single-step plan.
     #[must_use]
-    pub fn is_single_step(&self) -> bool {
+    pub const fn is_single_step(&self) -> bool {
         self.tasks.len() == 1
     }
 }

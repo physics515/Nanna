@@ -21,7 +21,7 @@ pub struct AgentMessage {
 }
 
 /// Task status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
     Pending,
     Running,
@@ -109,7 +109,7 @@ impl AgentCoordinator {
         let agents = self.agents.read().await;
         let entry = agents
             .get(agent_id)
-            .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {}", agent_id))))?;
+            .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {agent_id}"))))?;
 
         let task_id = Uuid::new_v4().to_string();
         let name: String = name.into();
@@ -171,13 +171,12 @@ impl AgentCoordinator {
 
     /// Cancel a task (if still running).
     pub async fn cancel_task(&self, task_id: &str) -> bool {
-        if let Some(task) = self.tasks.write().await.get_mut(task_id) {
-            if task.status == TaskStatus::Running || task.status == TaskStatus::Pending {
+        if let Some(task) = self.tasks.write().await.get_mut(task_id)
+            && (task.status == TaskStatus::Running || task.status == TaskStatus::Pending) {
                 task.status = TaskStatus::Cancelled;
                 task.completed_at = Some(chrono_timestamp());
                 return true;
             }
-        }
         false
     }
 
@@ -198,7 +197,7 @@ impl AgentCoordinator {
             mailbox.push(msg);
             Ok(msg_id)
         } else {
-            Err(AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {}", to))))
+            Err(AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {to}"))))
         }
     }
 
@@ -272,7 +271,7 @@ pub struct CriticalPathMetrics {
     pub sequential_ms: u64,
     /// Duration of the longest parallel branch (critical path)
     pub critical_path_ms: u64,
-    /// Parallelism efficiency (sequential / wall_clock)
+    /// Parallelism efficiency (sequential / `wall_clock`)
     pub parallelism_ratio: f32,
     /// Number of execution levels (dependency depth)
     pub execution_levels: usize,
@@ -300,12 +299,11 @@ impl CriticalPathMetrics {
             let mut max_task_id = String::new();
             
             for task_id in level {
-                if let Some(result) = results.iter().find(|r| &r.task_id == task_id) {
-                    if result.duration_ms > max_duration {
+                if let Some(result) = results.iter().find(|r| &r.task_id == task_id)
+                    && result.duration_ms > max_duration {
                         max_duration = result.duration_ms;
                         max_task_id = task_id.clone();
                     }
-                }
             }
             
             if max_duration > 0 {
@@ -391,7 +389,7 @@ impl Default for SwarmConfig {
 impl AgentCoordinator {
     /// Spawn a swarm of parallel tasks and wait for completion.
     ///
-    /// All tasks run in parallel (up to max_parallel), then results are
+    /// All tasks run in parallel (up to `max_parallel`), then results are
     /// optionally aggregated using the LLM.
     ///
     /// # Arguments
@@ -419,7 +417,7 @@ impl AgentCoordinator {
         let entry = agents
             .get(agent_id)
             .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::MissingApiKey(
-                format!("Agent not found: {}", agent_id)
+                format!("Agent not found: {agent_id}")
             )))?;
         let agent_config = entry.config.clone();
         let system_prompt = entry.system_prompt.clone();
@@ -517,12 +515,11 @@ impl AgentCoordinator {
             
             let agg_prompt = config.aggregation_prompt.unwrap_or_else(|| {
                 format!(
-                    "You are aggregating results from {} parallel research tasks.\n\n\
+                    "You are aggregating results from {successful} parallel research tasks.\n\n\
                     Synthesize these results into a coherent summary. \
                     Identify key themes, resolve contradictions, and highlight the most important findings.\n\n\
-                    {}\n\n\
-                    Synthesized summary:",
-                    successful, results_text
+                    {results_text}\n\n\
+                    Synthesized summary:"
                 )
             });
             
@@ -694,7 +691,7 @@ impl SwarmCoordinator {
         let decomposition_prompt = format!(
             r#"You are a task decomposition specialist. Break down the following task into smaller, independent subtasks that can be executed in parallel where possible.
 
-TASK: {}
+TASK: {task}
 
 Analyze this task and output a JSON response with this exact structure:
 {{
@@ -719,8 +716,7 @@ Rules:
 6. Keep subtasks focused - each should take 1-3 minutes max
 7. Aim for 2-6 subtasks for most tasks
 
-Output ONLY valid JSON, no markdown or explanation."#,
-            task
+Output ONLY valid JSON, no markdown or explanation."#
         );
 
         let llm = &self.coordinator.llm;
@@ -796,8 +792,7 @@ Output ONLY valid JSON, no markdown or explanation."#,
                 for dep_id in &subtask.dependencies {
                     if let Some(dep_result) = context.get(dep_id) {
                         prompt = format!(
-                            "{}\n\n--- Context from previous task ({}) ---\n{}",
-                            prompt, dep_id, dep_result
+                            "{prompt}\n\n--- Context from previous task ({dep_id}) ---\n{dep_result}"
                         );
                     }
                 }
@@ -806,7 +801,7 @@ Output ONLY valid JSON, no markdown or explanation."#,
             }).collect();
 
             // Determine which agent to use (use first subtask's domain)
-            let domain = subtasks.first().map(|s| s.domain.as_str()).unwrap_or("general");
+            let domain = subtasks.first().map_or("general", |s| s.domain.as_str());
             
             // Ensure agent is registered
             self.ensure_agent_registered(domain).await;
@@ -845,7 +840,7 @@ Output ONLY valid JSON, no markdown or explanation."#,
                 .join("\n\n");
 
             let agg_prompt = format!(
-                r#"You completed a complex task by breaking it into subtasks. Here are the results:
+                r"You completed a complex task by breaking it into subtasks. Here are the results:
 
 ORIGINAL TASK: {}
 
@@ -855,7 +850,7 @@ SUBTASK RESULTS:
 {}
 
 Synthesize these results into a coherent final response that addresses the original task.
-Be comprehensive but concise. Highlight key findings and conclusions."#,
+Be comprehensive but concise. Highlight key findings and conclusions.",
                 decomposed.original_task,
                 decomposed.execution_plan,
                 results_text

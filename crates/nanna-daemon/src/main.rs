@@ -237,12 +237,12 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
     
     // Create tokio runtime
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        .map_err(|e| format!("Failed to create runtime: {e}"))?;
     
     runtime.block_on(async {
         // Load config from Nanna config file (includes API keys)
         let mut builder = DaemonBuilder::from_nanna_config()
-            .map_err(|e| format!("Failed to load config: {}", e))?
+            .map_err(|e| format!("Failed to load config: {e}"))?
             .with_port(cli.port)
             .with_host(&cli.host)
             .with_log_level(&cli.log_level)
@@ -314,33 +314,27 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
 
 fn start_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    match manager.status() {
-        ServiceStatus::Running => {
-            println!("Daemon is already running");
-            Ok(())
-        }
-        _ => {
-            println!("Starting daemon...");
-            manager.start()?;
-            println!("Daemon started");
-            Ok(())
-        }
+    if manager.status() == ServiceStatus::Running {
+        println!("Daemon is already running");
+        Ok(())
+    } else {
+        println!("Starting daemon...");
+        manager.start()?;
+        println!("Daemon started");
+        Ok(())
     }
 }
 
 fn stop_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    match manager.status() {
-        ServiceStatus::Stopped => {
-            println!("Daemon is not running");
-            Ok(())
-        }
-        _ => {
-            println!("Stopping daemon...");
-            manager.stop()?;
-            println!("Daemon stopped");
-            Ok(())
-        }
+    if manager.status() == ServiceStatus::Stopped {
+        println!("Daemon is not running");
+        Ok(())
+    } else {
+        println!("Stopping daemon...");
+        manager.stop()?;
+        println!("Daemon stopped");
+        Ok(())
     }
 }
 
@@ -376,7 +370,7 @@ fn show_status(cli: &Cli) -> Result<(), String> {
     // Try to connect to health endpoint
     if status == ServiceStatus::Running || status == ServiceStatus::Unknown {
         let health_url = format!("http://{}:{}/health", cli.host, cli.health_port);
-        println!("\nChecking health endpoint: {}", health_url);
+        println!("\nChecking health endpoint: {health_url}");
         
         // Try to fetch health endpoint
         match std::process::Command::new("curl")
@@ -388,14 +382,14 @@ fn show_status(cli: &Cli) -> Result<(), String> {
                 if body.contains("ok") {
                     println!("Health: OK ✓");
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(uptime) = json.get("uptime_secs").and_then(|v| v.as_u64()) {
+                        if let Some(uptime) = json.get("uptime_secs").and_then(serde_json::Value::as_u64) {
                             let hours = uptime / 3600;
                             let mins = (uptime % 3600) / 60;
                             let secs = uptime % 60;
-                            println!("Uptime: {}h {}m {}s", hours, mins, secs);
+                            println!("Uptime: {hours}h {mins}m {secs}s");
                         }
                         if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
-                            println!("Version: {}", version);
+                            println!("Version: {version}");
                         }
                     }
                 } else {

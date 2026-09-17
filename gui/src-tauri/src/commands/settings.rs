@@ -214,8 +214,8 @@ pub async fn get_extended_settings(
                         Some(ToolInfo {
                             name: t.get("name")?.as_str()?.to_string(),
                             description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-                            is_user_tool: t.get("is_user_tool").and_then(|v| v.as_bool()).unwrap_or(false),
+                            enabled: t.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                            is_user_tool: t.get("is_user_tool").and_then(serde_json::Value::as_bool).unwrap_or(false),
                         })
                     })
                     .collect()
@@ -411,7 +411,7 @@ pub async fn set_provider_api_key(
                 std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
             }
         }
-        _ => return Err(format!("Unknown provider: {}", provider)),
+        _ => return Err(format!("Unknown provider: {provider}")),
     }
 
     // Durable storage is the OS keyring; config.toml never receives secrets.
@@ -441,7 +441,7 @@ pub async fn set_provider_api_key(
 
 /// Durably persist an OAuth login, then update live state and nudge the daemon.
 ///
-/// The SecureStore is written FIRST and a failure aborts the login: the config
+/// The `SecureStore` is written FIRST and a failure aborts the login: the config
 /// cache is session-only (`strip_secrets_for_disk` blanks the token in
 /// config.toml on every save), so a login that never reaches the store is
 /// exactly the restart-logout bug this path exists to prevent.
@@ -537,7 +537,7 @@ pub async fn run_claude_setup_token(
     persist_oauth_login(state.inner(), &credential).await?;
 
     info!("Successfully authenticated via claude setup-token (subscription: {})", subscription);
-    Ok(format!("Successfully authenticated! Subscription: {}", subscription))
+    Ok(format!("Successfully authenticated! Subscription: {subscription}"))
 }
 
 /// Import credentials from Claude Code CLI (~/.claude/.credentials.json)
@@ -552,14 +552,14 @@ pub async fn import_claude_code_credentials(
 
     // Load credentials (checks file and keychain)
     let loaded = manager.load()
-        .map_err(|e| format!("No credentials found: {}. Please run `claude login` first.", e))?;
+        .map_err(|e| format!("No credentials found: {e}. Please run `claude login` first."))?;
 
     // Check if token is expired
     if loaded.credential.is_expired() {
         if loaded.credential.can_refresh() {
             info!("Token expired, attempting auto-refresh...");
             let refreshed = manager.refresh_token(&loaded.credential).await
-                .map_err(|e| format!("Token expired and refresh failed: {}. Please run `claude login`.", e))?;
+                .map_err(|e| format!("Token expired and refresh failed: {e}. Please run `claude login`."))?;
 
             // Save refreshed token back to source
             if let Err(e) = manager.save(&refreshed, loaded.source) {
@@ -570,9 +570,8 @@ pub async fn import_claude_code_credentials(
 
             info!("Token refreshed and imported (subscription: {:?})", refreshed.subscription_type);
             return Ok(());
-        } else {
-            return Err("Token expired and cannot auto-refresh. Please run `claude login`.".to_string());
         }
+        return Err("Token expired and cannot auto-refresh. Please run `claude login`.".to_string());
     }
 
     info!(
@@ -723,14 +722,14 @@ pub async fn refresh_oauth_token(
 
     let manager = ClaudeCredentialManager::new();
     let loaded = manager.load()
-        .map_err(|e| format!("No credentials found: {}", e))?;
+        .map_err(|e| format!("No credentials found: {e}"))?;
 
     if !loaded.credential.can_refresh() {
         return Err("Cannot refresh: no refresh token available".to_string());
     }
 
     let refreshed = manager.refresh_token(&loaded.credential).await
-        .map_err(|e| format!("Token refresh failed: {}", e))?;
+        .map_err(|e| format!("Token refresh failed: {e}"))?;
 
     // Save back to source
     if let Err(e) = manager.save(&refreshed, loaded.source) {
@@ -753,10 +752,10 @@ pub async fn refresh_oauth_token(
     }
     let _ = state_guard.backend.config_reload().await;
 
-    let hours = refreshed.seconds_until_expiry().map(|s| s / 3600).unwrap_or(0);
+    let hours = refreshed.seconds_until_expiry().map_or(0, |s| s / 3600);
     info!("OAuth token refreshed, expires in {}h", hours);
 
-    Ok(format!("Token refreshed! Expires in {}h", hours))
+    Ok(format!("Token refreshed! Expires in {hours}h"))
 }
 
 /// Set the active LLM provider
@@ -792,7 +791,7 @@ pub async fn set_provider(
             }
         }
         "claude-proxy" | "ollama" => {}
-        _ => return Err(format!("Unknown provider: {}", provider)),
+        _ => return Err(format!("Unknown provider: {provider}")),
     }
 
     state_guard.config.llm.provider = provider.clone();
@@ -816,7 +815,7 @@ pub async fn set_embedding_config(
 
     // Validate provider
     if !["openai", "ollama", "disabled"].contains(&provider.as_str()) {
-        return Err(format!("Unknown embedding provider: {}", provider));
+        return Err(format!("Unknown embedding provider: {provider}"));
     }
 
     let model = if provider == "disabled" { "none".to_string() } else { model };
@@ -825,7 +824,7 @@ pub async fn set_embedding_config(
     if provider == "openai" {
         let valid_openai = ["text-embedding-3-small", "text-embedding-3-large"];
         if !valid_openai.contains(&model.as_str()) {
-            return Err(format!("Unknown OpenAI embedding model: {}", model));
+            return Err(format!("Unknown OpenAI embedding model: {model}"));
         }
     }
 
@@ -872,7 +871,7 @@ pub async fn set_ollama_host(
             info!("Ollama host saved to config: {}", host);
         }
         Err(e) => {
-            let err_msg = format!("Failed to save config: {}", e);
+            let err_msg = format!("Failed to save config: {e}");
             error!("{}", err_msg);
             return Err(err_msg);
         }
@@ -882,7 +881,7 @@ pub async fn set_ollama_host(
     // Also set env var for current session
     unsafe { std::env::set_var("OLLAMA_HOST", &host); }
 
-    Ok(format!("Ollama host saved: {}", host))
+    Ok(format!("Ollama host saved: {host}"))
 }
 
 /// Set Ollama API key (for remote/authenticated instances)
@@ -914,7 +913,7 @@ pub async fn set_ollama_api_key(
             info!("Ollama API key saved to OS keychain");
         }
         Err(e) => {
-            let err_msg = format!("Failed to save config: {}", e);
+            let err_msg = format!("Failed to save config: {e}");
             error!("{}", err_msg);
             return Err(err_msg);
         }
@@ -937,10 +936,10 @@ pub async fn get_ollama_models(
         .map_err(|e| e.to_string())?;
 
     let response = client
-        .get(format!("{}/api/tags", ollama_host))
+        .get(format!("{ollama_host}/api/tags"))
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to Ollama at {}: {}", ollama_host, e))?;
+        .map_err(|e| format!("Failed to connect to Ollama at {ollama_host}: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("Ollama returned error: {}", response.status()));
@@ -958,7 +957,7 @@ pub async fn get_ollama_models(
     }
 
     let tags: OllamaTagsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+        .map_err(|e| format!("Failed to parse Ollama response: {e}"))?;
 
     // Convert to our info struct, marking known embedding models
     // Comprehensive list of known embedding model name patterns
@@ -1026,7 +1025,7 @@ pub async fn get_anthropic_models(
     let (auth_header, auth_value) = if state_guard.config.llm.anthropic_use_oauth {
         let token = state_guard.config.llm.anthropic_oauth_token.clone()
             .ok_or("OAuth enabled but no token available")?;
-        ("Authorization".to_string(), format!("Bearer {}", token))
+        ("Authorization".to_string(), format!("Bearer {token}"))
     } else {
         let api_key = state_guard.config.llm.api_key.clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
@@ -1054,12 +1053,12 @@ pub async fn get_anthropic_models(
     let response = request
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch Anthropic models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch Anthropic models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {}: {}", status, body));
+        return Err(format!("Anthropic API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1074,7 +1073,7 @@ pub async fn get_anthropic_models(
     }
 
     let models: AnthropicModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+        .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
 
     Ok(models.data.into_iter().map(|m| ModelInfo {
         id: m.id.clone(),
@@ -1082,7 +1081,7 @@ pub async fn get_anthropic_models(
     }).collect())
 }
 
-/// Fetch available models from OpenAI
+/// Fetch available models from `OpenAI`
 #[tauri::command]
 pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     let api_key = std::env::var("OPENAI_API_KEY")
@@ -1095,15 +1094,15 @@ pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
 
     let response = client
         .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch OpenAI models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch OpenAI models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {}: {}", status, body));
+        return Err(format!("OpenAI API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1117,7 +1116,7 @@ pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     }
 
     let models: OpenAIModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenAI response: {e}"))?;
 
     // Filter to chat models (gpt-*, o1-*, chatgpt-*)
     let chat_prefixes = ["gpt-4", "gpt-3.5", "o1", "o3", "chatgpt"];
@@ -1140,7 +1139,7 @@ pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     Ok(result)
 }
 
-/// Fetch available models from OpenRouter
+/// Fetch available models from `OpenRouter`
 #[tauri::command]
 pub async fn get_openrouter_models(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1158,15 +1157,15 @@ pub async fn get_openrouter_models(
 
     let response = client
         .get("https://openrouter.ai/api/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch OpenRouter models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch OpenRouter models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenRouter API error {}: {}", status, body));
+        return Err(format!("OpenRouter API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1181,7 +1180,7 @@ pub async fn get_openrouter_models(
     }
 
     let models: OpenRouterModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenRouter response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenRouter response: {e}"))?;
 
     // Priority prefixes for sorting (these appear first)
     let priority_prefixes = [
@@ -1217,7 +1216,7 @@ pub async fn get_openrouter_models(
     Ok(result)
 }
 
-/// Fetch available embedding models from OpenRouter's dedicated embeddings endpoint
+/// Fetch available embedding models from `OpenRouter`'s dedicated embeddings endpoint
 #[tauri::command]
 pub async fn get_openrouter_embedding_models(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1235,15 +1234,15 @@ pub async fn get_openrouter_embedding_models(
 
     let response = client
         .get("https://openrouter.ai/api/v1/embeddings/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch OpenRouter embedding models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch OpenRouter embedding models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenRouter embeddings API error {}: {}", status, body));
+        return Err(format!("OpenRouter embeddings API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1258,7 +1257,7 @@ pub async fn get_openrouter_embedding_models(
     }
 
     let models: OpenRouterModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenRouter embeddings response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenRouter embeddings response: {e}"))?;
 
     let result: Vec<ModelInfo> = models.data.into_iter()
         .map(|m| ModelInfo {
@@ -1288,15 +1287,15 @@ pub async fn get_github_models(
     // GitHub Models catalog endpoint
     let response = client
         .get("https://models.inference.ai.azure.com/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch GitHub models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch GitHub models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub Models API error {}: {}", status, body));
+        return Err(format!("GitHub Models API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1315,7 +1314,7 @@ pub async fn get_github_models(
     }
 
     let text = response.text().await
-        .map_err(|e| format!("Failed to read GitHub response: {}", e))?;
+        .map_err(|e| format!("Failed to read GitHub response: {e}"))?;
 
     // Try to parse as JSON array or object with data/models field
     let models: Vec<GitHubModel> = if let Ok(arr) = serde_json::from_str::<Vec<GitHubModel>>(&text) {
@@ -1323,7 +1322,7 @@ pub async fn get_github_models(
     } else if let Ok(resp) = serde_json::from_str::<GitHubModelsResponse>(&text) {
         resp.data.unwrap_or(resp.models)
     } else {
-        return Err(format!("Failed to parse GitHub response: {}", text));
+        return Err(format!("Failed to parse GitHub response: {text}"));
     };
 
     // Filter and map models
@@ -1356,13 +1355,13 @@ pub async fn get_claude_proxy_models(
         let token = state_guard.config.llm.anthropic_oauth_token.clone().unwrap();
         client
             .get("https://api.anthropic.com/v1/models")
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             .header("user-agent", "claude-code/2.1.2")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
     } else if let Some(ref api_key) = state_guard.config.llm.api_key {
         client
             .get("https://api.anthropic.com/v1/models")
@@ -1370,7 +1369,7 @@ pub async fn get_claude_proxy_models(
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
     } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         client
             .get("https://api.anthropic.com/v1/models")
@@ -1378,7 +1377,7 @@ pub async fn get_claude_proxy_models(
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
     } else {
         // No Anthropic credentials - return default Claude models that the proxy supports
         return Ok(vec![
@@ -1392,7 +1391,7 @@ pub async fn get_claude_proxy_models(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {}: {}", status, body));
+        return Err(format!("Anthropic API error {status}: {body}"));
     }
 
     #[derive(Deserialize)]
@@ -1407,7 +1406,7 @@ pub async fn get_claude_proxy_models(
     }
 
     let models: AnthropicModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+        .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
 
     // Filter to chat models only (exclude embedding models, etc.)
     let result: Vec<ModelInfo> = models.data.into_iter()
@@ -1448,7 +1447,7 @@ pub async fn check_claude_proxy_health() -> Result<bool, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get(format!("{}/health", proxy_url)).send().await {
+    match client.get(format!("{proxy_url}/health")).send().await {
         Ok(resp) => Ok(resp.status().is_success()),
         Err(_) => Ok(false),
     }
@@ -1484,7 +1483,7 @@ pub async fn set_system_prompt(
 
     // Save to disk
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("System prompt {}", if prompt.is_some() { "updated" } else { "reset to default" });
     Ok(())
@@ -1499,7 +1498,7 @@ pub async fn set_agent_name(
     let mut state_guard = state.write().await;
     state_guard.config.agent.name = name.clone();
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
     info!("Agent name set to: {}", name);
     Ok(())
 }
@@ -1513,7 +1512,7 @@ pub async fn set_personality_mode(
     let mut state_guard = state.write().await;
     state_guard.config.agent.personality_mode = mode.clone();
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
     info!("Personality mode set to: {}", mode);
     Ok(())
 }
@@ -1533,7 +1532,7 @@ pub async fn set_streaming_enabled(
     let mut state_guard = state.write().await;
     state_guard.config.agent.streaming_enabled = enabled;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
     info!("Streaming: {}", if enabled { "enabled" } else { "disabled" });
     Ok(())
 }
@@ -1547,7 +1546,7 @@ pub async fn set_max_tokens(
     let mut state_guard = state.write().await;
     state_guard.config.llm.max_tokens = tokens;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
     info!("Max tokens set to: {}", tokens);
     Ok(())
 }
@@ -1576,7 +1575,7 @@ pub async fn set_agent_iteration_policy(
     state_guard.config.agent.nudge_after_iterations = nudge_after;
     state_guard.config.agent.nudge_interval_iterations = nudge_interval;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
     info!(
         "Agent iteration policy set: max={:?}, nudge_after={}, nudge_interval={}",
         max_iterations, nudge_after, nudge_interval
@@ -1591,7 +1590,7 @@ pub async fn export_config(
 ) -> Result<String, String> {
     let state_guard = state.read().await;
     toml::to_string_pretty(&state_guard.config)
-        .map_err(|e| format!("Failed to serialize config: {}", e))
+        .map_err(|e| format!("Failed to serialize config: {e}"))
 }
 
 /// Import config from TOML string
@@ -1601,12 +1600,12 @@ pub async fn import_config(
     config: String,
 ) -> Result<(), String> {
     let new_config: nanna_config::Config = toml::from_str(&config)
-        .map_err(|e| format!("Failed to parse config: {}", e))?;
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
 
     let mut state_guard = state.write().await;
     state_guard.config = new_config;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Config imported from TOML");
     Ok(())
@@ -1648,7 +1647,7 @@ pub async fn set_chat_model_priority(
     }
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon so changes take effect without restart
     let _ = state_guard.backend.config_set(
@@ -1696,7 +1695,7 @@ pub async fn set_embedding_model_priority(
     }
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Embedding model priority set: {:?}", priority);
     Ok(())
@@ -1721,7 +1720,7 @@ pub async fn set_summarization_model_priority(
     state_guard.config.llm.summarization_priority = priority.clone();
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Summarization model priority set: {:?}", priority);
     Ok(())
@@ -1750,7 +1749,7 @@ pub async fn set_ocr_model_priority(
     state_guard.config.memory.ocr_model_priority = priority.clone();
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("OCR model priority set: {:?}", priority);
     Ok(())
@@ -1775,7 +1774,7 @@ pub async fn set_use_embedded_ocr(
     state_guard.config.memory.use_embedded_ocr = enabled;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Embedded OCR (ocrs) set to: {}", enabled);
     Ok(())
@@ -1805,7 +1804,7 @@ pub async fn set_model_routing(
     state_guard.config.llm.model_routing = routes.clone();
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
@@ -1817,7 +1816,7 @@ pub async fn set_model_routing(
     Ok(())
 }
 
-/// Get routing_first_turn_primary setting
+/// Get `routing_first_turn_primary` setting
 #[tauri::command]
 pub async fn get_routing_first_turn_primary(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1826,7 +1825,7 @@ pub async fn get_routing_first_turn_primary(
     Ok(state_guard.config.llm.routing_first_turn_primary)
 }
 
-/// Set routing_first_turn_primary setting
+/// Set `routing_first_turn_primary` setting
 #[tauri::command]
 pub async fn set_routing_first_turn_primary(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1836,7 +1835,7 @@ pub async fn set_routing_first_turn_primary(
     state_guard.config.llm.routing_first_turn_primary = enabled;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
@@ -1856,13 +1855,11 @@ pub async fn get_sub_agent_models(
 ) -> Result<Vec<String>, String> {
     let state_guard = state.read().await;
     let llm = &state_guard.config.llm;
-    if llm.sub_agent_models.is_empty() {
-        if let Some(ref legacy) = llm.sub_agent_model {
-            if !legacy.is_empty() {
+    if llm.sub_agent_models.is_empty()
+        && let Some(ref legacy) = llm.sub_agent_model
+            && !legacy.is_empty() {
                 return Ok(vec![legacy.clone()]);
             }
-        }
-    }
     Ok(llm.sub_agent_models.clone())
 }
 
@@ -1880,7 +1877,7 @@ pub async fn set_sub_agent_models(
     state_guard.config.llm.sub_agent_model = None;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
@@ -1907,7 +1904,7 @@ pub async fn save_config(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Config saved to disk");
     Ok(())

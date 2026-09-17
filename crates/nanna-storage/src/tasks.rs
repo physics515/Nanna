@@ -1219,7 +1219,7 @@ fn validate_priority(priority: i64) -> Result<(), StorageError> {
 /// Every canonical acceptance shape, quoted verbatim in every parse error.
 ///
 /// serde names the Rust type it wanted ("expected internally tagged enum
-/// AcceptanceCheck") and never the shape, so a model has nothing to copy: the
+/// `AcceptanceCheck`") and never the shape, so a model has nothing to copy: the
 /// daemon logs hold 121 identical malformed acceptance calls. An error that
 /// carries the target shapes is the only version of this message that can end
 /// the loop on the next attempt.
@@ -1290,8 +1290,7 @@ fn normalize_integral_timeout(value: &mut serde_json::Value) {
         && !timeout.is_u64()
         && let Some(f) = timeout.as_f64()
         && f.fract() == 0.0
-        && f >= 0.0
-        && f < MAX_EXACT_F64_INT
+        && (0.0..MAX_EXACT_F64_INT).contains(&f)
     {
         *timeout = serde_json::Value::from(f as u64);
     }
@@ -1438,13 +1437,12 @@ fn validate_acceptance(value: &serde_json::Value) -> Result<(), StorageError> {
     // timeout_secs must be an unsigned integer when present — the harness
     // deserializes it strictly, and a shape that validates here but fails to
     // parse there would wedge every run in the scope.
-    if let Some(timeout) = value.get("timeout_secs") {
-        if !timeout.is_u64() {
+    if let Some(timeout) = value.get("timeout_secs")
+        && !timeout.is_u64() {
             return Err(StorageError::Invalid(
                 "acceptance 'timeout_secs' must be an unsigned integer (seconds)".to_string(),
             ));
         }
-    }
     match kind {
         "command" => require_str("command"),
         "file_exists" => require_str("path"),
@@ -1785,7 +1783,7 @@ fn split_sentences(text: &str) -> Vec<&str> {
         let next = bytes.get(i + c.len_utf8());
         let ends_here = c == '\n'
             || next.is_none()
-            || next.is_some_and(|b| b.is_ascii_whitespace());
+            || next.is_some_and(u8::is_ascii_whitespace);
         if !ends_here {
             continue;
         }
@@ -2866,7 +2864,7 @@ mod tests {
         // costs a stat, but a false PROHIBITION would block real work.
         let noisy =
             serde_json::json!({"kind": "command", "command": "cargo test --all -p nanna"});
-        assert!(acceptance_referenced_paths(&noisy).is_empty());
+        assert_eq!(acceptance_referenced_paths(&noisy), [] as [std::string::String; 0]);
     }
 
     /// The instrument/subject split. A `file_exists` (or path-`regex`) check
@@ -2877,10 +2875,10 @@ mod tests {
     #[test]
     fn only_a_command_check_has_evidence_inputs() {
         let file = serde_json::json!({"kind": "file_exists", "path": "artifact.txt"});
-        assert!(acceptance_evidence_paths(&file).is_empty());
+        assert_eq!(acceptance_evidence_paths(&file), [] as [std::string::String; 0]);
         let path_regex =
             serde_json::json!({"kind": "regex", "pattern": "PASS", "path": "report.txt"});
-        assert!(acceptance_evidence_paths(&path_regex).is_empty());
+        assert_eq!(acceptance_evidence_paths(&path_regex), [] as [std::string::String; 0]);
         assert_eq!(
             acceptance_referenced_paths(&path_regex),
             vec!["report.txt".to_string()],

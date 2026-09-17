@@ -61,7 +61,7 @@ impl Tool for BrowserScreenshotTool {
 
         let screenshot = screenshot_fn(url.to_string(), params.clone())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Screenshot failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Screenshot failed: {e}")))?;
 
         let base64 = base64_simd::STANDARD.encode_to_string(&screenshot);
 
@@ -122,7 +122,7 @@ impl Tool for BrowserExtractTool {
 
         let content = extract_fn(url.to_string(), params.clone())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Extraction failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Extraction failed: {e}")))?;
 
         Ok(ToolResult::success(content))
     }
@@ -183,7 +183,7 @@ impl Tool for BrowserActionTool {
 
         let result = action_fn(url.to_string(), params.clone())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Action failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Action failed: {e}")))?;
 
         Ok(ToolResult::success(result))
     }
@@ -241,7 +241,7 @@ impl Tool for BrowserEvaluateTool {
 
         let result = evaluate_fn(url.to_string(), params.clone())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Evaluate failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Evaluate failed: {e}")))?;
 
         Ok(ToolResult::success(result.to_string()).with_data(result))
     }

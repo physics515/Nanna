@@ -1,4 +1,4 @@
-//! Embedded Python interpreter powered by RustPython.
+//! Embedded Python interpreter powered by `RustPython`.
 //!
 //! Provides a zero-dependency Python execution environment for AI tool use.
 //! No system Python installation required — the interpreter is compiled into the binary.
@@ -231,10 +231,10 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
             }) {
             Ok(_) => {
                 // Extract results from the _nanna_result dict in scope
-                let extract = r#"
+                let extract = r"
 import json as _nj
 _nanna_json = _nj.dumps(_nanna_result)
-"#;
+";
                 if let Ok(code_obj) = vm.compile(extract, Mode::Exec, "<nanna-extract>".to_owned())
                 {
                     let _ = vm.run_code_obj(code_obj, scope.clone());
@@ -242,9 +242,9 @@ _nanna_json = _nj.dumps(_nanna_result)
 
                 // Get the JSON result by running a minimal expression
                 let json_code = "_nanna_json";
-                if let Ok(code_obj) = vm.compile(json_code, Mode::Eval, "<nanna-eval>".to_owned()) {
-                    if let Ok(val) = vm.run_code_obj(code_obj, scope) {
-                        if let Ok(s) = val.str(vm) {
+                if let Ok(code_obj) = vm.compile(json_code, Mode::Eval, "<nanna-eval>".to_owned())
+                    && let Ok(val) = vm.run_code_obj(code_obj, scope)
+                        && let Ok(s) = val.str(vm) {
                             // rustpython 0.5: PyStr::as_str was replaced by
                             // to_string_lossy (strings may be non-UTF-8 kinds).
                             if let Ok(parsed) =
@@ -263,7 +263,7 @@ _nanna_json = _nj.dumps(_nanna_result)
                                         .to_string(),
                                     success: parsed
                                         .get("success")
-                                        .and_then(|v| v.as_bool())
+                                        .and_then(serde_json::Value::as_bool)
                                         .unwrap_or(false),
                                     error: parsed
                                         .get("error")
@@ -273,8 +273,6 @@ _nanna_json = _nj.dumps(_nanna_result)
                                 };
                             }
                         }
-                    }
-                }
 
                 // Fallback if extraction failed
                 PythonResult {

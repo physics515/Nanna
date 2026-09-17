@@ -165,7 +165,7 @@ pub struct Task {
     pub parent_id: Option<i64>,
     /// `session` | `workspace` | `global`
     pub scope: String,
-    /// session_id or workspace_id depending on scope (None for global)
+    /// `session_id` or `workspace_id` depending on scope (None for global)
     pub scope_id: Option<String>,
     pub project: Option<String>,
     pub title: String,

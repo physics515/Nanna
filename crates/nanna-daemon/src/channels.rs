@@ -59,7 +59,7 @@ pub struct ChannelManager {
     router: Arc<RwLock<MessageRouter>>,
     /// Control plane reference for processing messages
     control: Arc<ControlPlane>,
-    /// Shared status manager reported via ChannelAction::Status
+    /// Shared status manager reported via `ChannelAction::Status`
     status_manager: Arc<StatusManager>,
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -67,12 +67,14 @@ pub struct ChannelManager {
 
 impl ChannelManager {
     /// Create a new channel manager that owns a fresh status manager.
+    #[must_use]
     pub fn new(control: Arc<ControlPlane>) -> Self {
         Self::with_status_manager(control, Arc::new(StatusManager::new()))
     }
 
     /// Create a channel manager that reports status through the given manager
     /// (typically the one attached to the control plane).
+    #[must_use]
     pub fn with_status_manager(control: Arc<ControlPlane>, status_manager: Arc<StatusManager>) -> Self {
         Self {
             listener_manager: RwLock::new(ListenerManager::new(1000)),
@@ -228,12 +230,9 @@ impl ChannelManager {
     /// This is `pub` so the webhook event processor in `server.rs` can call it
     /// directly after converting a `WebhookEvent` into an `IncomingMessage`.
     pub async fn process_message(msg: IncomingMessage, control: &Arc<ControlPlane>, router: &MessageRouter) {
-        let text = match &msg.content {
-            MessageContent::Text { text } => text.clone(),
-            _ => {
-                debug!("Ignoring non-text message from {}", msg.channel.provider);
-                return;
-            }
+        let text = if let MessageContent::Text { text } = &msg.content { text.clone() } else {
+            debug!("Ignoring non-text message from {}", msg.channel.provider);
+            return;
         };
 
         // Generate deterministic session ID from channel + sender
@@ -303,7 +302,7 @@ impl ChannelManager {
     /// List running listeners
     pub async fn list_listeners(&self) -> Vec<String> {
         let lm = self.listener_manager.read().await;
-        lm.list().iter().map(|s| s.to_string()).collect()
+        lm.list().iter().map(std::string::ToString::to_string).collect()
     }
 
     /// Send a message through a channel

@@ -40,7 +40,7 @@ pub async fn send_notification(
         .title(&title)
         .body(&body)
         .show()
-        .map_err(|e| format!("Failed to send notification: {}", e))?;
+        .map_err(|e| format!("Failed to send notification: {e}"))?;
 
     info!("Sent notification: {} - {}", title, body);
     Ok(())
@@ -53,7 +53,7 @@ pub async fn request_notification_permission(app: AppHandle) -> Result<bool, Str
 
     let permission = app.notification()
         .request_permission()
-        .map_err(|e| format!("Failed to request permission: {}", e))?;
+        .map_err(|e| format!("Failed to request permission: {e}"))?;
 
     Ok(matches!(permission, tauri_plugin_notification::PermissionState::Granted))
 }
@@ -65,7 +65,7 @@ pub async fn check_notification_permission(app: AppHandle) -> Result<String, Str
 
     let permission = app.notification()
         .permission_state()
-        .map_err(|e| format!("Failed to check permission: {}", e))?;
+        .map_err(|e| format!("Failed to check permission: {e}"))?;
 
     Ok(match permission {
         tauri_plugin_notification::PermissionState::Granted => "granted",
@@ -164,7 +164,7 @@ pub async fn get_tool_stats(
             result.as_ref().ok()
                 .and_then(|v| v.get("tools"))
                 .and_then(|v| v.as_array())
-                .map_or(0, |a| a.len()));
+                .map_or(0, std::vec::Vec::len));
         return result;
     }
 
@@ -193,7 +193,7 @@ pub async fn get_global_stats(
         info!("📊 get_global_stats: daemon responded, total_calls={}",
             result.as_ref().ok()
                 .and_then(|v| v.get("total_calls"))
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0));
         return result;
     }
@@ -440,7 +440,7 @@ pub async fn set_close_mode(
         "ask" => CloseMode::Ask,
         "minimize_to_tray" => CloseMode::MinimizeToTray,
         "quit_completely" => CloseMode::QuitCompletely,
-        _ => return Err(format!("Unknown close mode: {}", mode)),
+        _ => return Err(format!("Unknown close mode: {mode}")),
     };
 
     let state = state.read().await;
@@ -592,7 +592,7 @@ mod tests {
         );
         assert_eq!(messages(&merged), ["only"]);
 
-        assert!(merge_log_entries(Vec::new(), 50).is_empty());
+        assert_eq!(merge_log_entries(Vec::new(), 50), [] as [serde_json::Value; 0]);
     }
 
     /// A zero limit must not panic on the slice arithmetic.
@@ -602,6 +602,6 @@ mod tests {
             vec![entry("2024-01-01 12:00:01.000", LogSource::Daemon, "x")],
             0,
         );
-        assert!(merged.is_empty());
+        assert_eq!(merged, [] as [serde_json::Value; 0]);
     }
 }

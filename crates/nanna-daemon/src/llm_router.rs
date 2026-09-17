@@ -26,40 +26,43 @@ pub enum ProviderId {
 impl ProviderId {
     /// Stable lowercase name, matching the provider ids the GUI uses
     /// (`anthropic`, `openai`, `openrouter`, `github`, `ollama`).
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            ProviderId::Anthropic => "anthropic",
-            ProviderId::OpenAI => "openai",
-            ProviderId::OpenRouter => "openrouter",
-            ProviderId::GitHubModels => "github",
-            ProviderId::Ollama => "ollama",
+            Self::Anthropic => "anthropic",
+            Self::OpenAI => "openai",
+            Self::OpenRouter => "openrouter",
+            Self::GitHubModels => "github",
+            Self::Ollama => "ollama",
         }
     }
 
     /// Parse provider from model string prefix
+    #[must_use]
     pub fn from_model(model: &str) -> Self {
         let lower = model.to_lowercase();
 
         if lower.starts_with("openrouter/") {
-            ProviderId::OpenRouter
+            Self::OpenRouter
         } else if lower.starts_with("github/") {
-            ProviderId::GitHubModels
+            Self::GitHubModels
         } else if lower.starts_with("ollama/") {
-            ProviderId::Ollama
+            Self::Ollama
         } else if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
-            ProviderId::OpenAI
+            Self::OpenAI
         } else if lower.starts_with("claude") {
-            ProviderId::Anthropic
+            Self::Anthropic
         } else if lower.contains(':') {
             // Tag notation (e.g., "deepseek-r1:14b", "llama3.2:latest") = local Ollama model
-            ProviderId::Ollama
+            Self::Ollama
         } else {
             // Default to Anthropic for unknown models
-            ProviderId::Anthropic
+            Self::Anthropic
         }
     }
 
     /// Strip provider prefix from model name (e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b")
+    #[must_use]
     pub fn strip_prefix(model: &str) -> &str {
         if let Some(rest) = model.strip_prefix("openrouter/") {
             rest
@@ -92,15 +95,15 @@ pub enum ModelHealth {
 
 impl ModelHealth {
     /// Whether this model should be used for new requests
+    #[must_use]
     pub fn is_usable(&self) -> bool {
         match self {
-            ModelHealth::Healthy | ModelHealth::Degraded(_) => true,
-            ModelHealth::Unhealthy(_) => false,
-            ModelHealth::Cooldown { retry_after_ms, .. } => {
+            Self::Healthy | Self::Degraded(_) => true,
+            Self::Unhealthy(_) => false,
+            Self::Cooldown { retry_after_ms, .. } => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_millis() as u64);
                 now >= *retry_after_ms
             }
         }
@@ -131,6 +134,7 @@ pub struct LlmRouter {
 
 impl LlmRouter {
     /// Create a new router with no providers
+    #[must_use]
     pub fn new() -> Self {
         let model_cache = ModelInfoCache::default_location();
         Self {
@@ -271,14 +275,14 @@ impl LlmRouter {
         self
     }
 
-    /// Add an OpenAI provider
+    /// Add an `OpenAI` provider
     pub fn with_openai(self, api_key: &str) -> Self {
         info!("Adding OpenAI provider to router");
         self.insert_provider(ProviderId::OpenAI, LlmClient::openai(api_key));
         self
     }
 
-    /// Add an OpenRouter provider
+    /// Add an `OpenRouter` provider
     pub fn with_openrouter(self, api_key: &str) -> Self {
         info!("Adding OpenRouter provider to router");
         self.insert_provider(ProviderId::OpenRouter, LlmClient::openrouter(api_key));
@@ -358,8 +362,9 @@ impl LlmRouter {
     }
 
     /// Strip provider prefix from a model name.
-    /// Public convenience method for use by agent_service and other consumers.
+    /// Public convenience method for use by `agent_service` and other consumers.
     /// e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b"
+    #[must_use]
     pub fn strip_model_prefix(model: &str) -> String {
         ProviderId::strip_prefix(model).to_string()
     }
@@ -398,15 +403,15 @@ impl LlmRouter {
                     return info;
                 }
             }
-            nanna_llm::unknown_model_info(model, &format!("{:?}", provider))
+            nanna_llm::unknown_model_info(model, &format!("{provider:?}"))
         }
     }
 
     /// Check the health of a model based on recent stats.
     ///
     /// Thresholds:
-    /// - Unhealthy: success_rate < 50% with 5+ requests, or 5+ consecutive failures
-    /// - Degraded: success_rate < 80% or avg latency > 30s
+    /// - Unhealthy: `success_rate` < 50% with 5+ requests, or 5+ consecutive failures
+    /// - Degraded: `success_rate` < 80% or avg latency > 30s
     /// - Cooldown: was unhealthy, apply exponential backoff before retry
     pub async fn model_health(&self, model: &str) -> ModelHealth {
         let stats_guard = self.stats.read().await;
@@ -435,8 +440,7 @@ impl LlmRouter {
             let backoff_secs = (30u64).saturating_mul(1u64 << exponent).min(600);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis() as u64);
             // Estimate: cooldown started ~now (conservative; we don't have exact last-error time)
             let retry_after_ms = now_ms + (backoff_secs * 1000);
 
@@ -525,7 +529,7 @@ impl LlmRouter {
 
         let client = self
             .client_for(provider)
-            .ok_or_else(|| LlmError::MissingApiKey(format!("{:?}", provider)))?;
+            .ok_or_else(|| LlmError::MissingApiKey(format!("{provider:?}")))?;
 
         // Update model in request
         let mut request = request;
@@ -691,7 +695,7 @@ impl ProviderCredentials {
     ///   durable OAuth fallback. An enabled OAuth flag with a missing token
     ///   falls through — the boot chain used to dead-end there, registering no
     ///   Anthropic provider even though the CLI held valid credentials.
-    /// - OpenAI / OpenRouter / GitHub: config key → keyring key.
+    /// - `OpenAI` / `OpenRouter` / GitHub: config key → keyring key.
     /// - Ollama: always present (host needs no credential; blank key = anonymous).
     pub async fn resolve(llm: &crate::server::LlmConfig) -> Self {
         let store = SecureStore::new();

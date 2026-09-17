@@ -164,14 +164,14 @@ impl SearchCoverage {
     /// Entries the scan could not score. Never a "no match" — a row that was
     /// not compared was not consulted.
     #[must_use]
-    pub fn unsearchable(&self) -> usize {
+    pub const fn unsearchable(&self) -> usize {
         self.total.saturating_sub(self.comparable)
     }
 
     /// Whether every entry in the store was actually scored, so an empty
     /// result really does mean "nothing matched".
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.query_width_matches && self.unsearchable() == 0
     }
 }
@@ -353,7 +353,7 @@ pub trait MemoryPersistence: Send + Sync {
 /// failure has to be recorded against the durable queue, not against the
 /// chunk table — otherwise a provider that fails forever leaves no trace and
 /// the queue looks merely slow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingChunk {
     pub chunk_id: i64,
     pub memory_id: String,
@@ -462,7 +462,8 @@ impl Default for VectorStoreConfig {
 
 impl VectorStoreConfig {
     /// Create config with specified dimension
-    pub fn with_dimension(dim: usize) -> Self {
+    #[must_use]
+    pub const fn with_dimension(dim: usize) -> Self {
         Self {
             dimension: std::sync::atomic::AtomicUsize::new(dim),
             chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
@@ -727,8 +728,7 @@ impl VectorStore {
         if mismatched > 0 {
             let sample_dim = report.entries.iter()
                 .find(|e| e.embedding.len() != self.config.get_dimension())
-                .map(|e| e.embedding.len())
-                .unwrap_or(0);
+                .map_or(0, |e| e.embedding.len());
             warn!(
                 "Dimension mismatch loading from DB: {} of {} entries have {} dims (expected {}). \
                  They will be re-embedded.",
@@ -750,7 +750,7 @@ impl VectorStore {
 
     /// Check if GPU acceleration is available.
     #[must_use]
-    pub fn has_gpu(&self) -> bool {
+    pub const fn has_gpu(&self) -> bool {
         self.gpu.is_some() && self.gpu_pipeline.is_some()
     }
 
@@ -778,12 +778,11 @@ impl VectorStore {
         normalize_f32(&mut entry.embedding);
 
         // Write-through to persistence backend before updating in-memory cache
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.save_entry(&entry).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_entry(&entry).await {
                 warn!("Failed to persist memory entry {}: {}", entry.id, e);
                 // Non-fatal: continue with in-memory add
             }
-        }
 
         // Chunks follow the content, on EVERY path that writes content — not
         // just `remember`. The consolidation and dream paths mutate entries
@@ -1043,12 +1042,11 @@ impl VectorStore {
         drop(entries);
 
         // Write-through: remove from persistence backend
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.remove_entry(id).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.remove_entry(id).await {
                 warn!("Failed to remove memory entry {} from persistence: {}", id, e);
                 // Non-fatal
             }
-        }
 
         Ok(())
     }
@@ -1083,15 +1081,14 @@ impl VectorStore {
         );
 
         // Write-through: one batched persistence call for the whole set.
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.remove_entries(ids).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.remove_entries(ids).await {
                 warn!(
                     "Failed to batch-remove {} memory entries from persistence: {}",
                     requested, e
                 );
                 // Non-fatal
             }
-        }
 
         removed
     }
@@ -1115,12 +1112,11 @@ impl VectorStore {
         drop(entries);
 
         // Write-through to persistence backend
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.update_entry_fsrs(id, &new_fsrs).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.update_entry_fsrs(id, &new_fsrs).await {
                 warn!("Failed to persist FSRS update for {}: {}", id, e);
                 // Non-fatal
             }
-        }
 
         Ok(())
     }
@@ -1251,11 +1247,10 @@ impl VectorStore {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-        if let Some(expected) = expected_content {
-            if entry.content != expected {
+        if let Some(expected) = expected_content
+            && entry.content != expected {
                 return Ok(false);
             }
-        }
         entry.content = content.to_string();
         entry.embeddings.clear();
         if embedding.is_empty() {
@@ -1355,8 +1350,8 @@ impl VectorStore {
         }
 
         // Write-through: one batched persistence call for the whole set.
-        if let Some(ref db) = self.db {
-            if !removed_ids.is_empty() {
+        if let Some(ref db) = self.db
+            && !removed_ids.is_empty() {
                 let id_refs: Vec<&str> = removed_ids.iter().map(String::as_str).collect();
                 if let Err(e) = db.remove_entries(&id_refs).await {
                     warn!(
@@ -1367,7 +1362,6 @@ impl VectorStore {
                     // Non-fatal
                 }
             }
-        }
 
         removed
     }
@@ -1457,8 +1451,7 @@ impl VectorStore {
         if mismatched > 0 {
             let sample_dim = loaded.iter()
                 .find(|e| e.embedding.len() != self.config.get_dimension())
-                .map(|e| e.embedding.len())
-                .unwrap_or(0);
+                .map_or(0, |e| e.embedding.len());
             warn!(
                 "Dimension mismatch: {} of {} entries have {} dims (expected {}). \
                  They will be re-embedded after dimension probe.",
@@ -1536,17 +1529,14 @@ impl VectorStore {
                     .unwrap_or_else(|| format!("legacy-{}d", entry.embedding.len()));
                 entry.embeddings.entry(key).or_insert_with(|| entry.embedding.clone());
             }
-            match entry.embeddings.get(model) {
-                Some(vector) => {
-                    entry.embedding = vector.clone();
-                    entry.embedding_model = Some(model.to_string());
-                    rebound += 1;
-                }
-                None => {
-                    entry.embedding.clear();
-                    entry.embedding_model = None;
-                    missing += 1;
-                }
+            if let Some(vector) = entry.embeddings.get(model) {
+                entry.embedding = vector.clone();
+                entry.embedding_model = Some(model.to_string());
+                rebound += 1;
+            } else {
+                entry.embedding.clear();
+                entry.embedding_model = None;
+                missing += 1;
             }
         }
         (rebound, missing)
@@ -1651,7 +1641,7 @@ impl VectorStore {
             "Re-embedding {} of {} entries ({} dims → {} dims)...",
             mismatched_count, total,
             entries.iter().find(|e| e.embedding.len() != expected_dim)
-                .map(|e| e.embedding.len()).unwrap_or(0),
+                .map_or(0, |e| e.embedding.len()),
             expected_dim
         );
 
@@ -1853,11 +1843,10 @@ impl VectorStore {
     /// Best-effort: a lost dequeue costs one redundant re-embed on the next
     /// drain, which is strictly better than a lost vector.
     pub async fn dequeue_embedding(&self, memory_id: &str, ordinal: i64, model: &str) {
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
                 debug!("Could not dequeue {memory_id}#{ordinal}: {e}");
             }
-        }
     }
 
     /// Note a failed embedding attempt against the durable queue.
@@ -1871,14 +1860,13 @@ impl VectorStore {
         model: &str,
         error: &str,
     ) {
-        if let Some(ref db) = self.db {
-            if let Err(e) = db
+        if let Some(ref db) = self.db
+            && let Err(e) = db
                 .record_embedding_failure(memory_id, ordinal, model, error)
                 .await
             {
                 debug!("Could not record embedding failure for {memory_id}#{ordinal}: {e}");
             }
-        }
     }
 
     /// Queue depth per model with the most recent error for each.
@@ -2047,8 +2035,7 @@ impl ConversationMemory {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]

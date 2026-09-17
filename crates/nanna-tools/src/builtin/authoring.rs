@@ -86,7 +86,7 @@ impl ToolStore {
             }
             Ok(())
         } else {
-            Err(ToolError::NotFound(format!("Tool not found: {}", name)))
+            Err(ToolError::NotFound(format!("Tool not found: {name}")))
         }
     }
 
@@ -104,11 +104,11 @@ impl ToolStore {
     async fn save(&self, path: &PathBuf) -> Result<(), ToolError> {
         let tools = self.tools.read().await;
         let json = serde_json::to_string_pretty(&*tools)
-            .map_err(|e| ToolError::ExecutionFailed(format!("Serialization error: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Serialization error: {e}")))?;
 
         tokio::fs::write(path, json)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to save tools: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to save tools: {e}")))?;
 
         debug!("Saved {} tools to {:?}", tools.len(), path);
         Ok(())
@@ -122,10 +122,10 @@ impl ToolStore {
 
         let json = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read tools: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read tools: {e}")))?;
 
         let loaded: HashMap<String, ScriptTool> = serde_json::from_str(&json)
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse tools: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse tools: {e}")))?;
 
         let count = loaded.len();
         *self.tools.write().await = loaded;
@@ -141,7 +141,7 @@ pub struct CreateToolTool {
 
 impl CreateToolTool {
     #[must_use]
-    pub fn new(store: Arc<ToolStore>) -> Self {
+    pub const fn new(store: Arc<ToolStore>) -> Self {
         Self { store }
     }
 }
@@ -181,8 +181,7 @@ impl Tool for CreateToolTool {
         // Validate script type
         if !["bash", "python", "powershell", "sh"].contains(&script_type) {
             return Err(ToolError::InvalidParams(format!(
-                "Invalid script_type: {}. Use bash, python, or powershell",
-                script_type
+                "Invalid script_type: {script_type}. Use bash, python, or powershell"
             )));
         }
 
@@ -212,8 +211,7 @@ impl Tool for CreateToolTool {
         self.store.add(tool).await?;
 
         Ok(ToolResult::success(format!(
-            "Created tool '{}'. It will be available after restart or reload.",
-            name
+            "Created tool '{name}'. It will be available after restart or reload."
         )))
     }
 }
@@ -225,7 +223,7 @@ pub struct ListToolsTool {
 
 impl ListToolsTool {
     #[must_use]
-    pub fn new(store: Arc<ToolStore>) -> Self {
+    pub const fn new(store: Arc<ToolStore>) -> Self {
         Self { store }
     }
 }
@@ -262,7 +260,7 @@ pub struct DeleteToolTool {
 
 impl DeleteToolTool {
     #[must_use]
-    pub fn new(store: Arc<ToolStore>) -> Self {
+    pub const fn new(store: Arc<ToolStore>) -> Self {
         Self { store }
     }
 }
@@ -282,7 +280,7 @@ impl Tool for DeleteToolTool {
 
         self.store.remove(name).await?;
 
-        Ok(ToolResult::success(format!("Deleted tool '{}'", name)))
+        Ok(ToolResult::success(format!("Deleted tool '{name}'")))
     }
 }
 
@@ -293,7 +291,7 @@ pub struct ScriptToolExecutor {
 
 impl ScriptToolExecutor {
     #[must_use]
-    pub fn new(tool: ScriptTool) -> Self {
+    pub const fn new(tool: ScriptTool) -> Self {
         Self { tool }
     }
 }
@@ -355,7 +353,7 @@ impl Tool for ScriptToolExecutor {
         let output = cmd
             .output()
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to execute script: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to execute script: {e}")))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

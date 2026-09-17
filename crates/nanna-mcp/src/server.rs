@@ -3,7 +3,7 @@
 //! Exposes Nanna tools as an MCP server that external clients can connect to.
 //! Supports stdio transport (for CLI tools) and HTTP/SSE (for web clients).
 
-use crate::protocol::*;
+use crate::protocol::{CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult, ToolContent};
 use crate::{McpError, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -76,6 +76,7 @@ struct RegisteredResource {
 
 impl McpServer {
     /// Create a new MCP server
+    #[must_use]
     pub fn new(config: McpServerConfig) -> Self {
         Self {
             config,
@@ -428,11 +429,11 @@ impl Default for McpServerBuilder {
 
 #[cfg(feature = "tools-integration")]
 pub mod tools_bridge {
-    use super::*;
+    use super::{info, McpServer, Arc, Result, Tool, Value, ToolContent, CallToolResult};
     use nanna_tools::{ToolCall, ToolRegistry};
     use std::collections::HashMap as StdHashMap;
 
-    /// Register all tools from a ToolRegistry with the MCP server.
+    /// Register all tools from a `ToolRegistry` with the MCP server.
     ///
     /// `registry.definitions()` already has the registry's [`ToolPolicy`]
     /// applied, so a tool denied by `[tools] disabled` is never advertised to

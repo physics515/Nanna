@@ -35,13 +35,11 @@ impl ScriptedToolWrapper {
         // Check for permissions.json alongside the tool file
         if let Some(parent) = path.parent() {
             let perms_path = parent.join("permissions.json");
-            if perms_path.exists() {
-                if let Ok(perms_str) = std::fs::read_to_string(&perms_path) {
-                    if let Ok(mut perms) = serde_json::from_str::<ToolPermissions>(&perms_str) {
+            if perms_path.exists()
+                && let Ok(perms_str) = std::fs::read_to_string(&perms_path)
+                    && let Ok(mut perms) = serde_json::from_str::<ToolPermissions>(&perms_str) {
                         // Expand ~ to home directory and resolve relative paths
-                        let home = directories::UserDirs::new()
-                            .map(|d| d.home_dir().to_path_buf())
-                            .unwrap_or_else(|| PathBuf::from("."));
+                        let home = directories::UserDirs::new().map_or_else(|| PathBuf::from("."), |d| d.home_dir().to_path_buf());
                         let resolve = |p: &PathBuf| -> PathBuf {
                             let s = p.to_string_lossy();
                             if s == "*" {
@@ -60,8 +58,6 @@ impl ScriptedToolWrapper {
                         debug!(path = ?perms_path, read = ?perms.read, "Loaded permissions for scripted tool");
                         tool = tool.with_permissions(perms);
                     }
-                }
-            }
         }
 
         let manifest = extract_manifest(&tool.source).ok_or_else(|| {
@@ -255,8 +251,8 @@ impl Tool for ScriptedToolWrapper {
         );
 
         // Check for structured result: { content: "...", success: bool, data: {...} }
-        if let Value::Object(ref obj) = result.value {
-            if let Some(content_val) = obj.get("content") {
+        if let Value::Object(ref obj) = result.value
+            && let Some(content_val) = obj.get("content") {
                 let content = match content_val {
                     Value::String(s) => s.clone(),
                     Value::Null => String::new(),
@@ -264,7 +260,7 @@ impl Tool for ScriptedToolWrapper {
                 };
                 // Respect explicit success field if present
                 let is_success = obj.get("success")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or_else(|| !content.starts_with("Error:"));
                 let mut tool_result = if is_success {
                     ToolResult::success(content)
@@ -276,7 +272,6 @@ impl Tool for ScriptedToolWrapper {
                 }
                 return Ok(tool_result);
             }
-        }
 
         // Fallback: plain string/null/other
         let content = match result.value {

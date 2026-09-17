@@ -1,4 +1,4 @@
-//! CDP (Chrome DevTools Protocol) backend via chromiumoxide
+//! CDP (Chrome `DevTools` Protocol) backend via chromiumoxide
 
 use crate::{Browser, BrowserConfig, BrowserError, BrowserPage, BrowserType, ImageFormat, ScreenshotOptions};
 use async_trait::async_trait;
@@ -84,7 +84,7 @@ impl Browser for CdpBrowser {
 
         let co_config = builder
             .build()
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+            .map_err(BrowserError::LaunchFailed)?;
 
         let (browser, mut handler) = CoBrowser::launch(co_config)
             .await
@@ -214,7 +214,7 @@ where
 
 #[async_trait]
 impl BrowserPage for CdpPage {
-    fn url(&self) -> &str {
+    fn url(&self) -> &'static str {
         ""
     }
 
@@ -288,7 +288,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .click()
@@ -306,7 +306,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .type_str(text)
@@ -329,7 +329,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             // Focus and clear
             element.focus().await.ok();
@@ -361,7 +361,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .press_key(key)
@@ -381,7 +381,7 @@ impl BrowserPage for CdpPage {
             self.page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
             Ok(())
         })
         .await
@@ -401,10 +401,10 @@ impl BrowserPage for CdpPage {
 
     async fn get_attribute(&self, selector: &str, attribute: &str) -> Result<Option<String>, BrowserError> {
         let script = format!(
-            r#"(() => {{
+            r"(() => {{
                 const el = document.querySelector('{}');
                 return el ? el.getAttribute('{}') : null;
-            }})()"#,
+            }})()",
             selector.replace('\'', "\\'"),
             attribute.replace('\'', "\\'")
         );
@@ -439,7 +439,7 @@ impl BrowserPage for CdpPage {
 
     async fn query_all_text(&self, selector: &str) -> Result<Vec<String>, BrowserError> {
         let script = format!(
-            r#"Array.from(document.querySelectorAll('{}')).map(el => el.textContent || '')"#,
+            r"Array.from(document.querySelectorAll('{}')).map(el => el.textContent || '')",
             selector.replace('\'', "\\'")
         );
 

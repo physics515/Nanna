@@ -224,7 +224,7 @@ pub struct ClusteringWeights {
 }
 
 /// One day, for callers that never set an observed span.
-fn default_time_span_minutes() -> f32 {
+const fn default_time_span_minutes() -> f32 {
     1440.0
 }
 
@@ -368,7 +368,7 @@ impl CompressionLevel {
     /// The one hard rule is honesty about provenance: interpretation is
     /// welcome, invented facts are not.
     #[must_use]
-    pub fn summarization_prompt(&self) -> &'static str {
+    pub const fn summarization_prompt(&self) -> &'static str {
         match self {
             Self::Essence => {
                 "Distil these related memories to the single idea underneath them. Not a \
@@ -421,6 +421,7 @@ pub struct MemoryCluster {
 
 impl MemoryCluster {
     /// Create a new cluster from memories
+    #[must_use]
     pub fn new(memories: Vec<MemoryEntry>, compression_level: CompressionLevel, fsrs_params: &FsrsParameters) -> Self {
         let centroid = Self::compute_centroid(&memories);
         let avg_weight = memories.iter()
@@ -510,6 +511,7 @@ pub struct ConsolidationResult {
 ///
 /// Blends semantic similarity, recall affinity, importance proximity, and age proximity.
 /// Returns a value in [0, 1] where higher means more likely to cluster together.
+#[must_use]
 pub fn composite_cluster_score(
     a: &MemoryEntry,
     b: &MemoryEntry,
@@ -560,10 +562,7 @@ pub fn composite_cluster_score(
         return sim; // fallback to pure similarity
     }
 
-    (weights.similarity * sim
-        + weights.recall_affinity * recall_affinity
-        + weights.importance_proximity * importance_prox
-        + weights.age_proximity * age_prox)
+    weights.age_proximity.mul_add(age_prox, weights.importance_proximity.mul_add(importance_prox, weights.recall_affinity.mul_add(recall_affinity, weights.similarity * sim)))
         / total_weight
 }
 
@@ -578,7 +577,7 @@ pub fn composite_cluster_score(
 /// per-workspace memory scoping the `remember`/`recall` tools enforce. Exact
 /// `Option` equality (`None == None`, `Some(a) == Some(a)`) is the safe rule.
 #[must_use]
-pub(crate) fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
+pub fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     a.workspace_id == b.workspace_id
 }
 
@@ -637,6 +636,7 @@ pub fn is_verbatim_pinned<S: std::hash::BuildHasher>(
 /// built from it can never overflow a small local model's context window. A
 /// candidate that would breach either bound is left unassigned and re-clustered
 /// on a later seed — nothing is dropped, the band just consolidates in more passes.
+#[must_use]
 pub fn cluster_memories(
     memories: Vec<MemoryEntry>,
     config: &ConsolidationConfig,
@@ -805,6 +805,7 @@ fn consolidated_metadata(memories: &[MemoryEntry]) -> HashMap<String, String> {
 }
 
 /// Create a consolidated memory entry from a cluster
+#[must_use]
 pub fn create_consolidated_entry(
     cluster: &MemoryCluster,
     consolidated_content: String,

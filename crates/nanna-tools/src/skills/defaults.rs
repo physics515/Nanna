@@ -51,9 +51,9 @@ fn extract_version_from_source(source: &str) -> Option<String> {
     // Reuse the same pattern as extract_string_field in nanna-scripting
     let patterns = [
         r#"version: ""#,
-        r#"version: '"#,
+        r"version: '",
         r#"version:""#,
-        r#"version:'"#,
+        r"version:'",
     ];
     for pattern in &patterns {
         if let Some(start) = source.find(pattern) {
@@ -226,7 +226,7 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
     #[cfg(debug_assertions)]
     {
         let _ = tools_dir; // suppress unused warning
-        return 0;
+        0
     }
 
     #[cfg(not(debug_assertions))]

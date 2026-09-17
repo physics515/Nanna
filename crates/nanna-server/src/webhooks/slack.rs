@@ -58,12 +58,9 @@ fn verify_slack_signature(
     // bytes**, not a UTF-8-lossy string: the old `from_utf8(body).unwrap_or("")`
     // silently hashed an *empty* body for any non-UTF-8 payload, so a mangled
     // request could sail past with a signature computed over nothing.
-    let mut mac = match HmacSha256::new_from_slice(signing_secret.as_bytes()) {
-        Ok(m) => m,
-        Err(_) => {
-            warn!("Invalid Slack signing secret");
-            return false;
-        }
+    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(signing_secret.as_bytes()) { m } else {
+        warn!("Invalid Slack signing secret");
+        return false;
     };
     mac.update(b"v0:");
     mac.update(timestamp.as_bytes());
@@ -103,7 +100,7 @@ pub struct SlackEventInner {
     pub bot_id: Option<String>,
     /// For reaction events
     pub reaction: Option<String>,
-    /// Item that was reacted to (for reaction_added/removed)
+    /// Item that was reacted to (for `reaction_added/removed`)
     pub item: Option<SlackReactionItem>,
 }
 
@@ -215,12 +212,12 @@ pub async fn handle(
 
             // Handle reaction events (for memory feedback)
             if inner.event_type == "reaction_added" || inner.event_type == "reaction_removed" {
-                if let Some(item) = &inner.item {
-                    if item.item_type == "message" {
-                        if let (Some(channel), Some(ts), Some(reaction)) = 
+                if let Some(item) = &inner.item
+                    && item.item_type == "message"
+                        && let (Some(channel), Some(ts), Some(reaction)) = 
                             (&item.channel, &item.ts, &inner.reaction) 
                         {
-                            let message_key = format!("{}:{}:{}", PROVIDER, channel, ts);
+                            let message_key = format!("{PROVIDER}:{channel}:{ts}");
                             // A reaction that is not a feedback signal must change nothing:
                             // FSRS weights are the agent's long-term memory, and an emoji
                             // with no assigned meaning is not evidence either way.
@@ -243,8 +240,6 @@ pub async fn handle(
                                 }
                             }
                         }
-                    }
-                }
                 return Ok(Json(SlackResponse {
                     text: None,
                     response_type: None,
@@ -288,7 +283,7 @@ pub async fn handle(
 
                 // Link message to session for reaction-based feedback
                 if !message_ts.is_empty() {
-                    let message_key = format!("{}:{}:{}", PROVIDER, channel_id, message_ts);
+                    let message_key = format!("{PROVIDER}:{channel_id}:{message_ts}");
                     state.link_message_to_session(&message_key, &session_id).await;
                 }
 

@@ -5,7 +5,7 @@
 //! then keeps the highest-scoring sentences in original order until a target
 //! compression ratio is hit.
 //!
-//! Unlike true LLMLingua (per-token perplexity via a local causal LM), this is a
+//! Unlike true `LLMLingua` (per-token perplexity via a local causal LM), this is a
 //! sentence-level approach that works over the same chat API the rest of the
 //! agent uses — no separate GPU tokenizer stack required.
 //!
@@ -298,7 +298,7 @@ pub fn parse_scores(scores_text: &str) -> Vec<u8> {
                 score.trim()
             } else if let Some((_prefix, score)) = trimmed.split_once(')') {
                 score.trim()
-            } else if let Some((first, rest)) = trimmed.split_once(|c: char| c == '.' || c == '-') {
+            } else if let Some((first, rest)) = trimmed.split_once(['.', '-']) {
                 // Only treat as labeled if the left side is a pure index number
                 if first.trim().chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty() {
                     rest.trim()
@@ -312,7 +312,7 @@ pub fn parse_scores(scores_text: &str) -> Vec<u8> {
             let token: String = num_str
                 .chars()
                 .skip_while(|c| !c.is_ascii_digit())
-                .take_while(|c| c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
                 .collect();
             if token.is_empty() {
                 None
@@ -555,7 +555,7 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
         if (c == '.' || c == '!' || c == '?' || c == '\n') && i > start + 10 {
             let next_char = text[i + c.len_utf8()..].chars().next();
             let is_sentence_end = match next_char {
-                Some(' ') | Some('\n') | None => true,
+                Some(' ' | '\n') | None => true,
                 _ => c == '\n',
             };
             if is_sentence_end {

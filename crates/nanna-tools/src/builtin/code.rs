@@ -51,7 +51,8 @@ fn should_ignore(name: &str) -> bool {
 pub struct CodeOutlineTool;
 
 impl CodeOutlineTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -82,7 +83,7 @@ impl Tool for CodeOutlineTool {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| ToolError::Io(e))?;
+            .map_err(ToolError::Io)?;
 
         let ext = Path::new(path)
             .extension()
@@ -93,8 +94,7 @@ impl Tool for CodeOutlineTool {
 
         if outline.is_empty() {
             Ok(ToolResult::success(format!(
-                "No definitions found in {} (unsupported language or empty file)",
-                path
+                "No definitions found in {path} (unsupported language or empty file)"
             )))
         } else {
             let line_count = content.lines().count();
@@ -224,7 +224,8 @@ fn extract_by_patterns(content: &str, patterns: &[&str]) -> String {
 pub struct CodeSearchTool;
 
 impl CodeSearchTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -285,9 +286,9 @@ impl Tool for CodeSearchTool {
         let re = Regex::new(pattern_str)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid regex: {e}")))?;
 
-        let glob_pattern = file_pattern.map(|p| {
+        let glob_pattern = file_pattern.and_then(|p| {
             glob::Pattern::new(p).ok()
-        }).flatten();
+        });
 
         let mut results = Vec::new();
         let mut structured_matches: Vec<serde_json::Value> = Vec::new();
@@ -299,8 +300,7 @@ impl Tool for CodeSearchTool {
             .filter_entry(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|name| !should_ignore(name))
-                    .unwrap_or(true)
+                    .is_none_or(|name| !should_ignore(name))
             })
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
@@ -308,20 +308,17 @@ impl Tool for CodeSearchTool {
             let path = entry.path();
 
             // Apply file pattern filter
-            if let Some(ref glob) = glob_pattern {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !glob.matches(name) {
+            if let Some(ref glob) = glob_pattern
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && !glob.matches(name) {
                         continue;
                     }
-                }
-            }
 
             // Skip binary files (check first 512 bytes)
-            if let Ok(bytes) = std::fs::read(path) {
-                if bytes.len() > 512 && bytes[..512].contains(&0) {
+            if let Ok(bytes) = std::fs::read(path)
+                && bytes.len() > 512 && bytes[..512].contains(&0) {
                     continue;
                 }
-            }
 
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
@@ -392,7 +389,8 @@ impl Tool for CodeSearchTool {
 pub struct ProjectStructureTool;
 
 impl ProjectStructureTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -435,7 +433,7 @@ impl Tool for ProjectStructureTool {
 
         let root_path = Path::new(root);
         if !root_path.exists() {
-            return Ok(ToolResult::error(format!("Path does not exist: {}", root)));
+            return Ok(ToolResult::error(format!("Path does not exist: {root}")));
         }
 
         let mut output = Vec::new();
@@ -443,7 +441,7 @@ impl Tool for ProjectStructureTool {
         let mut total_size = 0u64;
         let mut total_lines = 0u64;
 
-        output.push(format!("{}/", root));
+        output.push(format!("{root}/"));
 
         for entry in WalkDir::new(root)
             .max_depth(max_depth)
@@ -451,8 +449,7 @@ impl Tool for ProjectStructureTool {
             .filter_entry(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|name| !should_ignore(name))
-                    .unwrap_or(true)
+                    .is_none_or(|name| !should_ignore(name))
             })
             .filter_map(Result::ok)
             .skip(1) // skip root
@@ -462,10 +459,10 @@ impl Tool for ProjectStructureTool {
             let name = entry.file_name().to_string_lossy();
 
             if entry.file_type().is_dir() {
-                output.push(format!("{}{}/", indent, name));
+                output.push(format!("{indent}{name}/"));
             } else if entry.file_type().is_file() {
                 let metadata = entry.metadata().ok();
-                let size = metadata.as_ref().map_or(0, |m| m.len());
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 total_files += 1;
                 total_size += size;
 
@@ -484,10 +481,10 @@ impl Tool for ProjectStructureTool {
 
                 let size_str = format_size(size);
                 let line_str = lines
-                    .map(|l| format!(", {} lines", l))
+                    .map(|l| format!(", {l} lines"))
                     .unwrap_or_default();
 
-                output.push(format!("{}{} ({}{})", indent, name, size_str, line_str));
+                output.push(format!("{indent}{name} ({size_str}{line_str})"));
             }
         }
 
@@ -523,6 +520,6 @@ fn format_size(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }

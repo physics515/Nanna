@@ -1,6 +1,6 @@
 //! Workspace handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{error, json, info, warn, ControlPlane, Event, WorkspaceAction, Value, PathBuf, Workspace};
 
 impl ControlPlane {
     // =========================================================================

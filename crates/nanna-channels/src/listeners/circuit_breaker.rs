@@ -78,19 +78,19 @@ impl CircuitBreaker {
     }
 
     #[must_use]
-    pub fn with_max_auth_failures(mut self, n: u32) -> Self {
+    pub const fn with_max_auth_failures(mut self, n: u32) -> Self {
         self.max_auth_failures = n;
         self
     }
 
     #[must_use]
-    pub fn with_max_conn_failures(mut self, n: u32) -> Self {
+    pub const fn with_max_conn_failures(mut self, n: u32) -> Self {
         self.max_conn_failures = n;
         self
     }
 
     #[must_use]
-    pub fn with_max_backoff_secs(mut self, secs: u64) -> Self {
+    pub const fn with_max_backoff_secs(mut self, secs: u64) -> Self {
         self.max_backoff_secs = secs;
         self
     }
@@ -198,6 +198,7 @@ impl CircuitBreaker {
     }
 
     /// Compute the backoff duration without sleeping.
+    #[must_use]
     pub fn backoff_duration(&self) -> Duration {
         let failures = self.auth_failures.max(self.conn_failures);
         if failures == 0 {
@@ -224,14 +225,17 @@ impl CircuitBreaker {
 
     // ── Accessors ───────────────────────────────────────────────────────
 
-    pub fn auth_failures(&self) -> u32 {
+    #[must_use]
+    pub const fn auth_failures(&self) -> u32 {
         self.auth_failures
     }
 
-    pub fn conn_failures(&self) -> u32 {
+    #[must_use]
+    pub const fn conn_failures(&self) -> u32 {
         self.conn_failures
     }
 
+    #[must_use]
     pub fn provider(&self) -> &str {
         &self.provider
     }

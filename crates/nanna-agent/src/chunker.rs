@@ -58,20 +58,19 @@ impl Chunk {
         let mut current = String::new();
         let mut offset = 0;
 
-        for sentence in content.split_terminator(|c: char| c == '.' || c == '\n') {
+        for sentence in content.split_terminator(['.', '\n']) {
             let sentence_with_term = if sentence.ends_with('\n') {
                 sentence.to_string()
             } else {
                 format!("{sentence}.")
             };
 
-            if current.len() + sentence_with_term.len() > TARGET_CHUNK_SIZE {
-                if !current.is_empty() {
+            if current.len() + sentence_with_term.len() > TARGET_CHUNK_SIZE
+                && !current.is_empty() {
                     chunks.push(Self::new(current.clone(), offset));
                     offset += current.len();
                     current.clear();
                 }
-            }
 
             current.push_str(&sentence_with_term);
         }

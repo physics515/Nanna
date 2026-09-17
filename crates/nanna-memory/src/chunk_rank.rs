@@ -55,7 +55,7 @@ impl ChunkHit {
     pub fn rank(&self) -> f32 {
         #[allow(clippy::cast_precision_loss)]
         let saturating = 1.0 - 1.0 / (1.0 + self.corroborating as f32);
-        self.best + (1.0 - self.best) * CORROBORATION_HEADROOM * saturating
+        ((1.0 - self.best) * CORROBORATION_HEADROOM).mul_add(saturating, self.best)
     }
 }
 

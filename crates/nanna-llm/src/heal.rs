@@ -138,6 +138,7 @@ pub fn escape_bare_controls_in_strings(s: &str) -> Option<String> {
 }
 
 /// Like [`heal_json`], but typed.
+#[must_use]
 pub fn heal_json_as<T: serde::de::DeserializeOwned>(input: &str) -> Option<T> {
     heal_json(input).and_then(|v| serde_json::from_value(v).ok())
 }

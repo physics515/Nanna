@@ -1,6 +1,6 @@
 //! Scheduler handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, info, ControlPlane, SchedulerAction, Value, Scheduler};
 
 impl ControlPlane {
     // =========================================================================

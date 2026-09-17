@@ -580,7 +580,7 @@ impl Channel for DiscordChannel {
             }
             _ => {
                 // For other content types, send as text description
-                let text = format!("[Unsupported content type]");
+                let text = "[Unsupported content type]".to_string();
                 self.send_message(channel_id, &text, message.reply_to.as_deref())
                     .await?
             }

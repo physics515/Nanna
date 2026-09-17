@@ -437,7 +437,7 @@ async fn ladder_depth(storage: &Arc<Storage>, parent_id: Option<i64>) -> usize {
 /// fires. Pure so the wording and thresholds are testable without storage.
 fn decomposition_note(depth: usize, open_siblings: usize, parent_id: Option<i64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if depth >= LADDER_NUDGE_DEPTH + 1 {
+    if depth > LADDER_NUDGE_DEPTH {
         parts.push(format!(
             "STOP SPLITTING: this item sits at planning depth {depth} (a subtask of a subtask              of a subtask). Every level of decomposition here has produced more planning, not              more working code. Execute this item's work in your very next step."
         ));
@@ -512,7 +512,7 @@ pub fn build_task_services(
     {
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
-        let turn_baselines = turn_baselines.clone();
+        let turn_baselines = turn_baselines;
         services.insert(
             "tasks.add".to_string(),
             Arc::new(move |params: Value| {
@@ -561,7 +561,7 @@ pub fn build_task_services(
                         .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
                     {
                         return Ok(json!({
-                            "task": task_to_json(&existing),
+                            "task": task_to_json(existing),
                             "deduplicated": true,
                             // Consistent with the closed-this-turn guard so
                             // callers have ONE flag for "nothing was created"
@@ -678,13 +678,12 @@ pub fn build_task_services(
                     // the tool result, which is exactly where the model is
                     // looking at the moment it chose planning over working.
                     let open_siblings = parent_id
-                        .map(|pid| {
+                        .map_or(0, |pid| {
                             open_items
                                 .iter()
                                 .filter(|t| t.parent_id == Some(pid))
                                 .count()
-                        })
-                        .unwrap_or(0);
+                        });
                     let depth = ladder_depth(&storage, parent_id).await;
                     let note = decomposition_note(depth, open_siblings, parent_id);
 
@@ -1463,7 +1462,7 @@ pub struct AgentStepRunner {
     /// and it was set on the OLD direct-chat path only. When the harness
     /// became the single chat path this runner replaced that one without
     /// carrying the sink across, so the branch silently no-opped: a 4-hour
-    /// run made 1315 exec + 501 read_file + 87 edit_file calls and stored
+    /// run made 1315 exec + 501 `read_file` + 87 `edit_file` calls and stored
     /// NOTHING (observed 2026-07-27). Wiring it back restores the intended
     /// behaviour for every turn, since every turn is now a harness run.
     pub memory: Option<Arc<nanna_memory::MemoryService>>,
@@ -2049,8 +2048,8 @@ pub(crate) fn carried_side_effect_note(
 /// 1. **A plan never restricts capability.** Its `tool_scope` is a guess made
 ///    before the work starts, and a step sealed inside that guess cannot do
 ///    the job the step turned out to need. Observed 2026-07-27: a plan that
-///    scoped steps to `exec` produced 141 exec calls and ZERO write_file /
-///    read_file / edit_file — every file operation went through shell
+///    scoped steps to `exec` produced 141 exec calls and ZERO `write_file` /
+///    `read_file` / `edit_file` — every file operation went through shell
 ///    heredocs, sailing past the anti-erosion ratchet, the syntax gate and
 ///    the fork refusals, which is why those guards never fired during the
 ///    `minidb.sh` forks we spent hours chasing.
@@ -2169,7 +2168,7 @@ fn wedged_runner_error(message: &str) -> bool {
 /// The character an Ollama tool-call parse abort names, when the body is one.
 ///
 /// Same last-line-fingerprint style as `provider_unknown_tool_name`
-/// (nanna-agent's loop_runner): the provider's own error body is the signal,
+/// (nanna-agent's `loop_runner)`: the provider's own error body is the signal,
 /// read out of whatever transport prefixes wrap it (`API error: 500 - {…}`).
 /// Ollama's Go JSON decoder rejects the model's generated tool call before it
 /// ever reaches the registry and names the offending byte — `invalid
@@ -2443,7 +2442,7 @@ fn gpu_memory_error(message: &str) -> bool {
 enum GpuFaultAction {
     /// Unload the runner (`keep_alive: 0`) and retry at the SAME size.
     ResetOnly,
-    /// Reset AND walk the num_ctx latch down a rung (floor-clamped).
+    /// Reset AND walk the `num_ctx` latch down a rung (floor-clamped).
     ResetAndDemote,
 }
 
@@ -2756,7 +2755,7 @@ impl AgentStepRunner {
     /// reused, not re-declared. Collapse-to-×N and the monotone timestamp rule
     /// are the slot's own (`record_verified_outcome_at`).
     ///
-    /// Chat scope is (`session`, session_id), which is exactly the scope the
+    /// Chat scope is (`session`, `session_id`), which is exactly the scope the
     /// chat harness seeds and reads. Background task runs have no chat sink and
     /// therefore no session to read — they keep today's behavior.
     async fn seed_verified_outcomes(&self, context: &mut nanna_agent::AgentContext) {
@@ -2909,8 +2908,9 @@ impl AgentStepRunner {
     }
 
     /// Whether this runner's model is served by the local Ollama instance.
-    /// Healing must be provider-aware: a `:free` suffix on an OpenRouter
+    /// Healing must be provider-aware: a `:free` suffix on an `OpenRouter`
     /// model id must never trigger local-server surgery.
+    #[must_use]
     pub fn is_ollama_model(&self) -> bool {
         crate::llm_router::ProviderId::from_model(&self.agent_config.model)
             == crate::llm_router::ProviderId::Ollama
@@ -3472,7 +3472,7 @@ pub async fn tasks_closed_since(
 }
 
 /// Scope identity for [`TurnBaselines`]. The unit separator (U+001F) cannot
-/// appear in a scope name, so no (scope, scope_id) pair collides with a
+/// appear in a scope name, so no (scope, `scope_id`) pair collides with a
 /// differently-split one — the same idiom the loop runner's repeat key uses.
 fn scope_key(scope: &str, scope_id: Option<&str>) -> String {
     format!("{scope}\u{1f}{}", scope_id.unwrap_or(""))
@@ -3970,7 +3970,7 @@ pub(crate) fn ollama_local_base() -> String {
 /// an orphan that the respawned server cannot see, because `ollama ps`
 /// reports the new server's own runners, not what is actually on the card.
 /// Verified live: four orphans (parents dead) held ~12.5 GB of a 16 GB card,
-/// the num_ctx sizing probe honestly latched 4096 from the 1.5 GB that
+/// the `num_ctx` sizing probe honestly latched 4096 from the 1.5 GB that
 /// remained — below the ~4.2k min-viable floor — and two endurance attempts
 /// died in minutes on below-floor stops. Each restart heal leaks one runner
 /// per loaded model, so repeated heals (e.g. the 2026-08-08 ministral leg's
@@ -3989,8 +3989,7 @@ pub async fn restart_ollama_server() -> bool {
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let last = LAST_OLLAMA_RESTART_EPOCH_SECS.load(std::sync::atomic::Ordering::Relaxed);
     if now_secs.saturating_sub(last) < OLLAMA_RESTART_COOLDOWN_SECS
         || LAST_OLLAMA_RESTART_EPOCH_SECS
@@ -6303,7 +6302,7 @@ pub struct RunStatus {
 
 /// Starts, cancels, and reports background long-horizon runs — one per scope
 /// key at a time (the store serializes the plan; two runners over one plan
-/// would race next()).
+/// would race `next()`).
 #[derive(Default)]
 pub struct TaskRunManager {
     runs: RwLock<HashMap<String, ActiveRun>>,

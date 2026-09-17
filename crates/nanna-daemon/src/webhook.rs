@@ -4,7 +4,7 @@
 //! - Telegram webhook (`/webhook/telegram`)
 //! - Discord interactions (`/webhook/discord`)
 //! - Slack events (`/webhook/slack`)
-//! - WhatsApp webhook (`/webhook/whatsapp`)
+//! - `WhatsApp` webhook (`/webhook/whatsapp`)
 //! - Generic webhooks (`/webhook/:id`)
 
 use axum::{
@@ -143,7 +143,7 @@ fn refuse_unconfigured(channel: &str, config_key: &str) -> StatusCode {
 /// Verify a Meta/WhatsApp `X-Hub-Signature-256` header against the raw body.
 ///
 /// Meta signs each webhook POST with `sha256=<hex>` where the digest is
-/// HMAC-SHA256(app_secret, raw_body). Without this check the `/webhook/whatsapp`
+/// HMAC-SHA256(app_secret, `raw_body`). Without this check the `/webhook/whatsapp`
 /// POST endpoint accepts **any** payload from anyone who learns the URL. The body
 /// is HMAC'd as raw bytes; comparison is constant-time via `Mac::verify_slice`.
 fn verify_meta_signature(app_secret: &str, signature_header: Option<&str>, body: &[u8]) -> bool {
@@ -221,13 +221,13 @@ pub struct WebhookConfig {
     pub discord_public_key: Option<String>,
     /// Slack signing secret
     pub slack_signing_secret: Option<String>,
-    /// WhatsApp verify token (GET subscription handshake)
+    /// `WhatsApp` verify token (GET subscription handshake)
     pub whatsapp_verify_token: Option<String>,
     /// WhatsApp/Meta app secret — HMAC-SHA256 key for the `X-Hub-Signature-256`
     /// on inbound POST payloads. `None` skips verification (matches the other
     /// providers when unconfigured).
     pub whatsapp_app_secret: Option<String>,
-    /// Generic webhook secrets (webhook_id -> secret)
+    /// Generic webhook secrets (`webhook_id` -> secret)
     pub generic_secrets: HashMap<String, String>,
 }
 
@@ -263,7 +263,8 @@ pub struct WebhookState {
 }
 
 impl WebhookState {
-    pub fn new(config: WebhookConfig, event_tx: mpsc::Sender<WebhookEvent>) -> Self {
+    #[must_use]
+    pub const fn new(config: WebhookConfig, event_tx: mpsc::Sender<WebhookEvent>) -> Self {
         Self { config, event_tx }
     }
 }
@@ -380,7 +381,7 @@ async fn telegram_webhook(
             sender_name: Some(format!(
                 "{}{}",
                 sender.first_name,
-                sender.last_name.map(|l| format!(" {}", l)).unwrap_or_default()
+                sender.last_name.map(|l| format!(" {l}")).unwrap_or_default()
             )),
             chat_id: msg.chat.id.to_string(),
             content: text,
@@ -573,7 +574,7 @@ async fn discord_webhook(
         
         Some(WebhookMessage {
             sender_id: u.id.clone(),
-            sender_name: Some(u.username.clone()),
+            sender_name: Some(u.username),
             chat_id: interaction.channel_id.clone().unwrap_or_default(),
             content,
             message_id: None,
@@ -651,8 +652,7 @@ fn verify_slack_signature(
     };
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     if now_secs.abs_diff(ts) > 300 {
         return false;
     }
@@ -762,13 +762,13 @@ async fn slack_webhook(
 // WhatsApp Webhook
 // =============================================================================
 
-/// WhatsApp webhook verification (GET request)
+/// `WhatsApp` webhook verification (GET request)
 async fn whatsapp_verify(
     State(state): State<Arc<WebhookState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let mode = params.get("hub.mode").map(|s| s.as_str());
-    let token = params.get("hub.verify_token").map(|s| s.as_str());
+    let mode = params.get("hub.mode").map(std::string::String::as_str);
+    let token = params.get("hub.verify_token").map(std::string::String::as_str);
     let challenge = params.get("hub.challenge");
     
     if mode == Some("subscribe") {
@@ -784,7 +784,7 @@ async fn whatsapp_verify(
     (StatusCode::FORBIDDEN, "Verification failed").into_response()
 }
 
-/// WhatsApp webhook message structure
+/// `WhatsApp` webhook message structure
 #[derive(Debug, Deserialize)]
 struct WhatsAppWebhook {
     entry: Vec<WhatsAppEntry>,
@@ -841,7 +841,7 @@ struct WhatsAppText {
     body: String,
 }
 
-/// Handle WhatsApp webhook
+/// Handle `WhatsApp` webhook
 async fn whatsapp_webhook(
     State(state): State<Arc<WebhookState>>,
     headers: HeaderMap,
@@ -1094,6 +1094,7 @@ pub struct WebhookServer {
 
 impl WebhookServer {
     /// Create a new webhook server
+    #[must_use]
     pub fn new(config: WebhookConfig) -> (Self, mpsc::Receiver<WebhookEvent>) {
         let (event_tx, event_rx) = mpsc::channel(100);
         (Self { config, event_tx }, event_rx)
@@ -1155,9 +1156,10 @@ impl WebhookServer {
     }
     
     /// Spawn the webhook server as a background task
+    #[must_use]
     pub fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<WebhookEvent>) {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let server = WebhookServer {
+        let server = Self {
             config: self.config,
             event_tx,
         };

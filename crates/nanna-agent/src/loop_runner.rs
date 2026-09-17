@@ -85,7 +85,7 @@ fn pressure_tier_active_tools() -> HashSet<String> {
 /// (2026-08-08, ministral-3:8b): Ollama's Mistral-family parser rejects a
 /// GENERATED call to an unserved tool with HTTP 500 and the body
 /// `{"error":"tool 'exec' not found"}` — the call never reaches the
-/// registry, so the normal unknown-tool guidance ("use discover_tools")
+/// registry, so the normal unknown-tool guidance ("use `discover_tools`")
 /// can never fire, and re-sending the identical request dies identically.
 /// qwen/gemma parsers pass unknown names through to the registry instead,
 /// which is why only some models trip this.
@@ -415,9 +415,9 @@ pub struct AgentConfig {
     pub summarization_priority: Vec<String>,
     /// Ollama URL for summarization (if using ollama)
     pub summarization_ollama_url: Option<String>,
-    /// OpenRouter API key (for summarization/extraction via OpenRouter models)
+    /// `OpenRouter` API key (for summarization/extraction via `OpenRouter` models)
     pub openrouter_api_key: Option<String>,
-    /// OpenAI API key (for summarization/extraction via OpenAI models)
+    /// `OpenAI` API key (for summarization/extraction via `OpenAI` models)
     pub openai_api_key: Option<String>,
     /// Threshold (in chars) above which tool results are replaced with a
     /// memory-reference stub in context. 0 = auto (scales with model context window).
@@ -473,6 +473,7 @@ pub struct ModelTier {
 
 impl ModelTier {
     /// Parse from "model:tier" format. If no tier specified, defaults to Complex.
+    #[must_use]
     pub fn parse(spec: &str) -> Self {
         if let Some((model, tier_str)) = spec.rsplit_once(':') {
             // Check if this looks like a tier annotation vs a tag (e.g. "deepseek-r1:14b")
@@ -548,9 +549,9 @@ pub type MemoryCallback = Box<
 pub type ThinkingCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Callback for tool start events (called with tool call id, name, and input)
-/// (call_id, name, input, model)
+/// (`call_id`, name, input, model)
 pub type ToolStartCallback = Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>;
-/// Callback for tool completion: (call_id, name, output, success, duration_ms, data)
+/// Callback for tool completion: (`call_id`, name, output, success, `duration_ms`, data)
 pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync>;
 /// Callback for checkpointing conversation state (messages as JSON, iteration count).
 /// Fired after each agent iteration completes (assistant response + tool results stored).
@@ -679,7 +680,7 @@ pub struct RunOptions {
     pub on_thinking: Option<ThinkingCallback>,
     /// Auto-extract memories after each run
     pub auto_extract_memories: bool,
-    /// Callback for storing extracted memories (required if auto_extract_memories is true)
+    /// Callback for storing extracted memories (required if `auto_extract_memories` is true)
     pub on_memory: Option<MemoryCallback>,
     /// Enable uncertainty/confidence tracking
     pub track_uncertainty: bool,
@@ -700,7 +701,7 @@ pub struct RunOptions {
     /// stream (or a long tool call) immediately instead of waiting for the
     /// next token batch to arrive.
     pub cancel: Option<CancelToken>,
-    /// Image attachments for the current message: Vec<(base64_data, media_type)>
+    /// Image attachments for the current message: Vec<(`base64_data`, `media_type`)>
     pub attachments: Vec<(String, String)>,
     /// Checkpoint callback: fired after each iteration with current conversation state.
     /// Enables crash recovery by persisting intermediate state.
@@ -711,7 +712,7 @@ pub struct RunOptions {
     /// If true, this is a sub-agent run. Nudge thresholds are lowered
     /// (start at 20 instead of 50) since sub-agents should be focused tasks.
     pub is_sub_agent: bool,
-    /// If true, all registered tools are available from iteration 1 (skip discover_tools).
+    /// If true, all registered tools are available from iteration 1 (skip `discover_tools`).
     /// Used for sub-agents that have a specific task and shouldn't waste a turn on discovery.
     pub all_tools_active: bool,
     /// Step-kind hint for model routing (P14 harness runs). Plan/replan steps
@@ -1819,7 +1820,7 @@ async fn structural_notices_for_call(
 /// each left the same break.
 ///
 /// The static sentence the write skill appends every time ("Fix that line with
-/// another edit_file.") is correct advice for the FIRST occurrence and
+/// another `edit_file`.") is correct advice for the FIRST occurrence and
 /// actively misleading by the twenty-fifth, because the reported line is where
 /// the parser gave up — for an unclosed quote, bracket or heredoc that is
 /// after the real mistake, so "fix that line" sends the model to the wrong
@@ -2151,7 +2152,7 @@ const ZERO_DELTA_DISCOVERY_BREAKER_AFTER: usize = 3;
 ///
 /// Observed live: 25 consecutive SUCCESSFUL edits produced the same failing
 /// verdict for 12m44s, each one receiving the identical static sentence "Fix
-/// that line with another edit_file." Every existing guard was blind to it,
+/// that line with another `edit_file`." Every existing guard was blind to it,
 /// because each edit is a different call — different arguments, therefore a
 /// different ledger key — and each edit is also a successful side-effectful
 /// call, so it bumped the world epoch and re-armed everything else.
@@ -2430,11 +2431,7 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     let action_hits = ACTION_CLAIMS.iter().filter(|p| lower.contains(*p)).count();
 
     // If the model both narrates actions AND claims completion, it hallucinated the workflow
-    if completion_hits >= 1 && action_hits >= 2 {
-        return true;
-    }
-
-    false
+    completion_hits >= 1 && action_hits >= 2
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -2480,7 +2477,7 @@ fn tool_call_fence_token_count(text: &str) -> usize {
 }
 
 /// Nesting budget for re-scanning the interior of an unparseable brace span.
-/// Derived from serde_json's own default recursion limit (128), not chosen:
+/// Derived from `serde_json`'s own default recursion limit (128), not chosen:
 /// an object nested deeper than serde parses cannot yield a `Value`, so
 /// scanning deeper cannot find one.
 const JSON_SCAN_DEPTH_MAX: usize = 128;
@@ -2641,7 +2638,7 @@ fn prose_call_params(map: &serde_json::Map<String, Value>, name_key: &str) -> Op
 /// Recognize a call-shaped JSON object: `(written_name, arguments)`.
 ///
 /// Shapes, in precedence order:
-/// 1. OpenAI envelope — `{"function": {"name": …, "arguments": …}}`;
+/// 1. `OpenAI` envelope — `{"function": {"name": …, "arguments": …}}`;
 /// 2. strong name keys — `{"action"|"tool"|"tool_name"|"function": "x", …}`
 ///    with either an explicit argument key or loose keys as arguments;
 /// 3. weak `name` key — `{"name": "x", …}` counts ONLY alongside an explicit
@@ -2650,27 +2647,23 @@ fn prose_call_params(map: &serde_json::Map<String, Value>, name_key: &str) -> Op
 fn prose_call_from_map(
     map: &serde_json::Map<String, Value>,
 ) -> Option<(String, Option<Value>)> {
-    if let Some(Value::Object(inner)) = map.get("function") {
-        if let Some(Value::String(name)) = inner.get("name") {
-            if looks_like_tool_name(name) {
+    if let Some(Value::Object(inner)) = map.get("function")
+        && let Some(Value::String(name)) = inner.get("name")
+            && looks_like_tool_name(name) {
                 return Some((name.clone(), prose_call_params(inner, "name")));
             }
-        }
-    }
     for key in PROSE_CALL_NAME_KEYS {
-        if let Some(Value::String(name)) = map.get(*key) {
-            if looks_like_tool_name(name) {
+        if let Some(Value::String(name)) = map.get(*key)
+            && looks_like_tool_name(name) {
                 return Some((name.clone(), prose_call_params(map, key)));
             }
-        }
     }
-    if let Some(Value::String(name)) = map.get("name") {
-        if looks_like_tool_name(name)
+    if let Some(Value::String(name)) = map.get("name")
+        && looks_like_tool_name(name)
             && PROSE_CALL_PARAM_KEYS.iter().any(|k| map.contains_key(*k))
         {
             return Some((name.clone(), prose_call_params(map, "name")));
         }
-    }
     None
 }
 
@@ -2691,7 +2684,7 @@ struct ProseToolCall {
 /// Walk a parsed JSON tree collecting call-shaped objects at any depth
 /// (`{"steps": [{"action": "read_file", …}]}` still counts — the model wrote
 /// what it wants done). Recursion is bounded by the parse itself
-/// (serde_json's recursion limit).
+/// (`serde_json`'s recursion limit).
 fn collect_prose_calls(value: &Value, span_raw: &str, out: &mut Vec<ProseToolCall>) {
     match value {
         Value::Object(map) => {
@@ -2746,7 +2739,7 @@ struct ProseDialectScan {
 }
 
 impl ProseDialectScan {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.calls.is_empty() && self.result_spans.is_empty() && self.fence_tokens == 0
     }
 }
@@ -3160,7 +3153,7 @@ pub fn wrapup_nudge_due(
     }
     // Guard against a 0 interval (would be div-by-zero / a nudge every iteration).
     let interval = nudge_interval.max(1);
-    if (iteration - nudge_after) % interval != 0 {
+    if !(iteration - nudge_after).is_multiple_of(interval) {
         return None;
     }
     let level = match nudge_count {
@@ -3214,7 +3207,7 @@ pub fn wrapup_nudge_message(
 /// nudge rungs (each detector injects once; only the late wrap-up ladder
 /// escalates further, and it stays available above this rung). If the
 /// model ignores the instruction twice, more copies are noise: the step
-/// then ends through the existing steps_without_progress → replan →
+/// then ends through the existing `steps_without_progress` → replan →
 /// abandon ladder, which this rung exists to make REACHABLE faster for
 /// claim-failure, never to replace. Nothing here stops the loop.
 pub const CLAIM_NUDGES_MAX: usize = 2;
@@ -3235,9 +3228,9 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 /// nudge on the escalation ladder.
 ///
 /// Observed live 2026-08-02 (gemma4:12b, two independent probes): the model
-/// COMPLETED the step's real work (write_file + read_file succeeded,
+/// COMPLETED the step's real work (`write_file` + `read_file` succeeded,
 /// artifact verified on disk) but never emitted the `TASK COMPLETE` claim
-/// the harness verdicts on, so steps_without_progress climbed through
+/// the harness verdicts on, so `steps_without_progress` climbed through
 /// replans until an external cancel at 20 minutes. Small local models lose
 /// the claim protocol from the system prompt under context churn
 /// (qwen3.5:9b emits it; gemma4:12b does not). This instruction re-teaches
@@ -3479,7 +3472,7 @@ impl ContextFloor {
     /// [`nanna_llm::ModelInfo::effective_output_budget`], `window < total()`
     /// is exactly "the irreducible input exceeds the hard input limit" — no
     /// request this loop could send would fit, regardless of compression.
-    fn total(self) -> usize {
+    const fn total(self) -> usize {
         self.system_tokens + self.tool_tokens + self.frame_tokens + self.output_reserve
     }
 }
@@ -3659,7 +3652,7 @@ fn detect_thinking_spiral(thinking: &str) -> bool {
 
     // Indicator 2: Sentence-level repetition in thinking (same sentence reappears 3+ times)
     let sentences: Vec<&str> = lower
-        .split(|c: char| c == '.' || c == '?' || c == '!')
+        .split(['.', '?', '!'])
         .map(str::trim)
         .filter(|s| s.len() > 30)
         .collect();
@@ -3711,7 +3704,7 @@ pub struct Agent {
 ///
 /// The provider streams `ContentBlockStart{index}` / `ToolUseDelta{index}` /
 /// `ContentBlockStop{index}` events. Crucially, OpenAI-compatible providers
-/// (OpenRouter, Ollama) open *all* tool-call blocks and only emit their
+/// (`OpenRouter`, Ollama) open *all* tool-call blocks and only emit their
 /// `ContentBlockStop`s together at the end — so a single-slot accumulator
 /// concatenated multiple tool calls' argument fragments into one buffer and
 /// mis-attributed them (the JSON healer then salvaged only the first object and
@@ -3740,7 +3733,7 @@ struct StreamBlockAssembler {
     thinking_signature: String,
     /// Active non-tool block type ("text"/"thinking") for stop routing.
     current_block_type: String,
-    /// In-flight tool blocks: index -> (id, name, json_buffer). Drained on stop.
+    /// In-flight tool blocks: index -> (id, name, `json_buffer`). Drained on stop.
     tool_blocks: std::collections::BTreeMap<usize, (String, String, String)>,
     tool_uses: Vec<(String, String, Value)>,
     content_blocks: Vec<ContentBlock>,
@@ -3831,40 +3824,37 @@ impl StreamBlockAssembler {
                 "Multiple balanced top-level JSON objects in a single tool block — streaming collapse; salvaging first only"
             );
         }
-        match nanna_llm::heal_json(&json) {
-            Some(input) => {
-                if serde_json::from_str::<Value>(&json).is_err() {
-                    warn!(
-                        tool_id = %id,
-                        tool_name = %name,
-                        original_json = %json,
-                        healed = %input,
-                        "Healed malformed tool_use JSON from stream"
-                    );
-                }
-                self.tool_uses.push((id.clone(), name.clone(), input.clone()));
-                self.content_blocks.push(ContentBlock::ToolUse { id, name, input });
-            }
-            None => {
+        if let Some(input) = nanna_llm::heal_json(&json) {
+            if serde_json::from_str::<Value>(&json).is_err() {
                 warn!(
                     tool_id = %id,
                     tool_name = %name,
-                    json = %json,
-                    "Failed to heal tool_use JSON from stream — returning error to model"
+                    original_json = %json,
+                    healed = %input,
+                    "Healed malformed tool_use JSON from stream"
                 );
-                self.content_blocks.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: serde_json::json!({}),
-                });
-                self.error_tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: format!(
-                        "Error: Your tool call for '{name}' had malformed JSON arguments and could not be parsed. Please retry with valid JSON."
-                    ),
-                    is_error: Some(true),
-                });
             }
+            self.tool_uses.push((id.clone(), name.clone(), input.clone()));
+            self.content_blocks.push(ContentBlock::ToolUse { id, name, input });
+        } else {
+            warn!(
+                tool_id = %id,
+                tool_name = %name,
+                json = %json,
+                "Failed to heal tool_use JSON from stream — returning error to model"
+            );
+            self.content_blocks.push(ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::json!({}),
+            });
+            self.error_tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: format!(
+                    "Error: Your tool call for '{name}' had malformed JSON arguments and could not be parsed. Please retry with valid JSON."
+                ),
+                is_error: Some(true),
+            });
         }
     }
 }
@@ -4016,8 +4006,8 @@ impl Agent {
             // Bounded blast radius (P14): a per-run wall-clock cap set by the
             // caller (never a default) ends the run cleanly instead of letting
             // a stuck run burn a GPU for hours.
-            if let Some(cap) = options.max_wall_clock {
-                if run_started.elapsed() >= cap {
+            if let Some(cap) = options.max_wall_clock
+                && run_started.elapsed() >= cap {
                     warn!(
                         elapsed_secs = run_started.elapsed().as_secs(),
                         cap_secs = cap.as_secs(),
@@ -4031,7 +4021,6 @@ impl Agent {
                     );
                     return Ok(state.into_response(true));
                 }
-            }
 
             // Budget visibility (P14): once past 80% of the token budget, tell
             // the model — an agent that knows its budget plans around it.
@@ -4069,15 +4058,13 @@ impl Agent {
                     .await;
                 } else if state.iterations > max {
                     // Extract memories before bailing — don't lose a long run's knowledge
-                    if options.auto_extract_memories {
-                        if let Some(ref on_memory) = options.on_memory {
-                            if let Ok(memories) = self.extract_memories().await {
+                    if options.auto_extract_memories
+                        && let Some(ref on_memory) = options.on_memory
+                            && let Ok(memories) = self.extract_memories().await {
                                 for memory in memories {
                                     on_memory(memory).await;
                                 }
                             }
-                        }
-                    }
                     warn!(
                         iterations = state.iterations,
                         max = max,
@@ -4329,7 +4316,19 @@ impl Agent {
 
                 // Tier 2 (standard): When exceeding compression_threshold, full summarization if available
                 if ctx.needs_compression() && !ctx.exceeds_hard_limit() {
-                    if !self.config.summarization_priority.is_empty() {
+                    if self.config.summarization_priority.is_empty() {
+                        info!(
+                            estimated_tokens = estimated,
+                            compression_threshold = compression_threshold,
+                            tier = "standard",
+                            "Tier 2: no summarization models, dropping oldest"
+                        );
+                        let dropped = ctx.drop_oldest(16);
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured",
+                        );
+                    } else {
                         let summarization_config = ContextSummarizationConfig {
                             model_priority: self.config.summarization_priority.clone(),
                             ollama_url: self.config.summarization_ollama_url.clone(),
@@ -4367,18 +4366,6 @@ impl Agent {
                                 );
                             }
                         }
-                    } else {
-                        info!(
-                            estimated_tokens = estimated,
-                            compression_threshold = compression_threshold,
-                            tier = "standard",
-                            "Tier 2: no summarization models, dropping oldest"
-                        );
-                        let dropped = ctx.drop_oldest(16);
-                        ctx.push_summarization_failure_notice(
-                            dropped,
-                            "no summarization models are configured",
-                        );
                     }
                 }
 
@@ -4386,7 +4373,20 @@ impl Agent {
                 if ctx.exceeds_hard_limit() {
                     let estimated = ctx.estimate_tokens();
 
-                    if !self.config.summarization_priority.is_empty() {
+                    if self.config.summarization_priority.is_empty() {
+                        warn!(
+                            estimated_tokens = estimated,
+                            hard_limit = hard_limit,
+                            tier = "hard_cap",
+                            "Tier 3: hard limit exceeded, truncating"
+                        );
+                        let dropped = ctx.truncate_to_limit();
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured and the \
+                             context exceeded the hard input limit",
+                        );
+                    } else {
                         let summarization_config = ContextSummarizationConfig {
                             model_priority: self.config.summarization_priority.clone(),
                             ollama_url: self.config.summarization_ollama_url.clone(),
@@ -4427,19 +4427,6 @@ impl Agent {
                                 );
                             }
                         }
-                    } else {
-                        warn!(
-                            estimated_tokens = estimated,
-                            hard_limit = hard_limit,
-                            tier = "hard_cap",
-                            "Tier 3: hard limit exceeded, truncating"
-                        );
-                        let dropped = ctx.truncate_to_limit();
-                        ctx.push_summarization_failure_notice(
-                            dropped,
-                            "no summarization models are configured and the \
-                             context exceeded the hard input limit",
-                        );
                     }
                 }
             }
@@ -4583,11 +4570,9 @@ impl Agent {
                 && !state.final_text.is_empty()
                 && !state.final_text.ends_with(' ')
                 && !state.final_text.ends_with('\n')
-            {
-                if let Some(ref on_text) = options.on_text {
+                && let Some(ref on_text) = options.on_text {
                     on_text(" ");
                 }
-            }
 
             // Call LLM with escalation: if a routed (cheap) model fails, retry with primary
             let llm_start = std::time::Instant::now();
@@ -4606,7 +4591,7 @@ impl Agent {
                 };
                 if should_escalate {
                     let escalation_reason = match &result {
-                        Err(e) => format!("error: {}", e),
+                        Err(e) => format!("error: {e}"),
                         Ok(r) => {
                             let bad_tools: Vec<_> = r
                                 .tool_uses
@@ -4614,7 +4599,7 @@ impl Agent {
                                 .filter(|(_, name, _)| name.is_empty())
                                 .map(|(id, _, _)| id.as_str())
                                 .collect();
-                            format!("malformed tool calls: {:?}", bad_tools)
+                            format!("malformed tool calls: {bad_tools:?}")
                         }
                     };
                     warn!(
@@ -5136,15 +5121,13 @@ impl Agent {
                     if options.track_uncertainty {
                         state.confidence = self.analyze_confidence(&state.final_text).await;
                     }
-                    if options.auto_extract_memories {
-                        if let Some(ref on_memory) = options.on_memory {
-                            if let Ok(memories) = self.extract_memories().await {
+                    if options.auto_extract_memories
+                        && let Some(ref on_memory) = options.on_memory
+                            && let Ok(memories) = self.extract_memories().await {
                                 for memory in memories {
                                     on_memory(memory).await;
                                 }
                             }
-                        }
-                    }
                     let truncated = state.wrap_up_truncated;
                     return Ok(state.into_response(truncated));
                 }
@@ -5487,15 +5470,13 @@ impl Agent {
                 }
 
                 // Auto-extract memories if enabled
-                if options.auto_extract_memories {
-                    if let Some(ref on_memory) = options.on_memory {
-                        if let Ok(memories) = self.extract_memories().await {
+                if options.auto_extract_memories
+                    && let Some(ref on_memory) = options.on_memory
+                        && let Ok(memories) = self.extract_memories().await {
                             for memory in memories {
                                 on_memory(memory).await;
                             }
                         }
-                    }
-                }
                 return Ok(state.into_response(false));
             }
 
@@ -5559,8 +5540,8 @@ impl Agent {
             // Bounded blast radius (P14): per-run tool-call cap set by the
             // caller. Checked after results are stored so the transcript is
             // coherent for salvage.
-            if let Some(cap) = options.max_tool_calls {
-                if state.tool_records.len() >= cap {
+            if let Some(cap) = options.max_tool_calls
+                && state.tool_records.len() >= cap {
                     warn!(
                         tool_calls = state.tool_records.len(),
                         cap = cap,
@@ -5574,7 +5555,6 @@ impl Agent {
                     );
                     return Ok(state.into_response(true));
                 }
-            }
 
             // Progress exhaustion (P22) — the step-level rung of the same
             // ladder, harness steps only: fold this iteration's yield into
@@ -5649,7 +5629,7 @@ impl Agent {
             // Progressive context distillation: rolling summary every N iterations
             if self.config.distillation_interval > 0
                 && state.iterations > 0
-                && state.iterations % self.config.distillation_interval == 0
+                && state.iterations.is_multiple_of(self.config.distillation_interval)
             {
                 self.run_progressive_distillation().await;
             }
@@ -5664,8 +5644,8 @@ impl Agent {
             }
 
             // Periodic memory extraction every 10 iterations
-            if options.auto_extract_memories && state.iterations > 0 && state.iterations % 10 == 0 {
-                if let Some(ref on_memory) = options.on_memory {
+            if options.auto_extract_memories && state.iterations > 0 && state.iterations.is_multiple_of(10)
+                && let Some(ref on_memory) = options.on_memory {
                     info!(iteration = state.iterations, "Periodic memory extraction");
                     if let Ok(memories) = self.extract_memories().await {
                         for memory in memories {
@@ -5673,7 +5653,6 @@ impl Agent {
                         }
                     }
                 }
-            }
         }
     }
 
@@ -5704,7 +5683,7 @@ impl Agent {
     /// joins the model context as a user-role message and never touches
     /// `on_text` or accumulated text, so it cannot leak into the persisted
     /// chat reply. It only PROMPTS the claim — the harness acceptance flow
-    /// (`step_claims_completion`, false_success_claims) judges it unchanged.
+    /// (`step_claims_completion`, `false_success_claims`) judges it unchanged.
     /// Returns whether an instruction was injected.
     async fn maybe_inject_claim_nudge(&self, state: &mut RunState, options: &RunOptions) -> bool {
         if options.step_kind.is_none() || options.mission_mode {
@@ -5788,9 +5767,8 @@ impl Agent {
         let budget_note = if options.budget_awareness {
             options.token_budget.map(|budget| {
                 format!(
-                    "[Budget: {} tokens. Be efficient with tool calls. \
-                     Delegate independent sub-tasks with the `task` tool to save context.]",
-                    budget
+                    "[Budget: {budget} tokens. Be efficient with tool calls. \
+                     Delegate independent sub-tasks with the `task` tool to save context.]"
                 )
             })
         } else {
@@ -5867,15 +5845,13 @@ impl Agent {
             }
         }
 
-        if options.auto_extract_memories {
-            if let Some(ref on_memory) = options.on_memory {
-                if let Ok(memories) = self.extract_memories().await {
+        if options.auto_extract_memories
+            && let Some(ref on_memory) = options.on_memory
+                && let Ok(memories) = self.extract_memories().await {
                     for memory in memories {
                         on_memory(memory).await;
                     }
                 }
-            }
-        }
         Ok(state.into_response(true))
     }
 
@@ -6257,7 +6233,7 @@ impl Agent {
         ctx.messages.push(AnthropicMessage::assistant(stripped));
     }
 
-    /// Strip large content from write_file/write tool_use blocks before storing in context.
+    /// Strip large content from `write_file/write` `tool_use` blocks before storing in context.
     ///
     /// The LLM already generated the content, so keeping it in stored context is pure waste.
     /// Replaces the `content` field with a size placeholder.
@@ -6273,10 +6249,10 @@ impl Agent {
     fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
         blocks.iter().map(|block| {
             match block {
-                ContentBlock::ToolUse { id, name, input } if is_write_tool(&name) => {
+                ContentBlock::ToolUse { id, name, input } if is_write_tool(name) => {
                     let mut input = input.clone();
-                    if let Some(obj) = input.as_object_mut() {
-                        if let Some(content_val) = obj.get("content") {
+                    if let Some(obj) = input.as_object_mut()
+                        && let Some(content_val) = obj.get("content") {
                             let size = content_val.as_str().map_or_else(
                                 || content_val.to_string().len(),
                                 str::len,
@@ -6286,7 +6262,6 @@ impl Agent {
                                 Value::String(format!("[content omitted here ONLY because your context window is limited — {size} bytes were sent to this tool; the tool result below is the authoritative record of what happened on disk]")),
                             );
                         }
-                    }
                     ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -6542,7 +6517,7 @@ impl Agent {
         for (((id, name, input, _), (response, duration_ms)), short_circuited) in
             tool_calls_with_meta
                 .into_iter()
-                .zip(results.into_iter())
+                .zip(results)
                 .zip(breaker_notices.iter().map(Option::is_some))
         {
             if duration_ms > 10_000 {
@@ -6677,8 +6652,8 @@ impl Agent {
             // the whole point of them. A refusal is not a write.
             let stored_input = if is_write_tool(&name) {
                 let mut input = input.clone();
-                if let Some(obj) = input.as_object_mut() {
-                    if let Some(content_val) = obj.get("content") {
+                if let Some(obj) = input.as_object_mut()
+                    && let Some(content_val) = obj.get("content") {
                         let size = content_val
                             .as_str()
                             .map_or_else(|| content_val.to_string().len(), str::len);
@@ -6698,7 +6673,6 @@ impl Agent {
                             Value::String(format!("[content omitted from context — {fate}]")),
                         );
                     }
-                }
                 input
             } else {
                 input.clone()
@@ -6868,8 +6842,8 @@ impl Agent {
             // can collapse the record of what was proven — the P22 chain's
             // final link was exactly that collapse, followed by a rewrite
             // over ten just-verified commands.
-            if !short_circuited {
-                if let Some((subject, outcome)) = exec_verified_outcome(
+            if !short_circuited
+                && let Some((subject, outcome)) = exec_verified_outcome(
                     &name,
                     &input,
                     response.result.success,
@@ -6879,7 +6853,6 @@ impl Agent {
                     let mut ctx = self.context.write().await;
                     ctx.record_verified_outcome(subject, outcome);
                 }
-            }
 
             let result_content = if response.result.success {
                 response.result.content
@@ -6945,8 +6918,8 @@ impl Agent {
             // real numbers instead so the promise matches what the handle will
             // actually reassemble.
             let mut ingested: Option<(usize, usize)> = None;
-            if !is_memory_tool(&name) {
-                if let Some(ref on_memory) = options.on_memory {
+            if !is_memory_tool(&name)
+                && let Some(ref on_memory) = options.on_memory {
                     // Run-length-collapse BEFORE chunking. Chunk count is
                     // driven by bytes and each chunk costs an embedding
                     // round-trip, a vector search and an insert — so a result
@@ -7032,7 +7005,6 @@ impl Agent {
                         .await;
                     }
                 }
-            }
 
             let final_content = match output_target {
                 OutputTarget::Context => {
@@ -7256,8 +7228,8 @@ impl Agent {
     /// Check if an error indicates the context length was exceeded.
     ///
     /// Various providers return this differently:
-    /// - OpenRouter/StepFun: "context_length_exceeded" in JSON body
-    /// - OpenAI: "maximum context length" / "reduce the length"
+    /// - OpenRouter/StepFun: "`context_length_exceeded`" in JSON body
+    /// - `OpenAI`: "maximum context length" / "reduce the length"
     /// - Anthropic: "prompt is too long"
     fn is_context_length_error(error: &str) -> bool {
         let lower = error.to_lowercase();
@@ -7308,11 +7280,9 @@ impl Agent {
                 for (client, model_name) in &clients {
                     if let Some(compressed) =
                         crate::compressor::compress_text(client, model_name, &content, 4).await
-                    {
-                        if compressed.len() < content.len() {
+                        && compressed.len() < content.len() {
                             return Some(compressed);
                         }
-                    }
                 }
                 None
             }
@@ -7354,7 +7324,7 @@ impl Agent {
                     LlmClient::openrouter(api_key)
                 }
                 _ => {
-                    return Err(format!("Unknown provider: {}", provider));
+                    return Err(format!("Unknown provider: {provider}"));
                 }
             };
             Ok((client, model.to_string()))
@@ -7388,15 +7358,14 @@ impl Agent {
         for tier_entry in &self.config.model_routing {
             if tier_entry.tier >= complexity {
                 // Skip unhealthy models (consecutive failures >= threshold)
-                if let Some(ref tracker) = self.stats {
-                    if !tracker.is_healthy(&tier_entry.model).await {
+                if let Some(ref tracker) = self.stats
+                    && !tracker.is_healthy(&tier_entry.model).await {
                         debug!(
                             model = %tier_entry.model,
                             "⚠️ Skipping unhealthy model in routing"
                         );
                         continue;
                     }
-                }
 
                 if tier_entry.model != self.config.model {
                     info!(
@@ -7664,13 +7633,12 @@ impl Agent {
         for (msg_idx, _tool_use_id) in to_stub {
             if let Some(msg) = ctx.messages.get_mut(msg_idx) {
                 for block in &mut msg.content {
-                    if let ContentBlock::ToolResult { content, .. } = block {
-                        if !content.starts_with("[superseded") {
+                    if let ContentBlock::ToolResult { content, .. } = block
+                        && !content.starts_with("[superseded") {
                             let old_len = content.len();
                             *content =
                                 format!("[superseded by later call — {old_len} chars removed]");
                         }
-                    }
                 }
             }
         }
@@ -7719,7 +7687,7 @@ impl Agent {
         let mut evicted = 0;
         let mut bytes_saved = 0usize;
 
-        for msg in ctx.messages[..eviction_range].iter_mut() {
+        for msg in &mut ctx.messages[..eviction_range] {
             if msg.role != "user" {
                 continue;
             }
@@ -7785,8 +7753,8 @@ impl Agent {
         }
     }
 
-    /// Find a dedup key for a tool result by looking up its corresponding tool_use block.
-    /// Returns "tool_name:primary_arg" for dedup-eligible tools.
+    /// Find a dedup key for a tool result by looking up its corresponding `tool_use` block.
+    /// Returns "`tool_name:primary_arg`" for dedup-eligible tools.
     fn find_tool_dedup_key(
         &self,
         messages: &[AnthropicMessage],
@@ -7797,8 +7765,8 @@ impl Agent {
                 continue;
             }
             for block in &msg.content {
-                if let ContentBlock::ToolUse { id, name, input } = block {
-                    if id == tool_use_id {
+                if let ContentBlock::ToolUse { id, name, input } = block
+                    && id == tool_use_id {
                         // Extract primary argument for dedup
                         let primary_arg = match name.as_str() {
                             "read_file" | "read" => input
@@ -7821,7 +7789,6 @@ impl Agent {
                         };
                         return primary_arg.map(|arg| format!("{name}:{arg}"));
                     }
-                }
             }
         }
         None
@@ -8186,9 +8153,9 @@ impl Agent {
 
         // Calculate base confidence
         let base_confidence = if uncertain_count > confident_count {
-            0.5 - (uncertain_count as f32 * 0.1)
+            (uncertain_count as f32).mul_add(-0.1, 0.5)
         } else if confident_count > uncertain_count {
-            0.8 + (confident_count as f32 * 0.05)
+            (confident_count as f32).mul_add(0.05, 0.8)
         } else {
             0.7 // Neutral
         };
@@ -8294,7 +8261,7 @@ impl Agent {
             / user_text.len().max(1) as f32;
 
         let intensity =
-            (0.3 + (exclamations as f32 * 0.1) + (caps_ratio * 0.3) + (max_matches as f32 * 0.1))
+            (max_matches as f32).mul_add(0.1, caps_ratio.mul_add(0.3, (exclamations as f32).mul_add(0.1, 0.3)))
                 .clamp(0.0, 1.0);
 
         // Suggest tone adjustment
@@ -8352,7 +8319,9 @@ impl Agent {
         let extraction_prompt = build_extraction_prompt(&conversation_text);
 
         // Use the first usable summarization model (cheaper than main model)
-        let (client, model_name) = if !self.config.summarization_priority.is_empty() {
+        let (client, model_name) = if self.config.summarization_priority.is_empty() {
+            ((*self.llm).clone(), self.config.model.clone())
+        } else {
             let mut found = None;
             for model_spec in &self.config.summarization_priority {
                 match self.create_client_for_model(model_spec) {
@@ -8366,8 +8335,6 @@ impl Agent {
                 }
             }
             found.unwrap_or_else(|| ((*self.llm).clone(), self.config.model.clone()))
-        } else {
-            ((*self.llm).clone(), self.config.model.clone())
         };
 
         info!(model = %model_name, "Running memory extraction");
@@ -8409,21 +8376,18 @@ impl Agent {
                     trimmed
                 };
 
-                match nanna_llm::heal_json_as::<Vec<ExtractedMemoryRaw>>(json_str) {
-                    Some(parsed) => {
-                        memories.extend(filter_extracted_memories(parsed));
-                    }
-                    None => {
-                        // This branch is reached precisely when the model wrote prose
-                        // instead of JSON, so the preview is arbitrary model-written
-                        // text: `.min(200)` clamps the length but not the boundary, and
-                        // a raw slice there panics on the first em-dash the model emits.
-                        let end = truncate_boundary(json_str, 200);
-                        warn!(
-                            "Memory extraction JSON parse failed after healing — raw response: {}",
-                            &json_str[..end]
-                        );
-                    }
+                if let Some(parsed) = nanna_llm::heal_json_as::<Vec<ExtractedMemoryRaw>>(json_str) {
+                    memories.extend(filter_extracted_memories(parsed));
+                } else {
+                    // This branch is reached precisely when the model wrote prose
+                    // instead of JSON, so the preview is arbitrary model-written
+                    // text: `.min(200)` clamps the length but not the boundary, and
+                    // a raw slice there panics on the first em-dash the model emits.
+                    let end = truncate_boundary(json_str, 200);
+                    warn!(
+                        "Memory extraction JSON parse failed after healing — raw response: {}",
+                        &json_str[..end]
+                    );
                 }
             }
         }
@@ -8484,16 +8448,13 @@ fn filter_extracted_memories(raw: Vec<ExtractedMemoryRaw>) -> Vec<ExtractedMemor
 /// not be able to impersonate a user assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MemoryProvenance {
     Stated,
+    #[default]
     Observed,
 }
 
-impl Default for MemoryProvenance {
-    fn default() -> Self {
-        Self::Observed
-    }
-}
 
 impl MemoryProvenance {
     /// Classify a free-form model label. Only an explicit, case-insensitive
@@ -8536,7 +8497,7 @@ pub struct ExtractedMemory {
     /// Provenance: did the user state this, or did the agent observe/infer it?
     #[serde(default)]
     pub provenance: MemoryProvenance,
-    /// Optional metadata tags (e.g. tool name, source_id, chunk index)
+    /// Optional metadata tags (e.g. tool name, `source_id`, chunk index)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
 }
@@ -8599,7 +8560,7 @@ struct RunState {
     input_tokens: u32,
     output_tokens: u32,
     final_text: String,
-    /// All text streamed via on_text this run (survives mid-iteration cancel)
+    /// All text streamed via `on_text` this run (survives mid-iteration cancel)
     streamed_text: String,
     confidence: Option<f32>,
     emotional_context: Option<EmotionalContext>,
@@ -8623,7 +8584,7 @@ struct RunState {
     thinking_spiral_nudged: bool,
     /// Streaming aborted on a detected thinking spiral this iteration.
     /// Out-of-band steering signal consumed by the recovery nudge — never
-    /// rendered as text (a marker echoed through on_text became the
+    /// rendered as text (a marker echoed through `on_text` became the
     /// persisted chat reply, observed live 2026-08-02).
     thinking_spiral_detected: bool,
     /// Whether we've already injected a tool-call-loop nudge (only once)
@@ -8682,7 +8643,7 @@ struct RunState {
     /// productive — the stall counter below is the bound).
     mission_rounds: usize,
     /// Mission mode: consecutive continuation rounds with zero tool calls.
-    /// Reset by any tool execution; ends the run at MISSION_STALL_ROUNDS_MAX.
+    /// Reset by any tool execution; ends the run at `MISSION_STALL_ROUNDS_MAX`.
     mission_stall_rounds: usize,
     /// Mission mode: MISSION COMPLETE claims made so far. The first claim
     /// triggers a verification prod; only a re-claim after a round that ran
@@ -8908,7 +8869,7 @@ fn repeat_marker(repeats: usize) -> String {
 }
 
 /// Chunk text into pieces of ~`target_chars` with `overlap_pct` overlap, snapping to line boundaries.
-/// Returns (chunk_index, chunk_content) pairs.
+/// Returns (`chunk_index`, `chunk_content`) pairs.
 fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usize, String)> {
     if text.len() <= target_chars {
         return vec![(0, text.to_string())];
@@ -8944,7 +8905,7 @@ fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usi
     chunks
 }
 
-/// Find the largest byte index <= max_bytes that is a valid char boundary.
+/// Find the largest byte index <= `max_bytes` that is a valid char boundary.
 /// A content-bearing digest of a large tool result: its head and its tail.
 ///
 /// A stub that carries only metadata ("18 KB stored, here is a handle") tells
@@ -8997,7 +8958,7 @@ fn extractive_summary(content: &str) -> String {
     )
 }
 
-fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();
     }
@@ -9048,6 +9009,7 @@ fn is_write_tool(name: &str) -> bool {
 /// (a successful write/edit, or an exec that flipped a definite non-zero exit
 /// to exit 0), not a tool name. Same classification for the generous
 /// questions, a stricter one for the question that ends a step.
+#[must_use]
 pub fn is_work_evidence_tool(name: &str) -> bool {
     is_write_tool(name)
         || matches!(

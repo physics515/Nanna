@@ -165,9 +165,9 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
-    /// OpenAI API key for embeddings (semantic memory)
+    /// `OpenAI` API key for embeddings (semantic memory)
     pub openai_api_key: Option<String>,
-    /// OpenRouter API key for multi-provider access
+    /// `OpenRouter` API key for multi-provider access
     pub openrouter_api_key: Option<String>,
     /// GitHub token for GitHub Models
     pub github_token: Option<String>,
@@ -230,11 +230,10 @@ impl LlmConfig {
         if !self.sub_agent_models.is_empty() {
             return self.sub_agent_models.clone();
         }
-        if let Some(ref legacy) = self.sub_agent_model {
-            if !legacy.is_empty() {
+        if let Some(ref legacy) = self.sub_agent_model
+            && !legacy.is_empty() {
                 return vec![legacy.clone()];
             }
-        }
         if !self.model_priority.is_empty() {
             return self.model_priority.clone();
         }
@@ -248,7 +247,7 @@ impl LlmConfig {
     ///
     /// Onboarding uses this to decide whether to prompt for a key. The old check
     /// looked only at `api_key` (the Anthropic slot), so a user who had entered an
-    /// OpenAI / OpenRouter / GitHub-Models key, or was using Anthropic OAuth, was
+    /// `OpenAI` / `OpenRouter` / GitHub-Models key, or was using Anthropic OAuth, was
     /// wrongly told they had no key. Ollama is intentionally excluded here: it is a
     /// keyless local backend, so "needs a key at all" is a separate question the
     /// onboarding tracks with `needsKey`.
@@ -337,11 +336,11 @@ pub struct AgentConfig {
     pub nudge_interval_iterations: usize,
 }
 
-fn default_nudge_after() -> usize {
+const fn default_nudge_after() -> usize {
     500
 }
 
-fn default_nudge_interval() -> usize {
+const fn default_nudge_interval() -> usize {
     100
 }
 
@@ -474,12 +473,12 @@ pub struct ToolsConfig {
     pub disabled: Vec<String>,
     pub exec_allowlist: Option<Vec<String>>,
     pub file_sandbox: Option<PathBuf>,
-    /// Brave Search API key for web_search tool
+    /// Brave Search API key for `web_search` tool
     pub brave_api_key: Option<String>,
     /// Use TypeScript skill implementations instead of Rust builtins
     pub use_script_tools: bool,
-    /// Directory containing tool scripts (default: {data_dir}/tools/)
-    /// Can be overridden with NANNA_TOOLS_DIR environment variable
+    /// Directory containing tool scripts (default: {`data_dir}/tools`/)
+    /// Can be overridden with `NANNA_TOOLS_DIR` environment variable
     pub tools_dir: Option<PathBuf>,
     /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
     ///
@@ -545,7 +544,7 @@ pub struct SchedulerConfig {
     pub heartbeat_interval_secs: u64,
 }
 
-fn default_heartbeat_interval_secs() -> u64 {
+const fn default_heartbeat_interval_secs() -> u64 {
     1800
 }
 
@@ -640,14 +639,14 @@ pub struct MemoryConfig {
     pub use_embedded_ocr: bool,
 }
 
-fn default_max_compression_ratio() -> f32 { 0.50 }
-fn default_min_remaining_memories() -> usize { 20 }
-fn default_dream_idle_threshold_secs() -> u64 { 300 }
+const fn default_max_compression_ratio() -> f32 { 0.50 }
+const fn default_min_remaining_memories() -> usize { 20 }
+const fn default_dream_idle_threshold_secs() -> u64 { 300 }
 
 /// Remembering conversation is the default: see the field docs.
 const fn default_auto_remember_messages() -> bool { true }
-fn default_dream_memory_pressure_count() -> usize { 5000 }
-fn default_use_embedded_ocr() -> bool { true }
+const fn default_dream_memory_pressure_count() -> usize { 5000 }
+const fn default_use_embedded_ocr() -> bool { true }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -793,26 +792,24 @@ impl Config {
         Ok(())
     }
 
-    /// Hydrate secret fields from SecureStore + environment if they are unset.
+    /// Hydrate secret fields from `SecureStore` + environment if they are unset.
     /// Safe to call repeatedly; never overwrites a value already present.
     pub fn load_secrets_from_store(&mut self) {
         use crate::credentials::{keys, SecureStore};
         let store = SecureStore::new();
         let fill = |slot: &mut Option<String>, key: &str, env: &str| {
-            if slot.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            if slot.as_ref().is_some_and(|s| !s.trim().is_empty()) {
                 return;
             }
-            if let Ok(v) = std::env::var(env) {
-                if !v.trim().is_empty() {
+            if let Ok(v) = std::env::var(env)
+                && !v.trim().is_empty() {
                     *slot = Some(v);
                     return;
                 }
-            }
-            if let Ok(v) = store.get(key) {
-                if !v.trim().is_empty() {
+            if let Ok(v) = store.get(key)
+                && !v.trim().is_empty() {
                     *slot = Some(v);
                 }
-            }
         };
         fill(&mut self.llm.api_key, keys::ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
         fill(&mut self.llm.openai_api_key, keys::OPENAI_API_KEY, "OPENAI_API_KEY");
@@ -1240,13 +1237,13 @@ mod tests {
         let llm = LlmConfig::default();
         assert_eq!(
             llm.effective_sub_agent_models(),
-            vec![llm.model.clone()],
+            vec![llm.model],
             "with nothing configured, sub-agents still get the primary model"
         );
         // An empty-string legacy value must not become a bogus candidate.
         let mut blank = LlmConfig::default();
         blank.sub_agent_model = Some(String::new());
-        assert_eq!(blank.effective_sub_agent_models(), vec![blank.model.clone()]);
+        assert_eq!(blank.effective_sub_agent_models(), vec![blank.model]);
     }
 
     #[test]

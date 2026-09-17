@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert!(!PROTOCOL_VERSION.is_empty());
+        assert_ne!(PROTOCOL_VERSION, "");
     }
 
     /// A transport whose `tools/list` reply encodes how many times it has been

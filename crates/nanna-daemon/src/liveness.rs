@@ -138,7 +138,7 @@ impl Phase {
     /// Wire spelling, identical to the serde rename — for callers that need
     /// the phase as a plain string (log fields, the beat event).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Preparing => "preparing",
@@ -194,7 +194,7 @@ struct LivenessState {
 }
 
 impl LivenessState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             running: false,
             turn_started: None,
@@ -280,7 +280,7 @@ pub struct SessionLiveness {
 }
 
 impl SessionLiveness {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             state: Mutex::new(LivenessState::new()),
         }

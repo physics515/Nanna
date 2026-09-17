@@ -200,7 +200,7 @@ impl Storage {
                 session_id.as_str(), 
                 workspace_id,
                 name,
-                format!("{{\"name\":\"{}\"}}", name).as_str()
+                format!("{{\"name\":\"{name}\"}}").as_str()
             ],
         )
         .await?;
@@ -318,21 +318,18 @@ impl Storage {
     /// Get session name - prefers name field, falls back to metadata, then generates one
     pub fn get_session_name(session: &Session) -> String {
         // First try the name column
-        if let Some(name) = &session.name {
-            if !name.is_empty() {
+        if let Some(name) = &session.name
+            && !name.is_empty() {
                 return name.clone();
             }
-        }
         // Fall back to metadata
         session.metadata
             .as_ref()
             .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| {
+            .and_then(|n| n.as_str()).map_or_else(|| {
                 let end = truncate_boundary(&session.session_id, 8);
                 format!("Session {}", &session.session_id[..end])
-            })
+            }, String::from)
     }
 
     /// Update session's workspace
@@ -504,7 +501,7 @@ mod tests {
         let report = repo.bulk_load_salvage().await.unwrap();
 
         assert_eq!(report.expected, 5);
-        assert!(report.corrupt_ids.is_empty());
+        assert_eq!(report.corrupt_ids, [] as [i64; 0]);
         assert_eq!(report.memories.len(), bulk.len());
         // Same memory_ids in the same order (both ORDER BY id ASC) — the per-id
         // reconstruction is lossless on a clean DB.
@@ -519,7 +516,7 @@ mod tests {
 // Model Stats Persistence
 // =============================================================================
 
-/// Stored model statistics row (mirrors nanna-agent::ModelStats without the dependency)
+/// Stored model statistics row (mirrors `nanna-agent::ModelStats` without the dependency)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredModelStats {
     pub model: String,
@@ -581,7 +578,7 @@ impl Storage {
                     s.total_output_tokens as i64,
                     s.total_cache_read_tokens as i64,
                     s.total_cache_creation_tokens as i64,
-                    s.consecutive_failures as i64,
+                    i64::from(s.consecutive_failures),
                     s.last_success_epoch_ms as i64,
                     s.last_failure_epoch_ms as i64,
                     s.tier_successes_simple as i64,
@@ -667,14 +664,14 @@ impl Storage {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             turso::params![
                 model,
-                success as i64,
+                i64::from(success),
                 latency_ms as i64,
-                input_tokens as i64,
-                output_tokens as i64,
-                cache_read_tokens as i64,
-                cache_creation_tokens as i64,
+                i64::from(input_tokens),
+                i64::from(output_tokens),
+                i64::from(cache_read_tokens),
+                i64::from(cache_creation_tokens),
                 tier.unwrap_or(""),
-                escalated as i64,
+                i64::from(escalated),
                 session_id.unwrap_or("")
             ],
         ).await?;
@@ -714,7 +711,7 @@ impl Storage {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             turso::params![
                 tool_name,
-                success as i64,
+                i64::from(success),
                 duration_ms as i64,
                 output_size as i64,
                 logged_error,
@@ -724,8 +721,8 @@ impl Storage {
 
         // Also update hourly aggregate
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
-        let success_incr = (success && !short_circuited) as i64;
-        let failure_incr = (!success && !short_circuited) as i64;
+        let success_incr = i64::from(success && !short_circuited);
+        let failure_incr = i64::from(!success && !short_circuited);
         conn.execute(
             "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
@@ -760,8 +757,8 @@ impl Storage {
             turso::params![
                 tool_name,
                 day,
-                success as i64,
-                (!success) as i64,
+                i64::from(success),
+                i64::from(!success),
                 duration_ms as i64
             ],
         ).await?;
@@ -888,7 +885,7 @@ impl Storage {
                  WHERE tool_name = ?1
                  ORDER BY created_at DESC
                  LIMIT ?2",
-                turso::params![name, limit as i64],
+                turso::params![name, i64::from(limit)],
             ).await?
         } else {
             conn.query(
@@ -896,7 +893,7 @@ impl Storage {
                  FROM tool_call_log
                  ORDER BY created_at DESC
                  LIMIT ?1",
-                turso::params![limit as i64],
+                turso::params![i64::from(limit)],
             ).await?
         };
         let mut result = Vec::new();
@@ -993,20 +990,20 @@ impl Storage {
     // Tool Stats (aggregated — replaces tool-stats.json)
     // =========================================================================
 
-    /// Save aggregated tool stats to the tool_stats table (upsert).
+    /// Save aggregated tool stats to the `tool_stats` table (upsert).
     pub async fn save_tool_stats_aggregated(&self, stats: &serde_json::Value) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         // The JSON is expected to be { "tools": { "tool_name": { stats... }, ... }, "sessions": N }
         if let Some(tools) = stats.get("tools").and_then(|v| v.as_object()) {
             for (tool_name, tool_data) in tools {
-                let call_count = tool_data.get("call_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let success_count = tool_data.get("success_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let failure_count = tool_data.get("failure_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let total_duration_ms = tool_data.get("total_duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                let latencies = tool_data.get("latencies_ms").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-                let output_sizes = tool_data.get("output_sizes").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-                let errors = tool_data.get("errors").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+                let call_count = tool_data.get("call_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let success_count = tool_data.get("success_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let failure_count = tool_data.get("failure_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let total_duration_ms = tool_data.get("total_duration_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let latencies = tool_data.get("latencies_ms").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+                let output_sizes = tool_data.get("output_sizes").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+                let errors = tool_data.get("errors").map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
 
                 conn.execute(
                     "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, updated_at)
@@ -1033,7 +1030,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Load aggregated tool stats from the tool_stats table (returns the JSON format ToolStatsTracker expects).
+    /// Load aggregated tool stats from the `tool_stats` table (returns the JSON format `ToolStatsTracker` expects).
     pub async fn load_tool_stats_aggregated(&self) -> Result<serde_json::Value, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn.query(
@@ -1108,7 +1105,7 @@ impl Storage {
     }
 
     /// Add a daemon message to the messages table.
-    /// Stores tool_calls, attachments, and reasoning in the metadata JSON field.
+    /// Stores `tool_calls`, attachments, and reasoning in the metadata JSON field.
     pub async fn add_daemon_message(
         &self,
         session_id: &str,

@@ -1,6 +1,6 @@
 //! Memory handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, warn, info, error, ControlPlane, MemoryAction, Value, ConsolidationConfig};
 
 impl ControlPlane {
     // =========================================================================
@@ -36,9 +36,7 @@ impl ControlPlane {
                         let fact_type = m.metadata.get("fact_type")
                             .cloned()
                             .unwrap_or_else(|| "unknown".to_string());
-                        let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                            .unwrap_or_else(|| m.timestamp.to_string());
+                        let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0).map_or_else(|| m.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
 
                         json!({
                             "id": m.id,
@@ -132,9 +130,7 @@ impl ControlPlane {
                     let fact_type = entry.metadata.get("fact_type")
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
-                    let created_at = chrono::DateTime::from_timestamp(entry.timestamp, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| entry.timestamp.to_string());
+                    let created_at = chrono::DateTime::from_timestamp(entry.timestamp, 0).map_or_else(|| entry.timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
                     
                     json!({
                         "memory": {
@@ -161,7 +157,7 @@ impl ControlPlane {
                     metadata.insert("tags".to_string(), tags.join(","));
                 }
 
-                match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
+                match memory.remember_with_importance(&content, metadata, f32::from(importance.unwrap_or(3))).await {
                     Ok((id, action)) => {
                         // Memory auto-persisted to Turso via write-through.
                         json!({
@@ -346,20 +342,17 @@ impl ControlPlane {
                 // call when no orchestrator is attached (minimal
                 // constructions); the fallback reports zero promotions and
                 // demotions because only the orchestrator tallies feedback.
-                let dreamed = match self.dreaming {
-                    Some(ref dreaming) => {
-                        dreaming.dream_with_consolidation(&config, summarize).await
-                    }
-                    None => {
-                        let fallback = memory.consolidate(&config, summarize).await;
-                        let total_memories = memory.count().await;
-                        fallback.map(|consolidation| nanna_memory::DreamingStats {
-                            consolidation,
-                            auto_promoted: 0,
-                            auto_demoted: 0,
-                            total_memories,
-                        })
-                    }
+                let dreamed = if let Some(ref dreaming) = self.dreaming {
+                    dreaming.dream_with_consolidation(&config, summarize).await
+                } else {
+                    let fallback = memory.consolidate(&config, summarize).await;
+                    let total_memories = memory.count().await;
+                    fallback.map(|consolidation| nanna_memory::DreamingStats {
+                        consolidation,
+                        auto_promoted: 0,
+                        auto_demoted: 0,
+                        total_memories,
+                    })
                 };
 
                 match dreamed {

@@ -1,6 +1,6 @@
 //! Channel handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, ControlPlane, ChannelAction, Value};
 
 impl ControlPlane {
     // =========================================================================
@@ -19,8 +19,7 @@ impl ControlPlane {
                 // Check which channels are configured (have credentials)
                 let telegram_configured = config.channels.telegram
                     .as_ref()
-                    .map(|t| !t.bot_token.is_empty())
-                    .unwrap_or(false);
+                    .is_some_and(|t| !t.bot_token.is_empty());
                 channels.push(json!({
                     "id": "telegram",
                     "type": "telegram",
@@ -29,8 +28,7 @@ impl ControlPlane {
                 
                 let discord_configured = config.channels.discord
                     .as_ref()
-                    .map(|d| !d.bot_token.is_empty())
-                    .unwrap_or(false);
+                    .is_some_and(|d| !d.bot_token.is_empty());
                 channels.push(json!({
                     "id": "discord",
                     "type": "discord",
@@ -39,8 +37,7 @@ impl ControlPlane {
                 
                 let slack_configured = config.channels.slack
                     .as_ref()
-                    .map(|s| !s.bot_token.is_empty())
-                    .unwrap_or(false);
+                    .is_some_and(|s| !s.bot_token.is_empty());
                 channels.push(json!({
                     "id": "slack",
                     "type": "slack",
@@ -49,8 +46,7 @@ impl ControlPlane {
                 
                 let signal_configured = config.channels.signal
                     .as_ref()
-                    .map(|s| !s.phone_number.is_empty())
-                    .unwrap_or(false);
+                    .is_some_and(|s| !s.phone_number.is_empty());
                 channels.push(json!({
                     "id": "signal",
                     "type": "signal",
@@ -59,8 +55,7 @@ impl ControlPlane {
                 
                 let whatsapp_configured = config.channels.whatsapp
                     .as_ref()
-                    .map(|w| w.access_token.is_some())
-                    .unwrap_or(false);
+                    .is_some_and(|w| w.access_token.is_some());
                 channels.push(json!({
                     "id": "whatsapp",
                     "type": "whatsapp",
@@ -77,24 +72,21 @@ impl ControlPlane {
                     });
                 };
 
-                match id {
-                    Some(channel_id) => match status_manager.get(&channel_id).await {
-                        Some(status) => json!({ "channel": status }),
-                        None => json!({
-                            "error": "not_found",
-                            "channel_id": channel_id,
-                            "message": "No status registered for this channel",
-                        }),
-                    },
-                    None => {
-                        let channels: Vec<_> = status_manager
-                            .all()
-                            .await
-                            .into_values()
-                            .collect();
-                        let summary = status_manager.summary().await;
-                        json!({ "channels": channels, "summary": summary })
-                    }
+                if let Some(channel_id) = id { match status_manager.get(&channel_id).await {
+                    Some(status) => json!({ "channel": status }),
+                    None => json!({
+                        "error": "not_found",
+                        "channel_id": channel_id,
+                        "message": "No status registered for this channel",
+                    }),
+                } } else {
+                    let channels: Vec<_> = status_manager
+                        .all()
+                        .await
+                        .into_values()
+                        .collect();
+                    let summary = status_manager.summary().await;
+                    json!({ "channels": channels, "summary": summary })
                 }
             }
             ChannelAction::Enable { id } => {

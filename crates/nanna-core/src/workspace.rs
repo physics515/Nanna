@@ -82,7 +82,7 @@ pub struct WorkspaceContext {
 impl WorkspaceContext {
     /// Check if context has any content
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.readme.is_none()
             && self.agents.is_none()
             && self.contributing.is_none()
@@ -179,8 +179,8 @@ pub struct GlobalPersona {
 impl GlobalPersona {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.persona.as_ref().map_or(true, |s| s.trim().is_empty())
-            && self.user_profile.as_ref().map_or(true, |s| s.trim().is_empty())
+        self.persona.as_ref().is_none_or(|s| s.trim().is_empty())
+            && self.user_profile.as_ref().is_none_or(|s| s.trim().is_empty())
     }
 
     /// Build the system-prompt section for global persona/user.
@@ -232,9 +232,7 @@ impl Workspace {
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "workspace".to_string());
+            .file_name().map_or_else(|| "workspace".to_string(), |n| n.to_string_lossy().to_string());
         let id = uuid::Uuid::new_v4().to_string();
 
         Self {
@@ -398,7 +396,7 @@ impl Workspace {
 }
 
 /// Default root AGENTS.md template (minimal).
-pub const DEFAULT_AGENTS_MD: &str = r#"# AGENTS.md
+pub const DEFAULT_AGENTS_MD: &str = r"# AGENTS.md
 
 This is the project workspace. Treat it that way.
 
@@ -419,7 +417,7 @@ This is the project workspace. Treat it that way.
 Capture build commands, architecture notes, and common pitfalls here so future
 sessions start with that knowledge. Keep it concise — this file is injected into
 every prompt.
-"#;
+";
 
 /// Maximum length of a workspace context filename, in bytes.
 const CONTEXT_FILENAME_LEN_MAX: usize = 128;
@@ -474,11 +472,10 @@ async fn read_optional_file(path: &Path) -> Result<Option<String>, WorkspaceErro
 pub async fn find_workspace_root(start_path: impl AsRef<Path>) -> Option<PathBuf> {
     let mut current = start_path.as_ref().to_path_buf();
 
-    if current.is_relative() {
-        if let Ok(abs) = current.canonicalize() {
+    if current.is_relative()
+        && let Ok(abs) = current.canonicalize() {
             current = abs;
         }
-    }
 
     loop {
         for marker in WORKSPACE_MARKERS {
@@ -564,11 +561,10 @@ impl WorkspaceRegistry {
         if !self.workspaces.contains_key(id) {
             return false;
         }
-        if let Some(prev) = self.active_id.take() {
-            if let Some(ws) = self.workspaces.get_mut(&prev) {
+        if let Some(prev) = self.active_id.take()
+            && let Some(ws) = self.workspaces.get_mut(&prev) {
                 ws.active = false;
             }
-        }
         if let Some(ws) = self.workspaces.get_mut(id) {
             ws.active = true;
             ws.last_accessed = chrono_timestamp();
@@ -578,11 +574,10 @@ impl WorkspaceRegistry {
     }
 
     pub fn clear_active(&mut self) {
-        if let Some(prev) = self.active_id.take() {
-            if let Some(ws) = self.workspaces.get_mut(&prev) {
+        if let Some(prev) = self.active_id.take()
+            && let Some(ws) = self.workspaces.get_mut(&prev) {
                 ws.active = false;
             }
-        }
     }
 
     #[must_use]
@@ -623,8 +618,7 @@ impl WorkspaceRegistry {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -637,7 +631,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         assert_eq!(ws.path, dir.path());
-        assert!(!ws.id.is_empty());
+        assert_ne!(ws.id, "");
     }
 
     #[tokio::test]

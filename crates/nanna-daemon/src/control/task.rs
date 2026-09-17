@@ -131,15 +131,14 @@ impl ControlPlane {
                     let append_after = repo
                         .list(&scope, scope_id.as_deref(), true)
                         .await
-                        .map(|tasks| {
+                        .map_or(0, |tasks| {
                             tasks
                                 .iter()
                                 .map(|t| t.sort_order)
                                 .max()
                                 .unwrap_or(0)
                                 .saturating_add(1)
-                        })
-                        .unwrap_or(0);
+                        });
                     (scope, scope_id, append_after)
                 };
                 // Canonicalize through the harness parser: a shape that would

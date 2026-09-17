@@ -4,8 +4,8 @@
 //! Browser automation for Nanna
 //!
 //! Supports multiple backends:
-//! - **Playwright** (default): Multi-browser support (Chromium, Firefox, WebKit)
-//! - **CDP**: Direct Chrome DevTools Protocol via chromiumoxide
+//! - **Playwright** (default): Multi-browser support (Chromium, Firefox, `WebKit`)
+//! - **CDP**: Direct Chrome `DevTools` Protocol via chromiumoxide
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -53,17 +53,14 @@ pub enum BrowserError {
 /// Supported browser types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum BrowserType {
+    #[default]
     Chromium,
     Firefox,
     Webkit,
 }
 
-impl Default for BrowserType {
-    fn default() -> Self {
-        Self::Chromium
-    }
-}
 
 impl std::fmt::Display for BrowserType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,7 +75,7 @@ impl std::fmt::Display for BrowserType {
 /// Browser configuration
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
-    /// Browser type (Chromium, Firefox, WebKit)
+    /// Browser type (Chromium, Firefox, `WebKit`)
     pub browser_type: BrowserType,
     /// Run in headless mode
     pub headless: bool,
@@ -131,20 +128,20 @@ impl BrowserConfig {
     }
 
     #[must_use]
-    pub fn headless(mut self, headless: bool) -> Self {
+    pub const fn headless(mut self, headless: bool) -> Self {
         self.headless = headless;
         self
     }
 
     #[must_use]
-    pub fn viewport(mut self, width: u32, height: u32) -> Self {
+    pub const fn viewport(mut self, width: u32, height: u32) -> Self {
         self.viewport_width = width;
         self.viewport_height = height;
         self
     }
 
     #[must_use]
-    pub fn timeout_ms(mut self, ms: u64) -> Self {
+    pub const fn timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = ms;
         self
     }
@@ -279,7 +276,7 @@ pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, Browser
                 "CDP backend only supports Chromium. Enable 'playwright' feature for Firefox/WebKit.".to_string(),
             ));
         }
-        return Ok(Arc::new(cdp::CdpBrowser::new(config)));
+        Ok(Arc::new(cdp::CdpBrowser::new(config)))
     }
 
     #[cfg(not(any(feature = "cdp", feature = "playwright")))]

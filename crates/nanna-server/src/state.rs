@@ -391,7 +391,7 @@ impl AppStateBuilder {
 
     /// Enable or disable the dreaming memory system.
     #[must_use]
-    pub fn dreaming(mut self, enable: bool) -> Self {
+    pub const fn dreaming(mut self, enable: bool) -> Self {
         self.enable_dreaming = enable;
         self
     }
@@ -405,7 +405,7 @@ impl AppStateBuilder {
 
     /// Enable or disable the scheduler.
     #[must_use]
-    pub fn scheduler(mut self, enable: bool) -> Self {
+    pub const fn scheduler(mut self, enable: bool) -> Self {
         self.enable_scheduler = enable;
         self
     }

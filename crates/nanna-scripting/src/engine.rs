@@ -49,7 +49,7 @@ pub struct ScriptEngine {
 impl ScriptEngine {
     /// Create a new script engine (Boa preferred, Deno fallback)
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             prefer_boa: true,
             enable_fallback: cfg!(all(feature = "boa", feature = "deno")),
@@ -223,8 +223,8 @@ impl ScriptEngine {
             }
             Err(primary_err) => {
                 // Try fallback if enabled
-                if self.enable_fallback {
-                    if let Some(fallback) = secondary {
+                if self.enable_fallback
+                    && let Some(fallback) = secondary {
                         warn!(
                             tool = %tool.name,
                             primary = %primary,
@@ -259,7 +259,6 @@ impl ScriptEngine {
                             }
                         }
                     }
-                }
 
                 Err(primary_err)
             }

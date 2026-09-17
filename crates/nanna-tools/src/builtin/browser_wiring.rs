@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 // Tracing available for future use
-use tracing::debug;
 
 /// Browser manager that maintains a browser instance for tool use.
 pub struct BrowserManager {
@@ -70,22 +69,21 @@ impl BrowserManager {
 
         let full_page = params
             .get("full_page")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let format = params
             .get("format")
             .and_then(|v| v.as_str())
-            .map(|f| match f.to_lowercase().as_str() {
+            .map_or(ImageFormat::Png, |f| match f.to_lowercase().as_str() {
                 "jpeg" | "jpg" => ImageFormat::Jpeg,
                 _ => ImageFormat::Png,
-            })
-            .unwrap_or(ImageFormat::Png);
+            });
 
         let options = ScreenshotOptions {
             full_page,
             format,
-            quality: params.get("quality").and_then(|v| v.as_u64()).map(|q| q as u8),
+            quality: params.get("quality").and_then(serde_json::Value::as_u64).map(|q| q as u8),
             selector: params.get("selector").and_then(|v| v.as_str()).map(String::from),
         };
 
@@ -166,7 +164,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Click requires 'selector'")?;
                 page.click(selector).await.map_err(|e| e.to_string())?;
-                Ok(format!("Clicked '{}'", selector))
+                Ok(format!("Clicked '{selector}'"))
             }
             "type" => {
                 let selector = params
@@ -178,7 +176,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Type requires 'text'")?;
                 page.type_text(selector, text).await.map_err(|e| e.to_string())?;
-                Ok(format!("Typed into '{}'", selector))
+                Ok(format!("Typed into '{selector}'"))
             }
             "fill" => {
                 let selector = params
@@ -190,7 +188,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Fill requires 'text'")?;
                 page.fill(selector, text).await.map_err(|e| e.to_string())?;
-                Ok(format!("Filled '{}'", selector))
+                Ok(format!("Filled '{selector}'"))
             }
             "press" => {
                 let selector = params
@@ -202,15 +200,15 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Press requires 'key'")?;
                 page.press(selector, key).await.map_err(|e| e.to_string())?;
-                Ok(format!("Pressed '{}' on '{}'", key, selector))
+                Ok(format!("Pressed '{key}' on '{selector}'"))
             }
             "wait" => {
                 let ms = params
                     .get("wait_ms")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(1000);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                Ok(format!("Waited {}ms", ms))
+                Ok(format!("Waited {ms}ms"))
             }
             "wait_selector" => {
                 let selector = params
@@ -218,7 +216,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("wait_selector requires 'selector'")?;
                 page.wait_for_selector(selector).await.map_err(|e| e.to_string())?;
-                Ok(format!("Found '{}'", selector))
+                Ok(format!("Found '{selector}'"))
             }
             // `scroll` and `navigate` are both in the `browser_action` skill's
             // advertised enum and neither was implemented, so the model was
@@ -247,7 +245,7 @@ impl BrowserManager {
                 page.goto(target).await.map_err(|e| e.to_string())?;
                 Ok(format!("Navigated to '{target}'"))
             }
-            _ => Err(format!("Unknown action: {}", action)),
+            _ => Err(format!("Unknown action: {action}")),
         }
     }
 
@@ -308,7 +306,7 @@ pub fn create_browser_tools(
     let action_tool = BrowserActionTool::new().with_action_fn(action_fn);
 
     // Evaluate tool
-    let mgr = manager.clone();
+    let mgr = manager;
     let evaluate_fn: BrowserFn<Value> = Arc::new(move |url, params| {
         let mgr = mgr.clone();
         Box::pin(async move { mgr.evaluate(&url, &params).await })

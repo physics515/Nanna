@@ -63,8 +63,7 @@ fn parse_ts(v: Option<&serde_json::Value>) -> i64 {
     match v {
         Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
         Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.timestamp())
-            .unwrap_or(0),
+            .map_or(0, |dt| dt.timestamp()),
         _ => 0,
     }
 }

@@ -130,7 +130,7 @@ pub struct ModelCost {
     pub priced: bool,
 }
 
-/// Per-request stats to attach to an AgentResponse for UI display.
+/// Per-request stats to attach to an `AgentResponse` for UI display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestModelStats {
     /// Which model actually handled this request
@@ -247,7 +247,7 @@ impl ModelStatsTracker {
     pub async fn is_healthy(&self, model: &str) -> bool {
         let inner = self.inner.read().await;
         inner.models.get(model)
-            .map_or(true, |s| s.consecutive_failures < UNHEALTHY_THRESHOLD)
+            .is_none_or(|s| s.consecutive_failures < UNHEALTHY_THRESHOLD)
     }
 
     /// Get summary statistics for all tracked models.
@@ -515,7 +515,7 @@ impl ModelStatsTracker {
     }
 }
 
-/// Flat struct matching nanna-storage::StoredModelStats layout.
+/// Flat struct matching `nanna-storage::StoredModelStats` layout.
 /// This avoids a cross-crate dependency while keeping the types aligned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorableModelStats {

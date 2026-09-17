@@ -47,7 +47,7 @@ pub struct DiscordListener {
 impl DiscordListener {
     /// Create a new Discord Gateway listener
     ///
-    /// Default intents: GUILDS, GUILD_MESSAGES, MESSAGE_CONTENT, DIRECT_MESSAGES
+    /// Default intents: GUILDS, `GUILD_MESSAGES`, `MESSAGE_CONTENT`, `DIRECT_MESSAGES`
     pub fn new(bot_token: impl Into<String>) -> Self {
         Self {
             bot_token: bot_token.into(),
@@ -64,7 +64,7 @@ impl DiscordListener {
 
     /// Set custom intents
     #[must_use]
-    pub fn with_intents(mut self, intents: u64) -> Self {
+    pub const fn with_intents(mut self, intents: u64) -> Self {
         self.intents = intents;
         self
     }
@@ -111,7 +111,7 @@ impl DiscordListener {
         })
     }
 
-    /// Convert Discord message to IncomingMessage
+    /// Convert Discord message to `IncomingMessage`
     fn convert_message(&self, data: &Value, self_id: &Option<String>) -> Option<IncomingMessage> {
         // Skip messages from self
         let author_id = data.get("author")?.get("id")?.as_str()?;
@@ -127,14 +127,12 @@ impl DiscordListener {
         let guild_id = data.get("guild_id").and_then(|v| v.as_str());
         
         // Check if guild is allowed
-        if !self.allowed_guilds.is_empty() {
-            if let Some(gid) = guild_id {
-                if !self.allowed_guilds.iter().any(|g| g == gid) {
+        if !self.allowed_guilds.is_empty()
+            && let Some(gid) = guild_id
+                && !self.allowed_guilds.iter().any(|g| g == gid) {
                     debug!("Ignoring message from non-allowed guild {}", gid);
                     return None;
                 }
-            }
-        }
 
         let channel_id = data.get("channel_id")?.as_str()?;
         let message_id = data.get("id")?.as_str()?;
@@ -156,10 +154,10 @@ impl DiscordListener {
         let referenced = data.get("referenced_message")
             .and_then(|r| r.get("id"))
             .and_then(|v| v.as_str())
-            .map(|id| format!("{}:{}", channel_id, id));
+            .map(|id| format!("{channel_id}:{id}"));
 
         Some(IncomingMessage {
-            id: format!("{}:{}", channel_id, message_id),
+            id: format!("{channel_id}:{message_id}"),
             channel: ChannelId::new("discord", channel_id.to_string()),
             sender: Sender {
                 id: author_id.to_string(),
@@ -207,7 +205,7 @@ impl DiscordListener {
             let (ws_stream, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = match connect_async(&url).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let detail = format!("WebSocket connect failed: {}", e);
+                    let detail = format!("WebSocket connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -281,11 +279,10 @@ impl DiscordListener {
                                             if let Some(url) = d.get("resume_gateway_url").and_then(|v| v.as_str()) {
                                                 *self.resume_url.write().await = Some(url.to_string());
                                             }
-                                            if let Some(user) = d.get("user") {
-                                                if let Some(id) = user.get("id").and_then(|v| v.as_str()) {
+                                            if let Some(user) = d.get("user")
+                                                && let Some(id) = user.get("id").and_then(|v| v.as_str()) {
                                                     *self.self_id.write().await = Some(id.to_string());
                                                 }
-                                            }
                                             cb.record_success().await;
                                             info!("Discord Gateway READY");
                                         }
@@ -329,7 +326,7 @@ impl DiscordListener {
                             // Invalid session
                             9 => {
                                 let resumable = payload.d.as_ref()
-                                    .and_then(|d| d.as_bool())
+                                    .and_then(serde_json::Value::as_bool)
                                     .unwrap_or(false);
                                 warn!("Discord Gateway invalid session (resumable: {})", resumable);
                                 should_resume = resumable;
@@ -343,12 +340,11 @@ impl DiscordListener {
                             }
                             // Hello
                             10 => {
-                                if let Some(d) = &payload.d {
-                                    if let Some(interval) = d.get("heartbeat_interval").and_then(|v| v.as_u64()) {
+                                if let Some(d) = &payload.d
+                                    && let Some(interval) = d.get("heartbeat_interval").and_then(serde_json::Value::as_u64) {
                                         _heartbeat_interval = Some(Duration::from_millis(interval));
                                         debug!("Heartbeat interval: {}ms", interval);
                                     }
-                                }
 
                                 // Send identify or resume
                                 let session = self.session_id.read().await.clone();
@@ -393,7 +389,7 @@ impl DiscordListener {
 
 #[async_trait]
 impl Listener for DiscordListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "discord"
     }
 

@@ -74,8 +74,8 @@ pub enum CredentialError {
 impl From<keyring::Error> for CredentialError {
     fn from(e: keyring::Error) -> Self {
         match e {
-            keyring::Error::NoEntry => CredentialError::NotFound,
-            _ => CredentialError::Keyring(e.to_string()),
+            keyring::Error::NoEntry => Self::NotFound,
+            _ => Self::Keyring(e.to_string()),
         }
     }
 }
@@ -102,7 +102,7 @@ pub struct SecureStore {
 impl SecureStore {
     /// Create a new secure store
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             allow_file_fallback: true,
             file_only: false,
@@ -112,7 +112,7 @@ impl SecureStore {
 
     /// Create without file fallback (keyring-only)
     #[must_use]
-    pub fn keyring_only() -> Self {
+    pub const fn keyring_only() -> Self {
         Self {
             allow_file_fallback: false,
             file_only: false,
@@ -222,11 +222,13 @@ impl SecureStore {
     }
     
     /// Check if a credential exists
+    #[must_use]
     pub fn exists(&self, key: &str) -> bool {
         self.get(key).is_ok()
     }
     
     /// List all stored credential keys (keyring doesn't support listing, so we check known keys)
+    #[must_use]
     pub fn list_keys(&self) -> Vec<String> {
         let known_keys = [
             keys::ANTHROPIC_API_KEY,
@@ -247,7 +249,7 @@ impl SecureStore {
         known_keys
             .iter()
             .filter(|k| self.exists(k))
-            .map(|k| k.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     }
 
@@ -407,17 +409,16 @@ impl SecureStore {
     fn file_encryption_key(&self) -> Result<[u8; 32], CredentialError> {
         // In file-only mode (tests/headless) never touch the OS keyring: the whole
         // point is determinism. Always use the colocated key file.
-        if !self.file_only {
-            if let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
+        if !self.file_only
+            && let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
                 match entry.get_password() {
                     Ok(b64) => {
-                        if let Ok(bytes) = base64_decode(&b64) {
-                            if bytes.len() == 32 {
+                        if let Ok(bytes) = base64_decode(&b64)
+                            && bytes.len() == 32 {
                                 let mut key = [0u8; 32];
                                 key.copy_from_slice(&bytes);
                                 return Ok(key);
                             }
-                        }
                     }
                     Err(keyring::Error::NoEntry) => {
                         let key = random_key()?;
@@ -428,7 +429,6 @@ impl SecureStore {
                     Err(_) => {}
                 }
             }
-        }
         let key_path = self
             .credentials_file_path()?
             .with_file_name("credentials.key");
@@ -520,7 +520,7 @@ impl OAuthCredential {
 
     /// Check if the token can be refreshed
     #[must_use]
-    pub fn can_refresh(&self) -> bool {
+    pub const fn can_refresh(&self) -> bool {
         self.refresh_token.is_some()
     }
 
@@ -621,13 +621,13 @@ impl Default for ClaudeCredentialManager {
 impl ClaudeCredentialManager {
     /// Create a new credential manager
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { home_dir: None }
     }
 
     /// Create with a custom home directory (for testing)
     #[must_use]
-    pub fn with_home_dir(home_dir: PathBuf) -> Self {
+    pub const fn with_home_dir(home_dir: PathBuf) -> Self {
         Self {
             home_dir: Some(home_dir),
         }
@@ -806,8 +806,7 @@ impl ClaudeCredentialManager {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(CredentialError::RefreshFailed(format!(
-                "Token refresh failed with status {}: {}",
-                status, body
+                "Token refresh failed with status {status}: {body}"
             )));
         }
 
@@ -865,9 +864,8 @@ impl ClaudeCredentialManager {
                     credential: new_credential,
                     source: loaded.source,
                 });
-            } else {
-                return Err(CredentialError::Expired);
             }
+            return Err(CredentialError::Expired);
         }
 
         Ok(loaded)

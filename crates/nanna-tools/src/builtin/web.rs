@@ -265,7 +265,7 @@ impl Tool for WebSearchBatchTool {
         // Format combined results
         let mut output = String::new();
         for (query, results) in &all_results {
-            output.push_str(&format!("=== Query: \"{}\" ===\n", query));
+            output.push_str(&format!("=== Query: \"{query}\" ===\n"));
             for (i, result) in results.iter().take(results_per).enumerate() {
                 output.push_str(&format!(
                     "{}. {}\n   {}\n   {}\n\n",
@@ -398,7 +398,7 @@ impl Tool for WebFetchTool {
 /// Fetched pages are full of multi-byte characters — em dashes, curly quotes,
 /// CJK — and slicing a string at a byte index inside one panics, taking the
 /// whole process down, so the cut walks back to the nearest boundary.
-fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();
     }
@@ -432,24 +432,22 @@ fn extract_readable_content(html: &str) -> String {
 
     // Try each content selector
     for selector_str in &content_selectors {
-        if let Ok(selector) = Selector::parse(selector_str) {
-            if let Some(element) = document.select(&selector).next() {
+        if let Ok(selector) = Selector::parse(selector_str)
+            && let Some(element) = document.select(&selector).next() {
                 let text = extract_text_from_element(&element);
                 if text.len() > 200 {
                     // Likely main content
                     return clean_extracted_text(&text);
                 }
             }
-        }
     }
 
     // Fallback: extract from body, excluding common noise elements
-    if let Ok(body_selector) = Selector::parse("body") {
-        if let Some(body) = document.select(&body_selector).next() {
+    if let Ok(body_selector) = Selector::parse("body")
+        && let Some(body) = document.select(&body_selector).next() {
             let text = extract_text_from_element(&body);
             return clean_extracted_text(&text);
         }
-    }
 
     // Last resort: strip all tags
     strip_html_basic(html)

@@ -1,6 +1,6 @@
 //! Memory tools for remembering and recalling information
 //!
-//! Uses MemoryService for persistent storage with embeddings and FSRS.
+//! Uses `MemoryService` for persistent storage with embeddings and FSRS.
 
 use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
-/// Adapter that wraps MemoryService to implement MemoryStorage trait.
+/// Adapter that wraps `MemoryService` to implement `MemoryStorage` trait.
 /// This bridges the gap between the tool abstraction and the actual memory service.
 pub struct MemoryServiceStorage {
     service: Arc<dyn MemoryServiceAdapter + Send + Sync>,
 }
 
-/// Trait to abstract over MemoryService (allows using it without direct dependency)
+/// Trait to abstract over `MemoryService` (allows using it without direct dependency)
 #[async_trait]
 pub trait MemoryServiceAdapter: Send + Sync {
     async fn remember(&self, content: &str, metadata: HashMap<String, String>, importance: f32) -> Result<String, String>;

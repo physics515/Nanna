@@ -76,7 +76,7 @@ pub async fn list_sessions(
                         name: s.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string(),
                         created_at: s.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         updated_at: s.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        message_count: s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        message_count: s.get("message_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
                         workspace_id: s.get("workspace_id").and_then(|v| v.as_str()).map(String::from),
                         workspace_name: s.get("workspace_name").and_then(|v| v.as_str()).map(String::from),
                         // Absent (not null) on an unpinned session — the daemon's
@@ -168,7 +168,7 @@ pub async fn clear_all_sessions(
 ) -> Result<usize, String> {
     let state_guard = state.read().await;
     let count = match state_guard.backend.sessions_delete_all().await {
-        Ok(result) => result.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        Ok(result) => result.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
         Err(e) => {
             warn!("Failed to clear daemon sessions: {e}");
             return Err(format!("Failed to clear sessions: {e}"));

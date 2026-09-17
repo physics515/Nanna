@@ -140,26 +140,22 @@ impl WorkspaceFiles {
     pub fn to_system_context(&self) -> String {
         let mut sections = Vec::new();
 
-        if let Some(ref readme) = self.readme {
-            if readme.has_content() {
+        if let Some(ref readme) = self.readme
+            && readme.has_content() {
                 sections.push(format!("## README.md\n{}", readme.content));
             }
-        }
-        if let Some(ref agents) = self.agents {
-            if agents.has_content() {
+        if let Some(ref agents) = self.agents
+            && agents.has_content() {
                 sections.push(format!("## AGENTS.md\n{}", agents.content));
             }
-        }
-        if let Some(ref contributing) = self.contributing {
-            if contributing.has_content() {
+        if let Some(ref contributing) = self.contributing
+            && contributing.has_content() {
                 sections.push(format!("## CONTRIBUTING.md\n{}", contributing.content));
             }
-        }
-        if let Some(ref roadmap) = self.roadmap {
-            if roadmap.has_content() {
+        if let Some(ref roadmap) = self.roadmap
+            && roadmap.has_content() {
                 sections.push(format!("## ROADMAP.md\n{}", roadmap.content));
             }
-        }
 
         let files_context = if sections.is_empty() {
             String::new()
@@ -199,26 +195,22 @@ impl WorkspaceFiles {
     #[must_use]
     pub fn existing_files(&self) -> Vec<&WorkspaceFile> {
         let mut files = Vec::new();
-        if let Some(ref f) = self.readme {
-            if f.exists {
+        if let Some(ref f) = self.readme
+            && f.exists {
                 files.push(f);
             }
-        }
-        if let Some(ref f) = self.agents {
-            if f.exists {
+        if let Some(ref f) = self.agents
+            && f.exists {
                 files.push(f);
             }
-        }
-        if let Some(ref f) = self.contributing {
-            if f.exists {
+        if let Some(ref f) = self.contributing
+            && f.exists {
                 files.push(f);
             }
-        }
-        if let Some(ref f) = self.roadmap {
-            if f.exists {
+        if let Some(ref f) = self.roadmap
+            && f.exists {
                 files.push(f);
             }
-        }
         files
     }
 

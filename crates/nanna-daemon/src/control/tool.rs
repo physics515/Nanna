@@ -1,6 +1,6 @@
 //! Tool handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, info, ControlPlane, ToolAction, Value};
 
 impl ControlPlane {
     // =========================================================================
@@ -148,7 +148,7 @@ impl ControlPlane {
                     return json!({ "error": "user_tools_unavailable", "message": "User tool manager not configured" });
                 };
                 
-                let permissions = needs_shell.map(|ns| {
+                let permissions = needs_shell.and_then(|ns| {
                     if ns {
                         Some(crate::user_tools::UserToolPermissions {
                             run: true,
@@ -157,7 +157,7 @@ impl ControlPlane {
                     } else {
                         None
                     }
-                }).flatten();
+                });
                 
                 match user_tools.update_tool(&name, description, code, None, permissions, None).await {
                     Ok(meta) => {

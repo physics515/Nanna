@@ -1,6 +1,6 @@
 //! Signal webhook handler (signal-cli-rest-api compatible)
 //!
-//! Works with: https://github.com/bbernhard/signal-cli-rest-api
+//! Works with: <https://github.com/bbernhard/signal-cli-rest-api>
 
 use crate::state::AppState;
 use crate::webhooks::auth;
@@ -173,19 +173,16 @@ pub async fn handle(
     let envelope = &webhook.envelope;
 
     // Skip non-data messages (typing, receipts, etc.)
-    let data_message = match &envelope.data_message {
-        Some(dm) => dm,
-        None => {
-            // Check for sync message (message sent from another device)
-            if envelope.sync_message.is_some() {
-                debug!("Ignoring sync message");
-            }
-            return Ok(Json(SignalResponse {
-                message: None,
-                recipient: None,
-                group_id: None,
-            }));
+    let data_message = if let Some(dm) = &envelope.data_message { dm } else {
+        // Check for sync message (message sent from another device)
+        if envelope.sync_message.is_some() {
+            debug!("Ignoring sync message");
         }
+        return Ok(Json(SignalResponse {
+            message: None,
+            recipient: None,
+            group_id: None,
+        }));
     };
 
     // Skip reactions
@@ -233,7 +230,7 @@ pub async fn handle(
         )
     } else {
         (
-            format!("signal:{}", sender),
+            format!("signal:{sender}"),
             None,
             Some(sender.clone()),
         )
@@ -250,16 +247,14 @@ pub async fn handle(
     let system_prompt = if group_id.is_some() {
         format!(
             "You are Nanna — moon god of the digital realm.\n\
-             You're in a Signal group chat. {} just sent a message.\n\
-             Be helpful, concise, and conversational. Only respond if addressed or if you can add value.",
-            sender_name
+             You're in a Signal group chat. {sender_name} just sent a message.\n\
+             Be helpful, concise, and conversational. Only respond if addressed or if you can add value."
         )
     } else {
         format!(
             "You are Nanna — moon god of the digital realm.\n\
-             You're chatting on Signal with {} ({}).\n\
-             Be helpful, concise, and conversational.",
-            sender_name, sender
+             You're chatting on Signal with {sender_name} ({sender}).\n\
+             Be helpful, concise, and conversational."
         )
     };
 

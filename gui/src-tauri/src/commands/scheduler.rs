@@ -123,10 +123,10 @@ pub(crate) fn cron_job_info_from_daemon(job: &serde_json::Value) -> Option<CronJ
         schedule,
         schedule_description,
         payload: job.get("payload").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        enabled: job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        enabled: job.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
         last_run: job.get("last_run").and_then(|v| v.as_str()).map(str::to_string),
         next_run: job.get("next_run").and_then(|v| v.as_str()).map(str::to_string),
-        run_count: job.get("run_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        run_count: job.get("run_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
         timezone: job.get("timezone").and_then(|v| v.as_str()).unwrap_or("UTC").to_string(),
     })
 }
@@ -312,7 +312,7 @@ pub async fn get_cron_job_history(
                     job_id: r.get("job_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     started_at: r.get("started_at").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     finished_at: r.get("finished_at").and_then(|v| v.as_str()).map(str::to_string),
-                    success: r.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                    success: r.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false),
                     output: r.get("output").and_then(|v| v.as_str()).map(str::to_string),
                     error: r.get("error").and_then(|v| v.as_str()).map(str::to_string),
                     duration_ms: None,
@@ -332,9 +332,7 @@ pub async fn validate_cron_expression(expression: String) -> Result<(bool, Strin
         Ok(parsed) => {
             let description = parsed.describe();
             let next = parsed
-                .next_from_now()
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "N/A".to_string());
+                .next_from_now().map_or_else(|| "N/A".to_string(), |dt| dt.format("%Y-%m-%d %H:%M").to_string());
             Ok((true, format!("{description} (next: {next})")))
         }
         Err(e) => Ok((false, e.to_string())),

@@ -95,16 +95,14 @@ fn walk_stop_points() -> Vec<PathBuf> {
 
 /// Resolve the user's home directory without adding a hard dependency on `dirs`.
 fn dirs_home() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty() {
             return Some(PathBuf::from(h));
         }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.is_empty() {
+    if let Ok(h) = std::env::var("USERPROFILE")
+        && !h.is_empty() {
             return Some(PathBuf::from(h));
         }
-    }
     None
 }
 
@@ -136,7 +134,7 @@ pub fn find_workspace_root(start: &Path) -> Option<(PathBuf, WorkspaceMarker)> {
                     marker,
                     current.display()
                 );
-                return Some((current.clone(), marker));
+                return Some((current, marker));
             }
         }
 
@@ -186,7 +184,7 @@ pub fn discover_workspace(explicit_path: Option<&Path>) -> Result<PathBuf, Works
         let cwd = std::env::current_dir()?;
         find_workspace_root(&cwd)
             .map(|(path, _)| path)
-            .ok_or_else(|| WorkspaceError::NotFound(cwd))
+            .ok_or(WorkspaceError::NotFound(cwd))
     }
 }
 

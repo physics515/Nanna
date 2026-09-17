@@ -1,7 +1,7 @@
-//! WhatsApp channel implementation via Cloud API
+//! `WhatsApp` channel implementation via Cloud API
 //!
-//! Uses Meta's official WhatsApp Business Cloud API.
-//! See: https://developers.facebook.com/docs/whatsapp/cloud-api
+//! Uses Meta's official `WhatsApp` Business Cloud API.
+//! See: <https://developers.facebook.com/docs/whatsapp/cloud-api>
 
 use crate::{
     Channel, ChannelCapabilities, ChannelError, ChannelFeatures, MessageContent, OutgoingMessage,
@@ -14,7 +14,7 @@ use tracing::debug;
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v21.0";
 
-/// WhatsApp Cloud API client
+/// `WhatsApp` Cloud API client
 #[derive(Clone)]
 pub struct WhatsAppChannel {
     client: Client,
@@ -24,10 +24,10 @@ pub struct WhatsAppChannel {
 }
 
 impl WhatsAppChannel {
-    /// Create a new WhatsApp channel.
+    /// Create a new `WhatsApp` channel.
     ///
-    /// - `access_token`: Meta access token with whatsapp_business_messaging permission
-    /// - `phone_number_id`: WhatsApp Business phone number ID
+    /// - `access_token`: Meta access token with `whatsapp_business_messaging` permission
+    /// - `phone_number_id`: `WhatsApp` Business phone number ID
     pub fn new(access_token: impl Into<String>, phone_number_id: impl Into<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -83,7 +83,7 @@ impl WhatsAppChannel {
                 .unwrap_or_else(|_| WhatsAppErrorResponse {
                     error: WhatsAppError {
                         message: format!("HTTP {status}"),
-                        code: status.as_u16() as i32,
+                        code: i32::from(status.as_u16()),
                         _error_subcode: None,
                         _fbtrace_id: None,
                     },

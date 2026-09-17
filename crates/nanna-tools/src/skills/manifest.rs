@@ -18,8 +18,8 @@ pub enum OutputTargetField {
 impl From<&OutputTargetField> for OutputTarget {
     fn from(field: &OutputTargetField) -> Self {
         match field {
-            OutputTargetField::Memory => OutputTarget::Memory,
-            OutputTargetField::Context => OutputTarget::Context,
+            OutputTargetField::Memory => Self::Memory,
+            OutputTargetField::Context => Self::Context,
         }
     }
 }
@@ -58,7 +58,7 @@ pub struct SkillManifest {
     pub output: OutputTargetField,
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     30
 }
 
@@ -84,7 +84,7 @@ impl SkillManifest {
     /// Load manifest from a tool.yaml file
     pub fn from_file(path: &Path) -> Result<Self, ToolError> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Io(e))?;
+            .map_err(ToolError::Io)?;
         
         let manifest: Self = serde_yaml::from_str(&content)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid manifest: {e}")))?;
@@ -93,6 +93,7 @@ impl SkillManifest {
     }
     
     /// Get the script/binary path, resolved relative to the manifest directory
+    #[must_use]
     pub fn resolve_executable(&self, manifest_dir: &Path) -> PathBuf {
         match &self.execution {
             ExecutionMethod::Python(p) => manifest_dir.join(p),
@@ -103,6 +104,7 @@ impl SkillManifest {
     }
     
     /// Get the working directory, resolved relative to the manifest directory
+    #[must_use]
     pub fn resolve_workdir(&self, manifest_dir: &Path) -> PathBuf {
         match &self.workdir {
             Some(wd) => manifest_dir.join(wd),

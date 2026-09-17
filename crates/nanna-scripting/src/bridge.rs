@@ -446,6 +446,7 @@ where
 
 impl NannaBridge {
     /// Create a new bridge with the given permissions
+    #[must_use]
     pub fn new(permissions: ToolPermissions) -> Self {
         Self {
             permissions,
@@ -478,11 +479,13 @@ impl NannaBridge {
     }
 
     /// Get the current session ID.
+    #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
     /// Get the default working directory as a string.
+    #[must_use]
     pub fn workdir(&self) -> Option<&str> {
         self.default_workdir.as_ref().and_then(|p| p.to_str())
     }
@@ -509,14 +512,13 @@ impl NannaBridge {
         let path = path.trim();
         
         // Expand ~ or ~/ (but not ~username which we don't support)
-        if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-            if let Some(home) = Self::home_dir() {
+        if (path == "~" || path.starts_with("~/") || path.starts_with("~\\"))
+            && let Some(home) = Self::home_dir() {
                 let rest = path.strip_prefix("~/")
                     .or_else(|| path.strip_prefix("~\\"))
                     .unwrap_or("");
                 return home.join(rest);
             }
-        }
         
         // An MSYS drive path the shell itself printed (`/d/Development/x`).
         //
@@ -670,7 +672,8 @@ impl NannaBridge {
     }
 
     /// Get stored tool definitions (for `Nanna.listTools()`)
-    pub fn list_tools(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn list_tools(&self) -> Option<&Value> {
         self.tool_definitions.as_ref()
     }
 
@@ -971,7 +974,7 @@ impl NannaBridge {
 
     /// Get the current platform (windows, darwin, linux)
     #[must_use]
-    pub fn platform() -> &'static str {
+    pub const fn platform() -> &'static str {
         if cfg!(windows) {
             "win32"
         } else if cfg!(target_os = "macos") {
@@ -1067,10 +1070,10 @@ impl NannaBridge {
         // Advisory file lock: prevent concurrent writes to the same path
         let canonical = self.resolve_path(path).canonicalize().unwrap_or_else(|_| self.resolve_path(path));
         {
-            let mut locks = FILE_WRITE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut locks = FILE_WRITE_LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if locks.contains(&canonical) {
                 return Err(ScriptError::Bridge(
-                    format!("File is being written by another agent: {}", path)
+                    format!("File is being written by another agent: {path}")
                 ));
             }
             locks.insert(canonical.clone());
@@ -1096,11 +1099,10 @@ impl NannaBridge {
         }
 
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
                 tokio::fs::create_dir_all(parent).await.ok();
             }
-        }
 
         // Name the cause machine-readably. The OS message alone is localized
         // prose ("Access is denied." / "Permission denied"), so a caller that
@@ -1145,7 +1147,7 @@ impl NannaBridge {
     /// so an overflow-length return proves more entries exist). The bound
     /// exists because every returned entry is marshalled into the script
     /// engine one JS object at a time; unbounded listings of real workspaces
-    /// (hundreds of thousands of entries under node_modules/.git/target) blow
+    /// (hundreds of thousands of entries under `node_modules/.git/target`) blow
     /// the 30s script deadline before the script runs a single line.
     pub async fn list_dir(
         &self,
@@ -1177,7 +1179,7 @@ impl NannaBridge {
                 .filter_entry(|e| {
                     e.file_name()
                         .to_str()
-                        .map_or(true, |name| !IGNORE_DIRS.contains(&name))
+                        .is_none_or(|name| !IGNORE_DIRS.contains(&name))
                 })
             {
                 if entries.len() >= cap {
@@ -1213,7 +1215,7 @@ impl NannaBridge {
                 let entry_type = metadata.as_ref().map_or("unknown", |m| {
                     if m.is_dir() { "dir" } else if m.is_symlink() { "link" } else { "file" }
                 }).to_string();
-                let size = metadata.as_ref().map_or(0, |m| m.len());
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 let modified = metadata
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1340,7 +1342,7 @@ pub struct FileStat {
     pub modified: Option<u64>,
 }
 
-/// Convert a walkdir entry to our DirEntry
+/// Convert a walkdir entry to our `DirEntry`
 fn dir_entry_from_walkdir(entry: &walkdir::DirEntry) -> Option<DirEntry> {
     let name = entry.path().to_string_lossy().to_string();
     let metadata = entry.metadata().ok()?;
@@ -1394,8 +1396,8 @@ fn strip_ansi_escapes(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip CSI sequence: ESC [ ... <final byte>
-            if let Some(next) = chars.next() {
-                if next == '[' {
+            if let Some(next) = chars.next()
+                && next == '[' {
                     // Consume until we hit a letter (the terminator)
                     for seq_char in chars.by_ref() {
                         if seq_char.is_ascii_alphabetic() {
@@ -1404,7 +1406,6 @@ fn strip_ansi_escapes(s: &str) -> String {
                     }
                 }
                 // else: other escape (ESC without [) — just skip the ESC and next char
-            }
         } else {
             result.push(c);
         }

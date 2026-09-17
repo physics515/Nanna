@@ -226,6 +226,7 @@ pub struct IpcServer {
 
 impl IpcServer {
     /// Create a new IPC server
+    #[must_use]
     pub fn new(config: IpcServerConfig) -> Self {
         let (request_tx, request_rx) = mpsc::channel(1000);
         let (event_tx, _) = broadcast::channel(1000);
@@ -244,8 +245,8 @@ impl IpcServer {
     
     /// Bind a TCP listener, retrying on transient port conflicts.
     ///
-    /// On Unix, sets SO_REUSEADDR so TIME_WAIT sockets don't block restart.
-    /// On Windows, SO_REUSEADDR has dangerous semantics (allows hijacking),
+    /// On Unix, sets `SO_REUSEADDR` so `TIME_WAIT` sockets don't block restart.
+    /// On Windows, `SO_REUSEADDR` has dangerous semantics (allows hijacking),
     /// so we retry with a short delay instead.
     async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
         let socket_addr: std::net::SocketAddr = addr.parse()
@@ -263,7 +264,7 @@ impl IpcServer {
             socket.set_nonblocking(true)?;
             socket.bind(&socket_addr.into())?;
             socket.listen(128)?;
-            return TcpListener::from_std(socket.into());
+            TcpListener::from_std(socket.into())
         }
 
         // On Windows, retry with delay if port is temporarily unavailable
@@ -288,11 +289,13 @@ impl IpcServer {
     }
 
     /// Get the address the server will bind to
+    #[must_use]
     pub fn address(&self) -> String {
         format!("{}:{}", self.config.host, self.config.port)
     }
     
     /// Get a sender for broadcasting events to clients
+    #[must_use]
     pub fn event_sender(&self) -> broadcast::Sender<Event> {
         self.event_tx.clone()
     }
@@ -319,7 +322,7 @@ impl IpcServer {
             client.tx.send(Message::Text(msg.into())).await.map_err(|e| e.to_string())?;
             Ok(())
         } else {
-            Err(format!("Client not found: {}", client_id))
+            Err(format!("Client not found: {client_id}"))
         }
     }
     
@@ -507,7 +510,7 @@ impl IpcServer {
                                     let error_response = Response::error(
                                         "unknown".to_string(),
                                         "parse_error",
-                                        format!("Invalid request: {}", e),
+                                        format!("Invalid request: {e}"),
                                     );
                                     if let Ok(json) = serde_json::to_string(&error_response) {
                                         let _ = msg_tx.send(Message::Text(json.into())).await;

@@ -57,7 +57,7 @@ pub async fn execute(
 /// It is a named function rather than an inline `format!` so that the syntax gate
 /// in `tests/default_skills_parse.rs` can check **this** string. A gate that
 /// re-implements the wrapper proves nothing about the wrapper.
-pub(crate) fn wrap_for_boa(source: &str) -> String {
+pub fn wrap_for_boa(source: &str) -> String {
     debug_assert!(
         !source.is_empty(),
         "a tool with no source should have been rejected before reaching the engine"
@@ -67,7 +67,7 @@ pub(crate) fn wrap_for_boa(source: &str) -> String {
     let transformed_source = source.replace("export default", "var __exported__ =");
 
     let wrapped = format!(
-        r#"
+        r"
         (function() {{
             {transformed_source}
             
@@ -91,7 +91,7 @@ pub(crate) fn wrap_for_boa(source: &str) -> String {
             
             throw new Error('No execute function found in tool. Make sure your tool exports an object with an execute function.');
         }})()
-        "#
+        "
     );
 
     debug_assert!(
@@ -211,9 +211,7 @@ fn console_error(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
 fn format_console_args(args: &[JsValue], context: &mut Context) -> String {
     args.iter()
         .map(|v| {
-            v.to_string(context)
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_else(|_| "[object]".to_string())
+            v.to_string(context).map_or_else(|_| "[object]".to_string(), |s| s.to_std_string_escaped())
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -459,7 +457,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             // Build result object
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
             obj.set(js_string!("success"), JsValue::from(response.success), false, context)?;
-            obj.set(js_string!("code"), response.code.map_or(JsValue::null(), |c| JsValue::from(c)), false, context)?;
+            obj.set(js_string!("code"), response.code.map_or(JsValue::null(), JsValue::from), false, context)?;
             obj.set(js_string!("stdout"), JsValue::from(js_string!(response.stdout.as_str())), false, context)?;
             obj.set(js_string!("stderr"), JsValue::from(js_string!(response.stderr.as_str())), false, context)?;
             // A deadline kill still ran the command: the tool layer needs both
@@ -539,8 +537,7 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
     let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let recursive = args.get(1)
         .filter(|v| !v.is_undefined() && !v.is_null())
-        .map(|v| v.to_boolean())
-        .unwrap_or(false);
+        .is_some_and(boa_engine::JsValue::to_boolean);
     // Optional third arg: bounded query — collect at most this many entries
     // (see NannaBridge::list_dir). Non-numeric / non-positive values mean
     // "no bound", matching a caller that simply omitted the argument.
@@ -652,7 +649,7 @@ fn nanna_fetch(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
     match result {
         Ok(response) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
-            obj.set(js_string!("status"), JsValue::from(response.status as f64), false, context)?;
+            obj.set(js_string!("status"), JsValue::from(f64::from(response.status)), false, context)?;
             obj.set(js_string!("body"), JsValue::from(js_string!(response.body.as_str())), false, context)?;
             // Convert headers to JS object
             let headers_obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
@@ -747,7 +744,7 @@ fn nanna_service(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     }
 }
 
-/// Convert JSON Value to Boa JsValue
+/// Convert JSON Value to Boa `JsValue`
 fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
     match value {
         Value::Null => Ok(JsValue::null()),
@@ -785,7 +782,7 @@ fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
     }
 }
 
-/// Convert Boa JsValue to JSON Value
+/// Convert Boa `JsValue` to JSON Value
 fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
     // Use Boa's variant enum for pattern matching
     use boa_engine::value::JsVariant;

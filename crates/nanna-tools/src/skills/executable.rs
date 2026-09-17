@@ -218,7 +218,7 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
-/// Parse JSON Schema parameters into ToolParameter format
+/// Parse JSON Schema parameters into `ToolParameter` format
 fn parse_json_schema_params(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
     

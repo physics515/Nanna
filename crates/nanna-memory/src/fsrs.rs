@@ -1,6 +1,6 @@
 //! FSRS-6 (Free Spaced Repetition Scheduler) implementation
 //!
-//! Based on the FSRS-6 algorithm: https://github.com/open-spaced-repetition/fsrs4anki
+//! Based on the FSRS-6 algorithm: <https://github.com/open-spaced-repetition/fsrs4anki>
 //! Power law forgetting curve optimized on 700M+ Anki reviews.
 //!
 //! Key concepts:
@@ -209,19 +209,19 @@ impl FsrsState {
         let r = self.retrievability(params);
         // Weight by access frequency (more accesses = stronger retrieval paths)
         let access_factor = (self.access_count as f32 / 10.0).min(1.0);
-        r * (0.5 + 0.5 * access_factor)
+        r * 0.5f32.mul_add(access_factor, 0.5)
     }
 
     /// Calculate overall accessibility score
     /// 
-    /// accessibility = 0.5 × retention + 0.3 × retrieval_strength + 0.2 × storage_strength
+    /// accessibility = 0.5 × retention + 0.3 × `retrieval_strength` + 0.2 × `storage_strength`
     #[must_use]
     pub fn accessibility(&self, params: &FsrsParameters) -> f32 {
         let retention = self.retrievability(params);
         let retrieval = self.retrieval_strength(params);
         let storage = self.storage_strength.min(1.0);
         
-        0.5 * retention + 0.3 * retrieval + 0.2 * storage
+        0.2f32.mul_add(storage, 0.3f32.mul_add(retrieval, 0.5 * retention))
     }
 
     /// Get memory state based on accessibility
@@ -258,9 +258,9 @@ impl FsrsState {
         // Stability increase formula from FSRS
         let stability_modifier = match rating {
             Rating::Again => params.w9, // Decrease on failure
-            Rating::Hard => 1.0 + params.w8 * params.w11.powf(-self.difficulty / 10.0),
-            Rating::Good => 1.0 + params.w8 * (1.0 - r).powf(params.w10),
-            Rating::Easy => 1.0 + params.w8 * params.w12.powf(self.difficulty / 10.0),
+            Rating::Hard => params.w8.mul_add(params.w11.powf(-self.difficulty / 10.0), 1.0),
+            Rating::Good => params.w8.mul_add((1.0 - r).powf(params.w10), 1.0),
+            Rating::Easy => params.w8.mul_add(params.w12.powf(self.difficulty / 10.0), 1.0),
         };
         
         self.stability = (self.stability * stability_modifier).max(0.1);
@@ -296,22 +296,19 @@ impl FsrsState {
 
 /// Rating for memory access quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Rating {
     /// Complete failure to recall
     Again,
     /// Recalled with significant difficulty
     Hard,
     /// Recalled correctly
+    #[default]
     Good,
     /// Recalled easily
     Easy,
 }
 
-impl Default for Rating {
-    fn default() -> Self {
-        Self::Good
-    }
-}
 
 /// Calculate retrievability using power law forgetting curve
 /// 
