@@ -80,7 +80,7 @@ A fully local run needs none.
 | **Signal Channel** | ✅ Stable | Signal CLI bridge |
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
-| **Tool System (46 tools, all wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
+| **Tool System (47 tools, all wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
 | **MCP Client** | ✅ Stable (stdio servers) | A server listed under `[mcp]` |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
@@ -95,7 +95,7 @@ A fully local run needs none.
   with drift protection: what you *stated* is kept in your words and never paraphrased away, and a
   summary is never re-summarized ([measured](bench/BASELINE.md#summarization-drift-content-fidelity-not-recall))
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
-- **46 filesystem tools, all of them wired** — file, shell, web, code-search, memory, task and
+- **47 filesystem tools, all of them wired** — file, shell, web, code-search, memory, task and
   curiosity tools work with no setup. A tool whose daemon-side service is missing is **withheld from
   the model rather than offered and left to fail**, and the daemon says at boot which ones and why —
   so the count you get is the count that works. Four groups need something present to register:
@@ -114,6 +114,7 @@ A fully local run needs none.
   refusing an edit that matches zero or several places rather than guessing, and re-registering on
   success; `list_user_tools` shows what has been authored.
 - **Asks when it is unsure** — `ask_user` posts a clarifying question into the conversation (the app, or the chat app you wrote from) and waits up to half an hour for your reply, which the running turn picks up and continues with; no reply, and it carries on with its best judgement and says what it assumed.
+- **Your file rules stay yours** — a rule you declared ("don't touch tests/") blocks `write_file`/`edit_file`; when it really stands in the way, `lift_invariant` asks you, quoting your own words, and lifts it only on a clear yes.
 - **Reads what it is shown** — `read_pdf` falls back to model OCR for image-only pages when a vision
   model is configured, and reports which of four things happened (no OCR configured, OCR ran, the
   document has no images to read, or no page was missing text) instead of returning an empty string
