@@ -4342,29 +4342,20 @@ impl Agent {
                             tier = "standard",
                             "Tier 2: standard summarization triggered"
                         );
-                        match ctx
+                        // Summarizer failures are handled inside: it truncates
+                        // and announces the loss itself.
+                        let iterations = ctx
                             .enforce_limits_with_summarization(
                                 &summarization_config,
                                 crate::context::SummarizationTarget::CompressionThreshold,
                             )
-                            .await
-                        {
-                            Ok(iterations) if iterations > 0 => {
-                                info!(
-                                    iterations = iterations,
-                                    new_tokens = ctx.estimate_tokens(),
-                                    "Tier 2 summarization complete"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(error = %e, "Tier 2 summarization failed, dropping oldest");
-                                let dropped = ctx.drop_oldest(16);
-                                ctx.push_summarization_failure_notice(
-                                    dropped,
-                                    &format!("summarization failed ({e})"),
-                                );
-                            }
+                            .await;
+                        if iterations > 0 {
+                            info!(
+                                iterations = iterations,
+                                new_tokens = ctx.estimate_tokens(),
+                                "Tier 2 summarization complete"
+                            );
                         }
                     }
                 }
@@ -4400,32 +4391,20 @@ impl Agent {
                             tier = "hard_cap",
                             "Tier 3: hard limit exceeded, aggressive summarization"
                         );
-                        match ctx
+                        // Summarizer failures are handled inside: it truncates
+                        // and announces the loss itself.
+                        let iterations = ctx
                             .enforce_limits_with_summarization(
                                 &summarization_config,
                                 crate::context::SummarizationTarget::HardLimit,
                             )
-                            .await
-                        {
-                            Ok(iterations) if iterations > 0 => {
-                                info!(
-                                    iterations = iterations,
-                                    new_tokens = ctx.estimate_tokens(),
-                                    "Tier 3 summarization complete"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(error = %e, "Tier 3 summarization failed, truncating");
-                                let dropped = ctx.truncate_to_limit();
-                                ctx.push_summarization_failure_notice(
-                                    dropped,
-                                    &format!(
-                                        "summarization failed at the hard \
-                                         input limit ({e})"
-                                    ),
-                                );
-                            }
+                            .await;
+                        if iterations > 0 {
+                            info!(
+                                iterations = iterations,
+                                new_tokens = ctx.estimate_tokens(),
+                                "Tier 3 summarization complete"
+                            );
                         }
                     }
                 }
