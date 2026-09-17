@@ -1,7 +1,12 @@
 //! Window, notification, stats, and lifecycle commands.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::{BackendMode, BackendStatus};
+use crate::state::{backend_handle, AppState, CloseMode, ModelStatusEvent};
+use nanna_core::log_buffer::LogEntry;
+use std::sync::Arc;
+use tauri::{AppHandle, Manager, State};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// Show the main window (called from system tray)
 ///
@@ -370,7 +375,7 @@ pub async fn get_tool_call_log(
 #[tauri::command]
 pub async fn get_backend_status(
     state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<backend::BackendStatus, String> {
+) -> Result<BackendStatus, String> {
     Ok(backend_handle(&state).await.status().await)
 }
 
@@ -635,6 +640,7 @@ pub async fn perform_quit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanna_core::log_buffer::LogSource;
 
     fn entry(timestamp: &str, source: LogSource, message: &str) -> LogEntry {
         LogEntry {

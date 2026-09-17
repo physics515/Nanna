@@ -17,27 +17,20 @@ pub mod commands;
 pub mod state;
 
 use backend::{Backend, BackendMode};
+use state::{backend_handle, AppState, CloseMode};
 
 use nanna_config::Config;
-use nanna_core::{
-    Workspace, WorkspaceRegistry, find_workspace_root, discover_workspaces,
-};
-use nanna_core::log_buffer::{LogBuffer, LogBufferLayer, LogEntry, LogSource};
-use serde::{Deserialize, Serialize};
+use nanna_core::{Workspace, WorkspaceRegistry};
+use nanna_core::log_buffer::{LogBuffer, LogBufferLayer, LogSource};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     menu::{MenuBuilder, MenuItemBuilder},
-    AppHandle, Emitter, Manager, State,
+    Emitter, Manager,
 };
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-
-// Re-export moved items at the crate root so sibling modules that `use crate::*`
-// keep resolving their existing paths.
-pub(crate) use commands::settings::ToolInfo;
-pub(crate) use state::{AppState, ChatMessage, ToolCallInfo, SessionInfo, AppConfig, ModelStatusEvent, CloseMode, backend_handle};
 
 // =============================================================================
 // App Setup

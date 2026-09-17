@@ -1,8 +1,11 @@
 //! Chat message command. The daemon owns the agent loop, streaming, tools, and
 //! storage; this just forwards the turn and shapes the reply for the frontend.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState, ChatMessage, ToolCallInfo};
+use std::sync::Arc;
+use tauri::{AppHandle, State};
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
 /// Send a message through the daemon and return the assistant reply.
 ///

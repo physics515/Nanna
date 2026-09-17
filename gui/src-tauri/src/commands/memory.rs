@@ -4,8 +4,12 @@
 //! Tuning knobs that have a config home are persisted to `config.toml` and
 //! pushed to the daemon; knobs the daemon manages internally are no-ops.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState};
+use serde::Serialize;
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::RwLock;
+use tracing::info;
 
 /// Memory search result
 #[derive(Debug, Clone, Serialize)]

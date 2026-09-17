@@ -9,7 +9,7 @@
 //! `subscribe_agent_events` is a no-op; the page polls the query commands.
 
 use crate::backend::Backend;
-use crate::{backend_handle, AppState};
+use crate::state::{backend_handle, AppState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

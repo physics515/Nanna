@@ -13,7 +13,7 @@
 
 use crate::daemon_client::{DaemonClient, DaemonClientConfig, DaemonEvent};
 use crate::daemon_manager::{DaemonManager, DaemonManagerConfig};
-use crate::AppState;
+use crate::state::AppState;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,7 +1,13 @@
 //! Workspace management commands.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::Backend;
+use crate::state::AppState;
+use nanna_core::{discover_workspaces, find_workspace_root, Workspace, WorkspaceRegistry};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 // =============================================================================
 // Workspace Commands
@@ -68,7 +74,8 @@ async fn registry_handle(state: &RwLock<AppState>) -> Arc<RwLock<WorkspaceRegist
 }
 
 /// The daemon handle and the workspace-registry cache, cloned out of the
-/// shared state together (see [`backend_handle`] and [`registry_handle`]).
+/// shared state together (see [`backend_handle`](crate::state::backend_handle)
+/// and [`registry_handle`]).
 async fn backend_and_registry(
     state: &RwLock<AppState>,
 ) -> (Arc<Backend>, Arc<RwLock<WorkspaceRegistry>>) {
