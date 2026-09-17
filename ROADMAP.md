@@ -1685,8 +1685,18 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
       unknown/extra fields). Added `ModelStatsTracker::total_cost_usd()` (grand-total known cloud spend; sums
       only priced models) surfaced as `total_cost_usd` on the `SystemAction::ModelStats` response; test.
-- [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
+- [x] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
+      *(2026-09-17)* Landed without `notify`: `control/config_watch.rs` stats the one file the
+      control plane loads and saves every 2 s (no new dependency, and a stat of the path sidesteps
+      editors that save by rename), waits 500 ms for the change to hold still, parses it, and
+      applies only when the parsed config differs from the running one — through the SAME
+      `apply_loaded_config` the `config.reload` verb now uses (agent LLM config, provider rebuild,
+      scheduler loop, `config_changed`). Verified live on the debug daemon: a hand edit of
+      `heartbeat_enabled` applied within ~1 s with exactly one `config_changed`; a file left
+      mid-edit as invalid TOML was logged and the running config kept; rewriting identical values
+      and the daemon's own `config.set` save produced **no** second event. Boot-only sections
+      (channels, MCP servers, webhooks) still need a restart — stated in `apply_loaded_config`.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
 - [~] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
       *(2026-07-20)* **Core `ToolPolicy` shipped + enforced.** New `nanna-tools::policy` — an allow/deny

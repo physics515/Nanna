@@ -307,6 +307,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
 # enabled = false         # keep the entry without starting it
 ```
 
+Edits to `config.toml` apply to a running daemon within a couple of seconds (models and
+providers, scheduler switches); channel, MCP and webhook settings are read at startup. A file
+that does not parse is logged and the running configuration is kept.
+
 MCP servers inherit the daemon's environment; there is deliberately no `env` table in
 `config.toml`, so a token a server needs is supplied by starting the daemon with it set.
 

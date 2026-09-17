@@ -3102,6 +3102,8 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        // Hand edits of config.toml apply without a restart.
+        control.spawn_config_watcher(self.shutdown_tx.subscribe());
         *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server

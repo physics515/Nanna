@@ -31,6 +31,7 @@ mod channel;
 mod chat;
 pub mod chat_harness;
 mod config;
+mod config_watch;
 mod memory;
 mod scheduler;
 mod session;
