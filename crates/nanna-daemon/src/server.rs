@@ -1420,6 +1420,87 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+/// Which auxiliary listeners the daemon brings up, and whether it claims the
+/// single-instance PID file.
+///
+/// Grouped rather than left as three loose `bool` fields on [`DaemonConfig`]:
+/// they are all "does this process own a second thing besides the IPC socket",
+/// they are all flipped together by the `--no-health-server` / `--no-pid-file`
+/// / `--enable-webhooks` flags, and a flat row of same-typed booleans is
+/// exactly the shape a caller can transpose silently.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerSwitches {
+    /// Enable HTTP health server
+    pub health_server: bool,
+    /// Enable webhook server for inbound messages
+    pub webhook_server: bool,
+    /// Enable PID file (prevents multiple instances)
+    pub pid_file: bool,
+}
+
+impl Default for ServerSwitches {
+    fn default() -> Self {
+        Self {
+            health_server: true,
+            pid_file: true,
+            // Disabled by default (needs configuration)
+            webhook_server: false,
+        }
+    }
+}
+
+/// The per-call tool audit trail's two settings: whether it is written at all,
+/// and whether it records argument values.
+///
+/// One is meaningless without the other — `log_values` does nothing while `log`
+/// is false — so they travel together rather than as two independent booleans a
+/// caller can set into a contradictory pair.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolAuditSwitches {
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    /// Mirrors `[tools] audit_log`.
+    pub log: bool,
+    /// Include a bounded preview of tool arguments in that trail.
+    /// Mirrors `[tools] audit_log_values`.
+    pub log_values: bool,
+}
+
+impl Default for ToolAuditSwitches {
+    fn default() -> Self {
+        Self {
+            log: true,
+            log_values: false,
+        }
+    }
+}
+
+/// The scheduler's two master switches, mirroring `[scheduler]`.
+///
+/// The heartbeat is subordinate to the scheduler — `heartbeat_enabled` cannot
+/// fire anything while `enabled` is false — so the pair is one setting with two
+/// levels, not two unrelated flags.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerSwitches {
+    /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
+    /// `false` loads cron jobs but fires nothing.
+    pub enabled: bool,
+    /// Whether the periodic heartbeat runs (mirrors
+    /// `[scheduler] heartbeat_enabled`). The heartbeat drives a full agent turn
+    /// against the chat model, so on a single-slot local backend it competes
+    /// with live conversation — hence a user-visible switch.
+    pub heartbeat_enabled: bool,
+}
+
+impl Default for SchedulerSwitches {
+    fn default() -> Self {
+        // Mirror `nanna_config::SchedulerConfig::default()`.
+        Self {
+            enabled: true,
+            heartbeat_enabled: true,
+        }
+    }
+}
+
 /// Configuration for the daemon server
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -1437,14 +1518,10 @@ pub struct DaemonConfig {
     pub agent: AgentServiceConfig,
     /// Enable memory service (requires embedding provider)
     pub enable_memory: bool,
-    /// Enable HTTP health server
-    pub enable_health_server: bool,
+    /// Which auxiliary listeners run, and whether the PID file is claimed
+    pub servers: ServerSwitches,
     /// Health server port (default: 5148)
     pub health_port: u16,
-    /// Enable PID file (prevents multiple instances)
-    pub enable_pid_file: bool,
-    /// Enable webhook server for inbound messages
-    pub enable_webhook_server: bool,
     /// Webhook server port (default: 3000)
     pub webhook_port: u16,
     /// Webhook configuration
@@ -1468,12 +1545,9 @@ pub struct DaemonConfig {
     /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
     /// tool actually stop executing (previously the list was parsed but ignored).
     pub tool_denylist: Vec<String>,
-    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
-    /// Mirrors `[tools] audit_log`.
-    pub tool_audit_log: bool,
-    /// Include a bounded preview of tool arguments in that trail.
-    /// Mirrors `[tools] audit_log_values`.
-    pub tool_audit_log_values: bool,
+    /// Whether the per-call tool audit trail is written, and how much of each
+    /// call it records.
+    pub tool_audit: ToolAuditSwitches,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -1492,14 +1566,8 @@ pub struct DaemonConfig {
     pub dream_memory_pressure_count: usize,
     /// MCP servers to start at boot (`[mcp]`).
     pub mcp: nanna_config::McpConfig,
-    /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
-    /// `false` loads cron jobs but fires nothing.
-    pub scheduler_enabled: bool,
-    /// Whether the periodic heartbeat runs (mirrors
-    /// `[scheduler] heartbeat_enabled`). The heartbeat drives a full agent turn
-    /// against the chat model, so on a single-slot local backend it competes
-    /// with live conversation — hence a user-visible switch.
-    pub heartbeat_enabled: bool,
+    /// The scheduler's master switch and its heartbeat switch (`[scheduler]`).
+    pub scheduler: SchedulerSwitches,
     /// Seconds between heartbeats (mirrors `[scheduler] heartbeat_interval_secs`).
     /// Clamped up to [`nanna_core::MIN_HEARTBEAT_INTERVAL_SECS`] when applied.
     pub heartbeat_interval_secs: u64,
@@ -1625,10 +1693,8 @@ impl Default for DaemonConfig {
             llm: LlmConfig::default(),
             agent: AgentServiceConfig::default(),
             enable_memory: true, // Enabled by default (requires embedding provider)
-            enable_health_server: true,
+            servers: ServerSwitches::default(),
             health_port: DEFAULT_HEALTH_PORT,
-            enable_pid_file: true,
-            enable_webhook_server: false, // Disabled by default (needs configuration)
             webhook_port: DEFAULT_WEBHOOK_PORT,
             webhook: WebhookConfig::default(),
             use_script_tools: true,
@@ -1636,8 +1702,7 @@ impl Default for DaemonConfig {
             vision_model_priority: Vec::new(),
             tool_allowlist: None,
             tool_denylist: Vec::new(),
-            tool_audit_log: true,
-            tool_audit_log_values: false,
+            tool_audit: ToolAuditSwitches::default(),
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -1647,8 +1712,7 @@ impl Default for DaemonConfig {
             dream_memory_pressure_count: 5000,
             mcp: nanna_config::McpConfig::default(),
             // Mirror nanna_config::SchedulerConfig::default().
-            scheduler_enabled: true,
-            heartbeat_enabled: true,
+            scheduler: SchedulerSwitches::default(),
             heartbeat_interval_secs: 1800,
         }
     }
@@ -2237,7 +2301,7 @@ impl DaemonServer {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         // Create PID file if enabled
-        let pid_file = if config.enable_pid_file {
+        let pid_file = if config.servers.pid_file {
             Some(PidFile::new(&config.data_dir))
         } else {
             None
@@ -2601,11 +2665,11 @@ impl DaemonServer {
             // reload re-applies them to this very loop (see the control plane's
             // config handler), so the toggles work without a daemon restart.
             let scheduler_config = nanna_core::SchedulerConfig {
-                enabled: self.config.scheduler_enabled,
+                enabled: self.config.scheduler.enabled,
                 heartbeat_interval: std::time::Duration::from_secs(
                     nanna_core::clamp_heartbeat_secs(self.config.heartbeat_interval_secs),
                 ),
-                heartbeat_enabled: self.config.heartbeat_enabled,
+                heartbeat_enabled: self.config.scheduler.heartbeat_enabled,
                 heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
                 max_concurrent: 4,
                 check_interval: std::time::Duration::from_secs(30),
@@ -3127,7 +3191,8 @@ impl DaemonServer {
         .with_tools_dir(tools_dir)
         .with_audit_log_path(
             self.config
-                .tool_audit_log
+                .tool_audit
+                .log
                 .then(|| self.config.tool_audit_path()),
         )
         .with_event_tx(self.ipc.event_sender())
@@ -3284,7 +3349,7 @@ impl DaemonServer {
         }
 
         // Spawn health HTTP server if enabled
-        let _health_state = if self.config.enable_health_server {
+        let _health_state = if self.config.servers.health_server {
             // Seed durable-memory-store health (load already ran in init_services),
             // so a corrupt/degraded store shows on /status, not just a boot log.
             //
@@ -3383,7 +3448,7 @@ impl DaemonServer {
         };
 
         // Spawn webhook HTTP server if enabled
-        if self.config.enable_webhook_server {
+        if self.config.servers.webhook_server {
             let mut webhook_config = self.config.webhook.clone();
             webhook_config.host = self.config.ipc.host.clone();
             webhook_config.port = self.config.webhook_port;
@@ -4488,17 +4553,17 @@ impl DaemonServer {
         // (chat harness, task tool, scheduled runs and the MCP bridge all call
         // the registry directly), and an audit that saw only one of them would
         // be worse than none — it would read as a complete account.
-        if self.config.tool_audit_log {
+        if self.config.tool_audit.log {
             let path = self.config.tool_audit_path();
             let sink = nanna_tools::JsonlAuditSink::new(
                 path.clone(),
                 nanna_tools::ToolAuditConfig {
-                    include_values: self.config.tool_audit_log_values,
+                    include_values: self.config.tool_audit.log_values,
                     ..Default::default()
                 },
             );
             tools.set_audit_sink(Some(Arc::new(sink))).await;
-            info!(path = %path.display(), values = self.config.tool_audit_log_values,
+            info!(path = %path.display(), values = self.config.tool_audit.log_values,
                   "Tool audit trail enabled");
         }
 
@@ -4720,8 +4785,8 @@ impl DaemonBuilder {
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
         // unconditional — which is how it kept stealing the local model's one
         // slot mid-chat.
-        builder.config.scheduler_enabled = config.scheduler.enabled;
-        builder.config.heartbeat_enabled = config.scheduler.heartbeat_enabled;
+        builder.config.scheduler.enabled = config.scheduler.enabled;
+        builder.config.scheduler.heartbeat_enabled = config.scheduler.heartbeat_enabled;
         builder.config.heartbeat_interval_secs = config.scheduler.heartbeat_interval_secs;
 
         // Wire webhook signature-verification secrets from the user's channel
@@ -4824,8 +4889,8 @@ impl DaemonBuilder {
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
         builder.config.tool_denylist = config.tools.disabled.clone();
-        builder.config.tool_audit_log = config.tools.audit_log;
-        builder.config.tool_audit_log_values = config.tools.audit_log_values;
+        builder.config.tool_audit.log = config.tools.audit_log;
+        builder.config.tool_audit.log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -4918,7 +4983,7 @@ impl DaemonBuilder {
     }
 
     pub fn with_health_server(mut self, enable: bool) -> Self {
-        self.config.enable_health_server = enable;
+        self.config.servers.health_server = enable;
         self
     }
 
@@ -4928,12 +4993,12 @@ impl DaemonBuilder {
     }
 
     pub fn with_pid_file(mut self, enable: bool) -> Self {
-        self.config.enable_pid_file = enable;
+        self.config.servers.pid_file = enable;
         self
     }
 
     pub fn with_webhook_server(mut self, enable: bool) -> Self {
-        self.config.enable_webhook_server = enable;
+        self.config.servers.webhook_server = enable;
         self
     }
 
@@ -5796,8 +5861,11 @@ mod tests {
         // config file documents — the daemon's fallback cannot drift from it.
         let daemon = DaemonConfig::default();
         let scheduler = nanna_config::SchedulerConfig::default();
-        assert_eq!(daemon.scheduler_enabled, scheduler.enabled);
-        assert_eq!(daemon.heartbeat_enabled, scheduler.heartbeat_enabled);
+        assert_eq!(daemon.scheduler.enabled, scheduler.enabled);
+        assert_eq!(
+            daemon.scheduler.heartbeat_enabled,
+            scheduler.heartbeat_enabled
+        );
         assert_eq!(
             daemon.heartbeat_interval_secs,
             scheduler.heartbeat_interval_secs
@@ -5815,17 +5883,17 @@ mod tests {
             heartbeat_enabled: false,
             heartbeat_interval_secs: 600,
         };
-        builder.config.scheduler_enabled = user.enabled;
-        builder.config.heartbeat_enabled = user.heartbeat_enabled;
+        builder.config.scheduler.enabled = user.enabled;
+        builder.config.scheduler.heartbeat_enabled = user.heartbeat_enabled;
         builder.config.heartbeat_interval_secs = user.heartbeat_interval_secs;
 
         // Mirrors the construction in `init_services`.
         let core = nanna_core::SchedulerConfig {
-            enabled: builder.config.scheduler_enabled,
+            enabled: builder.config.scheduler.enabled,
             heartbeat_interval: std::time::Duration::from_secs(nanna_core::clamp_heartbeat_secs(
                 builder.config.heartbeat_interval_secs,
             )),
-            heartbeat_enabled: builder.config.heartbeat_enabled,
+            heartbeat_enabled: builder.config.scheduler.heartbeat_enabled,
             ..nanna_core::SchedulerConfig::default()
         };
 

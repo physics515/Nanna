@@ -174,7 +174,10 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
 pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     use nanna_daemon::agent_service::AgentServiceConfig;
     use nanna_daemon::server::{EmbeddingConfig, LlmConfig};
-    use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};
+    use nanna_daemon::{
+        DaemonConfig, DaemonServer, IpcServerConfig, SchedulerSwitches, ServerSwitches,
+        ToolAuditSwitches, WebhookConfig,
+    };
 
     // Configure daemon
     let data_dir = Config::default_data_dir()?;
@@ -204,10 +207,12 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         },
         agent: AgentServiceConfig::default(),
         enable_memory: true,
-        enable_health_server: true,
+        servers: ServerSwitches {
+            health_server: true,
+            webhook_server: false,
+            pid_file: true,
+        },
         health_port: 5148,
-        enable_pid_file: true,
-        enable_webhook_server: false,
         webhook_port: 3000,
         webhook: WebhookConfig::default(),
         use_script_tools: config.tools.use_script_tools,
@@ -216,8 +221,10 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         vision_model_priority: config.memory.ocr_model_priority.clone(),
         tool_allowlist: Some(config.tools.enabled.clone()),
         tool_denylist: config.tools.disabled.clone(),
-        tool_audit_log: config.tools.audit_log,
-        tool_audit_log_values: config.tools.audit_log_values,
+        tool_audit: ToolAuditSwitches {
+            log: config.tools.audit_log,
+            log_values: config.tools.audit_log_values,
+        },
         // Legacy single-binary path: channels are not started here (matches the
         // field's Default). The daemon path wires channel config separately.
         channels: None,
@@ -226,8 +233,10 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         dream_idle_threshold_secs: config.memory.dream_idle_threshold_secs,
         dream_memory_pressure_count: config.memory.dream_memory_pressure_count,
         mcp: config.mcp.clone(),
-        scheduler_enabled: config.scheduler.enabled,
-        heartbeat_enabled: config.scheduler.heartbeat_enabled,
+        scheduler: SchedulerSwitches {
+            enabled: config.scheduler.enabled,
+            heartbeat_enabled: config.scheduler.heartbeat_enabled,
+        },
         heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
     };
 

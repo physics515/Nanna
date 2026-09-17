@@ -72,7 +72,9 @@ pub mod windows_service;
 
 pub use ipc::{IpcServer, IpcServerConfig, ConnectionId, DEFAULT_IPC_PORT};
 pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction, ConfigAction};
-pub use server::{DaemonServer, DaemonConfig};
+pub use server::{
+    DaemonConfig, DaemonServer, SchedulerSwitches, ServerSwitches, ToolAuditSwitches,
+};
 pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
 pub use nanna_memory::ActivityClock;
