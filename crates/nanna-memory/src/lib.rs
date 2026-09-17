@@ -71,6 +71,13 @@ mod lossy {
     }
 }
 
+/// At most the first 40 bytes of `content`, cut back to a char boundary, for
+/// log lines. A raw `&content[..40]` panics when byte 40 lands inside a
+/// multi-byte character — the same crash class that once wedged a chat turn.
+fn preview(content: &str) -> &str {
+    &content[..content.floor_char_boundary(40)]
+}
+
 pub use activity::ActivityClock;
 
 pub use chunk_rank::{collapse_chunk_hits, ChunkHit};
@@ -1718,7 +1725,7 @@ impl VectorStore {
                     } else {
                         warn!(
                             "Re-embed returned wrong dimension for '{}': expected {}, got {}",
-                            &entry.content[..entry.content.len().min(40)],
+                            preview(&entry.content),
                             expected_dim, new_embedding.len()
                         );
                         failed += 1;
@@ -1727,7 +1734,7 @@ impl VectorStore {
                 Err(e) => {
                     warn!(
                         "Failed to re-embed '{}': {}",
-                        &entry.content[..entry.content.len().min(40)], e
+                        preview(&entry.content), e
                     );
                     failed += 1;
                 }
@@ -2110,6 +2117,15 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_never_splits_a_character() {
+        // 39 ASCII bytes then a 3-byte char straddling byte 40.
+        let text = format!("{}€ tail", "a".repeat(39));
+        assert_eq!(preview(&text), "a".repeat(39));
+        assert_eq!(preview("short"), "short");
+        assert_eq!(preview(&"b".repeat(50)), "b".repeat(40));
+    }
 
     fn store_of_width(width: usize) -> VectorStore {
         VectorStore::new(VectorStoreConfig {
