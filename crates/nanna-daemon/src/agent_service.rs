@@ -47,6 +47,85 @@ fn message_is_mission(message: &str) -> bool {
     first_word.trim_end_matches(':').eq_ignore_ascii_case("mission")
 }
 
+/// The run-scoped buffers one chat fills as it streams.
+///
+/// Created once per [`AgentService::chat_with_options`] call and shared with
+/// the active-chat registry and the agent loop's callbacks. The text, thinking
+/// and tool buffers are cleared at every attempt start; the timeline, token
+/// totals, clock and cancel token span the whole run.
+struct ChatRunBuffers {
+    accumulated: Arc<tokio::sync::RwLock<String>>,
+    accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
+    active_tools: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
+    completed_tools: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    timeline: Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+    run_input_tokens: Arc<std::sync::atomic::AtomicU64>,
+    run_output_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Spend of the most recent LLM request — the "cost of the action"
+    /// stamped onto tool calls that request issues.
+    last_request_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Live context usage (last prompt size vs enforced window).
+    context_used: Arc<std::sync::atomic::AtomicU64>,
+    context_window_tokens: Arc<std::sync::atomic::AtomicU64>,
+    run_started: std::time::Instant,
+    cancel: CancelToken,
+}
+
+impl ChatRunBuffers {
+    fn new() -> Self {
+        Self {
+            accumulated: Arc::new(tokio::sync::RwLock::new(String::new())),
+            accumulated_thinking: Arc::new(tokio::sync::RwLock::new(String::new())),
+            active_tools: Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new())),
+            completed_tools: Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new())),
+            timeline: Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new())),
+            run_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            run_output_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_request_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            context_used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            context_window_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            run_started: std::time::Instant::now(),
+            cancel: CancelToken::new(),
+        }
+    }
+}
+
+/// Where a chat is in its walk down the model priority list.
+///
+/// `same_model_retries` counts CONSECUTIVE no-progress faults: it is bounded
+/// by `CHAT_TRANSIENT_RETRIES_MAX` and replenished when a failed attempt
+/// completed at least one tool call first (a fault after real forward work is
+/// a new burst, not an escalation of the last one). Total attempts are
+/// therefore bounded by `models.len() * (1 + CHAT_TRANSIENT_RETRIES_MAX)` plus
+/// one per completed-tool burst — the loop cannot spin without the model doing
+/// real work between faults.
+struct ModelWalk {
+    /// Index of the model being tried.
+    index: usize,
+    same_model_retries: usize,
+    /// Bounded server-down waits (see the connection-refused branch in
+    /// `handle_attempt_failure`). Derivation: one runner restart is back in
+    /// <60s; three 120s readiness waits = six minutes of continuous
+    /// downtime = the server is genuinely dead, stop stalling the run.
+    server_down_waits: usize,
+    last_error: String,
+    tried_models: Vec<String>,
+    rate_limited_providers: HashSet<crate::llm_router::ProviderId>,
+}
+
+impl ModelWalk {
+    fn new() -> Self {
+        Self {
+            index: 0,
+            same_model_retries: 0,
+            server_down_waits: 0,
+            last_error: String::from("No models available"),
+            tried_models: Vec::new(),
+            rate_limited_providers: HashSet::new(),
+        }
+    }
+}
+
 /// Per-session queue that serializes chat processing.
 /// Tokio's Mutex is FIFO-fair, so messages are processed in arrival order.
 struct SessionQueue {
@@ -61,7 +140,7 @@ struct SessionQueue {
 pub struct AgentServiceConfig {
     /// Default model to use
     pub model: String,
-    /// Model priority list for fallback (e.g., ["claude-opus-5", "claude-sonnet-5"])
+    /// Model priority list for fallback (e.g., `["claude-opus-5", "claude-sonnet-5"]`)
     pub model_priority: Vec<String>,
     /// Maximum tokens per response
     pub max_tokens: u32,
@@ -151,7 +230,7 @@ impl Default for AgentServiceConfig {
 /// Split out of [`AgentService::apply_llm_config`] so the mapping is testable
 /// without a live service.
 pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmConfig) {
-    cfg.model_priority = llm.model_priority.clone();
+    cfg.model_priority.clone_from(&llm.model_priority);
     // Same derivation boot uses: head of the priority list, else the single
     // `llm.model`. A priority list that just became empty must not strand the
     // agent on the model the old list's head named.
@@ -160,13 +239,13 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
         .first()
         .cloned()
         .unwrap_or_else(|| llm.model.clone());
-    cfg.summarization_priority = llm.summarization_priority.clone();
-    cfg.summarization_ollama_url = llm.ollama_url.clone();
-    cfg.openrouter_api_key = llm.openrouter_api_key.clone();
-    cfg.openai_api_key = llm.openai_api_key.clone();
-    cfg.model_routing = llm.model_routing.clone();
+    cfg.summarization_priority.clone_from(&llm.summarization_priority);
+    cfg.summarization_ollama_url.clone_from(&llm.ollama_url);
+    cfg.openrouter_api_key.clone_from(&llm.openrouter_api_key);
+    cfg.openai_api_key.clone_from(&llm.openai_api_key);
+    cfg.model_routing.clone_from(&llm.model_routing);
     cfg.routing_first_turn_primary = llm.routing_first_turn_primary;
-    cfg.sub_agent_model = llm.sub_agent_model.clone();
+    cfg.sub_agent_model.clone_from(&llm.sub_agent_model);
     // Resolved (list > legacy single > main chat list), exactly as boot does,
     // so consumers keep seeing one authoritative never-empty chain.
     cfg.sub_agent_models = llm.effective_sub_agent_models();
@@ -323,6 +402,7 @@ fn timeline_append_segment(
             });
         }
     }
+    drop(items);
 }
 
 /// Record a tool call starting (input captured; outcome back-filled on end).
@@ -436,21 +516,21 @@ pub(crate) fn timeline_tool_end(
             diff,
             ..
         } = item
+            && id == call_id
+            && out.is_none()
         {
-            if id == call_id && out.is_none() {
-                *out = Some(timeline_cap_output(record.output));
-                *success = Some(record.ok);
-                *duration_ms = Some(record.duration_ms);
-                *short_circuited = Some(record.replayed);
-                *diff = record.diff.take();
-                // The outcome fields are back-filled as a set: a reader that
-                // sees `success` decided must never find the replay marker
-                // still undecided, or it is back to guessing.
-                debug_assert!(out.is_some(), "a closed call must carry its output");
-                debug_assert!(success.is_some(), "a closed call must carry its verdict");
-                debug_assert!(short_circuited.is_some(), "…and whether it was a replay");
-                return;
-            }
+            *out = Some(timeline_cap_output(record.output));
+            *success = Some(record.ok);
+            *duration_ms = Some(record.duration_ms);
+            *short_circuited = Some(record.replayed);
+            *diff = record.diff.take();
+            // The outcome fields are back-filled as a set: a reader that
+            // sees `success` decided must never find the replay marker
+            // still undecided, or it is back to guessing.
+            debug_assert!(out.is_some(), "a closed call must carry its output");
+            debug_assert!(success.is_some(), "a closed call must carry its verdict");
+            debug_assert!(short_circuited.is_some(), "…and whether it was a replay");
+            return;
         }
     }
     items.push(TimelineItem::Tool {
@@ -471,6 +551,74 @@ pub(crate) fn timeline_tool_end(
     // property the fallback exists for.
     #[cfg(debug_assertions)]
     debug_assert!(items.len() == count_before + 1, "the fallback must append exactly one item");
+    drop(items);
+}
+
+/// One journal item as a crash-recovery checkpoint carries it: everything
+/// bulky bounded, and every trim saying so (see the checkpoint callback in
+/// `AgentService::attach_checkpoint_callback`).
+fn checkpoint_journal_item(item: TimelineItem) -> TimelineItem {
+    match item {
+        // `diff` is dropped here: up to 8 KB of file text per
+        // edit, carried into a checkpoint rewritten every
+        // iteration, grows the writes quadratically exactly like
+        // the full outputs trimmed below. The journal persisted
+        // when the run ends keeps it; a crash-recovered entry just
+        // shows no diff — an absence, never a false claim.
+        TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: _, at } => {
+            let output = output.map(|o| {
+                if o.len() > 200 {
+                    // A short circuit is neither: the tool never ran,
+                    // so calling it "failed" is the same lie the
+                    // journal used to tell about the whole entry.
+                    let outcome = match (short_circuited, success) {
+                        (Some(true), _) => "the tool never ran — the breaker replaced this call with a steering notice",
+                        (_, Some(false)) => "the call failed exactly as recorded",
+                        _ => "the call completed exactly as recorded",
+                    };
+                    format!(
+                        "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; {outcome}]",
+                        truncate(&o, 200)
+                    )
+                } else {
+                    o
+                }
+            });
+            let input = input.map(|i| {
+                let s = i.to_string();
+                if s.len() > 200 {
+                    serde_json::Value::String(format!(
+                        "[input ({} bytes) omitted from this crash-recovery checkpoint only; the call received it in full]",
+                        s.len()
+                    ))
+                } else {
+                    i
+                }
+            });
+            TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: None, at }
+        }
+        TimelineItem::Thinking { content, at } if content.len() > 500 => {
+            let total = content.len();
+            TimelineItem::Thinking {
+                content: format!(
+                    "{} …[thinking trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
+                    truncate(&content, 500)
+                ),
+                at,
+            }
+        }
+        TimelineItem::Text { content, at } if content.len() > 500 => {
+            let total = content.len();
+            TimelineItem::Text {
+                content: format!(
+                    "{} …[text trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
+                    truncate(&content, 500)
+                ),
+                at,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Read the breaker's machine-readable replay marker out of a tool result's
@@ -500,9 +648,11 @@ pub struct CompletedToolCallInfo {
 }
 
 /// Shared buffers for a run registered via
-/// [`AgentService::register_external_run`] — the P19 harness chat path fills
-/// these as it streams, so navigation recovery, Stop, and timeline
-/// persistence work identically to the in-service chat path.
+/// [`AgentService::register_external_run`].
+///
+/// The P19 harness chat path fills these as it streams, so navigation
+/// recovery, Stop, and timeline persistence work identically to the
+/// in-service chat path.
 #[derive(Clone)]
 pub struct ExternalRunHandle {
     pub cancel: CancelToken,
@@ -634,6 +784,7 @@ impl AgentService {
     }
 
     /// Set the shared session history for the `session.history` tool service.
+    #[must_use]
     pub fn with_session_history(mut self, history: crate::server::SharedSessionHistory) -> Self {
         self.session_history = Some(history);
         self
@@ -669,10 +820,11 @@ impl AgentService {
         // Check if we already have cached info for this model
         {
             let cached = self.current_model_info.read().await;
-            if let Some(ref info) = *cached {
-                if info.id == current_model && !info.is_expired() {
-                    return info.clone();
-                }
+            if let Some(ref info) = *cached
+                && info.id == current_model
+                && !info.is_expired()
+            {
+                return info.clone();
             }
         }
 
@@ -850,6 +1002,11 @@ impl AgentService {
     /// `history` should contain all prior session messages **excluding** the
     /// current user message (which is passed as `message`). The agent loop
     /// appends `message` itself, so we only pre-populate the older turns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ChatError`] when every model in the priority list failed or
+    /// had no provider; see [`Self::chat_with_options`].
     pub async fn chat(
         &self,
         session_id: &str,
@@ -857,10 +1014,15 @@ impl AgentService {
         system_prompt: Option<String>,
         history: &[SessionMessage],
     ) -> Result<ChatResult, ChatError> {
-        self.chat_with_options(session_id, message, system_prompt, history, None, None, None, vec![], false).await
+        self.chat_with_options(session_id, message, system_prompt, history, ChatOptions::default()).await
     }
 
     /// Chat with workspace scope for memory extraction
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ChatError`] when every model in the priority list failed or
+    /// had no provider; see [`Self::chat_with_options`].
     pub async fn chat_in_workspace(
         &self,
         session_id: &str,
@@ -870,21 +1032,31 @@ impl AgentService {
         workspace_id: Option<String>,
         attachments: Vec<(String, String)>,
     ) -> Result<ChatResult, ChatError> {
-        self.chat_with_options(session_id, message, system_prompt, history, None, None, workspace_id, attachments, false).await
+        let options = ChatOptions {
+            workspace_id,
+            attachments,
+            ..ChatOptions::default()
+        };
+        self.chat_with_options(session_id, message, system_prompt, history, options).await
     }
 
     /// Chat with optional model and `max_iterations` overrides (used by sub-sessions).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ChatError`] once the walk down the model list is exhausted:
+    /// every model either had no configured provider or failed after its
+    /// same-model transient retries and server-down waits. The error carries
+    /// the tried models and the last failure, plus a partial [`ChatResult`]
+    /// when the run streamed text, completed tool calls, or journaled anything
+    /// before giving up.
     pub async fn chat_with_options(
         &self,
         session_id: &str,
         message: &str,
         system_prompt: Option<String>,
         history: &[SessionMessage],
-        model_override: Option<String>,
-        max_iterations_override: Option<usize>,
-        workspace_id: Option<String>,
-        attachments: Vec<(String, String)>,
-        is_sub_agent: bool,
+        options: ChatOptions,
     ) -> Result<ChatResult, ChatError> {
         // Acquire per-session queue slot (FIFO ordering via tokio Mutex)
         let queue = self.get_or_create_queue(session_id).await;
@@ -895,41 +1067,17 @@ impl AgentService {
         let _guard = queue.lock.lock().await;
 
         // Create shared state buffers for run state tracking
-        let accumulated = Arc::new(tokio::sync::RwLock::new(String::new()));
-        let accumulated_thinking = Arc::new(tokio::sync::RwLock::new(String::new()));
-        let active_tools = Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new()));
-        let completed_tools = Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new()));
-        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
-        let run_input_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let run_output_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Spend of the most recent LLM request — the "cost of the action"
-        // stamped onto tool calls that request issues.
-        let last_request_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Live context usage (last prompt size vs enforced window).
-        let context_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let context_window_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let run_started = std::time::Instant::now();
-        let cancel = CancelToken::new();
+        let run = ChatRunBuffers::new();
+        let ChatRunBuffers {
+            accumulated,
+            accumulated_thinking,
+            active_tools,
+            completed_tools,
+            ..
+        } = &run;
 
         // Register this chat as active (for streaming state tracking)
-        {
-            let mut active = self.active_chats.write().await;
-            active.insert(session_id.to_string(), ActiveChat {
-                _session_id: session_id.to_string(),
-                cancelled: false,
-                cancel: cancel.clone(),
-                started_at: chrono::Utc::now(),
-                accumulated_text: accumulated.clone(),
-                accumulated_thinking: accumulated_thinking.clone(),
-                active_tool_calls: active_tools.clone(),
-                completed_tool_calls: completed_tools.clone(),
-                timeline: timeline.clone(),
-                run_input_tokens: run_input_tokens.clone(),
-                run_output_tokens: run_output_tokens.clone(),
-                context_used: context_used.clone(),
-                context_window: context_window_tokens.clone(),
-            });
-        }
+        self.register_active_chat(session_id, &run).await;
 
         // Populate the shared session history for the `recall_messages` tool
         if let Some(ref session_history) = self.session_history {
@@ -946,67 +1094,33 @@ impl AgentService {
             message_id: message_id.clone(),
         });
 
-        // Build model list to try (priority list, falling back to single model).
-        // This is rebuilt fresh on every chat() call — no persistent "last successful model"
-        // state. Each invocation (including heartbeats) always starts from the top of the
-        // priority list, so transient failures don't permanently shift the preferred model.
-        let base_models: Vec<String> = if let Some(ref model) = model_override {
-            // Explicit model override (e.g., from sub-session) — use only that model
-            vec![model.clone()]
-        } else {
-            let config = self.config.read().await;
-            if config.model_priority.is_empty() {
-                vec![config.model.clone()]
-            } else {
-                config.model_priority.clone()
-            }
-        };
-
-        // Apply health-aware reordering: healthy models first, skip unhealthy ones
-        let models_to_try = self.router.health_sorted_models(&base_models).await;
-
-        let mut last_error = String::from("No models available");
-        let mut tried_models = Vec::new();
-        let mut rate_limited_providers = HashSet::new();
+        let models_to_try = self.models_to_try(options.model_override.as_ref()).await;
 
         // Index-based walk so a transient provider fault can retry the SAME
         // model (`continue` without advancing) before falling down the
-        // priority list. `same_model_retries` counts CONSECUTIVE
-        // no-progress faults: it is bounded by CHAT_TRANSIENT_RETRIES_MAX
-        // and replenished when a failed attempt completed at least one tool
-        // call first (a fault after real forward work is a new burst, not an
-        // escalation of the last one). Total attempts are therefore bounded
-        // by models_to_try.len() * (1 + CHAT_TRANSIENT_RETRIES_MAX) plus one
-        // per completed-tool burst — the loop cannot spin without the model
-        // doing real work between faults.
-        let mut model_index = 0usize;
-        let mut same_model_retries = 0usize;
-        // Bounded server-down waits (see the connection-refused branch in
-        // the error handler). Derivation: one runner restart is back in
-        // <60s; three 120s readiness waits = six minutes of continuous
-        // downtime = the server is genuinely dead, stop stalling the run.
-        let mut server_down_waits = 0usize;
+        // priority list — see [`ModelWalk`] for the bounds.
+        let mut walk = ModelWalk::new();
 
-        while model_index < models_to_try.len() {
-            let model = &models_to_try[model_index];
+        while walk.index < models_to_try.len() {
+            let model = &models_to_try[walk.index];
             // Skip models whose provider was already rate-limited (shared bucket).
             // e.g., if Opus was rate-limited, skip Haiku (both Anthropic).
             let provider = crate::llm_router::ProviderId::from_model(model);
-            if rate_limited_providers.contains(&provider) {
+            if walk.rate_limited_providers.contains(&provider) {
                 info!("Skipping {} — provider {:?} is rate-limited", model, provider);
-                tried_models.push(format!("{model} (skipped: provider rate-limited)"));
-                model_index += 1;
+                walk.tried_models.push(format!("{model} (skipped: provider rate-limited)"));
+                walk.index += 1;
                 continue;
             }
 
-            if same_model_retries == 0 {
-                tried_models.push(model.clone());
+            if walk.same_model_retries == 0 {
+                walk.tried_models.push(model.clone());
             }
             info!(
                 "Trying model: {} (attempt {}, same-model retry {})",
                 model,
-                tried_models.len(),
-                same_model_retries
+                walk.tried_models.len(),
+                walk.same_model_retries
             );
 
             // Every attempt (fresh model OR same-model retry) starts from a
@@ -1023,9 +1137,9 @@ impl AgentService {
             // Notify clients which model we're using. Suppressed on
             // same-model retries: Event::Error{model_retry} already covers
             // those, and a re-emit would wipe the shown fallback reason.
-            if same_model_retries == 0 {
-                let fallback_reason = if tried_models.len() > 1 {
-                    Some(last_error.clone())
+            if walk.same_model_retries == 0 {
+                let fallback_reason = if walk.tried_models.len() > 1 {
+                    Some(walk.last_error.clone())
                 } else {
                     None
                 };
@@ -1036,7 +1150,7 @@ impl AgentService {
             }
 
             // Get the correct LLM client for this model from the router
-            let llm_client = if let Some(client) = self.router.client_for_model(model) { client } else {
+            let Some(llm_client) = self.router.client_for_model(model) else {
                 let detected = crate::llm_router::ProviderId::from_model(model);
                 // Name the CAUSE, not just the outcome. "detected: Anthropic,
                 // available: [Ollama]" is accurate and useless — it reads as
@@ -1055,620 +1169,783 @@ impl AgentService {
                     self.router.available_providers(),
                     because
                 );
-                last_error =
+                walk.last_error =
                     format!("No provider for model: {model} (detected: {detected:?}){because}");
-                same_model_retries = 0;
-                model_index += 1;
+                walk.same_model_retries = 0;
+                walk.index += 1;
                 continue;
             };
 
-            // Create agent config with this model
-            let mut agent_config = self.agent_config().await;
-            agent_config.model = LlmRouter::strip_model_prefix(model);
-
-            // Get model info for context configuration
-            let model_info = self.router.get_model_info(model).await;
-
-            // Create agent with context configured for the model
-            let agent = {
-                let mut context = nanna_agent::AgentContext::new(session_id.to_string());
-
-                // Configure context limits from model capabilities AND this
-                // agent's actual output budget — the reserve tracks
-                // max_tokens instead of the provider's max_output claim, so
-                // small-output agents keep most of the window for input.
-                // Claude's max_tokens is ONE ceiling over thinking and the
-                // visible answer together, so a thinking run needs the reserve
-                // widened by the reasoning budget or the answer is what gets
-                // squeezed out (Ollama bounds thinking inside num_predict and
-                // needs no extra).
-                let thinking_reserve_tokens = if agent_config.model.starts_with("claude") {
-                    agent_config
-                        .thinking_mode
-                        .budget_tokens()
-                        .unwrap_or(0) as usize
-                } else {
-                    0
-                };
-                context.configure_for_model_with_output(
-                    &model_info,
-                    agent_config.max_tokens as usize + thinking_reserve_tokens,
-                );
-
-                // Set system prompt if provided
-                if let Some(ref prompt) = system_prompt {
-                    context = context.with_system_prompt(prompt);
-                }
-
-                // Load prior conversation history into context
-                for msg in history {
-                    let anthropic_msg = match msg.role {
-                        MessageRole::User => AnthropicMessage::user_text(&msg.content),
-                        MessageRole::Assistant => AnthropicMessage::assistant_text(&msg.content),
-                        // System/Tool messages are not standard conversation turns;
-                        // skip them to avoid confusing the LLM message alternation
-                        MessageRole::System | MessageRole::Tool => continue,
-                    };
-                    context.messages.push(anthropic_msg);
-                }
-
-                let mut agent = Agent::new(
-                    agent_config,
-                    llm_client,
-                    self.tools.clone(),
-                )
-                .with_context(context);
-                // Record per-model request stats into the shared tracker so the
-                // control plane persists them and the router can route on them.
-                if let Some(ref tracker) = self.model_stats {
-                    agent = agent.with_stats(tracker.clone());
-                }
-                agent
-            };
+            let agent = self
+                .attempt_agent(session_id, model, llm_client, system_prompt.as_ref(), history)
+                .await;
 
             // Create run options with streaming callbacks
-            let session_id_for_stream = session_id.to_string();
-            let event_tx = self.event_tx.clone();
-
-            // Clone memory service for auto-extraction callback
-            let memory_for_extraction = self.memory.clone();
-            let has_memory = memory_for_extraction.is_some();
-
-            let accumulated_for_cb = accumulated.clone();
-            let timeline_for_text = timeline.clone();
-            let event_tx_thinking = self.event_tx.clone();
-            let session_id_thinking = session_id.to_string();
-            let event_tx_tool_start = self.event_tx.clone();
-            let session_id_tool_start = session_id.to_string();
-            let active_tools_for_cb = active_tools.clone();
-            let timeline_for_tool_start = timeline.clone();
-            let tokens_last_for_tool_start = last_request_tokens.clone();
-            let tokens_in_for_tool_start = run_input_tokens.clone();
-            let tokens_out_for_tool_start = run_output_tokens.clone();
-            let options = RunOptions {
-                cancel: Some(cancel.clone()),
-                on_text: Some(Box::new(move |chunk: &str| {
-                    // Accumulate text for run state recovery
-                    if let Ok(mut buf) = accumulated_for_cb.try_write() {
-                        buf.push_str(chunk);
-                    }
-                    timeline_append_segment(&timeline_for_text, chunk, false);
-                    let _ = event_tx.send(Event::MessageDelta {
-                        session_id: session_id_for_stream.clone(),
-                        message_id: String::new(),
-                        delta: chunk.to_string(),
-                    });
-                })),
-                on_thinking: Some(Box::new({
-                    let accumulated_thinking = accumulated_thinking.clone();
-                    let timeline_for_thinking = timeline.clone();
-                    move |chunk: &str| {
-                        // Accumulate thinking for run state recovery
-                        if let Ok(mut buf) = accumulated_thinking.try_write() {
-                            buf.push_str(chunk);
-                        }
-                        timeline_append_segment(&timeline_for_thinking, chunk, true);
-                        let _ = event_tx_thinking.send(Event::ThinkingDelta {
-                            session_id: session_id_thinking.clone(),
-                            delta: chunk.to_string(),
-                        });
-                    }
-                })),
-                on_tool_start: Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value, model: Option<&str>| {
-                    // Track active tool calls for run state recovery
-                    if let Ok(mut tools) = active_tools_for_cb.try_write() {
-                        tools.push(ActiveToolCallInfo {
-                            call_id: call_id.to_string(),
-                            name: name.to_string(),
-                            started_at: chrono::Utc::now(),
-                        });
-                    }
-                    // Cost of the action: the issuing request's spend, plus
-                    // the run total at this moment (benchmark breadcrumbs).
-                    let action_tokens = tokens_last_for_tool_start.load(Ordering::Relaxed);
-                    let total_tokens = tokens_in_for_tool_start.load(Ordering::Relaxed)
-                        + tokens_out_for_tool_start.load(Ordering::Relaxed);
-                    timeline_tool_start(&timeline_for_tool_start, call_id, name, input, action_tokens, total_tokens);
-                    let _ = event_tx_tool_start.send(Event::ToolStart {
-                        session_id: session_id_tool_start.clone(),
-                        call_id: call_id.to_string(),
-                        name: name.to_string(),
-                        input: input.clone(),
-                        model: model.map(std::string::ToString::to_string),
-                        tokens: (action_tokens > 0).then_some(action_tokens),
-                        total_tokens: (total_tokens > 0).then_some(total_tokens),
-                    });
-                })),
-                on_tool_end: {
-                    let event_tx_tool_end = self.event_tx.clone();
-                    let session_id_tool_end = session_id.to_string();
-                    let active_tools_for_end = active_tools.clone();
-                    let completed_tools_for_end = completed_tools.clone();
-                    let timeline_for_tool_end = timeline.clone();
-                    Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64, data: Option<&serde_json::Value>| {
-                        // Move from active to completed
-                        if let Ok(mut active) = active_tools_for_end.try_write() {
-                            active.retain(|t| t.call_id != call_id);
-                        }
-                        if let Ok(mut completed) = completed_tools_for_end.try_write() {
-                            completed.push(CompletedToolCallInfo {
-                                call_id: call_id.to_string(),
-                                name: name.to_string(),
-                                output: output.to_string(),
-                                success,
-                                duration_ms,
-                            });
-                        }
-                        // The replay marker rides in the result's structured
-                        // data, which the event carries but the journal used
-                        // to drop — so a restored timeline showed steering as
-                        // failures. Record it where the run record lives.
-                        timeline_tool_end(
-                            &timeline_for_tool_end,
-                            call_id,
-                            name,
-                            ToolEndRecord::from_result(output, success, duration_ms, data),
-                        );
-                        let _ = event_tx_tool_end.send(Event::ToolEnd {
-                            session_id: session_id_tool_end.clone(),
-                            call_id: call_id.to_string(),
-                            output: output.to_string(),
-                            success,
-                            duration_ms,
-                            data: data.cloned(),
-                        });
-                    }))
-                },
-                // Enable auto-extraction if memory service is available
-                auto_extract_memories: has_memory,
-                on_memory: if has_memory {
-                    let ws_id_for_memory = workspace_id.clone();
-                    Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
-                        let mem_service = memory_for_extraction.clone();
-                        let ws_id = ws_id_for_memory.clone();
-                        Box::pin(async move {
-                            if let Some(ref service) = mem_service {
-                                // Filter, importance and route all live in
-                                // `memory_adapter` — ONE copy, shared with the
-                                // harness sink in `tasks.rs`. Two private
-                                // copies is how those two sinks' policies
-                                // drifted apart before, at a cost of 704
-                                // discarded writes in a single run; this path
-                                // only decides what to say about the outcome.
-                                let category = memory.category.clone();
-                                let excerpt = truncate(&memory.content, 50);
-                                match crate::memory_adapter::store_extracted_memory(
-                                    service,
-                                    memory,
-                                    ws_id,
-                                )
-                                .await
-                                {
-                                    Ok(None) => info!(
-                                        "Skipping low-signal memory [{category}]: {excerpt}"
-                                    ),
-                                    Ok(Some(_)) => info!(
-                                        "Auto-extracted memory [{category}]: {excerpt}"
-                                    ),
-                                    Err(e) => warn!("Failed to auto-store memory: {e}"),
-                                }
-                            }
-                        })
-                    }))
-                } else {
-                    None
-                },
-                max_iterations: max_iterations_override,
-                attachments: attachments.clone(),
-                is_sub_agent,
-                all_tools_active: is_sub_agent,
-                // Capability transitions (provider benched, writes queued)
-                // reach the model once, in its next tool result.
-                degradations: self.degradations.clone(),
-                // "One path": a chat whose message opens with MISSION runs
-                // long-horizon — the loop auto-continues the model (visible
-                // as mission_control tool chips) until it declares MISSION
-                // COMPLETE or stalls. One user prompt, continuous work.
-                mission_mode: !is_sub_agent && message_is_mission(message),
-                on_usage: {
-                    // Run-scoped totals: every LLM request's usage counts,
-                    // including requests inside attempts that later fault —
-                    // that spend is real and belongs in the benchmark.
-                    // Also the realtime context-usage signal: each request's
-                    // prompt size vs the enforced window, pushed to clients.
-                    let usage_in = run_input_tokens.clone();
-                    let usage_out = run_output_tokens.clone();
-                    let usage_last = last_request_tokens.clone();
-                    let ctx_used = context_used.clone();
-                    let ctx_window = context_window_tokens.clone();
-                    let event_tx_usage = self.event_tx.clone();
-                    let session_id_usage = session_id.to_string();
-                    Some(Box::new(move |input: u32, output: u32, window: u64| {
-                        usage_in.fetch_add(u64::from(input), Ordering::Relaxed);
-                        usage_out.fetch_add(u64::from(output), Ordering::Relaxed);
-                        usage_last.store(u64::from(input) + u64::from(output), Ordering::Relaxed);
-                        ctx_used.store(u64::from(input), Ordering::Relaxed);
-                        ctx_window.store(window, Ordering::Relaxed);
-                        let _ = event_tx_usage.send(Event::ContextUsage {
-                            session_id: session_id_usage.clone(),
-                            used: u64::from(input),
-                            window,
-                        });
-                    }))
-                },
-                on_checkpoint: {
-                    let checkpoint_session_id = session_id.to_string();
-                    let checkpoint_accumulated = accumulated.clone();
-                    let checkpoint_completed = completed_tools.clone();
-                    let checkpoint_timeline = timeline.clone();
-                    let checkpoint_storage = self.storage.clone();
-                    Some(Box::new(move |messages: &[nanna_llm::AnthropicMessage], iteration: usize| {
-                        // Snapshot accumulated text + tool calls to a checkpoint.
-                        // This runs synchronously in the agent loop — keep it fast.
-                        let text = checkpoint_accumulated.try_read()
-                            .map(|t| t.clone())
-                            .unwrap_or_default();
-                        let tools: Vec<CompletedToolCallInfo> = checkpoint_completed.try_read()
-                            .map(|t| t.clone())
-                            .unwrap_or_default();
-
-                        // Timeline snapshot with EVERYTHING bulky bounded:
-                        // the checkpoint is rewritten every iteration, so
-                        // carrying full outputs, inputs (write_file bodies!),
-                        // or thinking/text segments would make cumulative
-                        // writes grow quadratically over a long mission. The
-                        // full record is persisted with the message when the
-                        // run ends; this bound only trims what a CRASH
-                        // recovery can redisplay, and every trim says so.
-                        let journal: Vec<TimelineItem> = timeline_lock(&checkpoint_timeline)
-                            .clone()
-                            .into_iter()
-                            .map(|item| match item {
-                                // `diff` is dropped here: up to 8 KB of file text per
-                                // edit, carried into a checkpoint rewritten every
-                                // iteration, grows the writes quadratically exactly like
-                                // the full outputs trimmed below. The journal persisted
-                                // when the run ends keeps it; a crash-recovered entry just
-                                // shows no diff — an absence, never a false claim.
-                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: _, at } => {
-                                    let output = output.map(|o| {
-                                        if o.len() > 200 {
-                                            // A short circuit is neither: the tool never ran,
-                                            // so calling it "failed" is the same lie the
-                                            // journal used to tell about the whole entry.
-                                            let outcome = match (short_circuited, success) {
-                                                (Some(true), _) => "the tool never ran — the breaker replaced this call with a steering notice",
-                                                (_, Some(false)) => "the call failed exactly as recorded",
-                                                _ => "the call completed exactly as recorded",
-                                            };
-                                            format!(
-                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; {outcome}]",
-                                                truncate(&o, 200)
-                                            )
-                                        } else {
-                                            o
-                                        }
-                                    });
-                                    let input = input.map(|i| {
-                                        let s = i.to_string();
-                                        if s.len() > 200 {
-                                            serde_json::Value::String(format!(
-                                                "[input ({} bytes) omitted from this crash-recovery checkpoint only; the call received it in full]",
-                                                s.len()
-                                            ))
-                                        } else {
-                                            i
-                                        }
-                                    });
-                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, short_circuited, diff: None, at }
-                                }
-                                TimelineItem::Thinking { content, at } if content.len() > 500 => {
-                                    let total = content.len();
-                                    TimelineItem::Thinking {
-                                        content: format!(
-                                            "{} …[thinking trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
-                                            truncate(&content, 500)
-                                        ),
-                                        at,
-                                    }
-                                }
-                                TimelineItem::Text { content, at } if content.len() > 500 => {
-                                    let total = content.len();
-                                    TimelineItem::Text {
-                                        content: format!(
-                                            "{} …[text trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
-                                            truncate(&content, 500)
-                                        ),
-                                        at,
-                                    }
-                                }
-                                other => other,
-                            })
-                            .collect();
-
-                        let checkpoint = serde_json::json!({
-                            "session_id": checkpoint_session_id,
-                            "iteration": iteration,
-                            "accumulated_text": text,
-                            "tool_calls": tools,
-                            "timeline": journal,
-                            "message_count": messages.len(),
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-
-                        // Write checkpoint to database (best-effort, fire-and-forget)
-                        if let Some(ref storage) = checkpoint_storage {
-                            if let Ok(json) = serde_json::to_string(&checkpoint) {
-                                let storage = storage.clone();
-                                let sid = checkpoint_session_id.clone();
-                                // Spawn async write — sync callback can't await
-                                let _ = tokio::task::spawn(async move {
-                                    if let Err(e) = storage.save_checkpoint(&sid, &json).await {
-                                        tracing::warn!("Failed to save checkpoint: {}", e);
-                                    }
-                                });
-                            }
-                        }
-                    }))
-                },
-                ..Default::default()
-            };
+            let run_options = self.run_options(session_id, message, &run, &options);
 
             // Run the agent
-            let result = agent.run(message, options).await;
+            let result = agent.run(message, run_options).await;
 
             match result {
                 Ok(response) => {
-                    // Remove from active chats and decrement queue depth
-                    {
-                        let mut active = self.active_chats.write().await;
-                        active.remove(session_id);
-                    }
-                    queue.depth.fetch_sub(1, Ordering::Relaxed);
-
-                    // Tool events already emitted in real-time via on_tool_end callback
-
-                    // Emit completion event
-                    let _ = self.event_tx.send(Event::MessageEnd {
-                        session_id: session_id.to_string(),
-                        message_id: message_id.clone(),
-                        content: response.text.clone(),
-                    });
-
-                    info!("Success with model: {}", model);
-
-                    // Clean up checkpoint — run completed successfully
-                    if let Some(ref storage) = self.storage {
-                        let storage = storage.clone();
-                        let sid = session_id.to_string();
-                        tokio::spawn(async move {
-                            let _ = storage.delete_checkpoint(&sid).await;
-                        });
-                    }
-
-                    let final_timeline = timeline_lock(&timeline).clone();
-                    let usage = RunUsage {
-                        input_tokens: run_input_tokens.load(Ordering::Relaxed),
-                        output_tokens: run_output_tokens.load(Ordering::Relaxed),
-                        duration_ms: run_started.elapsed().as_millis() as u64,
-                        model: model.clone(),
-                    };
-                    // One benchmark line per run: identical tasks across
-                    // models are compared on tokens spent and time taken.
-                    let (tl_tools, tl_faults) = final_timeline.iter().fold((0usize, 0usize), |(t, f), item| match item {
-                        TimelineItem::Tool { .. } => (t + 1, f),
-                        TimelineItem::Fault { .. } => (t, f + 1),
-                        _ => (t, f),
-                    });
-                    info!(
-                        session_id = %session_id,
-                        model = %usage.model,
-                        duration_s = usage.duration_ms / 1000,
-                        input_tokens = usage.input_tokens,
-                        output_tokens = usage.output_tokens,
-                        tool_calls = tl_tools,
-                        faults_healed = tl_faults,
-                        "📊 RUN SUMMARY"
-                    );
-
-                    return Ok(ChatResult {
-                        message_id,
-                        content: response.text,
-                        tool_calls: response.tool_calls.into_iter().map(|tc| ToolCallRecord {
-                            id: tc.id,
-                            name: tc.name,
-                            input: tc.input,
-                            output: Some(tc.output),
-                            success: Some(tc.success),
-                            duration_ms: Some(tc.duration_ms),
-                        }).collect(),
-                        input_tokens: response.input_tokens,
-                        output_tokens: response.output_tokens,
-                        reasoning: response.reasoning.map(|r| r.content),
-                        timeline: final_timeline,
-                        usage: Some(usage),
-                        partial: false,
-                    });
+                    return Ok(self
+                        .finish_chat_success(session_id, &queue, &run, message_id, model, response)
+                        .await);
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-                    warn!("Model {} failed: {}", model, error_str);
-                    last_error = error_str.clone();
-
-                    // Journal the fault so the timeline explains the seam:
-                    // thinking/text after this point is a fresh attempt
-                    // regenerating, not the same stream resuming. This push
-                    // is infallible on purpose — if the seam is ever lost,
-                    // the tail-merge rule fuses the dead attempt's partial
-                    // text with the retry's regeneration into one segment.
-                    timeline_lock(&timeline).push(TimelineItem::Fault {
-                        message: truncate(&error_str, 200),
-                        at: chrono::Utc::now().to_rfc3339(),
-                    });
-
-                    // A DOWN local server (connection refused — e.g. our own
-                    // runner-surgery restart window, observed live killing a
-                    // 4h55m mission two minutes after the surgery cured its
-                    // fault storm) is a WAIT condition, not a fault to
-                    // retry-count: attempts against a down server complete
-                    // zero tool calls, so progress-based replenishment can
-                    // never refill the budget, and the 2/5/10s backoffs burn
-                    // out inside a ~20-60s restart. Wait for readiness
-                    // (bounded) and resume the same model with the budget
-                    // untouched; if the server never comes back, fall
-                    // through to normal retry accounting and exhaust.
-                    if provider == crate::llm_router::ProviderId::Ollama
-                        && Self::is_server_down_error(&error_str)
-                        && server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
-                        && !cancel.is_cancelled()
-                    {
-                        server_down_waits += 1;
-                        warn!(
-                            "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
-                        );
-                        if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
-                            info!("Ollama is reachable again — resuming the run");
-                            continue;
-                        }
-                        warn!("Ollama still unreachable after {CHAT_SERVER_DOWN_WAIT_SECS}s — falling back to normal retry accounting");
-                    }
-
-                    // Transient provider fault (timeout / 5xx / dropped
-                    // stream / aborted generation)? Retry the SAME model with
-                    // escalating backoff before falling down the priority
-                    // list — a single-model list (the common local setup)
-                    // otherwise dies on the first hiccup and heartbeats fail
-                    // for hours. Mirrors the task harness's step-retry
-                    // ladder; Ollama-served models additionally get runner
-                    // surgery (provider-gated — never fires for cloud models).
-                    // Rate-limit/overload errors (429/529) are excluded: the
-                    // branch below honors the provider's Retry-After and the
-                    // shared-bucket skip instead of hammering it. A cancelled
-                    // chat must not heal either — no retry, no server surgery.
-                    // A fault after real forward progress starts a NEW burst:
-                    // replenish the same-model retry budget instead of letting
-                    // it accumulate across the whole message. A single-prompt
-                    // long-horizon mission gets exactly one user message — a
-                    // cumulative budget that survives hours of successful tool
-                    // rounds and then kills the run on the third hiccup is a
-                    // per-mission bound dressed up as a per-fault one. Progress
-                    // means at least one tool call completed this attempt
-                    // (completed_tools is cleared at attempt start), so the
-                    // heal loop cannot spin without real work between faults;
-                    // consecutive no-progress faults still climb the
-                    // unload→restart ladder and exhaust at the max.
-                    if same_model_retries > 0 && crate::tasks::is_transient_llm_error(&error_str) {
-                        let attempt_tool_calls = completed_tools.read().await.len();
-                        if attempt_tool_calls > 0 {
-                            info!(
-                                "Attempt completed {attempt_tool_calls} tool calls before this fault — new transient burst, retry budget replenished"
-                            );
-                            same_model_retries = 0;
-                        }
-                    }
-
-                    if crate::tasks::is_transient_llm_error(&error_str)
-                        && !Self::is_rate_limit_error(&error_str)
-                        && !cancel.is_cancelled()
-                        && same_model_retries < CHAT_TRANSIENT_RETRIES_MAX
-                    {
-                        same_model_retries += 1;
-                        let backoff_secs = CHAT_RETRY_BACKOFF_SECS[same_model_retries - 1];
-                        warn!(
-                            "Transient failure on {model} — retrying in {backoff_secs}s ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})"
-                        );
-                        let _ = self.event_tx.send(Event::Error {
-                            code: "model_retry".to_string(),
-                            message: format!(
-                                "Transient failure on {model}. Retrying ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})..."
-                            ),
-                            session_id: Some(session_id.to_string()),
-                        });
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                        // Re-check cancellation after the sleep: a cancel
-                        // arriving mid-backoff must not bounce the shared
-                        // Ollama server for a chat nobody is waiting on.
-                        if provider == crate::llm_router::ProviderId::Ollama
-                            && !cancel.is_cancelled()
-                        {
-                            // Second failure: unload the model to clear a
-                            // degraded runner. Final retry: restart the
-                            // server — the sticky degraded state survives
-                            // unloads (verified live in the endurance runs).
-                            if same_model_retries == 2 {
-                                crate::tasks::reset_ollama_runner_for(model).await;
-                            }
-                            if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
-                                && crate::tasks::ollama_restart_allowed()
-                            {
-                                crate::tasks::restart_ollama_server().await;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Rate limit? Wait before falling through, and record the
-                    // provider so we can skip other models on the same provider
-                    // (they share the same rate limit bucket).
-                    if Self::is_rate_limit_error(&error_str) {
-                        let provider = crate::llm_router::ProviderId::from_model(model);
-                        rate_limited_providers.insert(provider);
-                        let retry_secs = Self::parse_retry_after(&error_str).unwrap_or(10);
-                        // Cap wait at 60s
-                        let wait_secs = retry_secs.min(60);
-                        info!("Rate limited on {} (provider {:?}). Waiting {}s before trying next model...", model, provider, wait_secs);
-                        let _ = self.event_tx.send(Event::Error {
-                            code: "rate_limit".to_string(),
-                            message: format!("Rate limited on {model}. Waiting {wait_secs}s..."),
-                            session_id: Some(session_id.to_string()),
-                        });
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                    }
-
-                    // Context length exceeded? The agent's internal retry already
-                    // tried to truncate. If it still failed, skip to the next model
-                    // but log it clearly — trying a *smaller* model won't help.
-                    if Self::is_context_length_error(&error_str) {
-                        warn!(
-                            "Context length exceeded on {} even after emergency truncation. \
-                             History may be too large for this model's context window.",
-                            model
-                        );
-                    }
-
-                    // Emit error as a warning so it's visible, but continue trying
-                    let _ = self.event_tx.send(Event::Error {
-                        code: "model_error".to_string(),
-                        message: format!("Model {model} failed: {last_error}. Trying next model..."),
-                        session_id: Some(session_id.to_string()),
-                    });
-
-                    info!("Model {} failed, trying next model in priority list", model);
-                    same_model_retries = 0;
-                    model_index += 1;
+                    self.handle_attempt_failure(session_id, model, provider, &e.to_string(), &run, &mut walk)
+                        .await;
                 }
             }
         }
+
+        self.finish_chat_exhausted(session_id, &queue, &run, message_id, walk).await
+    }
+
+    /// Register a starting chat in `active_chats`, sharing the run's buffers so
+    /// run-state recovery and Stop see it streaming.
+    async fn register_active_chat(&self, session_id: &str, run: &ChatRunBuffers) {
+        let ChatRunBuffers {
+            accumulated,
+            accumulated_thinking,
+            active_tools,
+            completed_tools,
+            timeline,
+            run_input_tokens,
+            run_output_tokens,
+            context_used,
+            context_window_tokens,
+            cancel,
+            ..
+        } = run;
+        let mut active = self.active_chats.write().await;
+        active.insert(session_id.to_string(), ActiveChat {
+            _session_id: session_id.to_string(),
+            cancelled: false,
+            cancel: cancel.clone(),
+            started_at: chrono::Utc::now(),
+            accumulated_text: accumulated.clone(),
+            accumulated_thinking: accumulated_thinking.clone(),
+            active_tool_calls: active_tools.clone(),
+            completed_tool_calls: completed_tools.clone(),
+            timeline: timeline.clone(),
+            run_input_tokens: run_input_tokens.clone(),
+            run_output_tokens: run_output_tokens.clone(),
+            context_used: context_used.clone(),
+            context_window: context_window_tokens.clone(),
+        });
+    }
+
+    /// The models one chat walks, in order.
+    ///
+    /// Build model list to try (priority list, falling back to single model).
+    /// This is rebuilt fresh on every `chat()` call — no persistent "last successful model"
+    /// state. Each invocation (including heartbeats) always starts from the top of the
+    /// priority list, so transient failures don't permanently shift the preferred model.
+    async fn models_to_try(&self, model_override: Option<&String>) -> Vec<String> {
+        let base_models: Vec<String> = if let Some(model) = model_override {
+            // Explicit model override (e.g., from sub-session) — use only that model
+            vec![model.clone()]
+        } else {
+            let config = self.config.read().await;
+            if config.model_priority.is_empty() {
+                vec![config.model.clone()]
+            } else {
+                config.model_priority.clone()
+            }
+        };
+
+        // Apply health-aware reordering: healthy models first, skip unhealthy ones
+        self.router.health_sorted_models(&base_models).await
+    }
+
+    /// Build the agent for one attempt on `model`: its config, and a context
+    /// sized for the model and seeded with the system prompt and history.
+    async fn attempt_agent(
+        &self,
+        session_id: &str,
+        model: &str,
+        llm_client: Arc<nanna_llm::LlmClient>,
+        system_prompt: Option<&String>,
+        history: &[SessionMessage],
+    ) -> Agent {
+        // Create agent config with this model
+        let mut agent_config = self.agent_config().await;
+        agent_config.model = LlmRouter::strip_model_prefix(model);
+
+        // Get model info for context configuration
+        let model_info = self.router.get_model_info(model).await;
+
+        let mut context = nanna_agent::AgentContext::new(session_id.to_string());
+
+        // Configure context limits from model capabilities AND this
+        // agent's actual output budget — the reserve tracks
+        // max_tokens instead of the provider's max_output claim, so
+        // small-output agents keep most of the window for input.
+        // Claude's max_tokens is ONE ceiling over thinking and the
+        // visible answer together, so a thinking run needs the reserve
+        // widened by the reasoning budget or the answer is what gets
+        // squeezed out (Ollama bounds thinking inside num_predict and
+        // needs no extra).
+        let thinking_reserve_tokens = if agent_config.model.starts_with("claude") {
+            agent_config
+                .thinking_mode
+                .budget_tokens()
+                .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        context.configure_for_model_with_output(
+            &model_info,
+            agent_config.max_tokens as usize + thinking_reserve_tokens,
+        );
+
+        // Set system prompt if provided
+        if let Some(prompt) = system_prompt {
+            context = context.with_system_prompt(prompt);
+        }
+
+        // Load prior conversation history into context
+        for msg in history {
+            let anthropic_msg = match msg.role {
+                MessageRole::User => AnthropicMessage::user_text(&msg.content),
+                MessageRole::Assistant => AnthropicMessage::assistant_text(&msg.content),
+                // System/Tool messages are not standard conversation turns;
+                // skip them to avoid confusing the LLM message alternation
+                MessageRole::System | MessageRole::Tool => continue,
+            };
+            context.messages.push(anthropic_msg);
+        }
+
+        let mut agent = Agent::new(
+            agent_config,
+            llm_client,
+            self.tools.clone(),
+        )
+        .with_context(context);
+        // Record per-model request stats into the shared tracker so the
+        // control plane persists them and the router can route on them.
+        if let Some(ref tracker) = self.model_stats {
+            agent = agent.with_stats(tracker.clone());
+        }
+        agent
+    }
+
+    /// The agent-loop options for one attempt: cancellation, the streaming
+    /// and journaling callbacks, memory extraction, and the per-call overrides.
+    fn run_options(
+        &self,
+        session_id: &str,
+        message: &str,
+        run: &ChatRunBuffers,
+        chat_options: &ChatOptions,
+    ) -> RunOptions {
+        let is_sub_agent = chat_options.is_sub_agent;
+        // Clone memory service for auto-extraction callback
+        let memory_for_extraction = self.memory.clone();
+        let has_memory = memory_for_extraction.is_some();
+        let mut options = RunOptions {
+            cancel: Some(run.cancel.clone()),
+            // Enable auto-extraction if memory service is available
+            auto_extract_memories: has_memory,
+            max_iterations: chat_options.max_iterations_override,
+            attachments: chat_options.attachments.clone(),
+            is_sub_agent,
+            all_tools_active: is_sub_agent,
+            // Capability transitions (provider benched, writes queued)
+            // reach the model once, in its next tool result.
+            degradations: self.degradations.clone(),
+            // "One path": a chat whose message opens with MISSION runs
+            // long-horizon — the loop auto-continues the model (visible
+            // as mission_control tool chips) until it declares MISSION
+            // COMPLETE or stalls. One user prompt, continuous work.
+            mission_mode: !is_sub_agent && message_is_mission(message),
+            ..Default::default()
+        };
+        self.attach_stream_callbacks(&mut options, session_id, run);
+        self.attach_tool_end_callback(&mut options, session_id, run);
+        options.on_memory = if has_memory {
+            let workspace_id = &chat_options.workspace_id;
+            let ws_id_for_memory = workspace_id.clone();
+            Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
+                let mem_service = memory_for_extraction.clone();
+                let ws_id = ws_id_for_memory.clone();
+                Box::pin(async move {
+                    if let Some(ref service) = mem_service {
+                        // Filter, importance and route all live in
+                        // `memory_adapter` — ONE copy, shared with the
+                        // harness sink in `tasks.rs`. Two private
+                        // copies is how those two sinks' policies
+                        // drifted apart before, at a cost of 704
+                        // discarded writes in a single run; this path
+                        // only decides what to say about the outcome.
+                        let category = memory.category.clone();
+                        let excerpt = truncate(&memory.content, 50);
+                        match crate::memory_adapter::store_extracted_memory(
+                            service,
+                            memory,
+                            ws_id,
+                        )
+                        .await
+                        {
+                            Ok(None) => info!(
+                                "Skipping low-signal memory [{category}]: {excerpt}"
+                            ),
+                            Ok(Some(_)) => info!(
+                                "Auto-extracted memory [{category}]: {excerpt}"
+                            ),
+                            Err(e) => warn!("Failed to auto-store memory: {e}"),
+                        }
+                    }
+                })
+            }))
+        } else {
+            None
+        };
+        self.attach_usage_callback(&mut options, session_id, run);
+        self.attach_checkpoint_callback(&mut options, session_id, run);
+        options
+    }
+
+    /// Wire the text, thinking and tool-start streams: each feeds the run's
+    /// recovery buffers and journal, then the client event.
+    fn attach_stream_callbacks(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+        let ChatRunBuffers {
+            accumulated,
+            accumulated_thinking,
+            active_tools,
+            timeline,
+            run_input_tokens,
+            run_output_tokens,
+            last_request_tokens,
+            ..
+        } = run;
+        let session_id_for_stream = session_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let accumulated_for_cb = accumulated.clone();
+        let timeline_for_text = timeline.clone();
+        let event_tx_thinking = self.event_tx.clone();
+        let session_id_thinking = session_id.to_string();
+        let event_tx_tool_start = self.event_tx.clone();
+        let session_id_tool_start = session_id.to_string();
+        let active_tools_for_cb = active_tools.clone();
+        let timeline_for_tool_start = timeline.clone();
+        let tokens_last_for_tool_start = last_request_tokens.clone();
+        let tokens_in_for_tool_start = run_input_tokens.clone();
+        let tokens_out_for_tool_start = run_output_tokens.clone();
+        options.on_text = Some(Box::new(move |chunk: &str| {
+            // Accumulate text for run state recovery
+            if let Ok(mut buf) = accumulated_for_cb.try_write() {
+                buf.push_str(chunk);
+            }
+            timeline_append_segment(&timeline_for_text, chunk, false);
+            let _ = event_tx.send(Event::MessageDelta {
+                session_id: session_id_for_stream.clone(),
+                message_id: String::new(),
+                delta: chunk.to_string(),
+            });
+        }));
+        options.on_thinking = Some(Box::new({
+            let accumulated_thinking = accumulated_thinking.clone();
+            let timeline_for_thinking = timeline.clone();
+            move |chunk: &str| {
+                // Accumulate thinking for run state recovery
+                if let Ok(mut buf) = accumulated_thinking.try_write() {
+                    buf.push_str(chunk);
+                }
+                timeline_append_segment(&timeline_for_thinking, chunk, true);
+                let _ = event_tx_thinking.send(Event::ThinkingDelta {
+                    session_id: session_id_thinking.clone(),
+                    delta: chunk.to_string(),
+                });
+            }
+        }));
+        options.on_tool_start = Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value, model: Option<&str>| {
+            // Track active tool calls for run state recovery
+            if let Ok(mut tools) = active_tools_for_cb.try_write() {
+                tools.push(ActiveToolCallInfo {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    started_at: chrono::Utc::now(),
+                });
+            }
+            // Cost of the action: the issuing request's spend, plus
+            // the run total at this moment (benchmark breadcrumbs).
+            let action_tokens = tokens_last_for_tool_start.load(Ordering::Relaxed);
+            let total_tokens = tokens_in_for_tool_start.load(Ordering::Relaxed)
+                + tokens_out_for_tool_start.load(Ordering::Relaxed);
+            timeline_tool_start(&timeline_for_tool_start, call_id, name, input, action_tokens, total_tokens);
+            let _ = event_tx_tool_start.send(Event::ToolStart {
+                session_id: session_id_tool_start.clone(),
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: input.clone(),
+                model: model.map(std::string::ToString::to_string),
+                tokens: (action_tokens > 0).then_some(action_tokens),
+                total_tokens: (total_tokens > 0).then_some(total_tokens),
+            });
+        }));
+    }
+
+    /// Wire tool completion: move the call from active to completed, back-fill
+    /// its journal entry, and emit the client event.
+    fn attach_tool_end_callback(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+        let ChatRunBuffers {
+            active_tools,
+            completed_tools,
+            timeline,
+            ..
+        } = run;
+        options.on_tool_end = {
+            let event_tx_tool_end = self.event_tx.clone();
+            let session_id_tool_end = session_id.to_string();
+            let active_tools_for_end = active_tools.clone();
+            let completed_tools_for_end = completed_tools.clone();
+            let timeline_for_tool_end = timeline.clone();
+            Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64, data: Option<&serde_json::Value>| {
+                // Move from active to completed
+                if let Ok(mut active) = active_tools_for_end.try_write() {
+                    active.retain(|t| t.call_id != call_id);
+                }
+                if let Ok(mut completed) = completed_tools_for_end.try_write() {
+                    completed.push(CompletedToolCallInfo {
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        output: output.to_string(),
+                        success,
+                        duration_ms,
+                    });
+                }
+                // The replay marker rides in the result's structured
+                // data, which the event carries but the journal used
+                // to drop — so a restored timeline showed steering as
+                // failures. Record it where the run record lives.
+                timeline_tool_end(
+                    &timeline_for_tool_end,
+                    call_id,
+                    name,
+                    ToolEndRecord::from_result(output, success, duration_ms, data),
+                );
+                let _ = event_tx_tool_end.send(Event::ToolEnd {
+                    session_id: session_id_tool_end.clone(),
+                    call_id: call_id.to_string(),
+                    output: output.to_string(),
+                    success,
+                    duration_ms,
+                    data: data.cloned(),
+                });
+            }))
+        };
+    }
+
+    /// Wire per-request usage into the run totals and the live context gauge.
+    fn attach_usage_callback(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+        let ChatRunBuffers {
+            run_input_tokens,
+            run_output_tokens,
+            last_request_tokens,
+            context_used,
+            context_window_tokens,
+            ..
+        } = run;
+        options.on_usage = {
+            // Run-scoped totals: every LLM request's usage counts,
+            // including requests inside attempts that later fault —
+            // that spend is real and belongs in the benchmark.
+            // Also the realtime context-usage signal: each request's
+            // prompt size vs the enforced window, pushed to clients.
+            let usage_in = run_input_tokens.clone();
+            let usage_out = run_output_tokens.clone();
+            let usage_last = last_request_tokens.clone();
+            let ctx_used = context_used.clone();
+            let ctx_window = context_window_tokens.clone();
+            let event_tx_usage = self.event_tx.clone();
+            let session_id_usage = session_id.to_string();
+            Some(Box::new(move |input: u32, output: u32, window: u64| {
+                usage_in.fetch_add(u64::from(input), Ordering::Relaxed);
+                usage_out.fetch_add(u64::from(output), Ordering::Relaxed);
+                usage_last.store(u64::from(input) + u64::from(output), Ordering::Relaxed);
+                ctx_used.store(u64::from(input), Ordering::Relaxed);
+                ctx_window.store(window, Ordering::Relaxed);
+                let _ = event_tx_usage.send(Event::ContextUsage {
+                    session_id: session_id_usage.clone(),
+                    used: u64::from(input),
+                    window,
+                });
+            }))
+        };
+    }
+
+    /// Wire the per-iteration crash-recovery checkpoint.
+    fn attach_checkpoint_callback(&self, options: &mut RunOptions, session_id: &str, run: &ChatRunBuffers) {
+        let ChatRunBuffers {
+            accumulated,
+            completed_tools,
+            timeline,
+            ..
+        } = run;
+        options.on_checkpoint = {
+            let checkpoint_session_id = session_id.to_string();
+            let checkpoint_accumulated = accumulated.clone();
+            let checkpoint_completed = completed_tools.clone();
+            let checkpoint_timeline = timeline.clone();
+            let checkpoint_storage = self.storage.clone();
+            Some(Box::new(move |messages: &[nanna_llm::AnthropicMessage], iteration: usize| {
+                // Snapshot accumulated text + tool calls to a checkpoint.
+                // This runs synchronously in the agent loop — keep it fast.
+                let text = checkpoint_accumulated.try_read()
+                    .map(|t| t.clone())
+                    .unwrap_or_default();
+                let tools: Vec<CompletedToolCallInfo> = checkpoint_completed.try_read()
+                    .map(|t| t.clone())
+                    .unwrap_or_default();
+
+                // Timeline snapshot with EVERYTHING bulky bounded:
+                // the checkpoint is rewritten every iteration, so
+                // carrying full outputs, inputs (write_file bodies!),
+                // or thinking/text segments would make cumulative
+                // writes grow quadratically over a long mission. The
+                // full record is persisted with the message when the
+                // run ends; this bound only trims what a CRASH
+                // recovery can redisplay, and every trim says so.
+                let journal: Vec<TimelineItem> = timeline_lock(&checkpoint_timeline)
+                    .clone()
+                    .into_iter()
+                    .map(checkpoint_journal_item)
+                    .collect();
+
+                let checkpoint = serde_json::json!({
+                    "session_id": checkpoint_session_id,
+                    "iteration": iteration,
+                    "accumulated_text": text,
+                    "tool_calls": tools,
+                    "timeline": journal,
+                    "message_count": messages.len(),
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+
+                // Write checkpoint to database (best-effort, fire-and-forget)
+                if let Some(ref storage) = checkpoint_storage
+                    && let Ok(json) = serde_json::to_string(&checkpoint)
+                {
+                    let storage = storage.clone();
+                    let sid = checkpoint_session_id.clone();
+                    // Spawn async write — sync callback can't await. The handle is
+                    // dropped: the write is detached on purpose.
+                    tokio::task::spawn(async move {
+                        if let Err(e) = storage.save_checkpoint(&sid, &json).await {
+                            tracing::warn!("Failed to save checkpoint: {}", e);
+                        }
+                    });
+                }
+            }))
+        };
+    }
+
+    /// A successful attempt: release the run's registrations, emit completion,
+    /// clean up the checkpoint, and assemble the result.
+    async fn finish_chat_success(
+        &self,
+        session_id: &str,
+        queue: &SessionQueue,
+        run: &ChatRunBuffers,
+        message_id: String,
+        model: &str,
+        response: nanna_agent::AgentResponse,
+    ) -> ChatResult {
+        let ChatRunBuffers {
+            timeline,
+            run_input_tokens,
+            run_output_tokens,
+            run_started,
+            ..
+        } = run;
+        // Remove from active chats and decrement queue depth
+        {
+            let mut active = self.active_chats.write().await;
+            active.remove(session_id);
+        }
+        queue.depth.fetch_sub(1, Ordering::Relaxed);
+
+        // Tool events already emitted in real-time via on_tool_end callback
+
+        // Emit completion event
+        let _ = self.event_tx.send(Event::MessageEnd {
+            session_id: session_id.to_string(),
+            message_id: message_id.clone(),
+            content: response.text.clone(),
+        });
+
+        info!("Success with model: {}", model);
+
+        // Clean up checkpoint — run completed successfully
+        if let Some(ref storage) = self.storage {
+            let storage = storage.clone();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                let _ = storage.delete_checkpoint(&sid).await;
+            });
+        }
+
+        let final_timeline = timeline_lock(timeline).clone();
+        let usage = RunUsage {
+            input_tokens: run_input_tokens.load(Ordering::Relaxed),
+            output_tokens: run_output_tokens.load(Ordering::Relaxed),
+            duration_ms: crate::numeric::millis_u64(run_started.elapsed()),
+            model: model.to_string(),
+        };
+        // One benchmark line per run: identical tasks across
+        // models are compared on tokens spent and time taken.
+        let (tl_tools, tl_faults) = final_timeline.iter().fold((0usize, 0usize), |(t, f), item| match item {
+            TimelineItem::Tool { .. } => (t + 1, f),
+            TimelineItem::Fault { .. } => (t, f + 1),
+            _ => (t, f),
+        });
+        info!(
+            session_id = %session_id,
+            model = %usage.model,
+            duration_s = usage.duration_ms / 1000,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            tool_calls = tl_tools,
+            faults_healed = tl_faults,
+            "📊 RUN SUMMARY"
+        );
+
+        ChatResult {
+            message_id,
+            content: response.text,
+            tool_calls: response.tool_calls.into_iter().map(|tc| ToolCallRecord {
+                id: tc.id,
+                name: tc.name,
+                input: tc.input,
+                output: Some(tc.output),
+                success: Some(tc.success),
+                duration_ms: Some(tc.duration_ms),
+            }).collect(),
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            reasoning: response.reasoning.map(|r| r.content),
+            timeline: final_timeline,
+            usage: Some(usage),
+            partial: false,
+        }
+    }
+
+    /// A failed attempt: journal the fault, then decide between waiting out a
+    /// down local server, retrying the same model, or moving down the list —
+    /// recording the decision in `walk`.
+    async fn handle_attempt_failure(
+        &self,
+        session_id: &str,
+        model: &str,
+        provider: crate::llm_router::ProviderId,
+        error_str: &str,
+        run: &ChatRunBuffers,
+        walk: &mut ModelWalk,
+    ) {
+        let ChatRunBuffers {
+            completed_tools,
+            timeline,
+            cancel,
+            ..
+        } = run;
+        warn!("Model {} failed: {}", model, error_str);
+        walk.last_error = error_str.to_string();
+
+        // Journal the fault so the timeline explains the seam:
+        // thinking/text after this point is a fresh attempt
+        // regenerating, not the same stream resuming. This push
+        // is infallible on purpose — if the seam is ever lost,
+        // the tail-merge rule fuses the dead attempt's partial
+        // text with the retry's regeneration into one segment.
+        timeline_lock(timeline).push(TimelineItem::Fault {
+            message: truncate(error_str, 200),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+
+        // A DOWN local server (connection refused — e.g. our own
+        // runner-surgery restart window, observed live killing a
+        // 4h55m mission two minutes after the surgery cured its
+        // fault storm) is a WAIT condition, not a fault to
+        // retry-count: attempts against a down server complete
+        // zero tool calls, so progress-based replenishment can
+        // never refill the budget, and the 2/5/10s backoffs burn
+        // out inside a ~20-60s restart. Wait for readiness
+        // (bounded) and resume the same model with the budget
+        // untouched; if the server never comes back, fall
+        // through to normal retry accounting and exhaust.
+        if provider == crate::llm_router::ProviderId::Ollama
+            && Self::is_server_down_error(error_str)
+            && walk.server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
+            && !cancel.is_cancelled()
+        {
+            walk.server_down_waits += 1;
+            let server_down_waits = walk.server_down_waits;
+            warn!(
+                "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
+            );
+            if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
+                info!("Ollama is reachable again — resuming the run");
+                return;
+            }
+            warn!("Ollama still unreachable after {CHAT_SERVER_DOWN_WAIT_SECS}s — falling back to normal retry accounting");
+        }
+
+        // Transient provider fault (timeout / 5xx / dropped
+        // stream / aborted generation)? Retry the SAME model with
+        // escalating backoff before falling down the priority
+        // list — a single-model list (the common local setup)
+        // otherwise dies on the first hiccup and heartbeats fail
+        // for hours. Mirrors the task harness's step-retry
+        // ladder; Ollama-served models additionally get runner
+        // surgery (provider-gated — never fires for cloud models).
+        // Rate-limit/overload errors (429/529) are excluded: the
+        // branch below honors the provider's Retry-After and the
+        // shared-bucket skip instead of hammering it. A cancelled
+        // chat must not heal either — no retry, no server surgery.
+        // A fault after real forward progress starts a NEW burst:
+        // replenish the same-model retry budget instead of letting
+        // it accumulate across the whole message. A single-prompt
+        // long-horizon mission gets exactly one user message — a
+        // cumulative budget that survives hours of successful tool
+        // rounds and then kills the run on the third hiccup is a
+        // per-mission bound dressed up as a per-fault one. Progress
+        // means at least one tool call completed this attempt
+        // (completed_tools is cleared at attempt start), so the
+        // heal loop cannot spin without real work between faults;
+        // consecutive no-progress faults still climb the
+        // unload→restart ladder and exhaust at the max.
+        if walk.same_model_retries > 0 && crate::tasks::is_transient_llm_error(error_str) {
+            let attempt_tool_calls = completed_tools.read().await.len();
+            if attempt_tool_calls > 0 {
+                info!(
+                    "Attempt completed {attempt_tool_calls} tool calls before this fault — new transient burst, retry budget replenished"
+                );
+                walk.same_model_retries = 0;
+            }
+        }
+
+        if crate::tasks::is_transient_llm_error(error_str)
+            && !Self::is_rate_limit_error(error_str)
+            && !cancel.is_cancelled()
+            && walk.same_model_retries < CHAT_TRANSIENT_RETRIES_MAX
+        {
+            walk.same_model_retries += 1;
+            let same_model_retries = walk.same_model_retries;
+            let backoff_secs = CHAT_RETRY_BACKOFF_SECS[same_model_retries - 1];
+            warn!(
+                "Transient failure on {model} — retrying in {backoff_secs}s ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})"
+            );
+            let _ = self.event_tx.send(Event::Error {
+                code: "model_retry".to_string(),
+                message: format!(
+                    "Transient failure on {model}. Retrying ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})..."
+                ),
+                session_id: Some(session_id.to_string()),
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            // Re-check cancellation after the sleep: a cancel
+            // arriving mid-backoff must not bounce the shared
+            // Ollama server for a chat nobody is waiting on.
+            if provider == crate::llm_router::ProviderId::Ollama
+                && !cancel.is_cancelled()
+            {
+                // Second failure: unload the model to clear a
+                // degraded runner. Final retry: restart the
+                // server — the sticky degraded state survives
+                // unloads (verified live in the endurance runs).
+                if same_model_retries == 2 {
+                    crate::tasks::reset_ollama_runner_for(model).await;
+                }
+                if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
+                    && crate::tasks::ollama_restart_allowed()
+                {
+                    crate::tasks::restart_ollama_server().await;
+                }
+            }
+            return;
+        }
+
+        // Rate limit? Wait before falling through, and record the
+        // provider so we can skip other models on the same provider
+        // (they share the same rate limit bucket).
+        if Self::is_rate_limit_error(error_str) {
+            self.wait_out_rate_limit(session_id, model, error_str, walk).await;
+        }
+
+        // Context length exceeded? The agent's internal retry already
+        // tried to truncate. If it still failed, skip to the next model
+        // but log it clearly — trying a *smaller* model won't help.
+        if Self::is_context_length_error(error_str) {
+            warn!(
+                "Context length exceeded on {} even after emergency truncation. \
+                 History may be too large for this model's context window.",
+                model
+            );
+        }
+
+        // Emit error as a warning so it's visible, but continue trying
+        let last_error = &walk.last_error;
+        let _ = self.event_tx.send(Event::Error {
+            code: "model_error".to_string(),
+            message: format!("Model {model} failed: {last_error}. Trying next model..."),
+            session_id: Some(session_id.to_string()),
+        });
+
+        info!("Model {} failed, trying next model in priority list", model);
+        walk.same_model_retries = 0;
+        walk.index += 1;
+    }
+
+    /// Record `model`'s provider as rate-limited and wait out its Retry-After
+    /// (default 10s, capped at 60s) before the walk moves on.
+    async fn wait_out_rate_limit(
+        &self,
+        session_id: &str,
+        model: &str,
+        error_str: &str,
+        walk: &mut ModelWalk,
+    ) {
+        let provider = crate::llm_router::ProviderId::from_model(model);
+        walk.rate_limited_providers.insert(provider);
+        let retry_secs = Self::parse_retry_after(error_str).unwrap_or(10);
+        // Cap wait at 60s
+        let wait_secs = retry_secs.min(60);
+        info!("Rate limited on {} (provider {:?}). Waiting {}s before trying next model...", model, provider, wait_secs);
+        let _ = self.event_tx.send(Event::Error {
+            code: "rate_limit".to_string(),
+            message: format!("Rate limited on {model}. Waiting {wait_secs}s..."),
+            session_id: Some(session_id.to_string()),
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+    }
+
+    /// Every model is exhausted: release the run's registrations, announce the
+    /// failure, and preserve any partial work in the error.
+    async fn finish_chat_exhausted(
+        &self,
+        session_id: &str,
+        queue: &SessionQueue,
+        run: &ChatRunBuffers,
+        message_id: String,
+        walk: ModelWalk,
+    ) -> Result<ChatResult, ChatError> {
+        let ChatRunBuffers {
+            accumulated,
+            accumulated_thinking,
+            completed_tools,
+            timeline,
+            run_input_tokens,
+            run_output_tokens,
+            run_started,
+            ..
+        } = run;
+        let ModelWalk {
+            last_error,
+            tried_models,
+            ..
+        } = walk;
 
         // Remove from active chats and decrement queue depth
         {
@@ -1681,7 +1958,7 @@ impl AgentService {
         let partial_text = accumulated.read().await.clone();
         let partial_thinking = accumulated_thinking.read().await.clone();
         let completed = completed_tools.read().await.clone();
-        let full_timeline = timeline_lock(&timeline).clone();
+        let full_timeline = timeline_lock(timeline).clone();
 
         let error_msg = format!("All models exhausted. Tried: {tried_models:?}. Last error: {last_error}");
 
@@ -1712,7 +1989,7 @@ impl AgentService {
                 "Preserving partial result from failed run"
             );
 
-            Some(ChatResult {
+            Some(Box::new(ChatResult {
                 message_id: message_id.clone(),
                 content: format!(
                     "{partial_text}\n\n---\n⚠️ *This response is incomplete — the run failed after producing the above. Error: {last_error}*"
@@ -1725,11 +2002,11 @@ impl AgentService {
                 usage: Some(RunUsage {
                     input_tokens: run_input_tokens.load(Ordering::Relaxed),
                     output_tokens: run_output_tokens.load(Ordering::Relaxed),
-                    duration_ms: run_started.elapsed().as_millis() as u64,
+                    duration_ms: crate::numeric::millis_u64(run_started.elapsed()),
                     model: tried_models.last().cloned().unwrap_or_default(),
                 }),
                 partial: true,
-            })
+            }))
         } else {
             None
         };
@@ -2045,6 +2322,13 @@ impl AgentService {
     }
 
     /// Store a memory
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no memory service is configured, or when the
+    /// memory store fails to persist the entry. A missing or failing embedding
+    /// provider is not an error: the entry is stored unembedded and queued for
+    /// backfill.
     pub async fn remember(&self, content: &str, metadata: HashMap<String, String>) -> Result<String, String> {
         if let Some(ref memory) = self.memory {
             memory.remember_with_importance(content, metadata, 3.0)
@@ -2083,8 +2367,26 @@ pub struct ChatResult {
 pub struct ChatError {
     pub message: String,
     /// Partial result with accumulated text from the failed run (if any work was done).
-    /// Callers should persist this to avoid losing streamed work.
-    pub partial_result: Option<ChatResult>,
+    /// Callers should persist this to avoid losing streamed work. Boxed so the
+    /// error stays small on the `Ok` path of every `Result` that carries it.
+    pub partial_result: Option<Box<ChatResult>>,
+}
+
+/// Per-call options for [`AgentService::chat_with_options`] beyond the
+/// message itself. `Default` is a plain chat: the priority list, no iteration
+/// cap, no workspace scope, no attachments, not a sub-agent.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    /// Use exactly this model instead of the priority list (sub-sessions).
+    pub model_override: Option<String>,
+    /// Iteration cap for the agent loop (`None` = unlimited).
+    pub max_iterations_override: Option<usize>,
+    /// Workspace that scopes auto-extracted memories.
+    pub workspace_id: Option<String>,
+    /// Image attachments: `(base64_data, media_type)`.
+    pub attachments: Vec<(String, String)>,
+    /// Run as a sub-agent: every tool active and never mission mode.
+    pub is_sub_agent: bool,
 }
 
 /// Memory context for injection
@@ -2269,7 +2571,7 @@ mod tests {
         // instead of summarize", and a stale non-empty list would keep
         // spending a model the user just turned off.
         apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
-        assert!(agent_config_from(&cfg).summarization_priority.is_empty());
+        assert_eq!(agent_config_from(&cfg).summarization_priority, Vec::<String>::new());
     }
 
     #[test]
