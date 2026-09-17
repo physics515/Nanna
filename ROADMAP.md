@@ -4212,10 +4212,18 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             session and is not known to reach the channel.** Delivery writes the session and
             broadcasts to IPC clients, and nothing in that path calls the channel manager; not traced
             further this run. Route `SessionMessageAdded` for channel-owned sessions to their channel.
-      - [ ] **Recurring tasks can still overlap themselves past a tick.** The new claim covers
+      - [x] **Recurring tasks can still overlap themselves past a tick.** The new claim covers
             one-shots only; a `Recurring` run slower than 30s (consolidation, heartbeat prompts) is
             due again at the next tick — dreaming has its own in-flight latch for exactly this, other
             recurring jobs do not. Generalise the claim to "not while a run of this id is in flight".
+            *(2026-09-17)* Done: the scheduler loop takes an `InFlightClaim` per task id before
+            spawning and releases it (RAII) only after the run's state is settled, replacing the
+            one-shot-only `enabled = false` claim with one mechanism for every task type. Measured
+            with the claim bypassed: a 100ms recurring job on a 10ms tick ran **11 copies at once**
+            and a slow one-shot fired **8 times**; with it, peak concurrency 1 and exactly one fire.
+            The daemon's `dream_in_flight` latch stays — it also guards `run_now`, which does not go
+            through the loop. Cron-scheduled user jobs and the 5-min recurrence sweep are covered by
+            the same claim.
 - [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
       All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
       confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's

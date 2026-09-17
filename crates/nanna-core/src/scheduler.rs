@@ -723,6 +723,7 @@ impl Scheduler {
         let storage = self.storage.clone();
         let history = self.history.clone();
         let runtime = self.runtime.clone();
+        let in_flight = InFlight::default();
 
         // Spawn the scheduler loop
         tokio::spawn(async move {
@@ -804,18 +805,18 @@ impl Scheduler {
                             if !is_task_due(&task, now) {
                                 continue;
                             }
-                            // A one-shot is claimed BEFORE it is spawned. The
-                            // tick is 30s and nothing bounds how long a run
-                            // takes, so a one-shot still running at the next
-                            // tick was due again (`run_count` is only bumped
-                            // when the run finishes) and fired twice.
-                            if task.task_type.is_one_shot() {
-                                let mut tasks_guard = tasks.write().await;
-                                if let Some(t) = tasks_guard.get_mut(&task.id) {
-                                    t.enabled = false;
-                                }
-                            }
+                            // Claimed BEFORE it is spawned, released only after
+                            // its state is settled. The tick is 30s and nothing
+                            // bounds how long a run takes, while "due" is read
+                            // from state a run updates only when it FINISHES —
+                            // so a run still going at the next tick was due
+                            // again and started a second copy of itself.
+                            let Some(claim) = InFlightClaim::take(&in_flight, &task.id) else {
+                                debug!("Task {} still running; not starting it twice", task.id);
+                                continue;
+                            };
                             tokio::spawn(run_due_task(
+                                claim,
                                 task,
                                 executor.clone(),
                                 tasks.clone(),
@@ -847,6 +848,7 @@ impl Scheduler {
 /// was disabled in memory only; storage kept `enabled = 1`, so every daemon
 /// restart re-armed it and it fired again.)
 async fn run_due_task(
+    claim: InFlightClaim,
     task: ScheduledTask,
     executor: TaskExecutor,
     tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
@@ -854,6 +856,10 @@ async fn run_due_task(
     history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
 ) {
     let task_id = task.id.clone();
+    debug_assert_eq!(
+        claim.task_id, task_id,
+        "a run holds the claim for its own task"
+    );
     let one_shot = task.task_type.is_one_shot();
     debug!("Running task: {} ({})", task.name, task_id);
     let result = executor(task).await;
@@ -896,11 +902,52 @@ async fn run_due_task(
     if let Some(storage) = storage {
         settle_in_storage(&storage, &task_id, one_shot, &result, next_run.as_deref()).await;
     }
+    // Released only now: the in-memory state above is what the next tick reads.
+    drop(claim);
 
     if result.success {
         info!("Task {} completed in {}ms", task_id, result.duration_ms);
     } else {
         error!("Task {} failed: {:?}", task_id, result.error);
+    }
+}
+
+/// Ids of tasks with a run in progress. Bounded by the task map it indexes.
+type InFlight = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Proof that a task's run is in progress; releases the id when dropped, so an
+/// executor that panics (in a build that unwinds) does not wedge its task.
+struct InFlightClaim {
+    in_flight: InFlight,
+    task_id: String,
+}
+
+impl InFlightClaim {
+    /// Claim `task_id`, or `None` when a run of it is already in progress.
+    fn take(in_flight: &InFlight, task_id: &str) -> Option<Self> {
+        let mut ids = in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ids.insert(task_id.to_string()) {
+            return None;
+        }
+        debug_assert!(ids.contains(task_id));
+        drop(ids);
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+            task_id: task_id.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        let released = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.task_id);
+        debug_assert!(released, "a claim releases exactly the id it took");
     }
 }
 
@@ -1162,6 +1209,66 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    #[test]
+    fn an_in_flight_claim_excludes_a_second_run_until_released() {
+        let in_flight = InFlight::default();
+        let first = InFlightClaim::take(&in_flight, "job-a").expect("free");
+        assert!(InFlightClaim::take(&in_flight, "job-a").is_none());
+        let other = InFlightClaim::take(&in_flight, "job-b").expect("independent ids");
+        drop(first);
+        assert!(InFlightClaim::take(&in_flight, "job-a").is_some());
+        drop(other);
+        assert!(in_flight.lock().expect("ids").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recurring_run_slower_than_the_tick_never_overlaps_itself() {
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (running_in, peak_in, runs_in) = (running.clone(), peak.clone(), runs.clone());
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let (running, peak, runs) = (running_in.clone(), peak_in.clone(), runs_in.clone());
+            Box::pin(async move {
+                let now_running = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now_running, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                runs.fetch_add(1, Ordering::SeqCst);
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 100,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let config = SchedulerConfig {
+            heartbeat_enabled: false,
+            check_interval: Duration::from_millis(10),
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config).with_executor(executor);
+        // Due on every tick: the interval is far below both tick and run time.
+        scheduler
+            .add_task(recurring_task("sweep", Duration::from_millis(1), "x"))
+            .await;
+        scheduler.start();
+        let ran_twice = eventually(|| async { runs.load(Ordering::SeqCst) >= 3 }).await;
+        scheduler.stop().await;
+
+        assert!(ran_twice, "a recurring task keeps running after each run");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "never two runs of one task at once"
+        );
     }
 
     #[tokio::test]
