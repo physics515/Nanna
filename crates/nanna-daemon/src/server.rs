@@ -3087,6 +3087,64 @@ impl DaemonServer {
         self.storage = Some(storage);
     }
 
+    /// Open (and if needed recover) the durable store at `<data_dir>/nanna.db`.
+    ///
+    /// [`Self::run`] calls this only after claiming the PID file and the IPC
+    /// port: a live daemon holds nanna.db's exclusive lock, so an instance
+    /// that opened it first reported a storage failure instead of the real
+    /// conflict. Public so tests can drive the storage init path without
+    /// binding sockets. Idempotent: a second call keeps the open store.
+    pub async fn open_storage(&mut self) {
+        if self.storage.is_some() {
+            return;
+        }
+
+        // Initialize Turso storage. The recovering open verifies the memories
+        // table is readable; on page-level corruption it quarantines the
+        // damaged file, rebuilds a fresh store at the same path, and salvages
+        // every reachable row — so the daemon boots with a working store
+        // instead of a silently empty one.
+        let db_path = self.config.data_dir.join("nanna.db");
+        let storage_config = nanna_storage::StorageConfig {
+            path: db_path.to_string_lossy().to_string(),
+        };
+        match nanna_storage::open_with_recovery(&storage_config).await {
+            Ok((storage, recovery)) => {
+                info!("Storage initialized at {:?}", db_path);
+                if let Some(report) = recovery {
+                    warn!(
+                        "Memory store was REBUILT after corruption: {} memories recovered \
+                         (corrupt copy: {})",
+                        report.memories_recovered,
+                        report.quarantine_path.display()
+                    );
+                    self.memory_recovery = Some(Arc::new(report));
+                }
+                self.set_storage(Arc::new(storage));
+            }
+            Err(e) => {
+                // Storage is where MEMORY lives, not just model stats. Without
+                // it the daemon still runs and memory still "works" — in RAM,
+                // for this session, discarded on exit — so the failure reads as
+                // a good session until someone notices nothing was remembered.
+                //
+                // The old wording named model stats, the quietest thing lost,
+                // at warn level. That is the wrong end of the blast radius and
+                // the wrong severity: this is also the only signal a bad
+                // migration produces, since a migration that fails leaves the
+                // name unrecorded and gets retried on every boot forever.
+                error!(
+                    error = %e,
+                    db_path = ?db_path,
+                    "STORAGE UNAVAILABLE — memory is in-process only and will be LOST on exit; \
+                     model stats, tasks and checkpoints will not persist. Most likely a failed \
+                     migration or an unwritable database path."
+                );
+                self.storage_error = Some(e.to_string());
+            }
+        }
+    }
+
     /// Get the shutdown sender (for signaling shutdown)
     #[must_use]
     pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
@@ -3351,11 +3409,47 @@ impl DaemonServer {
         // Ensure data directory exists
         std::fs::create_dir_all(&self.config.data_dir)?;
 
-        self.acquire_pid_file()?;
+        // Claim THE daemon role before touching anything a live daemon owns:
+        // the PID file, then the IPC port, and only then the exit record and
+        // nanna.db. 2026-09-17: a duplicate whose PID check had been defeated
+        // opened storage first, so its first symptom was a turso lock error,
+        // and it built the router and memory service before dying at the IPC
+        // bind — after overwriting the live daemon's exit record.
+        let ipc_port = self.claim_daemon_role().await?;
 
-        self.arm_exit_reason_file();
+        self.open_storage().await;
 
-        self.load_sessions().await;
+        // Load sessions from Turso database
+        {
+            let loaded = self.sessions.load_from_db().await;
+            info!("Loaded {} sessions from database", loaded);
+        }
+
+        // If no sessions loaded from DB, check for legacy sessions.json migration
+        if self.sessions.count().await == 0 {
+            if let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await {
+                if !sessions.is_empty() {
+                    info!(
+                        "Migrating {} sessions from legacy sessions.json to database",
+                        sessions.len()
+                    );
+                    for session in sessions {
+                        self.sessions.restore(session).await;
+                    }
+                    if let Some(id) = default_id {
+                        self.sessions.set_default(&id).await;
+                    }
+                    // Mark as migrated
+                    self.persistence.mark_sessions_migrated().await;
+                }
+            }
+        }
+
+        // Create default session if none exist
+        if self.sessions.count().await == 0 {
+            let default_session = self.sessions.create(Some("Main".to_string())).await;
+            info!("Created default session: {}", default_session.id);
+        }
 
         // ONE run registry, created before the services so the embedding
         // drain, the dream gate, the scheduler and the control plane all hold
@@ -3440,7 +3534,7 @@ impl DaemonServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        let ipc_handle = self.spawn_ipc_server();
+        let ipc_handle = self.spawn_ipc_server(ipc_port);
 
         self.announce_memory_recovery();
 
@@ -3507,6 +3601,48 @@ impl DaemonServer {
             tracing::error!(%location, "PANIC: {payload}");
             previous_hook(info);
         }));
+    }
+
+    /// Claim the daemon role: the PID file, then the IPC port, then the exit
+    /// record — in that order, before anything a live daemon owns is touched.
+    ///
+    /// Returns the reserved (bound, not listening) IPC port, which
+    /// [`Self::spawn_ipc_server`] later listens on.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DaemonError::AlreadyRunning`] when another daemon holds the PID
+    /// file, and [`crate::DaemonError::Ipc`] when the port is taken — in which
+    /// case the PID file is released again, since this process is not THE
+    /// daemon after all.
+    async fn claim_daemon_role(&self) -> Result<crate::ipc::ReservedIpcPort, crate::DaemonError> {
+        self.acquire_pid_file()?;
+
+        // The port is the second, kernel-arbitrated claim: it catches a live
+        // daemon the PID file cannot vouch for (a PID file I/O failure, an
+        // instance run with --no-pid-file). Reserved, not listening — clients
+        // keep getting "connection refused" until the daemon is ready.
+        let ipc_port = match self.ipc.reserve_port().await {
+            Ok(port) => port,
+            Err(e) => {
+                error!(
+                    "IPC port {} unavailable: {} — another daemon (or another program) holds it; \
+                     exiting before touching storage",
+                    self.ipc.address(),
+                    e
+                );
+                if let Some(ref pid_file) = self.pid_file {
+                    pid_file.release();
+                }
+                return Err(crate::DaemonError::Ipc(format!(
+                    "IPC port {} unavailable: {e}",
+                    self.ipc.address()
+                )));
+            }
+        };
+
+        self.arm_exit_reason_file();
+        Ok(ipc_port)
     }
 
     /// Claim the single-instance PID file, when one is configured.
@@ -3901,12 +4037,12 @@ impl DaemonServer {
     /// An IPC-less daemon is unreachable (no control plane) but would keep
     /// running heartbeats and burning the LLM budget — observed live when a
     /// second instance lost the port race.
-    fn spawn_ipc_server(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_ipc_server(&self, ipc_port: crate::ipc::ReservedIpcPort) -> tokio::task::JoinHandle<()> {
         let ipc_server = self.ipc.clone();
         let ipc_shutdown = self.shutdown_tx.clone();
         let ipc_exit_reason = self.exit_reason.clone();
         tokio::spawn(async move {
-            if let Err(e) = ipc_server.run().await {
+            if let Err(e) = ipc_server.serve(ipc_port).await {
                 // An IPC-less daemon is unreachable (no control plane) but
                 // would keep running heartbeats and burning the LLM budget —
                 // observed live when a second instance lost the port race.
@@ -5917,6 +6053,8 @@ impl DaemonBuilder {
         self
     }
 
+    /// Assemble the server. Opens nothing: storage opens in
+    /// [`DaemonServer::run`] once this process has claimed the instance.
     pub async fn build(self) -> DaemonServer {
         let mut server = DaemonServer::new(
             self.config,
@@ -5925,51 +6063,6 @@ impl DaemonBuilder {
             self.brave_api_key,
         );
         server.log_buffer = self.log_buffer;
-
-        // Initialize Turso storage. The recovering open verifies the memories
-        // table is readable; on page-level corruption it quarantines the
-        // damaged file, rebuilds a fresh store at the same path, and salvages
-        // every reachable row — so the daemon boots with a working store
-        // instead of a silently empty one.
-        let db_path = server.config.data_dir.join("nanna.db");
-        let storage_config = nanna_storage::StorageConfig {
-            path: db_path.to_string_lossy().to_string(),
-        };
-        match nanna_storage::open_with_recovery(&storage_config).await {
-            Ok((storage, recovery)) => {
-                info!("Storage initialized at {:?}", db_path);
-                if let Some(report) = recovery {
-                    warn!(
-                        "Memory store was REBUILT after corruption: {} memories recovered \
-                         (corrupt copy: {})",
-                        report.memories_recovered,
-                        report.quarantine_path.display()
-                    );
-                    server.memory_recovery = Some(Arc::new(report));
-                }
-                server.set_storage(Arc::new(storage));
-            }
-            Err(e) => {
-                // Storage is where MEMORY lives, not just model stats. Without
-                // it the daemon still runs and memory still "works" — in RAM,
-                // for this session, discarded on exit — so the failure reads as
-                // a good session until someone notices nothing was remembered.
-                //
-                // The old wording named model stats, the quietest thing lost,
-                // at warn level. That is the wrong end of the blast radius and
-                // the wrong severity: this is also the only signal a bad
-                // migration produces, since a migration that fails leaves the
-                // name unrecorded and gets retried on every boot forever.
-                error!(
-                    error = %e,
-                    db_path = ?db_path,
-                    "STORAGE UNAVAILABLE — memory is in-process only and will be LOST on exit; \
-                     model stats, tasks and checkpoints will not persist. Most likely a failed \
-                     migration or an unwritable database path."
-                );
-                server.storage_error = Some(e.to_string());
-            }
-        }
 
         server
     }

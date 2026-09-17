@@ -143,6 +143,7 @@ impl SessionFilters {
     /// # Panics
     /// Panics on an empty `session_id` — a caller that narrows to nothing has a
     /// bug, and silently narrowing to `""` would mute the connection instead.
+    #[allow(clippy::significant_drop_tightening, reason = "see the doc above")]
     pub async fn narrow_to_session(&self, client_id: &str, session_id: String) {
         assert!(!session_id.is_empty(), "narrowed to an empty session id");
         let mut narrowed = self.narrowed.write().await;
@@ -152,14 +153,13 @@ impl SessionFilters {
             .insert(session_id);
         self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
         debug_assert!(!narrowed.is_empty(), "narrowing left no entry behind");
-        // Released only now: the guard spans the count update (see above).
-        drop(narrowed);
     }
 
     /// Stop delivering `session_id` to `client_id`.
     ///
     /// A connection that has never narrowed stays un-narrowed: unsubscribing
     /// from one session is not a request to be cut off from the rest.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn drop_session(&self, client_id: &str, session_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         if let Some(sessions) = narrowed.get_mut(client_id) {
@@ -169,6 +169,7 @@ impl SessionFilters {
     }
 
     /// Widen `client_id` back to the whole stream.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn widen_to_all(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.remove(client_id);
@@ -181,6 +182,7 @@ impl SessionFilters {
     /// # Panics
     /// Panics if the entry did not land, which would leave the connection
     /// silently receiving every session it just asked to stop receiving.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn drop_all_sessions(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.insert(client_id.to_string(), HashSet::new());
@@ -190,13 +192,11 @@ impl SessionFilters {
             "dropping all sessions left no filter entry, so the connection \
              would silently keep receiving every session",
         );
-        // Released only now: the guard spans the count update (see
-        // `narrow_to_session`).
-        drop(narrowed);
     }
 
     /// Forget a disconnected connection, so the map is bounded by live
     /// connections rather than by every connection the daemon has ever seen.
+    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn forget(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.remove(client_id);
@@ -213,8 +213,54 @@ impl SessionFilters {
     }
 }
 
-/// The receiving end of the request queue the daemon's main loop drains.
-type RequestReceiver = mpsc::Receiver<(ConnectionId, Request)>;
+/// The IPC port, bound but not yet listening.
+///
+/// Daemon startup reserves the port BEFORE opening storage, so an instance
+/// that can never serve IPC (the port is held — usually by a live daemon)
+/// exits before it touches `nanna.db`, instead of surfacing first as a turso
+/// lock failure and dying only after the router and memory service were built
+/// (2026-09-17). Bound-not-listening claims the port against a listening
+/// daemon while connects are still refused, so a client polling for readiness
+/// keeps reading "accepts a connection" as "serving".
+///
+/// On Unix the claim is exclusive against a LISTENING socket only: an instance
+/// that skipped the PID guard could still bind with `SO_REUSEADDR` and listen
+/// first, and this port's `listen` then fails — the pre-reservation failure,
+/// arbitrated late instead of early.
+pub struct ReservedIpcPort {
+    socket: socket2::Socket,
+    addr: SocketAddr,
+}
+
+impl ReservedIpcPort {
+    fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        let addr = socket
+            .local_addr()?
+            .as_socket()
+            .unwrap_or(addr);
+        Ok(Self { socket, addr })
+    }
+
+    /// The bound address (the real port when the configured one was 0).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn listen(self) -> Result<TcpListener, std::io::Error> {
+        self.socket.listen(128)?;
+        TcpListener::from_std(self.socket.into())
+    }
+}
 
 /// IPC Server for daemon communication
 pub struct IpcServer {
@@ -222,17 +268,16 @@ pub struct IpcServer {
     clients: Arc<RwLock<HashMap<ConnectionId, ClientConnection>>>,
     session_filters: Arc<SessionFilters>,
     request_tx: mpsc::Sender<(ConnectionId, Request)>,
-    request_rx: Arc<RwLock<Option<RequestReceiver>>>,
+    request_rx: Arc<RwLock<Option<mpsc::Receiver<(ConnectionId, Request)>>>>,
     event_tx: broadcast::Sender<Event>,
     shutdown_tx: broadcast::Sender<()>,
-    /// The address the listener actually bound, published once `run` binds.
+    /// The address the listener actually bound, published once it listens.
     /// With port 0 this is the only way to learn the port the OS chose.
-    bound_tx: watch::Sender<Option<std::net::SocketAddr>>,
+    bound_tx: watch::Sender<Option<SocketAddr>>,
 }
 
 impl IpcServer {
     /// Create a new IPC server
-    #[must_use]
     pub fn new(config: IpcServerConfig) -> Self {
         let (request_tx, request_rx) = mpsc::channel(1000);
         let (event_tx, _) = broadcast::channel(1000);
@@ -251,57 +296,36 @@ impl IpcServer {
         }
     }
     
-    /// Parse the configured bind address.
-    fn socket_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Error> {
-        addr.parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    }
-
-    /// Bind a TCP listener with `SO_REUSEADDR` (Unix), so `TIME_WAIT` sockets
-    /// don't block a fast restart.
-    #[cfg(unix)]
-    fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
-        let socket_addr = Self::socket_addr(addr)?;
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(socket_addr),
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_reuse_address(true)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&socket_addr.into())?;
-        socket.listen(128)?;
-        TcpListener::from_std(socket.into())
-    }
-
-    /// Bind a TCP listener, retrying on transient port conflicts (Windows).
+    /// Claim the IPC port without accepting connections yet.
     ///
-    /// On Windows, `SO_REUSEADDR` has dangerous semantics (allows hijacking),
-    /// so we retry with a short delay instead.
-    #[cfg(windows)]
-    async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
-        let socket_addr = Self::socket_addr(addr)?;
-        for attempt in 0..5 {
-            match TcpListener::bind(&socket_addr).await {
-                Ok(listener) => return Ok(listener),
-                Err(e) if attempt < 4 => {
-                    warn!("IPC bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    /// On Unix, sets `SO_REUSEADDR` so `TIME_WAIT` sockets don't block restart
+    /// (it does not permit binding over a LISTENING socket, which is what a
+    /// live daemon holds). On Windows, `SO_REUSEADDR` has dangerous semantics
+    /// (allows hijacking), so we retry with a short delay instead.
+    pub async fn reserve_port(&self) -> Result<ReservedIpcPort, std::io::Error> {
+        let addr: SocketAddr = self.address().parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        #[cfg(windows)]
+        {
+            for attempt in 0..5 {
+                match ReservedIpcPort::bind(addr) {
+                    Ok(port) => return Ok(port),
+                    Err(e) if attempt < 4 => {
+                        warn!("IPC bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
+            unreachable!()
         }
-        unreachable!()
+
+        #[cfg(not(windows))]
+        ReservedIpcPort::bind(addr)
     }
 
-    /// Bind a TCP listener (platforms with neither Unix nor Windows sockets).
-    #[cfg(not(any(unix, windows)))]
-    async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
-        let socket_addr = Self::socket_addr(addr)?;
-        TcpListener::bind(&socket_addr).await
-    }
-
-    /// The address the listener bound: `None` until `run` has bound it.
+    /// The address the listener bound: `None` until `serve` has bound it.
     ///
     /// Port 0 asks the OS for a free port, and this is how a caller learns
     /// which one. Choosing a port up front and releasing it before the server
@@ -312,13 +336,11 @@ impl IpcServer {
     }
 
     /// Get the address the server will bind to
-    #[must_use]
     pub fn address(&self) -> String {
         format!("{}:{}", self.config.host, self.config.port)
     }
     
     /// Get a sender for broadcasting events to clients
-    #[must_use]
     pub fn event_sender(&self) -> broadcast::Sender<Event> {
         self.event_tx.clone()
     }
@@ -338,12 +360,6 @@ impl IpcServer {
     }
     
     /// Send a response to a specific client
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `client_id` is not connected, the response cannot
-    /// be serialized, or the client's outgoing queue has closed (its
-    /// connection is shutting down).
     pub async fn send_response(&self, client_id: &str, response: Response) -> Result<(), String> {
         let clients = self.clients.read().await;
         if let Some(client) = clients.get(client_id) {
@@ -351,12 +367,12 @@ impl IpcServer {
             client.tx.send(Message::Text(msg.into())).await.map_err(|e| e.to_string())?;
             Ok(())
         } else {
-            Err(format!("Client not found: {client_id}"))
+            Err(format!("Client not found: {}", client_id))
         }
     }
     
     /// Broadcast an event to all subscribed clients
-    pub fn broadcast_event(&self, event: Event) {
+    pub async fn broadcast_event(&self, event: Event) {
         let _ = self.event_tx.send(event);
     }
     
@@ -376,22 +392,21 @@ impl IpcServer {
     }
     
     /// Run the IPC server
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the listener cannot be bound: the configured
-    /// `host:port` is not a socket address, or creating, configuring, binding
-    /// or listening on the socket fails (e.g. the port is taken). Errors on
-    /// individual accepts are logged, not returned.
     pub async fn run(self: &Arc<Self>) -> Result<(), std::io::Error> {
-        let addr = self.address();
-        #[cfg(unix)]
-        let listener = Self::bind_with_reuse(&addr)?;
-        #[cfg(not(unix))]
-        let listener = Self::bind_with_reuse(&addr).await?;
-        let bound = listener.local_addr()?;
-        self.bound_tx.send_replace(Some(bound));
-        info!("IPC server listening on ws://{bound}");
+        let port = self.reserve_port().await?;
+        self.serve(port).await
+    }
+
+    /// Serve on a port claimed earlier by [`Self::reserve_port`]: start
+    /// listening, then accept until shutdown.
+    pub async fn serve(self: &Arc<Self>, port: ReservedIpcPort) -> Result<(), std::io::Error> {
+        let addr = port.addr;
+        let listener = port.listen()?;
+        // Published only once the listener accepts: a caller waiting on this
+        // (a test on port 0, which learns the OS-chosen port here) must not
+        // connect before then.
+        self.bound_tx.send_replace(Some(addr));
+        info!("IPC server listening on ws://{addr}");
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -453,15 +468,18 @@ impl IpcServer {
             }
         };
         
-        let (ws_tx, mut ws_rx) = ws_stream.split();
-        let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
+        let (mut ws_tx, mut ws_rx) = ws_stream.split();
+        let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(100);
         
         // Store client connection
-        self.clients.write().await.insert(client_id.clone(), ClientConnection {
-            _id: client_id.clone(),
-            _addr: addr,
-            tx: msg_tx.clone(),
-        });
+        {
+            let mut clients = self.clients.write().await;
+            clients.insert(client_id.clone(), ClientConnection {
+                _id: client_id.clone(),
+                _addr: addr,
+                tx: msg_tx.clone(),
+            });
+        }
         
         // Broadcast connect event
         let _ = self.event_tx.send(Event::Connected { client_id: client_id.clone() });
@@ -474,13 +492,38 @@ impl IpcServer {
         let filtered_client_id = client_id.clone();
         
         // Spawn task to handle outgoing messages
-        let outgoing_task = tokio::spawn(forward_outgoing(
-            ws_tx,
-            msg_rx,
-            event_rx,
-            session_filters,
-            filtered_client_id,
-        ));
+        let outgoing_task = tokio::spawn(async move {
+            let mut event_rx = event_rx;
+            
+            loop {
+                tokio::select! {
+                    // Forward messages from the channel to WebSocket
+                    Some(msg) = msg_rx.recv() => {
+                        if ws_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Forward broadcast events to this client. Every receive result is
+                    // handled: an `Ok(event)` pattern let a `Lagged` error fail the match,
+                    // and the missed events vanished without the client ever knowing.
+                    received = event_rx.recv() => {
+                        let Some(event) = forwardable(received) else { break };
+                        // A connection that narrowed itself gets only what it
+                        // asked for. Until one does, this is a relaxed atomic
+                        // load and nothing else.
+                        if !session_filters.delivers(&filtered_client_id, &event).await {
+                            continue;
+                        }
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
         
         // Handle incoming messages. Every await here is bounded: the server
         // pings every WS_PING_INTERVAL_SECS (the pong resets the read
@@ -523,7 +566,7 @@ impl IpcServer {
                                     let error_response = Response::error(
                                         "unknown".to_string(),
                                         "parse_error",
-                                        format!("Invalid request: {e}"),
+                                        format!("Invalid request: {}", e),
                                     );
                                     if let Ok(json) = serde_json::to_string(&error_response) {
                                         let _ = msg_tx.send(Message::Text(json.into())).await;
@@ -558,25 +601,16 @@ impl IpcServer {
         // Cleanup
         outgoing_task.abort();
         
-        self.forget_client(&clients, &client_id_clone).await;
-    }
-
-    /// Drop a disconnected client's registration and filter, and announce it.
-    async fn forget_client(
-        &self,
-        clients: &RwLock<HashMap<ConnectionId, ClientConnection>>,
-        client_id: &str,
-    ) {
         {
             let mut clients_guard = clients.write().await;
-            clients_guard.remove(client_id);
+            clients_guard.remove(&client_id_clone);
         }
-        self.session_filters.forget(client_id).await;
+        self.session_filters.forget(&client_id_clone).await;
         
         // Broadcast disconnect event
-        let _ = self.event_tx.send(Event::Disconnected { client_id: client_id.to_string() });
+        let _ = self.event_tx.send(Event::Disconnected { client_id: client_id_clone.clone() });
         
-        info!("Client {} disconnected", client_id);
+        info!("Client {} disconnected", client_id_clone);
     }
 }
 
@@ -612,46 +646,6 @@ mod tests {
 
         server.shutdown();
         task.await.expect("run task").expect("run ends cleanly on shutdown");
-    }
-}
-
-/// A connection's outgoing half: forward queued messages (responses, pongs,
-/// pings) and the broadcast events this connection is subscribed to, until
-/// either source closes or the socket stops accepting writes.
-async fn forward_outgoing(
-    mut ws_tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
-    mut msg_rx: mpsc::Receiver<Message>,
-    mut event_rx: broadcast::Receiver<Event>,
-    session_filters: Arc<SessionFilters>,
-    filtered_client_id: ConnectionId,
-) {
-    loop {
-        tokio::select! {
-            // Forward messages from the channel to WebSocket
-            Some(msg) = msg_rx.recv() => {
-                if ws_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            // Forward broadcast events to this client. Every receive result is
-            // handled: an `Ok(event)` pattern let a `Lagged` error fail the match,
-            // and the missed events vanished without the client ever knowing.
-            received = event_rx.recv() => {
-                let Some(event) = forwardable(received) else { break };
-                // A connection that narrowed itself gets only what it
-                // asked for. Until one does, this is a relaxed atomic
-                // load and nothing else.
-                if !session_filters.delivers(&filtered_client_id, &event).await {
-                    continue;
-                }
-                if let Ok(json) = serde_json::to_string(&event)
-                    && ws_tx.send(Message::Text(json.into())).await.is_err()
-                {
-                    break;
-                }
-            }
-            else => break,
-        }
     }
 }
 
@@ -700,7 +694,7 @@ mod session_filter_tests {
 
     #[test]
     fn a_narrowed_connection_receives_only_its_sessions() {
-        let wanted: HashSet<String> = std::iter::once("a".to_string()).collect();
+        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
         assert!(delivers(Some(&wanted), &session_event("a")));
         assert!(
             !delivers(Some(&wanted), &session_event("b")),
@@ -711,7 +705,7 @@ mod session_filter_tests {
 
     #[test]
     fn narrowing_never_drops_events_that_carry_no_session() {
-        let wanted: HashSet<String> = std::iter::once("a".to_string()).collect();
+        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
         assert!(delivers(Some(&wanted), &Event::ConfigChanged));
         assert!(delivers(Some(&wanted), &Event::WorkspacesChanged));
     }
