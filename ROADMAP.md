@@ -3226,7 +3226,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       Still open here: **corrections and tool-success/failure**, which is where the
       `UsedSuccessfully`/`CausedError` variants finally get fed — reactions only ever produce
       Helpful/Unhelpful.
-      - [ ] *(scoped 2026-09-13 — skipped deliberately this run, with the reason and the design, so
+      - [~] *(scoped 2026-09-13 — skipped deliberately this run, with the reason and the design, so
             the next run starts from a decision)* **`UsedSuccessfully`/`CausedError` have no producer
             anywhere in the product.** Confirmed by grep: both variants appear only inside
             `nanna-memory/src/dreaming.rs` and its own tests. The whole apparatus around them is
@@ -3249,6 +3249,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             about one memory, unlike "a tool failed somewhere in a turn that also recalled things",
             which attributes a turn-level outcome to whatever happened to be in context — the same
             over-attribution the 2026-08-28 reaction work had to undo.
+            *(2026-09-17) `UsedSuccessfully` has its first producer — and it needed no agent-loop
+            threading.* The stub round trip already ends at a daemon service: `recall` resolves a
+            handle through `memory.get`. So the attribution lives at that boundary: a first-page
+            read (`offset == 0`) that resolves records `UsedSuccessfully` for every row the content
+            was assembled from (all chunks sharing the `source_id`, or the absorbing memory when the
+            handle was forwarded by dreaming), via a late-bound `DreamingService` slot; later pages
+            of the same read are the same use and record nothing. The dream cycle applies the tally
+            it already consumed (+0.5 each). Tested through the real service map with a real
+            `DreamingService` (three chunks → +0.5 each after a two-page read; mutation with the
+            page rule removed gives +1.0 and fails). **`CausedError` still has no producer, on
+            purpose:** an unresolvable handle has no memory to blame, and a short reassembly is
+            dreaming's doing, not a row's — neither is a fact about one memory.
       - [ ] *(2026-08-28)* **Telegram could feed the same loop; today it cannot see reactions.**
             `crates/nanna-channels/src/listeners/telegram.rs:87` requests
             `allowed_updates = ["message","edited_message"]`, and Telegram delivers

@@ -462,6 +462,58 @@ async fn assemble_handle_content(
 /// pairing in one function is the point: the offsets were once proven against
 /// the assembled text and then used to index a single chunk of it, which is
 /// both out of bounds and off-boundary.
+/// The dreaming orchestrator, reached late — it is built after script services.
+pub type DreamingSlot = Arc<std::sync::OnceLock<Arc<nanna_memory::DreamingService>>>;
+
+/// Which memories a `memory.get` read demonstrably used, and how. Pure.
+///
+/// This is the first producer of `UsedSuccessfully`, which the FSRS feedback
+/// loop priced and tallied but nothing ever sent. The attribution is the one
+/// that is a fact about specific memories rather than a guess: a model resolved
+/// a stored handle and got the stored text back, so those rows carried the work
+/// forward. Only the FIRST page counts — paging through one result is one use,
+/// and counting each page would reward long outputs for being long. A forwarded
+/// handle credits the memory that absorbed the original, because that is what
+/// answered.
+fn recall_feedback(
+    offset: usize,
+    served_ids: &[String],
+) -> Vec<(String, nanna_memory::MemoryFeedback)> {
+    if offset > 0 {
+        return Vec::new();
+    }
+    debug_assert!(
+        !served_ids.is_empty(),
+        "a resolved read served at least one row"
+    );
+    served_ids
+        .iter()
+        .map(|id| (id.clone(), nanna_memory::MemoryFeedback::UsedSuccessfully))
+        .collect()
+}
+
+/// The ids of the rows a handle's content was assembled from.
+async fn served_row_ids(
+    memory: &Arc<MemoryService>,
+    entry: &nanna_memory::MemoryListEntry,
+) -> Vec<String> {
+    let Some(source_id) = entry.metadata.get("source_id") else {
+        return vec![entry.id.clone()];
+    };
+    let ids: Vec<String> = memory
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        vec![entry.id.clone()]
+    } else {
+        ids
+    }
+}
+
 fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
     let total = content.len();
     let start = offset.min(total);
@@ -660,6 +712,9 @@ struct ScriptServiceDeps {
     /// Sessions, the event bus and the run registry `session.ask_user` posts
     /// through and waits on. `None` withholds the `ask_user` skill.
     ask_user: Option<crate::ask_user_service::AskUserDeps>,
+    /// Where `memory.get` records that a stored memory was used. `None`, or a
+    /// slot never filled, records nothing.
+    feedback: Option<DreamingSlot>,
 }
 
 
@@ -680,6 +735,7 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         screenshot_data_dir,
         reminders,
         ask_user,
+        feedback,
     } = deps;
     let memory = &memory;
     use serde_json::{Value, json};
@@ -907,10 +963,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
     // has a retrieval path.
     if let Some(mem) = memory {
         let mem_get = mem.clone();
+        let feedback_for_get = feedback;
         services.insert(
             "memory.get".to_string(),
             Arc::new(move |params: Value| {
                 let mem = mem_get.clone();
+                let feedback = feedback_for_get.clone();
                 Box::pin(async move {
                     let id = req_text(&params, "id")?;
                     let offset = opt_count(&params, "offset")?.unwrap_or(0);
@@ -920,6 +978,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 
                     let entry = resolve_memory_handle(&mem, &id).await?;
                     let content = assemble_handle_content(&mem, &entry).await;
+                    if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
+                        let served = served_row_ids(&mem, &entry).await;
+                        for (memory_id, signal) in recall_feedback(offset, &served) {
+                            dreaming.record_feedback(&memory_id, signal).await;
+                        }
+                    }
 
                     let total = content.len();
                     // Never split a UTF-8 char, and index the same text the
@@ -2021,6 +2085,9 @@ pub struct DaemonServer {
     scheduler_slot: crate::reminder_service::SchedulerSlot,
     /// Per-server MCP state: written by the boot task, read by `system.status`.
     mcp_status: crate::mcp_startup::McpStatus,
+    /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
+    /// in `run()`, right after it is built.
+    dreaming_slot: DreamingSlot,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -2174,6 +2241,7 @@ impl DaemonServer {
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             mcp_status: crate::mcp_startup::McpStatus::default(),
+            dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
             shutdown_tx,
@@ -2477,6 +2545,12 @@ impl DaemonServer {
                 .with_activity_clock(Arc::clone(&activity_clock)),
             )
         });
+
+        if let Some(ref dreaming) = dreaming
+            && self.dreaming_slot.set(Arc::clone(dreaming)).is_err()
+        {
+            warn!("dreaming slot was already filled; memory use feedback keeps the first service");
+        }
 
         // Dreaming must observe the very store the agent writes to, never a
         // private copy — that identity is the whole point of the shared seam.
@@ -4208,6 +4282,7 @@ impl DaemonServer {
                 browser_data_dir: Some(self.config.data_dir.clone()),
                 screenshot_data_dir: Some(self.config.data_dir.clone()),
                 reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
+                feedback: Some(Arc::clone(&self.dreaming_slot)),
                 ask_user: Some(crate::ask_user_service::AskUserDeps {
                     sessions: Arc::clone(&self.sessions),
                     events: self.ipc.event_sender(),
@@ -5018,6 +5093,62 @@ mod tests {
         service: &Arc<nanna_memory::MemoryService>,
     ) -> nanna_memory::MemoryListEntry {
         service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    #[test]
+    fn only_the_first_page_of_a_recall_counts_as_a_use() {
+        let served = vec!["chunk-1".to_string(), "chunk-2".to_string()];
+        let signals = recall_feedback(0, &served);
+        assert_eq!(signals.len(), 2);
+        assert!(
+            signals
+                .iter()
+                .all(|(_, f)| *f == nanna_memory::MemoryFeedback::UsedSuccessfully)
+        );
+        assert!(
+            recall_feedback(4000, &served).is_empty(),
+            "a later page is the same use"
+        );
+    }
+
+    /// End to end through the real service map: resolving a stub's handle
+    /// credits every chunk row that served it, once.
+    #[tokio::test]
+    async fn resolving_a_stored_result_credits_the_rows_that_served_it() {
+        let store = seeded_chunk_store(3, 3).await;
+        let dreaming = Arc::new(nanna_memory::DreamingService::with_shared_memory(
+            nanna_memory::DreamingConfig::default(),
+            Arc::clone(&store),
+        ));
+        let slot: DreamingSlot = Arc::new(std::sync::OnceLock::new());
+        assert!(slot.set(Arc::clone(&dreaming)).is_ok());
+        let services = build_script_services(ScriptServiceDeps {
+            memory: Some(Arc::clone(&store)),
+            feedback: Some(slot),
+            ..ScriptServiceDeps::default()
+        });
+
+        let first = services["memory.get"](serde_json::json!({ "id": "abc123", "limit": 7 }))
+            .await
+            .expect("resolved");
+        assert_eq!(first["content"], "part 1\n");
+        let next = services["memory.get"](serde_json::json!({ "id": "abc123", "offset": 7 }))
+            .await
+            .expect("next page");
+        assert_eq!(next["offset"], 7);
+
+        for chunk in ["chunk-1", "chunk-2", "chunk-3"] {
+            assert_eq!(
+                dreaming.pending_feedback_boost(chunk).await,
+                Some(0.5),
+                "{chunk}: one UsedSuccessfully, not one per page"
+            );
+        }
+        assert!(
+            services["memory.get"](serde_json::json!({ "id": "no-such-handle" }))
+                .await
+                .is_err()
+        );
     }
 
     /// The whole result is present: the reassembly is exactly the chunks, in
