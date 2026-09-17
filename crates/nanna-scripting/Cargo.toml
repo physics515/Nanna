@@ -38,7 +38,7 @@ nanna-proc = { path = "../nanna-proc" }
 boa_engine = { version = "0.22", optional = true }
 
 # Deno - V8-based (full featured fallback)
-deno_core = { version = "0.411", optional = true }
+deno_core = { version = "0.412", optional = true }
 deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
 deno_error = { version = "0.7", optional = true }
 

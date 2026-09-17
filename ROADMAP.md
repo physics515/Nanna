@@ -7136,6 +7136,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-17 sweep)* `cargo update` -> 19 compatible bumps (`aegis 0.9.16`, `syn 3.0.6`,
+     `unicode-ident 1.0.26`, `rustix 1.1.5`, `zlib-rs 0.6.8`, `derive-where 1.7.0`, ...; `synstructure`
+     dropped out of the tree). `cargo upgrade --incompatible` offered **one real row** -
+     `deno_core 0.411 -> 0.412` (published 2026-09-16, pulls `serde_v8 0.321` / `v8` bindings forward),
+     applied, compiled unchanged - plus the two standing downgrade traps (`criterion -> "0.7"`,
+     `lopdf -> "0.42"`), rejected. Both guarded pins fired exactly as documented and were put back
+     as the LAST lockfile step (`libc 0.2.189 -> 0.2.186`; `malachite-bigint@0.11.0 -> 0.9.2`, which
+     removed the `malachite-{base,nz} 0.11.0` it dragged in); rustpython re-checked on crates.io, still
+     `0.5.0`. Gate: 2025 tests / 0 failed, clippy 0 errors, `cargo build --release -p nanna-daemon`
+     green.
+     GUI: `vue 3.5.43`, `@lucide/vue 1.47.0`, `@vue/test-utils 2.5.1`. **`@vueuse/core` was a dead
+     direct dependency and is removed rather than majored 14 -> 15** - no file under `gui/` imports it
+     (the only consumer is `radix-vue`, which carries its own pinned `@vueuse/core 10.11.1`), the same
+     class as the `@formkit/drag-and-drop` removal. Typecheck 0 errors (canary proved), 251/251
+     vitest, `pnpm build` green. TypeScript 7 not re-tried: npm `typescript` is still 7.0.2 and
+     `vue-tsc` still 3.3.11, the two numbers the 2026-09-09 note says to check first.
+   - *(research 2026-09-17)* **Correction to the 2026-09-14 note below: `burn 0.22.0` is NOT a shipped
+     release.** crates.io on 2026-09-17: `max_stable_version` **0.21.0**, newest `0.22.0-pre.3`
+     (2026-08-25); `cubecl` likewise `0.10.0` stable / `0.11.0-pre.3`. The LibTorch deprecation is on
+     the 0.22 pre-release line. Mummu's port target is a pre-release, which matters for any exact pin.
+   - [ ] *(research 2026-09-17)* **Tauri 3.0.0-alpha.1 is published (crate + CLI, 2026-09-15), and its
+     headline change bears directly on this host's GUI-verification blocker.** v3 selects the webview
+     runtime when building the app (`tauri::Builder::runtime(tauri_runtime_cef::Cef::default())`)
+     instead of through `wry`/`cef` Cargo features, makes GTK generation explicit (`gtk3`/`gtk4`
+     features), moves runtime-specific APIs to extension traits (`AppHandleWryExt`), and switches the
+     Linux tray to `ksni` (drops `libappindicator`). A **CEF (Chromium) runtime** is the first route to a
+     Linux GUI that `chromedriver` can drive, sidestepping the WebKitGTK 4.1-vs-6.0 `WebKitWebDriver` ABI
+     question entirely - and `gtk4` is the generation `webkitgtk-6.0` (the package that DOES ship the
+     driver) belongs to. Alpha: do not migrate; re-evaluate at the first 3.0 RC, and when doing so
+     measure the bundle-size cost of shipping CEF before treating it as the fix.
+     Sources: [tauri-v3.0.0-alpha.0](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.0),
+     [tauri-v3.0.0-alpha.1](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.1).
    - *(2026-09-15 sweep)* `cargo update` -> 14 compatible bumps (`clap 4.6.7` + builder/derive/lex,
      `async-compression 0.4.47`, `compression-codecs 0.4.42`, `camino 1.2.6`, `playwright-rs 0.18.1`,
      `rustls 0.23.45`, `wide 1.7.1`). Both guarded pins fired again and were pinned back with the
