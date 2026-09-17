@@ -364,6 +364,10 @@ enum ChannelCommand<'a> {
     ClearModel,
     /// `/model a b` — more than one word; nothing is changed.
     ModelUsage,
+    /// `/status` — is Nanna up, busy here, and able to answer at all.
+    Status,
+    /// `/help` or `/start` (what Telegram sends when a chat opens).
+    Help,
 }
 
 /// Parse a channel command. Pure. `None` means an ordinary message.
@@ -376,8 +380,11 @@ fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
         .split_once(char::is_whitespace)
         .map_or((text, ""), |(head, rest)| (head, rest.trim()));
     let command = head.split_once('@').map_or(head, |(command, _bot)| command);
-    if command != "/model" {
-        return None;
+    match command {
+        "/status" => return Some(ChannelCommand::Status),
+        "/help" | "/start" => return Some(ChannelCommand::Help),
+        "/model" => {}
+        _ => return None,
     }
     let mut words = rest.split_whitespace();
     let command = match (words.next(), words.next()) {
@@ -391,6 +398,87 @@ fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
     Some(command)
 }
 
+/// What a chat-app user can type instead of talking to the model.
+const CHANNEL_HELP: &str = "Commands:\n\
+/status — whether Nanna is up, busy in this chat, and able to answer\n\
+/model — the model this chat uses; /model <name> pins one; /model default undoes it\n\
+/help — this list\n\
+Anything else is a message to Nanna.";
+
+/// Everything `/status` reports, gathered before it is worded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusFacts {
+    uptime_secs: u64,
+    turn_running: bool,
+    pinned_model: Option<String>,
+    providers: Vec<&'static str>,
+    pending_reminders: Option<usize>,
+}
+
+/// Word `/status`. Pure.
+///
+/// Leads with the one fact that explains silence: no provider means no turn
+/// can ever answer, which a chat user cannot otherwise tell from "busy".
+fn status_text(facts: &StatusFacts) -> String {
+    let hours = facts.uptime_secs / 3600;
+    let minutes = (facts.uptime_secs % 3600) / 60;
+    let mut lines = vec![format!("Nanna is up ({hours}h {minutes}m).")];
+    if facts.providers.is_empty() {
+        lines.push(
+            "No model provider is configured, so no message can be answered until one is.".into(),
+        );
+    } else {
+        lines.push(format!("Providers: {}.", facts.providers.join(", ")));
+    }
+    lines.push(if facts.turn_running {
+        "This chat: working on your last message.".into()
+    } else {
+        "This chat: idle.".into()
+    });
+    lines.push(facts.pinned_model.as_ref().map_or_else(
+        || "Model: Nanna's default.".to_string(),
+        |spec| format!("Model: pinned to `{spec}`."),
+    ));
+    if let Some(count) = facts.pending_reminders {
+        lines.push(format!("Reminders pending here: {count}."));
+    }
+    debug_assert!(lines.len() >= 4);
+    lines.join("\n")
+}
+
+/// Gather `/status` for one session.
+async fn status_facts(control: &ControlPlane, session_id: &str) -> StatusFacts {
+    let pending_reminders = match control.scheduler() {
+        Some(scheduler) => {
+            let tasks = scheduler.read().await.list_tasks().await;
+            let here = tasks.iter().filter(|task| {
+                task.name == crate::reminder_service::REMINDER_TASK_NAME
+                    && task.enabled
+                    && task.target_session.as_deref() == Some(session_id)
+            });
+            Some(here.count())
+        }
+        None => None,
+    };
+    StatusFacts {
+        uptime_secs: control.uptime_secs(),
+        turn_running: control.chat_runs.is_active(session_id).await,
+        pinned_model: control
+            .sessions
+            .get(session_id)
+            .await
+            .and_then(|session| session.chat_model().map(str::to_string)),
+        providers: control.router().map_or_else(Vec::new, |router| {
+            router
+                .available_providers_sorted()
+                .into_iter()
+                .map(crate::llm_router::ProviderId::name)
+                .collect()
+        }),
+        pending_reminders,
+    }
+}
+
 /// Carry out a channel command against the session; returns the reply.
 async fn run_channel_command(
     command: ChannelCommand<'_>,
@@ -399,6 +487,8 @@ async fn run_channel_command(
 ) -> String {
     let sessions = &control.sessions;
     match command {
+        ChannelCommand::Status => status_text(&status_facts(control, session_id).await),
+        ChannelCommand::Help => CHANNEL_HELP.to_string(),
         ChannelCommand::ShowModel => {
             // A rare command; cloning the session to read one key is fine.
             let Some(session) = sessions.get(session_id).await else {
@@ -743,7 +833,12 @@ mod tests {
             parse_channel_command("/model the big one"),
             Some(ModelUsage)
         );
+        assert_eq!(parse_channel_command("/status"), Some(Status));
+        assert_eq!(parse_channel_command("/status@NannaBot"), Some(Status));
+        assert_eq!(parse_channel_command("/help"), Some(Help));
+        assert_eq!(parse_channel_command("/start"), Some(Help));
         for message in [
+            "/statuses",
             "/models",
             "/modeling",
             "model x",
@@ -753,6 +848,66 @@ mod tests {
         ] {
             assert_eq!(parse_channel_command(message), None, "{message:?}");
         }
+    }
+
+    #[test]
+    fn status_leads_with_why_nothing_can_answer() {
+        let mut facts = StatusFacts {
+            uptime_secs: 3 * 3600 + 7 * 60 + 5,
+            turn_running: false,
+            pinned_model: None,
+            providers: Vec::new(),
+            pending_reminders: Some(2),
+        };
+        let bare = status_text(&facts);
+        assert_eq!(
+            bare,
+            "Nanna is up (3h 7m).\nNo model provider is configured, so no message can be answered until one is.\nThis chat: idle.\nModel: Nanna's default.\nReminders pending here: 2."
+        );
+        facts.providers = vec!["ollama", "anthropic"];
+        facts.turn_running = true;
+        facts.pinned_model = Some("ollama/qwen3.5:9b".into());
+        facts.pending_reminders = None;
+        let busy = status_text(&facts);
+        assert!(busy.contains("Providers: ollama, anthropic."), "{busy}");
+        assert!(busy.contains("working on your last message"), "{busy}");
+        assert!(busy.contains("pinned to `ollama/qwen3.5:9b`"), "{busy}");
+        assert!(
+            !busy.contains("Reminders"),
+            "no scheduler, no claim: {busy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_and_help_answer_through_the_channel() {
+        let sessions = Arc::new(SessionManager::new());
+        let control = Arc::new(ControlPlane::new(sessions.clone()));
+        let (router, sent) = recording_router();
+        let router = router.read().await;
+        ChannelManager::process_message(incoming("/status"), &control, &router).await;
+        ChannelManager::process_message(incoming("/help"), &control, &router).await;
+        let replies: Vec<String> = sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(replies[0].starts_with("Nanna is up ("), "{}", replies[0]);
+        assert!(
+            replies[0].contains("No model provider is configured"),
+            "{}",
+            replies[0]
+        );
+        assert!(replies[1].starts_with("Commands:"), "{}", replies[1]);
+        assert!(
+            sessions
+                .get(SESSION)
+                .await
+                .expect("session")
+                .messages
+                .is_empty()
+        );
     }
 
     #[test]
