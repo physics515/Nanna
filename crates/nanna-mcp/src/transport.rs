@@ -496,8 +496,9 @@ pub mod http {
         client: reqwest::Client,
         /// Pending requests
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
-        /// SSE connection active
-        connected: AtomicBool,
+        /// SSE connection active. Shared with the SSE task, which outlives
+        /// `connect`'s stack frame — see `connect`.
+        connected: Arc<AtomicBool>,
         /// Message endpoint (typically /message or from SSE endpoint)
         message_endpoint: Arc<Mutex<Option<String>>>,
         /// Shutdown signal
@@ -528,7 +529,7 @@ pub mod http {
                 base_url: base_url.clone(),
                 client,
                 pending,
-                connected: AtomicBool::new(false),
+                connected: Arc::new(AtomicBool::new(false)),
                 message_endpoint,
                 shutdown_tx,
             };
@@ -538,17 +539,21 @@ pub mod http {
             let client_clone = transport.client.clone();
             let base_url_clone = base_url.clone();
             let message_endpoint_clone = transport.message_endpoint.clone();
-            let connected_ptr = &raw const transport.connected as usize;
-            
+            // The task used to get a raw pointer to `transport.connected` —
+            // a field of a local that is moved out by `Ok(transport)` below, so
+            // every store the task made wrote through a dangling pointer. Its
+            // "safety" note (the shutdown channel) never held either: dropping
+            // the transport ends the task only between connections, not while
+            // a stream is open. The task owns a share now.
+            let connected_clone = Arc::clone(&transport.connected);
+
             tokio::spawn(async move {
-                // Safety: we know the transport outlives this task due to the shutdown channel
-                let connected = unsafe { &*(connected_ptr as *const AtomicBool) };
                 Self::sse_task(
                     client_clone,
                     base_url_clone,
                     pending_clone,
                     message_endpoint_clone,
-                    connected,
+                    &connected_clone,
                     shutdown_rx,
                 ).await;
             });
@@ -752,6 +757,56 @@ pub mod http {
             let _ = self.shutdown_tx.send(()).await;
             self.connected.store(false, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// The SSE task's view of the connection must reach the transport
+        /// `connect` returned. With the old raw pointer, a connection that
+        /// completed after `connect`'s 100 ms wait wrote into the moved-from
+        /// slot, so the returned transport never saw `true` — hence the server
+        /// here answers only after `connect` has returned.
+        #[tokio::test]
+        async fn the_returned_transport_sees_the_sse_task_connect() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .await
+                    .expect("head");
+                // Hold the stream open until the test ends.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            });
+
+            let transport = HttpTransport::connect(format!("http://{addr}"))
+                .await
+                .expect("connect");
+            let mut seen = false;
+            for _ in 0..100 {
+                if transport.connected.load(Ordering::SeqCst) {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                seen,
+                "the SSE task connected but the transport never saw it"
+            );
+            transport.close().await.expect("close");
+            assert!(!transport.connected.load(Ordering::SeqCst));
+            server.abort();
         }
     }
 }

@@ -485,6 +485,16 @@ impl DreamingService {
         debug!("Recorded {:?} feedback for memory {}", feedback, memory_id);
     }
 
+    /// The boost the next dream cycle will apply to `memory_id` from feedback
+    /// recorded so far; `None` when nothing is pending for it.
+    pub async fn pending_feedback_boost(&self, memory_id: &str) -> Option<f32> {
+        self.pending_feedback
+            .read()
+            .await
+            .get(memory_id)
+            .map(FeedbackTally::total_boost)
+    }
+
     /// Apply pending feedback immediately (doesn't wait for dreaming)
     pub async fn apply_feedback(
         &self,

@@ -35,6 +35,8 @@
 mod engine;
 mod tool;
 mod bridge;
+/// Pre-write snapshots behind every script `writeFile`, for undo.
+pub mod file_history;
 
 #[cfg(feature = "boa")]
 mod boa_impl;

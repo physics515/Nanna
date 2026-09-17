@@ -333,6 +333,18 @@ pub enum SessionAction {
         #[serde(default)]
         tools: Vec<String>,
     },
+    /// This session's file checkpoints — each file as it was just before a
+    /// tool write replaced it — newest first.
+    FileHistory {
+        id: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Put a file back the way checkpoint `checkpoint` found it. The current
+    /// content is checkpointed first, so this is undoable.
+    RestoreFile { id: String, checkpoint: u64 },
 
     // --- Sub-Agent Sessions (#72) ---
     /// Spawn a sub-agent session
@@ -465,7 +477,16 @@ pub enum ToolAction {
     /// Disable a tool
     Disable { name: String },
     /// Execute a tool directly
-    Execute { name: String, input: Value },
+    Execute {
+        name: String,
+        input: Value,
+        /// The conversation the call runs in, as `Nanna.sessionId()` sees it.
+        /// Without it a direct call reads whatever session the daemon was last
+        /// interactively bound to — an arbitrary one — so a session-scoped tool
+        /// (`todo`, `remind`) would file its work under someone else's chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     /// Create a user tool
     Create {
         name: String,
@@ -516,6 +537,11 @@ pub enum SchedulerAction {
         schedule: String,
         task: String,
         name: Option<String>,
+        /// A conversation the job's result is posted into after each run —
+        /// and so, for a channel conversation, sent to that chat. Absent: the
+        /// result goes to the job's run history only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// Update a job
     Update {
@@ -624,6 +650,15 @@ pub enum SystemAction {
     ToolStatsHourly {
         tool_name: Option<String>,
         hours: Option<u32>,
+    },
+    /// Estimated model spend per day or month, from the request log.
+    CostRollup {
+        /// Window in days (default 30, at most 366).
+        #[serde(default)]
+        days: Option<u32>,
+        /// `day` (default), `month`, or `session` (bucket label = session id).
+        #[serde(default)]
+        by: Option<String>,
     },
     /// Get daily tool stats time-series (for graphs)
     ToolStatsDaily {
@@ -755,6 +790,17 @@ pub enum Event {
         message_id: String,
         content: String,
     },
+    /// A complete message was appended to a session outside any streamed
+    /// turn — today, a reminder coming due. Streamed turns announce themselves
+    /// with `message_start`/`message_end`; this one had no turn, so without its
+    /// own event a client viewing the session would show nothing until reload.
+    SessionMessageAdded {
+        session_id: String,
+        message_id: String,
+        /// `user` | `assistant` | `system` | `tool`, as stored.
+        role: String,
+        content: String,
+    },
 
     // Thinking/reasoning events
     ThinkingDelta {
@@ -830,6 +876,13 @@ pub enum Event {
         name: Option<String>,
     },
     SessionDeleted {
+        id: String,
+    },
+    /// Every message of a session was removed (`session.clear`, or `/new` from
+    /// a chat app); the session itself, its name and its model pin remain. An
+    /// open view of it must empty, or it keeps showing a conversation the
+    /// next turn no longer sees.
+    SessionCleared {
         id: String,
     },
     SessionRenamed {
@@ -1001,6 +1054,7 @@ impl Event {
             Self::MessageStart { session_id, .. }
             | Self::MessageDelta { session_id, .. }
             | Self::MessageEnd { session_id, .. }
+            | Self::SessionMessageAdded { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::StepStarted { session_id, .. }
             | Self::ToolStart { session_id, .. }
@@ -1014,6 +1068,7 @@ impl Event {
             | Self::ContextUsage { session_id, .. } => Some(session_id),
             Self::SessionCreated { id, .. }
             | Self::SessionDeleted { id }
+            | Self::SessionCleared { id }
             | Self::SessionRenamed { id, .. } => Some(id),
             Self::Error { session_id, .. } => session_id.as_deref(),
             Self::WorkspacesChanged
@@ -1085,9 +1140,11 @@ impl From<ControlAction> for Action {
                 Action::Config(ConfigAction::Set { path, value })
             }
             ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => {
-                Action::Tool(ToolAction::Execute { name, input })
-            }
+            ControlAction::RunTool { name, input } => Action::Tool(ToolAction::Execute {
+                name,
+                input,
+                session_id: None,
+            }),
             ControlAction::Status => Action::System(SystemAction::Status),
             ControlAction::Restart => Action::System(SystemAction::Restart),
             ControlAction::Shutdown => Action::System(SystemAction::Shutdown),

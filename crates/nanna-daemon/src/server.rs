@@ -462,6 +462,72 @@ async fn assemble_handle_content(
 /// pairing in one function is the point: the offsets were once proven against
 /// the assembled text and then used to index a single chunk of it, which is
 /// both out of bounds and off-boundary.
+/// What a scheduled job posts into its conversation after a run. Pure.
+///
+/// Nothing for a heartbeat that found nothing to do (the `HEARTBEAT_OK`
+/// sentinel is run mechanics, not news) or for an empty result — a chat app
+/// would otherwise get a blank message on every quiet run.
+fn scheduled_output_message(task_name: &str, content: &str, heartbeat_ok: bool) -> Option<String> {
+    let content = content.trim();
+    if heartbeat_ok || content.is_empty() {
+        return None;
+    }
+    debug_assert!(!task_name.is_empty(), "every scheduled task is named");
+    Some(format!("**Scheduled: {task_name}**\n\n{content}"))
+}
+
+/// The dreaming orchestrator, reached late — it is built after script services.
+pub type DreamingSlot = Arc<std::sync::OnceLock<Arc<nanna_memory::DreamingService>>>;
+
+/// Which memories a `memory.get` read demonstrably used, and how. Pure.
+///
+/// This is the first producer of `UsedSuccessfully`, which the FSRS feedback
+/// loop priced and tallied but nothing ever sent. The attribution is the one
+/// that is a fact about specific memories rather than a guess: a model resolved
+/// a stored handle and got the stored text back, so those rows carried the work
+/// forward. Only the FIRST page counts — paging through one result is one use,
+/// and counting each page would reward long outputs for being long. A forwarded
+/// handle credits the memory that absorbed the original, because that is what
+/// answered.
+fn recall_feedback(
+    offset: usize,
+    served_ids: &[String],
+) -> Vec<(String, nanna_memory::MemoryFeedback)> {
+    if offset > 0 {
+        return Vec::new();
+    }
+    debug_assert!(
+        !served_ids.is_empty(),
+        "a resolved read served at least one row"
+    );
+    served_ids
+        .iter()
+        .map(|id| (id.clone(), nanna_memory::MemoryFeedback::UsedSuccessfully))
+        .collect()
+}
+
+/// The ids of the rows a handle's content was assembled from.
+async fn served_row_ids(
+    memory: &Arc<MemoryService>,
+    entry: &nanna_memory::MemoryListEntry,
+) -> Vec<String> {
+    let Some(source_id) = entry.metadata.get("source_id") else {
+        return vec![entry.id.clone()];
+    };
+    let ids: Vec<String> = memory
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        vec![entry.id.clone()]
+    } else {
+        ids
+    }
+}
+
 fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
     let total = content.len();
     let start = offset.min(total);
@@ -653,6 +719,16 @@ struct ScriptServiceDeps {
     /// The data dir desktop captures are written under. `None`, or no capture
     /// tool / display session, leaves `screenshot.capture` unregistered.
     screenshot_data_dir: Option<PathBuf>,
+    /// The late-bound scheduler and the sessions reminders are delivered
+    /// into. `None` leaves `schedule.*` unregistered, which withholds the three
+    /// reminder skills.
+    reminders: Option<(crate::reminder_service::SchedulerSlot, Arc<SessionManager>)>,
+    /// Sessions, the event bus and the run registry `session.ask_user` posts
+    /// through and waits on. `None` withholds the `ask_user` skill.
+    ask_user: Option<crate::ask_user_service::AskUserDeps>,
+    /// Where `memory.get` records that a stored memory was used. `None`, or a
+    /// slot never filled, records nothing.
+    feedback: Option<DreamingSlot>,
 }
 
 
@@ -671,6 +747,9 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         audio,
         browser_data_dir,
         screenshot_data_dir,
+        reminders,
+        ask_user,
+        feedback,
     } = deps;
     let memory = &memory;
     use serde_json::{Value, json};
@@ -898,10 +977,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
     // has a retrieval path.
     if let Some(mem) = memory {
         let mem_get = mem.clone();
+        let feedback_for_get = feedback;
         services.insert(
             "memory.get".to_string(),
             Arc::new(move |params: Value| {
                 let mem = mem_get.clone();
+                let feedback = feedback_for_get.clone();
                 Box::pin(async move {
                     let id = req_text(&params, "id")?;
                     let offset = opt_count(&params, "offset")?.unwrap_or(0);
@@ -911,6 +992,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 
                     let entry = resolve_memory_handle(&mem, &id).await?;
                     let content = assemble_handle_content(&mem, &entry).await;
+                    if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
+                        let served = served_row_ids(&mem, &entry).await;
+                        for (memory_id, signal) in recall_feedback(offset, &served) {
+                            dreaming.record_feedback(&memory_id, signal).await;
+                        }
+                    }
 
                     let total = content.len();
                     // Never split a UTF-8 char, and index the same text the
@@ -1156,6 +1243,25 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         );
     }
 
+    // File history. The bridge snapshots before every script write once a
+    // store is installed; these let the `file_history` skill list and restore.
+    services.extend(crate::file_history_service::build_file_history_services(
+        nanna_scripting::file_history::installed(),
+    ));
+
+    // Clarifying questions, answered by the user's next message to a live turn.
+    if let Some(deps) = ask_user {
+        services.extend(crate::ask_user_service::build_ask_user_services(deps));
+    }
+
+    // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
+    // these; the scheduler is built after this map, so it arrives by slot.
+    if let Some((scheduler, sessions)) = reminders {
+        services.extend(crate::reminder_service::build_reminder_services(
+            scheduler, sessions,
+        ));
+    }
+
     // Desktop capture. The `screenshot` skill declares this; the Rust tool
     // behind it was a stub, so this is the implementation, not a registration.
     if let Some(data_dir) = screenshot_data_dir {
@@ -1384,6 +1490,8 @@ pub struct DaemonConfig {
     /// Live memory count that forces a dream cycle regardless of idle time
     /// (mirrors `[memory] dream_memory_pressure_count`; `0` disables).
     pub dream_memory_pressure_count: usize,
+    /// MCP servers to start at boot (`[mcp]`).
+    pub mcp: nanna_config::McpConfig,
     /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
     /// `false` loads cron jobs but fires nothing.
     pub scheduler_enabled: bool,
@@ -1537,6 +1645,7 @@ impl Default for DaemonConfig {
             // Mirror DreamingConfig::default() (== nanna-config defaults).
             dream_idle_threshold_secs: 300,
             dream_memory_pressure_count: 5000,
+            mcp: nanna_config::McpConfig::default(),
             // Mirror nanna_config::SchedulerConfig::default().
             scheduler_enabled: true,
             heartbeat_enabled: true,
@@ -1985,6 +2094,14 @@ pub struct DaemonServer {
     /// Late-bound handle to the control plane for consumers created
     /// before it exists (filled in run(), read by the agent service).
     control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
+    /// The scheduler, for the `schedule.*` services built before it exists.
+    /// Filled once in run(), right after the scheduler is constructed.
+    scheduler_slot: crate::reminder_service::SchedulerSlot,
+    /// Per-server MCP state: written by the boot task, read by `system.status`.
+    mcp_status: crate::mcp_startup::McpStatus,
+    /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
+    /// in `run()`, right after it is built.
+    dreaming_slot: DreamingSlot,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -2136,6 +2253,9 @@ impl DaemonServer {
             sessions,
             _control: control,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
+            scheduler_slot: Arc::new(std::sync::OnceLock::new()),
+            mcp_status: crate::mcp_startup::McpStatus::default(),
+            dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
             shutdown_tx,
@@ -2440,6 +2560,12 @@ impl DaemonServer {
             )
         });
 
+        if let Some(ref dreaming) = dreaming
+            && self.dreaming_slot.set(Arc::clone(dreaming)).is_err()
+        {
+            warn!("dreaming slot was already filled; memory use feedback keeps the first service");
+        }
+
         // Dreaming must observe the very store the agent writes to, never a
         // private copy — that identity is the whole point of the shared seam.
         debug_assert_eq!(
@@ -2527,6 +2653,9 @@ impl DaemonServer {
             // one schedule period, which the log names.
             let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let agent_for_tasks = agent.clone();
+            let sessions_for_tasks = self.sessions.clone();
+            let events_for_tasks = self.ipc.event_sender();
+            let reminder_tick = scheduler.check_interval();
             let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
             let storage_for_tasks = self.storage.clone();
@@ -2556,6 +2685,8 @@ impl DaemonServer {
                 let chat_runs = chat_runs_for_tasks.clone();
                 let dream_in_flight = dream_in_flight_for_tasks.clone();
                 let scheduled_resume_parked = scheduled_resume_parked.clone();
+                let sessions = sessions_for_tasks.clone();
+                let events = events_for_tasks.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
@@ -2714,6 +2845,26 @@ impl DaemonServer {
                                 (true, Some("Skipped (no storage)".to_string()), None)
                             }
                         }
+                        crate::reminder_service::REMINDER_TASK_NAME => {
+                            // Delivered as a message, never run as a prompt:
+                            // a reminder needs no model, and must not wait for
+                            // one (see `reminder_service`).
+                            match crate::reminder_service::deliver_reminder(
+                                &sessions,
+                                &events,
+                                &task,
+                                chrono::Utc::now(),
+                                reminder_tick,
+                            )
+                            .await
+                            {
+                                Ok(content) => (true, Some(content), None),
+                                Err(e) => {
+                                    warn!("{e}");
+                                    (false, None, Some(e))
+                                }
+                            }
+                        }
                         _ if task.payload.is_empty() => {
                             debug!("Skipping task with empty payload: {}", task.name);
                             (true, Some("Skipped (empty payload)".to_string()), None)
@@ -2772,10 +2923,19 @@ impl DaemonServer {
                                             result.content.chars().take(200).collect::<String>()
                                         );
                                     }
-                                    if task.target_channel.is_some() {
+                                    if let Some(message) = scheduled_output_message(
+                                        &task.name,
+                                        &result.content,
+                                        heartbeat_ok,
+                                    ) && let Some(ref target) = task.target_session
+                                        && sessions
+                                            .post_assistant_message(&events, target, message)
+                                            .await
+                                            .is_none()
+                                    {
                                         warn!(
-                                            "Task '{}' targets a channel; channel routing from the \
-                                             daemon scheduler is not implemented yet",
+                                            "Task '{}' posts to session {target}, which no longer \
+                                             exists; its result is in the run history only",
                                             task.name
                                         );
                                     }
@@ -2926,7 +3086,14 @@ impl DaemonServer {
             scheduler = scheduler.with_executor(executor);
             scheduler.start();
             info!("Daemon scheduler started (heartbeat + cron runner)");
-            Arc::new(tokio::sync::RwLock::new(scheduler))
+            let scheduler = Arc::new(tokio::sync::RwLock::new(scheduler));
+            // `run` executes once per server, so the slot is empty here; a
+            // second fill would leave the reminder services on the first
+            // scheduler, which is the one still running.
+            if self.scheduler_slot.set(Arc::clone(&scheduler)).is_err() {
+                warn!("scheduler slot was already filled; reminders keep the first scheduler");
+            }
+            scheduler
         };
 
         // Create control plane with all services (including router for consolidation)
@@ -2948,6 +3115,7 @@ impl DaemonServer {
         .with_workspace_id(workspace_id_for_services)
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
+        .with_mcp_status(Arc::clone(&self.mcp_status))
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
         .with_chat_runs(chat_runs.clone())
@@ -3044,6 +3212,8 @@ impl DaemonServer {
         }
 
         let control = Arc::new(control);
+        // Hand edits of config.toml apply without a restart.
+        control.spawn_config_watcher(self.shutdown_tx.subscribe());
         *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server
@@ -3124,6 +3294,13 @@ impl DaemonServer {
                 state = state
                     .with_memory_rebuild(report.memories_recovered, report.memories_expected);
             }
+            let control_for_metrics = Arc::clone(&control);
+            state = state.with_metrics(Arc::new(move || {
+                let control = Arc::clone(&control_for_metrics);
+                Box::pin(async move {
+                    crate::metrics::render_metrics(&control.metrics_snapshot().await)
+                })
+            }));
             let health_state = Arc::new(state);
 
             // Update session count
@@ -3232,6 +3409,19 @@ impl DaemonServer {
                             "Discord public key found in webhook config; for outbound replies configure channels.discord with a bot_token"
                         );
                     }
+                }
+
+                // This router has no channel manager's forwarder behind it, so
+                // replies to webhook conversations need one of their own.
+                if let Some(events) = control.subscribe_events() {
+                    crate::channels::spawn_reply_forwarder(
+                        Arc::clone(&control.sessions),
+                        events,
+                        Arc::clone(&standalone_router),
+                        Arc::clone(&control.channel_counters),
+                    );
+                } else {
+                    warn!("No event bus attached; webhook conversations will get no replies");
                 }
 
                 standalone_router
@@ -4038,6 +4228,41 @@ impl DaemonServer {
         // (persists it + feeds the router). Cloning shares state
         // (Arc<RwLock<_>> inside).
         let model_stats = nanna_agent::ModelStatsTracker::new();
+        // Keep the per-request history too: lifetime totals cannot be split
+        // back into days, and `system.cost_rollup` prices days. The table
+        // existed with no writer until this sink.
+        if let Some(ref storage) = self.storage {
+            let storage = Arc::clone(storage);
+            model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
+                let storage = Arc::clone(&storage);
+                let obs = obs.clone();
+                // Read here, on the run's task: the task-local does not cross
+                // the spawn below.
+                let session_id = ToolRegistry::run_session_id();
+                tokio::spawn(async move {
+                    let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
+                    let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
+                    if let Err(e) = storage
+                        .log_model_request(
+                            &obs.model,
+                            obs.success,
+                            latency_ms,
+                            obs.input_tokens,
+                            obs.output_tokens,
+                            obs.cache_read_tokens,
+                            obs.cache_creation_tokens,
+                            obs.cache_creation_1h_tokens.min(obs.cache_creation_tokens),
+                            tier.as_deref(),
+                            obs.escalated,
+                            session_id.as_deref(),
+                        )
+                        .await
+                    {
+                        warn!("Failed to log model request: {e}");
+                    }
+                });
+            }));
+        }
 
         // Build script services and load all tools from disk
         let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =
@@ -4087,6 +4312,16 @@ impl DaemonServer {
                 Arc::clone(&authoring_slot),
             ));
 
+            // Before any skill runs: the bridge snapshots into this store on
+            // every script write from here on.
+            let file_history_root = self.config.data_dir.join("file-history");
+            if nanna_scripting::file_history::install(file_history_root.clone()) {
+                info!(
+                    "File history (pre-write snapshots) at {}",
+                    file_history_root.display()
+                );
+            }
+
             let services = build_script_services(ScriptServiceDeps {
                 memory: memory.clone(),
                 spawner: spawner_arc,
@@ -4104,6 +4339,13 @@ impl DaemonServer {
                 )),
                 browser_data_dir: Some(self.config.data_dir.clone()),
                 screenshot_data_dir: Some(self.config.data_dir.clone()),
+                reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
+                feedback: Some(Arc::clone(&self.dreaming_slot)),
+                ask_user: Some(crate::ask_user_service::AskUserDeps {
+                    sessions: Arc::clone(&self.sessions),
+                    events: self.ipc.event_sender(),
+                    chat_runs: Arc::clone(chat_runs),
+                }),
             });
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot
@@ -4160,6 +4402,17 @@ impl DaemonServer {
             let tool_count = tools.definitions().await.len();
             info!("Tool registry: {} tools (including aliases)", tool_count);
         }
+
+        // MCP servers register their tools as each handshake completes; the
+        // count above is the tool surface before them.
+        crate::mcp_startup::spawn_mcp_servers(
+            &self.config.mcp,
+            Arc::clone(&tools),
+            Arc::clone(&self.mcp_status),
+            self.shutdown_tx.subscribe(),
+            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
+        )
+        .await;
 
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
@@ -4438,6 +4691,7 @@ impl DaemonBuilder {
         // `ocr_model_priority` already means "vision-capable models, in order";
         // `vision.analyze` reads it rather than adding a second list.
         builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
+        builder.config.mcp = config.mcp.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
@@ -4898,6 +5152,75 @@ mod tests {
         service: &Arc<nanna_memory::MemoryService>,
     ) -> nanna_memory::MemoryListEntry {
         service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    #[test]
+    fn a_scheduled_result_is_posted_only_when_it_says_something() {
+        assert_eq!(
+            scheduled_output_message("inbox", "  3 new messages\n", false).as_deref(),
+            Some("**Scheduled: inbox**\n\n3 new messages")
+        );
+        assert_eq!(
+            scheduled_output_message("heartbeat", "HEARTBEAT_OK", true),
+            None
+        );
+        assert_eq!(scheduled_output_message("inbox", "   ", false), None);
+    }
+
+    #[test]
+    fn only_the_first_page_of_a_recall_counts_as_a_use() {
+        let served = vec!["chunk-1".to_string(), "chunk-2".to_string()];
+        let signals = recall_feedback(0, &served);
+        assert_eq!(signals.len(), 2);
+        assert!(
+            signals
+                .iter()
+                .all(|(_, f)| *f == nanna_memory::MemoryFeedback::UsedSuccessfully)
+        );
+        assert!(
+            recall_feedback(4000, &served).is_empty(),
+            "a later page is the same use"
+        );
+    }
+
+    /// End to end through the real service map: resolving a stub's handle
+    /// credits every chunk row that served it, once.
+    #[tokio::test]
+    async fn resolving_a_stored_result_credits_the_rows_that_served_it() {
+        let store = seeded_chunk_store(3, 3).await;
+        let dreaming = Arc::new(nanna_memory::DreamingService::with_shared_memory(
+            nanna_memory::DreamingConfig::default(),
+            Arc::clone(&store),
+        ));
+        let slot: DreamingSlot = Arc::new(std::sync::OnceLock::new());
+        assert!(slot.set(Arc::clone(&dreaming)).is_ok());
+        let services = build_script_services(ScriptServiceDeps {
+            memory: Some(Arc::clone(&store)),
+            feedback: Some(slot),
+            ..ScriptServiceDeps::default()
+        });
+
+        let first = services["memory.get"](serde_json::json!({ "id": "abc123", "limit": 7 }))
+            .await
+            .expect("resolved");
+        assert_eq!(first["content"], "part 1\n");
+        let next = services["memory.get"](serde_json::json!({ "id": "abc123", "offset": 7 }))
+            .await
+            .expect("next page");
+        assert_eq!(next["offset"], 7);
+
+        for chunk in ["chunk-1", "chunk-2", "chunk-3"] {
+            assert_eq!(
+                dreaming.pending_feedback_boost(chunk).await,
+                Some(0.5),
+                "{chunk}: one UsedSuccessfully, not one per page"
+            );
+        }
+        assert!(
+            services["memory.get"](serde_json::json!({ "id": "no-such-handle" }))
+                .await
+                .is_err()
+        );
     }
 
     /// The whole result is present: the reassembly is exactly the chunks, in

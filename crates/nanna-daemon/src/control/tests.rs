@@ -503,3 +503,40 @@ async fn gate_edges_are_never_lost_under_racing_claims() {
             .expect("waiter must not panic");
     }
 }
+
+/// A job may name a conversation for its results — and only a real one: a
+/// result posted into a missing session would be dropped on every run.
+#[tokio::test]
+async fn a_scheduled_job_can_post_into_an_existing_conversation_only() {
+    let sessions = Arc::new(SessionManager::new());
+    let session = sessions.create(None).await;
+    let scheduler = Arc::new(RwLock::new(Scheduler::new(
+        nanna_core::SchedulerConfig::default(),
+    )));
+    let cp = Arc::new(ControlPlane::new(sessions).with_scheduler(Arc::clone(&scheduler)));
+    let add = |session_id: Option<String>| {
+        Action::Scheduler(SchedulerAction::Add {
+            schedule: "0 8 * * *".into(),
+            task: "Summarize my inbox".into(),
+            name: Some("inbox".into()),
+            session_id,
+        })
+    };
+
+    let refused = cp.handle("test", add(Some("no-such-chat".into()))).await;
+    assert_eq!(refused["error"], "session_not_found", "{refused}");
+    assert!(
+        scheduler.read().await.list_tasks().await.is_empty(),
+        "nothing was added"
+    );
+
+    let created = cp.handle("test", add(Some(session.id.clone()))).await;
+    let id = created["id"].as_str().expect("created").to_string();
+    let job = cp
+        .handle("test", Action::Scheduler(SchedulerAction::Get { id }))
+        .await;
+    assert_eq!(job["job"]["target_session"], session.id.as_str(), "{job}");
+
+    let unrouted = cp.handle("test", add(None)).await;
+    assert_eq!(unrouted["status"], "created");
+}

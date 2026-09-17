@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.10",
+  version: "0.1.11",
   output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. After each edit the cheapest structural check (sh -n / node --check / JSON.parse) runs on the result and its verdict is appended — including whether the file parsed before the edit. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -417,7 +417,8 @@ export default {
             scope + "), not a tool limitation, and it stays in force until you lift it in chat. " +
             "The fix belongs in the artifact you are producing — if something that READS " + path +
             " is failing, change the code it exercises, not " + path + ". If you believe this constraint " +
-            "genuinely blocks the goal, ask_user about it instead of working around it.";
+            "genuinely blocks the goal, call lift_invariant with glob `" + inv.glob + "` — it asks the user and lifts " +
+            "the rule only on their yes — instead of working around it.";
         }
         return "";
       } catch (e) {

@@ -38,9 +38,76 @@ pub enum TaskType {
         next_run: Option<DateTime<Utc>>,
     },
     /// One-shot delayed task
+    ///
+    /// The delay is measured from a monotonic `Instant`, which cannot be
+    /// persisted: a reloaded `Delayed` task restarts its whole delay at boot.
+    /// Anything that must fire at a wall-clock moment across a restart is an
+    /// [`TaskType::At`] instead.
     Delayed { delay: Duration, created: Instant },
+    /// One-shot task due at an absolute wall-clock instant.
+    ///
+    /// Persisted as `at_<rfc3339>`, so a restart neither re-arms nor drifts it:
+    /// a moment that passed while the daemon was down is simply due on the
+    /// first tick after boot.
+    At { fire_at: DateTime<Utc> },
     /// Recurring task at fixed interval
     Recurring { interval: Duration },
+}
+
+/// Prefix of the persisted schedule string for [`TaskType::At`].
+const AT_SCHEDULE_PREFIX: &str = "at_";
+
+impl TaskType {
+    /// The schedule string this task type is persisted and reported as.
+    ///
+    /// One spelling, used by storage and by every client listing, so the
+    /// string a client shows is the string `job_to_task` parses back.
+    #[must_use]
+    pub fn schedule_label(&self) -> String {
+        match self {
+            Self::Heartbeat => "heartbeat".to_string(),
+            Self::Cron { schedule, .. } => schedule.clone(),
+            Self::Recurring { interval } => format!("every_{}s", interval.as_secs()),
+            Self::Delayed { delay, .. } => format!("delay_{}s", delay.as_secs()),
+            Self::At { fire_at } => format!("{AT_SCHEDULE_PREFIX}{}", fire_at.to_rfc3339()),
+        }
+    }
+
+    /// The next wall-clock moment this task is due, where one is known.
+    #[must_use]
+    pub fn next_run(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Cron { next_run, .. } => *next_run,
+            Self::At { fire_at } => Some(*fire_at),
+            Self::Heartbeat | Self::Recurring { .. } | Self::Delayed { .. } => None,
+        }
+    }
+
+    /// Whether a task of this type runs at most once.
+    #[must_use]
+    pub const fn is_one_shot(&self) -> bool {
+        matches!(self, Self::Delayed { .. } | Self::At { .. })
+    }
+}
+
+/// Whether `task` is due at `now`. Pure: the loop's only scheduling decision.
+///
+/// Heartbeats are never "due" here — they run on their own timer.
+#[must_use]
+pub fn is_task_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    if !task.enabled {
+        return false;
+    }
+    match &task.task_type {
+        TaskType::Cron { next_run, .. } => next_run.is_some_and(|next| next <= now),
+        TaskType::Recurring { interval } => task.last_run.is_none_or(|last| {
+            now.signed_duration_since(last)
+                >= chrono::Duration::from_std(*interval).unwrap_or_default()
+        }),
+        TaskType::Delayed { delay, created } => task.run_count == 0 && created.elapsed() >= *delay,
+        TaskType::At { fire_at } => task.run_count == 0 && *fire_at <= now,
+        TaskType::Heartbeat => false,
+    }
 }
 
 /// A scheduled task
@@ -311,6 +378,8 @@ impl Scheduler {
             TaskType::Recurring {
                 interval: Duration::from_secs(interval_secs),
             }
+        } else if let Some(fire_at) = parse_at(&job.schedule) {
+            TaskType::At { fire_at }
         } else if let Some(delay_secs) = parse_delay(&job.schedule) {
             TaskType::Delayed {
                 delay: Duration::from_secs(delay_secs),
@@ -382,17 +451,8 @@ impl Scheduler {
             None => return Ok(()),
         };
 
-        let schedule = match &task.task_type {
-            TaskType::Heartbeat => "heartbeat".to_string(),
-            TaskType::Cron { schedule, .. } => schedule.clone(),
-            TaskType::Recurring { interval } => format!("every_{}s", interval.as_secs()),
-            TaskType::Delayed { delay, .. } => format!("delay_{}s", delay.as_secs()),
-        };
-
-        let next_run = match &task.task_type {
-            TaskType::Cron { next_run, .. } => next_run.map(|dt| dt.to_rfc3339()),
-            _ => None,
-        };
+        let schedule = task.task_type.schedule_label();
+        let next_run = task.task_type.next_run().map(|dt| dt.to_rfc3339());
 
         let job = NewCronJob {
             job_id: task.id.clone(),
@@ -601,23 +661,14 @@ impl Scheduler {
 
     /// Record a job run
     async fn record_run(&self, result: &TaskResult) {
-        let mut history = self.history.write().await;
-        let runs = history.entry(result.task_id.clone()).or_default();
+        record_run_in(&self.history, result).await;
+    }
 
-        runs.push(JobRun {
-            id: runs.len() as i64 + 1,
-            job_id: result.task_id.clone(),
-            started_at: result.started_at,
-            finished_at: Some(result.finished_at),
-            success: result.success,
-            output: result.output.clone(),
-            error: result.error.clone(),
-        });
-
-        // Keep only last 100 runs per job
-        if runs.len() > 100 {
-            runs.remove(0);
-        }
+    /// How often the loop looks for due work — the resolution of every
+    /// non-heartbeat schedule, reminders included.
+    #[must_use]
+    pub const fn check_interval(&self) -> Duration {
+        self.config.check_interval
     }
 
     /// Run a task immediately (bypass schedule)
@@ -672,6 +723,7 @@ impl Scheduler {
         let storage = self.storage.clone();
         let history = self.history.clone();
         let runtime = self.runtime.clone();
+        let in_flight = InFlight::default();
 
         // Spawn the scheduler loop
         tokio::spawn(async move {
@@ -750,106 +802,27 @@ impl Scheduler {
                         };
 
                         for task in tasks_snapshot {
-                            if !task.enabled {
+                            if !is_task_due(&task, now) {
                                 continue;
                             }
-
-                            let should_run = match &task.task_type {
-                                TaskType::Cron { next_run, .. } => {
-                                    next_run.is_some_and(|nr| nr <= now)
-                                }
-                                TaskType::Recurring { interval: task_interval } => {
-                                    task.last_run.is_none_or(|lr| {
-                                        let elapsed = now.signed_duration_since(lr);
-                                        elapsed >= chrono::Duration::from_std(*task_interval).unwrap_or_default()
-                                    })
-                                }
-                                TaskType::Delayed { delay, created } => {
-                                    task.run_count == 0 && created.elapsed() >= *delay
-                                }
-                                TaskType::Heartbeat => false, // Handled separately
+                            // Claimed BEFORE it is spawned, released only after
+                            // its state is settled. The tick is 30s and nothing
+                            // bounds how long a run takes, while "due" is read
+                            // from state a run updates only when it FINISHES —
+                            // so a run still going at the next tick was due
+                            // again and started a second copy of itself.
+                            let Some(claim) = InFlightClaim::take(&in_flight, &task.id) else {
+                                debug!("Task {} still running; not starting it twice", task.id);
+                                continue;
                             };
-
-                            if should_run {
-                                let executor = executor.clone();
-                                let tasks = tasks.clone();
-                                let storage = storage.clone();
-                                let history = history.clone();
-                                let task_id = task.id.clone();
-
-                                tokio::spawn(async move {
-                                    debug!("Running task: {} ({})", task.name, task_id);
-                                    let result = executor(task).await;
-
-                                    // Record run in history
-                                    {
-                                        let mut hist = history.write().await;
-                                        let runs = hist.entry(task_id.clone()).or_default();
-                                        runs.push(JobRun {
-                                            id: runs.len() as i64 + 1,
-                                            job_id: task_id.clone(),
-                                            started_at: result.started_at,
-                                            finished_at: Some(result.finished_at),
-                                            success: result.success,
-                                            output: result.output.clone(),
-                                            error: result.error.clone(),
-                                        });
-                                        if runs.len() > 100 {
-                                            runs.remove(0);
-                                        }
-                                    }
-
-                                    // Update task state
-                                    {
-                                        let mut tasks_guard = tasks.write().await;
-                                        if let Some(t) = tasks_guard.get_mut(&task_id) {
-                                            t.last_run = Some(result.finished_at);
-                                            t.run_count += 1;
-
-                                            // Update next_run for cron tasks
-                                            if let TaskType::Cron {
-                                                parsed: Some(ref p),
-                                                ref mut next_run,
-                                                ..
-                                            } = t.task_type
-                                            {
-                                                *next_run = p.next_from_now();
-                                            }
-
-                                            // Disable one-shot tasks after running
-                                            if matches!(t.task_type, TaskType::Delayed { .. }) {
-                                                t.enabled = false;
-                                            }
-                                        }
-                                    }
-
-                                    // Update storage
-                                    if let Some(storage) = storage {
-                                        let next_run = {
-                                            let tasks = tasks.read().await;
-                                            tasks.get(&task_id).and_then(|t| {
-                                                if let TaskType::Cron { next_run, .. } = &t.task_type {
-                                                    next_run.map(|dt| dt.to_rfc3339())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                        };
-
-                                        let _ = storage.cron_jobs().update_last_run(
-                                            &task_id,
-                                            &result.finished_at.to_rfc3339(),
-                                            next_run.as_deref(),
-                                        ).await;
-                                    }
-
-                                    if !result.success {
-                                        error!("Task {} failed: {:?}", task_id, result.error);
-                                    } else {
-                                        info!("Task {} completed in {}ms", task_id, result.duration_ms);
-                                    }
-                                });
-                            }
+                            tokio::spawn(run_due_task(
+                                claim,
+                                task,
+                                executor.clone(),
+                                tasks.clone(),
+                                storage.clone(),
+                                history.clone(),
+                            ));
                         }
                     }
                 }
@@ -863,6 +836,174 @@ impl Scheduler {
             let _ = tx.send(()).await;
         }
     }
+}
+
+/// Run one due task and settle its state: history, `last_run`, storage.
+///
+/// One-shots are settled by outcome. A delivered one-shot is REMOVED — memory
+/// and storage — because a disabled row that is never re-enabled is dead
+/// weight that accumulates one row per reminder forever. A failed one stays,
+/// disabled and persisted disabled, so the failure is inspectable and a
+/// restart does not silently retry it. (Before this, a fired `Delayed` task
+/// was disabled in memory only; storage kept `enabled = 1`, so every daemon
+/// restart re-armed it and it fired again.)
+async fn run_due_task(
+    claim: InFlightClaim,
+    task: ScheduledTask,
+    executor: TaskExecutor,
+    tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    storage: Option<Arc<Storage>>,
+    history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+) {
+    let task_id = task.id.clone();
+    debug_assert_eq!(
+        claim.task_id, task_id,
+        "a run holds the claim for its own task"
+    );
+    let one_shot = task.task_type.is_one_shot();
+    debug!("Running task: {} ({})", task.name, task_id);
+    let result = executor(task).await;
+    debug_assert_eq!(
+        result.task_id, task_id,
+        "executor must answer for the task it ran"
+    );
+    debug_assert!(
+        result.finished_at >= result.started_at,
+        "a run cannot finish before it starts"
+    );
+
+    record_run_in(&history, &result).await;
+
+    let next_run = {
+        let mut tasks_guard = tasks.write().await;
+        if one_shot && result.success {
+            tasks_guard.remove(&task_id);
+            None
+        } else if let Some(t) = tasks_guard.get_mut(&task_id) {
+            t.last_run = Some(result.finished_at);
+            t.run_count += 1;
+            if let TaskType::Cron {
+                parsed: Some(ref p),
+                ref mut next_run,
+                ..
+            } = t.task_type
+            {
+                *next_run = p.next_from_now();
+            }
+            if one_shot {
+                t.enabled = false;
+            }
+            t.task_type.next_run().map(|dt| dt.to_rfc3339())
+        } else {
+            None
+        }
+    };
+
+    if let Some(storage) = storage {
+        settle_in_storage(&storage, &task_id, one_shot, &result, next_run.as_deref()).await;
+    }
+    // Released only now: the in-memory state above is what the next tick reads.
+    drop(claim);
+
+    if result.success {
+        info!("Task {} completed in {}ms", task_id, result.duration_ms);
+    } else {
+        error!("Task {} failed: {:?}", task_id, result.error);
+    }
+}
+
+/// Ids of tasks with a run in progress. Bounded by the task map it indexes.
+type InFlight = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Proof that a task's run is in progress; releases the id when dropped, so an
+/// executor that panics (in a build that unwinds) does not wedge its task.
+struct InFlightClaim {
+    in_flight: InFlight,
+    task_id: String,
+}
+
+impl InFlightClaim {
+    /// Claim `task_id`, or `None` when a run of it is already in progress.
+    fn take(in_flight: &InFlight, task_id: &str) -> Option<Self> {
+        let mut ids = in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ids.insert(task_id.to_string()) {
+            return None;
+        }
+        debug_assert!(ids.contains(task_id));
+        drop(ids);
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+            task_id: task_id.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        let released = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.task_id);
+        debug_assert!(released, "a claim releases exactly the id it took");
+    }
+}
+
+/// Mirror a finished run into storage. See [`run_due_task`] for the one-shot rule.
+async fn settle_in_storage(
+    storage: &Storage,
+    task_id: &str,
+    one_shot: bool,
+    result: &TaskResult,
+    next_run: Option<&str>,
+) {
+    let jobs = storage.cron_jobs();
+    if one_shot && result.success {
+        if let Err(e) = jobs.delete(task_id).await {
+            warn!("Failed to delete delivered one-shot {task_id}: {e}");
+        }
+        return;
+    }
+    let finished_at = result.finished_at.to_rfc3339();
+    if let Err(e) = jobs.update_last_run(task_id, &finished_at, next_run).await {
+        warn!("Failed to persist the last run of task {task_id}: {e}");
+    }
+    if one_shot && let Err(e) = jobs.set_enabled(task_id, false).await {
+        warn!("Failed to persist failed one-shot {task_id} as disabled: {e}");
+    }
+}
+
+/// Append a run to the bounded per-job history.
+async fn record_run_in(history: &RwLock<HashMap<String, Vec<JobRun>>>, result: &TaskResult) {
+    let mut hist = history.write().await;
+    let runs = hist.entry(result.task_id.clone()).or_default();
+    runs.push(JobRun {
+        id: runs.len() as i64 + 1,
+        job_id: result.task_id.clone(),
+        started_at: result.started_at,
+        finished_at: Some(result.finished_at),
+        success: result.success,
+        output: result.output.clone(),
+        error: result.error.clone(),
+    });
+    if runs.len() > JOB_HISTORY_RUNS_MAX {
+        runs.remove(0);
+    }
+    debug_assert!(runs.len() <= JOB_HISTORY_RUNS_MAX);
+}
+
+/// Runs kept per job. The GUI's history view pages ten at a time; a hundred is
+/// ten pages, and the list is in memory only.
+const JOB_HISTORY_RUNS_MAX: usize = 100;
+
+/// Parse an absolute one-shot schedule like `at_2026-09-17T10:00:00+00:00`.
+fn parse_at(schedule: &str) -> Option<DateTime<Utc>> {
+    let stamp = schedule.strip_prefix(AT_SCHEDULE_PREFIX)?;
+    DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Parse interval string like "every_300s" into seconds
@@ -939,6 +1080,23 @@ pub fn delayed_task(name: &str, delay: Duration, payload: &str) -> ScheduledTask
     }
 }
 
+/// Helper to create a one-shot task due at an absolute wall-clock instant
+#[must_use]
+pub fn at_task(name: &str, fire_at: DateTime<Utc>, payload: &str) -> ScheduledTask {
+    ScheduledTask {
+        id: format!("{}-{}", name, uuid::Uuid::new_v4()),
+        name: name.to_string(),
+        task_type: TaskType::At { fire_at },
+        payload: payload.to_string(),
+        enabled: true,
+        last_run: None,
+        run_count: 0,
+        timezone: "UTC".to_string(),
+        target_channel: None,
+        target_session: None,
+    }
+}
+
 /// Helper to create a memory consolidation ("dreaming") task
 #[must_use]
 pub fn consolidation_task(interval: Option<Duration>) -> ScheduledTask {
@@ -987,6 +1145,208 @@ mod tests {
         let task = Scheduler::cron_task("daily-backup", "0 3 * * *", "Run backup").unwrap();
         assert_eq!(task.name, "daily-backup");
         assert!(matches!(task.task_type, TaskType::Cron { .. }));
+    }
+
+    fn fixed(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("in range")
+    }
+
+    #[test]
+    fn an_at_schedule_parses_back_to_the_instant_it_was_written_from() {
+        let fire_at = fixed(0);
+        let label = TaskType::At { fire_at }.schedule_label();
+        assert!(label.starts_with("at_"), "{label}");
+        assert_eq!(parse_at(&label), Some(fire_at));
+        assert_eq!(parse_at("at_not-a-time"), None);
+        assert_eq!(parse_at("delay_60s"), None);
+    }
+
+    #[test]
+    fn an_at_task_is_due_once_at_its_instant_and_never_while_disabled() {
+        let mut task = at_task("reminder", fixed(60), "stretch");
+        assert!(!is_task_due(&task, fixed(59)));
+        assert!(is_task_due(&task, fixed(60)));
+        assert!(
+            is_task_due(&task, fixed(6000)),
+            "overdue after downtime is still due"
+        );
+        task.enabled = false;
+        assert!(!is_task_due(&task, fixed(60)));
+        task.enabled = true;
+        task.run_count = 1;
+        assert!(!is_task_due(&task, fixed(60)));
+        assert!(task.task_type.is_one_shot());
+        assert_eq!(task.task_type.next_run(), Some(fixed(60)));
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_at_task_keeps_its_instant_instead_of_rearming() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let before = Scheduler::new(SchedulerConfig::default()).with_storage(storage.clone());
+        let mut task = at_task("reminder", fixed(90), "stretch");
+        task.target_session = Some("chat-1".into());
+        let id = task.id.clone();
+        before.add_task(task).await;
+
+        let after = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        assert_eq!(after.load_jobs().await.expect("load"), 1);
+        let reloaded = after.get_task(&id).await.expect("reloaded");
+        assert!(matches!(reloaded.task_type, TaskType::At { fire_at } if fire_at == fixed(90)));
+        assert_eq!(reloaded.target_session.as_deref(), Some("chat-1"));
+        assert_eq!(reloaded.payload, "stretch");
+    }
+
+    /// Wait (bounded) for `condition`, polling the scheduler's own state.
+    async fn eventually<F, Fut>(mut condition: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[test]
+    fn an_in_flight_claim_excludes_a_second_run_until_released() {
+        let in_flight = InFlight::default();
+        let first = InFlightClaim::take(&in_flight, "job-a").expect("free");
+        assert!(InFlightClaim::take(&in_flight, "job-a").is_none());
+        let other = InFlightClaim::take(&in_flight, "job-b").expect("independent ids");
+        drop(first);
+        assert!(InFlightClaim::take(&in_flight, "job-a").is_some());
+        drop(other);
+        assert!(in_flight.lock().expect("ids").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recurring_run_slower_than_the_tick_never_overlaps_itself() {
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (running_in, peak_in, runs_in) = (running.clone(), peak.clone(), runs.clone());
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let (running, peak, runs) = (running_in.clone(), peak_in.clone(), runs_in.clone());
+            Box::pin(async move {
+                let now_running = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now_running, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                runs.fetch_add(1, Ordering::SeqCst);
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success: true,
+                    output: None,
+                    error: None,
+                    duration_ms: 100,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let config = SchedulerConfig {
+            heartbeat_enabled: false,
+            check_interval: Duration::from_millis(10),
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config).with_executor(executor);
+        // Due on every tick: the interval is far below both tick and run time.
+        scheduler
+            .add_task(recurring_task("sweep", Duration::from_millis(1), "x"))
+            .await;
+        scheduler.start();
+        let ran_twice = eventually(|| async { runs.load(Ordering::SeqCst) >= 3 }).await;
+        scheduler.stop().await;
+
+        assert!(ran_twice, "a recurring task keeps running after each run");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "never two runs of one task at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shots_fire_once_then_vanish_on_success_and_stay_disabled_on_failure() {
+        let storage = Arc::new(Storage::in_memory().await.expect("in-memory storage"));
+        let calls: Arc<std::sync::Mutex<HashMap<String, usize>>> = Arc::default();
+        let calls_in_executor = calls.clone();
+        let executor: TaskExecutor = Arc::new(move |task: ScheduledTask| {
+            let calls = calls_in_executor.clone();
+            Box::pin(async move {
+                *calls
+                    .lock()
+                    .expect("calls")
+                    .entry(task.id.clone())
+                    .or_default() += 1;
+                // Slower than several ticks: without the claim, the next tick
+                // would see the one-shot still due and fire it again.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let success = task.payload == "deliverable";
+                TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success,
+                    output: None,
+                    error: (!success).then(|| "session gone".to_string()),
+                    duration_ms: 150,
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                }
+            })
+        });
+        let config = SchedulerConfig {
+            heartbeat_enabled: false,
+            check_interval: Duration::from_millis(20),
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config)
+            .with_storage(storage.clone())
+            .with_executor(executor);
+        let delivered = at_task("reminder", Utc::now(), "deliverable");
+        let failed = at_task("reminder", Utc::now(), "undeliverable");
+        let (delivered_id, failed_id) = (delivered.id.clone(), failed.id.clone());
+        scheduler.add_task(delivered).await;
+        scheduler.add_task(failed).await;
+        scheduler.start();
+
+        let settled = eventually(|| async {
+            scheduler.get_task(&delivered_id).await.is_none()
+                && scheduler
+                    .get_task(&failed_id)
+                    .await
+                    .is_some_and(|t| t.run_count == 1)
+        })
+        .await;
+        scheduler.stop().await;
+        assert!(settled, "both one-shots should have run and settled");
+
+        let calls = calls.lock().expect("calls").clone();
+        assert_eq!(calls.get(&delivered_id), Some(&1), "fired exactly once");
+        assert_eq!(calls.get(&failed_id), Some(&1), "fired exactly once");
+        let kept = scheduler
+            .get_task(&failed_id)
+            .await
+            .expect("failed one-shot kept");
+        assert!(!kept.enabled);
+
+        // Storage agrees, so a restart neither re-fires nor resurrects.
+        let restarted = Scheduler::new(SchedulerConfig::default()).with_storage(storage);
+        assert_eq!(restarted.load_jobs().await.expect("load"), 1);
+        assert!(restarted.get_task(&delivered_id).await.is_none());
+        let reloaded = restarted
+            .get_task(&failed_id)
+            .await
+            .expect("failed one-shot persisted");
+        assert!(
+            !reloaded.enabled,
+            "a failed one-shot must not re-arm on restart"
+        );
     }
 
     #[test]

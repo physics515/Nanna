@@ -31,6 +31,7 @@ mod channel;
 mod chat;
 pub mod chat_harness;
 mod config;
+mod config_watch;
 mod memory;
 mod scheduler;
 mod session;
@@ -115,6 +116,8 @@ pub struct ControlPlane {
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
     pub(crate) chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    /// Channel messages in and out, for `/metrics`.
+    pub(crate) channel_counters: Arc<crate::channel_counters::ChannelCounters>,
     /// Per-session liveness ledgers (P22): current phase, last tool, last
     /// side-effecting call, stop state — stamped by the chat sink, read by
     /// the liveness beat and the `session.liveness` verb.
@@ -129,6 +132,8 @@ pub struct ControlPlane {
     /// pending transitions once, in the model's next tool result. `None` in
     /// minimal test constructions.
     degradations: Option<Arc<nanna_agent::DegradationLedger>>,
+    /// Per-server MCP state from the boot task; `None` outside a daemon.
+    mcp_status: Option<crate::mcp_startup::McpStatus>,
 }
 
 impl ControlPlane {
@@ -164,9 +169,11 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -226,9 +233,11 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -290,9 +299,11 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -401,6 +412,18 @@ impl ControlPlane {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(event);
         }
+    }
+
+    /// A new receiver on the daemon event bus, if one is attached.
+    pub fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Event>> {
+        self.event_tx.as_ref().map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// Attach the MCP boot task's per-server state.
+    #[must_use]
+    pub fn with_mcp_status(mut self, status: crate::mcp_startup::McpStatus) -> Self {
+        self.mcp_status = Some(status);
+        self
     }
 
     /// Set the scheduler

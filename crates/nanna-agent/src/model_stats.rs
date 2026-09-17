@@ -16,10 +16,27 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use nanna_storage::StoredModelStats;
 
+/// Called with every recorded request.
+///
+/// It is the per-request history the in-memory aggregates cannot give back (a
+/// day's spend is not derivable from lifetime totals). Must not block: the
+/// daemon's sink hands the write to a task.
+pub type RequestSink = Arc<dyn Fn(&RequestObservation) + Send + Sync>;
+
 /// Global model statistics tracker. Thread-safe, designed for concurrent access.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelStatsTracker {
-    inner: Arc<RwLock<StatsInner>>, 
+    inner: Arc<RwLock<StatsInner>>,
+    /// Set once by the host; shared by every clone.
+    sink: Arc<std::sync::OnceLock<RequestSink>>,
+}
+
+impl std::fmt::Debug for ModelStatsTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelStatsTracker")
+            .field("sink_set", &self.sink.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,7 +94,7 @@ pub struct TierCounts {
 }
 
 /// A completed request observation to record.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestObservation {
     pub model: String,
     pub success: bool,
@@ -172,11 +189,21 @@ impl ModelStatsTracker {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(StatsInner::default())),
+            sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Send every future observation to `sink` as well. Returns `false` when a
+    /// sink was already set (the first one stays).
+    pub fn set_request_sink(&self, sink: RequestSink) -> bool {
+        self.sink.set(sink).is_ok()
     }
 
     /// Record a completed request observation.
     pub async fn record(&self, obs: RequestObservation) {
+        if let Some(sink) = self.sink.get() {
+            sink(&obs);
+        }
         let mut inner = self.inner.write().await;
         let stats = inner.models.entry(obs.model.clone()).or_insert_with(|| ModelStats::new(&obs.model));
 
@@ -606,6 +633,40 @@ impl From<StorableModelStats> for StoredModelStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_recorded_request_reaches_the_sink_once_set() {
+        let tracker = ModelStatsTracker::new();
+        tracker.record(observation("before-sink", true)).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen_in_sink = Arc::clone(&seen);
+        assert!(
+            tracker.set_request_sink(Arc::new(move |obs: &RequestObservation| {
+                seen_in_sink.lock().expect("seen").push(obs.model.clone());
+            }))
+        );
+        assert!(
+            !tracker.set_request_sink(Arc::new(|_: &RequestObservation| {})),
+            "set once"
+        );
+        // A clone shares the sink, as it shares the stats.
+        tracker
+            .clone()
+            .record(observation("claude-opus-5", true))
+            .await;
+        tracker
+            .record(observation("ollama/qwen3.5:9b", false))
+            .await;
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["claude-opus-5".to_string(), "ollama/qwen3.5:9b".to_string()]
+        );
+        assert_eq!(
+            tracker.summaries().await.len(),
+            3,
+            "the aggregates still record everything"
+        );
+    }
 
     fn observation(model: &str, success: bool) -> RequestObservation {
         RequestObservation {

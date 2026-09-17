@@ -1631,9 +1631,23 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             on *every* attempt is a configuration fault, not a transient one, and deserves to
             surface (health endpoint degradation, or a once-per-boot loud notice) rather than
             scroll past. Needs a decision on where operator-visible faults belong.
-- [ ] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
+- [~] **Prometheus metrics** — new `nanna-metrics` crate (`NannaMetrics`: llm_request_duration,
       llm_tokens_total, tool_execution_duration, channel_messages/errors_total, queue_depth,
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
+      *(2026-09-17)* **`GET /metrics` landed on the health server (5148), no new crate or
+      dependency** — the text format is a line format, and the numbers already existed in the tool
+      and model stats trackers. Series: `nanna_up`, `uptime_seconds`, `sessions`,
+      `chat_runs_active`, `memory_entries`, `reminders_pending`, `tool_calls_total{tool,outcome}`,
+      `tool_latency_p95_milliseconds`, `model_requests_total`, `model_tokens_total{model,kind}`,
+      `model_healthy`, `mcp_server_up{server,state}`, `mcp_server_tools`. Every label comes from a
+      registered tool, configured model or configured MCP server — never a session or message — so
+      series count is bounded by configuration. Verified by scraping the live debug daemon.
+      Remaining from the original list: request-duration histograms (the trackers keep p95, not
+      buckets) and channel message/error counters (the channel path has no counters yet).
+      *(2026-09-17, later)* Channel counters landed: `nanna_channel_messages_total{channel,direction}`
+      and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
+      daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
+      in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
 - [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
@@ -1685,8 +1699,18 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
       unknown/extra fields). Added `ModelStatsTracker::total_cost_usd()` (grand-total known cloud spend; sums
       only priced models) surfaced as `total_cost_usd` on the `SystemAction::ModelStats` response; test.
-- [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
+- [x] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
+      *(2026-09-17)* Landed without `notify`: `control/config_watch.rs` stats the one file the
+      control plane loads and saves every 2 s (no new dependency, and a stat of the path sidesteps
+      editors that save by rename), waits 500 ms for the change to hold still, parses it, and
+      applies only when the parsed config differs from the running one — through the SAME
+      `apply_loaded_config` the `config.reload` verb now uses (agent LLM config, provider rebuild,
+      scheduler loop, `config_changed`). Verified live on the debug daemon: a hand edit of
+      `heartbeat_enabled` applied within ~1 s with exactly one `config_changed`; a file left
+      mid-edit as invalid TOML was logged and the running config kept; rewriting identical values
+      and the daemon's own `config.set` save produced **no** second event. Boot-only sections
+      (channels, MCP servers, webhooks) still need a restart — stated in `apply_loaded_config`.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
 - [~] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
       *(2026-07-20)* **Core `ToolPolicy` shipped + enforced.** New `nanna-tools::policy` — an allow/deny
@@ -1787,6 +1811,44 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
+- [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
+      `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
+      read the reply from `chat.send`'s response `content`. Two things had made that impossible:
+      the `{provider}:{chat}:{sender}` session was **never created** — `chat.send` refuses a session
+      that does not exist, and nothing else creates one under a derived key — and since the P22 fast
+      ack (2026-08-14) the response is a **delivery ack with `content: ""`**, the answer arriving later
+      as `message_end` on the event bus. So a channel user got
+      `"I encountered an error processing your message."` (reproduced by a probe test against the
+      unmodified function), and with a session in place would have got an empty message.
+      Fixed at the architecture the rest of the daemon already uses: the channel session is created
+      on first contact with its **reply route persisted in session metadata** (`reply_channel`, not
+      the unpersisted `owner`, so it survives a restart — tested against real Turso storage), and ONE
+      **reply forwarder per router** subscribes to the event bus and sends each finished turn
+      (`message_end`) and each appended assistant message (a delivered reminder) to the channel its
+      session names. GUI/CLI sessions have no route and are skipped. A refused turn (no agent, turn
+      could not start) is answered immediately with the daemon's own reason
+      (`Nanna could not answer this message: Agent service not configured`). The webhook processor
+      shares the channel manager's router and forwarder when there is one and gets its own
+      otherwise, so no reply is sent twice. 6 tests (real `ControlPlane` + `SessionManager` + a
+      recording channel). **Not live-verified** — no bot token on this host; a real Telegram
+      round-trip is the remaining check.
+      - [ ] Live round-trip against a real bot (Telegram is cheapest): message in → `message_end` →
+            reply out, then a `remind` set from the chat arriving in the chat.
+      - [x] `nanna-server`'s own Telegram/Discord/Slack handlers were not audited for the same
+            ack-as-reply assumption — check whether that server is still reachable in daemon mode
+            before spending time on it.
+            *(2026-09-17, checked — not affected.)* `nanna serve`'s webhook handlers call
+            `AppState::process_message`, which runs its own agent inline and returns the finished
+            text (`webhooks/telegram.rs:177`); there is no delivery ack in that path to misread.
+      - [ ] **The daemon's generic `/webhook/{id}` refuses every call, and its refusal names a
+            setting that cannot fix it.** *(found 2026-09-17)* `WebhookConfig::generic_secrets` is
+            populated by nothing outside `webhook.rs` and its fail-closed test — no config key, no IPC
+            verb, no keyring entry — so every id is "unregistered". The 401/503 text points at
+            `server.webhook_secret (per webhook id)`, which is `nanna serve`'s single shared secret
+            and never reaches the daemon. Fail-closed is the safe failure; the dead field and the
+            misleading remedy are the defects. Needs a decision on WHERE per-hook secrets live
+            (the P1 rule is "secrets leave config.toml", so keyring-backed with a create/revoke verb
+            is the likely shape) — product-level, not taken unattended.
 - [~] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
       *(2026-08-23)* **The headline was stale; the hole it hid was real and is now fixed.** Both live
@@ -1954,7 +2016,13 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
 - [ ] **Browser relay Chrome extension** (Low/High) — MV3 extension ↔ daemon relay (proposed port 5150),
       feed the LLM the accessibility tree (not raw DOM); tools `browser_relay_{snapshot,action,screenshot}`.
 - [ ] **Paired devices / nodes** — defer to P9 (Tor P2P) rather than a standalone mDNS/WebSocket scheme.
-- [ ] Gateway control: `/restart` + `/status` as channel commands, full backup/restore archive, ~~self-update via GitHub releases~~ **(GUI half landed 2026-07-24, v0.2.1: tauri-plugin-updater with signed NSIS artifacts, endpoint = raw master `.updater/latest.json` since `releases/latest` skips pre-releases; status-bar "Update to vX" chip — user-initiated apply so a running mission is never yanked. Remaining: headless-daemon self-update.)**
+- [~] Gateway control: `/restart` + `/status` as channel commands, full backup/restore archive, ~~self-update via GitHub releases~~ **(GUI half landed 2026-07-24, v0.2.1: tauri-plugin-updater with signed NSIS artifacts, endpoint = raw master `.updater/latest.json` since `releases/latest` skips pre-releases; status-bar "Update to vX" chip — user-initiated apply so a running mission is never yanked. Remaining: headless-daemon self-update.)**
+      *(2026-09-17)* **`/status` and `/help` landed** beside `/model`. `/status` leads with the one fact
+      a chat user cannot otherwise tell from "busy" — **no model provider configured, so nothing can
+      answer** — then uptime, whether this chat's turn is running, the model pin, and reminders pending
+      in this chat (omitted, not zeroed, when there is no scheduler). `/help` (and Telegram's `/start`)
+      lists the commands. Neither reaches the model or the session. 3 tests. `/restart` deliberately
+      NOT added: anyone in an allowed chat could bounce the daemon mid-mission, which is an owner call.
 
 ### P9 — Multi-Device Swarm (Tor P2P) 🌱 (not started)
 Personal device mesh over Tor hidden services — zero-config, encrypted, no port forwarding. Every
@@ -3158,7 +3226,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       Still open here: **corrections and tool-success/failure**, which is where the
       `UsedSuccessfully`/`CausedError` variants finally get fed — reactions only ever produce
       Helpful/Unhelpful.
-      - [ ] *(scoped 2026-09-13 — skipped deliberately this run, with the reason and the design, so
+      - [~] *(scoped 2026-09-13 — skipped deliberately this run, with the reason and the design, so
             the next run starts from a decision)* **`UsedSuccessfully`/`CausedError` have no producer
             anywhere in the product.** Confirmed by grep: both variants appear only inside
             `nanna-memory/src/dreaming.rs` and its own tests. The whole apparatus around them is
@@ -3181,6 +3249,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             about one memory, unlike "a tool failed somewhere in a turn that also recalled things",
             which attributes a turn-level outcome to whatever happened to be in context — the same
             over-attribution the 2026-08-28 reaction work had to undo.
+            *(2026-09-17) `UsedSuccessfully` has its first producer — and it needed no agent-loop
+            threading.* The stub round trip already ends at a daemon service: `recall` resolves a
+            handle through `memory.get`. So the attribution lives at that boundary: a first-page
+            read (`offset == 0`) that resolves records `UsedSuccessfully` for every row the content
+            was assembled from (all chunks sharing the `source_id`, or the absorbing memory when the
+            handle was forwarded by dreaming), via a late-bound `DreamingService` slot; later pages
+            of the same read are the same use and record nothing. The dream cycle applies the tally
+            it already consumed (+0.5 each). Tested through the real service map with a real
+            `DreamingService` (three chunks → +0.5 each after a two-page read; mutation with the
+            page rule removed gives +1.0 and fails). **`CausedError` still has no producer, on
+            purpose:** an unresolvable handle has no memory to blame, and a short reassembly is
+            dreaming's doing, not a row's — neither is a fact about one memory.
       - [ ] *(2026-08-28)* **Telegram could feed the same loop; today it cannot see reactions.**
             `crates/nanna-channels/src/listeners/telegram.rs:87` requests
             `allowed_updates = ["message","edited_message"]`, and Telegram delivers
@@ -4131,7 +4211,7 @@ browser-automation crate, scheduler skills, and swarm coordinator all exist in-t
 also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — they error when called.)
 
 **A. Wire what's already built** (service registration + config, not new subsystems):
-- [ ] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
+- [x] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
       `Nanna.service("schedule.add"/…)` which is never registered. "Check back in 20 minutes"
       self-scheduling is the difference between an agent and a chatbot; ROADMAP:1721 already says
       "wire, don't duplicate". Add absolute-timestamp one-shots (fire once, auto-disable) while in there.
@@ -4174,6 +4254,59 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       live agent turn — i.e. a working model. This host has neither a cloud credential nor Ollama, so
       the one property that distinguishes "wired" from "half-wired" here is the one property that
       could not be checked. Build it on a host that can watch a reminder land.
+      **(2026-09-17) Landed — and verified on a host with no model, because delivery turned out not
+      to need one.** A reminder is text somebody already wrote, so firing it is a message, not an
+      agent turn: the executor's new `reminder` arm appends it to the originating session as an
+      assistant message (persisted, so it is in the next turn's history) and broadcasts the new
+      `Event::SessionMessageAdded`, which the GUI forwards as `session-message-added` and the chat
+      page appends. `target_session` got its first writer (`schedule.add`, fed by the skill's
+      `Nanna.sessionId()` — the run-scoped binding, not a process-wide cell) and first reader
+      (`deliver_reminder`). Reminders are a new **`TaskType::At`** one-shot persisted as `at_<rfc3339>`,
+      so a restart neither re-arms nor postpones them. Bounds: 100 pending (the listing is where they
+      all meet a model's context, ~2.5k tokens), 4 KiB text (re-read as history every later turn).
+      `schedule.cancel` touches only `reminder` jobs — an id of `memory_consolidation` answers "no
+      pending reminder has id …". `withheld_count` 16 → **0 skills missing a service anywhere**
+      (the audit ledger `KNOWN_MISSING_SERVICES` is now empty); on a bare host the 5 still withheld
+      are all credential/model-gated.
+      **Three defects surfaced on the way, two only by driving the real daemon:**
+      (1) **Every reminder a skill sent was refused** — Boa hands JS numbers over as JSON floats, so
+      `delay_secs: 3` arrived as `3.0` and a strict `as_i64` said "must be greater than zero". Now
+      parsed with the task services' lenient integer reader; pinned by a dialect test.
+      (2) **A direct `tool.execute` over IPC dropped a failed tool's message** — the reply carried
+      `output` (empty on failure) and not `error`, so every refusal read as `success:false, ""`.
+      `error` is now returned, and `execute` takes an optional `session_id` so a direct call runs in a
+      stated conversation instead of whichever one the daemon was last bound to.
+      (3) **Scheduler one-shots double-fired and re-armed on restart** (pre-existing, `Delayed`): a
+      due one-shot was re-spawned on every 30s tick until its run finished — **8 fires** in the
+      mutation check with the new claim removed — and a fired one stayed `enabled = 1` in storage, so
+      each daemon restart fired it again. One-shots are now claimed before spawning; a delivered one
+      is removed from memory and storage, a failed one kept disabled and persisted disabled.
+      Verified: 11 service + 4 scheduler unit tests (claim test proven to fail without the claim),
+      GUI parser/decision spec + `DaemonEvent` wire test, and the **real debug daemon over IPC**:
+      reminder set → `session_message_added` event and persisted history 7s later → job gone;
+      no-session / zero-delay / dreaming-id refusals each named; and a 20s reminder set, daemon
+      stopped (`clean_shutdown`), restarted 90s later → delivered 6s after boot with
+      "is 2 min late — Nanna was not running when it came due". GUI rendering itself NOT
+      WebDriver-verified (Linux harness still blocked on `WebKitWebDriver`).
+      - [x] **A reminder set from a channel conversation (Telegram/Discord/…) lands in the daemon
+            session and is not known to reach the channel.** Delivery writes the session and
+            broadcasts to IPC clients, and nothing in that path calls the channel manager; not traced
+            further this run. Route `SessionMessageAdded` for channel-owned sessions to their channel.
+            *(2026-09-17)* Done as part of the channel-reply fix below (P8, "Channel conversations were
+            answered with an error"): the reply forwarder sends both `message_end` and assistant
+            `session_message_added` to the channel a session names.
+      - [x] **Recurring tasks can still overlap themselves past a tick.** The new claim covers
+            one-shots only; a `Recurring` run slower than 30s (consolidation, heartbeat prompts) is
+            due again at the next tick — dreaming has its own in-flight latch for exactly this, other
+            recurring jobs do not. Generalise the claim to "not while a run of this id is in flight".
+            *(2026-09-17)* Done: the scheduler loop takes an `InFlightClaim` per task id before
+            spawning and releases it (RAII) only after the run's state is settled, replacing the
+            one-shot-only `enabled = false` claim with one mechanism for every task type. Measured
+            with the claim bypassed: a 100ms recurring job on a 10ms tick ran **11 copies at once**
+            and a slow one-shot fired **8 times**; with it, peak concurrency 1 and exactly one fire.
+            The daemon's `dream_in_flight` latch stays — it also guards `run_now`, which does not go
+            through the loop. Cron-scheduled user jobs and the 5-min recurrence sweep are covered by
+            the same claim.
 - [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
       All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
       confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's
@@ -4423,11 +4556,122 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       real daemon (`tool="grim" executable="/usr/bin/grim"`, and the boot left the screenshot
       directory empty) and the pixel path was not exercised. A capture is one command; someone's
       screen is not test fixture.
-- [ ] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
+- [~] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
       constructed nowhere and nanna-config has no `[mcp]` section. Add config + daemon boot registration +
       bearer/OAuth headers on HttpTransport (currently none) + Streamable HTTP (pinned to 2024-11-05 legacy
       SSE). Unlocks the whole connector ecosystem (calendar, email, home automation) — highest-leverage
       integration path for a personal daemon.
+      *(2026-09-17) The stdio half landed, and it found a bug that would have broken every turn.*
+      `[[mcp.servers]] {name, command, args, enabled}` in `nanna-config` (bounded at 16 servers —
+      each is a child process, ~50–100 MB for the common Node ones; blank/duplicate/over-limit
+      entries are named in the log, not started). The daemon starts them **in the background** after
+      the skill registry is built (`mcp_startup.rs`), so a first-run `npx -y` download cannot hold
+      readiness hostage, and shuts them down on the shutdown broadcast. **The latent bug:** MCP tools
+      registered as `server:tool`, and both Anthropic and OpenAI validate tool names against
+      `^[a-zA-Z0-9_-]{1,64}$` — a `:` rejects the WHOLE request, so the first MCP tool anyone
+      configured would have failed every turn. Now `mcp__{server}__{tool}`, sanitized, and hashed
+      past 64 characters so two long names sharing a prefix stay distinct. No `env` table on purpose:
+      secrets left `config.toml` in P1, and a server inherits the daemon's environment.
+      Verified on the real debug daemon with a stdio fixture server (Python, scratch config): tool
+      listed as `mcp__fixture__shout`, `tool.execute` returned `HELLO FROM NANNA`, a nonexistent
+      command and a duplicate name each logged and skipped while the good server started, and on
+      SIGTERM the daemon exited `clean_shutdown` with the fixture child reaped. Not verified: a
+      model actually choosing the tool (no model on this host), and a real `npx` server.
+      - [ ] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
+            "legacy" client, and the current spec cannot talk to it.** MCP's current revision is
+            **`2026-07-28`**, which removes the `initialize` handshake: every request carries
+            `_meta["io.modelcontextprotocol/protocolVersion"]`, servers MUST implement
+            `server/discover`, and server-to-client requests become `InputRequiredResult` replies
+            (multi-round-trip). nanna-mcp pins `2024-11-05` and opens with `initialize`. Per the
+            spec's compatibility matrix, **legacy client × modern-only server = fails** ("legacy
+            clients have no fall-forward mechanism"); only dual-era servers still answer
+            `initialize`. The stdio startup landed today reports such a failure honestly
+            (`mcp_servers` → `failed` with the server's error, doctor/GUI too), but it will be the
+            common case as servers move. The fix is a **dual-era client**: on stdio, probe with
+            `server/discover` carrying the preferred modern version in `_meta`; a `DiscoverResult`
+            or a recognized modern error (`UnsupportedProtocolVersionError`, code `-32022`, with a
+            `supported` list) means modern — never fall back then; any other error or a timeout
+            means legacy → `initialize`. Cache the era per server process. On Streamable HTTP,
+            send a modern request and inspect a `400` body before falling back. Build the modern
+            path against a real modern server (the reference SDKs' "everything" server), not only a
+            hand-written fixture — a fixture written from the same reading of the spec cannot catch
+            a misreading. Sources:
+            [versioning](https://modelcontextprotocol.io/specification/versioning),
+            [2026-07-28 compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+            [stdio backward compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio).
+      - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
+            speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
+            keyring (not `config.toml`), then Streamable HTTP.
+            *(2026-09-17, found while scoping this)* **`HttpTransport::connect` had undefined
+            behaviour.** It gave its SSE task a raw pointer to `transport.connected`, a field of a
+            local that `Ok(transport)` then moved — every later connect/disconnect write went
+            through a dangling pointer (the "safety" comment relied on the shutdown channel, which
+            does not stop the task while a stream is open). No caller yet, which is the only reason
+            it never bit. Fixed with an `Arc<AtomicBool>` and the `unsafe` removed; a test with a
+            local SSE server that answers *after* `connect` returns fails on the old code and passes
+            on the new (5/5 reruns). The flag is still write-only — nothing reads it — and the
+            transport is the deprecated 2024-11-05 HTTP+SSE one, so this item remains a rewrite, not
+            a config wiring job.
+            *(research 2026-09-17 — what the rewrite targets)* **Streamable HTTP as of `2026-07-28`**
+            is much simpler than the 2025 shape: one MCP endpoint, **every** JSON-RPC message its own
+            `POST` with `Accept: application/json, text/event-stream`; each request answered by a
+            JSON object **or** an SSE stream scoped to that request (progress/log notifications, then
+            the response); **no sessions** (`Mcp-Session-Id` gone), **no GET stream**, no
+            `Last-Event-ID` resumption; cancellation = closing that request's stream (no
+            `notifications/cancelled`). Required headers mirror the body: `MCP-Protocol-Version`
+            (must equal `_meta["io.modelcontextprotocol/protocolVersion"]`), `Mcp-Method`, and
+            `Mcp-Name` for `tools/call`/`resources/read`/`prompts/get` (Base64 sentinel
+            `=?base64?…?=` for non-header-safe values); mismatches are `400` + `-32020`
+            `HeaderMismatch`. **Clients MUST mirror `x-mcp-header`-annotated tool parameters into
+            `Mcp-Param-{Name}` headers and MUST drop tools whose annotations are invalid** — a
+            requirement nanna-mcp's schema guard should enforce at `tools/list`. Server-to-client
+            asks arrive as `InputRequiredResult` (retry with `inputResponses`), and change
+            notifications only via a `subscriptions/listen` stream. Era detection: send a modern
+            request; on `400`/`404`/`405` inspect the body — a recognized modern JSON-RPC error means
+            modern (retry with the advertised versions), otherwise fall back to `initialize`
+            (2025-era Streamable HTTP) or, failing a POST, `GET` for the legacy `endpoint` event.
+            Consequence for this item: build the modern POST client first and keep the SSE transport
+            only as the last fallback — or drop it, since it is deprecated and eligible for removal.
+            Source: [Streamable HTTP, 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+      - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
+            need a token, so a GitHub/Calendar server does not require exporting the token into the
+            daemon's own environment (where every `exec` child also inherits it).
+            *(2026-09-17)* `secret_env = ["VAR", …]` names the variables; values live in the secure
+            store under `mcp.<server>.<VAR>`, set by `nanna mcp secret set|delete <server> <VAR>`
+            (hidden prompt, or stdin when piped — never argv, which `ps` shows). All-or-nothing per
+            server: a missing, blank, repeated or malformed name refuses that server with the exact
+            command to fix it, under the server's own name in `system.status`; the others start, and a
+            config without `secret_env` never touches the keyring at boot. The CLI notes when a stored
+            secret is not listed by any server. Tests: resolver, name rules, startup refusal, CLI
+            target/wiring notes. **Real daemon:** fixture server started, the one missing its token
+            reported `not_started` with `nanna mcp secret set needs_token …`; the real CLI refused
+            `BAD-NAME`. Not exercised: a stored value reaching a child — that needs a write to the
+            operator's keyring, which a nightly run does not do. `nanna doctor`'s `mcp.servers` check
+            fails the same way (real CLI against the smoke config: `[FAIL]` naming the set command,
+            exit 1), never printing a value.
+      - [x] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
+            server as started / failed-with-reason; today that lives only in the boot log.
+            *(2026-09-17)* `nanna doctor` half done: an offline `mcp.servers` check judges the
+            config the way the daemon will start it — FAIL when a command is not on `PATH` (or an
+            absolute `command` is not an executable file), naming the server and noting the daemon's
+            PATH can differ from the shell's; WARN for entries the daemon will skip (blank,
+            duplicate, over the limit); OK listing what will start. Nothing is spawned. Verified on
+            the real CLI against the smoke config: `[FAIL] mcp.servers 'broken' runs
+            /nonexistent/mcp-server, which is not an executable file; also not started: … 'fixture'
+            is used twice`. Still open: live per-server state (started / handshake failed) over IPC
+            and on the GUI Tools page.
+            *(2026-09-17, later)* **IPC half done:** `system.status` now carries `mcp_servers` —
+            each configured server as `starting` / `started` (with its tool count) / `failed` (with
+            the spawn or handshake error) / `not_started` (with the config reason).
+            `McpIntegration::start_all` returns per-server outcomes instead of swallowing failures
+            into a log line. Verified on the debug daemon with the fixture config: `fixture` started
+            with 1 tool, `broken` failed with `No such file or directory (os error 2)`, the duplicate
+            reported not_started. Remaining: render it on the GUI Tools page.
+            *(2026-09-17, later still)* **GUI half done:** `get_mcp_servers` (Tauri) reads the field,
+            `lib/mcpServers.ts` validates it (malformed entries dropped, never throws), and
+            `McpServerList` shows each server with a state dot and its tool count or failure reason
+            on the Tools landing panel (hidden when none are configured). 6 vitest incl. the exact
+            payload captured from the live daemon. Not WebDriver-verified (Linux harness blocked).
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.
@@ -4436,18 +4680,36 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
 restriction rails — "nanna is a god, it's her call what she wants to do." The original "safety & trust" group
 is dissolved; what stays below is only what protects Nanna's own work and keeps her agency HERS — none of it
 asks permission or restricts her.)*:
-- [ ] **Clarifying questions across channels** (owner-requested 2026-07-24: "nanna should be able to ask
+- [x] **Clarifying questions across channels** (owner-requested 2026-07-24: "nanna should be able to ask
       clarifying questions") — an `ask_user` tool Nanna calls when SHE judges a request ambiguous: the
       question reaches the user's active channel (GUI, Telegram, …), the task parks in the P15 blocked state,
       and the run resumes when the answer arrives. Sub-agents already have exactly this shape toward their
       parent (`ask_parent`, crates/nanna-tools/src/builtin/ask_parent.rs) — the user-facing analog is the
       missing piece. Her choice to ask, about intent — never a required checkpoint before acting.
-- [ ] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
+      *(2026-09-17) Landed as an `ask_user` skill over `session.ask_user`, with no new plumbing into
+      the agent loop.* The question is appended to the conversation and announced with
+      `session_message_added`, so it shows in an open GUI chat and — via the channel reply forwarder
+      from the same run — arrives in Telegram/Discord/Slack. The answer is **the user's next message
+      to the live turn**: while a turn runs, `chat.send` already queues a new message for the run
+      (`PendingMessages`); `ask_user` waits on that queue, drains what arrives (so it is not also
+      interjected) and returns it as the tool result, and the turn continues with it. Bounded: waits
+      `wait_secs` (default 600, max 1800 = the scheduler's default check-in period), then says no
+      reply came yet and to proceed on best judgement — a later reply is still admitted into the run.
+      With no live turn it posts and returns at once, saying the answer will start a new turn.
+      Deviation from the sketch above, deliberately: no P15 "blocked" park — waiting inside the tool
+      call keeps the run's context and plan intact with zero harness changes, and the model is never
+      stranded because the wait is bounded. Verified: 4 service tests against the real
+      `ChatRunRegistry` (answer consumed from the queue after 300 ms, no-live-turn returns
+      immediately, unanswered wait ends and says so, unknown session refused) and on the real daemon
+      (skill → service → persisted question + `session_message_added`, no model calls). **Not
+      verified:** a model choosing to ask, and a reply arriving mid-turn end to end — both need a
+      live turn.
+- [x] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
-      - [ ] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
-            already ships, in the wrong place.** `write_file` parks the outgoing version at
+      - [x] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
+            already ships, in the wrong place.** *(Implemented 2026-09-17 — see the note below.)* `write_file` parks the outgoing version at
             `<file>.__prev__` (ONE slot, overwritten each write) plus the richest earlier version
             at `<file>.__best__` — both *inside the user's tree*, and `edit_file` parks nothing.
             Claude Code's checkpointing is the shape to copy: a copy of each file taken *before*
@@ -4459,6 +4721,40 @@ asks permission or restricts her.)*:
             data dir's budget, not a magic count; per-session store under the daemon data dir
             keeps user repos free of `.__prev__` litter.
             Source: [Claude Code checkpointing guide](https://thepromptshelf.dev/blog/claude-code-checkpointing-rewind-guide-2026/).
+      *(2026-09-17) File-state checkpointing landed, at the one chokepoint every script write
+      shares.* `nanna_scripting::file_history` snapshots a file's bytes (or its absence) inside
+      `NannaBridge::write_file`, before the write, into `{data_dir}/file-history/<session>/` — so
+      `write_file`, `edit_file`, `file_buffer` and user-authored tools are all covered by
+      construction, and nothing lands in the user's tree. Bounds, each stated with its reason in
+      the module: 100 recent checkpoints per session (Claude Code's number) + each file's first
+      checkpoint kept as a baseline (≤400), 256 MiB per session, **1 GiB across all sessions**
+      (least recently written sessions pruned when a new one starts — per-session bounds alone grow
+      with session count), files over 8 MiB not snapshotted (logged). Identical content is not
+      re-snapshotted; a snapshot failure never blocks the write. `files.history` / `files.restore`
+      services + a `file_history` skill let Nanna list and restore her own writes; a restore
+      snapshots the current state first, so it is undoable; restoring a creation removes the file.
+      **Found on the real daemon, not in tests:** one `write_file` produced three checkpoints, two of
+      them the skills' own `.nanna/write_hiwater.json`/`read_marks.json` bookkeeping — now excluded
+      with the `.__prev__`/`.__best__` parks. Verified over IPC (write → destructive overwrite →
+      edit → list → restore → file byte-identical to the original; unknown checkpoint refused by
+      name). 8 store/service tests incl. eviction order and cross-session pruning.
+      - [ ] **Retire the in-tree `.__prev__`/`.__best__` parks** now that an out-of-tree history
+            exists — but `write_file`'s verdict sentences and P22 Tier 3 recovery guidance name
+            those files to the model, so it is a coordinated change to the skill's messages, not a
+            deletion; measure on a mission leg before and after.
+      - [x] **GUI rewind** — list a session's checkpoints in the run timeline and restore one with
+            a click (the services exist; needs an IPC verb pair and a view).
+            *(2026-09-17)* IPC `session.file_history {id, path?, limit?}` and
+            `session.restore_file {id, checkpoint}` share the exact functions the `file_history`
+            skill's services use, so the GUI and the model can never disagree about what exists.
+            The chat header gains a **Files** button: a panel of this chat's checkpoints (file name,
+            size or "new file"), each with Restore behind a confirmation that says what will happen
+            ("put plan.md back to its 62-byte version" / "remove plan.md (a tool created it)").
+            Verified the verbs on the real daemon (write → clobber → list → restore → file
+            byte-identical; another session sees nothing; unknown checkpoint refused by name) and
+            the panel with 4 vitest (parser, wording, restore sends the clicked checkpoint of the
+            open chat only after confirming). Placed in the header rather than the run timeline —
+            the timeline is per message, and a restore is per chat. Not WebDriver-verified.
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
@@ -4496,12 +4792,81 @@ asks permission or restricts her.)*:
 - [ ] **File/log monitors** — no watcher anywhere wakes the agent; best latency today is the heartbeat.
       Watcher → agent-prompt (reusing scheduler/executor plumbing): a download landing, a build log erroring,
       a folder changing are the daemon's native senses.
-- [ ] **Detached sub-agents with channel notifications** — the chat task tool blocks the parent turn, and
+- [~] **Detached sub-agents with channel notifications** — the chat task tool blocks the parent turn, and
       scheduled-task channel routing is a warn-"not implemented" (server.rs:1242). "Do X" from Telegram then
       walk away requires fire-and-forget spawn + completion that reaches the channel, not just GUI clients.
-- [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
+      *(2026-09-17) The scheduled-task half is done.* `scheduler.add` takes an optional `session_id`
+      (refused if the conversation does not exist) stored as the job's `target_session`, and after
+      each run the executor posts the result into that conversation through the one
+      daemon-originated-message path (`SessionManager::post_assistant_message`, now shared by
+      reminders, `ask_user` and scheduled jobs): persisted, announced, and forwarded to the chat
+      app when it is a channel conversation. A quiet heartbeat (`HEARTBEAT_OK`) or an empty result
+      posts nothing. The "channel routing is not implemented" warning is gone. 2 tests (pure
+      message rule; add refuses a missing session and stores a real one). The prompt run itself
+      needs a model, so the post-run delivery was not exercised live. Remaining: fire-and-forget
+      sub-agent spawn whose completion posts the same way.
+- [~] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
+      *(2026-09-17)* Inspect and stop landed as chat commands: `/status` (is a turn running here,
+      can anything answer) and **`/stop`**, which cancels this chat's turn through the same arm as
+      IPC `chat.cancel` and says whether anything was running. A message sent mid-run already joins
+      the run (interjection). "Approve" stays out — no approval gates by owner decision.
+      *(2026-09-17)* **`/new`** starts a chat over: a channel conversation is one fixed session
+      per chat, so before this a Telegram user could never leave a long, confused history. It
+      empties the messages, drops a provider-outage park (or it would resume into the empty
+      conversation), keeps the model pin, reply route and reminders, and is **refused while a
+      turn runs** ("Send /stop first") — test mutation-checked.
+      *(2026-09-17)* **"typing…" while a turn runs.** `Channel::send_typing` was implemented for
+      Telegram and Discord and called by nothing, so a chat user saw silence from sending a message
+      until a reply minutes later. The reply forwarder now re-sends it on the turn's own events
+      (start, deltas, tools, liveness beats) at most every 4 s per session — Telegram's action lasts
+      5 s, Discord's 10 s — and stops at `message_end`; no timers, the throttle map holds only
+      sessions mid-turn. Test: one typing for a burst of deltas, none for a GUI session
+      (mutation-checked: unthrottled it fails). No live bot. Same day, the gap it left — a silent
+      tool call longer than 5 s let Telegram's indicator lapse, since beats are 30 s — closed: a
+      4 s tick refreshes every mid-turn session, and a session with no event for two beat intervals
+      (60 s; a live turn always beats) is dropped, so a crashed turn cannot show "typing…" forever.
+      Paused-time test over 10 s of silence and a dead turn; both halves mutation-checked.
+      Found in self-review before the PR: the first version awaited each typing call inside the
+      reply forwarder, so a provider outage (30 s client timeout per call) would let the forwarder
+      fall behind the event bus and **skip a `message_end` — a lost reply** to save an indicator.
+      Typing sends are detached tasks now (≤ one per session per 4 s, each ending at that timeout).
+      Cost: a typing call can land just after the reply, showing "typing…" for up to 5 s after
+      the answer on Telegram.
+      - [x] *(found in the same review)* **The reply send itself is still awaited inside the
+            forwarder.** The event bus holds 1000 events (`ipc.rs`); a turn streams a delta per
+            chunk, so while one chat's reply send sits in a 30 s provider timeout, another session's
+            long streamed turn can overrun the buffer and its `message_end` is skipped (`Lagged`
+            is only logged). Not changed tonight because replies are order-sensitive per chat (a
+            reminder vs. an answer). Shape: a per-route FIFO task (bounded queue, spawned on first
+            reply, idle-exits), so sends stay ordered within a chat and never block the bus reader.
+            *(same night)* Done in that shape: `spawn_reply_outbox`, queue bound
+            `REMINDERS_PENDING_MAX + 2` (every reminder of one chat coming due during an outage, plus
+            the turn's answer and one `ask_user` question), 60 s idle exit with respawn on the next
+            reply, a full queue drops with an error log and a `send_failed` count. Test: chat A's
+            send hangs while chat B's turn streams 64 events into a 16-slot bus — B's answer arrives
+            and A's is sent once released; **against the previous forwarder the same test loses B's
+            reply** (`[]`). 5/5 reruns.
+      - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
+            now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
+            calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview
+            that disappears when the bot sends the real message with `sendMessage`), and Bot API
+            10.3 (2026-08-24) added `can_stop`/`keep_on_stop`, a user-facing stop button that maps
+            directly onto `/stop`. Sketch: throttle `MessageDelta`s per session into draft updates
+            (text so far, tail-truncated to 4096 with a marker), keep `sendMessage` at `message_end`
+            as today; groups keep "typing…". The stop press arrives as an Update with a
+            `stopped_message_generation` field — the listener must add it to `allowed_updates` and
+            route it to the same arm as `/stop`; `keep_on_stop` only keeps the draft briefly, so a
+            stopped answer should be sent as a real message if it is to stay. Open: whether the ~30 s
+            lifetime needs a refresh during long tool calls, and the update's exact payload (not
+            confirmed in the docs read). Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
+            [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft),
+            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html). Follow-up the same day: a clear —
+      `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
+      `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
+      daemon instead of showing a conversation the next turn no longer sees (daemon event test,
+      Tauri parse test, 2 vitest; not WebDriver-verified).
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.
@@ -4704,9 +5069,18 @@ asks permission or restricts her.)*:
             `apply_chat_model_override` moves exactly the chat model on the per-turn config clone
             — never the shared service config, so sub-agents, summarization and other sessions
             are untouched (pinned by `a_chat_model_pick_moves_exactly_two_fields`).
-      - [ ] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
+      - [x] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
             user still cannot say "use the big model for this conversation" — a `/model <name>`
             channel command over the same `session.set_model` verb would close it.
+            *(2026-09-17)* Done in `ChannelManager::process_message`, ahead of the turn: `/model`
+            shows the pin, `/model <spec>` pins, `/model default|reset|clear` unpins, and anything
+            with more than one word changes nothing and says how to use it. Exact command word
+            (`/models` is a message) and Telegram's `/model@Bot` group form. Same store as the GUI
+            picker (`set_chat_model`); the pin is kept even when no provider can serve it — the
+            turn remains the place that decides — but the reply then says so instead of claiming it
+            will run. A command is never sent to the model and never becomes a session message.
+            4 tests (parser, reply wording both ways, pin → show → clear → usage end to end through
+            a recording channel). Needed the channel-reply fix from the same run to be reachable at all.
 - [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
       restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
       (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
@@ -4751,9 +5125,32 @@ asks permission or restricts her.)*:
       `Usage` + `MessageStartUsage`, carry it through `StreamEvent::MessageStart` and
       `RequestObservation`, keep a separate 1h total in `model_stats`, and price the two parts
       separately.
-- [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
+- [~] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
       cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
       visibility more than a per-terminal-session number.
+      *(2026-09-17) Day/month rollups landed — after finding the table they need was never written.*
+      `model_request_log` (migration 006) had a `Storage::log_model_request` and **no caller anywhere**,
+      so there was no per-request history to split into days. `ModelStatsTracker` now takes a set-once
+      request sink, and the daemon's sink writes every observation (spawned, never blocking the
+      request path). Migration 016 adds the per-request 1-hour cache-write share so a day prices
+      exactly as the lifetime totals do. `Storage::model_usage_buckets(days, by_month)` sums per
+      `YYYY-MM-DD` / `YYYY-MM` and model (window clamped to 366 days), and IPC
+      `system.cost_rollup {days?, by?: day|month}` prices each bucket from the reference table —
+      unknown/local models reported **unpriced and named**, never $0, so the total is labelled a
+      floor. Tests: storage rollup against real Turso with backdated rows (day and month grouping,
+      window, clamp), sink fan-out across tracker clones, pricing/unpriced rule; the verb answered
+      live on the debug daemon (empty log, invalid `by` refused). **Still open:** GUI surfacing, and
+      the spend **cap**, which is a gate and therefore an owner call under the no-gates rule.
+      *(later the same day)* **Per-session rollups landed** without touching the agent loop: the sink
+      fires synchronously inside the run's own future, so `ToolRegistry::run_session_id()` (a new
+      registry-free read of the run-scoped task-local) names the conversation before the write is
+      spawned. `system.cost_rollup {by: "session"}` groups by it (an empty label = requests made
+      outside any conversation). Tests: the task-local is readable in a callback inside the run and
+      not across `spawn`; the storage rollup groups the logged rows under their session.
+      *(and)* **GUI surfacing:** the Model Stats page shows **Spend by day** for the last 30 days
+      (`get_cost_rollup` → `lib/costRollup.ts`): per-day totals newest first, a day that used an
+      unpriced model marked `+` (a floor, with a tooltip saying so), and the unpriced models named.
+      Hidden when the daemon has no log yet. 3 vitest; not WebDriver-verified.
 - [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.
@@ -4769,8 +5166,13 @@ asks permission or restricts her.)*:
       `nanna export <id> [-f md|json] [-o file-or-dir]`, stdout by default; the daemon's
       suggested filename is a bounded ASCII slug and only its last component is ever joined
       onto a directory. An unknown id is refused, not exported empty. `PRIVACY.md` updated.
-      - [ ] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
+      - [x] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
             session menu, verified over WebDriver once `WebKitWebDriver` exists on the host.
+            *(2026-09-17)* Session menu → **Export Markdown / Export JSON**. The `export_session`
+            Tauri command has the daemon render the document, then opens the save dialog **from
+            Rust** and writes there — the destination never comes from the webview, so the command
+            is not a write-anywhere surface. Cancel → nothing written, no toast; success names the
+            path. 1 vitest + 1 Rust test; still not WebDriver-verified.
       - [x] **Memory export** — the same shape for the memory store (FSRS state included).
             *(2026-09-11 — shipped.)* `memory.export {scope, format}`, rendered by the daemon;
             `nanna export --memories [--scope global|<workspace>]`. Each memory carries
@@ -5121,9 +5523,14 @@ lfm2.5 2/42.** What the series surfaced and fixed:
       staging debris beside the specs). Lock the dir for future series.
 - [ ] **GUI stale pane on workspace switch** — selecting a workspace keeps rendering the previous
       session's chat until a new chat is created.
-- [ ] **Killed runs orphan `llama-server`** — holds GB of VRAM invisibly (`ollama ps` stops listing
+- [x] **Killed runs orphan `llama-server`** — holds GB of VRAM invisibly (`ollama ps` stops listing
       it; `keep_alive=0` doesn't reclaim it); wrote off gemma for a day. Sweep by process name
       before sizing anything.
+      *(ticked 2026-09-17 — the fix shipped 2026-08-10 in PR #206 and this box was never closed.)*
+      The leak was the restart heal killing only `ollama.exe`: `restart_ollama_server`
+      (`nanna-daemon/src/tasks.rs`) now takes the whole tree (`taskkill /F /T`) and then sweeps
+      `llama-server` by image name (`pkill -x` off Windows), which cannot hit a live server's runner
+      because every server is dead at that point.
 
 ---
 
@@ -5728,10 +6135,21 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       the only thing `expect` added was a second panic that destroys the record exactly
       when it is most wanted. New test poisons the mutex from a real panicking thread and
       asserts the earlier entry survives AND a later write still lands.
-- [ ] **No lift path for a declared file invariant**: once registered, a prohibition
+- [x] **No lift path for a declared file invariant**: once registered, a prohibition
       stands until the registry file is removed. "You can edit tests/ now" is exactly
       the permissive phrasing a conservative extractor must not act on, so lifting
       needs its own deliberate, `ask_user`-confirmed shape.
+      *(2026-09-17)* That shape, now that `ask_user` exists: a `lift_invariant` skill over an
+      `invariants.lift` service. It quotes the user's own sentence back ("You said: \"don't touch
+      tests/\" … Reply \"yes\" to lift it"), waits on the live turn like `ask_user`, and removes
+      every rule on that glob only for an **explicit yes** (`is_explicit_yes`: must start with a yes
+      word, no negation anywhere — "yes but not tests/unit", "wait, yes", "keep it" all keep the
+      rule). The registry travels as text through the script bridge both ways, so the rule lifted
+      is the one `write_file`'s guard enforces — **the first version resolved the path in the
+      service and found a different file, caught only by driving the real daemon.** The
+      `write_file`/`edit_file` refusals now name `lift_invariant` (skills bumped 0.1.17 / 0.1.11).
+      Tests: yes/no classifier, glob-exact removal, a live-registry service test for yes and a
+      hedged yes; real daemon: question posted quoting the sentence, rule untouched without a reply.
 - [ ] **Evidence hashing is anchored at run start, not at task-write time**: the
       repository layer has no workspace root to resolve a relative acceptance path,
       so the hash baseline is taken where the workdir is known instead.
@@ -6430,6 +6848,36 @@ keep the phases readable; promote individual items into a phase when they become
       probe then repeated on a clean 30s cadence with a fresh client UUID each time. Shutdown was clean
       (`nanna-daemon.exit.json` → `"reason": "clean_shutdown"`).
 
+- [~] *(found 2026-09-17)* **The GUI calls `std::env::set_var` from async Tauri commands.**
+      `set_provider_api_key` sets `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/… in the GUI process "for this
+      session", under `unsafe` blocks whose note says "single-threaded application context" — Tauri runs
+      commands on a multi-threaded tokio runtime, and glibc `setenv` racing any concurrent `getenv` is
+      the undefined behaviour Rust 2024 made `set_var` unsafe for. The GUI reads those vars back in ~15
+      places (key-set badges, model listing fallbacks). The fix is to read keys from `AppState.config`
+      (already hydrated from the keyring) and drop the env writes, not to add a lock.
+      Same day: the legacy `set_api_key` command was deleted — no frontend caller, and it lost the key
+      (`save()` strips secrets and it never wrote the keyring) while logging "API key updated".
+      *(same day)* The five API keys no longer go through `set_var`: `set_provider_api_key` writes the
+      secure store and the GUI reads `config` (refilled from it). That also fixed a restart bug —
+      `get_openai_models` and the Brave "key set" badge read **only** env, so a stored key vanished
+      from them after the GUI restarted. `OLLAMA_HOST`'s `set_var` was dead too (nothing in the GUI process reads it) and is gone. Still on
+      `set_var`: the Claude proxy
+      URL/flag — which turned out to be **a setting nothing consumes**: no crate reads
+      `CLAUDE_PROXY_ENABLED`/`CLAUDE_PROXY_URL`, so the Settings → Models "Claude Proxy" toggle changes
+      the GUI's own environment, drives its health check, and routes no request through the proxy
+      (it is also forgotten on restart). **Owner decision:** wire it into the router as a provider, or
+      remove the toggle — not guessed at in a nightly run. Precedence note: an `OPENAI_API_KEY`
+      exported before launch now wins over a key typed into Settings in the GUI process, as it
+      already did in the daemon (`load_secrets_from_store` prefers env).
+- [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
+      neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
+      `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system
+      libraries (`unknown type [0x13] section .relr.dyn` — DT_RELR, newer than that binutils);
+      `NO_STRIP=true` gets past it. (2) The GTK plugin then dies copying
+      `/usr/lib/gdk-pixbuf-2.0/2.10.0`, a loader directory this host does not have. The 2026-09-14
+      AppImage failure was a different cause (tmpfs quota). The release workflow builds on its own
+      runner, so this blocks only local AppImage verification; fix by pointing the gtk plugin at the
+      host's actual pixbuf loader dir (or skipping it), or accept `.deb` as the local Linux check.
 - [x] *(2026-09-14)* **`XDG_DATA_HOME` + `NANNA_CONFIG_PATH` isolate the GUI on Linux** — the skill's
       smoke-run recipe is written for the daemon's `--data-dir`/`--port` flags, which the GUI binary
       does not take, and it notes that on Windows `%APPDATA%` cannot redirect settings because
@@ -6466,6 +6914,18 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
+      - [ ] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
+            **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
+            plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
+            Linux they drive WebKitGTK without any `WebKitWebDriver` binary — which removes the
+            4.1-vs-6.0 ABI question entirely and needs no `sudo`. Default ports 4444 (the
+            intermediary) / 4445 (the plugin). The catch is that it is a dependency **compiled into
+            the app**, so the shape has to be a Cargo feature (e.g. `e2e-webdriver`) that CI and the
+            nightly enable and release bundles never do — a WebDriver port in a shipped build would
+            be a remote-control surface. Decide that shape, then point the shared harness at
+            `tauri-webdriver` instead of `tauri-driver`. Source:
+            [Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver),
+            crates.io `tauri-plugin-webdriver` / `tauri-webdriver`.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
@@ -7136,6 +7596,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **(b) A slow run cannot be cut short safely**, because killing a `cargo` mid-flight
            risks corrupting the shared target dir. It has to be waited out.
            Fix: stagger the schedules, or have each routine take a shared cross-repo lock and defer.
+   - *(2026-09-17 sweep)* `cargo update` -> 19 compatible bumps (`aegis 0.9.16`, `syn 3.0.6`,
+     `unicode-ident 1.0.26`, `rustix 1.1.5`, `zlib-rs 0.6.8`, `derive-where 1.7.0`, ...; `synstructure`
+     dropped out of the tree). `cargo upgrade --incompatible` offered **one real row** -
+     `deno_core 0.411 -> 0.412` (published 2026-09-16, pulls `serde_v8 0.321` / `v8` bindings forward),
+     applied, compiled unchanged - plus the two standing downgrade traps (`criterion -> "0.7"`,
+     `lopdf -> "0.42"`), rejected. Both guarded pins fired exactly as documented and were put back
+     as the LAST lockfile step (`libc 0.2.189 -> 0.2.186`; `malachite-bigint@0.11.0 -> 0.9.2`, which
+     removed the `malachite-{base,nz} 0.11.0` it dragged in); rustpython re-checked on crates.io, still
+     `0.5.0`. Gate: 2025 tests / 0 failed, clippy 0 errors, `cargo build --release -p nanna-daemon`
+     green.
+     GUI: `vue 3.5.43`, `@lucide/vue 1.47.0`, `@vue/test-utils 2.5.1`. **`@vueuse/core` was a dead
+     direct dependency and is removed rather than majored 14 -> 15** - no file under `gui/` imports it
+     (the only consumer is `radix-vue`, which carries its own pinned `@vueuse/core 10.11.1`), the same
+     class as the `@formkit/drag-and-drop` removal. Typecheck 0 errors (canary proved), 251/251
+     vitest, `pnpm build` green. TypeScript 7 not re-tried: npm `typescript` is still 7.0.2 and
+     `vue-tsc` still 3.3.11, the two numbers the 2026-09-09 note says to check first.
+   - *(research 2026-09-17)* **Correction to the 2026-09-14 note below: `burn 0.22.0` is NOT a shipped
+     release.** crates.io on 2026-09-17: `max_stable_version` **0.21.0**, newest `0.22.0-pre.3`
+     (2026-08-25); `cubecl` likewise `0.10.0` stable / `0.11.0-pre.3`. The LibTorch deprecation is on
+     the 0.22 pre-release line. Mummu's port target is a pre-release, which matters for any exact pin.
+   - [ ] *(research 2026-09-17)* **Tauri 3.0.0-alpha.1 is published (crate + CLI, 2026-09-15), and its
+     headline change bears directly on this host's GUI-verification blocker.** v3 selects the webview
+     runtime when building the app (`tauri::Builder::runtime(tauri_runtime_cef::Cef::default())`)
+     instead of through `wry`/`cef` Cargo features, makes GTK generation explicit (`gtk3`/`gtk4`
+     features), moves runtime-specific APIs to extension traits (`AppHandleWryExt`), and switches the
+     Linux tray to `ksni` (drops `libappindicator`). A **CEF (Chromium) runtime** is the first route to a
+     Linux GUI that `chromedriver` can drive, sidestepping the WebKitGTK 4.1-vs-6.0 `WebKitWebDriver` ABI
+     question entirely - and `gtk4` is the generation `webkitgtk-6.0` (the package that DOES ship the
+     driver) belongs to. Alpha: do not migrate; re-evaluate at the first 3.0 RC, and when doing so
+     measure the bundle-size cost of shipping CEF before treating it as the fix.
+     Sources: [tauri-v3.0.0-alpha.0](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.0),
+     [tauri-v3.0.0-alpha.1](https://github.com/tauri-apps/tauri/releases/tag/tauri-v3.0.0-alpha.1).
    - *(2026-09-15 sweep)* `cargo update` -> 14 compatible bumps (`clap 4.6.7` + builder/derive/lex,
      `async-compression 0.4.47`, `compression-codecs 0.4.42`, `camino 1.2.6`, `playwright-rs 0.18.1`,
      `rustls 0.23.45`, `wide 1.7.1`). Both guarded pins fired again and were pinned back with the

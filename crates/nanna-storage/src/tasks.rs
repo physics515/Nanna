@@ -1832,11 +1832,7 @@ pub fn merge_declared_invariants(
     existing_json: &str,
     fresh: &[DeclaredInvariant],
 ) -> Option<String> {
-    let mut merged: Vec<DeclaredInvariant> = serde_json::from_str::<serde_json::Value>(existing_json)
-        .ok()
-        .and_then(|v| v.get("invariants").cloned())
-        .and_then(|v| serde_json::from_value::<Vec<DeclaredInvariant>>(v).ok())
-        .unwrap_or_default();
+    let mut merged: Vec<DeclaredInvariant> = parse_declared_invariants(existing_json);
     let mut added = 0usize;
     for invariant in fresh {
         if merged
@@ -1856,6 +1852,71 @@ pub fn merge_declared_invariants(
         "invariants": merged,
     }))
     .ok()
+}
+
+/// The registry's invariants whose glob is `glob` (trailing `/` ignored). Pure.
+#[must_use]
+pub fn declared_invariants_for(existing_json: &str, glob: &str) -> Vec<DeclaredInvariant> {
+    let wanted = glob.trim().trim_end_matches('/');
+    parse_declared_invariants(existing_json)
+        .into_iter()
+        .filter(|inv| !wanted.is_empty() && inv.glob.trim_end_matches('/') == wanted)
+        .collect()
+}
+
+fn parse_declared_invariants(existing_json: &str) -> Vec<DeclaredInvariant> {
+    serde_json::from_str::<serde_json::Value>(existing_json)
+        .ok()
+        .and_then(|v| v.get("invariants").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<DeclaredInvariant>>(v).ok())
+        .unwrap_or_default()
+}
+
+/// The registry with every invariant on `glob` removed, or `None` when none
+/// matched. Pure. Lifting is the user's act, so the caller must already hold
+/// their explicit yes (see [`is_explicit_yes`]).
+#[must_use]
+pub fn lift_declared_invariants(existing_json: &str, glob: &str) -> Option<String> {
+    let wanted = glob.trim().trim_end_matches('/');
+    let all = parse_declared_invariants(existing_json);
+    let kept: Vec<&DeclaredInvariant> = all
+        .iter()
+        .filter(|inv| wanted.is_empty() || inv.glob.trim_end_matches('/') != wanted)
+        .collect();
+    if kept.len() == all.len() {
+        return None;
+    }
+    debug_assert!(kept.len() < all.len());
+    serde_json::to_string_pretty(&serde_json::json!({
+        "version": DECLARED_INVARIANTS_VERSION,
+        "invariants": kept,
+    }))
+    .ok()
+}
+
+/// Whether a reply is an unambiguous yes. Pure.
+///
+/// Deliberately narrow — the same conservatism the extractor applies to
+/// declaring an invariant applies to lifting one. The reply must START with a
+/// yes word and carry no negation anywhere: "yes" and "sure, go ahead" lift;
+/// "yes but not tests/unit", "no", "not yet" and silence do not.
+#[must_use]
+pub fn is_explicit_yes(reply: &str) -> bool {
+    const YES: &[&str] = &[
+        "yes", "y", "yep", "yeah", "sure", "ok", "okay", "allow", "lift", "go",
+    ];
+    const NEGATIONS: &[&str] = &[
+        "no", "not", "don't", "dont", "never", "wait", "stop", "keep",
+    ];
+    let lowered = reply.trim().to_lowercase();
+    let words: Vec<&str> = lowered
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let Some(first) = words.first() else {
+        return false;
+    };
+    YES.contains(first) && !words.iter().any(|w| NEGATIONS.contains(w))
 }
 
 fn is_blocked(task: &Task, by_id: &HashMap<i64, &Task>) -> bool {
@@ -2065,6 +2126,59 @@ fn decode_task_row(row: &turso::Row) -> Result<Task, StorageError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_an_unambiguous_yes_lifts_a_declared_rule() {
+        for yes in ["yes", "Yes!", "  y", "sure, go ahead", "ok lift it", "yeah"] {
+            assert!(is_explicit_yes(yes), "{yes:?}");
+        }
+        for not_yes in [
+            "",
+            "no",
+            "not yet",
+            "yes but not tests/unit",
+            "keep it",
+            "maybe",
+            "wait, yes",
+            "don't",
+        ] {
+            assert!(!is_explicit_yes(not_yes), "{not_yes:?}");
+        }
+    }
+
+    #[test]
+    fn lifting_removes_exactly_the_rules_on_that_glob() {
+        let registry = serde_json::json!({
+            "version": 1,
+            "invariants": [
+                { "kind": "read_only", "glob": "tests/", "source": "don't touch tests/", "scope": "session" },
+                { "kind": "no_delete", "glob": "tests", "source": "never delete tests", "scope": "session" },
+                { "kind": "read_only", "glob": "spec.md", "source": "leave spec.md alone", "scope": "session" },
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            declared_invariants_for(&registry, "tests").len(),
+            2,
+            "trailing slash is the same rule"
+        );
+        let lifted = lift_declared_invariants(&registry, "tests/").expect("something lifted");
+        let remaining = declared_invariants_for(&lifted, "spec.md");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(declared_invariants_for(&lifted, "tests").len(), 0);
+        assert_eq!(
+            lift_declared_invariants(&lifted, "tests"),
+            None,
+            "nothing left to lift"
+        );
+        assert_eq!(lift_declared_invariants("not json", "tests"), None);
+        assert_eq!(
+            lift_declared_invariants(&registry, "  "),
+            None,
+            "an empty glob lifts nothing"
+        );
+    }
+
     use super::*;
     use crate::Storage;
 

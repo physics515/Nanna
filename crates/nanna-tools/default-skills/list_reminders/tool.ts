@@ -1,8 +1,8 @@
 export default {
   name: "list_reminders",
   requires: ["schedule.list"],
-  version: "0.1.0",
-  description: "List all active reminders showing their messages and remaining time.",
+  version: "0.2.0",
+  description: "List all pending reminders, soonest first, showing their messages and remaining time.",
   parameters: {
     type: "object",
     properties: {},
@@ -12,7 +12,7 @@ export default {
     try {
       var reminders = Nanna.service("schedule.list", {});
       if (!reminders || reminders.length === 0) {
-        return "No active reminders.";
+        return "No pending reminders.";
       }
 
       var lines = [];
@@ -25,9 +25,10 @@ export default {
         lines.push("[" + r.id + "] \"" + r.message + "\" - " + timeStr + " remaining");
       }
 
-      return "Active reminders (" + reminders.length + "):\n\n" + lines.join("\n");
+      return "Pending reminders (" + reminders.length + "):\n\n" + lines.join("\n");
     } catch (e) {
-      return "Error: Schedule service not available. " + e;
+      var msg = "" + (e && e.message ? e.message : e);
+      return { content: "list_reminders: " + msg, success: false };
     }
   }
 }

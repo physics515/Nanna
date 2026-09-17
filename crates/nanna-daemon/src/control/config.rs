@@ -34,6 +34,29 @@ impl ControlPlane {
     /// COMMITTED mutation (the in-memory config was replaced and the router
     /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
     /// error only means nobody is subscribed.
+    /// Make `new_config` the running configuration and push it everywhere a
+    /// live change must reach: the agent, the router, the scheduler loop, and
+    /// every client (`config_changed`).
+    ///
+    /// This is the reload the GUI triggers after saving a credential — the step
+    /// that makes a post-boot login actually reach the router. The Scheduler
+    /// tab rides the same hop, and so does a hand edit of `config.toml` (see
+    /// `config_watch`). What it does NOT re-apply is anything wired only at
+    /// boot (channels, MCP servers, the webhook server).
+    pub(super) async fn apply_loaded_config(&self, new_config: Config) {
+        let mut config = self.config.write().await;
+        *config = new_config;
+        info!("Config reloaded from disk");
+        if let Some(ref agent) = self.agent {
+            agent.apply_llm_config(&config.llm).await;
+        }
+        let snapshot = config.clone();
+        drop(config);
+        self.rebuild_llm_providers(&snapshot).await;
+        self.apply_scheduler_settings(&snapshot).await;
+        self.notify_config_changed();
+    }
+
     pub(super) fn notify_config_changed(&self) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(Event::ConfigChanged);
@@ -200,27 +223,7 @@ impl ControlPlane {
             ConfigAction::Reload => {
                 match Config::load() {
                     Ok(new_config) => {
-                        let mut config = self.config.write().await;
-                        *config = new_config.with_env_overrides();
-                        info!("Config reloaded from disk");
-
-                        // Propagate to agent service
-                        if let Some(ref agent) = self.agent {
-                            agent.apply_llm_config(&config.llm).await;
-                        }
-
-                        // This is the reload the GUI triggers after saving a
-                        // credential — the step that makes a post-boot login
-                        // actually reach the router. The Scheduler tab rides the
-                        // same hop: it saves to the shared config file and then
-                        // asks for a reload, which is what gets those toggles to
-                        // the running scheduler loop.
-                        let snapshot = config.clone();
-                        drop(config);
-                        self.rebuild_llm_providers(&snapshot).await;
-                        self.apply_scheduler_settings(&snapshot).await;
-                        self.notify_config_changed();
-
+                        self.apply_loaded_config(new_config.with_env_overrides()).await;
                         json!({ "status": "reloaded" })
                     }
                     Err(e) => json!({ "error": "reload_failed", "message": e.to_string() })

@@ -191,7 +191,15 @@ pub struct HealthState {
     pub agent_available: bool,
     /// Last error message (if any)
     pub last_error: Arc<RwLock<Option<String>>>,
+    /// Renders `GET /metrics`. `None` answers 404: a health server with no
+    /// control plane behind it has nothing true to report.
+    pub metrics: Option<MetricsFn>,
 }
+
+/// Produces the `/metrics` body on demand.
+pub type MetricsFn = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>> + Send + Sync,
+>;
 
 impl HealthState {
     pub fn new(memory_available: bool, agent_available: bool) -> Self {
@@ -207,7 +215,15 @@ impl HealthState {
             memory_expected_rows: None,
             agent_available,
             last_error: Arc::new(RwLock::new(None)),
+            metrics: None,
         }
+    }
+
+    /// Serve `GET /metrics` from `render`.
+    #[must_use]
+    pub fn with_metrics(mut self, render: MetricsFn) -> Self {
+        self.metrics = Some(render);
+        self
     }
 
     /// Seed the durable-memory-store health (from `MemoryService::store_health`).
@@ -277,6 +293,23 @@ async fn health(State(state): State<Arc<HealthState>>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: state.start_time.elapsed().as_secs(),
     })
+}
+
+/// Prometheus scrape endpoint (GET /metrics).
+async fn metrics(State(state): State<Arc<HealthState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(ref render) = state.metrics else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = render().await;
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            crate::metrics::METRICS_CONTENT_TYPE,
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// Kubernetes-style liveness probe (GET /healthz)
@@ -364,6 +397,7 @@ impl HealthServer {
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz))
             .route("/status", get(status))
+            .route("/metrics", get(metrics))
             .layer(cors)
             .with_state(self.state.clone())
     }

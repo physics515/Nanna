@@ -18,18 +18,8 @@ impl ControlPlane {
                 let tasks = scheduler.list_tasks().await;
                 let jobs: Vec<_> = tasks.into_iter()
                     .map(|t| {
-                        let (schedule, next_run) = match &t.task_type {
-                            nanna_core::TaskType::Heartbeat => ("heartbeat".to_string(), None),
-                            nanna_core::TaskType::Cron { schedule, next_run, .. } => {
-                                (schedule.clone(), next_run.map(|dt| dt.to_rfc3339()))
-                            }
-                            nanna_core::TaskType::Recurring { interval } => {
-                                (format!("every_{}s", interval.as_secs()), None)
-                            }
-                            nanna_core::TaskType::Delayed { delay, .. } => {
-                                (format!("delay_{}s", delay.as_secs()), None)
-                            }
-                        };
+                        let schedule = t.task_type.schedule_label();
+                        let next_run = t.task_type.next_run().map(|dt| dt.to_rfc3339());
                         json!({
                             "id": t.id,
                             "name": t.name,
@@ -50,18 +40,8 @@ impl ControlPlane {
             SchedulerAction::Get { id } => {
                 let scheduler = scheduler.read().await;
                 if let Some(task) = scheduler.get_task(&id).await {
-                    let (schedule, next_run) = match &task.task_type {
-                        nanna_core::TaskType::Heartbeat => ("heartbeat".to_string(), None),
-                        nanna_core::TaskType::Cron { schedule, next_run, .. } => {
-                            (schedule.clone(), next_run.map(|dt| dt.to_rfc3339()))
-                        }
-                        nanna_core::TaskType::Recurring { interval } => {
-                            (format!("every_{}s", interval.as_secs()), None)
-                        }
-                        nanna_core::TaskType::Delayed { delay, .. } => {
-                            (format!("delay_{}s", delay.as_secs()), None)
-                        }
-                    };
+                    let schedule = task.task_type.schedule_label();
+                    let next_run = task.task_type.next_run().map(|dt| dt.to_rfc3339());
                     json!({
                         "job": {
                             "id": task.id,
@@ -81,14 +61,30 @@ impl ControlPlane {
                     json!({ "error": "not_found", "id": id })
                 }
             }
-            SchedulerAction::Add { schedule, task, name } => {
+            SchedulerAction::Add {
+                schedule,
+                task,
+                name,
+                session_id,
+            } => {
+                // A result posted into a conversation that does not exist would
+                // be dropped on every run; refuse it now instead.
+                if let Some(ref id) = session_id
+                    && !self.sessions.exists(id).await
+                {
+                    return json!({
+                        "error": "session_not_found",
+                        "message": format!("Session {id} not found; the job was not added"),
+                    });
+                }
                 // Try to parse as cron expression
                 match Scheduler::cron_task(
                     name.as_deref().unwrap_or("unnamed"),
                     &schedule,
                     &task,
                 ) {
-                    Ok(scheduled_task) => {
+                    Ok(mut scheduled_task) => {
+                        scheduled_task.target_session = session_id;
                         let id = scheduled_task.id.clone();
                         let scheduler = scheduler.read().await;
                         scheduler.add_task(scheduled_task).await;

@@ -3,6 +3,39 @@
 use super::*;
 
 impl ControlPlane {
+    /// Gather everything `GET /metrics` reports, in one pass.
+    pub async fn metrics_snapshot(&self) -> crate::metrics::MetricsSnapshot {
+        let memory_entries = match self.memory {
+            Some(ref memory) => Some(memory.count().await),
+            None => None,
+        };
+        let reminders_pending = match self.scheduler {
+            Some(ref scheduler) => {
+                let tasks = scheduler.read().await.list_tasks().await;
+                let pending = tasks.iter().filter(|task| {
+                    task.name == crate::reminder_service::REMINDER_TASK_NAME && task.enabled
+                });
+                Some(pending.count())
+            }
+            None => None,
+        };
+        let mcp_servers = match self.mcp_status {
+            Some(ref status) => status.read().await.clone(),
+            None => Vec::new(),
+        };
+        crate::metrics::MetricsSnapshot {
+            uptime_secs: self.uptime_secs(),
+            sessions: self.sessions.count().await,
+            chat_runs_active: self.chat_runs.active_count().await,
+            memory_entries,
+            reminders_pending,
+            tools: self.tool_stats.summaries().await,
+            models: self.model_stats.summaries().await,
+            mcp_servers,
+            channels: self.channel_counters.snapshot(),
+        }
+    }
+
     // =========================================================================
     // System Handlers
     // =========================================================================
@@ -81,6 +114,13 @@ impl ControlPlane {
                     "tool_count": tool_count,
                     "scheduler_available": scheduler_available,
                     "llm_providers": llm_providers,
+                    // Each configured MCP server: starting / started (with its
+                    // tool count) / failed or not_started (with the reason).
+                    // A failed server's tools are simply absent otherwise.
+                    "mcp_servers": match self.mcp_status {
+                        Some(ref status) => json!(*status.read().await),
+                        None => json!([]),
+                    },
                     "config_path": self.config_path,
                 })
             }
@@ -182,6 +222,23 @@ impl ControlPlane {
                     }
                 } else {
                     json!({ "buckets": [], "error": "Storage not available" })
+                }
+            }
+            SystemAction::CostRollup { days, by } => {
+                let Some(ref storage) = self.storage else {
+                    return json!({ "error": "storage_unavailable", "message": "Cost rollups need the request log in storage" });
+                };
+                let period = match by.as_deref() {
+                    None | Some("day") => nanna_storage::UsagePeriod::Day,
+                    Some("month") => nanna_storage::UsagePeriod::Month,
+                    Some("session") => nanna_storage::UsagePeriod::Session,
+                    Some(other) => {
+                        return json!({ "error": "invalid_period", "message": format!("`by` must be \"day\", \"month\" or \"session\" (got {other:?})") });
+                    }
+                };
+                match storage.model_usage_by(days.unwrap_or(30), period).await {
+                    Ok(usage) => json!(crate::cost_rollup::price_buckets(usage)),
+                    Err(e) => json!({ "error": "rollup_failed", "message": e.to_string() }),
                 }
             }
             SystemAction::ToolStatsDaily { tool_name, days } => {

@@ -566,6 +566,7 @@ impl<'a> ToolsApi<'a> {
         self.client.request(Action::Tool(ToolAction::Execute {
             name: name.to_string(),
             input,
+            session_id: None,
         })).await
     }
 }
@@ -625,6 +626,7 @@ impl SchedulerApi<'_> {
                 schedule: schedule.to_string(),
                 task: task.to_string(),
                 name: name.map(String::from),
+                session_id: None,
             }))
             .await
     }

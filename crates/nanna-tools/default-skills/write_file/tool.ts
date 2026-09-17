@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.16",
+  version: "0.1.17",
   output: "memory",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); a shrinking rewrite that deletes more top-level sections than it keeps is held ONCE with the current content and the removed names — send the same content again to confirm the deletions; blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery and the richest earlier version at <file>.__best__.",
   parameters: {
@@ -365,7 +365,8 @@ export default {
             scope + "), not a tool limitation, and it stays in force until you lift it in chat. " +
             "The fix belongs in the artifact you are producing — if something that READS " + path +
             " is failing, change the code it exercises, not " + path + ". If you believe this constraint " +
-            "genuinely blocks the goal, ask_user about it instead of working around it.";
+            "genuinely blocks the goal, call lift_invariant with glob `" + inv.glob + "` — it asks the user and lifts " +
+            "the rule only on their yes — instead of working around it.";
         }
         return "";
       } catch (e) {

@@ -219,6 +219,19 @@ impl Backend {
                             "done": true,
                         }));
                     }
+                    DaemonEvent::SessionMessageAdded { session_id, message_id, role, content } => {
+                        let _ = app.emit("session-message-added", serde_json::json!({
+                            "session_id": session_id,
+                            "message_id": message_id,
+                            "role": role,
+                            "content": content,
+                        }));
+                    }
+                    DaemonEvent::SessionCleared { id } => {
+                        let _ = app.emit("session-cleared", serde_json::json!({
+                            "session_id": id,
+                        }));
+                    }
                     DaemonEvent::ThinkingDelta { session_id, delta, .. } => {
                         let _ = app.emit("thinking-chunk", serde_json::json!({
                             "session_id": session_id,
@@ -429,6 +442,12 @@ daemon_proxies! {
     session_set_workspace(session_id: &str, workspace_id: Option<&str>);
     /// Set or clear the chat-model pin for a session
     session_set_model(session_id: &str, model: Option<&str>);
+    /// Render a session as a document
+    session_export(session_id: &str, format: &str);
+    /// A session's file checkpoints, newest first
+    session_file_history(session_id: &str, limit: Option<usize>);
+    /// Restore one file checkpoint of a session
+    session_restore_file(session_id: &str, checkpoint: u64);
     /// Set or clear the user-selected extra tools for a session (additive;
     /// empty = default tool behavior)
     session_set_tools(session_id: &str, tools: Vec<String>);
