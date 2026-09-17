@@ -6768,6 +6768,15 @@ keep the phases readable; promote individual items into a phase when they become
       probe then repeated on a clean 30s cadence with a fresh client UUID each time. Shutdown was clean
       (`nanna-daemon.exit.json` → `"reason": "clean_shutdown"`).
 
+- [ ] *(found 2026-09-17)* **The GUI calls `std::env::set_var` from async Tauri commands.**
+      `set_provider_api_key` sets `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/… in the GUI process "for this
+      session", under `unsafe` blocks whose note says "single-threaded application context" — Tauri runs
+      commands on a multi-threaded tokio runtime, and glibc `setenv` racing any concurrent `getenv` is
+      the undefined behaviour Rust 2024 made `set_var` unsafe for. The GUI reads those vars back in ~15
+      places (key-set badges, model listing fallbacks). The fix is to read keys from `AppState.config`
+      (already hydrated from the keyring) and drop the env writes, not to add a lock.
+      Same day: the legacy `set_api_key` command was deleted — no frontend caller, and it lost the key
+      (`save()` strips secrets and it never wrote the keyring) while logging "API key updated".
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
       neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
       `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system

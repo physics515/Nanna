@@ -217,7 +217,6 @@ pub fn run() {
             commands::sessions::set_session_tools,
             commands::settings::get_config,
             commands::settings::set_model,
-            commands::settings::set_api_key,
             commands::memory::search_memory,
             commands::memory::get_memory_stats,
             commands::system::show_window,

@@ -94,32 +94,6 @@ pub async fn set_model(state: State<'_, Arc<RwLock<AppState>>>, model: String) -
     Ok(())
 }
 
-/// Set API key
-#[tauri::command]
-pub async fn set_api_key(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    api_key: String,
-) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-
-    // The daemon owns the live LLM client; persist the key to config (which the
-    // daemon reads) and ask it to reload.
-    state_guard.config.llm.api_key = Some(api_key.clone());
-
-    // SAFETY: single-threaded application context
-    unsafe {
-        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
-    }
-
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save config: {e}");
-    }
-    let _ = state_guard.backend.config_reload().await;
-
-    info!("API key updated");
-    Ok(())
-}
-
 /// Extended settings for the settings page
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedSettings {
