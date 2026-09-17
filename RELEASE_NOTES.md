@@ -69,6 +69,16 @@ client was forwarded the whole event stream, so an attached client saw other ses
 deltas, tool calls and errors on the wire. Narrowing is now real and opt-in, costing a single atomic
 load until someone uses it.
 
+**Anthropic OAuth identified itself as a Claude Code release from a year ago.** Subscription sign-in
+presents Nanna as a Claude Code client, and the version it reported was pinned at `2.1.2`. It now
+reports `2.1.273`, matching the current CLI.
+
+**`[general] data_dir` now does something.** The setting parsed, validated and round-tripped while
+changing nothing — the daemon always used the platform default. It is honoured now, the daemon says
+at boot when a configured location is in use, and `--data-dir` still wins over it. Pointing it at a
+new folder does **not** move an existing store; the daemon opens whatever is there. Daemon logs also
+follow `--data-dir` and the configured location instead of splitting off to the default one.
+
 ## What This Release Does Not Do
 
 **Reminders still do not work,** and the three `schedule.*` tools stay withheld. The blocker is not
