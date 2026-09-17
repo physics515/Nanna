@@ -4596,10 +4596,8 @@ struct MessageStartData {
 }
 
 /// Prompt-side token usage reported in the Anthropic `message_start` event.
-/// Field names mirror the wire JSON keys, so the shared `_input_tokens` suffix
-/// is required (not a naming smell).
+/// Field names mirror the wire JSON keys.
 #[derive(Debug, Deserialize, Default)]
-#[allow(clippy::struct_field_names)]
 struct MessageStartUsage {
     #[serde(default)]
     input_tokens: u32,
