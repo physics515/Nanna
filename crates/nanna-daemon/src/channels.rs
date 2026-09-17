@@ -646,12 +646,54 @@ fn reply_text(event: &Event) -> Option<(&str, &str)> {
     (!content.trim().is_empty()).then_some((session_id.as_str(), content.as_str()))
 }
 
+/// How often a running turn re-sends the chat app's "typing…" indicator.
+///
+/// Derived from the providers: Telegram shows a chat action for 5 s (or until
+/// the bot's next message), Discord's typing lasts 10 s. Re-sending every 4 s
+/// keeps the shorter one continuous; it is throttled per session, so a burst
+/// of deltas costs one request per interval, not one per token.
+const TYPING_REFRESH: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// What an event says about a turn's liveness in a session. Pure.
+#[derive(Debug, PartialEq, Eq)]
+enum TurnSignal<'a> {
+    /// The turn is producing something — keep "typing…" up.
+    Working(&'a str),
+    /// The turn finished; its reply is being sent.
+    Finished(&'a str),
+}
+
+fn turn_signal(event: &Event) -> Option<TurnSignal<'_>> {
+    match event {
+        Event::MessageStart { session_id, .. }
+        | Event::MessageDelta { session_id, .. }
+        | Event::ThinkingDelta { session_id, .. }
+        | Event::StepStarted { session_id, .. }
+        | Event::ToolStart { session_id, .. }
+        | Event::ToolEnd { session_id, .. }
+        | Event::LivenessBeat { session_id, .. } => Some(TurnSignal::Working(session_id)),
+        Event::MessageEnd { session_id, .. } => Some(TurnSignal::Finished(session_id)),
+        _ => None,
+    }
+}
+
+/// Whether to send "typing…" now, given when it was last sent. Pure.
+fn typing_due(last_sent: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_sent.is_none_or(|last| now.saturating_duration_since(last) >= TYPING_REFRESH)
+}
+
 /// Forward replies for channel-routed sessions back through `router`.
 ///
 /// One forwarder per router: the webhook processor shares the channel
 /// manager's router when there is one, and gets its own forwarder only when it
 /// builds a standalone router — so no reply is sent twice. Sessions without a
 /// reply route (GUI, CLI) are skipped; their clients read the same events.
+///
+/// While a routed session's turn runs, the chat also shows "typing…": a
+/// Telegram user used to see nothing at all between sending a message and a
+/// reply minutes later. Driven by the turn's own events, so there is no timer
+/// to leak; the throttle map holds only sessions mid-turn (entries leave on
+/// `message_end`) and is bounded by the channel session count.
 pub fn spawn_reply_forwarder(
     sessions: Arc<SessionManager>,
     mut events: broadcast::Receiver<Event>,
@@ -659,6 +701,8 @@ pub fn spawn_reply_forwarder(
     counters: Arc<crate::channel_counters::ChannelCounters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut typing: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
         loop {
             let event = match events.recv().await {
                 Ok(event) => event,
@@ -671,6 +715,27 @@ pub fn spawn_reply_forwarder(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
+            match turn_signal(&event) {
+                Some(TurnSignal::Working(session_id)) => {
+                    let now = std::time::Instant::now();
+                    if typing_due(typing.get(session_id).copied(), now) {
+                        if let Some(route) = sessions.reply_channel(session_id).await {
+                            typing.insert(session_id.to_string(), now);
+                            let router = router.read().await;
+                            if let Some(channel) = router.get(&route.provider) {
+                                let target = ChannelId::new(&route.provider, &route.id);
+                                if let Err(e) = channel.send_typing(&target).await {
+                                    debug!("typing indicator for {session_id} not sent: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(TurnSignal::Finished(session_id)) => {
+                    typing.remove(session_id);
+                }
+                None => {}
+            }
             let Some((session_id, text)) = reply_text(&event) else {
                 continue;
             };
@@ -727,6 +792,13 @@ mod tests {
                     .push((message.channel.id, text));
             }
             Ok("sent-1".to_string())
+        }
+        async fn send_typing(&self, channel_id: &ChannelId) -> Result<(), ChannelError> {
+            self.sent
+                .lock()
+                .expect("sent")
+                .push((channel_id.id.clone(), "<typing>".to_string()));
+            Ok(())
         }
     }
 
@@ -1136,6 +1208,90 @@ mod tests {
         assert_eq!(
             refusal_text(&bare).as_deref(),
             Some("Nanna could not answer this message: agent_unavailable")
+        );
+    }
+
+    #[test]
+    fn typing_is_throttled_and_follows_the_turn() {
+        let start = std::time::Instant::now();
+        assert!(typing_due(None, start));
+        assert!(!typing_due(Some(start), start + Duration::from_secs(3)));
+        assert!(typing_due(Some(start), start + TYPING_REFRESH));
+        assert!(
+            !typing_due(Some(start + Duration::from_secs(1)), start),
+            "clock skew never panics"
+        );
+
+        let beat = Event::ToolStart {
+            session_id: "s".into(),
+            call_id: "c".into(),
+            name: "read_file".into(),
+            input: serde_json::Value::Null,
+            model: None,
+            tokens: None,
+            total_tokens: None,
+        };
+        assert_eq!(turn_signal(&beat), Some(TurnSignal::Working("s")));
+        let end = Event::MessageEnd {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            content: String::new(),
+        };
+        assert_eq!(turn_signal(&end), Some(TurnSignal::Finished("s")));
+        assert_eq!(turn_signal(&Event::WorkspacesChanged), None);
+    }
+
+    #[tokio::test]
+    async fn a_routed_turn_shows_typing_once_per_interval_and_gui_turns_do_not() {
+        let sessions = Arc::new(SessionManager::new());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "chat-7".into(),
+        };
+        sessions
+            .ensure_channel_session(SESSION, "test · ada", &route)
+            .await;
+        let gui = sessions.create(None).await;
+        let (events_tx, events_rx) = broadcast::channel(64);
+        let (router, sent) = recording_router();
+        let counters = Arc::new(crate::channel_counters::ChannelCounters::default());
+        let forwarder = spawn_reply_forwarder(sessions.clone(), events_rx, router, counters);
+
+        for session_id in [gui.id.as_str(), SESSION] {
+            events_tx
+                .send(Event::MessageStart {
+                    session_id: session_id.into(),
+                    message_id: "m".into(),
+                })
+                .expect("a receiver");
+            for delta in ["a", "b", "c"] {
+                events_tx
+                    .send(Event::MessageDelta {
+                        session_id: session_id.into(),
+                        message_id: "m".into(),
+                        delta: delta.into(),
+                    })
+                    .expect("a receiver");
+            }
+        }
+        events_tx
+            .send(Event::MessageEnd {
+                session_id: SESSION.into(),
+                message_id: "m".into(),
+                content: "abc".into(),
+            })
+            .expect("a receiver");
+
+        let delivered = wait_for(&sent, 2).await;
+        drop(events_tx);
+        forwarder.await.expect("forwarder exits");
+        assert_eq!(
+            delivered,
+            vec![
+                ("chat-7".to_string(), "<typing>".to_string()),
+                ("chat-7".to_string(), "abc".to_string()),
+            ],
+            "one typing for a burst of deltas, none for the GUI session"
         );
     }
 

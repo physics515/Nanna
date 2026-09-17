@@ -16,7 +16,8 @@ files she writes.
 ## What's Fixed
 
 **Chat apps get answers.** Each chat gets its own conversation, created on first contact with its
-reply route remembered — so it survives a restart. When a turn finishes, the answer is sent back to
+reply route remembered — so it survives a restart. Telegram and Discord show "typing…" while Nanna
+works on your message. When a turn finishes, the answer is sent back to
 the chat it came from. If a message cannot be answered at all, the chat is told why ("no model
 provider is configured"), not "an error". Webhook conversations are covered by the same path.
 
@@ -104,7 +105,7 @@ WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
 
 ## Numbers
 
-- **2,102 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
+- **2,104 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
 - **3 → 0** bundled tools withheld for want of a daemon service.
 - **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
 - Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing

@@ -4795,7 +4795,26 @@ asks permission or restricts her.)*:
       per chat, so before this a Telegram user could never leave a long, confused history. It
       empties the messages, drops a provider-outage park (or it would resume into the empty
       conversation), keeps the model pin, reply route and reminders, and is **refused while a
-      turn runs** ("Send /stop first") — test mutation-checked. Follow-up the same day: a clear —
+      turn runs** ("Send /stop first") — test mutation-checked.
+      *(2026-09-17)* **"typing…" while a turn runs.** `Channel::send_typing` was implemented for
+      Telegram and Discord and called by nothing, so a chat user saw silence from sending a message
+      until a reply minutes later. The reply forwarder now re-sends it on the turn's own events
+      (start, deltas, tools, liveness beats) at most every 4 s per session — Telegram's action lasts
+      5 s, Discord's 10 s — and stops at `message_end`; no timers, the throttle map holds only
+      sessions mid-turn. Test: one typing for a burst of deltas, none for a GUI session
+      (mutation-checked: unthrottled it fails). No live bot. Gap: a silent stretch longer than 5 s
+      with no event (a long tool call; beats are 30 s) lets Telegram's indicator lapse.
+      - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
+            now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
+            calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview
+            that disappears when the bot sends the real message with `sendMessage`), and Bot API
+            10.3 (2026-08-24) added `can_stop`/`keep_on_stop`, a user-facing stop button that maps
+            directly onto `/stop`. Sketch: throttle `MessageDelta`s per session into draft updates
+            (text so far, tail-truncated to 4096 with a marker), keep `sendMessage` at `message_end`
+            as today; groups keep "typing…". Open: how the stop press is delivered to the bot (not
+            confirmed in the docs read), and whether the 30 s lifetime needs a refresh during tool
+            calls. Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
+            [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft). Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
