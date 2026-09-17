@@ -195,6 +195,12 @@ pub async fn get_model_stats(
 }
 
 /// Estimated spend per day over the last `days` days (`system.cost_rollup`).
+///
+/// # Errors
+///
+/// Fails when there is no daemon connection or the `system.cost_rollup`
+/// request is dropped or times out, and with the daemon's own `message` when
+/// it refuses — no request log in storage, or a rollup that failed to read it.
 #[tauri::command]
 pub async fn get_cost_rollup(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -210,6 +216,7 @@ pub async fn get_cost_rollup(
             "by": "day"
         }))
         .await?;
+    drop(state_guard);
     if result.get("error").is_some() {
         return Err(result["message"]
             .as_str()

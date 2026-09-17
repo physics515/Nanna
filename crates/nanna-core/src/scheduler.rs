@@ -77,7 +77,7 @@ impl TaskType {
 
     /// The next wall-clock moment this task is due, where one is known.
     #[must_use]
-    pub fn next_run(&self) -> Option<DateTime<Utc>> {
+    pub const fn next_run(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::Cron { next_run, .. } => *next_run,
             Self::At { fire_at } => Some(*fire_at),
@@ -1005,6 +1005,9 @@ async fn record_run_in(
         runs.remove(0);
     }
     debug_assert!(runs.len() <= JOB_HISTORY_RUNS_MAX);
+    // Held across the push and the trim together: a reader between them would
+    // see the history one run over its bound.
+    drop(hist);
 }
 
 /// Runs kept per job. The GUI's history view pages ten at a time; a hundred is
@@ -1019,7 +1022,7 @@ fn parse_at(schedule: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Parse interval string like "every_300s" into seconds
+/// Parse interval string like `every_300s` into seconds
 fn parse_interval(schedule: &str) -> Option<u64> {
     if schedule.starts_with("every_") && schedule.ends_with('s') {
         let num_str = &schedule[6..schedule.len() - 1];

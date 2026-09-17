@@ -26,7 +26,7 @@ pub struct McpToolResult {
 
 /// Longest tool name every provider Nanna routes to accepts.
 ///
-/// Anthropic and OpenAI both validate tool names against
+/// Anthropic and `OpenAI` both validate tool names against
 /// `^[a-zA-Z0-9_-]{1,64}$`; a name outside it rejects the WHOLE request, not
 /// just the tool, so one badly named MCP tool would break every turn.
 pub const WIRE_TOOL_NAME_CHARS_MAX: usize = 64;

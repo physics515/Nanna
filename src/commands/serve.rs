@@ -28,10 +28,15 @@ pub fn server_port(flag: Option<u16>, config: &Config) -> u16 {
     port
 }
 
-/// Run the HTTP server
-pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
-    let (llm, tools, storage) = init_components(config).await?;
-
+/// The [`Nanna`] instance `nanna serve` keeps for backwards compatibility,
+/// on the provider `config` names.
+///
+/// # Errors
+///
+/// `API key not found` when neither `[llm].api_key` nor that provider's key
+/// variable (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, else `ANTHROPIC_API_KEY`)
+/// is set, and whatever [`Nanna::new`] reports for the built client.
+async fn build_bot(config: &Config) -> anyhow::Result<Nanna> {
     // Get API key for bot - default to Anthropic
     let env_var = match config.llm.provider.as_str() {
         "openai" => "OPENAI_API_KEY",
@@ -67,6 +72,15 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
     } else {
         info!("CPU-only mode (SIMD active)");
     }
+
+    Ok(bot)
+}
+
+/// Run the HTTP server
+pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
+    let (llm, tools, storage) = init_components(config).await?;
+
+    let bot = build_bot(config).await?;
 
     // Get Telegram token from config or environment
     let telegram_token = config

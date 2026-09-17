@@ -725,10 +725,10 @@ fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: 
     let target = ChannelId::new(&route.provider, &route.id);
     tokio::spawn(async move {
         let router = router.read().await;
-        if let Some(channel) = router.get(&target.provider) {
-            if let Err(e) = channel.send_typing(&target).await {
-                debug!("typing indicator for {session_id} not sent: {e}");
-            }
+        if let Some(channel) = router.get(&target.provider)
+            && let Err(e) = channel.send_typing(&target).await
+        {
+            debug!("typing indicator for {session_id} not sent: {e}");
         }
     });
 }
