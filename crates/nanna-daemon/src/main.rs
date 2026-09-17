@@ -270,7 +270,7 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
             builder = builder.with_log_buffer(buf.clone());
         }
 
-        let mut daemon = builder.build().await;
+        let mut daemon = builder.build();
         
         // Setup signal handlers
         let shutdown_tx = daemon.shutdown_handle();
