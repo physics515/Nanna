@@ -4565,6 +4565,28 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       command and a duplicate name each logged and skipped while the good server started, and on
       SIGTERM the daemon exited `clean_shutdown` with the fixture child reaped. Not verified: a
       model actually choosing the tool (no model on this host), and a real `npx` server.
+      - [ ] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
+            "legacy" client, and the current spec cannot talk to it.** MCP's current revision is
+            **`2026-07-28`**, which removes the `initialize` handshake: every request carries
+            `_meta["io.modelcontextprotocol/protocolVersion"]`, servers MUST implement
+            `server/discover`, and server-to-client requests become `InputRequiredResult` replies
+            (multi-round-trip). nanna-mcp pins `2024-11-05` and opens with `initialize`. Per the
+            spec's compatibility matrix, **legacy client × modern-only server = fails** ("legacy
+            clients have no fall-forward mechanism"); only dual-era servers still answer
+            `initialize`. The stdio startup landed today reports such a failure honestly
+            (`mcp_servers` → `failed` with the server's error, doctor/GUI too), but it will be the
+            common case as servers move. The fix is a **dual-era client**: on stdio, probe with
+            `server/discover` carrying the preferred modern version in `_meta`; a `DiscoverResult`
+            or a recognized modern error (`UnsupportedProtocolVersionError`, code `-32022`, with a
+            `supported` list) means modern — never fall back then; any other error or a timeout
+            means legacy → `initialize`. Cache the era per server process. On Streamable HTTP,
+            send a modern request and inspect a `400` body before falling back. Build the modern
+            path against a real modern server (the reference SDKs' "everything" server), not only a
+            hand-written fixture — a fixture written from the same reading of the spec cannot catch
+            a misreading. Sources:
+            [versioning](https://modelcontextprotocol.io/specification/versioning),
+            [2026-07-28 compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+            [stdio backward compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio).
       - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.
