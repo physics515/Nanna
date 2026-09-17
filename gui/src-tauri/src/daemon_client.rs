@@ -877,6 +877,11 @@ impl DaemonClient {
     }
 
     /// Render a session as a document (`markdown` or `json`) — `{format, filename, content}`.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.export` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_export(&self, session_id: &str, format: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -888,6 +893,11 @@ impl DaemonClient {
     }
 
     /// A session's file checkpoints, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.file_history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_file_history(
         &self,
         session_id: &str,
@@ -903,6 +913,11 @@ impl DaemonClient {
     }
 
     /// Restore one file checkpoint of a session.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.restore_file` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_restore_file(
         &self,
         session_id: &str,

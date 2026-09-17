@@ -332,6 +332,14 @@ fn export_filter(format: &str) -> Option<(&'static str, &'static [&'static str])
 /// opened from Rust, so the destination path never comes from the webview —
 /// a command that wrote wherever the page asked would be a write-anywhere
 /// surface. Returns the saved path, or `None` when the dialog was cancelled.
+///
+/// # Errors
+///
+/// Fails when `format` is neither `markdown` nor `json`; when the daemon
+/// cannot be reached or the `session.export` request is dropped or times out;
+/// with the daemon's own `message` when it refuses to render the session; when
+/// the picked dialog entry is not a file path; and when writing that path
+/// fails. A cancelled dialog is `Ok(None)`, not an error.
 #[tauri::command]
 pub async fn export_session(
     app: tauri::AppHandle,
@@ -395,6 +403,13 @@ mod export_tests {
 
 /// This session's file checkpoints (files as they were before a tool wrote
 /// them), newest first. A daemon refusal comes back as `Err` with its message.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.file_history`
+/// request is dropped or times out, and with the daemon's own `message` when
+/// it refuses — file history not enabled on that daemon, or the history could
+/// not be read.
 #[tauri::command]
 pub async fn get_file_history(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -406,6 +421,7 @@ pub async fn get_file_history(
         .backend
         .session_file_history(&session_id, limit)
         .await?;
+    drop(state_guard);
     if result.get("error").is_some() {
         return Err(result["message"]
             .as_str()
@@ -417,6 +433,13 @@ pub async fn get_file_history(
 
 /// Restore one file checkpoint. Returns what the daemon did (`rewrote` /
 /// `removed`, with the path).
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.restore_file`
+/// request is dropped or times out, and with the daemon's own `message` when
+/// it refuses — file history not enabled on that daemon, an unknown
+/// checkpoint, or a restore that could not be written.
 #[tauri::command]
 pub async fn restore_file_checkpoint(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -428,6 +451,7 @@ pub async fn restore_file_checkpoint(
         .backend
         .session_restore_file(&session_id, checkpoint)
         .await?;
+    drop(state_guard);
     if result.get("error").is_some() {
         return Err(result["message"]
             .as_str()

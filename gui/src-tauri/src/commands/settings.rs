@@ -794,12 +794,19 @@ pub async fn get_daemon_providers(
 ///
 /// Empty — not an error — when the daemon predates the field or has no MCP
 /// servers configured: the Tools page then simply shows no MCP section.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `system.status` request is
+/// dropped or times out. A `mcp_servers` field that is missing or not an array
+/// lists nothing rather than failing.
 #[tauri::command]
 pub async fn get_mcp_servers(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let state_guard = state.read().await;
     let status = state_guard.backend.system_status().await?;
+    drop(state_guard);
     Ok(status
         .get("mcp_servers")
         .and_then(|v| v.as_array())
@@ -1009,6 +1016,9 @@ pub async fn set_ollama_host(
         }
     }
     let _ = state_guard.backend.config_reload().await;
+    // Held from the validation through the save and the reload notice, so a
+    // concurrent config write cannot land between them.
+    drop(state_guard);
     // No `OLLAMA_HOST` copy in this process's environment: nothing in the GUI
     // reads it (the daemon is a separate process and reads the config file),
     // and `set_var` here raced concurrent `getenv` on the multi-threaded runtime.
@@ -1260,6 +1270,16 @@ pub async fn get_anthropic_models(
 pub async fn get_openai_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
+    #[derive(Deserialize)]
+    struct OpenAIModelsResponse {
+        data: Vec<OpenAIModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenAIModel {
+        id: String,
+    }
+
     // Config first: it holds the keyring copy, which survives a restart.
     let api_key = state.read().await.config.llm.openai_api_key.clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -1272,25 +1292,15 @@ pub async fn get_openai_models(
 
     let response = client
         .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch OpenAI models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch OpenAI models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {}: {}", status, body));
-    }
-
-    #[derive(Deserialize)]
-    struct OpenAIModelsResponse {
-        data: Vec<OpenAIModel>,
-    }
-
-    #[derive(Deserialize)]
-    struct OpenAIModel {
-        id: String,
+        return Err(format!("OpenAI API error {status}: {body}"));
     }
 
     let api_key = std::env::var("OPENAI_API_KEY")
