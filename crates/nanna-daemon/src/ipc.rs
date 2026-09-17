@@ -143,7 +143,6 @@ impl SessionFilters {
     /// # Panics
     /// Panics on an empty `session_id` — a caller that narrows to nothing has a
     /// bug, and silently narrowing to `""` would mute the connection instead.
-    #[allow(clippy::significant_drop_tightening, reason = "see the doc above")]
     pub async fn narrow_to_session(&self, client_id: &str, session_id: String) {
         assert!(!session_id.is_empty(), "narrowed to an empty session id");
         let mut narrowed = self.narrowed.write().await;
@@ -153,13 +152,14 @@ impl SessionFilters {
             .insert(session_id);
         self.narrowed_count.store(narrowed.len(), Ordering::Relaxed);
         debug_assert!(!narrowed.is_empty(), "narrowing left no entry behind");
+        // Released only now: the guard spans the count update (see above).
+        drop(narrowed);
     }
 
     /// Stop delivering `session_id` to `client_id`.
     ///
     /// A connection that has never narrowed stays un-narrowed: unsubscribing
     /// from one session is not a request to be cut off from the rest.
-    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn drop_session(&self, client_id: &str, session_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         if let Some(sessions) = narrowed.get_mut(client_id) {
@@ -169,7 +169,6 @@ impl SessionFilters {
     }
 
     /// Widen `client_id` back to the whole stream.
-    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn widen_to_all(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.remove(client_id);
@@ -182,7 +181,6 @@ impl SessionFilters {
     /// # Panics
     /// Panics if the entry did not land, which would leave the connection
     /// silently receiving every session it just asked to stop receiving.
-    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn drop_all_sessions(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.insert(client_id.to_string(), HashSet::new());
@@ -192,11 +190,13 @@ impl SessionFilters {
             "dropping all sessions left no filter entry, so the connection \
              would silently keep receiving every session",
         );
+        // Released only now: the guard spans the count update (see
+        // `narrow_to_session`).
+        drop(narrowed);
     }
 
     /// Forget a disconnected connection, so the map is bounded by live
     /// connections rather than by every connection the daemon has ever seen.
-    #[allow(clippy::significant_drop_tightening, reason = "see narrow_to_session")]
     pub async fn forget(&self, client_id: &str) {
         let mut narrowed = self.narrowed.write().await;
         narrowed.remove(client_id);

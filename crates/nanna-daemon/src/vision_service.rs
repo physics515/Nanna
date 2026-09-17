@@ -95,10 +95,6 @@ pub fn bind_pdf_ocr_fn(
 
 /// Build `vision.analyze`, or an empty map when no configured vision model is
 /// reachable.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
-)]
 pub fn build_vision_services(
     router: &Arc<LlmRouter>,
     configured: &[String],

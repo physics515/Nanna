@@ -157,10 +157,6 @@ fn capture_refusal(target: &str) -> Option<String> {
 }
 
 /// Build `screenshot.capture`, or an empty map with no tool or no session.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
-)]
 pub fn build_screenshot_services(data_dir: &Path) -> HashMap<String, ServiceFn> {
     let Some((tool, executable)) = find_capture_tool() else {
         info!(

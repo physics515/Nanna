@@ -64,6 +64,17 @@ pub const fn f64_from_u64(value: u64) -> f64 {
     value as f64
 }
 
+/// `value` as an `i64`: truncates toward zero, clamps to the `i64` range, and
+/// maps NaN to 0.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "f64 -> i64 has no lossless conversion; the caller only converts whole \
+              values within 2^53, which are exact, and `as` saturates otherwise"
+)]
+pub const fn i64_from_f64(value: f64) -> i64 {
+    value as i64
+}
+
 /// `value` as a `u64`: truncates toward zero, clamps to `0..=u64::MAX`, and
 /// maps NaN to 0.
 #[expect(

@@ -171,9 +171,10 @@ async fn register_live(
 /// is loaded with the same services every bundled skill gets — without the
 /// slot it would silently be the only tool in the daemon that cannot call one,
 /// and the map cannot contain a closure that captures the finished map.
-#[allow(
+#[expect(
     clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
+    reason = "the slot is read back into `ToolRegistry::load_skills_with_services`, \
+              which takes the default-hasher map, so a generic hasher cannot flow through"
 )]
 pub fn build_tool_authoring_services(
     tools_dir: PathBuf,

@@ -79,10 +79,6 @@ fn tts_output_path(audio_dir: &std::path::Path, generated_at_nanos: u128) -> Pat
 }
 
 /// Build `audio.tts` and `audio.transcribe`, or an empty map without a key.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
-)]
 pub fn build_audio_services(
     openai_api_key: Option<&str>,
     data_dir: &std::path::Path,
