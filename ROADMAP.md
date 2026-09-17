@@ -1830,9 +1830,12 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       round-trip is the remaining check.
       - [ ] Live round-trip against a real bot (Telegram is cheapest): message in → `message_end` →
             reply out, then a `remind` set from the chat arriving in the chat.
-      - [ ] `nanna-server`'s own Telegram/Discord/Slack handlers were not audited for the same
+      - [x] `nanna-server`'s own Telegram/Discord/Slack handlers were not audited for the same
             ack-as-reply assumption — check whether that server is still reachable in daemon mode
             before spending time on it.
+            *(2026-09-17, checked — not affected.)* `nanna serve`'s webhook handlers call
+            `AppState::process_message`, which runs its own agent inline and returns the finished
+            text (`webhooks/telegram.rs:177`); there is no delivery ack in that path to misread.
       - [ ] **The daemon's generic `/webhook/{id}` refuses every call, and its refusal names a
             setting that cannot fix it.** *(found 2026-09-17)* `WebhookConfig::generic_secrets` is
             populated by nothing outside `webhook.rs` and its fail-closed test — no config key, no IPC
