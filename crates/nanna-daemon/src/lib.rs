@@ -45,6 +45,7 @@ pub use nanna_core::log_buffer;
 pub mod log_file;
 pub mod memory_adapter;
 pub mod memory_persistence;
+mod numeric;
 pub mod persistence;
 pub mod protocol;
 pub mod server;

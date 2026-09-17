@@ -65,6 +65,14 @@ impl ServiceManager {
     }
     
     /// Install the service
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no service backend, or the
+    /// backend step fails: on Linux, creating or writing the systemd user unit
+    /// or spawning `systemctl`; on macOS, writing the launchd plist or spawning
+    /// `launchctl`; on Windows, connecting to the service manager or creating
+    /// the service.
     pub fn install(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.install_windows();
@@ -80,6 +88,14 @@ impl ServiceManager {
     }
     
     /// Uninstall the service
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no service backend, or the
+    /// backend step fails: on Linux, removing the systemd unit file or spawning
+    /// `systemctl daemon-reload`; on macOS, removing the launchd plist; on
+    /// Windows, connecting to the service manager or opening/deleting the
+    /// service.
     pub fn uninstall(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.uninstall_windows();
@@ -95,6 +111,14 @@ impl ServiceManager {
     }
     
     /// Start the service
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no service backend, or the
+    /// service command could not be issued: spawning `systemctl` (Linux) or
+    /// `launchctl` (macOS) failed, or the Windows service manager could not be
+    /// reached or refused the start. A spawned command's non-zero exit status is
+    /// not checked.
     pub fn start(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.start_windows();
@@ -110,6 +134,14 @@ impl ServiceManager {
     }
     
     /// Stop the service
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no service backend, or the
+    /// service command could not be issued: spawning `systemctl` (Linux) or
+    /// `launchctl` (macOS) failed, or the Windows service manager could not be
+    /// reached or refused the stop. A spawned command's non-zero exit status is
+    /// not checked.
     pub fn stop(&self) -> Result<(), String> {
         #[cfg(windows)]
         return self.stop_windows();

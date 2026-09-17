@@ -479,18 +479,22 @@ impl SessionLiveness {
             .map(|t| t.elapsed().as_secs());
 
         let awaiting = if !s.running {
-            match &s.last_stop {
+            s.last_stop.as_ref().map_or_else(
+                || "idle — no turn this daemon lifetime".to_string(),
                 // The exit cause, when the caller supplied one, is the more
                 // honest half of "how did that end" — say it beside the stop.
-                Some(stop) => match &stop.exit_cause {
-                    Some(cause) => format!(
-                        "idle — last turn ended {} ({cause}) at {}",
-                        stop.kind, stop.at
-                    ),
-                    None => format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                |stop| {
+                    stop.exit_cause.as_ref().map_or_else(
+                        || format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                        |cause| {
+                            format!(
+                                "idle — last turn ended {} ({cause}) at {}",
+                                stop.kind, stop.at
+                            )
+                        },
+                    )
                 },
-                None => "idle — no turn this daemon lifetime".to_string(),
-            }
+            )
         } else if let Some(tool) = &s.tool_in_flight {
             format!(
                 "tool {} running for {}s",

@@ -21,7 +21,7 @@
 //!   nanna-daemon uninstall        Uninstall system service
 //!   nanna-daemon service          (Windows only) Run as Windows Service
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use nanna_daemon::server::DaemonBuilder;
 use nanna_daemon::service::{ServiceConfig, ServiceManager, ServiceStatus};
 use std::path::PathBuf;
@@ -39,9 +39,6 @@ use nanna_daemon::windows_service;
 #[command(name = "nanna-daemon")]
 #[command(about = "Nanna AI assistant background daemon")]
 #[command(version)]
-// CLI toggles are naturally independent booleans; a bitflags/enum here would
-// only obscure the arg surface.
-#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -58,17 +55,10 @@ struct Cli {
     #[arg(long, default_value_t = nanna_daemon::DEFAULT_HEALTH_PORT)]
     health_port: u16,
     
-    /// Disable HTTP health server
-    #[arg(long)]
-    no_health_server: bool,
-    
-    /// Disable PID file (allows multiple instances)
-    #[arg(long)]
-    no_pid_file: bool,
-    
-    /// Enable webhook server for inbound messages
-    #[arg(long)]
-    enable_webhooks: bool,
+    // Flattened in place, so `--no-health-server`, `--no-pid-file` and
+    // `--enable-webhooks` keep their names and their position in `--help`.
+    #[command(flatten)]
+    servers: ServerToggles,
     
     /// Webhook server port (default: 3000)
     #[arg(long, default_value = "3000")]
@@ -90,6 +80,22 @@ struct Cli {
     /// Disable rotating file logs (console + in-memory buffer only).
     #[arg(long)]
     no_file_log: bool,
+}
+
+/// The switches for the daemon's optional servers and its PID file.
+#[derive(Args)]
+struct ServerToggles {
+    /// Disable HTTP health server
+    #[arg(long)]
+    no_health_server: bool,
+    
+    /// Disable PID file (allows multiple instances)
+    #[arg(long)]
+    no_pid_file: bool,
+    
+    /// Enable webhook server for inbound messages
+    #[arg(long)]
+    enable_webhooks: bool,
 }
 
 #[derive(Subcommand)]
@@ -219,7 +225,10 @@ fn main() {
         Commands::Start => start_service(&cli),
         Commands::Stop => stop_service(&cli),
         Commands::Restart => restart_service(&cli),
-        Commands::Status => show_status(&cli),
+        Commands::Status => {
+            show_status(&cli);
+            Ok(())
+        }
         Commands::Install => install_service(&cli),
         Commands::Uninstall => uninstall_service(&cli),
         #[cfg(windows)]
@@ -247,9 +256,9 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
             .with_host(&cli.host)
             .with_log_level(&cli.log_level)
             .with_health_port(cli.health_port)
-            .with_health_server(!cli.no_health_server)
-            .with_pid_file(!cli.no_pid_file)
-            .with_webhook_server(cli.enable_webhooks)
+            .with_health_server(!cli.servers.no_health_server)
+            .with_pid_file(!cli.servers.no_pid_file)
+            .with_webhook_server(cli.servers.enable_webhooks)
             .with_webhook_port(cli.webhook_port);
         
         if let Some(ref data_dir) = cli.data_dir {
@@ -316,26 +325,24 @@ fn start_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     if manager.status() == ServiceStatus::Running {
         println!("Daemon is already running");
-        Ok(())
     } else {
         println!("Starting daemon...");
         manager.start()?;
         println!("Daemon started");
-        Ok(())
     }
+    Ok(())
 }
 
 fn stop_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     if manager.status() == ServiceStatus::Stopped {
         println!("Daemon is not running");
-        Ok(())
     } else {
         println!("Stopping daemon...");
         manager.stop()?;
         println!("Daemon stopped");
-        Ok(())
     }
+    Ok(())
 }
 
 fn restart_service(cli: &Cli) -> Result<(), String> {
@@ -351,7 +358,7 @@ fn restart_service(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn show_status(cli: &Cli) -> Result<(), String> {
+fn show_status(cli: &Cli) {
     let status = get_service_manager(cli).status();
 
     println!("Nanna Daemon Status");
@@ -406,8 +413,6 @@ fn show_status(cli: &Cli) -> Result<(), String> {
             }
         }
     }
-    
-    Ok(())
 }
 
 fn install_service(cli: &Cli) -> Result<(), String> {

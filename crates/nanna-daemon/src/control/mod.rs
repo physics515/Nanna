@@ -54,7 +54,7 @@ pub struct ControlPlane {
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
     config: Arc<RwLock<Config>>,
     config_path: Option<PathBuf>,
-    _data_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
     /// Log buffer for serving daemon logs to the GUI
@@ -146,7 +146,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            _data_dir: None,
+            data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -209,7 +209,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            _data_dir: None,
+            data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -244,8 +244,9 @@ impl ControlPlane {
         router: Option<Arc<LlmRouter>>,
     ) -> Self {
         // Load config from disk
-        let (config, config_path, data_dir) = match Config::load() {
-            Ok(cfg) => {
+        let (config, config_path, data_dir) = Config::load().map_or_else(
+            |_| (Config::default().with_env_overrides(), None, None),
+            |cfg| {
                 // Save must target the same file `Config::load()` reads. This
                 // used to point at {data_dir}/config.toml while load reads
                 // {config_dir}/config.toml — every control-plane config write
@@ -253,9 +254,8 @@ impl ControlPlane {
                 let path = Config::default_config_path().ok();
                 let data = nanna_config::Config::default_data_dir().ok();
                 (cfg.with_env_overrides(), path, data)
-            }
-            Err(_) => (Config::default().with_env_overrides(), None, None),
-        };
+            },
+        );
 
         // Initialize user tools manager
         let user_tools = data_dir.as_ref().map(|d| {
@@ -274,7 +274,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(config)),
             config_path,
-            _data_dir: data_dir,
+            data_dir,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -344,6 +344,7 @@ impl ControlPlane {
     /// Attach the IPC server's narrowing registry, so `Subscribe` and
     /// `Unsubscribe` change what that connection is actually sent rather than
     /// only what the daemon records about it.
+    #[must_use]
     pub fn with_session_filters(mut self, filters: Arc<crate::ipc::SessionFilters>) -> Self {
         self.session_filters = Some(filters);
         self
@@ -369,6 +370,7 @@ impl ControlPlane {
     }
 
     /// Attach the long-horizon task run manager (P14).
+    #[must_use]
     pub fn with_task_runs(mut self, task_runs: Arc<crate::tasks::TaskRunManager>) -> Self {
         self.task_runs = Some(task_runs);
         self
@@ -386,6 +388,7 @@ impl ControlPlane {
     }
 
     /// Set the shared workspace ID for script services
+    #[must_use]
     pub fn with_workspace_id(mut self, ws_id: Arc<tokio::sync::RwLock<Option<String>>>) -> Self {
         self.services_workspace_id = Some(ws_id);
         self
@@ -410,6 +413,7 @@ impl ControlPlane {
     }
 
     /// Set the scheduler
+    #[must_use]
     pub fn with_scheduler(mut self, scheduler: Arc<RwLock<Scheduler>>) -> Self {
         self.scheduler = Some(scheduler);
         self
@@ -424,6 +428,7 @@ impl ControlPlane {
 
     /// Share a run registry created by the caller — the daemon's dream gate
     /// holds the same handle, so "a mission is live" is one fact, not two.
+    #[must_use]
     pub fn with_chat_runs(mut self, runs: Arc<chat_harness::ChatRunRegistry>) -> Self {
         self.chat_runs = runs;
         self
@@ -455,7 +460,7 @@ impl ControlPlane {
         }
 
         // One-time migration: if tool-stats.json exists, migrate and rename it
-        if let Some(ref data_dir) = self._data_dir {
+        if let Some(ref data_dir) = self.data_dir {
             let tool_stats_path = data_dir.join("tool-stats.json");
             if tool_stats_path.exists() {
                 match tokio::fs::read_to_string(&tool_stats_path).await {
@@ -542,6 +547,12 @@ impl ControlPlane {
     }
 
     /// Load user tools and register them with the tool registry
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no user tool manager is wired, or when the user
+    /// tools directory cannot be read. Individual unreadable or unparseable
+    /// tool files are logged and skipped, not reported here.
     pub async fn load_user_tools(&self) -> Result<usize, String> {
         let Some(ref user_tools) = self.user_tools else {
             return Err("User tools manager not initialized".to_string());
@@ -678,6 +689,9 @@ impl ControlPlane {
                 // it is rather than reporting a clean success.
                 warn!("Tool toggle for {canonical} not persisted: {e}");
             }
+            // Released only now: mutate, derive and persist are one critical
+            // section, so a concurrent toggle cannot interleave with the save.
+            drop(config);
 
             policy
         };

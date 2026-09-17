@@ -177,11 +177,10 @@ pub(crate) fn describe_value(value: &Value) -> String {
 
 /// Convert a whole `f64` to `i64`, or `None` when the conversion would be a
 /// guess. See [`F64_EXACT_INT_MAX`] for why the magnitude is bounded.
-// The cast is exact by construction: fract() == 0.0 and |f| <= 2^53 put the
-// value well inside i64.
-#[allow(clippy::cast_possible_truncation)]
+// The conversion is exact by construction: fract() == 0.0 and |f| <= 2^53
+// put the value well inside i64.
 fn whole_f64_to_i64(f: f64) -> Option<i64> {
-    (f.fract() == 0.0 && f.abs() <= F64_EXACT_INT_MAX).then_some(f as i64)
+    (f.fract() == 0.0 && f.abs() <= F64_EXACT_INT_MAX).then_some(crate::numeric::i64_from_f64(f))
 }
 
 /// Read an i64 from the dialects that actually reach this service.
@@ -379,10 +378,10 @@ fn opt_string(params: &Value, key: &str) -> Option<String> {
 /// canonical object, identical to what the planner admits and what `create`
 /// stores.
 fn canonical_acceptance(params: &Value) -> Result<Option<Value>, String> {
-    match params.get("acceptance").filter(|v| !v.is_null()) {
-        Some(raw) => AcceptanceCheck::canonicalize(raw).map(Some),
-        None => Ok(None),
-    }
+    params
+        .get("acceptance")
+        .filter(|v| !v.is_null())
+        .map_or(Ok(None), |raw| AcceptanceCheck::canonicalize(raw).map(Some))
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +460,6 @@ fn decomposition_note(depth: usize, open_siblings: usize, parent_id: Option<i64>
 
 /// Build the `tasks.*` services the todo skill calls. Registered in
 /// `build_script_services` when storage is available.
-#[allow(clippy::too_many_lines)]
 pub fn build_task_services(
     storage: Arc<Storage>,
     workspace_id: Arc<RwLock<Option<String>>>,
@@ -469,651 +467,694 @@ pub fn build_task_services(
 ) -> HashMap<String, ServiceFn> {
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
-    let err_str = |e: StorageError| e.to_string();
-
-    // tasks.next {scope?, session_id?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id.clone();
-        services.insert(
-            "tasks.next".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                Box::pin(async move {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let next = storage
-                        .tasks()
-                        .next(&scope, scope_id.as_deref())
-                        .await
-                        .map_err(err_str)?;
-                    match next {
-                        Some(task) => {
-                            let notes = storage
-                                .tasks()
-                                .notes(task.id, STEP_NOTES_TAIL)
-                                .await
-                                .map_err(err_str)?;
-                            let mut value = task_to_json(&task);
-                            value["notes"] =
-                                json!(notes.iter().map(|n| n.content.clone()).collect::<Vec<_>>());
-                            Ok(json!({ "task": value }))
-                        }
-                        None => Ok(json!({ "task": Value::Null })),
-                    }
-                })
-            }),
-        );
-    }
-
-    // tasks.add {title, scope?, session_id?, parent_id?, priority?, labels?,
-    //            tools?, due_at?, recurrence?, depends_on?, acceptance?,
-    //            project?, assignee?, description?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id.clone();
-        let turn_baselines = turn_baselines;
-        services.insert(
-            "tasks.add".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                let turn_baselines = turn_baselines.clone();
-                Box::pin(async move {
-                    // A subtask always lives in its parent's scope — replan
-                    // steps only know the parent id, not the run's scope.
-                    let parent_id = opt_i64(&params, "parent_id")?;
-                    let (scope, scope_id, parent_sort, parent_acceptance) =
-                        if let Some(parent_id) = parent_id {
-                            let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
-                            (
-                                parent.scope,
-                                parent.scope_id,
-                                Some(parent.sort_order),
-                                parent.acceptance,
-                            )
-                        } else {
-                            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                            (scope, scope_id, None, None)
-                        };
-                    let title = opt_string(&params, "title")
-                        .or_else(|| opt_string(&params, "text"))
-                        .ok_or_else(|| "title is required".to_string())?;
-
-                    // Idempotent add: re-adding a title that is ALREADY open
-                    // in this scope returns the existing item instead of a
-                    // second copy. Observed live (lfm2.5 smoke): 5 seeded
-                    // tasks became ~50 as the model re-decomposed the same
-                    // work every step — "Write data file with header and 3
-                    // rows" was created ten times — so the plan grew faster
-                    // than it was worked and the real items drowned. Only
-                    // OPEN items dedupe: a genuinely recurring chore
-                    // ("run the tests") must still be addable after the
-                    // previous one is closed, and reopening history would be
-                    // the worse failure.
-                    let open_items = storage
-                        .tasks()
-                        .list(&scope, scope_id.as_deref(), false)
-                        .await
-                        .map_err(err_str)?;
-                    if let Some(existing) = open_items
-                        .iter()
-                        .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
-                    {
-                        return Ok(json!({
-                            "task": task_to_json(existing),
-                            "deduplicated": true,
-                            // Consistent with the closed-this-turn guard so
-                            // callers have ONE flag for "nothing was created"
-                            // — the todo skill suppresses its "Added task"
-                            // confirmation on exactly this field.
-                            "created": false,
-                            "note": format!(
-                                "Task #{} \"{}\" already exists and is still open — reusing it \
-                                 instead of creating a duplicate. Work on it rather than \
-                                 planning it again.",
-                                existing.id, existing.title
-                            ),
-                        }));
-                    }
-
-                    // Closed-since-turn-start guard. The open-title reuse
-                    // above deliberately lets a CLOSED title be added again —
-                    // a recurring chore must stay addable tomorrow — but
-                    // "tomorrow" is the point: within ONE turn, a title the
-                    // run already finished or abandoned is settled work, and
-                    // re-creating it is how a turn spins. Observed live
-                    // 2026-08-02 (session 05775d1d): the harness's replan step
-                    // drives this very service through the todo tool, and
-                    // task #2059 (abandoned) came straight back as #2060 with
-                    // the identical title, immediately re-seeded.
-                    //
-                    // The baseline is the same one `seed_continuation` uses
-                    // and the comparison is the same `same_title` rule, so
-                    // both doors now answer "is this the same task?"
-                    // identically. No live turn → no baseline → unchanged
-                    // behavior for adds from outside a run.
-                    if let Some(baseline) =
-                        turn_baselines.baseline(&scope, scope_id.as_deref()).await
-                    {
-                        let closed =
-                            tasks_closed_since(&storage, &scope, scope_id.as_deref(), &baseline)
-                                .await?
-                                .into_iter()
-                                .find(|t| same_title(&t.title, &title));
-                        if let Some(closed) = closed {
-                            tracing::info!(
-                                task_id = closed.id,
-                                status = %closed.status,
-                                title = %title,
-                                "refusing to re-create a title this turn already closed"
-                            );
-                            // A returned notice, never an error: the model
-                            // reads it as a normal result and moves on.
-                            return Ok(json!({
-                                "task": task_to_json(&closed),
-                                "created": false,
-                                "closed_this_turn": true,
-                                "note": closed_this_turn_notice(&closed.title, &closed.status),
-                            }));
-                        }
-                    }
-
-                    // Ordering: a subtask inherits its parent's ladder
-                    // position; a new root task appends AFTER everything
-                    // (defaulting to 0 would jump the whole queue — observed
-                    // live as a task explosion drowning the seeded plan).
-                    let sort_order = match opt_i64(&params, "sort_order")? {
-                        Some(explicit) => explicit,
-                        None => match parent_sort {
-                            Some(parent_sort) => parent_sort,
-                            None => storage
-                                .tasks()
-                                .list(&scope, scope_id.as_deref(), true)
-                                .await
-                                .map_err(err_str)?
-                                .iter()
-                                .map(|t| t.sort_order)
-                                .max()
-                                .unwrap_or(0)
-                                .saturating_add(1),
-                        },
-                    };
-                    let new = NewTask {
-                        parent_id,
-                        scope,
-                        scope_id,
-                        project: opt_string(&params, "project"),
-                        title,
-                        description: opt_string(&params, "description"),
-                        // Floored at 2: priority 1 is the user speaking (an
-                        // interjection jumps the queue at p1), and this
-                        // service is the MODEL's write surface — a
-                        // self-created todo must never outrank user-origin
-                        // work (observed live 2026-08-02: a self-created p1
-                        // side-task preempted the user's p2 request).
-                        priority: opt_i64(&params, "priority")?.unwrap_or(3).max(2),
-                        labels: opt_string_vec(&params, "labels")?.unwrap_or_default(),
-                        tool_scope: opt_string_vec(&params, "tools")?.unwrap_or_default(),
-                        due_at: opt_string(&params, "due_at"),
-                        recurrence: opt_string(&params, "recurrence"),
-                        depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
-                        // Acceptance inheritance: a subtask that declares no
-                        // check of its own answers to its parent's — the same
-                        // write-time principle as scope inheritance. Without
-                        // it, self-created children are self-graded: closing
-                        // them looks like progress to model and scheduler
-                        // alike while the parent's real check fails
-                        // byte-identically (observed 2026-08-07/08: 97 items
-                        // marked done against 6 features actually verified —
-                        // the whole gap was acceptance-less scaffolding).
-                        // "Done is a verdict" only binds where a verdict
-                        // exists; this gives every child one by default.
-                        acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
-                        assignee: opt_string(&params, "assignee"),
-                        sort_order,
-                    };
-                    // Decomposition damping — a returned note, never a
-                    // refusal. The item is created regardless; the note rides
-                    // the tool result, which is exactly where the model is
-                    // looking at the moment it chose planning over working.
-                    let open_siblings = parent_id
-                        .map_or(0, |pid| {
-                            open_items
-                                .iter()
-                                .filter(|t| t.parent_id == Some(pid))
-                                .count()
-                        });
-                    let depth = ladder_depth(&storage, parent_id).await;
-                    let note = decomposition_note(depth, open_siblings, parent_id);
-
-                    let task = storage.tasks().create(new).await.map_err(err_str)?;
-                    match note {
-                        Some(note) => Ok(json!({ "task": task_to_json(&task), "note": note })),
-                        None => Ok(json!({ "task": task_to_json(&task) })),
-                    }
-                })
-            }),
-        );
-    }
-
-    // tasks.update {id, ...patch}
-    {
-        let storage = storage.clone();
-        services.insert(
-            "tasks.update".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                Box::pin(async move {
-                    let id = req_i64(&params, "id")?;
-                    // Null/absent values SKIP a field, never wipe it: the Boa
-                    // bridge serializes `undefined` object members as null, so
-                    // a partial update from the tool must not clear every
-                    // field it did not mention. (Clearing a field is a
-                    // deliberate op this service intentionally does not
-                    // expose.) A value that is PRESENT but unreadable is a
-                    // different thing entirely and errors — skipping it left
-                    // the model believing it had set a field the store never
-                    // saw.
-                    let patch = TaskPatch {
-                        title: opt_string(&params, "title").or_else(|| opt_string(&params, "text")),
-                        description: params
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .map(|s| Some(s.to_string())),
-                        status: opt_string(&params, "status"),
-                        // Same floor as tasks.add: the model cannot promote
-                        // its own work to p1 after the fact either.
-                        priority: opt_i64(&params, "priority")?.map(|p| p.max(2)),
-                        labels: opt_string_vec(&params, "labels")?,
-                        tool_scope: opt_string_vec(&params, "tools")?,
-                        due_at: params
-                            .get("due_at")
-                            .and_then(Value::as_str)
-                            .map(|s| Some(s.to_string())),
-                        recurrence: params
-                            .get("recurrence")
-                            .and_then(Value::as_str)
-                            .map(|s| Some(s.to_string())),
-                        depends_on: opt_i64_vec(&params, "depends_on")?,
-                        acceptance: canonical_acceptance(&params)?.map(Some),
-                        assignee: params
-                            .get("assignee")
-                            .and_then(Value::as_str)
-                            .map(|s| Some(s.to_string())),
-                        parent_id: opt_i64(&params, "parent_id")?.map(Some),
-                        project: params
-                            .get("project")
-                            .and_then(Value::as_str)
-                            .map(|s| Some(s.to_string())),
-                        sort_order: opt_i64(&params, "sort_order")?,
-                    };
-                    let actor = opt_string(&params, "actor");
-                    let task = storage
-                        .tasks()
-                        .update(id, patch, actor.as_deref())
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "task": task_to_json(&task) }))
-                })
-            }),
-        );
-    }
-
-    // tasks.done {id, actor?, workdir?} — runs the acceptance check first:
-    // done is a verdict, not an assertion (the P14 anti-drift keystone).
-    {
-        let storage = storage.clone();
-        services.insert(
-            "tasks.done".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                Box::pin(async move {
-                    let id = req_i64(&params, "id")?;
-                    let actor = opt_string(&params, "actor");
-                    let task = storage.tasks().get(id).await.map_err(err_str)?;
-
-                    let mut verified = false;
-                    let mut verdict_detail = Value::Null;
-                    if let Some(acceptance) = &task.acceptance {
-                        let check = AcceptanceCheck::from_json(acceptance)?;
-                        let workdir = opt_string(&params, "workdir")
-                            .map_or_else(|| PathBuf::from("."), PathBuf::from);
-                        let verdict = check.run(&workdir).await;
-                        storage
-                            .tasks()
-                            .log_activity(
-                                id,
-                                actor.as_deref(),
-                                "acceptance_checked",
-                                Some(json!({
-                                    "passed": verdict.passed,
-                                    "detail": verdict.detail,
-                                })),
-                            )
-                            .await
-                            .map_err(err_str)?;
-                        if !verdict.passed {
-                            return Ok(json!({
-                                "done": false,
-                                "verdict": verdict.detail,
-                                "message": format!(
-                                    "Acceptance check failed — task #{id} is NOT done: {}",
-                                    verdict.detail
-                                ),
-                            }));
-                        }
-                        verified = true;
-                        verdict_detail = json!(verdict.detail);
-                    }
-
-                    let outcome = storage
-                        .tasks()
-                        .complete(
-                            id,
-                            actor.as_deref(),
-                            Some(json!({ "verified": verified, "verdict": verdict_detail })),
-                        )
-                        .await
-                        .map_err(err_str)?;
-                    // Parent refocus — the generalizable form of "notice when
-                    // the goal is already satisfied". The model finishes a
-                    // subtask and is pointed back at the goal it serves; if it
-                    // believes the parent is done it CLAIMS so, and the
-                    // ordinary verify-on-claim path runs the check. The model
-                    // stays in the loop; nothing is auto-scored. In chat the
-                    // same reflex is returning to the user's request after a
-                    // sub-errand.
-                    let refocus = match task.parent_id {
-                        Some(pid) => match storage.tasks().get(pid).await {
-                            Ok(parent)
-                                if parent.status != "done" && parent.status != "cancelled" =>
-                            {
-                                Some(format!(
-                                    "This was a subtask of #{} '{}'. If that goal is now \
-                                     satisfied, mark it done — its acceptance check will \
-                                     verify. Do not split it further.",
-                                    parent.id, parent.title
-                                ))
-                            }
-                            _ => None,
-                        },
-                        None => None,
-                    };
-                    Ok(json!({
-                        "done": true,
-                        "verified": verified,
-                        "refocus": refocus,
-                        "already_done": outcome.already_done,
-                        "auto_completed": outcome.auto_completed,
-                    }))
-                })
-            }),
-        );
-    }
-
-    // tasks.list {scope?, session_id?, include_done?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id.clone();
-        services.insert(
-            "tasks.list".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                Box::pin(async move {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let include_done = opt_bool(&params, "include_done")?.unwrap_or(true);
-                    let tasks = storage
-                        .tasks()
-                        .list(&scope, scope_id.as_deref(), include_done)
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
-                })
-            }),
-        );
-    }
-
-    // tasks.query {filter, scope?, session_id?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id.clone();
-        services.insert(
-            "tasks.query".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                Box::pin(async move {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let filter = opt_string(&params, "filter")
-                        .ok_or_else(|| "filter is required".to_string())?;
-                    let tasks = storage
-                        .tasks()
-                        .query(&scope, scope_id.as_deref(), &filter)
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
-                })
-            }),
-        );
-    }
-
-    // tasks.note {id, content, author?}
-    {
-        let storage = storage.clone();
-        services.insert(
-            "tasks.note".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                Box::pin(async move {
-                    let id = req_i64(&params, "id")?;
-                    let content = opt_string(&params, "content")
-                        .or_else(|| opt_string(&params, "text"))
-                        .ok_or_else(|| "content is required".to_string())?;
-                    let author = opt_string(&params, "author");
-                    let note = storage
-                        .tasks()
-                        .add_note(id, author.as_deref(), &content)
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "note_id": note.id }))
-                })
-            }),
-        );
-    }
-
-    // tasks.remove {id}
-    {
-        let storage = storage.clone();
-        services.insert(
-            "tasks.remove".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                Box::pin(async move {
-                    let id = req_i64(&params, "id")?;
-                    let actor = opt_string(&params, "actor");
-
-                    // A task carrying a machine-checkable acceptance check is
-                    // a CONTRACT — someone (the planner, the eval, the user)
-                    // defined what "done" means for it, and deleting it
-                    // destroys the only objective record of the goal. Erasing
-                    // it is never the right move: the honest outcomes are
-                    // finish it or cancel it, both of which keep the item and
-                    // its history. Observed live (lfm2.5 smoke): blocked on a
-                    // refusing write_file and holding only `write_file` and
-                    // `todo`, the model deleted a SEEDED plan item — the run
-                    // then died on a task the harness still expected to
-                    // verify. Scratch items the model invents carry no
-                    // acceptance and stay freely removable.
-                    let existing = storage.tasks().get(id).await.map_err(err_str)?;
-                    if existing.acceptance.is_some() {
-                        return Ok(json!({
-                            "removed": false,
-                            "refused": true,
-                            "note": format!(
-                                "Task #{} \"{}\" has a machine-checkable acceptance check, so it is \
-                                 a commitment rather than scratch work and was NOT deleted — it is \
-                                 fully intact. If the work is finished, complete it (the check runs \
-                                 automatically). If it should not be done at all, set its status to \
-                                 cancelled. Either way the record survives.",
-                                existing.id, existing.title
-                            ),
-                        }));
-                    }
-
-                    let removed = storage
-                        .tasks()
-                        .delete(id, actor.as_deref())
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "removed": removed }))
-                })
-            }),
-        );
-    }
-
-    // tasks.clear {scope?, session_id?, closed_only?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id.clone();
-        services.insert(
-            "tasks.clear".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                Box::pin(async move {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let closed_only = opt_bool(&params, "closed_only")?.unwrap_or(true);
-
-                    // Same contract rule as tasks.remove, applied in bulk —
-                    // and this is the path that actually bites. Observed live
-                    // (lfm2.5 endurance, 2026-07-25): guarding only the
-                    // per-id remove left `clear` wide open, and one call took
-                    // the scope from 42 tasks to 6 mid-run, destroying 36
-                    // seeded features the harness was still driving.
-                    //
-                    // Ancestors of a contract are protected too: `delete`
-                    // removes whole SUBTREES, so clearing a scratch parent
-                    // would take a contract-bearing child down with it.
-                    let all = storage
-                        .tasks()
-                        .list(&scope, scope_id.as_deref(), true)
-                        .await
-                        .map_err(err_str)?;
-                    let parents: HashMap<i64, Option<i64>> =
-                        all.iter().map(|t| (t.id, t.parent_id)).collect();
-                    let mut protected: std::collections::HashSet<i64> =
-                        std::collections::HashSet::new();
-                    for task in all.iter().filter(|t| t.acceptance.is_some()) {
-                        let mut cursor = Some(task.id);
-                        while let Some(id) = cursor {
-                            if !protected.insert(id) {
-                                break; // this ancestor chain is already marked
-                            }
-                            cursor = parents.get(&id).copied().flatten();
-                        }
-                    }
-
-                    let mut removed = 0u64;
-                    for task in &all {
-                        if protected.contains(&task.id) {
-                            continue;
-                        }
-                        if closed_only && task.status != "done" && task.status != "cancelled" {
-                            continue;
-                        }
-                        // A subtree delete may already have taken this id;
-                        // that is success, not an error.
-                        if let Ok(count) = storage.tasks().delete(task.id, None).await {
-                            removed += count;
-                        }
-                    }
-
-                    let kept = protected.len();
-                    Ok(json!({
-                        "removed": removed,
-                        "protected": kept,
-                        "note": if kept > 0 {
-                            format!(
-                                "Cleared {removed} scratch task(s). {kept} task(s) carrying an \
-                                 acceptance contract were KEPT — they define what \"done\" means \
-                                 and are still intact. Complete or cancel those instead."
-                            )
-                        } else {
-                            format!("Cleared {removed} task(s).")
-                        },
-                    }))
-                })
-            }),
-        );
-    }
-
-    // tasks.counts {scope?, session_id?}
-    {
-        let storage = storage.clone();
-        let workspace_id = workspace_id;
-        services.insert(
-            "tasks.counts".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                let workspace_id = workspace_id.clone();
-                Box::pin(async move {
-                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let (open, closed) = storage
-                        .tasks()
-                        .counts(&scope, scope_id.as_deref())
-                        .await
-                        .map_err(err_str)?;
-                    Ok(json!({ "open": open, "closed": closed }))
-                })
-            }),
-        );
-    }
-
-    // tasks.import {session_id, items: [{text, status}]} — v0.1 JSON migration
-    {
-        let storage = storage;
-        services.insert(
-            "tasks.import".to_string(),
-            Arc::new(move |params: Value| {
-                let storage = storage.clone();
-                Box::pin(async move {
-                    let session_id = opt_string(&params, "session_id")
-                        .ok_or_else(|| "session_id is required".to_string())?;
-                    let items: Vec<(String, String)> = params
-                        .get("items")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|item| {
-                                    (
-                                        item.get("text")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        item.get("status")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("pending")
-                                            .to_string(),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let imported = storage
-                        .tasks()
-                        .import_v01(&session_id, &items)
-                        .await
-                        .map_err(err_str)?;
-                    info!(session_id = %session_id, imported, "Migrated v0.1 todo JSON into task store");
-                    Ok(json!({ "imported": imported }))
-                })
-            }),
-        );
-    }
+    services.insert("tasks.next".to_string(), task_next_service(&storage, &workspace_id));
+    services.insert(
+        "tasks.add".to_string(),
+        task_add_service(&storage, &workspace_id, turn_baselines),
+    );
+    services.insert("tasks.update".to_string(), task_update_service(&storage));
+    services.insert("tasks.done".to_string(), task_done_service(&storage));
+    services.insert("tasks.list".to_string(), task_list_service(&storage, &workspace_id));
+    services.insert("tasks.query".to_string(), task_query_service(&storage, &workspace_id));
+    services.insert("tasks.note".to_string(), task_note_service(&storage));
+    services.insert("tasks.remove".to_string(), task_remove_service(&storage));
+    services.insert("tasks.clear".to_string(), task_clear_service(&storage, &workspace_id));
+    services.insert("tasks.counts".to_string(), task_counts_service(&storage, workspace_id));
+    services.insert("tasks.import".to_string(), task_import_service(storage));
 
     services
+}
+
+// tasks.next {scope?, session_id?}
+fn task_next_service(
+    storage: &Arc<Storage>,
+    workspace_id: &Arc<RwLock<Option<String>>>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    let workspace_id = workspace_id.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        Box::pin(async move {
+            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let next = storage
+                .tasks()
+                .next(&scope, scope_id.as_deref())
+                .await
+                .map_err(err_str)?;
+            match next {
+                Some(task) => {
+                    let notes = storage
+                        .tasks()
+                        .notes(task.id, STEP_NOTES_TAIL)
+                        .await
+                        .map_err(err_str)?;
+                    let mut value = task_to_json(&task);
+                    value["notes"] =
+                        json!(notes.iter().map(|n| n.content.clone()).collect::<Vec<_>>());
+                    Ok(json!({ "task": value }))
+                }
+                None => Ok(json!({ "task": Value::Null })),
+            }
+        })
+    })
+}
+
+// tasks.add {title, scope?, session_id?, parent_id?, priority?, labels?,
+//            tools?, due_at?, recurrence?, depends_on?, acceptance?,
+//            project?, assignee?, description?}
+fn task_add_service(
+    storage: &Arc<Storage>,
+    workspace_id: &Arc<RwLock<Option<String>>>,
+    turn_baselines: Arc<TurnBaselines>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    let workspace_id = workspace_id.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        let turn_baselines = turn_baselines.clone();
+        Box::pin(async move {
+            // A subtask always lives in its parent's scope — replan
+            // steps only know the parent id, not the run's scope.
+            let parent_id = opt_i64(&params, "parent_id")?;
+            let (scope, scope_id, parent_sort, parent_acceptance) =
+                if let Some(parent_id) = parent_id {
+                    let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
+                    (
+                        parent.scope,
+                        parent.scope_id,
+                        Some(parent.sort_order),
+                        parent.acceptance,
+                    )
+                } else {
+                    let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                    (scope, scope_id, None, None)
+                };
+            let title = opt_string(&params, "title")
+                .or_else(|| opt_string(&params, "text"))
+                .ok_or_else(|| "title is required".to_string())?;
+
+            // Idempotent add: re-adding a title that is ALREADY open
+            // in this scope returns the existing item instead of a
+            // second copy. Observed live (lfm2.5 smoke): 5 seeded
+            // tasks became ~50 as the model re-decomposed the same
+            // work every step — "Write data file with header and 3
+            // rows" was created ten times — so the plan grew faster
+            // than it was worked and the real items drowned. Only
+            // OPEN items dedupe: a genuinely recurring chore
+            // ("run the tests") must still be addable after the
+            // previous one is closed, and reopening history would be
+            // the worse failure.
+            let open_items = storage
+                .tasks()
+                .list(&scope, scope_id.as_deref(), false)
+                .await
+                .map_err(err_str)?;
+            if let Some(existing) = open_items
+                .iter()
+                .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
+            {
+                return Ok(json!({
+                    "task": task_to_json(existing),
+                    "deduplicated": true,
+                    // Consistent with the closed-this-turn guard so
+                    // callers have ONE flag for "nothing was created"
+                    // — the todo skill suppresses its "Added task"
+                    // confirmation on exactly this field.
+                    "created": false,
+                    "note": format!(
+                        "Task #{} \"{}\" already exists and is still open — reusing it \
+                         instead of creating a duplicate. Work on it rather than \
+                         planning it again.",
+                        existing.id, existing.title
+                    ),
+                }));
+            }
+
+            // Closed-since-turn-start guard. The open-title reuse
+            // above deliberately lets a CLOSED title be added again —
+            // a recurring chore must stay addable tomorrow — but
+            // "tomorrow" is the point: within ONE turn, a title the
+            // run already finished or abandoned is settled work, and
+            // re-creating it is how a turn spins. Observed live
+            // 2026-08-02 (session 05775d1d): the harness's replan step
+            // drives this very service through the todo tool, and
+            // task #2059 (abandoned) came straight back as #2060 with
+            // the identical title, immediately re-seeded.
+            //
+            // The baseline is the same one `seed_continuation` uses
+            // and the comparison is the same `same_title` rule, so
+            // both doors now answer "is this the same task?"
+            // identically. No live turn → no baseline → unchanged
+            // behavior for adds from outside a run.
+            if let Some(reply) = closed_this_turn_reply(
+                &storage,
+                &turn_baselines,
+                &scope,
+                scope_id.as_deref(),
+                &title,
+            )
+            .await?
+            {
+                return Ok(reply);
+            }
+
+            // Ordering: a subtask inherits its parent's ladder
+            // position; a new root task appends AFTER everything
+            // (defaulting to 0 would jump the whole queue — observed
+            // live as a task explosion drowning the seeded plan).
+            let sort_order =
+                add_sort_order(&storage, &params, parent_sort, &scope, scope_id.as_deref())
+                    .await?;
+            let new = NewTask {
+                parent_id,
+                scope,
+                scope_id,
+                project: opt_string(&params, "project"),
+                title,
+                description: opt_string(&params, "description"),
+                // Floored at 2: priority 1 is the user speaking (an
+                // interjection jumps the queue at p1), and this
+                // service is the MODEL's write surface — a
+                // self-created todo must never outrank user-origin
+                // work (observed live 2026-08-02: a self-created p1
+                // side-task preempted the user's p2 request).
+                priority: opt_i64(&params, "priority")?.unwrap_or(3).max(2),
+                labels: opt_string_vec(&params, "labels")?.unwrap_or_default(),
+                tool_scope: opt_string_vec(&params, "tools")?.unwrap_or_default(),
+                due_at: opt_string(&params, "due_at"),
+                recurrence: opt_string(&params, "recurrence"),
+                depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
+                // Acceptance inheritance: a subtask that declares no
+                // check of its own answers to its parent's — the same
+                // write-time principle as scope inheritance. Without
+                // it, self-created children are self-graded: closing
+                // them looks like progress to model and scheduler
+                // alike while the parent's real check fails
+                // byte-identically (observed 2026-08-07/08: 97 items
+                // marked done against 6 features actually verified —
+                // the whole gap was acceptance-less scaffolding).
+                // "Done is a verdict" only binds where a verdict
+                // exists; this gives every child one by default.
+                acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
+                assignee: opt_string(&params, "assignee"),
+                sort_order,
+            };
+            // Decomposition damping — a returned note, never a
+            // refusal. The item is created regardless; the note rides
+            // the tool result, which is exactly where the model is
+            // looking at the moment it chose planning over working.
+            let open_siblings = parent_id
+                .map_or(0, |pid| {
+                    open_items
+                        .iter()
+                        .filter(|t| t.parent_id == Some(pid))
+                        .count()
+                });
+            let depth = ladder_depth(&storage, parent_id).await;
+            let note = decomposition_note(depth, open_siblings, parent_id);
+
+            let task = storage.tasks().create(new).await.map_err(err_str)?;
+            Ok(note.map_or_else(
+                || json!({ "task": task_to_json(&task) }),
+                |note| json!({ "task": task_to_json(&task), "note": note }),
+            ))
+        })
+    })
+}
+
+/// The reply `tasks.add` returns instead of re-creating `title`, when the live
+/// turn in this scope already closed a task with the same title. `None` when
+/// there is no live turn or no closed title matches.
+async fn closed_this_turn_reply(
+    storage: &Arc<Storage>,
+    turn_baselines: &TurnBaselines,
+    scope: &str,
+    scope_id: Option<&str>,
+    title: &str,
+) -> Result<Option<Value>, String> {
+    let Some(baseline) = turn_baselines.baseline(scope, scope_id).await else {
+        return Ok(None);
+    };
+    let closed = tasks_closed_since(storage, scope, scope_id, &baseline)
+        .await?
+        .into_iter()
+        .find(|t| same_title(&t.title, title));
+    let Some(closed) = closed else {
+        return Ok(None);
+    };
+    tracing::info!(
+        task_id = closed.id,
+        status = %closed.status,
+        title = %title,
+        "refusing to re-create a title this turn already closed"
+    );
+    // A returned notice, never an error: the model
+    // reads it as a normal result and moves on.
+    Ok(Some(json!({
+        "task": task_to_json(&closed),
+        "created": false,
+        "closed_this_turn": true,
+        "note": closed_this_turn_notice(&closed.title, &closed.status),
+    })))
+}
+
+/// The ladder position for a task `tasks.add` creates: the explicit
+/// `sort_order` parameter, else the parent's position, else one past every
+/// task in the scope.
+async fn add_sort_order(
+    storage: &Arc<Storage>,
+    params: &Value,
+    parent_sort: Option<i64>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Result<i64, String> {
+    Ok(match opt_i64(params, "sort_order")? {
+        Some(explicit) => explicit,
+        None => match parent_sort {
+            Some(parent_sort) => parent_sort,
+            None => storage
+                .tasks()
+                .list(scope, scope_id, true)
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|t| t.sort_order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        },
+    })
+}
+
+// tasks.update {id, ...patch}
+fn task_update_service(storage: &Arc<Storage>) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        Box::pin(async move {
+            let id = req_i64(&params, "id")?;
+            // Null/absent values SKIP a field, never wipe it: the Boa
+            // bridge serializes `undefined` object members as null, so
+            // a partial update from the tool must not clear every
+            // field it did not mention. (Clearing a field is a
+            // deliberate op this service intentionally does not
+            // expose.) A value that is PRESENT but unreadable is a
+            // different thing entirely and errors — skipping it left
+            // the model believing it had set a field the store never
+            // saw.
+            let patch = TaskPatch {
+                title: opt_string(&params, "title").or_else(|| opt_string(&params, "text")),
+                description: params
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                status: opt_string(&params, "status"),
+                // Same floor as tasks.add: the model cannot promote
+                // its own work to p1 after the fact either.
+                priority: opt_i64(&params, "priority")?.map(|p| p.max(2)),
+                labels: opt_string_vec(&params, "labels")?,
+                tool_scope: opt_string_vec(&params, "tools")?,
+                due_at: params
+                    .get("due_at")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                recurrence: params
+                    .get("recurrence")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                depends_on: opt_i64_vec(&params, "depends_on")?,
+                acceptance: canonical_acceptance(&params)?.map(Some),
+                assignee: params
+                    .get("assignee")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                parent_id: opt_i64(&params, "parent_id")?.map(Some),
+                project: params
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .map(|s| Some(s.to_string())),
+                sort_order: opt_i64(&params, "sort_order")?,
+            };
+            let actor = opt_string(&params, "actor");
+            let task = storage
+                .tasks()
+                .update(id, patch, actor.as_deref())
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "task": task_to_json(&task) }))
+        })
+    })
+}
+
+// tasks.done {id, actor?, workdir?} — runs the acceptance check first:
+// done is a verdict, not an assertion (the P14 anti-drift keystone).
+fn task_done_service(storage: &Arc<Storage>) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        Box::pin(async move {
+            let id = req_i64(&params, "id")?;
+            let actor = opt_string(&params, "actor");
+            let task = storage.tasks().get(id).await.map_err(err_str)?;
+
+            let (verified, verdict_detail) = if let Some(acceptance) = &task.acceptance {
+                let check = AcceptanceCheck::from_json(acceptance)?;
+                let workdir = opt_string(&params, "workdir")
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let verdict = check.run(&workdir).await;
+                storage
+                    .tasks()
+                    .log_activity(
+                        id,
+                        actor.as_deref(),
+                        "acceptance_checked",
+                        Some(json!({
+                            "passed": verdict.passed,
+                            "detail": verdict.detail,
+                        })),
+                    )
+                    .await
+                    .map_err(err_str)?;
+                if !verdict.passed {
+                    return Ok(json!({
+                        "done": false,
+                        "verdict": verdict.detail,
+                        "message": format!(
+                            "Acceptance check failed — task #{id} is NOT done: {}",
+                            verdict.detail
+                        ),
+                    }));
+                }
+                (true, json!(verdict.detail))
+            } else {
+                (false, Value::Null)
+            };
+
+            let outcome = storage
+                .tasks()
+                .complete(
+                    id,
+                    actor.as_deref(),
+                    Some(json!({ "verified": verified, "verdict": verdict_detail })),
+                )
+                .await
+                .map_err(err_str)?;
+            // Parent refocus — the generalizable form of "notice when
+            // the goal is already satisfied". The model finishes a
+            // subtask and is pointed back at the goal it serves; if it
+            // believes the parent is done it CLAIMS so, and the
+            // ordinary verify-on-claim path runs the check. The model
+            // stays in the loop; nothing is auto-scored. In chat the
+            // same reflex is returning to the user's request after a
+            // sub-errand.
+            let refocus = match task.parent_id {
+                Some(pid) => match storage.tasks().get(pid).await {
+                    Ok(parent)
+                        if parent.status != "done" && parent.status != "cancelled" =>
+                    {
+                        Some(format!(
+                            "This was a subtask of #{} '{}'. If that goal is now \
+                             satisfied, mark it done — its acceptance check will \
+                             verify. Do not split it further.",
+                            parent.id, parent.title
+                        ))
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            Ok(json!({
+                "done": true,
+                "verified": verified,
+                "refocus": refocus,
+                "already_done": outcome.already_done,
+                "auto_completed": outcome.auto_completed,
+            }))
+        })
+    })
+}
+
+// tasks.list {scope?, session_id?, include_done?}
+fn task_list_service(
+    storage: &Arc<Storage>,
+    workspace_id: &Arc<RwLock<Option<String>>>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    let workspace_id = workspace_id.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        Box::pin(async move {
+            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let include_done = opt_bool(&params, "include_done")?.unwrap_or(true);
+            let tasks = storage
+                .tasks()
+                .list(&scope, scope_id.as_deref(), include_done)
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
+        })
+    })
+}
+
+// tasks.query {filter, scope?, session_id?}
+fn task_query_service(
+    storage: &Arc<Storage>,
+    workspace_id: &Arc<RwLock<Option<String>>>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    let workspace_id = workspace_id.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        Box::pin(async move {
+            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let filter = opt_string(&params, "filter")
+                .ok_or_else(|| "filter is required".to_string())?;
+            let tasks = storage
+                .tasks()
+                .query(&scope, scope_id.as_deref(), &filter)
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
+        })
+    })
+}
+
+// tasks.note {id, content, author?}
+fn task_note_service(storage: &Arc<Storage>) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        Box::pin(async move {
+            let id = req_i64(&params, "id")?;
+            let content = opt_string(&params, "content")
+                .or_else(|| opt_string(&params, "text"))
+                .ok_or_else(|| "content is required".to_string())?;
+            let author = opt_string(&params, "author");
+            let note = storage
+                .tasks()
+                .add_note(id, author.as_deref(), &content)
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "note_id": note.id }))
+        })
+    })
+}
+
+// tasks.remove {id}
+fn task_remove_service(storage: &Arc<Storage>) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        Box::pin(async move {
+            let id = req_i64(&params, "id")?;
+            let actor = opt_string(&params, "actor");
+
+            // A task carrying a machine-checkable acceptance check is
+            // a CONTRACT — someone (the planner, the eval, the user)
+            // defined what "done" means for it, and deleting it
+            // destroys the only objective record of the goal. Erasing
+            // it is never the right move: the honest outcomes are
+            // finish it or cancel it, both of which keep the item and
+            // its history. Observed live (lfm2.5 smoke): blocked on a
+            // refusing write_file and holding only `write_file` and
+            // `todo`, the model deleted a SEEDED plan item — the run
+            // then died on a task the harness still expected to
+            // verify. Scratch items the model invents carry no
+            // acceptance and stay freely removable.
+            let existing = storage.tasks().get(id).await.map_err(err_str)?;
+            if existing.acceptance.is_some() {
+                return Ok(json!({
+                    "removed": false,
+                    "refused": true,
+                    "note": format!(
+                        "Task #{} \"{}\" has a machine-checkable acceptance check, so it is \
+                         a commitment rather than scratch work and was NOT deleted — it is \
+                         fully intact. If the work is finished, complete it (the check runs \
+                         automatically). If it should not be done at all, set its status to \
+                         cancelled. Either way the record survives.",
+                        existing.id, existing.title
+                    ),
+                }));
+            }
+
+            let removed = storage
+                .tasks()
+                .delete(id, actor.as_deref())
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "removed": removed }))
+        })
+    })
+}
+
+// tasks.clear {scope?, session_id?, closed_only?}
+fn task_clear_service(
+    storage: &Arc<Storage>,
+    workspace_id: &Arc<RwLock<Option<String>>>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    let workspace_id = workspace_id.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        Box::pin(async move {
+            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let closed_only = opt_bool(&params, "closed_only")?.unwrap_or(true);
+
+            // Same contract rule as tasks.remove, applied in bulk —
+            // and this is the path that actually bites. Observed live
+            // (lfm2.5 endurance, 2026-07-25): guarding only the
+            // per-id remove left `clear` wide open, and one call took
+            // the scope from 42 tasks to 6 mid-run, destroying 36
+            // seeded features the harness was still driving.
+            //
+            // Ancestors of a contract are protected too: `delete`
+            // removes whole SUBTREES, so clearing a scratch parent
+            // would take a contract-bearing child down with it.
+            let all = storage
+                .tasks()
+                .list(&scope, scope_id.as_deref(), true)
+                .await
+                .map_err(err_str)?;
+            let parents: HashMap<i64, Option<i64>> =
+                all.iter().map(|t| (t.id, t.parent_id)).collect();
+            let mut protected: std::collections::HashSet<i64> =
+                std::collections::HashSet::new();
+            for task in all.iter().filter(|t| t.acceptance.is_some()) {
+                let mut cursor = Some(task.id);
+                while let Some(id) = cursor {
+                    if !protected.insert(id) {
+                        break; // this ancestor chain is already marked
+                    }
+                    cursor = parents.get(&id).copied().flatten();
+                }
+            }
+
+            let mut removed = 0u64;
+            for task in &all {
+                if protected.contains(&task.id) {
+                    continue;
+                }
+                if closed_only && task.status != "done" && task.status != "cancelled" {
+                    continue;
+                }
+                // A subtree delete may already have taken this id;
+                // that is success, not an error.
+                if let Ok(count) = storage.tasks().delete(task.id, None).await {
+                    removed += count;
+                }
+            }
+
+            let kept = protected.len();
+            Ok(json!({
+                "removed": removed,
+                "protected": kept,
+                "note": if kept > 0 {
+                    format!(
+                        "Cleared {removed} scratch task(s). {kept} task(s) carrying an \
+                         acceptance contract were KEPT — they define what \"done\" means \
+                         and are still intact. Complete or cancel those instead."
+                    )
+                } else {
+                    format!("Cleared {removed} task(s).")
+                },
+            }))
+        })
+    })
+}
+
+// tasks.counts {scope?, session_id?}
+fn task_counts_service(
+    storage: &Arc<Storage>,
+    workspace_id: Arc<RwLock<Option<String>>>,
+) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    let storage = storage.clone();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        let workspace_id = workspace_id.clone();
+        Box::pin(async move {
+            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+            let (open, closed) = storage
+                .tasks()
+                .counts(&scope, scope_id.as_deref())
+                .await
+                .map_err(err_str)?;
+            Ok(json!({ "open": open, "closed": closed }))
+        })
+    })
+}
+
+// tasks.import {session_id, items: [{text, status}]} — v0.1 JSON migration
+fn task_import_service(storage: Arc<Storage>) -> ServiceFn {
+    let err_str = |e: StorageError| e.to_string();
+    Arc::new(move |params: Value| {
+        let storage = storage.clone();
+        Box::pin(async move {
+            let session_id = opt_string(&params, "session_id")
+                .ok_or_else(|| "session_id is required".to_string())?;
+            let items: Vec<(String, String)> = params
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|item| {
+                            (
+                                item.get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                item.get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("pending")
+                                    .to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let imported = storage
+                .tasks()
+                .import_v01(&session_id, &items)
+                .await
+                .map_err(err_str)?;
+            info!(session_id = %session_id, imported, "Migrated v0.1 todo JSON into task store");
+            Ok(json!({ "imported": imported }))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,8 +1530,10 @@ pub struct AgentStepRunner {
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
-/// contract (`MessageDelta` / `ToolStart` / `ToolEnd`), so a long-horizon run
-/// renders in the transcript with no protocol change on the GUI side.
+/// contract (`MessageDelta` / `ToolStart` / `ToolEnd`).
+///
+/// A long-horizon run therefore renders in the transcript with no protocol
+/// change on the GUI side.
 ///
 /// When `run` is set (chat-backed runs), every callback ALSO fills the
 /// registered [`crate::agent_service::ExternalRunHandle`] buffers, which is
@@ -1695,8 +1738,8 @@ impl ChatSink {
             let session_id = self.session_id.clone();
             // Recording is async and this callback is sync — hand it off.
             tokio::spawn(async move {
-                if let Some(storage) = storage {
-                    if let Err(e) = storage
+                if let Some(storage) = storage
+                    && let Err(e) = storage
                         .log_tool_call(&nanna_storage::NewToolCall {
                             tool_name: &observation.tool_name,
                             success: observation.success,
@@ -1707,9 +1750,8 @@ impl ChatSink {
                             session_id: Some(&session_id),
                         })
                         .await
-                    {
-                        tracing::warn!("Failed to log tool call to DB: {e}");
-                    }
+                {
+                    tracing::warn!("Failed to log tool call to DB: {e}");
                 }
                 stats.record(observation).await;
             });
@@ -1731,6 +1773,39 @@ impl ChatSink {
     /// `ActiveChat`, and `ExternalRunHandle` — this path's only handle on that
     /// state — does not expose them; when it does, they belong here beside the
     /// event.
+    /// Wire a harness step's text, thinking, tool and usage streams into this
+    /// sink.
+    ///
+    /// The live context gauge rides along: the step path never set
+    /// `on_usage`, so the ONLY emitter of `ContextUsage` sat in the retired
+    /// in-service chat path: every client's meter read 0 of 0 for the whole
+    /// run while the daemon recomputed the real figures on every request (59
+    /// of 59 captured run-state snapshots, 56 of them mid-run).
+    fn attach_stream_callbacks(&self, options: &mut nanna_agent::RunOptions) {
+        let text_sink = self.clone();
+        let think_sink = self.clone();
+        let start_sink = self.clone();
+        let end_sink = self.clone();
+        options.on_text = Some(Box::new(move |chunk: &str| text_sink.delta(chunk)));
+        options.on_thinking = Some(Box::new(move |chunk: &str| think_sink.thinking(chunk)));
+        options.on_tool_start = Some(Box::new(
+            move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
+                start_sink.tool_start(call_id, name, input, model);
+            },
+        ));
+        options.on_tool_end = Some(Box::new(
+            move |call_id: &str,
+                  name: &str,
+                  output: &str,
+                  success: bool,
+                  duration_ms: u64,
+                  data: Option<&Value>| {
+                end_sink.tool_end(call_id, name, output, success, duration_ms, data);
+            },
+        ));
+        options.on_usage = Some(self.usage_callback());
+    }
+
     fn usage_callback(&self) -> Box<dyn Fn(u32, u32, u64) + Send + Sync> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
@@ -2324,10 +2399,10 @@ fn wedge_reset_due(
     }
     // Same token, same abort point: the retry re-entered the same wedge, so
     // the free first retry is not buying evidence — it already arrived.
-    if let (Some(cur), Some(prev)) = (current, previous) {
-        if cur.is_repeat_of(prev) {
-            return Some(WedgeReset::Confirmed);
-        }
+    if let (Some(cur), Some(prev)) = (current, previous)
+        && cur.is_repeat_of(prev)
+    {
+        return Some(WedgeReset::Confirmed);
     }
     // Otherwise the original rule: reset once the fault has repeated at all.
     // This still covers "empty completion", which has no fingerprint to
@@ -2485,110 +2560,12 @@ impl StepRunner for AgentStepRunner {
         let mut cur_wedge: Option<WedgeFingerprint> = None;
         let mut prev_wedge: Option<WedgeFingerprint> = None;
         for attempt in 0..=STEP_LLM_RETRIES {
-            if attempt > 0 {
-                // Stop pressed while the failed attempt ran: don't sleep out
-                // a backoff and burn a whole fresh step after the user asked
-                // to abort.
-                if request
-                    .cancel
-                    .as_ref()
-                    .is_some_and(CancelToken::is_cancelled)
-                {
-                    return Err(last_err);
-                }
-                tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
-                let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
-                let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
-                // A Stop arriving mid-backoff aborts the sleep too — the
-                // user is not waiting on a retry they just cancelled.
-                if let Some(token) = request.cancel.as_ref() {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => return Err(last_err),
-                        () = sleep => {}
-                    }
-                } else {
-                    sleep.await;
-                }
-                // A WEDGED runner does not recover by being asked again: its
-                // state has to be cleared. Retrying one three times against
-                // the same wedge is how a run dies — observed 2026-07-27,
-                // 17 repetition aborts collapsing into back-to-back
-                // attempt=1,2,3 failures until the run ended.
-                //
-                // Two ways in. The fingerprint says this abort IS the last
-                // one (same stuck token, same abort point), which is already
-                // the evidence a retry would have bought — so act now.
-                // Failing that, the original ladder: reset from the SECOND
-                // retry, by which point the fault has repeated once, leaving
-                // the first retry free for a genuinely transient drop.
-                if let Some(reason) =
-                    wedge_reset_due(attempt, &last_err, cur_wedge.as_ref(), prev_wedge.as_ref())
-                {
-                    tracing::warn!(
-                        attempt,
-                        ?reason,
-                        "wedged runner — resetting it before the next attempt"
-                    );
-                    self.reset_ollama_runner().await;
-                }
-                // Out of VRAM: reset on EVERY fault (reloading at the same
-                // size is the blip fix), demote only once the fault REPEATS
-                // within the run (shrinking is the repeat fix) — see
-                // `gpu_fault_action` for why the first fault gets tolerance
-                // the old code denied it. The demotion is clamped to the
-                // run's measured minimum viable window, so a fault can never
-                // be "healed" into a size the floor check refuses.
-                if gpu_memory_error(&last_err) {
-                    let fault = self
-                        .gpu_fault_count
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
-                    match gpu_fault_action(fault) {
-                        GpuFaultAction::ResetOnly => {
-                            tracing::warn!(
-                                gpu_faults = fault,
-                                "first GPU memory fault of this run — resetting \
-                                 the runner at the SAME size; a single fault at \
-                                 a sane starting pin is a load blip until a \
-                                 second fault proves otherwise"
-                            );
-                        }
-                        GpuFaultAction::ResetAndDemote => {
-                            // The clamp: the smallest window THIS run's steps
-                            // stay viable in (pressure-tier floor solved for
-                            // the window).
-                            let floor = nanna_agent::min_viable_num_ctx(
-                                &self.tools,
-                                &self.system_prompt,
-                                self.workspace_context.as_deref(),
-                                self.workspace_root.as_deref(),
-                                &request.prompt,
-                                self.agent_config.max_tokens as usize,
-                            )
-                            .await;
-                            // demote_context announces old → new and
-                            // clamped-or-not; `None` means the latch already
-                            // sits at the floor — the retry then reloads at
-                            // the same size and, if the fault persists, the
-                            // existing loud below-floor/fault failure
-                            // surfaces (resumable) instead of a manufactured
-                            // unusable window.
-                            let demoted = nanna_llm::LlmClient::demote_context(
-                                &self.agent_config.model,
-                                Some(floor),
-                            );
-                            tracing::warn!(
-                                gpu_faults = fault,
-                                min_viable_ctx = floor,
-                                demoted_to = ?demoted,
-                                "repeat GPU memory fault — demotion ladder engaged"
-                            );
-                        }
-                    }
-                    // The reset rides along on every fault, demoted or not.
-                    self.reset_ollama_runner().await;
-                }
+            if attempt > 0
+                && !self
+                    .prepare_retry(&request, attempt, &last_err, cur_wedge.as_ref(), prev_wedge.as_ref())
+                    .await
+            {
+                return Err(last_err);
             }
             // A fresh context per attempt: the re-anchor makes retries free —
             // there is no partial transcript worth salvaging. After a
@@ -2694,6 +2671,127 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Get ready for retry `attempt` of a step: honour a Stop, back off, and
+    /// clear a wedged or out-of-memory runner. Returns `false` when the user
+    /// cancelled, in which case the step ends with the last error.
+    async fn prepare_retry(
+        &self,
+        request: &StepRequest,
+        attempt: usize,
+        last_err: &str,
+        cur_wedge: Option<&WedgeFingerprint>,
+        prev_wedge: Option<&WedgeFingerprint>,
+    ) -> bool {
+        // Stop pressed while the failed attempt ran: don't sleep out
+        // a backoff and burn a whole fresh step after the user asked
+        // to abort.
+        if request
+            .cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            return false;
+        }
+        tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
+        let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
+        // A Stop arriving mid-backoff aborts the sleep too — the
+        // user is not waiting on a retry they just cancelled.
+        if let Some(token) = request.cancel.as_ref() {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return false,
+                () = sleep => {}
+            }
+        } else {
+            sleep.await;
+        }
+        // A WEDGED runner does not recover by being asked again: its
+        // state has to be cleared. Retrying one three times against
+        // the same wedge is how a run dies — observed 2026-07-27,
+        // 17 repetition aborts collapsing into back-to-back
+        // attempt=1,2,3 failures until the run ended.
+        //
+        // Two ways in. The fingerprint says this abort IS the last
+        // one (same stuck token, same abort point), which is already
+        // the evidence a retry would have bought — so act now.
+        // Failing that, the original ladder: reset from the SECOND
+        // retry, by which point the fault has repeated once, leaving
+        // the first retry free for a genuinely transient drop.
+        if let Some(reason) = wedge_reset_due(attempt, last_err, cur_wedge, prev_wedge) {
+            tracing::warn!(
+                attempt,
+                ?reason,
+                "wedged runner — resetting it before the next attempt"
+            );
+            self.reset_ollama_runner().await;
+        }
+        // Out of VRAM: reset on EVERY fault (reloading at the same
+        // size is the blip fix), demote only once the fault REPEATS
+        // within the run (shrinking is the repeat fix) — see
+        // `gpu_fault_action` for why the first fault gets tolerance
+        // the old code denied it. The demotion is clamped to the
+        // run's measured minimum viable window, so a fault can never
+        // be "healed" into a size the floor check refuses.
+        if gpu_memory_error(last_err) {
+            self.handle_gpu_fault(request).await;
+        }
+        true
+    }
+
+    /// One GPU memory fault: reset the runner, and demote the context window
+    /// once the fault repeats within the run.
+    async fn handle_gpu_fault(&self, request: &StepRequest) {
+        let fault = self
+            .gpu_fault_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        match gpu_fault_action(fault) {
+            GpuFaultAction::ResetOnly => {
+                tracing::warn!(
+                    gpu_faults = fault,
+                    "first GPU memory fault of this run — resetting \
+                     the runner at the SAME size; a single fault at \
+                     a sane starting pin is a load blip until a \
+                     second fault proves otherwise"
+                );
+            }
+            GpuFaultAction::ResetAndDemote => {
+                // The clamp: the smallest window THIS run's steps
+                // stay viable in (pressure-tier floor solved for
+                // the window).
+                let floor = nanna_agent::min_viable_num_ctx(
+                    &self.tools,
+                    &self.system_prompt,
+                    self.workspace_context.as_deref(),
+                    self.workspace_root.as_deref(),
+                    &request.prompt,
+                    self.agent_config.max_tokens as usize,
+                )
+                .await;
+                // demote_context announces old → new and
+                // clamped-or-not; `None` means the latch already
+                // sits at the floor — the retry then reloads at
+                // the same size and, if the fault persists, the
+                // existing loud below-floor/fault failure
+                // surfaces (resumable) instead of a manufactured
+                // unusable window.
+                let demoted = nanna_llm::LlmClient::demote_context(
+                    &self.agent_config.model,
+                    Some(floor),
+                );
+                tracing::warn!(
+                    gpu_faults = fault,
+                    min_viable_ctx = floor,
+                    demoted_to = ?demoted,
+                    "repeat GPU memory fault — demotion ladder engaged"
+                );
+            }
+        }
+        // The reset rides along on every fault, demoted or not.
+        self.reset_ollama_runner().await;
+    }
+
     /// The re-anchor's concrete half: the side-effecting calls the
     /// INTERRUPTED ATTEMPT made, read from the P22 Tier 4 liveness ledger and
     /// bounded by a share of this model's live input budget.
@@ -2924,11 +3022,42 @@ impl AgentStepRunner {
         reset_ollama_runner_for(&self.agent_config.model).await;
     }
 
+    /// The agent for one step: the runner's config with a step-appropriate
+    /// temperature, bound to the provider that serves the model.
+    fn step_agent(
+        &self,
+        step_kind: nanna_agent::harness::StepKind,
+        context: nanna_agent::AgentContext,
+    ) -> Result<nanna_agent::Agent, StepAttemptError> {
+        let mut config = self.agent_config.clone();
+        // Execution/verification wants determinism (pass^k reliability on a
+        // small model); planning keeps the configured creative temperature.
+        if matches!(
+            step_kind,
+            nanna_agent::harness::StepKind::Execute | nanna_agent::harness::StepKind::Verify
+        ) {
+            config.temperature = config.temperature.min(0.3);
+        }
+        let model_display = config.model.clone();
+        let llm_client = self
+            .router
+            .client_for_model(&config.model)
+            .ok_or_else(|| format!("No provider available for model '{model_display}'"))?;
+        config.model = LlmRouter::strip_model_prefix(&config.model);
+
+        let mut agent = nanna_agent::Agent::new(config, llm_client, self.tools.clone())
+            .with_context(context);
+        if let Some(tracker) = &self.stats {
+            agent = agent.with_stats(tracker.clone());
+        }
+        Ok(agent)
+    }
+
     async fn try_run_step(
         &self,
         request: &StepRequest,
     ) -> Result<StepOutcome, StepAttemptError> {
-        use nanna_agent::{Agent, AgentContext, RunOptions};
+        use nanna_agent::{AgentContext, RunOptions};
 
         // Name the item before its output starts arriving, so a multi-step
         // run reads as a sequence of labelled pieces of work rather than one
@@ -2947,26 +3076,7 @@ impl AgentStepRunner {
         }
         self.seed_verified_outcomes(&mut context).await;
 
-        let mut config = self.agent_config.clone();
-        // Execution/verification wants determinism (pass^k reliability on a
-        // small model); planning keeps the configured creative temperature.
-        if matches!(
-            request.step_kind,
-            nanna_agent::harness::StepKind::Execute | nanna_agent::harness::StepKind::Verify
-        ) {
-            config.temperature = config.temperature.min(0.3);
-        }
-        let model_display = config.model.clone();
-        let llm_client = self
-            .router
-            .client_for_model(&config.model)
-            .ok_or_else(|| format!("No provider available for model '{model_display}'"))?;
-        config.model = LlmRouter::strip_model_prefix(&config.model);
-
-        let mut agent = Agent::new(config, llm_client, self.tools.clone()).with_context(context);
-        if let Some(tracker) = &self.stats {
-            agent = agent.with_stats(tracker.clone());
-        }
+        let agent = self.step_agent(request.step_kind, context)?;
 
         // The plan's `tool_scope` does NOT gate anything. It is a guess made
         // before the work started, and every time it has been enforced it has
@@ -2996,46 +3106,7 @@ impl AgentStepRunner {
         };
         let restrict_to_active = true;
 
-        // Show the work as it happens: the step's text, thinking, and tool
-        // activity stream through the same events a plain chat turn uses,
-        // and fill the registered run buffers for recovery/persistence.
-        let (on_text, on_thinking, on_tool_start, on_tool_end, on_usage) = match &self.chat_sink {
-            None => (None, None, None, None, None),
-            Some(sink) => {
-                let text_sink = sink.clone();
-                let think_sink = sink.clone();
-                let start_sink = sink.clone();
-                let end_sink = sink.clone();
-                (
-                    Some(Box::new(move |chunk: &str| text_sink.delta(chunk))
-                        as Box<dyn Fn(&str) + Send + Sync>),
-                    Some(Box::new(move |chunk: &str| think_sink.thinking(chunk))
-                        as Box<dyn Fn(&str) + Send + Sync>),
-                    Some(Box::new(
-                        move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
-                            start_sink.tool_start(call_id, name, input, model);
-                        },
-                    )
-                        as Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>),
-                    Some(Box::new(
-                        move |call_id: &str,
-                              name: &str,
-                              output: &str,
-                              success: bool,
-                              duration_ms: u64,
-                              data: Option<&Value>| {
-                            end_sink.tool_end(call_id, name, output, success, duration_ms, data);
-                        },
-                    )
-                        as Box<
-                            dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync,
-                        >),
-                    Some(sink.usage_callback()),
-                )
-            }
-        };
-
-        let options = RunOptions {
+        let mut options = RunOptions {
             max_iterations: request.max_iterations,
             token_budget: request.token_budget,
             max_wall_clock: request.max_wall_clock,
@@ -3066,16 +3137,6 @@ impl AgentStepRunner {
                 ..nanna_agent::ToolActivation::default()
             },
             is_sub_agent: true,
-            on_text,
-            on_thinking,
-            on_tool_start,
-            on_tool_end,
-            // The live context gauge. This path never set `on_usage`, so the
-            // ONLY emitter of `ContextUsage` sat in the retired in-service
-            // chat path: every client's meter read 0 of 0 for the whole run
-            // while the daemon recomputed the real figures on every request
-            // (59 of 59 captured run-state snapshots, 56 of them mid-run).
-            on_usage,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
             // Capability transitions (provider benched, writes queued) reach
@@ -3083,6 +3144,12 @@ impl AgentStepRunner {
             degradations: self.degradations.clone(),
             ..Default::default()
         };
+        // Show the work as it happens: the step's text, thinking, and tool
+        // activity stream through the same events a plain chat turn uses,
+        // and fill the registered run buffers for recovery/persistence.
+        if let Some(sink) = &self.chat_sink {
+            sink.attach_stream_callbacks(&mut options);
+        }
 
         let result = agent
             .run(&request.prompt, options)
@@ -3130,10 +3197,10 @@ impl AgentStepRunner {
         // acceptance references triggers an immediate re-check of that item.
         let mut touched_paths: Vec<String> = Vec::new();
         for record in &result.tool_calls {
-            if let Some(path) = touched_path_of(&record.name, &record.input) {
-                if !touched_paths.contains(&path) {
-                    touched_paths.push(path);
-                }
+            if let Some(path) = touched_path_of(&record.name, &record.input)
+                && !touched_paths.contains(&path)
+            {
+                touched_paths.push(path);
             }
         }
 
@@ -3284,6 +3351,12 @@ impl AgentPlanner {
 /// the user speaking mid-run outranks anything already planned - and (b)
 /// must not be outranked by an item the harness already marked `in_progress`
 /// - see `SessionInterjector::yield_current_item`.
+///
+/// # Errors
+///
+/// Returns an error when the scope's existing tasks cannot be listed, or when
+/// not one planned task could be created (an empty plan included). Individual
+/// rejected tasks are logged and skipped while at least one lands.
 pub async fn seed_plan(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3299,8 +3372,9 @@ pub async fn seed_plan(
         .list(scope, scope_id, false)
         .await
         .map_err(|e| e.to_string())?;
-    let base_sort =
-        existing.iter().map(|t| t.sort_order).min().unwrap_or(0) - plan.tasks.len() as i64 - 1;
+    let base_sort = existing.iter().map(|t| t.sort_order).min().unwrap_or(0)
+        - crate::numeric::i64_saturating(plan.tasks.len())
+        - 1;
 
     let mut ids = Vec::with_capacity(plan.tasks.len());
     for (index, task) in plan.tasks.iter().enumerate() {
@@ -3321,7 +3395,7 @@ pub async fn seed_plan(
             depends_on: Vec::new(),
             acceptance: task.acceptance.clone(),
             assignee: None,
-            sort_order: base_sort + index as i64,
+            sort_order: base_sort + crate::numeric::i64_saturating(index),
         };
         match repo.create(new).await {
             Ok(created) => ids.push(created.id),
@@ -3430,6 +3504,10 @@ pub fn same_title(a: &str, b: &str) -> bool {
 /// "work this turn already did". An id snapshot rather than a timestamp bound
 /// because a cancelled task carries no completion stamp and the store's
 /// datetime strings would need parsing — set difference is exact.
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed.
 pub async fn closed_task_ids(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3458,11 +3536,15 @@ pub async fn closed_task_ids(
 /// Returns whole tasks rather than titles so the one caller that must NAME
 /// what it refused (`tasks.add`, whose notice cites the settled task's id and
 /// verdict) does not need a second query with a second chance to drift.
-pub async fn tasks_closed_since(
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed.
+pub async fn tasks_closed_since<S: std::hash::BuildHasher + Sync>(
     storage: &Arc<Storage>,
     scope: &str,
     scope_id: Option<&str>,
-    baseline: &HashSet<i64>,
+    baseline: &HashSet<i64, S>,
 ) -> Result<Vec<Task>, String> {
     Ok(storage
         .tasks()
@@ -3596,12 +3678,18 @@ pub fn closed_this_turn_notice(title: &str, status: &str) -> String {
 /// BEFORE the turn never filter — a user may legitimately re-ask yesterday's
 /// question — and genuinely new titles (decomposed subtasks, next features)
 /// seed exactly as before.
-pub async fn seed_continuation(
+///
+/// # Errors
+///
+/// Returns an error when the scope's tasks cannot be listed, or — once at
+/// least one proposed task survives the filter — when [`seed_plan`] fails.
+/// A plan whose every task was already closed this turn is `Ok` and empty.
+pub async fn seed_continuation<S: std::hash::BuildHasher + Sync>(
     storage: &Arc<Storage>,
     scope: &str,
     scope_id: Option<&str>,
     plan: &Plan,
-    closed_before_turn: &HashSet<i64>,
+    closed_before_turn: &HashSet<i64, S>,
 ) -> Result<Vec<i64>, String> {
     let closed_this_turn = tasks_closed_since(storage, scope, scope_id, closed_before_turn).await?;
     let fresh: Vec<_> = plan
@@ -3655,6 +3743,12 @@ pub async fn seed_continuation(
 /// carrying over a hundred each.
 ///
 /// Returns how many items were demoted.
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed
+/// or an item cannot be updated; items demoted before the failure stay
+/// demoted.
 pub async fn demote_in_progress(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3689,8 +3783,8 @@ pub async fn demote_in_progress(
 
 /// Messages held for one session before admission.
 ///
-/// Bound justification: these are messages a human typed while watching a run
-/// - an unbounded queue here is a memory leak fed by a stuck run. 64 is far
+/// Bound justification: these are messages a human typed while watching a run —
+/// an unbounded queue here is a memory leak fed by a stuck run. 64 is far
 /// past any realistic burst of human typing between two step boundaries, and
 /// overflow drops the OLDEST so the most recent intent always survives.
 pub const PENDING_MESSAGES_MAX: usize = 64;
@@ -5999,7 +6093,7 @@ mod tests {
 
     /// REGRESSION (P19 live drive, 2026-07-24): tool calls vanished when the
     /// user navigated away mid-run, because the harness streamed events only —
-    /// `get_run_state` recovery reads the ActiveChat buffers, and nothing was
+    /// `get_run_state` recovery reads the `ActiveChat` buffers, and nothing was
     /// filling them. Every sink callback must land in the shared run handle,
     /// not just on the event bus.
     #[tokio::test]
@@ -6029,6 +6123,7 @@ mod tests {
             assert_eq!(done[0].name, "exec");
             assert_eq!(done[0].output, "file.txt");
             assert!(done[0].success);
+            drop(done);
         }
 
         // And the journal persisted with the final message: text merged per
@@ -6303,6 +6398,16 @@ pub struct RunStatus {
     pub resumes: usize,
 }
 
+/// What a long-horizon run works on: the goal, the plan it drains, the runner
+/// that executes each step, the run's bounds, and the directory it runs in.
+pub struct TaskRunSpec {
+    pub goal: String,
+    pub source: TursoTaskSource,
+    pub runner: AgentStepRunner,
+    pub config: LongHorizonConfig,
+    pub workdir: PathBuf,
+}
+
 /// Starts, cancels, and reports background long-horizon runs — one per scope
 /// key at a time (the store serializes the plan; two runners over one plan
 /// would race `next()`).
@@ -6323,7 +6428,10 @@ impl TaskRunManager {
     }
 
     /// Spawn a background run. Errors if one is already active for the scope.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a run is already active for the source's scope.
     pub async fn start(
         self: &Arc<Self>,
         goal: String,
@@ -6333,24 +6441,26 @@ impl TaskRunManager {
         workdir: PathBuf,
         event_tx: tokio::sync::broadcast::Sender<Event>,
     ) -> Result<(), String> {
-        self.start_with_interjector(goal, source, runner, config, workdir, event_tx, None)
-            .await
+        let spec = TaskRunSpec { goal, source, runner, config, workdir };
+        self.start_with_interjector(spec, event_tx, None).await
     }
 
     /// [`Self::start`], plus the hook that lets user messages join this run
     /// at a step boundary instead of queueing behind it. Chat-backed runs
     /// always pass one; background runs do not.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a run is already active for the source's scope, or
+    /// when the run registered here is gone again before its cancel token can
+    /// be read back.
     pub async fn start_with_interjector(
         self: &Arc<Self>,
-        goal: String,
-        source: TursoTaskSource,
-        runner: AgentStepRunner,
-        config: LongHorizonConfig,
-        workdir: PathBuf,
+        spec: TaskRunSpec,
         event_tx: tokio::sync::broadcast::Sender<Event>,
         interjector: Option<Arc<SessionInterjector>>,
     ) -> Result<(), String> {
+        let TaskRunSpec { goal, source, runner, config, workdir } = spec;
         let key = Self::scope_key(&source.scope, source.scope_id.as_deref());
         {
             let mut runs = self.runs.write().await;
@@ -6475,8 +6585,13 @@ impl TaskRunManager {
     pub async fn status(&self, scope: &str, scope_id: Option<&str>) -> RunStatus {
         let key = Self::scope_key(scope, scope_id);
         let runs = self.runs.read().await;
-        let reports = self.reports.read().await;
-        let (last_report, resumes) = reports
+        // `runs` is held first and throughout: a finishing run removes itself
+        // from `runs` before recording its report, so while this guard is held
+        // the report for this key cannot change and needs no guard of its own.
+        let (last_report, resumes) = self
+            .reports
+            .read()
+            .await
             .get(&key)
             .map_or((None, 0), |(report, resumes)| (Some(report.clone()), *resumes));
         runs.get(&key).map_or_else(
@@ -6636,7 +6751,7 @@ mod session_scope_tests {
             .with_services(services)
     }
 
-    /// The shape a run WITH a bound session emits: scope and session_id both
+    /// The shape a run WITH a bound session emits: scope and `session_id` both
     /// present, straight from `Nanna.sessionId()`. It lands in that session.
     #[tokio::test]
     async fn the_todo_tools_bound_session_params_land_in_that_session() {
@@ -6668,7 +6783,7 @@ mod session_scope_tests {
     /// The shape a SESSION-LESS run emits on `next`/`list`: `session_id` is
     /// present but null, because `Nanna.sessionId()` returned null and `base`
     /// is not compacted. It must fail with a message that names every way out
-    /// — restating "requires session_id" is precisely what the model could not
+    /// — restating "requires `session_id`" is precisely what the model could not
     /// act on across 35 logged failures.
     #[tokio::test]
     async fn a_null_session_id_is_told_how_to_supply_a_scope() {
@@ -7100,7 +7215,7 @@ mod retry_note_tests {
         let one = carried_side_effect_note(&marks(1), carried_side_effect_budget_bytes(27_904), true);
         assert!(one.contains("1 side-effecting tool call before"), "{one}");
 
-        assert!(carried_side_effect_note(&[], 2_000, true).is_empty());
+        assert_eq!(carried_side_effect_note(&[], 2_000, true), "");
 
         // A run with no memory service never stored those outputs, so the
         // note must not send the model looking for them — it keeps the half

@@ -162,6 +162,9 @@ impl ChannelManager {
             } else {
                 info!("Slack Socket Mode listener configured");
             }
+            // Last listener: the outbound registration below needs only the
+            // router, which stays locked to the end of `configure`.
+            drop(lm);
 
             // Register outbound channel
             router.register(
@@ -191,6 +194,11 @@ impl ChannelManager {
     }
 
     /// Start processing incoming messages
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listener manager's inbound receiver was
+    /// already taken — i.e. this manager has been started before.
     pub async fn start(&mut self) -> Result<(), String> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -294,8 +302,7 @@ impl ChannelManager {
             let _ = tx.send(()).await;
         }
         
-        let mut lm = self.listener_manager.write().await;
-        lm.stop_all().await;
+        self.listener_manager.write().await.stop_all().await;
         info!("All channel listeners stopped");
     }
 
@@ -306,6 +313,11 @@ impl ChannelManager {
     }
 
     /// Send a message through a channel
+    ///
+    /// # Errors
+    ///
+    /// Returns the router's error as text: no outbound channel is registered
+    /// for `channel.provider`, or the provider's own send failed.
     pub async fn send(&self, channel: ChannelId, content: MessageContent) -> Result<String, String> {
         let router = self.router.read().await;
         router

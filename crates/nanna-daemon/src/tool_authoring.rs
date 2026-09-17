@@ -53,12 +53,12 @@ fn resolve_tool_dir(tools_dir: &Path, name: &str) -> Result<PathBuf, String> {
 
     // A validated name cannot traverse, but the directory it points at can
     // still be a symlink somebody else planted.
-    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "'{name}' is a symlink; refusing to write through it"
-            ));
-        }
+    if let Ok(meta) = std::fs::symlink_metadata(&dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "'{name}' is a symlink; refusing to write through it"
+        ));
     }
     Ok(dir)
 }
@@ -171,9 +171,10 @@ async fn register_live(
 /// is loaded with the same services every bundled skill gets — without the
 /// slot it would silently be the only tool in the daemon that cannot call one,
 /// and the map cannot contain a closure that captures the finished map.
-#[allow(
+#[expect(
     clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
+    reason = "the slot is read back into `ToolRegistry::load_skills_with_services`, \
+              which takes the default-hasher map, so a generic hasher cannot flow through"
 )]
 pub fn build_tool_authoring_services(
     tools_dir: PathBuf,

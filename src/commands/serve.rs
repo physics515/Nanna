@@ -180,7 +180,9 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
 /// Run the daemon server (background mode)
 pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     use nanna_daemon::agent_service::AgentServiceConfig;
-    use nanna_daemon::server::{EmbeddingConfig, LlmConfig};
+    use nanna_daemon::server::{
+        EmbeddingConfig, LlmConfig, SchedulerSwitches, ServerSwitches, ToolAuditSwitches,
+    };
     use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};
 
     // Configure daemon
@@ -211,10 +213,12 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         },
         agent: AgentServiceConfig::default(),
         enable_memory: true,
-        enable_health_server: true,
+        servers: ServerSwitches {
+            health: true,
+            pid_file: true,
+            webhook: false,
+        },
         health_port: 5148,
-        enable_pid_file: true,
-        enable_webhook_server: false,
         webhook_port: 3000,
         webhook: WebhookConfig::default(),
         use_script_tools: config.tools.use_script_tools,
@@ -223,8 +227,10 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         vision_model_priority: config.memory.ocr_model_priority.clone(),
         tool_allowlist: Some(config.tools.enabled.clone()),
         tool_denylist: config.tools.disabled.clone(),
-        tool_audit_log: config.tools.audit_log,
-        tool_audit_log_values: config.tools.audit_log_values,
+        tool_audit: ToolAuditSwitches {
+            log: config.tools.audit_log,
+            log_values: config.tools.audit_log_values,
+        },
         // Legacy single-binary path: channels are not started here (matches the
         // field's Default). The daemon path wires channel config separately.
         channels: None,
@@ -232,9 +238,11 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         memory_min_remaining_memories: config.memory.min_remaining_memories,
         dream_idle_threshold_secs: config.memory.dream_idle_threshold_secs,
         dream_memory_pressure_count: config.memory.dream_memory_pressure_count,
-        scheduler_enabled: config.scheduler.enabled,
-        heartbeat_enabled: config.scheduler.heartbeat_enabled,
-        heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
+        scheduler: SchedulerSwitches {
+            enabled: config.scheduler.enabled,
+            heartbeat_enabled: config.scheduler.heartbeat_enabled,
+            heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
+        },
     };
 
     info!("Initializing daemon server...");
