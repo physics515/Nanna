@@ -3061,7 +3061,10 @@ impl AgentStepRunner {
             // `explore {}` calls, 3 short-circuits).
             repeat_ledger: Some(Arc::clone(&self.repeat_ledger)),
             initial_active_tools: active,
-            restrict_to_active_tools: restrict_to_active,
+            tool_activation: nanna_agent::ToolActivation {
+                restrict_to_active_tools: restrict_to_active,
+                ..nanna_agent::ToolActivation::default()
+            },
             is_sub_agent: true,
             on_text,
             on_thinking,

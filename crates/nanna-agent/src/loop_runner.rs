@@ -670,6 +670,38 @@ impl DegradationLedger {
     }
 }
 
+/// What a run analyzes about its conversation beyond producing the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunAnalysis {
+    /// Auto-extract memories after each run
+    pub auto_extract_memories: bool,
+    /// Enable uncertainty/confidence tracking
+    pub track_uncertainty: bool,
+    /// Enable emotional context analysis
+    pub track_emotions: bool,
+}
+
+/// Which tools a run starts with active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolActivation {
+    /// If true, all registered tools are available from iteration 1 (skip `discover_tools`).
+    /// Used for sub-agents that have a specific task and shouldn't waste a turn on discovery.
+    pub all_tools_active: bool,
+    /// Start from `RunOptions::initial_active_tools` instead of the full core
+    /// set — dropping the memory trio (`remember` / `recall` / `reflect`),
+    /// which is noise during an execution step and measurably costs a small
+    /// model accuracy.
+    ///
+    /// **This never gates capability.** `discover_tools` is sent on every
+    /// request regardless of this flag, so the model can always pull in any
+    /// tool in the registry the moment it needs one. A scope is a starting
+    /// set, not a cage — see [`DISCOVERY_TOOL_NAME`].
+    ///
+    /// Ignored when the scope is empty (nothing to start from) or
+    /// `all_tools_active` is set.
+    pub restrict_to_active_tools: bool,
+}
+
 /// Options for running the agent
 #[derive(Default)]
 pub struct RunOptions {
@@ -681,14 +713,12 @@ pub struct RunOptions {
     pub on_text: Option<StreamCallback>,
     /// Callback for streaming thinking/reasoning (called with each thinking chunk)
     pub on_thinking: Option<ThinkingCallback>,
-    /// Auto-extract memories after each run
-    pub auto_extract_memories: bool,
-    /// Callback for storing extracted memories (required if `auto_extract_memories` is true)
+    /// What the run analyzes beyond its answer: memory extraction,
+    /// confidence, emotional context.
+    pub analysis: RunAnalysis,
+    /// Callback for storing extracted memories (required if
+    /// `analysis.auto_extract_memories` is true)
     pub on_memory: Option<MemoryCallback>,
-    /// Enable uncertainty/confidence tracking
-    pub track_uncertainty: bool,
-    /// Enable emotional context analysis
-    pub track_emotions: bool,
     /// Override thinking mode for this run
     pub thinking_mode: Option<ThinkingMode>,
     /// Token budget for this run (total input + output tokens allowed)
@@ -715,9 +745,8 @@ pub struct RunOptions {
     /// If true, this is a sub-agent run. Nudge thresholds are lowered
     /// (start at 20 instead of 50) since sub-agents should be focused tasks.
     pub is_sub_agent: bool,
-    /// If true, all registered tools are available from iteration 1 (skip `discover_tools`).
-    /// Used for sub-agents that have a specific task and shouldn't waste a turn on discovery.
-    pub all_tools_active: bool,
+    /// Which tools the run starts with active (see [`ToolActivation`]).
+    pub tool_activation: ToolActivation,
     /// Step-kind hint for model routing (P14 harness runs). Plan/replan steps
     /// deserve the biggest model, verification a mid model, execution the
     /// cheap local path. None = classic structural heuristic.
@@ -725,21 +754,8 @@ pub struct RunOptions {
     /// Tools to pre-activate for this run on top of the core set (P14
     /// per-item tool scoping: the active set is the current task's `tools:`
     /// hint, not the whole registry — small models degrade past 5-10
-    /// definitions). Ignored when `all_tools_active` is set.
+    /// definitions). Ignored when `tool_activation.all_tools_active` is set.
     pub initial_active_tools: Vec<String>,
-    /// Start from `initial_active_tools` instead of the full core set —
-    /// dropping the memory trio (`remember` / `recall` / `reflect`), which is
-    /// noise during an execution step and measurably costs a small model
-    /// accuracy.
-    ///
-    /// **This never gates capability.** `discover_tools` is sent on every
-    /// request regardless of this flag, so the model can always pull in any
-    /// tool in the registry the moment it needs one. A scope is a starting
-    /// set, not a cage — see [`DISCOVERY_TOOL_NAME`].
-    ///
-    /// Ignored when the scope is empty (nothing to start from) or
-    /// `all_tools_active` is set.
-    pub restrict_to_active_tools: bool,
     /// Wall-clock budget for this run (P14 bounded blast radius).
     /// Exceeding it ends the run with `truncated = true`.
     pub max_wall_clock: Option<std::time::Duration>,
@@ -4194,7 +4210,7 @@ impl Agent {
         self.add_user_message_with_budget(message, &options).await;
 
         // Pre-activate all tools for sub-agents so they don't waste a turn on discover_tools
-        if options.all_tools_active {
+        if options.tool_activation.all_tools_active {
             let all_names = self.tools.tool_names().await;
             for name in all_names {
                 state.active_tools.insert(name);
@@ -4277,7 +4293,7 @@ impl Agent {
                     .await;
                 } else if state.iterations > max {
                     // Extract memories before bailing — don't lose a long run's knowledge
-                    if options.auto_extract_memories
+                    if options.analysis.auto_extract_memories
                         && let Some(ref on_memory) = options.on_memory
                             && let Ok(memories) = self.extract_memories().await {
                                 for memory in memories {
@@ -4393,7 +4409,7 @@ impl Agent {
             if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
                 && (state.iterations == 1 || window_shrink_note.is_some())
             {
-                let restrict = options.restrict_to_active_tools && !options.all_tools_active;
+                let restrict = options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active;
                 let mut floor = self.context_floor(&state.active_tools, restrict).await;
                 if configured_window < floor.total() {
                     // Before giving up, try the PRESSURE tier: the floor's
@@ -4670,7 +4686,7 @@ impl Agent {
                 .build_request_with_thinking(
                     options.thinking_mode,
                     &state.active_tools,
-                    options.restrict_to_active_tools && !options.all_tools_active,
+                    options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
                 )
                 .await;
             // A planning step asks for one JSON answer and may not act:
@@ -4914,7 +4930,7 @@ impl Agent {
                 request.tools = self
                     .request_tool_defs(
                         &state.active_tools,
-                        options.restrict_to_active_tools && !options.all_tools_active,
+                        options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
                     )
                     .await;
                 result = self.call_llm(&request, &options, &mut state).await;
@@ -5314,10 +5330,10 @@ impl Agent {
                     if state.final_text.trim().is_empty() {
                         state.final_text = step_activity_digest(&state.tool_records);
                     }
-                    if options.track_uncertainty {
+                    if options.analysis.track_uncertainty {
                         state.confidence = Some(Self::analyze_confidence(&state.final_text));
                     }
-                    if options.auto_extract_memories
+                    if options.analysis.auto_extract_memories
                         && let Some(ref on_memory) = options.on_memory
                             && let Ok(memories) = self.extract_memories().await {
                                 for memory in memories {
@@ -5658,17 +5674,17 @@ impl Agent {
 
                 // Normal exit: no tool calls and not a narration loop
                 // Analyze uncertainty if enabled
-                if options.track_uncertainty {
+                if options.analysis.track_uncertainty {
                     state.confidence = Some(Self::analyze_confidence(&state.final_text));
                 }
 
                 // Analyze emotional context if enabled
-                if options.track_emotions {
+                if options.analysis.track_emotions {
                     state.emotional_context = self.analyze_emotions().await;
                 }
 
                 // Auto-extract memories if enabled
-                if options.auto_extract_memories
+                if options.analysis.auto_extract_memories
                     && let Some(ref on_memory) = options.on_memory
                         && let Ok(memories) = self.extract_memories().await {
                             for memory in memories {
@@ -5842,7 +5858,7 @@ impl Agent {
             }
 
             // Periodic memory extraction every 10 iterations
-            if options.auto_extract_memories && state.iterations > 0 && state.iterations.is_multiple_of(10)
+            if options.analysis.auto_extract_memories && state.iterations > 0 && state.iterations.is_multiple_of(10)
                 && let Some(ref on_memory) = options.on_memory {
                     info!(iteration = state.iterations, "Periodic memory extraction");
                     if let Ok(memories) = self.extract_memories().await {
@@ -6043,7 +6059,7 @@ impl Agent {
             }
         }
 
-        if options.auto_extract_memories
+        if options.analysis.auto_extract_memories
             && let Some(ref on_memory) = options.on_memory
                 && let Ok(memories) = self.extract_memories().await {
                     for memory in memories {
@@ -6445,7 +6461,7 @@ impl Agent {
                     );
                     let available = tool_names_for_request(
                         &state.active_tools,
-                        options.restrict_to_active_tools && !options.all_tools_active,
+                        options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
                     );
                     return Some(discovery_pause_notice(
                         state.task_anchor.as_deref(),
@@ -11480,7 +11496,10 @@ mod repeat_failure_breaker_tests {
                 "do the step",
                 RunOptions {
                     initial_active_tools: initial,
-                    restrict_to_active_tools: true,
+                    tool_activation: ToolActivation {
+                        restrict_to_active_tools: true,
+                        ..ToolActivation::default()
+                    },
                     max_iterations: Some(1),
                     ..RunOptions::default()
                 },
@@ -11550,7 +11569,10 @@ mod repeat_failure_breaker_tests {
                 "do the step",
                 RunOptions {
                     initial_active_tools: initial,
-                    restrict_to_active_tools: true,
+                    tool_activation: ToolActivation {
+                        restrict_to_active_tools: true,
+                        ..ToolActivation::default()
+                    },
                     max_iterations: Some(1),
                     ..RunOptions::default()
                 },
