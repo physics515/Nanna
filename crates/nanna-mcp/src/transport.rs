@@ -501,8 +501,10 @@ pub mod http {
         client: reqwest::Client,
         /// Pending requests
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
-        /// SSE connection active
-        connected: AtomicBool,
+        /// SSE connection active. Shared with the SSE task through an `Arc`:
+        /// the transport is returned by value after the task is spawned, so a
+        /// pointer to this field would dangle as soon as it moved.
+        connected: Arc<AtomicBool>,
         /// Message endpoint (typically /message or from SSE endpoint)
         message_endpoint: Arc<Mutex<Option<String>>>,
         /// Shutdown signal
@@ -533,7 +535,7 @@ pub mod http {
                 base_url: base_url.clone(),
                 client,
                 pending,
-                connected: AtomicBool::new(false),
+                connected: Arc::new(AtomicBool::new(false)),
                 message_endpoint,
                 shutdown_tx,
             };
@@ -543,17 +545,15 @@ pub mod http {
             let client_clone = transport.client.clone();
             let base_url_clone = base_url.clone();
             let message_endpoint_clone = transport.message_endpoint.clone();
-            let connected_ptr = &raw const transport.connected as usize;
-            
+            let connected = Arc::clone(&transport.connected);
+
             tokio::spawn(async move {
-                // Safety: we know the transport outlives this task due to the shutdown channel
-                let connected = unsafe { &*(connected_ptr as *const AtomicBool) };
                 Self::sse_task(
                     client_clone,
                     base_url_clone,
                     pending_clone,
                     message_endpoint_clone,
-                    connected,
+                    &connected,
                     shutdown_rx,
                 ).await;
             });
