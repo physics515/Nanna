@@ -486,6 +486,10 @@ impl DreamingService {
     }
 
     /// Apply pending feedback immediately (doesn't wait for dreaming)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no memory has `memory_id`.
     pub async fn apply_feedback(
         &self,
         memory_id: &str,
@@ -644,6 +648,12 @@ impl DreamingService {
     }
 
     /// Remember something (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`crate::MemoryService::remember`]: the store write
+    /// fails (e.g. a vector whose width does not match the store). A missing or
+    /// failing embedding provider is not an error.
     pub async fn remember(
         &self,
         content: &str,
@@ -653,11 +663,21 @@ impl DreamingService {
     }
 
     /// Recall memories (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NoEmbeddingProvider`] when no embedding function is
+    /// configured, and [`MemoryError::Io`] when embedding the query fails.
     pub async fn recall(&self, query: &str) -> Result<Vec<crate::RecallResult>, MemoryError> {
         self.memory.recall(query).await
     }
 
     /// Forget a memory (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no memory has `id`. Failing to
+    /// remove it from the persistence backend is logged, not returned.
     pub async fn forget(&self, id: &str) -> Result<(), MemoryError> {
         self.memory.forget(id).await
     }
@@ -668,11 +688,23 @@ impl DreamingService {
     }
 
     /// Save memories to file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Serialization`] when the entries cannot be encoded
+    /// and [`MemoryError::Io`] when the temporary file cannot be written or
+    /// renamed over `path`.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.memory.save(path).await
     }
 
     /// Load memories from file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Io`] when the file cannot be read and
+    /// [`MemoryError::Serialization`] when it is not a JSON array of memory
+    /// entries.
     pub async fn load(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.memory.load(path).await
     }

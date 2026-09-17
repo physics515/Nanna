@@ -8,6 +8,7 @@
 //! - Merges related memories
 //! - Respects a maximum compression ratio to avoid over-aggressive consolidation
 
+use crate::lossy::LossyF32;
 use crate::{MemoryEntry, FsrsParameters, FsrsState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -426,7 +427,7 @@ impl MemoryCluster {
         let centroid = Self::compute_centroid(&memories);
         let avg_weight = memories.iter()
             .map(|m| m.fsrs.weight(fsrs_params))
-            .sum::<f32>() / memories.len().max(1) as f32;
+            .sum::<f32>() / memories.len().max(1).lossy_f32();
         
         Self {
             memories,
@@ -453,7 +454,7 @@ impl MemoryCluster {
             }
         }
         
-        let count = memories.len() as f32;
+        let count = memories.len().lossy_f32();
         for val in &mut centroid {
             *val /= count;
         }
@@ -522,8 +523,8 @@ pub fn composite_cluster_score(
 
     // 2. Recall affinity: memories accessed a similar number of times are "peers"
     //    and memories both accessed recently are likely contextually related.
-    let recall_a = a.fsrs.access_count as f32;
-    let recall_b = b.fsrs.access_count as f32;
+    let recall_a = a.fsrs.access_count.lossy_f32();
+    let recall_b = b.fsrs.access_count.lossy_f32();
     let max_recall = recall_a.max(recall_b).max(1.0);
     // Equal access counts are peers (affinity 1), including two never-accessed
     // memories — `min/max` wrongly scored (0,0) as 0. Divergence lowers affinity.
@@ -548,7 +549,7 @@ pub fn composite_cluster_score(
     //    store's history score 0.0, and everything in between is linear — which
     //    makes a young workspace discriminate at minute scale and a mature one
     //    at week scale, with no tuning constant to go stale.
-    let age_diff_minutes = (a.timestamp - b.timestamp).unsigned_abs() as f32 / 60.0;
+    let age_diff_minutes = (a.timestamp - b.timestamp).unsigned_abs().lossy_f32() / 60.0;
     // A store with no span yet (one memory, or all written in the same second)
     // has no time axis to judge on — treat everything as contemporaneous rather
     // than dividing by zero.
@@ -638,7 +639,7 @@ pub fn is_verbatim_pinned<S: std::hash::BuildHasher>(
 /// on a later seed — nothing is dropped, the band just consolidates in more passes.
 #[must_use]
 pub fn cluster_memories(
-    memories: Vec<MemoryEntry>,
+    memories: &[MemoryEntry],
     config: &ConsolidationConfig,
 ) -> Vec<Vec<MemoryEntry>> {
     if memories.is_empty() {
@@ -961,7 +962,7 @@ mod tests {
             config.cluster_threshold
         );
 
-        let clusters = cluster_memories(vec![a, b], &config);
+        let clusters = cluster_memories(&[a, b], &config);
         assert!(
             clusters.iter().all(|c| c.len() == 1),
             "unrelated memories were clustered together: sizes {:?}",
@@ -1147,12 +1148,12 @@ mod tests {
             content: "test".into(),
             embedding: vec![1.0, 0.0, 0.0],
             metadata: HashMap::new(),
-            timestamp: 1000000,
+            timestamp: 1_000_000,
             fsrs: FsrsState::default(),
             workspace_id: None,
         };
         let score = composite_cluster_score(&entry, &entry, &weights);
-        assert!(score > 0.9, "identical memories should score high: {}", score);
+        assert!(score > 0.9, "identical memories should score high: {score}");
     }
 
     #[test]
@@ -1181,7 +1182,7 @@ mod tests {
             workspace_id: None,
         };
         let score = composite_cluster_score(&a, &b, &weights);
-        assert!(score < 0.3, "very different memories should score low: {}", score);
+        assert!(score < 0.3, "very different memories should score low: {score}");
     }
 
     #[test]
@@ -1227,7 +1228,7 @@ mod tests {
             },
         ];
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         // 1 and 2 are similar in embedding, importance, age, and recall → should cluster
         // 3 is different on every axis → separate
@@ -1488,7 +1489,7 @@ mod tests {
         };
         let memories: Vec<_> = (0..25).map(|i| similar_entry(&i.to_string(), "x")).collect();
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         assert!(
             clusters.iter().all(|c| c.len() <= 10),
@@ -1526,7 +1527,7 @@ mod tests {
             scoped_entry("b", Some("ws-B")),
         ];
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         assert_eq!(clusters.len(), 2, "cross-workspace memories must not cluster");
         assert!(clusters.iter().all(|c| c.len() == 1));
@@ -1545,7 +1546,7 @@ mod tests {
             scoped_entry("b", Some("ws-A")),
         ];
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         assert_eq!(clusters.len(), 1, "same-workspace memories must cluster");
         assert_eq!(clusters[0].len(), 2);
@@ -1567,7 +1568,7 @@ mod tests {
             scoped_entry("scoped", Some("ws-A")),
         ];
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         assert_eq!(clusters.len(), 2, "global and workspace memories must not merge");
     }
@@ -1588,7 +1589,7 @@ mod tests {
         }
         let expected_total = memories.len();
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         // No cluster spans scopes.
         assert!(
@@ -1618,7 +1619,7 @@ mod tests {
         let body = "a".repeat(100);
         let memories: Vec<_> = (0..10).map(|i| similar_entry(&i.to_string(), &body)).collect();
 
-        let clusters = cluster_memories(memories, &config);
+        let clusters = cluster_memories(&memories, &config);
 
         assert!(
             clusters
