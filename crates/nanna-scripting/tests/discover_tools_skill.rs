@@ -15,7 +15,7 @@
 
 mod common;
 
-use nanna_scripting::{ScriptEngine, ScriptedTool, ToolSearchFn};
+use nanna_scripting::{BridgeCapabilities, ScriptEngine, ScriptedTool, ToolSearchFn};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,11 +114,11 @@ async fn ranked_search_path_orders_results_and_filters_core_tools() {
         .execute_full(
             &tool,
             json!({ "query": "run command" }),
-            Some(defs()),
-            None,
-            None,
-            None,
-            Some(search),
+            BridgeCapabilities {
+                tool_definitions: Some(defs()),
+                tool_search: Some(search),
+                ..BridgeCapabilities::default()
+            },
         )
         .await
         .expect("discover_tools should run")
