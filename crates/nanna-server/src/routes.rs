@@ -70,7 +70,8 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         .sessions()
         .list_recent(10000)
         .await
-        .map_or(0, |s| s.len() as i64);
+        // At most 10,000 sessions were requested, so the count always fits.
+        .map_or(0, |s| i64::try_from(s.len()).unwrap_or(i64::MAX));
 
     Json(MetricsResponse {
         uptime_secs: 0, // Would need start time tracking
@@ -215,25 +216,25 @@ async fn send_message(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     
-    if let Some(msg) = messages.last() {
-        Ok(Json(MessageResponse {
-            id: msg.id,
-            role: msg.role.clone(),
-            content: msg.content.clone(),
-            created_at: msg.created_at.clone(),
-            tokens_in: msg.tokens_in,
-            tokens_out: msg.tokens_out,
-        }))
-    } else {
-        Ok(Json(MessageResponse {
+    let reply = messages.last().map_or_else(
+        || MessageResponse {
             id: 0,
             role: "assistant".to_string(),
             content: response,
             created_at: chrono::Utc::now().to_rfc3339(),
             tokens_in: None,
             tokens_out: None,
-        }))
-    }
+        },
+        |msg| MessageResponse {
+            id: msg.id,
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            created_at: msg.created_at.clone(),
+            tokens_in: msg.tokens_in,
+            tokens_out: msg.tokens_out,
+        },
+    );
+    Ok(Json(reply))
 }
 
 async fn get_messages(

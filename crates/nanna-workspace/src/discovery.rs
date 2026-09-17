@@ -156,6 +156,14 @@ pub fn find_workspace_root(start: &Path) -> Option<(PathBuf, WorkspaceMarker)> {
 }
 
 /// Discover workspace from current directory or explicit path
+///
+/// # Errors
+///
+/// Returns [`WorkspaceError::Io`] when the current directory cannot be read
+/// (needed for a relative `explicit_path`, or when no path is given), and
+/// [`WorkspaceError::NotFound`] when `explicit_path` does not exist or, with no
+/// explicit path, when no workspace marker is found from the current directory
+/// upward. An existing explicit path is accepted even without a marker.
 pub fn discover_workspace(explicit_path: Option<&Path>) -> Result<PathBuf, WorkspaceError> {
     if let Some(path) = explicit_path {
         let abs_path = if path.is_absolute() {

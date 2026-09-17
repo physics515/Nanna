@@ -140,14 +140,23 @@ fn stop_daemon_process(pid_file: &std::path::Path) -> anyhow::Result<()> {
 
     #[cfg(not(windows))]
     {
-        // SAFETY: kill(2) is safe to call with a valid PID and signal number
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if ret == 0 {
-            println!("✅ Daemon stopped (PID {pid})");
-        } else {
-            let err = std::io::Error::last_os_error();
-            println!("⚠️  Failed to stop daemon (PID {pid}): {err}");
-            println!("   It may have already been terminated");
+        // A PID file value beyond `pid_t` is no process this command started;
+        // wrapping it negative would signal a whole process group (-1: every
+        // process we may signal), so it is reported instead of sent.
+        match libc::pid_t::try_from(pid) {
+            // SAFETY: kill(2) is safe to call with a valid PID and signal number
+            Ok(target) if unsafe { libc::kill(target, libc::SIGTERM) } == 0 => {
+                println!("✅ Daemon stopped (PID {pid})");
+            }
+            Ok(_) => {
+                let err = std::io::Error::last_os_error();
+                println!("⚠️  Failed to stop daemon (PID {pid}): {err}");
+                println!("   It may have already been terminated");
+            }
+            Err(_) => {
+                println!("⚠️  Failed to stop daemon (PID {pid}): not a valid process id");
+                println!("   It may have already been terminated");
+            }
         }
     }
 
@@ -228,7 +237,10 @@ fn is_process_alive(pid: u32) -> bool {
 
     #[cfg(not(windows))]
     {
-        // SAFETY: kill(2) with signal 0 checks process existence without sending a signal
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        // A value beyond `pid_t` cannot name a running process.
+        libc::pid_t::try_from(pid).is_ok_and(|target| {
+            // SAFETY: kill(2) with signal 0 checks process existence without sending a signal
+            unsafe { libc::kill(target, 0) == 0 }
+        })
     }
 }

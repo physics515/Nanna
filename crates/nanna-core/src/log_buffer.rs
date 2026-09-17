@@ -108,6 +108,7 @@ impl LogBuffer {
             entries.len() <= self.max_entries,
             "log buffer must stay within its capacity"
         );
+        drop(entries);
     }
 
     /// Get all entries

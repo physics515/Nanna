@@ -127,14 +127,20 @@ impl SlackChannel {
     // ========================================================================
 
     /// Send a text message to a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a posted-message result, or Slack reports any other error.
     pub async fn send_text(
         &self,
         channel: &str,
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<SlackMessage, ChannelError> {
-        debug!(channel, "Sending Slack message");
-
         #[derive(Serialize)]
         struct Params<'a> {
             channel: &'a str,
@@ -144,6 +150,8 @@ impl SlackChannel {
             #[serde(skip_serializing_if = "Option::is_none")]
             mrkdwn: Option<bool>,
         }
+
+        debug!(channel, "Sending Slack message");
 
         let result: PostMessageResponse = self
             .api(
@@ -165,20 +173,28 @@ impl SlackChannel {
     }
 
     /// Update a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a posted-message result, or Slack reports any other error.
     pub async fn update_message(
         &self,
         channel: &str,
         ts: &str,
         text: &str,
     ) -> Result<SlackMessage, ChannelError> {
-        debug!(channel, ts, "Updating Slack message");
-
         #[derive(Serialize)]
         struct Params<'a> {
             channel: &'a str,
             ts: &'a str,
             text: &'a str,
         }
+
+        debug!(channel, ts, "Updating Slack message");
 
         let result: PostMessageResponse = self
             .api("chat.update", Params { channel, ts, text })
@@ -192,14 +208,21 @@ impl SlackChannel {
     }
 
     /// Delete a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the response body is not a Slack `ok`/`error` object, or Slack
+    /// reports any other error.
     pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), ChannelError> {
-        debug!(channel, ts, "Deleting Slack message");
-
         #[derive(Serialize)]
         struct Params<'a> {
             channel: &'a str,
             ts: &'a str,
         }
+
+        debug!(channel, ts, "Deleting Slack message");
 
         self.api_ok("chat.delete", Params { channel, ts }).await
     }
@@ -209,23 +232,30 @@ impl SlackChannel {
     // ========================================================================
 
     /// Add a reaction to a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the response body is not a Slack `ok`/`error` object, or Slack
+    /// reports any other error.
     pub async fn add_reaction(
         &self,
         channel: &str,
         ts: &str,
         emoji: &str,
     ) -> Result<(), ChannelError> {
-        debug!(channel, ts, emoji, "Adding Slack reaction");
-
-        // Remove colons if present (Slack API wants just the name)
-        let emoji = emoji.trim_matches(':');
-
         #[derive(Serialize)]
         struct Params<'a> {
             channel: &'a str,
             timestamp: &'a str,
             name: &'a str,
         }
+
+        debug!(channel, ts, emoji, "Adding Slack reaction");
+
+        // Remove colons if present (Slack API wants just the name)
+        let emoji = emoji.trim_matches(':');
 
         self.api_ok(
             "reactions.add",
@@ -239,20 +269,27 @@ impl SlackChannel {
     }
 
     /// Remove a reaction from a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the response body is not a Slack `ok`/`error` object, or Slack
+    /// reports any other error.
     pub async fn remove_reaction(
         &self,
         channel: &str,
         ts: &str,
         emoji: &str,
     ) -> Result<(), ChannelError> {
-        let emoji = emoji.trim_matches(':');
-
         #[derive(Serialize)]
         struct Params<'a> {
             channel: &'a str,
             timestamp: &'a str,
             name: &'a str,
         }
+
+        let emoji = emoji.trim_matches(':');
 
         self.api_ok(
             "reactions.remove",
@@ -266,6 +303,14 @@ impl SlackChannel {
     }
 
     /// Get reactions on a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a `reactions.get` result, or Slack reports any other error.
     pub async fn get_reactions(
         &self,
         channel: &str,
@@ -310,6 +355,14 @@ impl SlackChannel {
     // ========================================================================
 
     /// Reply in a thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a posted-message result, or Slack reports any other error.
     pub async fn reply_thread(
         &self,
         channel: &str,
@@ -320,6 +373,14 @@ impl SlackChannel {
     }
 
     /// Get thread replies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a `conversations.replies` result, or Slack reports any other error.
     pub async fn get_thread_replies(
         &self,
         channel: &str,
@@ -354,6 +415,13 @@ impl SlackChannel {
     // ========================================================================
 
     /// Pin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the response body is not a Slack `ok`/`error` object, or Slack
+    /// reports any other error.
     pub async fn pin_message(&self, channel: &str, ts: &str) -> Result<(), ChannelError> {
         #[derive(Serialize)]
         struct Params<'a> {
@@ -366,6 +434,13 @@ impl SlackChannel {
     }
 
     /// Unpin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the response body is not a Slack `ok`/`error` object, or Slack
+    /// reports any other error.
     pub async fn unpin_message(&self, channel: &str, ts: &str) -> Result<(), ChannelError> {
         #[derive(Serialize)]
         struct Params<'a> {
@@ -382,6 +457,12 @@ impl SlackChannel {
     // ========================================================================
 
     /// Upload a file to a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent, the response
+    /// body is not valid JSON, Slack reports the upload failed (a rate limit
+    /// included), or the response carries no file object.
     pub async fn upload_file(
         &self,
         channels: &[&str],
@@ -389,6 +470,13 @@ impl SlackChannel {
         filename: &str,
         title: Option<&str>,
     ) -> Result<SlackFile, ChannelError> {
+        #[derive(Deserialize)]
+        struct Response {
+            ok: bool,
+            file: Option<SlackFile>,
+            error: Option<String>,
+        }
+
         // Use files.uploadV2 (newer API)
         let url = format!("{SLACK_API_BASE}/files.uploadV2");
 
@@ -414,13 +502,6 @@ impl SlackChannel {
             .await
             .map_err(|e| ChannelError::Send(e.to_string()))?;
 
-        #[derive(Deserialize)]
-        struct Response {
-            ok: bool,
-            file: Option<SlackFile>,
-            error: Option<String>,
-        }
-
         let result: Response = response
             .json()
             .await
@@ -443,6 +524,14 @@ impl SlackChannel {
     // ========================================================================
 
     /// Get channel info.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a `conversations.info` result, or Slack reports any other error.
     pub async fn get_channel_info(&self, channel: &str) -> Result<SlackChannelInfo, ChannelError> {
         #[derive(Serialize)]
         struct Params<'a> {
@@ -462,6 +551,14 @@ impl SlackChannel {
     }
 
     /// List channels the bot is in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not a `conversations.list` result, or Slack reports any other error.
     pub async fn list_channels(&self) -> Result<Vec<SlackChannelInfo>, ChannelError> {
         #[derive(Serialize)]
         struct Params {
@@ -488,6 +585,14 @@ impl SlackChannel {
     }
 
     /// Validate the bot token by calling auth.test.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Slack reports `ratelimited` or
+    /// answers HTTP 429, [`ChannelError::NotFound`] for `channel_not_found`,
+    /// [`ChannelError::Auth`] for `invalid_auth` or `token_revoked`, and
+    /// [`ChannelError::Send`] if the request cannot be sent, the response body
+    /// is not an `auth.test` result, or Slack reports any other error.
     pub async fn validate(&self) -> Result<SlackAuthInfo, ChannelError> {
         #[derive(Serialize)]
         struct Empty {}
@@ -572,9 +677,8 @@ impl Channel for SlackChannel {
 
     async fn edit(&self, message_id: &str, content: MessageContent) -> Result<(), ChannelError> {
         let (channel, ts) = parse_message_id(message_id)?;
-        let text = match content {
-            MessageContent::Text { text } => text,
-            _ => return Err(ChannelError::Send("Can only edit text messages".to_string())),
+        let MessageContent::Text { text } = content else {
+            return Err(ChannelError::Send("Can only edit text messages".to_string()));
         };
         self.update_message(&channel, &ts, &text).await?;
         Ok(())
@@ -609,9 +713,8 @@ impl Channel for SlackChannel {
 
     async fn reply_thread(&self, thread_id: &str, content: MessageContent) -> Result<String, ChannelError> {
         let (channel, thread_ts) = parse_message_id(thread_id)?;
-        let text = match content {
-            MessageContent::Text { text } => text,
-            _ => return Err(ChannelError::Send("Can only send text to threads".to_string())),
+        let MessageContent::Text { text } = content else {
+            return Err(ChannelError::Send("Can only send text to threads".to_string()));
         };
         let msg = self.reply_thread(&channel, &thread_ts, &text).await?;
         Ok(format!("{}:{}", msg.channel, msg.ts))

@@ -32,7 +32,9 @@ pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
 }
 
-/// Legacy pre-unification identity (`bot/clawd/Nanna`). Kept solely so the first
+/// Legacy pre-unification identity (`bot/clawd/Nanna`).
+///
+/// Kept solely so the first
 /// boot after upgrade can migrate existing config and credential files into the
 /// canonical tree instead of stranding a user's data under the old vendor slug.
 #[must_use]
@@ -172,14 +174,14 @@ pub struct LlmConfig {
     /// GitHub token for GitHub Models
     pub github_token: Option<String>,
     /// Model priority list for fallback (first working model is used)
-    /// Format: ["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]
+    /// Format: `["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]`
     pub model_priority: Vec<String>,
     /// Anthropic OAuth access token (alternative to API key)
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
     /// Model priority list for summarization (first working model is used)
-    /// Format: ["ollama/llama3.2", "ollama/mistral", "claude-haiku"]
+    /// Format: `["ollama/llama3.2", "ollama/mistral", "claude-haiku"]`
     /// If empty, truncates instead of summarizing
     pub summarization_priority: Vec<String>,
     /// Ollama server URL for summarization (if using ollama model)
@@ -187,9 +189,9 @@ pub struct LlmConfig {
     /// Ollama API key (optional — for remote/authenticated Ollama instances)
     pub ollama_api_key: Option<String>,
     /// Model routing priority for cost optimization.
-    /// Format: ["model:tier", ...] where tier is simple|medium|complex.
+    /// Format: `["model:tier", ...]` where tier is simple|medium|complex.
     /// Cheapest models first. Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
+    /// Example: `["claude-haiku-4-5:simple", "claude-opus-5:complex"]`
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
@@ -201,7 +203,7 @@ pub struct LlmConfig {
     /// Model priority list for sub-agents spawned via the `task` tool: first
     /// working model wins, failures fall back to the next in the list.
     /// Empty = sub-agents use the main chat list (`model_priority`).
-    /// Format: ["ollama/qwen3:4b", "claude-haiku-3-5"]
+    /// Format: `["ollama/qwen3:4b", "claude-haiku-3-5"]`
     pub sub_agent_models: Vec<String>,
     /// Anthropic prompt-cache lifetime: `"5m"` (default) or `"1h"`. A 1-hour cache write
     /// costs 2x input instead of 1.25x and pays only when requests sharing a prompt start
@@ -573,7 +575,7 @@ pub struct MemoryConfig {
     /// Model to use for memory extraction (empty = use chat model)
     pub extraction_model: String,
     /// Embedding model priority list for fallback
-    /// Format: ["openai/text-embedding-3-small", "ollama/nomic-embed-text"]
+    /// Format: `["openai/text-embedding-3-small", "ollama/nomic-embed-text"]`
     pub embedding_priority: Vec<String>,
     /// Maximum fraction of memories that can be removed in a single consolidation run (0.0-1.0).
     /// Default: 0.50 (50%)
@@ -759,6 +761,15 @@ impl Config {
     /// Persist any secret fields currently held in-memory into the OS keyring
     /// (or encrypted file fallback), then blank them on this Config. Call after
     /// onboarding / GUI key entry so `save()` never writes secrets to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SecureStore::set`](crate::credentials::SecureStore::set)
+    /// failure: the keyring entry cannot be opened, or the keyring write fails and
+    /// the encrypted file fallback fails too. Secrets are processed in a fixed
+    /// order and each field is blanked before its write, so on error the failing
+    /// secret and those already stored are gone from this `Config`; later ones
+    /// are left in place.
     pub fn migrate_secrets_to_keyring(&mut self) -> Result<(), crate::credentials::CredentialError> {
         use crate::credentials::{keys, SecureStore};
         let store = SecureStore::new();
@@ -1174,8 +1185,10 @@ mod tests {
 
     #[test]
     fn blank_or_whitespace_key_does_not_count() {
-        let mut llm = LlmConfig::default();
-        llm.openai_api_key = Some("   ".into());
+        let mut llm = LlmConfig {
+            openai_api_key: Some("   ".into()),
+            ..Default::default()
+        };
         assert!(
             !llm.has_configured_api_key(),
             "a whitespace-only key is not a real credential"
@@ -1193,9 +1206,11 @@ mod tests {
 
     #[test]
     fn sub_agent_models_win_when_set() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
-        llm.sub_agent_models = vec!["sub-a".into(), "sub-b".into()];
+        let llm = LlmConfig {
+            model_priority: vec!["chat-a".into(), "chat-b".into()],
+            sub_agent_models: vec!["sub-a".into(), "sub-b".into()],
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["sub-a".to_string(), "sub-b".to_string()]
@@ -1204,8 +1219,10 @@ mod tests {
 
     #[test]
     fn an_empty_sub_agent_list_falls_back_to_the_chat_list() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
+        let llm = LlmConfig {
+            model_priority: vec!["chat-a".into(), "chat-b".into()],
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["chat-a".to_string(), "chat-b".to_string()],
@@ -1215,9 +1232,11 @@ mod tests {
 
     #[test]
     fn the_legacy_single_model_still_works_and_is_outranked_by_the_list() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into()];
-        llm.sub_agent_model = Some("legacy-sub".into());
+        let mut llm = LlmConfig {
+            model_priority: vec!["chat-a".into()],
+            sub_agent_model: Some("legacy-sub".into()),
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["legacy-sub".to_string()],
@@ -1241,8 +1260,10 @@ mod tests {
             "with nothing configured, sub-agents still get the primary model"
         );
         // An empty-string legacy value must not become a bogus candidate.
-        let mut blank = LlmConfig::default();
-        blank.sub_agent_model = Some(String::new());
+        let blank = LlmConfig {
+            sub_agent_model: Some(String::new()),
+            ..Default::default()
+        };
         assert_eq!(blank.effective_sub_agent_models(), vec![blank.model]);
     }
 

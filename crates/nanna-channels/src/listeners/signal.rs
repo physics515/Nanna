@@ -12,6 +12,7 @@ use super::{Listener, ListenerError, ListenerHandle};
 use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -131,16 +132,15 @@ impl SignalListener {
         }
 
         let source = envelope.envelope.source_number
-            .or(envelope.envelope.source_uuid.clone())?;
+            .or_else(|| envelope.envelope.source_uuid.clone())?;
 
         let sender_name = envelope.envelope.source_name.clone();
         
         // Determine if this is a group message
-        let (_chat_id, group_name) = if let Some(ref group) = data_message.group_info {
-            (group.group_id.clone(), group.group_name.clone())
-        } else {
-            (source.clone(), None)
-        };
+        let (_chat_id, group_name) = data_message.group_info.as_ref().map_or_else(
+            || (source.clone(), None),
+            |group| (group.group_id.clone(), group.group_name.clone()),
+        );
 
         Some(IncomingMessage {
             id: envelope.envelope.timestamp.to_string(),
@@ -270,7 +270,6 @@ impl SignalListener {
             info!("Connected to Signal SSE stream");
 
             // Read SSE stream
-            use futures_util::StreamExt;
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
 

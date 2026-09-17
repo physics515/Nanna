@@ -209,7 +209,9 @@ fn run_case(count: usize, topics: usize, spread: f32, related: bool, config: &Co
     let pairs = pairs_considered(&memories, config);
 
     let start = Instant::now();
-    let clusters = cluster_memories(memories, config);
+    let clusters = cluster_memories(&memories, config);
+    // Dropped inside the timed region, where the by-value signature dropped it.
+    drop(memories);
     let elapsed = start.elapsed();
 
     let wall_ms = elapsed.as_secs_f64() * 1000.0;

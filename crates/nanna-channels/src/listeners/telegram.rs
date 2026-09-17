@@ -123,7 +123,7 @@ impl TelegramListener {
         }
 
         let sender = message.from.as_ref()?;
-        let content = self.extract_content(message)?;
+        let content = Self::extract_content(message)?;
 
         Some(IncomingMessage {
             id: format!("{}:{}", message.chat.id, message.message_id),
@@ -151,7 +151,7 @@ impl TelegramListener {
     }
 
     /// Extract message content
-    fn extract_content(&self, message: &TelegramMessage) -> Option<MessageContent> {
+    fn extract_content(message: &TelegramMessage) -> Option<MessageContent> {
         // Text message
         if let Some(text) = &message.text {
             return Some(MessageContent::Text { text: text.clone() });
@@ -178,7 +178,7 @@ impl TelegramListener {
         if let Some(audio) = &message.audio {
             return Some(MessageContent::Audio {
                 url: audio.file_id.clone(),
-                duration_secs: Some(audio.duration as f32),
+                duration_secs: Some(duration_secs(audio.duration)),
             });
         }
 
@@ -186,7 +186,7 @@ impl TelegramListener {
         if let Some(voice) = &message.voice {
             return Some(MessageContent::Audio {
                 url: voice.file_id.clone(),
-                duration_secs: Some(voice.duration as f32),
+                duration_secs: Some(duration_secs(voice.duration)),
             });
         }
 
@@ -194,7 +194,7 @@ impl TelegramListener {
         if let Some(video) = &message.video {
             return Some(MessageContent::Video {
                 url: video.file_id.clone(),
-                duration_secs: Some(video.duration as f32),
+                duration_secs: Some(duration_secs(video.duration)),
                 caption: message.caption.clone(),
             });
         }
@@ -283,6 +283,17 @@ impl TelegramListener {
 
         info!("Telegram listener stopped");
     }
+}
+
+/// A Telegram media duration (whole seconds, `i32` on the wire) as the `f32`
+/// seconds the channel model carries.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "std has no i32 -> f32 conversion; f32 is exact for every whole second below 2^24 \
+              (~194 days), and a longer duration rounding to a neighbouring second is harmless"
+)]
+const fn duration_secs(secs: i32) -> f32 {
+    secs as f32
 }
 
 #[async_trait]

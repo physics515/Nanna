@@ -58,7 +58,7 @@ fn verify_slack_signature(
     // bytes**, not a UTF-8-lossy string: the old `from_utf8(body).unwrap_or("")`
     // silently hashed an *empty* body for any non-UTF-8 payload, so a mangled
     // request could sail past with a signature computed over nothing.
-    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(signing_secret.as_bytes()) { m } else {
+    let Ok(mut mac) = HmacSha256::new_from_slice(signing_secret.as_bytes()) else {
         warn!("Invalid Slack signing secret");
         return false;
     };
@@ -140,6 +140,17 @@ pub struct SlackResponse {
     pub challenge: Option<String>,
 }
 
+impl SlackResponse {
+    /// A bare acknowledgment with no reply text.
+    const fn ack() -> Self {
+        Self {
+            text: None,
+            response_type: None,
+            challenge: None,
+        }
+    }
+}
+
 /// Handle Slack event API webhook
 pub async fn handle(
     State(state): State<AppState>,
@@ -203,104 +214,101 @@ pub async fn handle(
         && let Some(inner) = event.event {
             // Ignore bot messages
             if inner.bot_id.is_some() {
-                return Ok(Json(SlackResponse {
-                    text: None,
-                    response_type: None,
-                    challenge: None,
-                }));
+                return Ok(Json(SlackResponse::ack()));
             }
 
             // Handle reaction events (for memory feedback)
             if inner.event_type == "reaction_added" || inner.event_type == "reaction_removed" {
-                if let Some(item) = &inner.item
-                    && item.item_type == "message"
-                        && let (Some(channel), Some(ts), Some(reaction)) = 
-                            (&item.channel, &item.ts, &inner.reaction) 
-                        {
-                            let message_key = format!("{PROVIDER}:{channel}:{ts}");
-                            // A reaction that is not a feedback signal must change nothing:
-                            // FSRS weights are the agent's long-term memory, and an emoji
-                            // with no assigned meaning is not evidence either way.
-                            if inner.event_type == "reaction_added" {
-                                match classify_reaction(reaction) {
-                                    ReactionFeedback::NotFeedback => {
-                                        debug!(
-                                            "Slack reaction {} on {} carries no feedback",
-                                            reaction, message_key
-                                        );
-                                    }
-                                    signal => {
-                                        let positive = signal == ReactionFeedback::Positive;
-                                        info!(
-                                            "Slack reaction {} on {} (positive: {})",
-                                            reaction, message_key, positive
-                                        );
-                                        state.record_message_feedback(&message_key, positive).await;
-                                    }
-                                }
-                            }
-                        }
-                return Ok(Json(SlackResponse {
-                    text: None,
-                    response_type: None,
-                    challenge: None,
-                }));
+                record_reaction_feedback(&state, &inner).await;
+                return Ok(Json(SlackResponse::ack()));
             }
 
             // Handle app_mention and message events
             if inner.event_type == "app_mention" || inner.event_type == "message" {
-                let user_id = inner.user.as_deref().unwrap_or("unknown");
-                let channel_id = inner.channel.as_deref().unwrap_or("unknown");
-                let text = inner.text.as_deref().unwrap_or("");
-                let message_ts = inner.ts.as_deref().unwrap_or("");
-
-                if text.is_empty() {
-                    return Ok(Json(SlackResponse {
-                        text: None,
-                        response_type: None,
-                        challenge: None,
-                    }));
-                }
-
-                let session_id = format!("slack:{channel_id}:{user_id}");
-                info!("Slack message from {}: {}", user_id, text.chars().take(50).collect::<String>());
-
-                // Build system prompt
-                let system_prompt = format!(
-                    "You are Nanna — moon god of the digital realm.\n\
-                     You're chatting on Slack with user {user_id}.\n\
-                     Be helpful and use Slack markdown (mrkdwn)."
-                );
-
-                // Process message (with memory extraction if enabled)
-                let response_text = match state.process_message(&session_id, text, Some(&system_prompt)).await {
-                    Ok(text) => text,
-                    Err(e) => {
-                        tracing::warn!("Error processing Slack message: {}", e);
-                        "Sorry, I encountered an error.".to_string()
-                    }
-                };
-
-                // Link message to session for reaction-based feedback
-                if !message_ts.is_empty() {
-                    let message_key = format!("{PROVIDER}:{channel_id}:{message_ts}");
-                    state.link_message_to_session(&message_key, &session_id).await;
-                }
-
-                return Ok(Json(SlackResponse {
-                    text: Some(response_text),
-                    response_type: Some("in_channel".to_string()),
-                    challenge: None,
-                }));
+                return Ok(Json(answer_message(&state, &inner).await));
             }
         }
 
     // Default acknowledgment
-    Ok(Json(SlackResponse {
-        text: None,
-        response_type: None,
+    Ok(Json(SlackResponse::ack()))
+}
+
+/// Turn a reaction event on a message into memory feedback for the session
+/// that message belongs to. Removals and emoji with no feedback meaning change
+/// nothing.
+async fn record_reaction_feedback(state: &AppState, inner: &SlackEventInner) {
+    if let Some(item) = &inner.item
+        && item.item_type == "message"
+            && let (Some(channel), Some(ts), Some(reaction)) = 
+                (&item.channel, &item.ts, &inner.reaction) 
+            {
+                let message_key = format!("{PROVIDER}:{channel}:{ts}");
+                // A reaction that is not a feedback signal must change nothing:
+                // FSRS weights are the agent's long-term memory, and an emoji
+                // with no assigned meaning is not evidence either way.
+                if inner.event_type == "reaction_added" {
+                    match classify_reaction(reaction) {
+                        ReactionFeedback::NotFeedback => {
+                            debug!(
+                                "Slack reaction {} on {} carries no feedback",
+                                reaction, message_key
+                            );
+                        }
+                        signal => {
+                            let positive = signal == ReactionFeedback::Positive;
+                            info!(
+                                "Slack reaction {} on {} (positive: {})",
+                                reaction, message_key, positive
+                            );
+                            state.record_message_feedback(&message_key, positive).await;
+                        }
+                    }
+                }
+            }
+}
+
+/// Run the agent on an `app_mention` or `message` event and build the reply.
+/// An event with no text gets a bare acknowledgment.
+async fn answer_message(state: &AppState, inner: &SlackEventInner) -> SlackResponse {
+    let user_id = inner.user.as_deref().unwrap_or("unknown");
+    let channel_id = inner.channel.as_deref().unwrap_or("unknown");
+    let text = inner.text.as_deref().unwrap_or("");
+    let message_ts = inner.ts.as_deref().unwrap_or("");
+
+    if text.is_empty() {
+        return SlackResponse::ack();
+    }
+
+    let session_id = format!("slack:{channel_id}:{user_id}");
+    info!("Slack message from {}: {}", user_id, text.chars().take(50).collect::<String>());
+
+    // Build system prompt
+    let system_prompt = format!(
+        "You are Nanna — moon god of the digital realm.\n\
+         You're chatting on Slack with user {user_id}.\n\
+         Be helpful and use Slack markdown (mrkdwn)."
+    );
+
+    // Process message (with memory extraction if enabled)
+    let response_text = match state.process_message(&session_id, text, Some(&system_prompt)).await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!("Error processing Slack message: {}", e);
+            "Sorry, I encountered an error.".to_string()
+        }
+    };
+
+    // Link message to session for reaction-based feedback
+    if !message_ts.is_empty() {
+        let message_key = format!("{PROVIDER}:{channel_id}:{message_ts}");
+        state.link_message_to_session(&message_key, &session_id).await;
+    }
+
+    SlackResponse {
+        text: Some(response_text),
+        response_type: Some("in_channel".to_string()),
         challenge: None,
-    }))
+    }
 }
 
 /// Handle Slack slash commands

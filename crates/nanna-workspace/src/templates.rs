@@ -131,6 +131,13 @@ pub fn list_templates() -> Vec<WorkspaceTemplate> {
 }
 
 /// Create a workspace from a template
+///
+/// # Errors
+///
+/// Returns [`WorkspaceError::TemplateNotFound`] when no built-in template has
+/// id `template_id`, and [`WorkspaceError::Io`] when the workspace directory,
+/// one of the template's directories, or one of its files cannot be created or
+/// written. Files written before the failure are left in place.
 pub async fn create_from_template(path: &Path, template_id: &str) -> Result<(), WorkspaceError> {
     let template = list_templates()
         .into_iter()

@@ -9,6 +9,7 @@ use crate::{
     MemoryCluster, cluster_memories, create_consolidated_entry, is_verbatim_pinned,
 };
 use crate::chunking::{derive_chunk_params, ChunkParams};
+use crate::lossy::{f32_to_usize, LossyF32};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -321,6 +322,12 @@ impl MemoryService {
     /// the caller always has one in hand, because a switch is only ever
     /// observed on a successful embed. `window_tokens` is that model's input
     /// limit, or `None` when the provider does not publish one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dimension` is 0: a provider that produced a vector has a
+    /// positive width, so zero means the caller did not pass a real embedding's
+    /// width, and binding the store to it would reject every later write.
     pub async fn rebind_embeddings(
         &self,
         model: &str,
@@ -705,10 +712,10 @@ impl MemoryService {
         workspace_id: Option<String>,
         reason: &str,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let id = match metadata.get("source_id") {
-            Some(source_id) => format!("{source_id}-{}", uuid::Uuid::new_v4()),
-            None => uuid::Uuid::new_v4().to_string(),
-        };
+        let id = metadata.get("source_id").map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |source_id| format!("{source_id}-{}", uuid::Uuid::new_v4()),
+        );
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
@@ -1213,6 +1220,19 @@ impl MemoryService {
         }
 
         // Create new memory with importance
+        self.create_global_memory(content, metadata, importance, embedding).await
+    }
+
+    /// The create step of [`Self::remember_with_importance`]: store `content` as
+    /// a new global memory carrying `importance` (1-5 scale) and the vector
+    /// already computed for it.
+    async fn create_global_memory(
+        &self,
+        content: &str,
+        metadata: HashMap<String, String>,
+        importance: f32,
+        embedding: Vec<f32>,
+    ) -> Result<(String, IngestAction), MemoryError> {
         let id = uuid::Uuid::new_v4().to_string();
         let mut fsrs = FsrsState::new();
         // Normalize importance from 1-5 scale to 0.5-1.5 multiplier
@@ -1232,7 +1252,7 @@ impl MemoryService {
             embedding_model,
             embeddings,
             embedding,
-            metadata: metadata.clone(),
+            metadata,
             timestamp: chrono_timestamp(),
             fsrs,
             workspace_id: None, // Global memory
@@ -1388,10 +1408,10 @@ impl MemoryService {
         // uuid that fallback could only ever fire by a 1-in-4-billion accident —
         // and if it did fire it would return an unrelated memory, which is worse
         // than failing. Prefixing makes it a guarantee.
-        let id = match metadata.get("source_id") {
-            Some(source_id) => format!("{source_id}-{}", uuid::Uuid::new_v4()),
-            None => uuid::Uuid::new_v4().to_string(),
-        };
+        let id = metadata.get("source_id").map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |source_id| format!("{source_id}-{}", uuid::Uuid::new_v4()),
+        );
         let mut fsrs = FsrsState::new();
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
 
@@ -1827,8 +1847,10 @@ impl MemoryService {
         let entries = self.store.all_entries().await;
         let params = &self.config.fsrs;
         
-        let mut stats = MemoryStats::default();
-        stats.total = entries.len();
+        let mut stats = MemoryStats {
+            total: entries.len(),
+            ..MemoryStats::default()
+        };
         
         for entry in entries {
             match entry.fsrs.state(params) {
@@ -1919,6 +1941,11 @@ impl MemoryService {
     }
 
     /// Update a memory's content
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no memory has `id`. Persistence and
+    /// chunk-write failures are logged, not returned.
     pub async fn update_content(&self, id: &str, content: &str) -> Result<(), MemoryError> {
         self.store.update_content(id, content).await?;
         info!("Updated memory content: {}", id);
@@ -1950,6 +1977,12 @@ impl MemoryService {
     }
 
     /// Flush all in-memory entries to the persistence backend (for JSON → Turso migration).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Persistence`] when no persistence backend is
+    /// attached. Individual entries that fail to save are logged and left out
+    /// of the returned count.
     pub async fn flush_to_db(&self) -> Result<usize, MemoryError> {
         self.store.flush_to_db().await
     }
@@ -1994,7 +2027,7 @@ impl MemoryService {
         let total_memories = self.count().await;
 
         // Compute budget: how many memories we're allowed to remove
-        let max_removable = ((total_memories as f32) * config.max_compression_ratio) as usize;
+        let max_removable = f32_to_usize(total_memories.lossy_f32() * config.max_compression_ratio);
         let floor_headroom = total_memories.saturating_sub(config.min_remaining_memories);
         let mut removal_budget = max_removable.min(floor_headroom);
 
@@ -2015,25 +2048,7 @@ impl MemoryService {
         // workspace record: the observed span IS the store's lifetime for
         // clustering purposes, it needs no new dependency, and it stays correct
         // for a workspace that sat idle for a month or was seeded from an import.
-        let config = {
-            let mut config = config.clone();
-            let span_minutes = {
-                let all = self.store.all_entries().await;
-                match (
-                    all.iter().map(|e| e.timestamp).min(),
-                    all.iter().map(|e| e.timestamp).max(),
-                ) {
-                    (Some(first), Some(last)) => (last - first) as f32 / 60.0,
-                    _ => 0.0,
-                }
-            };
-            config.clustering_weights.time_span_minutes = span_minutes.max(1.0);
-            info!(
-                "Consolidation timescale: store spans {:.1} hours",
-                span_minutes / 60.0
-            );
-            config
-        };
+        let config = self.with_store_timescale(config).await;
         let config = &config;
 
         // Get all memories grouped by weight
@@ -2073,19 +2088,7 @@ impl MemoryService {
             // `observed` — laundering the provenance and un-pinning itself. Two
             // folds over disjoint partitions can't do that, and cost strictly
             // less than one fold over their union (|A|² + |B|² <= (|A|+|B|)²).
-            let band_count = memories.len();
-            let (pinned, unpinned): (Vec<_>, Vec<_>) = memories
-                .into_iter()
-                .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
-            debug_assert_eq!(
-                pinned.len() + unpinned.len(),
-                band_count,
-                "the provenance partition must not drop a memory"
-            );
-            debug_assert!(
-                pinned.iter().all(|entry| is_verbatim_pinned(&entry.metadata)),
-                "the pinned partition must hold only pinned memories"
-            );
+            let (pinned, unpinned) = partition_verbatim_pinned(memories);
 
             // Phase (b): fold true duplicates deterministically FIRST, so the
             // summarizer is only ever paid for genuinely distinct content.
@@ -2184,83 +2187,111 @@ impl MemoryService {
             };
 
             // Cluster using composite score (similarity + recall + importance + age)
-            let clusters = cluster_memories(memories, config);
+            let clusters = cluster_memories(&memories, config);
+            removal_budget = self
+                .consolidate_clusters(
+                    clusters,
+                    compression_level,
+                    config,
+                    &summarize_fn,
+                    removal_budget,
+                    &mut result,
+                )
+                .await;
+        }
 
-            for cluster_memories in clusters {
-                if removal_budget == 0 {
-                    break;
-                }
+        log_consolidation_outcome(&result);
 
-                if cluster_memories.len() < config.min_cluster_size {
-                    // Singleton or small cluster - process individually if Expand
-                    if compression_level == CompressionLevel::Expand {
-                        for memory in &cluster_memories {
-                            if let Err(e) = self.expand_memory(memory, &summarize_fn).await {
-                                result.errors.push(format!("Expand failed for {}: {}", memory.id, e));
-                            } else {
-                                result.memories_expanded += 1;
-                            }
+        Ok(result)
+    }
+
+    /// `config` with its clustering timescale set to how long this store has
+    /// been accumulating: the minutes between its oldest and newest memory,
+    /// floored at one minute.
+    async fn with_store_timescale(&self, config: &ConsolidationConfig) -> ConsolidationConfig {
+        let mut config = config.clone();
+        let span_minutes = {
+            let all = self.store.all_entries().await;
+            match (
+                all.iter().map(|e| e.timestamp).min(),
+                all.iter().map(|e| e.timestamp).max(),
+            ) {
+                (Some(first), Some(last)) => (last - first).lossy_f32() / 60.0,
+                _ => 0.0,
+            }
+        };
+        config.clustering_weights.time_span_minutes = span_minutes.max(1.0);
+        info!(
+            "Consolidation timescale: store spans {:.1} hours",
+            span_minutes / 60.0
+        );
+        config
+    }
+
+    /// Consolidate one band's clusters, spending at most `removal_budget` and
+    /// recording every outcome in `result`. Returns the budget left.
+    async fn consolidate_clusters<F, Fut>(
+        &self,
+        clusters: Vec<Vec<MemoryEntry>>,
+        compression_level: CompressionLevel,
+        config: &ConsolidationConfig,
+        summarize_fn: &F,
+        mut removal_budget: usize,
+        result: &mut ConsolidationResult,
+    ) -> usize
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<String, String>> + Send,
+    {
+        for cluster_memories in clusters {
+            if removal_budget == 0 {
+                break;
+            }
+
+            if cluster_memories.len() < config.min_cluster_size {
+                // Singleton or small cluster - process individually if Expand
+                if compression_level == CompressionLevel::Expand {
+                    for memory in &cluster_memories {
+                        if let Err(e) = self.expand_memory(memory, summarize_fn).await {
+                            result.errors.push(format!("Expand failed for {}: {}", memory.id, e));
+                        } else {
+                            result.memories_expanded += 1;
                         }
                     }
-                    result.memories_processed += cluster_memories.len();
-                    continue;
                 }
+                result.memories_processed += cluster_memories.len();
+                continue;
+            }
 
-                // How many would this cluster merge away?
-                let would_remove = cluster_memories.len() - 1; // -1 because we create 1 new
-                if would_remove > removal_budget {
-                    // Skip this cluster — it would exceed our budget
+            // How many would this cluster merge away?
+            let would_remove = cluster_memories.len() - 1; // -1 because we create 1 new
+            if would_remove > removal_budget {
+                // Skip this cluster — it would exceed our budget
+                result.memories_processed += cluster_memories.len();
+                continue;
+            }
+
+            // Create cluster and consolidate
+            let cluster = MemoryCluster::new(
+                cluster_memories.clone(),
+                compression_level,
+                &self.config.fsrs,
+            );
+
+            match self.consolidate_cluster(&cluster, summarize_fn).await {
+                Ok(()) => {
+                    result.clusters_formed += 1;
+                    result.memories_merged += would_remove;
                     result.memories_processed += cluster_memories.len();
-                    continue;
+                    removal_budget = removal_budget.saturating_sub(would_remove);
                 }
-
-                // Create cluster and consolidate
-                let cluster = MemoryCluster::new(
-                    cluster_memories.clone(),
-                    compression_level,
-                    &self.config.fsrs,
-                );
-
-                match self.consolidate_cluster(&cluster, &summarize_fn).await {
-                    Ok(()) => {
-                        result.clusters_formed += 1;
-                        result.memories_merged += would_remove;
-                        result.memories_processed += cluster_memories.len();
-                        removal_budget = removal_budget.saturating_sub(would_remove);
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("Cluster consolidation failed: {e}"));
-                        result.memories_processed += cluster_memories.len();
-                    }
+                Err(e) => {
+                    result.errors.push(format!("Cluster consolidation failed: {e}"));
+                    result.memories_processed += cluster_memories.len();
                 }
             }
         }
-
-        // `deduped` belongs in the summary: it is the only line that REMOVES
-        // rows, and leaving it out made a cycle that deleted 13 memories read
-        // as "0 merged" — compression looked like a no-op while the store
-        // visibly shrank underneath it.
-        info!(
-            "Consolidation complete: {} processed, {} clusters, {} merged, {} deduped, \
-             {} expanded, {} errors",
-            result.memories_processed,
-            result.clusters_formed,
-            result.memories_merged,
-            result.memories_deduped,
-            result.memories_expanded,
-            result.errors.len()
-        );
-
-        // A COUNT of errors is not a report of them. One observed cycle logged
-        // "89 processed, 0 clusters, 0 merged, 0 expanded, 5 errors" — a total
-        // no-op with five unexplained failures, and the strings describing them
-        // were built, stored on the result, and then dropped on the floor. Say
-        // what actually broke.
-        for error in &result.errors {
-            warn!("Consolidation error: {error}");
-        }
-
-        Ok(result)
+        removal_budget
     }
 
     /// Run the deterministic dedup fold over one partition of a band, charging
@@ -2394,29 +2425,7 @@ impl MemoryService {
                 .await
             {
                 Ok(DedupCommit::Committed(new_embedding)) => {
-                    // Keep the in-memory copy in step with the store — including
-                    // the vector. A survivor left holding its pre-merge embedding
-                    // would be compared (and later clustered) on a vector that no
-                    // longer describes its content.
-                    survivors[target_index].content = merged;
-                    if let Some(embedding) = new_embedding {
-                        survivors[target_index].embedding = embedding;
-                    }
-                    survivors[target_index].fsrs.importance = survivors[target_index]
-                        .fsrs
-                        .importance
-                        .max(candidate.fsrs.importance);
-                    survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
-                    // Generation is monotone across a fold, for the same reason
-                    // importance is: an entry that absorbed a consolidation
-                    // product still CONTAINS a consolidation product. Without
-                    // this a generation-1 gist folding into a generation-0 row
-                    // would launder itself back into the summarizer's input and
-                    // defeat the never-re-summarize rule below.
-                    survivors[target_index].fsrs.generation = survivors[target_index]
-                        .fsrs
-                        .generation
-                        .max(candidate.fsrs.generation);
+                    absorb_fold(&mut survivors[target_index], &candidate, merged, new_embedding);
                     folded_sources.push((candidate.id.clone(), candidate.content.clone()));
                     folded_count += 1;
                     result.memories_deduped += 1;
@@ -2904,9 +2913,81 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// The largest single observation the episodic writer can hand us: one semantic
-/// chunk plus its `[tool → target — outcome] ` header (the target is itself
-/// capped at 120 chars, so 192 covers the header whole).
+/// Split a band into its verbatim-pinned (user-stated) memories and the rest.
+fn partition_verbatim_pinned(memories: Vec<MemoryEntry>) -> (Vec<MemoryEntry>, Vec<MemoryEntry>) {
+    let band_count = memories.len();
+    let (pinned, unpinned): (Vec<_>, Vec<_>) = memories
+        .into_iter()
+        .partition(|entry: &MemoryEntry| is_verbatim_pinned(&entry.metadata));
+    debug_assert_eq!(
+        pinned.len() + unpinned.len(),
+        band_count,
+        "the provenance partition must not drop a memory"
+    );
+    debug_assert!(
+        pinned.iter().all(|entry| is_verbatim_pinned(&entry.metadata)),
+        "the pinned partition must hold only pinned memories"
+    );
+    (pinned, unpinned)
+}
+
+/// Log a finished consolidation cycle's totals, then every error it collected.
+fn log_consolidation_outcome(result: &ConsolidationResult) {
+    // `deduped` belongs in the summary: it is the only line that REMOVES
+    // rows, and leaving it out made a cycle that deleted 13 memories read
+    // as "0 merged" — compression looked like a no-op while the store
+    // visibly shrank underneath it.
+    info!(
+        "Consolidation complete: {} processed, {} clusters, {} merged, {} deduped, \
+         {} expanded, {} errors",
+        result.memories_processed,
+        result.clusters_formed,
+        result.memories_merged,
+        result.memories_deduped,
+        result.memories_expanded,
+        result.errors.len()
+    );
+
+    // A COUNT of errors is not a report of them. One observed cycle logged
+    // "89 processed, 0 clusters, 0 merged, 0 expanded, 5 errors" — a total
+    // no-op with five unexplained failures, and the strings describing them
+    // were built, stored on the result, and then dropped on the floor. Say
+    // what actually broke.
+    for error in &result.errors {
+        warn!("Consolidation error: {error}");
+    }
+}
+
+/// Apply a committed dedup fold of `candidate` to the in-memory `survivor`.
+fn absorb_fold(
+    survivor: &mut MemoryEntry,
+    candidate: &MemoryEntry,
+    merged: String,
+    new_embedding: Option<Vec<f32>>,
+) {
+    // Keep the in-memory copy in step with the store — including
+    // the vector. A survivor left holding its pre-merge embedding
+    // would be compared (and later clustered) on a vector that no
+    // longer describes its content.
+    survivor.content = merged;
+    if let Some(embedding) = new_embedding {
+        survivor.embedding = embedding;
+    }
+    survivor.fsrs.importance = survivor.fsrs.importance.max(candidate.fsrs.importance);
+    survivor.fsrs.access_count += candidate.fsrs.access_count;
+    // Generation is monotone across a fold, for the same reason
+    // importance is: an entry that absorbed a consolidation
+    // product still CONTAINS a consolidation product. Without
+    // this a generation-1 gist folding into a generation-0 row
+    // would launder itself back into the summarizer's input and
+    // defeat the never-re-summarize rule in `consolidate`.
+    survivor.fsrs.generation = survivor.fsrs.generation.max(candidate.fsrs.generation);
+}
+
+/// The largest single observation the episodic writer can hand us.
+///
+/// That is one semantic chunk plus its `[tool → target — outcome] ` header (the
+/// target is itself capped at 120 chars, so 192 covers the header whole).
 ///
 /// Exported so the producer chunks against the same number the consumer bounds
 /// against. Them drifting apart IS the bug this documents.
@@ -2959,13 +3040,14 @@ pub fn chunk_max_chars_for_window(embedding_window_tokens: usize) -> usize {
     let usable = window_chars.saturating_sub(MEMORY_OBSERVATION_HEADER_CHARS);
     // Never zero: a pathologically small window still has to chunk into
     // something, and one char at a time is the floor that keeps progress.
-    usable.min(MEMORY_CHUNK_TARGET_CHARS).max(1)
+    usable.clamp(1, MEMORY_CHUNK_TARGET_CHARS)
 }
 
-/// Kept for callers that want the compile-time target rather than a
-/// model-derived budget — notably the output-reserve derivation, which is
-/// about the largest routine `write_file` payload and only ever coincided with
-/// the embedding chunk size.
+/// The compile-time chunk target, for callers that want it rather than a
+/// model-derived budget.
+///
+/// Notably the output-reserve derivation, which is about the largest routine
+/// `write_file` payload and only ever coincided with the embedding chunk size.
 pub const MEMORY_CHUNK_MAX_CHARS: usize = MEMORY_CHUNK_TARGET_CHARS;
 
 
@@ -3384,7 +3466,7 @@ mod tests {
 
         for i in 0..8 {
             service
-                .remember(&format!("memory number {i}"), Default::default())
+                .remember(&format!("memory number {i}"), HashMap::default())
                 .await
                 .expect("seed");
         }
@@ -4181,7 +4263,7 @@ mod tests {
     /// a database.
     #[derive(Default)]
     struct ChunkBackfillDb {
-        /// (chunk_id, content, embedded_by)
+        /// (`chunk_id`, content, `embedded_by`)
         chunks: std::sync::Mutex<Vec<(i64, String, Option<String>)>>,
         unchunked: std::sync::Mutex<Vec<String>>,
     }
@@ -4246,11 +4328,12 @@ mod tests {
             let next = store.iter().map(|(id, _, _)| *id).max().unwrap_or(0) + 1;
             for (i, c) in chunks.iter().enumerate() {
                 store.push((
-                    next + i as i64,
+                    next + i64::try_from(i).unwrap(),
                     c.content.clone(),
                     c.embedding_model.clone().filter(|_| c.embedding.is_some()),
                 ));
             }
+            drop(store);
             Ok(())
         }
     }
@@ -4373,7 +4456,7 @@ mod tests {
         assert_eq!((start, total), (10, 10));
 
         let (way_past, start, _) = r.excerpt(9_999, 100);
-        assert!(way_past.is_empty());
+        assert_eq!(way_past, "");
         assert_eq!(start, 10, "the offset is clamped to the end, not echoed back");
     }
 
@@ -4820,7 +4903,7 @@ mod tests {
     }
 
     /// A write whose embed call itself carries the switch (the daemon's
-    /// embed_fn rebinds before returning) hands back a vector of the OLD
+    /// `embed_fn` rebinds before returning) hands back a vector of the OLD
     /// width. That write must land as a queued-for-backfill entry — never
     /// error, which is what produced the per-write WARN loop.
     #[tokio::test]
@@ -4928,7 +5011,7 @@ mod tests {
 
     // ---- Fold vs live-write concurrency (the 2026-08-10 incident class) ----
 
-    /// Shared slot letting a test embed_fn call back INTO the service — the
+    /// Shared slot letting a test `embed_fn` call back INTO the service — the
     /// deterministic hook point for "a live write lands between the fold's
     /// snapshot and its commit" (the embed of the merged text sits exactly
     /// there).
@@ -4949,7 +5032,8 @@ mod tests {
                     // Only the fold's MERGED text carries both markers; that
                     // embed call is the window between snapshot and commit.
                     if text.contains(hook_markers.0) && text.contains(hook_markers.1) {
-                        if let Some(service) = slot.lock().await.clone() {
+                        let service = slot.lock().await.clone();
+                        if let Some(service) = service {
                             service
                                 .update_content(rewrite_target, rewrite_content)
                                 .await
