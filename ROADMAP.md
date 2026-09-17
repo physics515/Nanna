@@ -4567,7 +4567,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       - [ ] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
-      - [~] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
+      - [x] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
             server as started / failed-with-reason; today that lives only in the boot log.
             *(2026-09-17)* `nanna doctor` half done: an offline `mcp.servers` check judges the
             config the way the daemon will start it — FAIL when a command is not on `PATH` (or an
@@ -4585,6 +4585,11 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             into a log line. Verified on the debug daemon with the fixture config: `fixture` started
             with 1 tool, `broken` failed with `No such file or directory (os error 2)`, the duplicate
             reported not_started. Remaining: render it on the GUI Tools page.
+            *(2026-09-17, later still)* **GUI half done:** `get_mcp_servers` (Tauri) reads the field,
+            `lib/mcpServers.ts` validates it (malformed entries dropped, never throws), and
+            `McpServerList` shows each server with a state dot and its tool count or failure reason
+            on the Tools landing panel (hidden when none are configured). 6 vitest incl. the exact
+            payload captured from the live daemon. Not WebDriver-verified (Linux harness blocked).
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.

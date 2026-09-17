@@ -230,6 +230,7 @@ pub fn run() {
             commands::settings::get_credential_status,
             commands::settings::refresh_oauth_token,
             commands::settings::get_daemon_providers,
+            commands::settings::get_mcp_servers,
             commands::settings::check_env_var,
             // Cognitive memory (FSRS-6 + dreaming)
             commands::memory::get_cognitive_memory_stats,

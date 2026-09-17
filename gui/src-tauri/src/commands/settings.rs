@@ -714,6 +714,23 @@ pub async fn get_daemon_providers(
         .ok_or_else(|| "daemon did not report llm_providers".to_string())
 }
 
+/// Each configured MCP server's state, from the daemon's `system.status`.
+///
+/// Empty — not an error — when the daemon predates the field or has no MCP
+/// servers configured: the Tools page then simply shows no MCP section.
+#[tauri::command]
+pub async fn get_mcp_servers(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let state_guard = state.read().await;
+    let status = state_guard.backend.system_status().await?;
+    Ok(status
+        .get("mcp_servers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 /// Refresh the OAuth token if expired or expiring soon
 #[tauri::command]
 pub async fn refresh_oauth_token(

@@ -110,6 +110,7 @@
               <FileCode2 class="w-4 h-4 mr-1" /> Templates
             </UiButton>
           </div>
+          <McpServerList :servers="mcpServers" class="mt-8" />
         </div>
       </div>
 
@@ -364,6 +365,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
+import { parseMcpServers, type McpServerState } from '~/lib/mcpServers'
 import { invoke } from '@tauri-apps/api/core'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import {
@@ -607,6 +609,21 @@ async function refreshTools() {
   } finally {
     refreshing.value = false
     loading.value = false
+  }
+  await refreshMcpServers()
+}
+
+/** Configured MCP servers and why any of them is not serving tools. */
+const mcpServers = ref<McpServerState[]>([])
+
+async function refreshMcpServers() {
+  try {
+    mcpServers.value = parseMcpServers(await invoke<unknown>('get_mcp_servers'))
+  } catch (e) {
+    // An older daemon or a dropped connection: show no MCP section rather
+    // than a stale one.
+    mcpServers.value = []
+    console.warn('Could not read MCP server state:', e)
   }
 }
 
