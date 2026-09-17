@@ -1,103 +1,103 @@
-# Nanna v0.3.20-beta.29 — A Quarter of the Toolbox Was Never Handed Over
+# Nanna v0.3.21-beta.30 — Things That Talk Back
 
-Nanna ships 44 tools. On a default install you were getting 28.
+If you wrote to Nanna from Telegram, Discord or Slack, every message was answered with
+**"I encountered an error processing your message."** Every one.
 
-Not because the missing ones were broken — because the daemon-side service each one calls was
-registered nowhere, and a skill whose service is absent is **withheld from the model** rather than
-offered and left to fail. That withholding is correct, and it was also silent: one `info` line per
-skill, among a few hundred at boot. The README said "44 filesystem tools — file, shell, web, vision,
-OCR, PDF, memory, and scheduling", and three of those categories did not exist at runtime.
+Not because the model failed — the model was never asked. Two things were wrong at once. The
+conversation a chat message belongs to was never created, and the daemon refuses a message for a
+conversation that does not exist. And even past that, the channel code read its reply out of the
+daemon's response to "send this message" — which, since the daemon learned to acknowledge a message
+the moment it arrives (so a long task never times out the sender), is a receipt, not an answer.
 
-This release wires 13 of the 16 back, and makes the remaining gap impossible to acquire again.
+This release makes the chat apps real conversations again, and then builds on that: reminders that
+arrive, questions Nanna can ask you, results that land where you asked for them, and an undo for the
+files she writes.
 
 ## What's Fixed
 
-**16 of 44 bundled skills were withheld at every boot. Now 3 are.** The count came out of a new audit
-that cross-checks every skill's declared `requires: [...]` against every service the daemon can
-register, parsed with the loader's own extractor rather than a bespoke regex — so a declaration the
-test cannot see is one the daemon cannot see either. Any remaining gap has to be named with its
-reason, and a second test fails when an entry goes **stale in either direction**: the service got
-implemented, or no skill asks for it any more. It caught its own author twice during this run.
+**Chat apps get answers.** Each chat gets its own conversation, created on first contact with its
+reply route remembered — so it survives a restart. When a turn finishes, the answer is sent back to
+the chat it came from. If a message cannot be answered at all, the chat is told why ("no model
+provider is configured"), not "an error". Webhook conversations are covered by the same path.
 
-The daemon also **announces the gap at boot** now, once, naming the withheld skills *and* the
-services blocking them — not just a count, because a count tells you something is missing without
-telling you what to configure.
+**Reminders work — and survive a restart.** `remind`, `list_reminders` and `cancel_reminder` were
+the last three tools withheld at boot; **no bundled tool is missing its service any more**. A due
+reminder is posted into the conversation that set it — in the app, and in the chat app you wrote
+from. A reminder that came due while Nanna was not running is delivered at the next start and says
+how late it is. Driven for real: set, delivered 7 s later; set, daemon stopped, restarted 90 s
+later, delivered 6 s after boot with "is 2 min late".
 
-**Nanna can write its own tools, and use them in the same breath.** `create_tool` authors a new
-JS/TS tool and registers it live — callable immediately, no restart. `edit_tool` changes one,
-refusing an edit that matches zero or several places rather than guessing which you meant, and
-re-registering on success. `list_user_tools` shows what has been authored. All three were withheld
-before this release; none of their services existed.
+**The scheduler no longer runs two copies of one job.** Anything still running when the next
+30-second check came round was started again — a slow one-shot fired **8 times** in the test that
+now pins it, a slow recurring job ran **11 copies at once**. And a fired one-shot was re-armed by
+every restart. Both are gone.
 
-**It can see, read, listen, browse and look at your screen** — where you have the pieces for it.
-`analyze_image`, `describe_image` and `ocr` need a vision-capable model named in
-`[memory] ocr_model_priority`. `text_to_speech` and `transcribe` need an OpenAI key. The four
-`browser_*` tools need Chromium or Chrome installed. `screenshot` needs a desktop capture tool and a
-display. Where a piece is absent the tools stay withheld and the boot line tells you exactly which
-setting or program would turn them on.
+**MCP servers actually start — and their tools would have broken every request.** The MCP client
+was complete and nothing ever launched it. Configured servers now start at boot, in the background.
+On the way: MCP tools were named `server:tool`, and the colon is invalid for both Anthropic and
+OpenAI, which reject the *whole request* over it — the first MCP tool anyone added would have failed
+every turn. They are named `mcp__server__tool` now.
 
-**Scanned PDFs are readable, and an empty answer now tells you why it is empty.** `read_pdf` falls
-back to model OCR for image-only pages. More usefully, it distinguishes four outcomes that all used
-to look like an empty string: no OCR model is configured, OCR ran and recovered text, OCR ran and
-the images carried none, or the document has no embedded images at all and simply is not a scan.
+**A failed tool call over IPC said nothing.** A direct tool call that failed answered `success:
+false` with an empty string; the reason was dropped. It is returned now.
 
-**Things that made a file now tell you where it is.** Generated speech, page screenshots and desktop
-captures used to report a byte count and drop the bytes — an API call or a browser launch spent
-producing something nobody could open. All three write a file and return its path.
+## What's New
 
-**Four browser tools were advertised with five contract mismatches.** `browser_evaluate` sent
-`expression` where the daemon read `script`, so every call would have answered `Missing script`.
-`browser_extract` offered an `attribute` parameter with no implementation behind it. `browser_action`
-advertised `scroll` and `navigate`, neither of which existed. All five are closed, and the browser
-services are the one group verified end to end here: a page served on loopback, a real Chromium
-launched, and the extraction, attribute, expression, scroll and PNG all asserted.
+**Ask when unsure.** `ask_user` posts a clarifying question into the conversation — app or chat app —
+and waits up to half an hour for your reply, which the running task picks up and continues with. No
+reply, and it carries on with its best judgement and says what it assumed.
 
-**A tool that forgot its `permissions.json` was handed the whole filesystem.** The default written on
-a tool author's behalf was `read: ["*"], write: ["*"]` — which is how `edit_tool`, the tool whose job
-is rewriting other tools' source, ran unscoped while its own sibling was confined to home. It is now
-home-scoped, derived from a census of the 44 bundled skills rather than picked, and every such grant
-is announced naming the tool. Existing installs are untouched: the grant is persisted, so a directory
-that already has one keeps it.
+**Undo for file writes.** Before `write_file`, `edit_file` or `file_buffer` changes a file, its
+previous content is saved outside your project. Nanna can list and restore her own checkpoints
+(`file_history`), and the chat header has a **Files** button that does the same for you. A restore
+is itself undoable; restoring a file a tool created removes it. Bounded: 100 recent checkpoints per
+conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall.
 
-**`~` in a permission scope denied everything instead of meaning home.** The doc comments promised
-`~` support; the check compared against a literal `~` path component, which matches nothing. Only
-reachable by building permissions programmatically, which is exactly why it would have waited for the
-next caller. Now implemented.
+**Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/model
+<name>` to pin that conversation's model (`/model default` undoes it), `/help`.
 
-**One connection could see every conversation.** `Subscribe` was recorded and ignored — every IPC
-client was forwarded the whole event stream, so an attached client saw other sessions' message
-deltas, tool calls and errors on the wire. Narrowing is now real and opt-in, costing a single atomic
-load until someone uses it.
+**Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet
+heartbeat posts nothing.
 
-**Anthropic OAuth identified itself as a Claude Code release from a year ago.** Subscription sign-in
-presents Nanna as a Claude Code client, and the version it reported was pinned at `2.1.2`. It now
-reports `2.1.273`, matching the current CLI.
+**Hand edits of `config.toml` apply without a restart** (models, providers, scheduler switches). A
+half-saved file that does not parse is logged and the running configuration is kept; saving the same
+values changes nothing.
 
-**`[general] data_dir` now does something.** The setting parsed, validated and round-tripped while
-changing nothing — the daemon always used the platform default. It is honoured now, the daemon says
-at boot when a configured location is in use, and `--data-dir` still wins over it. Pointing it at a
-new folder does **not** move an existing store; the daemon opens whatever is there. Daemon logs also
-follow `--data-dir` and the configured location instead of splitting off to the default one.
+**Spend by day, month and conversation.** The per-request log existed with nothing writing it; it is
+written now, and `system.cost_rollup` prices it. The Model Stats page shows spend by day for the last
+30 days. Models with no list price (local, unknown) are named and marked, never counted as $0.
+
+**Operations.** Prometheus `/metrics` on the health port (tools, models, MCP servers, channel
+messages in and out, reminders, live runs). `system.status` and the Tools page show each MCP server
+as started, failed (with the error) or not started (with the reason). `nanna doctor` checks MCP
+commands are on `PATH`.
+
+**Memory learns from use.** When Nanna recalls a result she stored earlier, the memories that
+served it are credited — the first producer of the "used successfully" signal the memory system has
+priced since July.
 
 ## What This Release Does Not Do
 
-**Reminders still do not work,** and the three `schedule.*` tools stay withheld. The blocker is not
-the missing service bridge it looked like: the scheduler's one-shot timers are fully live, but the
-output of a scheduled run reaches the log and nothing else — `target_session`, the field that looks
-like the delivery route, is set by no caller and read by no code. Wiring the services on top of that
-would have the model promise you a reminder that fires into a log file.
+**None of this was driven through a live chat app.** There is no bot token on the build host. The
+channel path is tested with a recording channel against the real control plane and session store; a
+real Telegram round-trip is the remaining check.
 
-**The vision, speech and screenshot paths are wired but not exercised end to end here.** This host
-has no cloud credential, and running a screen capture to prove plumbing would have photographed the
-operator's desktop unasked. Everything up to the request is tested; the request itself is not.
+**MCP servers speaking only the newest protocol (2026-07-28) will not connect.** That revision drops
+the `initialize` handshake Nanna's client uses. Such a server is reported as failed, with its error,
+on the Tools page and in `system.status` — but it does not work yet. Stdio servers only;
+HTTP servers are not started from config.
 
-**Browsing costs 3.8 MB.** Enabling the browser stack adds 9 crates and grows the daemon binary by
-5.7% (66,483,104 → 70,302,752 bytes). That is the one change here that makes the shipped binary
-bigger.
+**`ask_user` waiting inside a running task, and a scheduled job's result being posted after a real
+model run, were not exercised end to end** — both need a live model turn. The mechanics under them
+are tested against the real run registry and session store.
+
+**GUI changes are not WebDriver-verified.** Linux still lacks a WebKitGTK driver matching the app's
+WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
 
 ## Numbers
 
-- **1,999 tests pass, 0 fail** across 79 binaries; clippy reports 0 errors.
-- **16 → 3** bundled skills withheld at boot.
-- **6 dependencies** removed that nothing imported; `backoff`, `instant` and `nix` leave the lockfile.
-- Release daemon: **70,325,024 bytes**.
+- **2,089 Rust tests and 268 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
+- **3 → 0** bundled tools withheld for want of a daemon service.
+- **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
+- Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing
+  imported it).
