@@ -6729,6 +6729,15 @@ keep the phases readable; promote individual items into a phase when they become
       probe then repeated on a clean 30s cadence with a fresh client UUID each time. Shutdown was clean
       (`nanna-daemon.exit.json` → `"reason": "clean_shutdown"`).
 
+- [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
+      neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
+      `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system
+      libraries (`unknown type [0x13] section .relr.dyn` — DT_RELR, newer than that binutils);
+      `NO_STRIP=true` gets past it. (2) The GTK plugin then dies copying
+      `/usr/lib/gdk-pixbuf-2.0/2.10.0`, a loader directory this host does not have. The 2026-09-14
+      AppImage failure was a different cause (tmpfs quota). The release workflow builds on its own
+      runner, so this blocks only local AppImage verification; fix by pointing the gtk plugin at the
+      host's actual pixbuf loader dir (or skipping it), or accept `.deb` as the local Linux check.
 - [x] *(2026-09-14)* **`XDG_DATA_HOME` + `NANNA_CONFIG_PATH` isolate the GUI on Linux** — the skill's
       smoke-run recipe is written for the daemon's `--data-dir`/`--port` flags, which the GUI binary
       does not take, and it notes that on Windows `%APPDATA%` cannot redirect settings because
