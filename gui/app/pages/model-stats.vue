@@ -35,6 +35,30 @@
         @primary="fetchStats"
       />
 
+      <!-- Spend per day, from the daemon's request log -->
+      <div v-if="spendDays.length > 0" class="glass-panel rounded-xl p-5" data-testid="spend-by-day">
+        <div class="flex items-baseline justify-between mb-3">
+          <h3 class="text-lg font-semibold text-nanna-text">Spend by day</h3>
+          <span class="text-sm text-nanna-text-muted">
+            last 30 days: {{ formatUsd(costRollup.pricedTotalUsd) }}<span v-if="costRollup.unpricedModels.length > 0"> + unpriced use</span>
+          </span>
+        </div>
+        <table class="w-full text-sm">
+          <tbody>
+            <tr v-for="day in spendDays" :key="day.period" class="border-t border-white/[0.04]">
+              <td class="py-1.5 font-mono text-nanna-text-muted">{{ day.period }}</td>
+              <td class="py-1.5 text-right text-nanna-text-muted">{{ day.requests }} requests</td>
+              <td class="py-1.5 text-right font-mono text-nanna-text" :title="day.partlyUnpriced ? 'Includes models with no list price; this is a floor' : ''">
+                {{ formatUsd(day.costUsd) }}<span v-if="day.partlyUnpriced">+</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-if="costRollup.unpricedModels.length > 0" class="text-xs text-nanna-text-dim mt-2">
+          Not priced (local or unknown): {{ costRollup.unpricedModels.join(', ') }}
+        </p>
+      </div>
+
       <!-- Model cards -->
       <div v-for="model in sortedModels" :key="model.model" class="glass-panel rounded-xl p-5">
         <!-- Model header -->
@@ -167,6 +191,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { formatUsd, parseCostRollup, spendByPeriod, type CostRollup } from '~/lib/costRollup'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, BarChart3 } from '@lucide/vue'
 
@@ -207,9 +232,24 @@ const sortedModels = computed(() => {
   return [...models.value].sort((a, b) => b.total_requests - a.total_requests)
 })
 
+/** Spend per day; empty (and hidden) when the daemon has no request log yet. */
+const costRollup = ref<CostRollup>({ buckets: [], pricedTotalUsd: 0, unpricedModels: [] })
+const spendDays = computed(() => spendByPeriod(costRollup.value))
+
+async function fetchCostRollup() {
+  try {
+    costRollup.value = parseCostRollup(await invoke<unknown>('get_cost_rollup', { days: 30 }))
+  } catch (e) {
+    // An older daemon or no storage: hide the section instead of guessing.
+    costRollup.value = { buckets: [], pricedTotalUsd: 0, unpricedModels: [] }
+    console.warn('Could not read the cost rollup:', e)
+  }
+}
+
 async function fetchStats() {
   isLoading.value = true
   loadError.value = null
+  void fetchCostRollup()
   try {
     const result = await invoke<{ models: ModelStat[] }>('get_model_stats')
     models.value = result.models || []

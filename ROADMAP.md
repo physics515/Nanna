@@ -5044,6 +5044,10 @@ asks permission or restricts her.)*:
       spawned. `system.cost_rollup {by: "session"}` groups by it (an empty label = requests made
       outside any conversation). Tests: the task-local is readable in a callback inside the run and
       not across `spawn`; the storage rollup groups the logged rows under their session.
+      *(and)* **GUI surfacing:** the Model Stats page shows **Spend by day** for the last 30 days
+      (`get_cost_rollup` → `lib/costRollup.ts`): per-day totals newest first, a day that used an
+      unpriced model marked `+` (a floor, with a tooltip saying so), and the unpriced models named.
+      Hidden when the daemon has no log yet. 3 vitest; not WebDriver-verified.
 - [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.
