@@ -4625,7 +4625,9 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             target/wiring notes. **Real daemon:** fixture server started, the one missing its token
             reported `not_started` with `nanna mcp secret set needs_token …`; the real CLI refused
             `BAD-NAME`. Not exercised: a stored value reaching a child — that needs a write to the
-            operator's keyring, which a nightly run does not do. Not yet in `nanna doctor`.
+            operator's keyring, which a nightly run does not do. `nanna doctor`'s `mcp.servers` check
+            fails the same way (real CLI against the smoke config: `[FAIL]` naming the set command,
+            exit 1), never printing a value.
       - [x] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
             server as started / failed-with-reason; today that lives only in the boot log.
             *(2026-09-17)* `nanna doctor` half done: an offline `mcp.servers` check judges the

@@ -118,7 +118,9 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
     checks.push(check_ollama_servers(config));
-    checks.push(check_mcp_servers(config, command_resolves));
+    checks.push(check_mcp_servers(config, command_resolves, |key| {
+        nanna_config::credentials::SecureStore::new().get(key).ok()
+    }));
 
     debug_assert!(
         checks
@@ -216,9 +218,16 @@ fn check_server_exposure() -> Check {
 /// failure — the daemon would log a spawn error at boot and the server's tools
 /// would silently never appear.
 ///
-/// `resolves` answers "can this command be spawned" so the verdict logic is
-/// testable without a real `PATH`. Offline: nothing is spawned or contacted.
-fn check_mcp_servers(config: &Config, resolves: impl Fn(&str) -> bool) -> Check {
+/// `resolves` answers "can this command be spawned" and `secret` looks a
+/// `secret_env` value up by store key, so the verdict logic is testable without
+/// a real `PATH` or keyring. A server missing a secret is a failure for the same
+/// reason as a missing command: the daemon will not start it. Offline: nothing
+/// is spawned or contacted, and no secret value is printed.
+fn check_mcp_servers(
+    config: &Config,
+    resolves: impl Fn(&str) -> bool,
+    secret: impl Fn(&str) -> Option<String>,
+) -> Check {
     const NAME: &str = "mcp.servers";
     if config.mcp.servers.is_empty() {
         return Check::ok(NAME, "no MCP servers configured");
@@ -238,8 +247,29 @@ fn check_mcp_servers(config: &Config, resolves: impl Fn(&str) -> bool) -> Check 
         })
         .collect();
     debug_assert!(missing.len() <= start.len());
+    let unsecreted: Vec<String> = start
+        .iter()
+        .filter_map(|entry| entry.resolve_secret_env(&secret).err())
+        .collect();
+    if missing.is_empty() && !unsecreted.is_empty() {
+        let mut detail = unsecreted.join("; ");
+        if !skipped.is_empty() {
+            detail = format!("{detail}; also not started: {}", skipped.join("; "));
+        }
+        return Check::fail(
+            NAME,
+            detail,
+            "store each named secret with `nanna mcp secret set <server> <VAR>`, or remove it from \
+             that server's `secret_env`",
+        );
+    }
     if !missing.is_empty() {
-        let mut detail = missing.join("; ");
+        let mut detail = missing
+            .iter()
+            .chain(&unsecreted)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         if !skipped.is_empty() {
             detail = format!("{detail}; also not started: {}", skipped.join("; "));
         }
@@ -967,6 +997,10 @@ mod tests {
         Config::default()
     }
 
+    fn no_secrets(_: &str) -> Option<String> {
+        None
+    }
+
     fn with_mcp(servers: &[(&str, &str)]) -> Config {
         let mut config = cfg();
         config.mcp.servers = servers
@@ -986,17 +1020,21 @@ mod tests {
     fn mcp_servers_are_judged_the_way_the_daemon_will_start_them() {
         let installed = |command: &str| command == "npx";
 
-        let none = check_mcp_servers(&cfg(), installed);
+        let none = check_mcp_servers(&cfg(), installed, no_secrets);
         assert_eq!(none.severity, Severity::Ok);
 
-        let fine = check_mcp_servers(&with_mcp(&[("files", "npx")]), installed);
+        let fine = check_mcp_servers(&with_mcp(&[("files", "npx")]), installed, no_secrets);
         assert_eq!(fine.severity, Severity::Ok, "{fine:?}");
         assert!(
             fine.detail.contains("1 will start at daemon boot: files"),
             "{fine:?}"
         );
 
-        let missing = check_mcp_servers(&with_mcp(&[("files", "npx"), ("git", "uvx")]), installed);
+        let missing = check_mcp_servers(
+            &with_mcp(&[("files", "npx"), ("git", "uvx")]),
+            installed,
+            no_secrets,
+        );
         assert_eq!(missing.severity, Severity::Fail, "{missing:?}");
         assert!(
             missing
@@ -1009,6 +1047,7 @@ mod tests {
         let both = check_mcp_servers(
             &with_mcp(&[("files", "npx"), ("git", "/opt/uvx"), ("files", "npx")]),
             installed,
+            no_secrets,
         );
         assert_eq!(both.severity, Severity::Fail, "{both:?}");
         assert!(
@@ -1022,10 +1061,35 @@ mod tests {
             "{both:?}"
         );
 
-        let duplicate =
-            check_mcp_servers(&with_mcp(&[("files", "npx"), ("files", "npx")]), installed);
+        let duplicate = check_mcp_servers(
+            &with_mcp(&[("files", "npx"), ("files", "npx")]),
+            installed,
+            no_secrets,
+        );
         assert_eq!(duplicate.severity, Severity::Warn, "{duplicate:?}");
         assert!(duplicate.detail.contains("is used twice"), "{duplicate:?}");
+    }
+
+    #[test]
+    fn an_mcp_server_missing_its_secret_fails_without_printing_any_value() {
+        let installed = |command: &str| command == "npx";
+        let mut config = with_mcp(&[("github", "npx")]);
+        config.mcp.servers[0].secret_env = vec!["GITHUB_TOKEN".into()];
+
+        let unset = check_mcp_servers(&config, installed, no_secrets);
+        assert_eq!(unset.severity, Severity::Fail, "{unset:?}");
+        assert!(
+            unset
+                .detail
+                .contains("run `nanna mcp secret set github GITHUB_TOKEN`"),
+            "{unset:?}"
+        );
+
+        let stored =
+            |key: &str| (key == "mcp.github.GITHUB_TOKEN").then(|| "ghp_value".to_string());
+        let set = check_mcp_servers(&config, installed, stored);
+        assert_eq!(set.severity, Severity::Ok, "{set:?}");
+        assert!(!set.detail.contains("ghp_value"), "{set:?}");
     }
 
     #[test]
