@@ -77,11 +77,10 @@ type BoundAddr = tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>;
 /// collapsing them is what made this suite fail on healthy code under load while
 /// giving a useless message when the code was genuinely broken.
 async fn wait_until_ready(
+    started: std::time::Instant,
     bound: &mut BoundAddr,
     handle: &mut tokio::task::JoinHandle<Result<(), String>>,
 ) -> u16 {
-    let started = std::time::Instant::now();
-
     loop {
         if let Some(addr) = *bound.borrow_and_update() {
             return addr.port();
@@ -150,14 +149,23 @@ impl TestDaemon {
             server.run().await.map_err(|e| e.to_string())
         });
 
-        let Ok(mut bound) = bound_rx.await else {
+        // One ceiling over the whole boot, `build()` included: a build that
+        // wedges never sends its receiver, and must fail the test rather than
+        // hang it.
+        let started = std::time::Instant::now();
+        let mut bound = match tokio::time::timeout(READY_HANG_CEILING, bound_rx).await {
+            Ok(Ok(bound)) => bound,
             // The task ended before the server was even built: surface its cause.
-            match handle.await {
+            Ok(Err(_)) => match handle.await {
                 Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
                 other => panic!("daemon task ended before building the server: {other:?}"),
-            }
+            },
+            Err(_) => panic!(
+                "daemon is still building after {READY_HANG_CEILING:?} — this is the hang \
+                 ceiling, not a latency assertion, so treat it as a wedged boot"
+            ),
         };
-        let port = wait_until_ready(&mut bound, &mut handle).await;
+        let port = wait_until_ready(started, &mut bound, &mut handle).await;
         Self { port, _data_dir: data_dir, handle }
     }
 
@@ -704,5 +712,55 @@ async fn narrowing_a_connection_stops_another_sessions_events_on_the_wire() {
     narrowed.disconnect().await;
     unfiltered.disconnect().await;
     actor.disconnect().await;
+    daemon.stop();
+}
+
+/// A daemon with no model configured answers a chat by naming the missing
+/// setting, instead of running a turn on a model named "".
+///
+/// That blank name used to resolve to whichever provider claims unprefixed
+/// names, so the turn's steps sent requests naming no model (a debug-assertion
+/// panic in the agent loop, a provider error in release) and the user got no
+/// explanation.
+#[tokio::test]
+async fn a_chat_with_no_model_configured_says_which_setting_is_missing() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("no model".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+
+    client
+        .chat()
+        .send(&session, "hello")
+        .await
+        .expect("chat.send is accepted");
+
+    let explained = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageDelta { delta, .. })
+                    if delta.contains("could not run") =>
+                {
+                    return delta;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn answered: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn answers before the ceiling");
+    assert!(
+        explained.contains("No model is configured") && explained.contains("[llm] model"),
+        "the reply names the missing setting: {explained}"
+    );
+
+    client.disconnect().await;
     daemon.stop();
 }

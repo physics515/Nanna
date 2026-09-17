@@ -74,11 +74,17 @@ impl AgentSpawner for AgentSpawnerImpl {
         // provider is missing is skipped; a candidate whose run fails hands
         // the prompt to the next (a fresh agent — sub-agent runs are
         // idempotent by contract, the parent only consumes the final text).
+        // Blank names are dropped the same way the chat walk drops them: a
+        // blank candidate would reach the provider that claims unprefixed
+        // names and send a request naming no model.
         let candidates = if sub_agent_models.is_empty() {
-            vec![base_config.model.clone()]
+            crate::agent_service::named_models(std::slice::from_ref(&base_config.model))
         } else {
-            sub_agent_models.clone()
+            crate::agent_service::named_models(&sub_agent_models)
         };
+        if candidates.is_empty() {
+            return Err(crate::agent_service::NO_MODEL_CONFIGURED.to_string());
+        }
 
         let control = self.control.read().await.clone();
         let Some(control) = control else {
@@ -2857,8 +2863,10 @@ impl DaemonServer {
         let stats_save_handle = self.spawn_stats_autosave(&control);
         self.spawn_sub_agent_checkin();
 
+        // The configured address: with port 0 the real port is only known once
+        // the IPC task binds, and its own "listening" line reports that.
         info!(
-            "Daemon ready. IPC server listening on ws://{}",
+            "Daemon ready. IPC server configured for ws://{}",
             self.ipc.address()
         );
 

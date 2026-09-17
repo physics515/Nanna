@@ -39,6 +39,7 @@
 //! there is a genuine multi-item run to attribute work to.
 
 use super::{ControlPlane, Value, json};
+use crate::agent_service::{NO_MODEL_CONFIGURED, named_models};
 use crate::session::{MessageRole, SessionMessage, TimelineItem};
 use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
@@ -909,6 +910,18 @@ impl ChatTurn {
         // say it is THIS chat's, and say how to drop it.
         let model = step_runner.agent_config.model.clone();
         self.live.set_model(&model);
+        // A blank name is no model at all. It must be caught here, not by the
+        // provider check below: an unprefixed name resolves to whichever
+        // provider claims those, so "" passed that check whenever that
+        // provider was registered and every step sent a request naming no
+        // model. A pin is never blank (clearing one removes it), so this is
+        // always the Settings model.
+        if named_models(std::slice::from_ref(&model)).is_empty() {
+            *turn_stop_kind = "no_model".to_string();
+            tracing::warn!("chat turn cannot run: no model is configured");
+            self.final_sink.delta(&format!("_could not run: {NO_MODEL_CONFIGURED}._"));
+            return None;
+        }
         if step_runner.router.client_for_model(&model).is_none() {
             *turn_stop_kind = "no_provider".to_string();
             tracing::warn!(

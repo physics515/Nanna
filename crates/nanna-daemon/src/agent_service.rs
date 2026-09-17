@@ -119,8 +119,7 @@ impl ModelWalk {
     /// every provider being down.
     fn new(models: &[String]) -> Self {
         let last_error = if models.is_empty() {
-            "No model is configured: set [agent] model, or add provider credentials \
-             so a model priority list can be built"
+            NO_MODEL_CONFIGURED
         } else {
             "No models available"
         };
@@ -135,6 +134,12 @@ impl ModelWalk {
     }
 }
 
+/// Why a run cannot start when no model is configured, naming the settings
+/// that fix it. Shared by every entry point that resolves a model, so they
+/// agree on what "no model" means and on what to tell the user.
+pub(crate) const NO_MODEL_CONFIGURED: &str = "No model is configured: choose one in \
+     Settings → Models (config.toml: [llm] model or [llm] model_priority)";
+
 /// The models a chat walks: the priority list when there is one, otherwise the
 /// single default model — minus blank names.
 ///
@@ -142,7 +147,7 @@ impl ModelWalk {
 /// configured walked `[""]`, which routed to whichever provider claims
 /// unprefixed names and sent it a request naming no model (a debug-assertion
 /// panic in `prompt_cache_control`, a provider error in release).
-fn configured_models(model: &str, priority: &[String]) -> Vec<String> {
+pub(crate) fn configured_models(model: &str, priority: &[String]) -> Vec<String> {
     if priority.is_empty() {
         named_models(&[model.to_string()])
     } else {
@@ -151,7 +156,7 @@ fn configured_models(model: &str, priority: &[String]) -> Vec<String> {
 }
 
 /// `models` without blank or whitespace-only entries.
-fn named_models(models: &[String]) -> Vec<String> {
+pub(crate) fn named_models(models: &[String]) -> Vec<String> {
     models.iter().filter(|m| !m.trim().is_empty()).cloned().collect()
 }
 
@@ -1279,14 +1284,19 @@ impl AgentService {
             let config = self.config.read().await;
             configured_models(&config.model, &config.model_priority)
         };
+        // Nothing to rank: the health sort's all-unhealthy fallback would log
+        // that every model is down, when none is configured at all.
+        if base_models.is_empty() {
+            return base_models;
+        }
 
         // Apply health-aware reordering: healthy models first, skip unhealthy ones
         self.router.health_sorted_models(&base_models).await
     }
 
     /// Whether any model is configured to run a prompt with. A daemon built
-    /// without one (no `[agent] model`, no credentials to derive a priority
-    /// list from) has nothing to send a scheduled prompt to.
+    /// without one (no `[llm] model`, no `[llm] model_priority`) has nothing
+    /// to send a scheduled prompt to.
     pub async fn has_configured_model(&self) -> bool {
         let config = self.config.read().await;
         !configured_models(&config.model, &config.model_priority).is_empty()
