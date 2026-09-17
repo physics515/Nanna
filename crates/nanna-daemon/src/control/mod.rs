@@ -130,6 +130,8 @@ pub struct ControlPlane {
     /// pending transitions once, in the model's next tool result. `None` in
     /// minimal test constructions.
     degradations: Option<Arc<nanna_agent::DegradationLedger>>,
+    /// Per-server MCP state from the boot task; `None` outside a daemon.
+    mcp_status: Option<crate::mcp_startup::McpStatus>,
 }
 
 impl ControlPlane {
@@ -168,6 +170,7 @@ impl ControlPlane {
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -230,6 +233,7 @@ impl ControlPlane {
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -294,6 +298,7 @@ impl ControlPlane {
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -407,6 +412,13 @@ impl ControlPlane {
     /// A new receiver on the daemon event bus, if one is attached.
     pub fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Event>> {
         self.event_tx.as_ref().map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// Attach the MCP boot task's per-server state.
+    #[must_use]
+    pub fn with_mcp_status(mut self, status: crate::mcp_startup::McpStatus) -> Self {
+        self.mcp_status = Some(status);
+        self
     }
 
     /// Set the scheduler

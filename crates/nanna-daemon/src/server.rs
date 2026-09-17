@@ -2010,6 +2010,8 @@ pub struct DaemonServer {
     /// The scheduler, for the `schedule.*` services built before it exists.
     /// Filled once in run(), right after the scheduler is constructed.
     scheduler_slot: crate::reminder_service::SchedulerSlot,
+    /// Per-server MCP state: written by the boot task, read by `system.status`.
+    mcp_status: crate::mcp_startup::McpStatus,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -2162,6 +2164,7 @@ impl DaemonServer {
             _control: control,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
+            mcp_status: crate::mcp_startup::McpStatus::default(),
             ipc,
             persistence,
             shutdown_tx,
@@ -3006,6 +3009,7 @@ impl DaemonServer {
         .with_workspace_id(workspace_id_for_services)
         .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
+        .with_mcp_status(Arc::clone(&self.mcp_status))
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
         .with_chat_runs(chat_runs.clone())
@@ -4249,8 +4253,10 @@ impl DaemonServer {
         crate::mcp_startup::spawn_mcp_servers(
             &self.config.mcp,
             Arc::clone(&tools),
+            Arc::clone(&self.mcp_status),
             self.shutdown_tx.subscribe(),
-        );
+        )
+        .await;
 
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {

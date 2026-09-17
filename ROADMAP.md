@@ -4565,6 +4565,13 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             /nonexistent/mcp-server, which is not an executable file; also not started: … 'fixture'
             is used twice`. Still open: live per-server state (started / handshake failed) over IPC
             and on the GUI Tools page.
+            *(2026-09-17, later)* **IPC half done:** `system.status` now carries `mcp_servers` —
+            each configured server as `starting` / `started` (with its tool count) / `failed` (with
+            the spawn or handshake error) / `not_started` (with the config reason).
+            `McpIntegration::start_all` returns per-server outcomes instead of swallowing failures
+            into a log line. Verified on the debug daemon with the fixture config: `fixture` started
+            with 1 tool, `broken` failed with `No such file or directory (os error 2)`, the duplicate
+            reported not_started. Remaining: render it on the GUI Tools page.
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.

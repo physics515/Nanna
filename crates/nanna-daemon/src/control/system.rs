@@ -81,6 +81,13 @@ impl ControlPlane {
                     "tool_count": tool_count,
                     "scheduler_available": scheduler_available,
                     "llm_providers": llm_providers,
+                    // Each configured MCP server: starting / started (with its
+                    // tool count) / failed or not_started (with the reason).
+                    // A failed server's tools are simply absent otherwise.
+                    "mcp_servers": match self.mcp_status {
+                        Some(ref status) => json!(*status.read().await),
+                        None => json!([]),
+                    },
                     "config_path": self.config_path,
                 })
             }
