@@ -204,13 +204,228 @@ impl ControlPlane {
                     json!({ "entries": [], "error": "Storage not available" })
                 }
             }
-            SystemAction::ProbeOllama { base_url } => {
-                let probe = nanna_llm::probe_ollama(&base_url, std::time::Duration::from_secs(5)).await;
-                match &probe {
-                    nanna_llm::OllamaProbe::Reachable { models } => json!({ "reachable": true, "models": models }),
-                    nanna_llm::OllamaProbe::Unreachable { reason } => json!({ "reachable": false, "reason": reason }),
-                }
+            SystemAction::ProbeOllama { base_url, models } => {
+                let (base_url, models) = {
+                    let config = self.config.read().await;
+                    let base_url = base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map_or_else(|| config.memory.ollama_host.clone(), str::to_string);
+                    let models = if models.is_empty() {
+                        configured_ollama_models(&config)
+                    } else {
+                        models
+                    };
+                    (base_url, models)
+                };
+                let probe = nanna_llm::probe_ollama(&base_url, OLLAMA_PROBE_TIMEOUT).await;
+                ollama_probe_report(&base_url, &probe, &models)
             }
+            SystemAction::ValidateApiKey { provider, key } => {
+                // The key is used for this one request and dropped; it is
+                // never logged and never written anywhere.
+                crate::validate_api_key::handle_validate_api_key(&provider, &key).await
+            }
+        }
+    }
+}
+
+/// How long one Ollama probe may take, connect and answer together. A local
+/// server answers `/api/tags` in milliseconds and a LAN one in tens; 3 s is
+/// past both with room, and a dead host cannot stall the onboarding wizard
+/// for longer than that. Same figure `nanna doctor --online` uses.
+const OLLAMA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Every Ollama model the configuration names — the chat model when the
+/// provider is Ollama, the chat priority list, and the embedding priority
+/// list — as the tags Ollama lists them under, deduplicated.
+fn configured_ollama_models(config: &nanna_config::Config) -> Vec<String> {
+    let mut wanted: Vec<String> = Vec::new();
+    let mut push = |spec: &str| {
+        if is_ollama_model_spec(spec) {
+            let tag = ollama_tag(spec);
+            if !wanted.iter().any(|have| have.eq_ignore_ascii_case(&tag)) {
+                wanted.push(tag);
+            }
+        }
+    };
+    if config.llm.provider.eq_ignore_ascii_case("ollama") {
+        push(&config.llm.model);
+    }
+    for spec in config
+        .llm
+        .model_priority
+        .iter()
+        .chain(&config.memory.embedding_priority)
+    {
+        push(spec);
+    }
+    wanted
+}
+
+/// Does a model spec name an Ollama model? `ollama/<model>`, or a bare
+/// `name:tag` with no provider prefix (how Ollama ids look, and how the
+/// router detects them).
+fn is_ollama_model_spec(model: &str) -> bool {
+    let model = model.trim();
+    model.starts_with("ollama/") || (!model.contains('/') && model.contains(':'))
+}
+
+/// A model as the tag Ollama lists it under: no `ollama/` prefix, and
+/// `:latest` when no tag is given — Ollama's own default.
+fn ollama_tag(model: &str) -> String {
+    let model = model.trim();
+    let model = match model.split_once('/') {
+        Some((prefix, rest)) if prefix.eq_ignore_ascii_case("ollama") => rest,
+        _ => model,
+    };
+    let name = model.rsplit('/').next().unwrap_or(model);
+    if name.contains(':') {
+        model.to_string()
+    } else {
+        format!("{model}:latest")
+    }
+}
+
+/// The wire shape of a `system.probe_ollama` answer. Pure, so the two
+/// questions it must keep apart can be tested without a socket:
+///
+/// * `reachable: false` + `reason` — nothing usable answered (`missing` is
+///   empty here on purpose: a dead server has told us nothing about models,
+///   and listing every wanted model as "missing" would read as a pull problem).
+/// * `reachable: true` + `missing` — the server answered and these wanted
+///   models are not installed; each carries the `ollama pull` that fixes it.
+///
+/// `wanted` is echoed back normalized (`name:tag`) so a client can show what
+/// was actually compared.
+fn ollama_probe_report(
+    base_url: &str,
+    probe: &nanna_llm::OllamaProbe,
+    wanted: &[String],
+) -> Value {
+    let wanted: Vec<String> = wanted.iter().map(|m| ollama_tag(m)).collect();
+    match probe {
+        nanna_llm::OllamaProbe::Unreachable { reason } => json!({
+            "base_url": base_url,
+            "reachable": false,
+            "reason": reason,
+            "models": [],
+            "wanted": wanted,
+            "missing": [],
+        }),
+        nanna_llm::OllamaProbe::Reachable { models } => {
+            let missing: Vec<Value> = wanted
+                .iter()
+                .filter(|want| !models.iter().any(|have| have.eq_ignore_ascii_case(want)))
+                .map(|name| json!({ "name": name, "pull": format!("ollama pull {name}") }))
+                .collect();
+            json!({
+                "base_url": base_url,
+                "reachable": true,
+                "models": models,
+                "wanted": wanted,
+                "missing": missing,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod ollama_probe_tests {
+    use super::*;
+    use nanna_llm::OllamaProbe;
+
+    fn wanted(models: &[&str]) -> Vec<String> {
+        models.iter().map(|m| (*m).to_string()).collect()
+    }
+
+    #[test]
+    fn a_dead_server_is_unreachable_and_claims_nothing_about_models() {
+        let probe = OllamaProbe::Unreachable {
+            reason: "connection refused".to_string(),
+        };
+        let report = ollama_probe_report("http://localhost:11434", &probe, &wanted(&["qwen3.5:9b"]));
+        assert_eq!(report["reachable"], json!(false));
+        assert_eq!(report["reason"], json!("connection refused"));
+        assert_eq!(report["models"], json!([]));
+        // Down is not "every model is missing": the two must stay distinguishable.
+        assert_eq!(report["missing"], json!([]));
+        assert_eq!(report["wanted"], json!(["qwen3.5:9b"]));
+    }
+
+    #[test]
+    fn a_live_server_names_each_missing_model_with_its_pull_command() {
+        let probe = OllamaProbe::Reachable {
+            models: vec!["qwen3.5:9b".to_string(), "nomic-embed-text:latest".to_string()],
+        };
+        let report = ollama_probe_report(
+            "http://localhost:11434",
+            &probe,
+            &wanted(&["ollama/qwen3.5:9b", "nomic-embed-text", "gemma4:12b"]),
+        );
+        assert_eq!(report["reachable"], json!(true));
+        assert!(report.get("reason").is_none(), "a reachable server has no failure reason");
+        assert_eq!(report["models"], json!(["qwen3.5:9b", "nomic-embed-text:latest"]));
+        // `ollama/` stripped, `:latest` supplied — compared as Ollama lists them.
+        assert_eq!(
+            report["wanted"],
+            json!(["qwen3.5:9b", "nomic-embed-text:latest", "gemma4:12b"])
+        );
+        assert_eq!(
+            report["missing"],
+            json!([{ "name": "gemma4:12b", "pull": "ollama pull gemma4:12b" }])
+        );
+    }
+
+    #[test]
+    fn a_live_server_with_every_wanted_model_reports_nothing_missing() {
+        let probe = OllamaProbe::Reachable {
+            models: vec!["QWEN3.5:9b".to_string()],
+        };
+        let report = ollama_probe_report("http://gpu-box:11434", &probe, &wanted(&["qwen3.5:9b"]));
+        assert_eq!(report["reachable"], json!(true));
+        assert_eq!(report["missing"], json!([]), "tag comparison is case-insensitive");
+        assert_eq!(report["base_url"], json!("http://gpu-box:11434"));
+    }
+
+    #[test]
+    fn configured_ollama_models_collects_chat_priority_and_embeddings_once() {
+        let mut config = nanna_config::Config::default();
+        config.llm.provider = "ollama".to_string();
+        config.llm.model = "qwen3.5:9b".to_string();
+        config.llm.model_priority = vec![
+            "ollama/qwen3.5:9b".to_string(),
+            "anthropic/claude-sonnet-5".to_string(),
+            "gemma4:12b".to_string(),
+        ];
+        config.memory.embedding_priority = vec!["ollama/nomic-embed-text".to_string()];
+        assert_eq!(
+            configured_ollama_models(&config),
+            vec!["qwen3.5:9b", "gemma4:12b", "nomic-embed-text:latest"],
+            "cloud specs are skipped, duplicates folded, tags normalized"
+        );
+    }
+
+    #[test]
+    fn a_non_ollama_chat_provider_contributes_no_chat_model() {
+        let mut config = nanna_config::Config::default();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
+        config.llm.model_priority.clear();
+        config.memory.embedding_priority.clear();
+        assert!(configured_ollama_models(&config).is_empty());
+    }
+
+    #[test]
+    fn the_probe_action_parses_with_both_fields_absent() {
+        let raw = json!({ "type": "system", "action": "probe_ollama" });
+        match serde_json::from_value::<Action>(raw).expect("must parse") {
+            Action::System(SystemAction::ProbeOllama { base_url, models }) => {
+                assert_eq!(base_url, None);
+                assert!(models.is_empty());
+            }
+            other => panic!("expected probe_ollama, got {other:?}"),
         }
     }
 }

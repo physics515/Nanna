@@ -57,6 +57,7 @@ pub mod audio_service;
 pub mod browser_service;
 pub mod screenshot_service;
 pub mod user_tools;
+pub mod validate_api_key;
 pub mod webhook;
 
 #[cfg(windows)]

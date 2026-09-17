@@ -1897,6 +1897,94 @@ pub async fn set_sub_agent_models(
 }
 
 // =============================================================================
+// Data storage location (`[general] data_dir`)
+// =============================================================================
+
+/// Where the daemon keeps its store, as the GUI can report it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataDirInfo {
+    /// The directory the current config selects (override or platform default).
+    pub effective: String,
+    /// The platform default, so the UI can offer "reset to default".
+    pub default: String,
+    /// Whether `[general] data_dir` names somewhere other than the default.
+    pub is_custom: bool,
+}
+
+/// Report the configured data directory.
+///
+/// Reads the in-memory config the GUI already holds; nothing here touches the
+/// daemon, because the GUI is a pure client and the value the daemon *booted*
+/// with may differ from the value on disk until it restarts — which is exactly
+/// what the UI tells the user.
+#[tauri::command]
+pub async fn get_data_dir(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<DataDirInfo, String> {
+    let state_guard = state.read().await;
+    let default = nanna_config::Config::default_data_dir()
+        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
+    let effective = state_guard
+        .config
+        .resolve_data_dir()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    Ok(DataDirInfo {
+        effective: effective.display().to_string(),
+        default: default.display().to_string(),
+        is_custom: state_guard.config.has_custom_data_dir(),
+    })
+}
+
+/// Set (or, with `None` / blank, clear) the configured data directory.
+///
+/// Validates the folder first — absolute, a directory, creatable, writable —
+/// and refuses rather than persisting a path the daemon cannot use. Writes
+/// `config.toml` only; **no data is moved**. The daemon reads this at boot,
+/// so the change takes effect on its next restart, and the returned info is
+/// what the UI shows while stating that.
+#[tauri::command]
+pub async fn set_data_dir(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    path: Option<String>,
+) -> Result<DataDirInfo, String> {
+    let chosen = path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+
+    if let Some(dir) = &chosen {
+        nanna_config::validate_data_dir(dir).map_err(|e| e.to_string())?;
+    }
+
+    let mut state_guard = state.write().await;
+    state_guard.config.general.data_dir = chosen.clone();
+    state_guard
+        .config
+        .save()
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+
+    match &chosen {
+        Some(dir) => info!(
+            "Data directory set to {} — takes effect when the daemon restarts; existing data is not moved",
+            dir.display()
+        ),
+        None => info!("Data directory reset to the platform default — takes effect when the daemon restarts"),
+    }
+
+    let default = nanna_config::Config::default_data_dir()
+        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
+    let effective = state_guard
+        .config
+        .resolve_data_dir()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    Ok(DataDirInfo {
+        effective: effective.display().to_string(),
+        default: default.display().to_string(),
+        is_custom: state_guard.config.has_custom_data_dir(),
+    })
+}
+
+// =============================================================================
 // Config Persistence Commands
 // =============================================================================
 

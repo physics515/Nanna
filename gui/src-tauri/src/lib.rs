@@ -313,6 +313,8 @@ pub fn run() {
             commands::settings::set_routing_first_turn_primary,
             commands::settings::get_sub_agent_models,
             commands::settings::set_sub_agent_models,
+            commands::settings::get_data_dir,
+            commands::settings::set_data_dir,
             // Model status
             commands::system::get_model_status,
             commands::system::get_model_stats,
