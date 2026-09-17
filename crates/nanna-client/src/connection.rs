@@ -80,6 +80,11 @@ pub struct Client {
 
 impl Client {
     /// Connect to the daemon
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Connection`] when the WebSocket handshake with
+    /// `config.url` fails, or [`ClientError::Timeout`] when it does not complete
+    /// within `config.connect_timeout`.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
         let (event_tx, _) = broadcast::channel::<Event>(100);
@@ -194,8 +199,8 @@ impl Client {
     ) {
         // Try to parse as Response first
         if let Ok(response) = serde_json::from_str::<Response>(text) {
-            let mut pending = pending.write().await;
-            if let Some(req) = pending.remove(&response.id) {
+            let req = pending.write().await.remove(&response.id);
+            if let Some(req) = req {
                 let result = match response.result {
                     ResponseResult::Success { data } => Ok(data),
                     ResponseResult::Error { code, message } => {
@@ -290,6 +295,18 @@ impl Client {
     }
     
     /// Send a request and wait for response
+    ///
+    /// # Errors
+    /// - [`ClientError::NotConnected`] when the client is not connected.
+    /// - [`ClientError::Protocol`] when the request cannot be serialised.
+    /// - [`ClientError::Request`] when the connection handler has already shut
+    ///   down (the outgoing queue is closed) or the response channel is dropped
+    ///   without an answer.
+    /// - [`ClientError::Connection`] when the connection drops while the request
+    ///   is pending.
+    /// - [`ClientError::Server`] when the daemon answers with an error.
+    /// - [`ClientError::Timeout`] when no response arrives within
+    ///   `config.request_timeout`.
     pub async fn request(&self, action: Action) -> Result<Value> {
         if !self.is_connected().await {
             return Err(ClientError::NotConnected);
@@ -320,8 +337,7 @@ impl Client {
             Ok(Err(_)) => Err(ClientError::Request("Response channel closed".to_string())),
             Err(_) => {
                 // Remove pending request on timeout
-                let mut pending = self.pending.write().await;
-                pending.remove(&id);
+                self.pending.write().await.remove(&id);
                 Err(ClientError::Timeout)
             }
         }
