@@ -380,6 +380,8 @@ enum ChannelCommand<'a> {
     ModelUsage,
     /// `/status` — is Nanna up, busy here, and able to answer at all.
     Status,
+    /// `/stop` — cancel the turn running in this chat.
+    Stop,
     /// `/help` or `/start` (what Telegram sends when a chat opens).
     Help,
 }
@@ -397,6 +399,7 @@ fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
     match command {
         "/status" => return Some(ChannelCommand::Status),
         "/help" | "/start" => return Some(ChannelCommand::Help),
+        "/stop" => return Some(ChannelCommand::Stop),
         "/model" => {}
         _ => return None,
     }
@@ -416,6 +419,7 @@ fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
 const CHANNEL_HELP: &str = "Commands:\n\
 /status — whether Nanna is up, busy in this chat, and able to answer\n\
 /model — the model this chat uses; /model <name> pins one; /model default undoes it\n\
+/stop — stop what Nanna is working on in this chat\n\
 /help — this list\n\
 Anything else is a message to Nanna.";
 
@@ -496,13 +500,17 @@ async fn status_facts(control: &ControlPlane, session_id: &str) -> StatusFacts {
 /// Carry out a channel command against the session; returns the reply.
 async fn run_channel_command(
     command: ChannelCommand<'_>,
-    control: &ControlPlane,
+    control: &Arc<ControlPlane>,
     session_id: &str,
 ) -> String {
     let sessions = &control.sessions;
     match command {
         ChannelCommand::Status => status_text(&status_facts(control, session_id).await),
         ChannelCommand::Help => CHANNEL_HELP.to_string(),
+        ChannelCommand::Stop => {
+            let response = control.handle_chat_cancel_for_channel(session_id).await;
+            stop_reply(&response)
+        }
         ChannelCommand::ShowModel => {
             // A rare command; cloning the session to read one key is fine.
             let Some(session) = sessions.get(session_id).await else {
@@ -542,6 +550,16 @@ async fn run_channel_command(
              `/model` alone shows the current one; `/model default` undoes a pin."
                 .to_string()
         }
+    }
+}
+
+/// The reply to `/stop`, from the daemon's cancel response. Pure.
+fn stop_reply(response: &serde_json::Value) -> String {
+    match response.get("status").and_then(serde_json::Value::as_str) {
+        Some("cancelled") => "Stopped. Anything already written stays; send a new message to continue.".to_string(),
+        Some("not_active") => "Nothing is running in this chat.".to_string(),
+        _ => refusal_text(response)
+            .unwrap_or_else(|| "The stop request got an answer Nanna did not recognise; nothing is known to have stopped.".to_string()),
     }
 }
 
@@ -862,6 +880,7 @@ mod tests {
         assert_eq!(parse_channel_command("/status@NannaBot"), Some(Status));
         assert_eq!(parse_channel_command("/help"), Some(Help));
         assert_eq!(parse_channel_command("/start"), Some(Help));
+        assert_eq!(parse_channel_command("/stop"), Some(Stop));
         for message in [
             "/statuses",
             "/models",
@@ -911,14 +930,16 @@ mod tests {
         let router = router.read().await;
         ChannelManager::process_message(incoming("/status"), &control, &router).await;
         ChannelManager::process_message(incoming("/help"), &control, &router).await;
+        ChannelManager::process_message(incoming("/stop"), &control, &router).await;
         let replies: Vec<String> = sent
             .lock()
             .expect("sent")
             .iter()
             .map(|(_, text)| text.clone())
             .collect();
-        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert_eq!(replies.len(), 3, "{replies:?}");
         assert!(replies[0].starts_with("Nanna is up ("), "{}", replies[0]);
+        assert!(replies[2].contains("agent_unavailable"), "{}", replies[2]);
         assert!(
             replies[0].contains("No model provider is configured"),
             "{}",
@@ -932,6 +953,19 @@ mod tests {
                 .expect("session")
                 .messages
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn stop_says_what_happened() {
+        let cancelled = serde_json::json!({ "status": "cancelled", "session_id": "s" });
+        assert!(stop_reply(&cancelled).starts_with("Stopped."));
+        let idle = serde_json::json!({ "status": "not_active", "session_id": "s" });
+        assert_eq!(stop_reply(&idle), "Nothing is running in this chat.");
+        let no_agent = serde_json::json!({ "error": "agent_unavailable" });
+        assert_eq!(
+            stop_reply(&no_agent),
+            "Nanna could not answer this message: agent_unavailable"
         );
     }
 

@@ -53,8 +53,9 @@ previous content is saved outside your project. Nanna can list and restore her o
 is itself undoable; restoring a file a tool created removes it. Bounded: 100 recent checkpoints per
 conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall.
 
-**Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/model
-<name>` to pin that conversation's model (`/model default` undoes it), `/help`.
+**Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/stop`
+(cancel what Nanna is doing in that chat), `/model <name>` to pin that conversation's model
+(`/model default` undoes it), `/help`.
 
 **Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet
 heartbeat posts nothing.

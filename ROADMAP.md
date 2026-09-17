@@ -4761,9 +4761,13 @@ asks permission or restricts her.)*:
       message rule; add refuses a missing session and stores a real one). The prompt run itself
       needs a model, so the post-run delivery was not exercised live. Remaining: fire-and-forget
       sub-agent spawn whose completion posts the same way.
-- [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
+- [~] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
+      *(2026-09-17)* Inspect and stop landed as chat commands: `/status` (is a turn running here,
+      can anything answer) and **`/stop`**, which cancels this chat's turn through the same arm as
+      IPC `chat.cancel` and says whether anything was running. A message sent mid-run already joins
+      the run (interjection). "Approve" stays out — no approval gates by owner decision.
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.
