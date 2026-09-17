@@ -24,7 +24,7 @@ pub async fn execute(
 ) -> Result<Value> {
     // Transpile TypeScript if needed
     let source = if tool.is_typescript {
-        transpile_typescript(&tool.source)?
+        transpile_typescript(&tool.source)
     } else {
         tool.source.clone()
     };
@@ -167,17 +167,26 @@ fn register_console(context: &mut Context) -> Result<()> {
     // Create console object
     let console = boa_engine::object::ObjectInitializer::new(context)
         .function(
-            NativeFunction::from_fn_ptr(console_log),
+            NativeFunction::from_fn_ptr(|_, args, context| {
+                console_log(args, context);
+                Ok(JsValue::undefined())
+            }),
             js_string!("log"),
             0,
         )
         .function(
-            NativeFunction::from_fn_ptr(console_warn),
+            NativeFunction::from_fn_ptr(|_, args, context| {
+                console_warn(args, context);
+                Ok(JsValue::undefined())
+            }),
             js_string!("warn"),
             0,
         )
         .function(
-            NativeFunction::from_fn_ptr(console_error),
+            NativeFunction::from_fn_ptr(|_, args, context| {
+                console_error(args, context);
+                Ok(JsValue::undefined())
+            }),
             js_string!("error"),
             0,
         )
@@ -190,22 +199,19 @@ fn register_console(context: &mut Context) -> Result<()> {
     Ok(())
 }
 
-fn console_log(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn console_log(args: &[JsValue], context: &mut Context) {
     let msg = format_console_args(args, context);
     tracing::info!(target: "script", "{}", msg);
-    Ok(JsValue::undefined())
 }
 
-fn console_warn(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn console_warn(args: &[JsValue], context: &mut Context) {
     let msg = format_console_args(args, context);
     tracing::warn!(target: "script", "{}", msg);
-    Ok(JsValue::undefined())
 }
 
-fn console_error(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn console_error(args: &[JsValue], context: &mut Context) {
     let msg = format_console_args(args, context);
     tracing::error!(target: "script", "{}", msg);
-    Ok(JsValue::undefined())
 }
 
 fn format_console_args(args: &[JsValue], context: &mut Context) -> String {
@@ -323,12 +329,14 @@ fn nanna_list_tools(_: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
             boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
         })?;
 
-    match bridge.list_tools() {
-        Some(defs) => json_to_js(defs, context).map_err(|e| {
-            boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
-        }),
-        None => Ok(JsValue::null()),
-    }
+    bridge.list_tools().map_or_else(
+        || Ok(JsValue::null()),
+        |defs| {
+            json_to_js(defs, context).map_err(|e| {
+                boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
+            })
+        },
+    )
 }
 
 /// `Nanna.searchTools(query[, limit])` — ranked BM25 tool search.
@@ -352,7 +360,7 @@ fn nanna_search_tools(_: &JsValue, args: &[JsValue], context: &mut Context) -> J
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|v| v.to_number(context).ok())
         .filter(|n| n.is_finite() && *n >= 1.0)
-        .map_or(crate::bridge::DEFAULT_TOOL_SEARCH_LIMIT, |n| n as usize);
+        .map_or(crate::bridge::DEFAULT_TOOL_SEARCH_LIMIT, crate::f64_to_usize);
 
     let Some(bridge) = BRIDGE.with(|b| b.borrow().clone()) else {
         return empty_array(context);
@@ -408,7 +416,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     let timeout_secs = args.get(2)
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|v| v.to_number(context).ok())
-        .map(|n| n as u64);
+        .map(crate::f64_to_u64);
     
     tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
     
@@ -467,7 +475,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             // elapsed time cannot reach that (the deadline bounds it to minutes).
             obj.set(
                 js_string!("elapsed_ms"),
-                JsValue::from(response.elapsed_ms as f64),
+                JsValue::from(crate::u64_to_f64(response.elapsed_ms)),
                 false,
                 context,
             )?;
@@ -501,14 +509,14 @@ fn nanna_read_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRe
     })?;
 
     match result {
-        Ok(content) => Ok(JsValue::from(js_string!(content.as_str()))),
+        Ok(text) => Ok(JsValue::from(js_string!(text.as_str()))),
         Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
     }
 }
 
 fn nanna_write_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
-    let content = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+    let text = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
 
     let bridge = BRIDGE.with(|b| b.borrow().clone())
         .ok_or_else(|| {
@@ -520,7 +528,7 @@ fn nanna_write_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
             .enable_all()
             .build()
             .expect("Failed to create runtime");
-        rt.block_on(bridge.write_file(&path, &content))
+        rt.block_on(bridge.write_file(&path, &text))
     })
     .join()
     .map_err(|_| {
@@ -546,7 +554,7 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         .map(|v| v.to_number(context))
         .transpose()?
         .filter(|n| n.is_finite() && *n >= 1.0)
-        .map(|n| n as usize);
+        .map(crate::f64_to_usize);
 
     let bridge = BRIDGE.with(|b| b.borrow().clone())
         .ok_or_else(|| {
@@ -573,8 +581,8 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
                 let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
                 obj.set(js_string!("name"), JsValue::from(js_string!(entry.name.as_str())), false, context)?;
                 obj.set(js_string!("entry_type"), JsValue::from(js_string!(entry.entry_type.as_str())), false, context)?;
-                obj.set(js_string!("size"), JsValue::from(entry.size as f64), false, context)?;
-                obj.set(js_string!("modified"), entry.modified.map_or(JsValue::null(), |m| JsValue::from(m as f64)), false, context)?;
+                obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(entry.size)), false, context)?;
+                obj.set(js_string!("modified"), entry.modified.map_or(JsValue::null(), |m| JsValue::from(crate::u64_to_f64(m))), false, context)?;
                 js_array.push(JsValue::from(obj), context)?;
             }
             Ok(js_array.into())
@@ -606,10 +614,10 @@ fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
     match result {
         Ok(stat) => {
             let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
-            obj.set(js_string!("size"), JsValue::from(stat.size as f64), false, context)?;
+            obj.set(js_string!("size"), JsValue::from(crate::u64_to_f64(stat.size)), false, context)?;
             obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
             obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;
-            obj.set(js_string!("modified"), stat.modified.map_or(JsValue::null(), |m| JsValue::from(m as f64)), false, context)?;
+            obj.set(js_string!("modified"), stat.modified.map_or(JsValue::null(), |m| JsValue::from(crate::u64_to_f64(m))), false, context)?;
             Ok(obj.into())
         }
         Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
@@ -682,30 +690,20 @@ fn nanna_get_env(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
 fn nanna_session_id(_: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
     BRIDGE.with(|cell| {
         let borrow = cell.borrow();
-        if let Some(ref bridge) = *borrow {
-            if let Some(sid) = bridge.session_id() {
-                Ok(JsValue::from(js_string!(sid)))
-            } else {
-                Ok(JsValue::null())
-            }
-        } else {
-            Ok(JsValue::null())
-        }
+        Ok(borrow
+            .as_ref()
+            .and_then(|bridge| bridge.session_id())
+            .map_or_else(JsValue::null, |sid| JsValue::from(js_string!(sid))))
     })
 }
 
 fn nanna_workdir(_: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
     BRIDGE.with(|cell| {
         let borrow = cell.borrow();
-        if let Some(ref bridge) = *borrow {
-            if let Some(wd) = bridge.workdir() {
-                Ok(JsValue::from(js_string!(wd)))
-            } else {
-                Ok(JsValue::null())
-            }
-        } else {
-            Ok(JsValue::null())
-        }
+        Ok(borrow
+            .as_ref()
+            .and_then(|bridge| bridge.workdir())
+            .map_or_else(JsValue::null, |wd| JsValue::from(js_string!(wd))))
     })
 }
 
@@ -749,15 +747,10 @@ fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
     match value {
         Value::Null => Ok(JsValue::null()),
         Value::Bool(b) => Ok(JsValue::from(*b)),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(JsValue::from(i as f64))
-            } else if let Some(f) = n.as_f64() {
-                Ok(JsValue::from(f))
-            } else {
-                Ok(JsValue::from(0.0))
-            }
-        }
+        Value::Number(n) => Ok(JsValue::from(
+            n.as_i64()
+                .map_or_else(|| n.as_f64().unwrap_or(0.0), crate::i64_to_f64),
+        )),
         Value::String(s) => Ok(JsValue::from(js_string!(s.as_str()))),
         Value::Array(arr) => {
             // boa 1.0-dev: JsArray::new is fallible.
@@ -788,7 +781,10 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
     use boa_engine::value::JsVariant;
     
     match value.variant() {
-        JsVariant::Undefined | JsVariant::Null => Ok(Value::Null),
+        // BigInt and Symbol have no JSON representation either.
+        JsVariant::Undefined | JsVariant::Null | JsVariant::BigInt(_) | JsVariant::Symbol(_) => {
+            Ok(Value::Null)
+        }
         JsVariant::Boolean(b) => Ok(Value::Bool(b)),
         JsVariant::Integer32(i) => Ok(Value::Number(i.into())),
         JsVariant::Float64(f) => {
@@ -841,17 +837,15 @@ fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
                 Ok(Value::Object(map))
             }
         }
-        JsVariant::BigInt(_) => Ok(Value::Null), // BigInt not directly representable in JSON
-        JsVariant::Symbol(_) => Ok(Value::Null), // Symbols not representable in JSON
     }
 }
 
 /// Transpile TypeScript to JavaScript
 /// Note: Boa doesn't support TypeScript natively. If actual TS syntax is present,
 /// execution will fail and trigger Deno fallback (which has real TS support).
-fn transpile_typescript(source: &str) -> Result<String> {
+fn transpile_typescript(source: &str) -> String {
     // Just pass through - Boa handles plain JS, Deno handles TS
-    Ok(source.to_string())
+    source.to_string()
 }
 
 #[cfg(test)]
@@ -874,7 +868,7 @@ mod tests {
         
         // Compare structurally (Boa uses f64 internally, so integers become floats)
         assert_eq!(output["name"], "test");
-        assert_eq!(output["count"].as_f64().unwrap() as i64, 42);
+        assert_eq!(output["count"].as_f64(), Some(42.0));
         assert_eq!(output["enabled"], true);
         assert_eq!(output["tags"].as_array().unwrap().len(), 3);
     }

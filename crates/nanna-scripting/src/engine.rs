@@ -74,6 +74,10 @@ impl ScriptEngine {
     ///
     /// `tool_definitions` is an optional JSON array of tool definitions for `Nanna.listTools()`.
     /// `services` is an optional map of service functions callable via `Nanna.service()`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::execute_full`].
     pub async fn execute(
         &self,
         tool: &ScriptedTool,
@@ -85,6 +89,10 @@ impl ScriptEngine {
     }
 
     /// Execute a scripted tool with an optional default working directory.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::execute_full`].
     pub async fn execute_with_workdir(
         &self,
         tool: &ScriptedTool,
@@ -97,6 +105,10 @@ impl ScriptEngine {
     }
 
     /// Execute a scripted tool with optional working directory and session ID.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::execute_full`].
     pub async fn execute_with_workdir_and_session(
         &self,
         tool: &ScriptedTool,
@@ -111,6 +123,16 @@ impl ScriptEngine {
 
     /// Execute a scripted tool with every optional bridge capability,
     /// including the ranked tool search behind `Nanna.searchTools()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the engine's error when the script fails and no fallback runs
+    /// (fallback disabled, or no second engine compiled in) — for example
+    /// [`ScriptError::Execution`] when the script throws, does not parse, or
+    /// exports no callable `execute`, [`ScriptError::Timeout`] when it overruns
+    /// the tool's deadline, or [`ScriptError::EngineNotAvailable`] when the
+    /// chosen engine is not compiled in. When the fallback engine fails too,
+    /// returns [`ScriptError::Execution`] naming both failures.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_full(
         &self,
@@ -163,45 +185,16 @@ impl ScriptEngine {
         let needs_advanced = needs_advanced_engine(&tool.source);
 
         // Determine engine order
-        let (primary, secondary): (EngineKind, Option<EngineKind>) = if needs_advanced {
-            // Skip Boa for scripts that use features it can't handle
-            debug!(tool = %tool.name, "Script needs advanced engine, preferring Deno");
-            #[cfg(feature = "deno")]
-            let p = EngineKind::Deno;
-            #[cfg(not(feature = "deno"))]
-            let p = EngineKind::Boa; // Try Boa anyway if Deno unavailable
-
-            #[cfg(all(feature = "deno", feature = "boa"))]
-            let s = Some(EngineKind::Boa);
-            #[cfg(not(all(feature = "deno", feature = "boa")))]
-            let s = None;
-
-            (p, s)
-        } else if self.prefer_boa {
-            #[cfg(feature = "boa")]
-            let p = EngineKind::Boa;
-            #[cfg(not(feature = "boa"))]
-            let p = EngineKind::Deno;
-
-            #[cfg(all(feature = "deno", feature = "boa"))]
-            let s = Some(EngineKind::Deno);
-            #[cfg(not(all(feature = "deno", feature = "boa")))]
-            let s = None;
-
-            (p, s)
-        } else {
-            #[cfg(feature = "deno")]
-            let p = EngineKind::Deno;
-            #[cfg(not(feature = "deno"))]
-            let p = EngineKind::Boa;
-
-            #[cfg(all(feature = "deno", feature = "boa"))]
-            let s = Some(EngineKind::Boa);
-            #[cfg(not(all(feature = "deno", feature = "boa")))]
-            let s = None;
-
-            (p, s)
-        };
+        let (primary, secondary): (EngineKind, Option<EngineKind>) =
+            if self.prefer_boa && !needs_advanced {
+                (BOA_FIRST_PRIMARY, BOA_FIRST_FALLBACK)
+            } else {
+                // Skip Boa for scripts that use features it can't handle
+                if needs_advanced {
+                    debug!(tool = %tool.name, "Script needs advanced engine, preferring Deno");
+                }
+                (DENO_FIRST_PRIMARY, DENO_FIRST_FALLBACK)
+            };
 
         debug!(tool = %tool.name, engine = %primary, "Executing script");
 
@@ -210,7 +203,7 @@ impl ScriptEngine {
 
         match primary_result {
             Ok(value) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = crate::elapsed_ms(start);
                 info!(tool = %tool.name, engine = %primary, duration_ms, "Script executed successfully");
                 
                 Ok(ExecutionResult {
@@ -235,7 +228,7 @@ impl ScriptEngine {
 
                         match self.execute_with_engine(tool, &input, &bridge, fallback).await {
                             Ok(value) => {
-                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let duration_ms = crate::elapsed_ms(start);
                                 info!(
                                     tool = %tool.name,
                                     engine = %fallback,
@@ -317,15 +310,12 @@ impl ScriptEngine {
     /// Check which engines are available
     #[must_use]
     pub fn available_engines(&self) -> Vec<EngineKind> {
-        let mut engines = Vec::new();
-        
-        #[cfg(feature = "boa")]
-        engines.push(EngineKind::Boa);
-        
-        #[cfg(feature = "deno")]
-        engines.push(EngineKind::Deno);
-        
-        engines
+        vec![
+            #[cfg(feature = "boa")]
+            EngineKind::Boa,
+            #[cfg(feature = "deno")]
+            EngineKind::Deno,
+        ]
     }
 }
 
@@ -341,6 +331,31 @@ impl Default for ScriptEngine {
 /// script/bridge handoff overhead (TS transpile, thread + runtime spawn, result
 /// marshaling), all sub-second, with margin.
 const ENGINE_TIMEOUT_HANDOFF_MARGIN_MS: u64 = 10_000;
+
+/// First engine when Deno leads: scripts that need more than Boa offers, or an
+/// engine configured to prefer Deno. Boa stands in when Deno is not compiled in.
+#[cfg(feature = "deno")]
+const DENO_FIRST_PRIMARY: EngineKind = EngineKind::Deno;
+#[cfg(not(feature = "deno"))]
+const DENO_FIRST_PRIMARY: EngineKind = EngineKind::Boa;
+
+/// Fallback when Deno leads: Boa, only if both engines are compiled in.
+#[cfg(all(feature = "deno", feature = "boa"))]
+const DENO_FIRST_FALLBACK: Option<EngineKind> = Some(EngineKind::Boa);
+#[cfg(not(all(feature = "deno", feature = "boa")))]
+const DENO_FIRST_FALLBACK: Option<EngineKind> = None;
+
+/// First engine when Boa leads. Deno stands in when Boa is not compiled in.
+#[cfg(feature = "boa")]
+const BOA_FIRST_PRIMARY: EngineKind = EngineKind::Boa;
+#[cfg(not(feature = "boa"))]
+const BOA_FIRST_PRIMARY: EngineKind = EngineKind::Deno;
+
+/// Fallback when Boa leads: Deno, only if both engines are compiled in.
+#[cfg(all(feature = "deno", feature = "boa"))]
+const BOA_FIRST_FALLBACK: Option<EngineKind> = Some(EngineKind::Deno);
+#[cfg(not(all(feature = "deno", feature = "boa")))]
+const BOA_FIRST_FALLBACK: Option<EngineKind> = None;
 
 /// The command deadline (seconds) a call asks the shell bridge for, if any.
 ///
@@ -359,10 +374,7 @@ fn extend_for_requested(base_ms: u64, requested_secs: Option<u64>) -> u64 {
     let requested_ms = requested_secs
         .and_then(|s| s.checked_mul(1000))
         .map(|ms| ms.saturating_add(ENGINE_TIMEOUT_HANDOFF_MARGIN_MS));
-    match requested_ms {
-        Some(req) => base_ms.max(req),
-        None => base_ms,
-    }
+    requested_ms.map_or(base_ms, |req| base_ms.max(req))
 }
 
 /// Compute the effective script-engine deadline for one execution.

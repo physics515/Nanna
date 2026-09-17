@@ -118,6 +118,15 @@ impl PythonEngine {
     ///
     /// Each call gets a fresh interpreter — variables don't leak between calls.
     /// Working directory is set via `os.chdir()` if provided.
+    ///
+    /// A Python exception or syntax error is not an `Err`: it comes back as a
+    /// [`PythonResult`] with `success: false` and the exception in `error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Execution`] if the interpreter thread cannot be
+    /// spawned or ends without a result (it panicked), and
+    /// [`ScriptError::Timeout`] if the code runs past `timeout_secs`.
     pub async fn execute(
         &self,
         code: &str,
@@ -137,7 +146,7 @@ impl PythonEngine {
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), receiver).await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = crate::elapsed_ms(start);
 
         match result {
             Ok(Ok(mut py_result)) => {
@@ -157,6 +166,12 @@ impl PythonEngine {
             )),
             Err(_) => Err(ScriptError::Timeout(timeout_secs * 1000)),
         }
+    }
+}
+
+impl Default for PythonEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -209,7 +224,7 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
     // Python bytecode). rustpython 0.5 replaced `Interpreter::with_init` with a
     // builder: stdlib module defs come from `stdlib_module_defs(&ctx)` and frozen
     // modules are added on the builder itself.
-    let builder = vm::Interpreter::builder(Default::default());
+    let builder = vm::Interpreter::builder(vm::Settings::default());
     let stdlib_defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
     let interp = builder
         .add_native_modules(&stdlib_defs)
@@ -227,7 +242,7 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
             .map_err(|e| format!("SyntaxError: {e}"))
             .and_then(|code_obj| {
                 vm.run_code_obj(code_obj, scope.clone())
-                    .map_err(|exc| format_exception(vm, exc))
+                    .map_err(|exc| format_exception(vm, &exc))
             }) {
             Ok(_) => {
                 // Extract results from the _nanna_result dict in scope
@@ -299,11 +314,9 @@ _nanna_json = _nj.dumps(_nanna_result)
 
 /// Build wrapper Python code that captures stdout, stderr, and exceptions.
 fn build_wrapper(user_code: &str, workdir: Option<&str>) -> String {
-    let chdir = if let Some(wd) = workdir {
+    let chdir = workdir.map_or_else(String::new, |wd| {
         format!("import os; os.chdir({})\n", python_string_literal(wd))
-    } else {
-        String::new()
-    };
+    });
 
     // Escape the user code for embedding in a triple-quoted string
     // We use exec() with the code as a variable to avoid any escaping issues
@@ -375,7 +388,7 @@ finally:
 /// Format a Python exception into a human-readable string.
 fn format_exception(
     vm: &rustpython_vm::VirtualMachine,
-    exc: rustpython_vm::PyRef<rustpython_vm::builtins::PyBaseException>,
+    exc: &rustpython_vm::PyRef<rustpython_vm::builtins::PyBaseException>,
 ) -> String {
     // Convert to PyObject and call str()
     use rustpython_vm::AsObject;
@@ -645,7 +658,7 @@ print("Path:", type(pathlib.Path('.')).__name__)
     async fn test_file_operations() {
         let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
-        let code = r#"
+        let code = r"
 import tempfile, os
 with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
     f.write('hello from python')
@@ -653,7 +666,7 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
 with open(name) as f:
     print(f.read())
 os.unlink(name)
-"#;
+";
         let result = engine.execute(code, None, 10).await.unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert!(result.stdout.contains("hello from python"));
@@ -683,11 +696,11 @@ os.unlink(name)
     async fn test_code_with_triple_quotes() {
         let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
-        let code = r#"
+        let code = r"
 msg = '''hello
 world'''
 print(msg)
-"#;
+";
         let result = engine.execute(code, None, 10).await.unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert!(result.stdout.contains("hello\nworld"));

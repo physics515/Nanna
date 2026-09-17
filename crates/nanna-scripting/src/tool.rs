@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// A user-authored tool written in JavaScript/TypeScript
@@ -26,8 +27,11 @@ impl ScriptedTool {
     pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
         let source = source.into();
         let name = name.into();
-        let is_typescript =
-            name.ends_with(".ts") || source.contains(": string") || source.contains(": number");
+        // `rsplit_once` reads the text after the last `.`, which is exactly the
+        // (case-sensitive) `.ts` suffix test this heuristic has always used.
+        let is_typescript = name.rsplit_once('.').is_some_and(|(_, ext)| ext == "ts")
+            || source.contains(": string")
+            || source.contains(": number");
 
         Self {
             name,
@@ -40,6 +44,11 @@ impl ScriptedTool {
     }
 
     /// Create from a file path
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the file cannot be read, including when its
+    /// contents are not valid UTF-8.
     pub fn from_file(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
         let source = std::fs::read_to_string(&path)?;
@@ -447,12 +456,11 @@ fn js_object_literal_to_json(block: &str) -> String {
             }
             // Trailing comma: drop if the next significant char closes a container.
             b',' => {
-                if next_significant_is_close(block, i + 1) {
-                    i += 1; // skip the comma
-                } else {
+                // A trailing comma is skipped; any other is kept.
+                if !next_significant_is_close(block, i + 1) {
                     out.push(',');
-                    i += 1;
                 }
+                i += 1;
             }
             // Bare identifier: a key (followed by ':') gets quoted; a literal
             // value (true/false/null) is copied verbatim.
@@ -496,7 +504,8 @@ fn read_js_string(block: &str, open: usize) -> (String, usize) {
             match bytes.get(i + 1) {
                 Some(b'"') => s.push('"'),
                 Some(b'\'') => s.push('\''),
-                Some(b'\\') => s.push('\\'),
+                // A lone trailing backslash is kept as-is, like an escaped one.
+                Some(b'\\') | None => s.push('\\'),
                 Some(b'/') => s.push('/'),
                 Some(b'n') => s.push('\n'),
                 Some(b't') => s.push('\t'),
@@ -527,7 +536,6 @@ fn read_js_string(block: &str, open: usize) -> (String, usize) {
                     }
                     continue;
                 }
-                None => s.push('\\'),
             }
             i += 2;
             continue;
@@ -554,7 +562,9 @@ fn push_json_string(out: &mut String, raw: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
             c => out.push(c),
         }
     }
@@ -691,7 +701,7 @@ export default {
 }
 "#;
         let m = extract_manifest(src).expect("manifest");
-        assert!(m.requires.is_empty());
+        assert_eq!(m.requires, Vec::<String>::new());
     }
 
     #[test]
@@ -706,10 +716,8 @@ export default {
 }
 "#;
         let m = extract_manifest(src).expect("manifest");
-        assert!(m.requires.is_empty());
+        assert_eq!(m.requires, Vec::<String>::new());
     }
-
-    use super::*;
 
     #[test]
     fn test_extract_manifest() {
@@ -852,7 +860,7 @@ export default {
 
     #[test]
     fn params_schema_handles_single_quotes_and_enum() {
-        let source = r#"
+        let source = r"
             export default {
                 name: 't',
                 description: 'd',
@@ -864,7 +872,7 @@ export default {
                 },
                 execute(i) {}
             }
-        "#;
+        ";
         let params = extract_parameters_schema(source).expect("single quotes normalize");
         assert_eq!(params["properties"]["mode"]["type"], "string");
         assert_eq!(params["properties"]["mode"]["enum"][1], "slow");
@@ -897,7 +905,7 @@ export default {
             params["properties"]["args"]["description"],
             "JSON like: '{\"pattern\": \"*.rs\", \"dry_run\": true}'"
         );
-        assert!(params["required"].as_array().unwrap().is_empty());
+        assert_eq!(params["required"], serde_json::json!([]));
     }
 
     #[test]
