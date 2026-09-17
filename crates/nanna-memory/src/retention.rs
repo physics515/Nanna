@@ -561,15 +561,15 @@ mod tests {
     /// A `summarize_fn` that preserves the cluster's `topic:<n>` tag so the
     /// consolidated entry re-embeds onto the same centroid. Takes `String` by
     /// value to match the `Fn(String) -> Fut` contract the consolidator requires.
-    #[allow(clippy::needless_pass_by_value)]
-    fn echo_summarize(prompt: String) -> impl std::future::Future<Output = Result<String, String>> {
+    /// The future owns the prompt, as a real summarizer's request would.
+    async fn echo_summarize(prompt: String) -> Result<String, String> {
         // The prompt is built from member contents, each carrying `topic:<n>`.
         // Echo the first tag so the summary is deterministically re-embeddable.
         let summary = parse_topic_tag(&prompt).map_or_else(
             || "untagged consolidated".to_string(),
             |topic| format!("topic:{topic} consolidated"),
         );
-        async move { Ok(summary) }
+        Ok(summary)
     }
 
     // ---- Summarization drift ------------------------------------------------
@@ -977,7 +977,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // exact ratios of exactly-representable inputs
     fn report_ratio_math() {
         let m = |count, recall| RetentionMeasurement {
             memory_count: count,
@@ -1000,8 +999,12 @@ mod tests {
             after: m(0, 0.0),
             memories_merged: 0,
         };
-        assert_eq!(empty.compression_ratio(), 0.0);
-        assert_eq!(empty.recall_retention(), 1.0);
+        // Exact: both are returned as literals, so compare the bits (which also
+        // rules out a NaN or a negative zero sneaking through).
+        let compression = empty.compression_ratio();
+        assert_eq!(compression.to_bits(), 0.0_f32.to_bits(), "compression {compression}");
+        let retention = empty.recall_retention();
+        assert_eq!(retention.to_bits(), 1.0_f32.to_bits(), "retention {retention}");
 
         // Recall appeared from nothing → infinity, not divide-by-zero.
         let appeared = RetentionReport {

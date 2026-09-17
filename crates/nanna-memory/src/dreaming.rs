@@ -10,6 +10,7 @@ use crate::{
     ActivityClock, ConsolidationConfig, ConsolidationResult, EmbedFn, MemoryError, MemoryService,
     MemoryServiceConfig,
 };
+use crate::lossy::LossyF32;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,14 +158,15 @@ impl FeedbackTally {
     /// one rounding per term).
     // Counts are exact in f32 below 2^24; beyond that the rounding error is
     // ~1e-7 relative, absorbed by the ±1.0 clamp the dream loop applies.
-    #[allow(clippy::cast_precision_loss)]
-    const fn total_boost(&self) -> f32 {
-        let total = (self.helpful as f32).mul_add(feedback_boost(MemoryFeedback::Helpful), 0.0);
+    fn total_boost(&self) -> f32 {
+        let total = self.helpful.lossy_f32().mul_add(feedback_boost(MemoryFeedback::Helpful), 0.0);
         let total =
-            (self.unhelpful as f32).mul_add(feedback_boost(MemoryFeedback::Unhelpful), total);
-        let total = (self.used_successfully as f32)
+            self.unhelpful.lossy_f32().mul_add(feedback_boost(MemoryFeedback::Unhelpful), total);
+        let total = self
+            .used_successfully
+            .lossy_f32()
             .mul_add(feedback_boost(MemoryFeedback::UsedSuccessfully), total);
-        (self.caused_error as f32).mul_add(feedback_boost(MemoryFeedback::CausedError), total)
+        self.caused_error.lossy_f32().mul_add(feedback_boost(MemoryFeedback::CausedError), total)
     }
 }
 

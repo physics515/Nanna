@@ -1101,8 +1101,6 @@ mod tests {
         dot / (na.sqrt() * nb.sqrt())
     }
 
-    // PRNG + norm math is test-only; precision of the f32 casts is irrelevant.
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
     #[test]
     fn cosine_matches_scalar_reference_on_embedding_sized_vectors() {
         // Deterministic pseudo-random 768-dim pairs (typical embedding width).
@@ -1112,7 +1110,10 @@ mod tests {
                 s ^= s << 13;
                 s ^= s >> 17;
                 s ^= s << 5;
-                (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+                // Doubling is exact in binary floating point, so the fused
+                // multiply-add rounds once where `x * 2.0 - 1.0` did: the same
+                // bits for every `u32` state (checked exhaustively).
+                (s.lossy_f32() / u32::MAX.lossy_f32()).mul_add(2.0, -1.0)
             };
             let a: Vec<f32> = (0..768).map(|_| next()).collect();
             let b: Vec<f32> = (0..768).map(|_| next()).collect();
