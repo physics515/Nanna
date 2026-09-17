@@ -1,6 +1,8 @@
 //! Memory management commands. The daemon owns the memory store; these forward
-//! to it. Tuning knobs that have a config home are persisted to `config.toml`
-//! and pushed to the daemon; knobs the daemon manages internally are no-ops.
+//! to it.
+//!
+//! Tuning knobs that have a config home are persisted to `config.toml` and
+//! pushed to the daemon; knobs the daemon manages internally are no-ops.
 
 #[allow(clippy::wildcard_imports)]
 use crate::*;
@@ -18,21 +20,55 @@ pub struct MemorySearchResult {
     pub relevance: f32,
 }
 
+/// A count from a daemon reply; 0 when the key is absent or not an unsigned
+/// integer. Lossless on the 64-bit targets this ships for; it saturates where
+/// the former `as usize` would have wrapped.
+fn count_field(reply: &serde_json::Value, key: &str) -> usize {
+    reply
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// Share of `content_len` taken up by `matches` query hits, capped at 1.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "relevance is an f32 score on the wire; usize has no lossless conversion to f32, and the counts are converted exactly as the score always has been"
+)]
+fn match_density(matches: usize, content_len: usize) -> f32 {
+    (matches as f32 / content_len.max(1) as f32).min(1.0)
+}
+
+/// Narrow a daemon-reported `f64` score to the `f32` the memory page's wire
+/// type carries.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MemoryItem's score fields are f32 on the wire; f64 has no lossless conversion to f32, and `as` rounds to the nearest f32, the intended narrowing"
+)]
+const fn score_to_f32(score: f64) -> f32 {
+    score as f32
+}
+
 /// Search across all sessions (substring match over daemon-stored history).
+///
+/// # Errors
+///
+/// Returns `Failed to list sessions: …` when the daemon cannot be reached or
+/// the `session.list` request is dropped or times out. A session whose
+/// `session.history` request fails is skipped rather than failing the search.
 #[tauri::command]
 pub async fn search_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<MemorySearchResult>, String> {
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
     let max_results = limit.unwrap_or(50) as usize;
     let query_lower = query.to_lowercase();
 
     // Sessions come from the daemon (it owns nanna.db).
     let sessions: Vec<(String, String)> = {
-        let result = state_guard
-            .backend
+        let result = backend
             .sessions_list()
             .await
             .map_err(|e| format!("Failed to list sessions: {e}"))?;
@@ -58,27 +94,30 @@ pub async fn search_memory(
     let mut results = Vec::new();
 
     for (session_id, session_name) in &sessions {
-        let messages: Vec<(String, String, String, String)> =
-            if let Ok(result) = state_guard.backend.session_history(session_id, Some(1000)).await {
-                result
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .map(|msgs| {
-                        msgs.iter()
-                            .filter_map(|m| {
-                                Some((
-                                    m.get("id")?.as_str()?.to_string(),
-                                    m.get("role")?.as_str()?.to_string(),
-                                    m.get("content")?.as_str()?.to_string(),
-                                    m.get("timestamp")?.as_str()?.to_string(),
-                                ))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
+        let messages: Vec<(String, String, String, String)> = backend
+            .session_history(session_id, Some(1000))
+            .await
+            .map_or_else(
+                |_| vec![],
+                |result| {
+                    result
+                        .get("messages")
+                        .and_then(|v| v.as_array())
+                        .map(|msgs| {
+                            msgs.iter()
+                                .filter_map(|m| {
+                                    Some((
+                                        m.get("id")?.as_str()?.to_string(),
+                                        m.get("role")?.as_str()?.to_string(),
+                                        m.get("content")?.as_str()?.to_string(),
+                                        m.get("timestamp")?.as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+            );
 
         for (msg_id, role, content, timestamp) in messages {
             let content_lower = content.to_lowercase();
@@ -95,7 +134,7 @@ pub async fn search_memory(
                 };
 
                 let matches = content_lower.matches(&query_lower).count();
-                let relevance = (matches as f32 / content.len().max(1) as f32).min(1.0);
+                let relevance = match_density(matches, content.len());
 
                 results.push(MemorySearchResult {
                     session_id: session_id.clone(),
@@ -126,14 +165,18 @@ pub struct MemoryStats {
     pub newest_session: Option<String>,
 }
 
+/// Session and message totals for the memory browser.
+///
+/// # Errors
+///
+/// Returns `Failed to list sessions: …` when the daemon cannot be reached or
+/// the `session.list` request is dropped or times out.
 #[tauri::command]
 pub async fn get_memory_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<MemoryStats, String> {
-    let state_guard = state.read().await;
-
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .sessions_list()
         .await
         .map_err(|e| format!("Failed to list sessions: {e}"))?;
@@ -146,10 +189,11 @@ pub async fn get_memory_stats(
     let mut total_messages = 0u32;
     let mut timestamps: Vec<String> = Vec::new();
     for session in &sessions {
+        // Saturates where `as` wrapped; a count past u32::MAX is unreachable.
         total_messages += session
             .get("message_count")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as u32;
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
         if let Some(created) = session.get("created_at").and_then(|v| v.as_str()) {
             timestamps.push(created.to_string());
         }
@@ -157,7 +201,7 @@ pub async fn get_memory_stats(
     timestamps.sort();
 
     Ok(MemoryStats {
-        total_sessions: sessions.len() as u32,
+        total_sessions: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
         total_messages,
         oldest_session: timestamps.first().cloned(),
         newest_session: timestamps.last().cloned(),
@@ -168,6 +212,11 @@ pub async fn get_memory_stats(
 ///
 /// The daemon runs consolidation on its own schedule; there is no runtime toggle
 /// for it over IPC yet, so this is a no-op accepted for UI compatibility.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn set_dreaming_enabled(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -179,6 +228,13 @@ pub async fn set_dreaming_enabled(
 
 /// Set whether messages are automatically remembered (persisted to config +
 /// pushed to the daemon).
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// daemon is then not told, though this client's cached value has already
+/// changed. The push to the daemon (`config.set` of
+/// `memory.auto_remember_messages`) is best-effort and never fails the command.
 #[tauri::command]
 pub async fn set_auto_remember_messages(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -191,12 +247,20 @@ pub async fn set_auto_remember_messages(
         .backend
         .config_set("memory.auto_remember_messages", serde_json::json!(enabled))
         .await;
+    drop(state_guard);
     info!("Auto-remember messages set: {enabled}");
     Ok(())
 }
 
 /// Set max compression ratio for memory consolidation (persisted to config +
 /// pushed to the daemon).
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// daemon is then not told, though this client's cached value has already
+/// changed. The push to the daemon (`config.set` of
+/// `memory.max_compression_ratio`) is best-effort and never fails the command.
 #[tauri::command]
 pub async fn set_max_compression_ratio(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -210,12 +274,20 @@ pub async fn set_max_compression_ratio(
         .backend
         .config_set("memory.max_compression_ratio", serde_json::json!(clamped))
         .await;
+    drop(state_guard);
     info!("Max compression ratio set: {clamped}");
     Ok(())
 }
 
 /// Set minimum remaining memories floor for consolidation (persisted to config +
 /// pushed to the daemon).
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// daemon is then not told, though this client's cached value has already
+/// changed. The push to the daemon (`config.set` of
+/// `memory.min_remaining_memories`) is best-effort and never fails the command.
 #[tauri::command]
 pub async fn set_min_remaining_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -229,6 +301,7 @@ pub async fn set_min_remaining_memories(
         .backend
         .config_set("memory.min_remaining_memories", serde_json::json!(clamped))
         .await;
+    drop(state_guard);
     info!("Min remaining memories set: {clamped}");
     Ok(())
 }
@@ -249,23 +322,29 @@ pub struct CognitiveMemoryStats {
     pub last_consolidation: Option<String>,
 }
 
+/// Memory-state totals (FSRS active/dormant/silent/unavailable) from the
+/// daemon.
+///
+/// # Errors
+///
+/// Returns `Failed to get memory stats: …` when the daemon cannot be reached or
+/// the `memory.stats` request is dropped or times out.
 #[tauri::command]
 pub async fn get_cognitive_memory_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<CognitiveMemoryStats, String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .memory_stats()
         .await
         .map_err(|e| format!("Failed to get memory stats: {e}"))?;
 
     Ok(CognitiveMemoryStats {
-        total_memories: result.get("total").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        active: result.get("active").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        dormant: result.get("dormant").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        silent: result.get("silent").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        unavailable: result.get("unavailable").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        total_memories: count_field(&result, "total"),
+        active: count_field(&result, "active"),
+        dormant: count_field(&result, "dormant"),
+        silent: count_field(&result, "silent"),
+        unavailable: count_field(&result, "unavailable"),
         consolidation_enabled: result
             .get("consolidation_enabled")
             .and_then(serde_json::Value::as_bool)
@@ -288,22 +367,27 @@ pub struct ConsolidationResultInfo {
 }
 
 /// Manually trigger memory consolidation ("dream").
+///
+/// # Errors
+///
+/// Returns `Consolidation failed: …` when the daemon cannot be reached or the
+/// `memory.consolidate` request is dropped or times out. Consolidation can run
+/// long; the request is allowed the client's full request timeout.
 #[tauri::command]
 pub async fn trigger_consolidation(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<ConsolidationResultInfo, String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .memory_consolidate()
         .await
         .map_err(|e| format!("Consolidation failed: {e}"))?;
 
     Ok(ConsolidationResultInfo {
-        memories_processed: result.get("memories_processed").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        clusters_formed: result.get("clusters_formed").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        memories_merged: result.get("memories_merged").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-        memories_expanded: result.get("memories_expanded").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        memories_processed: count_field(&result, "memories_processed"),
+        clusters_formed: count_field(&result, "clusters_formed"),
+        memories_merged: count_field(&result, "memories_merged"),
+        memories_expanded: count_field(&result, "memories_expanded"),
         errors: result
             .get("errors")
             .and_then(|v| v.as_array())
@@ -314,6 +398,11 @@ pub async fn trigger_consolidation(
 
 /// Apply pending FSRS updates. The daemon applies these itself during recall, so
 /// this is a no-op accepted for UI compatibility.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn apply_memory_updates(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -323,6 +412,11 @@ pub async fn apply_memory_updates(
 
 /// Manually save memories. The daemon persists via Turso write-through on every
 /// mutation, so there is nothing to flush from the client — a no-op.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn save_memories(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -355,11 +449,15 @@ fn memory_item_from_json(m: &serde_json::Value) -> Option<MemoryItem> {
         id: m.get("id")?.as_str()?.to_string(),
         content: m.get("content")?.as_str()?.to_string(),
         fact_type: m.get("fact_type").and_then(|v| v.as_str()).unwrap_or("stated").to_string(),
-        importance: m.get("importance").and_then(serde_json::Value::as_f64).unwrap_or(3.0) as f32,
+        importance: score_to_f32(m.get("importance").and_then(serde_json::Value::as_f64).unwrap_or(3.0)),
         state: m.get("state").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
-        weight: m.get("weight").and_then(serde_json::Value::as_f64).unwrap_or(1.0) as f32,
-        retrievability: m.get("retrievability").and_then(serde_json::Value::as_f64).unwrap_or(1.0) as f32,
-        access_count: m.get("access_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        weight: score_to_f32(m.get("weight").and_then(serde_json::Value::as_f64).unwrap_or(1.0)),
+        retrievability: score_to_f32(m.get("retrievability").and_then(serde_json::Value::as_f64).unwrap_or(1.0)),
+        // Saturates where `as` wrapped; an access count past u32::MAX is unreachable.
+        access_count: m
+            .get("access_count")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
         created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         session_id: m.get("session_id").and_then(|v| v.as_str()).map(String::from),
         workspace_id: m.get("workspace_id").and_then(|v| v.as_str()).map(String::from),
@@ -380,6 +478,11 @@ fn resolve_memory_scope(scope: Option<String>, workspace_id: Option<String>) -> 
 
 /// List semantic memories. Scope semantics: "global" = global-only;
 /// a workspace id = global + that workspace (what the agent sees there).
+///
+/// # Errors
+///
+/// Returns `Failed to list memories: …` when the daemon cannot be reached or
+/// the `memory.list` request is dropped or times out.
 #[tauri::command]
 pub async fn list_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -387,9 +490,8 @@ pub async fn list_memories(
     workspace_id: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
     let effective = resolve_memory_scope(scope, workspace_id);
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .memory_list(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to list memories: {e}"))?;
@@ -404,14 +506,19 @@ pub async fn list_memories(
 }
 
 /// Get a single memory by ID.
+///
+/// # Errors
+///
+/// Returns `Failed to get memory: …` when the daemon cannot be reached or the
+/// `memory.get` request is dropped or times out. An unknown id — a reply
+/// without a usable `memory` object — is `Ok(None)`.
 #[tauri::command]
 pub async fn get_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<Option<MemoryItem>, String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .memory_get(&id)
         .await
         .map_err(|e| format!("Failed to get memory: {e}"))?;
@@ -419,14 +526,19 @@ pub async fn get_memory(
 }
 
 /// Delete a memory by ID.
+///
+/// # Errors
+///
+/// Returns `Failed to delete memory: …` when the daemon cannot be reached or
+/// the `memory.delete` request is dropped or times out. A refusal the daemon
+/// reports in its reply is not checked.
 #[tauri::command]
 pub async fn delete_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .memory_delete(&id)
         .await
         .map_err(|e| format!("Failed to delete memory: {e}"))?;
@@ -435,15 +547,20 @@ pub async fn delete_memory(
 }
 
 /// Update a memory's content.
+///
+/// # Errors
+///
+/// Returns `Failed to update memory: …` when the daemon cannot be reached or
+/// the `memory.update` request is dropped or times out. A refusal the daemon
+/// reports in its reply is not checked.
 #[tauri::command]
 pub async fn update_memory(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
     content: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .memory_update(&id, Some(&content), None)
         .await
         .map_err(|e| format!("Failed to update memory: {e}"))?;
@@ -451,13 +568,20 @@ pub async fn update_memory(
     Ok(())
 }
 
-/// Clear memories in a scope. "global" clears global-only; a workspace id
-/// clears ONLY that workspace's entries (never the globals its tab also
-/// displays — destructive ops stay conservative); no scope clears all.
+/// Clear memories in a scope.
+///
+/// "global" clears global-only; a workspace id clears ONLY that workspace's
+/// entries (never the globals its tab also displays — destructive ops stay
+/// conservative); no scope clears all.
 /// (This is the command the memory page invokes. The old `clear_all_memories`
 /// name never existed as a command — and the note here claiming nothing called
 /// it was wrong: Settings → Data still invoked it until 2026-07-24, so its
 /// "Delete All Memories" button was dead. Both call sites now use this one.)
+///
+/// # Errors
+///
+/// Returns `Failed to clear memories: …` when the daemon cannot be reached or
+/// the `memory.clear` request is dropped or times out.
 #[tauri::command]
 pub async fn clear_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -465,9 +589,8 @@ pub async fn clear_memories(
     workspace_id: Option<String>,
 ) -> Result<(), String> {
     let effective = resolve_memory_scope(scope, workspace_id);
-    let state_guard = state.read().await;
-    state_guard
-        .backend
+    backend_handle(&state)
+        .await
         .memory_clear(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to clear memories: {e}"))?;
@@ -483,6 +606,11 @@ pub async fn clear_memories(
 ///
 /// The daemon owns the memory service and does not expose this over IPC yet, so
 /// the client reports the neutral default.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_similarity_threshold(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -494,6 +622,11 @@ pub async fn get_similarity_threshold(
 ///
 /// No daemon control action exists for this yet; accepted for UI compatibility
 /// (validates the range) but does not change daemon behavior.
+///
+/// # Errors
+///
+/// Returns `Threshold must be between 0.0 and 1.0` for a value outside that
+/// range, NaN included.
 #[tauri::command]
 pub async fn set_similarity_threshold(
     _state: State<'_, Arc<RwLock<AppState>>>,
