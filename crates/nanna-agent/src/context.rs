@@ -1349,16 +1349,16 @@ impl AgentContext {
         self.hard_limit.max(2_000)
     }
 
-    /// Reload workspace context from disk
+    /// Reload workspace context from disk.
     ///
-    /// # Errors
-    /// Returns error if workspace cannot be loaded
-    pub async fn reload_workspace(&mut self) -> Result<(), nanna_workspace::WorkspaceError> {
+    /// Cannot fail: [`WorkspaceFiles::load`] reads each workspace file
+    /// leniently, so a missing or unreadable file simply drops out of the
+    /// context. Without a workspace root this does nothing.
+    pub async fn reload_workspace(&mut self) {
         if let Some(ref root) = self.workspace_root {
             let files = WorkspaceFiles::load(root).await;
             self.workspace_context = Some(files.to_system_context());
         }
-        Ok(())
     }
 
     /// Allocate a portion of context budget to a sub-agent.

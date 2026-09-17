@@ -10,10 +10,13 @@ use nanna_tools::{OutputTarget, ToolCall, ToolRegistry, ToolResponse, ToolResult
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use crate::numeric::{f32_to_usize, millis_u64, usize_to_f32};
 
 /// Core tools always sent to the LLM. Everything else is discoverable via `discover_tools`.
 const CORE_TOOL_NAMES: &[&str] = &["remember", "recall", "reflect", "discover_tools"];
@@ -411,7 +414,7 @@ pub struct AgentConfig {
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
     /// Model priority list for summarization (first working model is used)
-    /// Format: "provider/model" e.g. ["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku"]
+    /// Format: "provider/model" e.g. `["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku"]`
     pub summarization_priority: Vec<String>,
     /// Ollama URL for summarization (if using ollama)
     pub summarization_ollama_url: Option<String>,
@@ -432,7 +435,7 @@ pub struct AgentConfig {
     /// When enabled, the agent classifies each iteration's complexity and routes
     /// to the cheapest model capable of handling it.
     /// Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
+    /// Example: `["claude-haiku-4-5:simple", "claude-opus-5:complex"]`
     pub model_routing: Vec<ModelTier>,
     /// Whether to always use the primary model for the first iteration
     /// (user-facing response quality). Default: true.
@@ -1090,7 +1093,8 @@ fn iteration_produced_information(
                 .unwrap_or("");
             let normalized: String =
                 first_line.split_whitespace().collect::<Vec<_>>().join(" ");
-            normalized.hash(&mut hasher);
+            // Hashed as `str`, which is exactly how `String` hashes itself.
+            normalized.as_str().hash(&mut hasher);
         }
         novel |= seen.insert(hasher.finish());
     }
@@ -1511,6 +1515,7 @@ impl RepeatLedger {
         } else {
             None
         };
+        drop(streaks);
 
         StructuralVerdictOutcome {
             repeat_edits,
@@ -1553,12 +1558,14 @@ impl RepeatLedger {
             entry.count = 1;
             entry.escalated = false;
         }
-        if entry.count >= ZERO_INFO_NAME_STREAK_AFTER && !entry.escalated {
+        let reached = if entry.count >= ZERO_INFO_NAME_STREAK_AFTER && !entry.escalated {
             entry.escalated = true;
             Some(entry.count)
         } else {
             None
-        }
+        };
+        drop(streaks);
+        reached
     }
 }
 
@@ -1751,7 +1758,8 @@ fn name_outcome_signature(record: &ToolCallRecord) -> u64 {
                 masked.push(ch);
             }
         }
-        masked.hash(&mut hasher);
+        // Hashed as `str`, which is exactly how `String` hashes itself.
+        masked.as_str().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -2238,6 +2246,136 @@ fn discovery_pause_notice(
     )
 }
 
+/// [`detect_narration_loop`] with tool history: completion claims that, in
+/// numbers, are phantom-completion evidence even from an active agent.
+const COMPLETION_CLAIMS_ACTIVE: &[&str] = &[
+    "the file is clean",
+    "the file is now",
+    "the rewrite is complete",
+    "the redesign is complete",
+    "successfully wrote",
+    "successfully updated",
+    "successfully created",
+    "successfully modified",
+    "file has been updated",
+    "file has been rewritten",
+    "file has been modified",
+    "changes are complete",
+    "changes are done",
+    "the update is complete",
+    "here's what i changed",
+    "i've rewritten",
+    "i've updated",
+    "i've modified",
+    "i've created the",
+    "i've written the",
+    "verified the",
+    "file is correct",
+    "it now uses only",
+];
+
+/// [`detect_narration_loop`] with tool history: action narration that,
+/// alongside completion claims, marks a phantom workflow.
+const ACTION_CLAIMS_ACTIVE: &[&str] = &[
+    "let me read",
+    "let me check",
+    "let me verify",
+    "let me write",
+    "let me rewrite",
+    "now let me",
+];
+
+/// [`detect_narration_loop`] strategy 1: phrases that indicate the model is
+/// *talking about* using tools.
+const NARRATION_PHRASES: &[&str] = &[
+    "let me read",
+    "let me look",
+    "let me find",
+    "let me list",
+    "let me examine",
+    "let me check",
+    "let me start",
+    "let me try",
+    "let me write",
+    "let me rewrite",
+    "let me update",
+    "let me verify",
+    "let me create",
+    "let me modify",
+    "let me open",
+    "let me review",
+    "let me fix",
+    "let me see",
+    "now let me",
+    "now i'll",
+    "i'll start by",
+    "i'll read",
+    "i'll look",
+    "i'll examine",
+    "i'll list",
+    "i'll write",
+    "i'll rewrite",
+    "i'll update",
+    "i'll check",
+    "i'll verify",
+    "i'll create",
+    "i'll modify",
+    "i need to",
+    "i should read",
+    "i should look",
+    "i should check",
+    "i should write",
+    "reading the file",
+    "listing the directory",
+    "executing the command",
+    "running the command",
+    "writing the file",
+    "rewriting the file",
+    "use my tools",
+    "invoke my tools",
+    "actually execute",
+    "actually use",
+];
+
+/// [`detect_narration_loop`] strategy 2: claims that file work was done and
+/// succeeded.
+const COMPLETION_CLAIMS: &[&str] = &[
+    "the file is clean",
+    "the file is now",
+    "the rewrite is complete",
+    "the redesign is complete",
+    "successfully wrote",
+    "successfully updated",
+    "successfully created",
+    "successfully modified",
+    "file has been updated",
+    "file has been rewritten",
+    "file has been modified",
+    "changes are complete",
+    "changes are done",
+    "the update is complete",
+    "here's what i changed",
+    "i've rewritten",
+    "i've updated",
+    "i've modified",
+    "i've created the",
+    "i've written the",
+    "verified the",
+    "file is correct",
+    "it now uses only",
+];
+
+/// [`detect_narration_loop`] strategy 2: narrated actions that, beside a
+/// completion claim, mean the workflow was hallucinated.
+const ACTION_CLAIMS: &[&str] = &[
+    "let me read",
+    "let me check",
+    "let me verify",
+    "let me write",
+    "let me rewrite",
+    "now let me",
+];
+
 /// Detect degenerate narration loops in streaming text.
 ///
 /// Returns `true` if the text shows signs of the model narrating tool usage
@@ -2260,39 +2398,6 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     // are status narration (describing what it already did), not hallucination.
     // Only trigger on strong phantom-completion signals in this case.
     if has_tool_history {
-        const COMPLETION_CLAIMS_ACTIVE: &[&str] = &[
-            "the file is clean",
-            "the file is now",
-            "the rewrite is complete",
-            "the redesign is complete",
-            "successfully wrote",
-            "successfully updated",
-            "successfully created",
-            "successfully modified",
-            "file has been updated",
-            "file has been rewritten",
-            "file has been modified",
-            "changes are complete",
-            "changes are done",
-            "the update is complete",
-            "here's what i changed",
-            "i've rewritten",
-            "i've updated",
-            "i've modified",
-            "i've created the",
-            "i've written the",
-            "verified the",
-            "file is correct",
-            "it now uses only",
-        ];
-        const ACTION_CLAIMS_ACTIVE: &[&str] = &[
-            "let me read",
-            "let me check",
-            "let me verify",
-            "let me write",
-            "let me rewrite",
-            "now let me",
-        ];
         let completion_hits = COMPLETION_CLAIMS_ACTIVE
             .iter()
             .filter(|p| lower.contains(*p))
@@ -2306,57 +2411,6 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     }
 
     // ── Strategy 1: Repeated intent-to-act phrases ──
-    // Phrases that indicate the model is *talking about* using tools
-    const NARRATION_PHRASES: &[&str] = &[
-        "let me read",
-        "let me look",
-        "let me find",
-        "let me list",
-        "let me examine",
-        "let me check",
-        "let me start",
-        "let me try",
-        "let me write",
-        "let me rewrite",
-        "let me update",
-        "let me verify",
-        "let me create",
-        "let me modify",
-        "let me open",
-        "let me review",
-        "let me fix",
-        "let me see",
-        "now let me",
-        "now i'll",
-        "i'll start by",
-        "i'll read",
-        "i'll look",
-        "i'll examine",
-        "i'll list",
-        "i'll write",
-        "i'll rewrite",
-        "i'll update",
-        "i'll check",
-        "i'll verify",
-        "i'll create",
-        "i'll modify",
-        "i need to",
-        "i should read",
-        "i should look",
-        "i should check",
-        "i should write",
-        "reading the file",
-        "listing the directory",
-        "executing the command",
-        "running the command",
-        "writing the file",
-        "rewriting the file",
-        "use my tools",
-        "invoke my tools",
-        "actually execute",
-        "actually use",
-    ];
-
     // Count total hits across all phrases (not just unique phrases with 2+ hits)
     let total_hits: usize = NARRATION_PHRASES
         .iter()
@@ -2389,41 +2443,6 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     // but no tool calls were actually made. This catches the pattern where
     // a weak model says "I've rewritten the file... verified... it's clean"
     // without ever calling write_file.
-    const COMPLETION_CLAIMS: &[&str] = &[
-        "the file is clean",
-        "the file is now",
-        "the rewrite is complete",
-        "the redesign is complete",
-        "successfully wrote",
-        "successfully updated",
-        "successfully created",
-        "successfully modified",
-        "file has been updated",
-        "file has been rewritten",
-        "file has been modified",
-        "changes are complete",
-        "changes are done",
-        "the update is complete",
-        "here's what i changed",
-        "i've rewritten",
-        "i've updated",
-        "i've modified",
-        "i've created the",
-        "i've written the",
-        "verified the",
-        "file is correct",
-        "it now uses only",
-    ];
-
-    const ACTION_CLAIMS: &[&str] = &[
-        "let me read",
-        "let me check",
-        "let me verify",
-        "let me write",
-        "let me rewrite",
-        "now let me",
-    ];
-
     let completion_hits = COMPLETION_CLAIMS
         .iter()
         .filter(|p| lower.contains(*p))
@@ -2890,7 +2909,7 @@ fn prose_call_salvage_notice(
         );
     }
     for (written, guidance) in unresolved {
-        body.push_str(&format!(" `{written}` {guidance}."));
+        let _ = write!(body, " `{written}` {guidance}.");
     }
     if fence_tokens > 0 && executed.is_empty() && unresolved.is_empty() {
         body.push_str(
@@ -3093,9 +3112,9 @@ pub fn mission_dir_listing(dir: &std::path::Path) -> String {
     let mut lines: Vec<String> = names
         .iter()
         .take(MISSION_LISTING_ENTRIES_MAX)
-        .map(|(name, size)| match size {
-            Some(s) => format!("- {name} ({s} bytes)"),
-            None => format!("- {name}/"),
+        .map(|(name, size)| {
+            size.as_ref()
+                .map_or_else(|| format!("- {name}/"), |s| format!("- {name} ({s} bytes)"))
         })
         .collect();
     if total > MISSION_LISTING_ENTRIES_MAX {
@@ -3597,18 +3616,209 @@ fn detect_repetition(text: &str) -> bool {
     max_repeats >= 4 && total_dupes > lines.len() / 4
 }
 
+/// The degenerate-output checks run on streamed text at each ~8000-char
+/// checkpoint. Returns the notice to append when the stream must be aborted
+/// (logging why), or `None` to keep streaming.
+fn streamed_text_abort_notice(
+    text: &str,
+    has_tool_history: bool,
+    no_tool_uses: bool,
+) -> Option<&'static str> {
+    if detect_narration_loop(text, has_tool_history) {
+        warn!(
+            text_len = text.len(),
+            "🔄 Narration loop detected in streaming response — aborting stream"
+        );
+        return Some("\n\n[I got stuck narrating instead of acting. Let me try again with a focused approach.]");
+    }
+    if detect_repetition(text) {
+        warn!(
+            text_len = text.len(),
+            "🔁 Repetitive output detected in streaming response — aborting stream"
+        );
+        return Some("\n\n[I got stuck repeating myself. Let me stop and take a different approach.]");
+    }
+    // P22 Tier 4 structural arm at the checkpoint: the
+    // model is streaming tool calls as TEXT (the lfm leg
+    // streamed hundreds per turn) — the rest of the
+    // stream is doomed, so stop paying for it. The main
+    // loop's salvage then executes what it meant.
+    if no_tool_uses
+        && text_streams_prose_tool_calls(text)
+    {
+        warn!(
+            text_len = text.len(),
+            "🛟 Prose tool calls detected in streaming response — \
+             aborting stream for salvage"
+        );
+        return Some("\n\n[I wrote tool calls as text instead of executing them. Stopping to run them properly.]");
+    }
+    None
+}
+
+/// Stream watchdog multiple. The bound is DERIVED, not chosen: the transport
+/// already declares its silence tolerance (`STREAM_READ_TIMEOUT_SECS`
+/// of quiet between chunks kills the connection with an error), so on
+/// any truly silent socket the transport fires first and the error
+/// takes the normal retry path below. A wait of 2× that bound can
+/// therefore only be reached when the transport still believes the
+/// stream healthy while no event arrives — a wedged future (lost
+/// waker, swallowed pipeline stage), the class that held a session
+/// silent for 50+ minutes on 2026-08-10 with zero log output. 2 is
+/// the smallest multiple that cannot race the transport's own timer.
+/// The timeout is re-armed on every event: it bounds SILENCE, never
+/// total stream length, mirroring the transport's own semantics.
+const STREAM_WATCHDOG_MULTIPLE: u64 = 2;
+
+/// Await the next stream read, unless `cancel` fires first — checked first
+/// on every poll — in which case the read is dropped and `None` returned.
+async fn race_stream_cancel<F: std::future::Future>(
+    next: F,
+    cancel: Option<&CancelToken>,
+) -> Option<F::Output> {
+    if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                info!("Stream aborted by cancel — dropping the in-flight response");
+                None
+            }
+            event = next => Some(event),
+        }
+    } else {
+        Some(next.await)
+    }
+}
+
+/// The error for a stream that stayed silent past the `watchdog`, logged
+/// loudly as it is built.
+fn stream_watchdog_error(model: &str, watchdog: std::time::Duration) -> AgentError {
+    let silent_secs = watchdog.as_secs();
+    error!(
+        model = %model,
+        silent_secs,
+        read_timeout_secs = nanna_llm::STREAM_READ_TIMEOUT_SECS,
+        "⏱️ STREAM WATCHDOG: no token, no block, no error for {silent_secs}s — \
+         the transport's own read timeout never fired, so the stream future is \
+         wedged; abandoning the call loudly instead of hanging the turn"
+    );
+    AgentError::StreamWatchdog {
+        silent_secs,
+        read_timeout_secs: nanna_llm::STREAM_READ_TIMEOUT_SECS,
+        multiple: STREAM_WATCHDOG_MULTIPLE,
+        model: model.to_string(),
+    }
+}
+
+/// Take in one streamed reasoning delta: hand it to `on_thinking`, append it
+/// to the run's and the block's reasoning, and count its tokens. Returns
+/// whether the reasoning has now tripped the thinking-spiral detector, in
+/// which case the caller aborts the stream.
+fn absorb_thinking_delta(
+    state: &mut RunState,
+    asm: &mut StreamBlockAssembler,
+    on_thinking: Option<&ThinkingCallback>,
+    thinking: &str,
+) -> bool {
+    // Capture thinking/reasoning content
+    if let Some(callback) = on_thinking {
+        callback(thinking);
+    }
+    state.reasoning_content.push_str(thinking);
+    state.current_reasoning.push_str(thinking);
+    asm.on_thinking(thinking);
+    // Estimate tokens (~4 chars per token)
+    state.reasoning_tokens += reasoning_token_estimate(thinking);
+
+    thinking_spiral_tripped(state, asm, thinking.len())
+}
+
+/// Close the streamed content block at `index`.
+fn close_stream_block(
+    state: &mut RunState,
+    asm: &mut StreamBlockAssembler,
+    on_thinking: Option<&ThinkingCallback>,
+    index: usize,
+) {
+    // Finalizing a thinking block emits a trailing-newline side effect
+    // so consecutive thinking blocks don't run together in the stream.
+    if asm.on_block_stop(index) {
+        if let Some(callback) = on_thinking {
+            callback("\n");
+        }
+        state.reasoning_content.push('\n');
+        state.current_reasoning.push('\n');
+    }
+}
+
+/// Whether the reasoning streamed so far has tripped the thinking-spiral
+/// detector, after a delta of `delta_len` bytes was appended. On a trip the
+/// spiral is flagged for the main loop and the tripping block is dropped;
+/// the caller aborts the stream.
+fn thinking_spiral_tripped(
+    state: &mut RunState,
+    asm: &mut StreamBlockAssembler,
+    delta_len: usize,
+) -> bool {
+    // Detect thinking spirals: model going in circles during reasoning.
+    // Check periodically (every ~3000 chars of thinking) to avoid overhead.
+    //
+    // Measured over `current_reasoning` — THIS reasoning block —
+    // not the run-accumulated `reasoning_content`. The detector's
+    // indicators are repetition counts, so feeding it every
+    // iteration's reasoning concatenated makes them aggregate
+    // across unrelated passages and cross the threshold on volume
+    // alone. Indicator 3 in particular counts ordinary hedging
+    // ("wait,", "but ", "however", "alternatively") and needs only
+    // 8 across >4000 chars, which any few thousand words of
+    // English clears. This was unreachable while the Anthropic
+    // path streamed empty thinking text; asking for
+    // `display: "summarized"` fills it with real prose and arms it.
+    //
+    // Guarded by `nudges.thinking_spiral` because the abort
+    // discards the reply: without it a second trip in the same
+    // run has no recovery path left (the nudge at the loop head
+    // is one-shot and only re-arms in mission mode) and the turn
+    // ends with empty text and no error.
+    if !state.nudges.thinking_spiral
+        && state.current_reasoning.len() > 3000
+        && state.current_reasoning.len() % 3000 < delta_len
+        && detect_thinking_spiral(&state.current_reasoning)
+    {
+        warn!(
+            thinking_len = state.current_reasoning.len(),
+            thinking_tokens = state.reasoning_tokens,
+            "🌀 Thinking spiral detected — aborting stream and forcing action"
+        );
+        // Signal the main loop out-of-band; the recovery nudge
+        // is harness-to-model steering, not conversation, so
+        // nothing goes through on_text (an echoed marker became
+        // the persisted chat reply, observed live 2026-08-02).
+        // Partial text is discarded with the aborted stream.
+        state.steering.thinking_spiral_detected = true;
+        // Drop the block that tripped it, or the next delta
+        // re-measures the same text and trips again immediately.
+        state.current_reasoning.clear();
+        asm.text.clear();
+        asm.block_text.clear();
+        return true;
+    }
+    false
+}
+
+/// Reasoning tokens estimated for one thinking delta (~4 chars per token).
+///
+/// Saturates at `u32::MAX` where the old `as u32` truncated; the two differ
+/// only for a single delta longer than 16 GiB, which no stream carries.
+fn reasoning_token_estimate(thinking: &str) -> u32 {
+    u32::try_from(thinking.len() / 4).unwrap_or(u32::MAX)
+}
+
 /// Detect thinking spiral: the model's reasoning is going in circles without
 /// making progress. Catches analysis paralysis where the model repeatedly
 /// considers the same options, re-asks the same questions, or flip-flops
 /// between approaches.
 fn detect_thinking_spiral(thinking: &str) -> bool {
-    // Must have enough thinking to check (at least ~2000 chars)
-    if thinking.len() < 2000 {
-        return false;
-    }
-
-    let lower = thinking.to_lowercase();
-
     // Indicator 1: Repeated deliberation phrases that signal circular reasoning
     const SPIRAL_PHRASES: &[&str] = &[
         "wait, but",
@@ -3639,6 +3849,13 @@ fn detect_thinking_spiral(thinking: &str) -> bool {
         "i don't have the ability",
         "i don't have that",
     ];
+
+    // Must have enough thinking to check (at least ~2000 chars)
+    if thinking.len() < 2000 {
+        return false;
+    }
+
+    let lower = thinking.to_lowercase();
 
     let spiral_matches = SPIRAL_PHRASES
         .iter()
@@ -3875,12 +4092,14 @@ impl Agent {
     }
 
     /// Set a shared model stats tracker.
+    #[must_use]
     pub fn with_stats(mut self, stats: crate::model_stats::ModelStatsTracker) -> Self {
         self.stats = Some(stats);
         self
     }
 
     /// Set a shared tool stats tracker.
+    #[must_use]
     pub fn with_tool_stats(mut self, tool_stats: crate::tool_stats::ToolStatsTracker) -> Self {
         self.tool_stats = Some(tool_stats);
         self
@@ -4026,8 +4245,8 @@ impl Agent {
             // the model — an agent that knows its budget plans around it.
             if let Some(budget) = options.token_budget {
                 let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
-                if !state.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
-                    state.budget_warned = true;
+                if !state.steering.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
+                    state.steering.budget_warned = true;
                     let note = budget_warning_message(
                         cumulative,
                         budget,
@@ -4041,7 +4260,7 @@ impl Agent {
             state.iterations += 1;
             if let Some(max) = max_iterations {
                 if state.iterations > max
-                    && !state.wrap_up_engaged
+                    && !state.wrap_up.engaged
                     && state.final_text.trim().is_empty()
                     && !state.tool_records.is_empty()
                 {
@@ -4468,7 +4687,7 @@ impl Agent {
             // The reserved wrap-up iteration is text-only by construction:
             // with no definitions served, the model cannot spend its final
             // say on another tool call.
-            if state.wrap_up_engaged {
+            if state.wrap_up.engaged {
                 request.tools = None;
             }
             if let Some(ref routed) = routed_model {
@@ -4561,13 +4780,10 @@ impl Agent {
 
             // Escalation: if routed model failed or returned malformed tool calls, retry with primary
             if routed_model.is_some() {
-                let should_escalate = match &result {
-                    Err(_) => true,
-                    Ok(r) => {
-                        // Check for malformed tool calls (empty name or unparseable JSON)
-                        r.tool_uses.iter().any(|(_, name, _)| name.is_empty())
-                    }
-                };
+                let should_escalate = result.as_ref().map_or(true, |r| {
+                    // Check for malformed tool calls (empty name or unparseable JSON)
+                    r.tool_uses.iter().any(|(_, name, _)| name.is_empty())
+                });
                 if should_escalate {
                     let escalation_reason = match &result {
                         Err(e) => format!("error: {e}"),
@@ -4741,7 +4957,7 @@ impl Agent {
             // error: if its one LLM call fails, synthesize the report from
             // the tool record and end the step the way it was going to end.
             let mut result = match result {
-                Err(e) if state.wrap_up_engaged => {
+                Err(e) if state.wrap_up.engaged => {
                     warn!(
                         error = %e,
                         "wrap-up iteration failed — synthesizing the step report"
@@ -4749,7 +4965,7 @@ impl Agent {
                     if state.final_text.trim().is_empty() {
                         state.final_text = step_activity_digest(&state.tool_records);
                     }
-                    let truncated = state.wrap_up_truncated;
+                    let truncated = state.wrap_up.truncated;
                     return Ok(state.into_response(truncated));
                 }
                 other => other?,
@@ -4761,7 +4977,7 @@ impl Agent {
             let tier_label = if escalated {
                 "escalated".to_string()
             } else {
-                complexity.map_or("primary".to_string(), |c| format!("{c:?}").to_lowercase())
+                complexity.map_or_else(|| "primary".to_string(), |c| format!("{c:?}").to_lowercase())
             };
 
             state
@@ -4770,7 +4986,7 @@ impl Agent {
                     model: actual_model.clone(),
                     was_routed,
                     tier: tier_label,
-                    latency_ms: llm_latency.as_millis() as u64,
+                    latency_ms: millis_u64(llm_latency),
                     throughput_tps: if llm_latency.as_millis() > 0 {
                         f64::from(result.output_tokens) / llm_latency.as_secs_f64()
                     } else {
@@ -4816,7 +5032,7 @@ impl Agent {
 
             // Post-hoc thinking spiral detection (catches sync/non-streaming path
             // where we can't abort mid-stream)
-            if !state.thinking_spiral_nudged
+            if !state.nudges.thinking_spiral
                 && result.tool_uses.is_empty()
                 && result.text.is_empty()
                 && detect_thinking_spiral(&state.current_reasoning)
@@ -4826,7 +5042,7 @@ impl Agent {
                     reasoning_tokens = state.reasoning_tokens,
                     "🌀 Post-hoc thinking spiral detected (sync path) — injecting action nudge"
                 );
-                state.thinking_spiral_nudged = true;
+                state.nudges.thinking_spiral = true;
                 state.reasoning_content.clear();
                 state.current_reasoning.clear();
 
@@ -4917,6 +5133,7 @@ impl Agent {
                                 }
                             }
                         }
+                        drop(ctx);
                         PriorMaterial { normalized }
                     };
 
@@ -5093,12 +5310,12 @@ impl Agent {
                 // that no longer exist (tools were off; call-shaped prose in
                 // the report is quotation, not intent). Guarantee the report
                 // is never silence.
-                if state.wrap_up_engaged {
+                if state.wrap_up.engaged {
                     if state.final_text.trim().is_empty() {
                         state.final_text = step_activity_digest(&state.tool_records);
                     }
                     if options.track_uncertainty {
-                        state.confidence = self.analyze_confidence(&state.final_text).await;
+                        state.confidence = Some(Self::analyze_confidence(&state.final_text));
                     }
                     if options.auto_extract_memories
                         && let Some(ref on_memory) = options.on_memory
@@ -5107,7 +5324,7 @@ impl Agent {
                                     on_memory(memory).await;
                                 }
                             }
-                    let truncated = state.wrap_up_truncated;
+                    let truncated = state.wrap_up.truncated;
                     return Ok(state.into_response(truncated));
                 }
 
@@ -5193,9 +5410,9 @@ impl Agent {
                 // notice and must reach the stall machinery below.
                 if salvaged_uses.is_empty()
                     && (!salvage_unresolved.is_empty() || salvage_fence_tokens > 0)
-                    && !state.narration_nudged
+                    && !state.nudges.narration
                 {
-                    state.narration_nudged = true;
+                    state.nudges.narration = true;
                     warn!(
                         unresolved = salvage_unresolved.len(),
                         fence_tokens = salvage_fence_tokens,
@@ -5219,14 +5436,14 @@ impl Agent {
                 // Detect narration loop: model talked about using tools but never called them
                 let has_tool_history = !state.tool_records.is_empty();
                 if detect_narration_loop(&state.final_text, has_tool_history)
-                    && !state.narration_nudged
+                    && !state.nudges.narration
                 {
                     warn!(
                         text_len = state.final_text.len(),
                         iteration = state.iterations,
                         "🔄 Narration loop detected — injecting nudge and retrying"
                     );
-                    state.narration_nudged = true;
+                    state.nudges.narration = true;
 
                     // The broken response is already in context (stored
                     // unconditionally above) — inject only the user-role
@@ -5245,13 +5462,13 @@ impl Agent {
 
                 // Detect degenerate line repetition: the model re-emitting the
                 // same substantial line(s) — a known small-model generation loop
-                if detect_repetition(&state.final_text) && !state.repetition_nudged {
+                if detect_repetition(&state.final_text) && !state.nudges.repetition {
                     warn!(
                         text_len = state.final_text.len(),
                         iteration = state.iterations,
                         "🔁 Repetitive output detected — injecting nudge and retrying"
                     );
-                    state.repetition_nudged = true;
+                    state.nudges.repetition = true;
 
                     // The broken response is already in context (stored
                     // unconditionally above); only the nudge is added here
@@ -5269,14 +5486,14 @@ impl Agent {
 
                 // Thinking spiral: the stream handler aborted mid-reasoning and
                 // flagged it out-of-band (no marker text — see the abort site)
-                if !state.thinking_spiral_nudged && state.thinking_spiral_detected {
+                if !state.nudges.thinking_spiral && state.steering.thinking_spiral_detected {
                     warn!(
                         reasoning_tokens = state.reasoning_tokens,
                         iteration = state.iterations,
                         "🌀 Thinking spiral recovery — injecting action nudge and retrying"
                     );
-                    state.thinking_spiral_nudged = true;
-                    state.thinking_spiral_detected = false;
+                    state.nudges.thinking_spiral = true;
+                    state.steering.thinking_spiral_detected = false;
 
                     // The aborted turn contributes nothing user-visible
                     state.final_text.clear();
@@ -5342,9 +5559,9 @@ impl Agent {
                     }
                     // Detectors re-arm each round: a narration relapse three
                     // hours in must be caught like the first one.
-                    state.narration_nudged = false;
-                    state.repetition_nudged = false;
-                    state.thinking_spiral_nudged = false;
+                    state.nudges.narration = false;
+                    state.nudges.repetition = false;
+                    state.nudges.thinking_spiral = false;
 
                     // The model's partial answer is already in context (stored
                     // unconditionally above), so it builds on its own progress
@@ -5364,10 +5581,11 @@ impl Agent {
                         // Live disk anchor: the registry's session-aware
                         // workdir is where the model is actually working
                         // (seeded from the active workspace by the daemon).
-                        let listing = match self.tools.default_workdir().await {
-                            Some(dir) => mission_dir_listing(&dir),
-                            None => String::new(),
-                        };
+                        let listing = self
+                            .tools
+                            .default_workdir()
+                            .await
+                            .map_or_else(String::new, |dir| mission_dir_listing(&dir));
                         mission_continue_message(
                             state.mission_rounds,
                             state.mission_stall_rounds,
@@ -5430,17 +5648,18 @@ impl Agent {
                         "🪞 Run ended on identical zero-tool-call rounds — \
                          appending the honesty note to the reply"
                     );
-                    state.final_text.push_str(&format!(
+                    let _ = write!(
+                        state.final_text,
                         "\n\n[{n} consecutive replies in this run were identical and \
                          emitted zero tool calls — nothing new was done between them, \
                          and no tool has verified the claims above.]"
-                    ));
+                    );
                 }
 
                 // Normal exit: no tool calls and not a narration loop
                 // Analyze uncertainty if enabled
                 if options.track_uncertainty {
-                    state.confidence = self.analyze_confidence(&state.final_text).await;
+                    state.confidence = Some(Self::analyze_confidence(&state.final_text));
                 }
 
                 // Analyze emotional context if enabled
@@ -5463,7 +5682,7 @@ impl Agent {
             // call-shaped output anyway (some providers echo tool JSON as
             // content) gets its report synthesized rather than executed —
             // the step is over.
-            if state.wrap_up_engaged {
+            if state.wrap_up.engaged {
                 warn!(
                     attempted_calls = result.tool_uses.len(),
                     "wrap-up iteration attempted tool calls — ending the step with a \
@@ -5472,7 +5691,7 @@ impl Agent {
                 if state.final_text.trim().is_empty() {
                     state.final_text = step_activity_digest(&state.tool_records);
                 }
-                let truncated = state.wrap_up_truncated;
+                let truncated = state.wrap_up.truncated;
                     return Ok(state.into_response(truncated));
             }
 
@@ -5575,7 +5794,7 @@ impl Agent {
             // the claim never does — teach the claim protocol directly.
             // Evaluated BEFORE the loop-nudge detector below on purpose: on
             // the iteration the loop nudge first fires this still sees
-            // `tool_loop_nudged == false`, so the model always gets one full
+            // `steering.tool_loop_nudged == false`, so the model always gets one full
             // post-loop-nudge attempt before this rung engages — the same
             // 2 + 1 derivation as the sibling breakers.
             self.maybe_inject_claim_nudge(&mut state, &options).await;
@@ -5591,8 +5810,8 @@ impl Agent {
             // calls that keep failing identically, the zero-information
             // breaker (ZERO_INFO_BREAKER_AFTER) for calls that keep
             // succeeding with byte-identical results.
-            if !state.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
-                state.tool_loop_nudged = true;
+            if !state.steering.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
+                state.steering.tool_loop_nudged = true;
                 warn!(
                     iteration = state.iterations,
                     last_tool = state.tool_records.last().map_or("", |r| r.name.as_str()),
@@ -5669,7 +5888,7 @@ impl Agent {
             return false;
         }
         // (b) — the softer rung gets its chance first.
-        if !state.tool_loop_nudged {
+        if !state.steering.tool_loop_nudged {
             return false;
         }
         // (c) — the latest text already claims completion: the model found
@@ -5728,8 +5947,8 @@ impl Agent {
     /// step is ending (hard budget vs progress exhaustion) for the response's
     /// `truncated` flag.
     async fn engage_wrap_up(&self, state: &mut RunState, reason: &str, truncated: bool) {
-        state.wrap_up_engaged = true;
-        state.wrap_up_truncated = truncated;
+        state.wrap_up.engaged = true;
+        state.wrap_up.truncated = truncated;
         warn!(
             iteration = state.iterations,
             reason,
@@ -5942,21 +6161,7 @@ impl Agent {
         let mut narration_check_len = 0usize; // track text length at last narration check
         // Re-arm per call: a spiral flag left unconsumed (e.g. the abort raced
         // finalized tool calls) must not fire recovery on a healthy later round.
-        state.thinking_spiral_detected = false;
-
-        // Stream watchdog. The bound is DERIVED, not chosen: the transport
-        // already declares its silence tolerance (`STREAM_READ_TIMEOUT_SECS`
-        // of quiet between chunks kills the connection with an error), so on
-        // any truly silent socket the transport fires first and the error
-        // takes the normal retry path below. A wait of 2× that bound can
-        // therefore only be reached when the transport still believes the
-        // stream healthy while no event arrives — a wedged future (lost
-        // waker, swallowed pipeline stage), the class that held a session
-        // silent for 50+ minutes on 2026-08-10 with zero log output. 2 is
-        // the smallest multiple that cannot race the transport's own timer.
-        // The timeout is re-armed on every event: it bounds SILENCE, never
-        // total stream length, mirroring the transport's own semantics.
-        const STREAM_WATCHDOG_MULTIPLE: u64 = 2;
+        state.steering.thinking_spiral_detected = false;
         let watchdog = std::time::Duration::from_secs(
             nanna_llm::STREAM_READ_TIMEOUT_SECS * STREAM_WATCHDOG_MULTIPLE,
         );
@@ -5969,39 +6174,14 @@ impl Agent {
             // minutes after Stop (observed 2026-07-31). Breaking here
             // drops `stream`, which closes the in-flight HTTP response.
             let next = tokio::time::timeout(watchdog, stream.next());
-            let event = if let Some(token) = cancel {
-                tokio::select! {
-                    biased;
-                    () = token.cancelled() => {
-                        info!("Stream aborted by cancel — dropping the in-flight response");
-                        // Incomplete tool JSON is discarded; text/thinking
-                        // already accumulated survive in the partial result.
-                        break;
-                    }
-                    event = next => event,
-                }
-            } else {
-                next.await
+            let Some(event) = race_stream_cancel(next, cancel).await else {
+                // Incomplete tool JSON is discarded; text/thinking
+                // already accumulated survive in the partial result.
+                break;
             };
             let event = match event {
                 Ok(event) => event,
-                Err(_elapsed) => {
-                    let silent_secs = watchdog.as_secs();
-                    error!(
-                        model = %request.model,
-                        silent_secs,
-                        read_timeout_secs = nanna_llm::STREAM_READ_TIMEOUT_SECS,
-                        "⏱️ STREAM WATCHDOG: no token, no block, no error for {silent_secs}s — \
-                         the transport's own read timeout never fired, so the stream future is \
-                         wedged; abandoning the call loudly instead of hanging the turn"
-                    );
-                    return Err(AgentError::StreamWatchdog {
-                        silent_secs,
-                        read_timeout_secs: nanna_llm::STREAM_READ_TIMEOUT_SECS,
-                        multiple: STREAM_WATCHDOG_MULTIPLE,
-                        model: request.model.clone(),
-                    });
-                }
+                Err(_elapsed) => return Err(stream_watchdog_error(&request.model, watchdog)),
             };
             let Some(event) = event else { break };
             match event? {
@@ -6015,41 +6195,12 @@ impl Agent {
                     if asm.text.len() - narration_check_len > 8000 {
                         narration_check_len = asm.text.len();
                         let has_tool_history = !state.tool_records.is_empty();
-                        if detect_narration_loop(&asm.text, has_tool_history) {
-                            warn!(
-                                text_len = asm.text.len(),
-                                "🔄 Narration loop detected in streaming response — aborting stream"
-                            );
+                        if let Some(notice) = streamed_text_abort_notice(
+                            &asm.text,
+                            has_tool_history,
+                            asm.tool_uses.is_empty(),
+                        ) {
                             // Append a notice and break out of the stream
-                            let notice = "\n\n[I got stuck narrating instead of acting. Let me try again with a focused approach.]";
-                            on_text(notice);
-                            asm.text.push_str(notice);
-                            break;
-                        }
-                        if detect_repetition(&asm.text) {
-                            warn!(
-                                text_len = asm.text.len(),
-                                "🔁 Repetitive output detected in streaming response — aborting stream"
-                            );
-                            let notice = "\n\n[I got stuck repeating myself. Let me stop and take a different approach.]";
-                            on_text(notice);
-                            asm.text.push_str(notice);
-                            break;
-                        }
-                        // P22 Tier 4 structural arm at the checkpoint: the
-                        // model is streaming tool calls as TEXT (the lfm leg
-                        // streamed hundreds per turn) — the rest of the
-                        // stream is doomed, so stop paying for it. The main
-                        // loop's salvage then executes what it meant.
-                        if asm.tool_uses.is_empty()
-                            && text_streams_prose_tool_calls(&asm.text)
-                        {
-                            warn!(
-                                text_len = asm.text.len(),
-                                "🛟 Prose tool calls detected in streaming response — \
-                                 aborting stream for salvage"
-                            );
-                            let notice = "\n\n[I wrote tool calls as text instead of executing them. Stopping to run them properly.]";
                             on_text(notice);
                             asm.text.push_str(notice);
                             break;
@@ -6057,57 +6208,7 @@ impl Agent {
                     }
                 }
                 StreamEvent::ThinkingDelta { thinking, .. } => {
-                    // Capture thinking/reasoning content
-                    if let Some(callback) = on_thinking {
-                        callback(&thinking);
-                    }
-                    state.reasoning_content.push_str(&thinking);
-                    state.current_reasoning.push_str(&thinking);
-                    asm.on_thinking(&thinking);
-                    // Estimate tokens (~4 chars per token)
-                    state.reasoning_tokens += (thinking.len() / 4) as u32;
-
-                    // Detect thinking spirals: model going in circles during reasoning.
-                    // Check periodically (every ~3000 chars of thinking) to avoid overhead.
-                    //
-                    // Measured over `current_reasoning` — THIS reasoning block —
-                    // not the run-accumulated `reasoning_content`. The detector's
-                    // indicators are repetition counts, so feeding it every
-                    // iteration's reasoning concatenated makes them aggregate
-                    // across unrelated passages and cross the threshold on volume
-                    // alone. Indicator 3 in particular counts ordinary hedging
-                    // ("wait,", "but ", "however", "alternatively") and needs only
-                    // 8 across >4000 chars, which any few thousand words of
-                    // English clears. This was unreachable while the Anthropic
-                    // path streamed empty thinking text; asking for
-                    // `display: "summarized"` fills it with real prose and arms it.
-                    //
-                    // Guarded by `thinking_spiral_nudged` because the abort
-                    // discards the reply: without it a second trip in the same
-                    // run has no recovery path left (the nudge at the loop head
-                    // is one-shot and only re-arms in mission mode) and the turn
-                    // ends with empty text and no error.
-                    if !state.thinking_spiral_nudged
-                        && state.current_reasoning.len() > 3000
-                        && state.current_reasoning.len() % 3000 < thinking.len()
-                        && detect_thinking_spiral(&state.current_reasoning)
-                    {
-                        warn!(
-                            thinking_len = state.current_reasoning.len(),
-                            thinking_tokens = state.reasoning_tokens,
-                            "🌀 Thinking spiral detected — aborting stream and forcing action"
-                        );
-                        // Signal the main loop out-of-band; the recovery nudge
-                        // is harness-to-model steering, not conversation, so
-                        // nothing goes through on_text (an echoed marker became
-                        // the persisted chat reply, observed live 2026-08-02).
-                        // Partial text is discarded with the aborted stream.
-                        state.thinking_spiral_detected = true;
-                        // Drop the block that tripped it, or the next delta
-                        // re-measures the same text and trips again immediately.
-                        state.current_reasoning.clear();
-                        asm.text.clear();
-                        asm.block_text.clear();
+                    if absorb_thinking_delta(state, &mut asm, on_thinking, &thinking) {
                         break;
                     }
                 }
@@ -6115,15 +6216,7 @@ impl Agent {
                     asm.on_block_start(index, content_type, tool_id, tool_name);
                 }
                 StreamEvent::ContentBlockStop { index } => {
-                    // Finalizing a thinking block emits a trailing-newline side effect
-                    // so consecutive thinking blocks don't run together in the stream.
-                    if asm.on_block_stop(index) {
-                        if let Some(callback) = on_thinking {
-                            callback("\n");
-                        }
-                        state.reasoning_content.push('\n');
-                        state.current_reasoning.push('\n');
-                    }
+                    close_stream_block(state, &mut asm, on_thinking, index);
                 }
                 StreamEvent::ToolUseDelta { index, partial_json } => {
                     asm.on_tool_delta(index, &partial_json);
@@ -6187,7 +6280,7 @@ impl Agent {
                     state.reasoning_content.push_str(thinking);
                     state.current_reasoning.push_str(thinking);
                     // Estimate tokens (~4 chars per token)
-                    state.reasoning_tokens += (thinking.len() / 4) as u32;
+                    state.reasoning_tokens += reasoning_token_estimate(thinking);
                 }
                 ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
             }
@@ -6972,10 +7065,10 @@ impl Agent {
                         tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
 
                         on_memory(ExtractedMemory {
-                            content: match &target {
-                                Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
-                                None => format!("[{name} — {outcome}] {chunk_content}"),
-                            },
+                            content: target.as_ref().map_or_else(
+                                || format!("[{name} — {outcome}] {chunk_content}"),
+                                |t| format!("[{name} → {t} — {outcome}] {chunk_content}"),
+                            ),
                             category: TOOL_RESULT_CATEGORY.to_string(),
                             // A tool result is always agent-observed, never a user statement.
                             provenance: MemoryProvenance::Observed,
@@ -7383,59 +7476,9 @@ impl Agent {
             Some(StepKind::Execute) | None => {}
         }
         let ctx = self.context.read().await;
-        let messages = &ctx.messages;
-
-        // If we have no messages yet, it's the initial turn — complex
-        if messages.is_empty() {
-            return TaskComplexity::Complex;
-        }
-
-        // Look at the last assistant message to understand what's happening
-        let last_assistant = messages.iter().rev().find(|m| m.role == "assistant");
-
-        // If the last assistant message was entirely tool calls with no text,
-        // the next iteration is likely just continuing tool execution — simple
-        if let Some(assistant_msg) = last_assistant {
-            let has_text = assistant_msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_tools = assistant_msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-
-            if has_tools && !has_text {
-                // Pure tool-calling iteration: the model just needs to decide what tool to call next
-                return TaskComplexity::Simple;
-            }
-        }
-
-        // Look at the last user message (which may contain tool results)
-        let last_user = messages.iter().rev().find(|m| m.role == "user");
-        if let Some(user_msg) = last_user {
-            let has_tool_results = user_msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-
-            if has_tool_results {
-                // We're in a tool result → next LLM call cycle
-                // Simple if we've been doing straightforward tool calls
-                if state.iterations > 2 {
-                    return TaskComplexity::Simple;
-                }
-                return TaskComplexity::Medium;
-            }
-        }
-
-        // Early iterations with user text: likely complex (initial analysis)
-        if state.iterations <= 2 {
-            return TaskComplexity::Complex;
-        }
-
-        // Default to medium for mid-conversation turns
-        TaskComplexity::Medium
+        let complexity = classify_messages(&ctx.messages, state.iterations);
+        drop(ctx);
+        complexity
     }
 
     /// Run progressive context distillation: produce a structured rolling summary
@@ -7455,11 +7498,11 @@ impl Agent {
             return;
         }
 
-        let (client, model_name) =
-            match self.create_client_for_model(&self.config.summarization_priority[0]) {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
+        let Ok((client, model_name)) =
+            self.create_client_for_model(&self.config.summarization_priority[0])
+        else {
+            return;
+        };
 
         let ctx = self.context.read().await;
         // Only distill if we have enough messages
@@ -7534,7 +7577,6 @@ impl Agent {
                     })
                     .collect();
                 if !facts.is_empty() {
-                    let mut ctx = self.context.write().await;
                     // Rolling replace of the distilled-facts slot ONLY. This
                     // used to overwrite `consolidated_summary` wholesale,
                     // which destroyed every earlier summarization product —
@@ -7542,7 +7584,7 @@ impl Agent {
                     // ≤512 tokens about the last ten messages (observed live
                     // 2026-08-10: 2571→934 chars right before a from-scratch
                     // rewrite over passing work).
-                    ctx.set_distilled_facts(facts.as_str());
+                    self.context.write().await.set_distilled_facts(facts.as_str());
                     info!(
                         facts_len = facts.len(),
                         "🧬 Progressive distillation complete"
@@ -7595,7 +7637,7 @@ impl Agent {
                     }
 
                     // Find the corresponding tool_use to get the dedup key
-                    let dedup_key = self.find_tool_dedup_key(&ctx.messages, tool_use_id);
+                    let dedup_key = Self::find_tool_dedup_key(&ctx.messages, tool_use_id);
                     if let Some(key) = dedup_key {
                         if let Some(&prev_idx) = seen.get(&key) {
                             // This tool+input was called before — the previous result is superseded
@@ -7720,6 +7762,7 @@ impl Agent {
                 }
             }
         }
+        drop(ctx);
 
         if evicted > 0 {
             info!(
@@ -7735,7 +7778,6 @@ impl Agent {
     /// Find a dedup key for a tool result by looking up its corresponding `tool_use` block.
     /// Returns "`tool_name:primary_arg`" for dedup-eligible tools.
     fn find_tool_dedup_key(
-        &self,
         messages: &[AnthropicMessage],
         tool_use_id: &str,
     ) -> Option<String> {
@@ -7780,11 +7822,11 @@ impl Agent {
             return None;
         }
 
-        let (client, model_name) =
-            match self.create_client_for_model(&self.config.summarization_priority[0]) {
-                Ok(pair) => pair,
-                Err(_) => return None,
-            };
+        let Ok((client, model_name)) =
+            self.create_client_for_model(&self.config.summarization_priority[0])
+        else {
+            return None;
+        };
 
         // Tool-type-aware summarization prompts
         let instruction = match tool_name {
@@ -7947,6 +7989,7 @@ impl Agent {
         // still exceed the limit.  Resize them here at the last gate before the API.
         let messages = {
             let mut msgs = ctx.messages_for_request();
+            drop(ctx);
             let model = &self.config.model;
             for msg in &mut msgs {
                 for block in &mut msg.content {
@@ -8075,9 +8118,8 @@ impl Agent {
         }
 
     /// Reload workspace context from disk
-    pub async fn reload_workspace(&self) -> Result<(), nanna_workspace::WorkspaceError> {
-        let mut ctx = self.context.write().await;
-        ctx.reload_workspace().await
+    pub async fn reload_workspace(&self) {
+        self.context.write().await.reload_workspace().await;
     }
 
     /// Get the current workspace root (if set)
@@ -8087,8 +8129,9 @@ impl Agent {
 
     /// Analyze confidence level in a response.
     ///
-    /// Uses heuristics and optional LLM analysis to estimate confidence.
-    async fn analyze_confidence(&self, response: &str) -> Option<f32> {
+    /// Uses phrase heuristics (no LLM call) to estimate confidence, clamped to
+    /// `0.1..=0.99`.
+    fn analyze_confidence(response: &str) -> f32 {
         // Quick heuristic analysis (no LLM call needed for basic cases)
         let lower = response.to_lowercase();
 
@@ -8131,15 +8174,13 @@ impl Agent {
             .count();
 
         // Calculate base confidence
-        let base_confidence = if uncertain_count > confident_count {
-            (uncertain_count as f32).mul_add(-0.1, 0.5)
-        } else if confident_count > uncertain_count {
-            (confident_count as f32).mul_add(0.05, 0.8)
-        } else {
-            0.7 // Neutral
+        let base_confidence = match uncertain_count.cmp(&confident_count) {
+            std::cmp::Ordering::Greater => usize_to_f32(uncertain_count).mul_add(-0.1, 0.5),
+            std::cmp::Ordering::Less => usize_to_f32(confident_count).mul_add(0.05, 0.8),
+            std::cmp::Ordering::Equal => 0.7, // Neutral
         };
 
-        Some(base_confidence.clamp(0.1, 0.99))
+        base_confidence.clamp(0.1, 0.99)
     }
 
     /// Analyze emotional context of the conversation.
@@ -8163,69 +8204,15 @@ impl Agent {
                     }
                 })
             });
+        drop(ctx);
 
         let user_text = last_user_msg?;
         let lower = user_text.to_lowercase();
 
-        // Emotion detection heuristics
-        let emotions = [
-            (
-                "frustrated",
-                vec![
-                    "frustrated",
-                    "annoyed",
-                    "ugh",
-                    "why won't",
-                    "doesn't work",
-                    "broken",
-                    "useless",
-                    "terrible",
-                    "hate",
-                ],
-            ),
-            (
-                "confused",
-                vec![
-                    "confused",
-                    "don't understand",
-                    "what do you mean",
-                    "huh",
-                    "?",
-                    "lost",
-                    "unclear",
-                ],
-            ),
-            (
-                "excited",
-                vec![
-                    "excited",
-                    "amazing",
-                    "awesome",
-                    "love it",
-                    "fantastic",
-                    "great",
-                    "wonderful",
-                    "!",
-                    "can't wait",
-                ],
-            ),
-            (
-                "grateful",
-                vec!["thank", "thanks", "appreciate", "grateful", "helped"],
-            ),
-            (
-                "anxious",
-                vec![
-                    "worried", "anxious", "nervous", "scared", "urgent", "asap", "hurry",
-                ],
-            ),
-            ("neutral", vec![]),
-        ];
-
         let mut detected_emotion = "neutral";
         let mut max_matches = 0;
 
-        for (emotion, keywords) in &emotions {
+        for (emotion, keywords) in EMOTION_KEYWORDS {
             let matches = keywords.iter().filter(|k| lower.contains(*k)).count();
             if matches > max_matches {
                 max_matches = matches;
@@ -8236,11 +8223,11 @@ impl Agent {
         // Calculate intensity based on punctuation and caps
         let exclamations = user_text.matches('!').count();
         let _questions = user_text.matches('?').count(); // Reserved for future use
-        let caps_ratio = user_text.chars().filter(|c| c.is_uppercase()).count() as f32
-            / user_text.len().max(1) as f32;
+        let caps_ratio = usize_to_f32(user_text.chars().filter(|c| c.is_uppercase()).count())
+            / usize_to_f32(user_text.len().max(1));
 
         let intensity =
-            (max_matches as f32).mul_add(0.1, caps_ratio.mul_add(0.3, (exclamations as f32).mul_add(0.1, 0.3)))
+            usize_to_f32(max_matches).mul_add(0.1, caps_ratio.mul_add(0.3, usize_to_f32(exclamations).mul_add(0.1, 0.3)))
                 .clamp(0.0, 1.0);
 
         // Suggest tone adjustment
@@ -8282,7 +8269,7 @@ impl Agent {
             let role = &msg.role;
             for block in &msg.content {
                 if let ContentBlock::Text { text } = block {
-                    conversation_text.push_str(&format!("{role}: {text}\n"));
+                    let _ = writeln!(conversation_text, "{role}: {text}");
                 }
             }
         }
@@ -8532,6 +8519,156 @@ Example: [{{"content": "User prefers dark mode", "category": "preference", "prov
     )
 }
 
+/// The structural complexity heuristic behind `Agent::classify_complexity`,
+/// over the context's messages and the run's iteration count.
+fn classify_messages(messages: &[AnthropicMessage], iterations: usize) -> TaskComplexity {
+    // If we have no messages yet, it's the initial turn — complex
+    if messages.is_empty() {
+        return TaskComplexity::Complex;
+    }
+
+    // Look at the last assistant message to understand what's happening
+    let last_assistant = messages.iter().rev().find(|m| m.role == "assistant");
+
+    // If the last assistant message was entirely tool calls with no text,
+    // the next iteration is likely just continuing tool execution — simple
+    if let Some(assistant_msg) = last_assistant {
+        let has_text = assistant_msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { .. }));
+        let has_tools = assistant_msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+        if has_tools && !has_text {
+            // Pure tool-calling iteration: the model just needs to decide what tool to call next
+            return TaskComplexity::Simple;
+        }
+    }
+
+    // Look at the last user message (which may contain tool results)
+    let last_user = messages.iter().rev().find(|m| m.role == "user");
+    if let Some(user_msg) = last_user {
+        let has_tool_results = user_msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+
+        if has_tool_results {
+            // We're in a tool result → next LLM call cycle
+            // Simple if we've been doing straightforward tool calls
+            if iterations > 2 {
+                return TaskComplexity::Simple;
+            }
+            return TaskComplexity::Medium;
+        }
+    }
+
+    // Early iterations with user text: likely complex (initial analysis)
+    if iterations <= 2 {
+        return TaskComplexity::Complex;
+    }
+
+    // Default to medium for mid-conversation turns
+    TaskComplexity::Medium
+}
+
+/// Emotion detection heuristics for `Agent::analyze_emotions`: each emotion
+/// with the keywords that signal it, checked in this order.
+const EMOTION_KEYWORDS: &[(&str, &[&str])] = &[
+    (
+        "frustrated",
+        &[
+            "frustrated",
+            "annoyed",
+            "ugh",
+            "why won't",
+            "doesn't work",
+            "broken",
+            "useless",
+            "terrible",
+            "hate",
+        ],
+    ),
+    (
+        "confused",
+        &[
+            "confused",
+            "don't understand",
+            "what do you mean",
+            "huh",
+            "?",
+            "lost",
+            "unclear",
+        ],
+    ),
+    (
+        "excited",
+        &[
+            "excited",
+            "amazing",
+            "awesome",
+            "love it",
+            "fantastic",
+            "great",
+            "wonderful",
+            "!",
+            "can't wait",
+        ],
+    ),
+    (
+        "grateful",
+        &["thank", "thanks", "appreciate", "grateful", "helped"],
+    ),
+    (
+        "anxious",
+        &[
+            "worried", "anxious", "nervous", "scared", "urgent", "asap", "hurry",
+        ],
+    ),
+    ("neutral", &[]),
+];
+
+/// The one-shot recovery nudges of the streaming detectors: each is injected
+/// at most once per run.
+#[derive(Default)]
+struct DetectorNudges {
+    /// Whether we've already injected a narration-loop nudge (only retry once)
+    narration: bool,
+    /// Whether we've already injected a repetitive-output nudge (only retry once)
+    repetition: bool,
+    /// Whether we've already injected a thinking-spiral nudge (only retry once)
+    thinking_spiral: bool,
+}
+
+/// Run-level steering bookkeeping beside the detector nudges.
+#[derive(Default)]
+struct SteeringFlags {
+    /// Streaming aborted on a detected thinking spiral this iteration.
+    /// Out-of-band steering signal consumed by the recovery nudge — never
+    /// rendered as text (a marker echoed through `on_text` became the
+    /// persisted chat reply, observed live 2026-08-02).
+    thinking_spiral_detected: bool,
+    /// Whether we've already injected a tool-call-loop nudge (only once)
+    tool_loop_nudged: bool,
+    /// Whether the 80% token-budget status has been surfaced to the model
+    budget_warned: bool,
+}
+
+/// The reserved tools-off wrap-up iteration.
+#[derive(Default)]
+struct WrapUp {
+    /// The wrap-up iteration is in flight: the next LLM call carries no tool
+    /// definitions and its text ends the run.
+    engaged: bool,
+    /// Whether the wrap-up was engaged by a hard budget (report `truncated =
+    /// true`, the historical meaning) rather than by progress exhaustion
+    /// (`false` — the step ENDED; nothing was cut mid-flight).
+    truncated: bool,
+}
+
 /// Internal state for a run
 struct RunState {
     iterations: usize,
@@ -8555,19 +8692,11 @@ struct RunState {
     active_tools: HashSet<String>,
     /// Per-iteration model statistics for UI display
     model_stats: Vec<crate::model_stats::RequestModelStats>,
-    /// Whether we've already injected a narration-loop nudge (only retry once)
-    narration_nudged: bool,
-    /// Whether we've already injected a repetitive-output nudge (only retry once)
-    repetition_nudged: bool,
-    /// Whether we've already injected a thinking-spiral nudge (only retry once)
-    thinking_spiral_nudged: bool,
-    /// Streaming aborted on a detected thinking spiral this iteration.
-    /// Out-of-band steering signal consumed by the recovery nudge — never
-    /// rendered as text (a marker echoed through `on_text` became the
-    /// persisted chat reply, observed live 2026-08-02).
-    thinking_spiral_detected: bool,
-    /// Whether we've already injected a tool-call-loop nudge (only once)
-    tool_loop_nudged: bool,
+    /// The streaming detectors' one-shot recovery nudges.
+    nudges: DetectorNudges,
+    /// The out-of-band spiral signal and the one-time tool-loop nudge and
+    /// budget warning.
+    steering: SteeringFlags,
     /// Completion-claim rung: direct claim instructions injected this step
     /// (bounded by [`CLAIM_NUDGES_MAX`] — one instruction + one repeat).
     claim_nudge_count: usize,
@@ -8610,8 +8739,6 @@ struct RunState {
     /// discovery-style skill is guarded the moment its first result proves
     /// it is one. Bounded by the registered-tool population.
     discovery_tool_names: HashSet<String>,
-    /// Whether the 80% token-budget status has been surfaced to the model
-    budget_warned: bool,
     /// The resolved task anchor for this run ([`resolve_task_anchor`]):
     /// the harness step's item title, else the run's goal line, else `None`.
     /// Every injected steering text opens with it ([`anchor_header`]).
@@ -8650,13 +8777,8 @@ struct RunState {
     /// `seen_information`. At [`STEP_EXHAUSTION_AFTER`] the step stops
     /// spinning and the reserved wrap-up iteration is engaged.
     no_information_iterations: usize,
-    /// The reserved tools-off wrap-up iteration is in flight: the next LLM
-    /// call carries no tool definitions and its text ends the run.
-    wrap_up_engaged: bool,
-    /// Whether the wrap-up was engaged by a hard budget (report `truncated =
-    /// true`, the historical meaning) rather than by progress exhaustion
-    /// (`false` — the step ENDED; nothing was cut mid-flight).
-    wrap_up_truncated: bool,
+    /// The reserved tools-off wrap-up iteration.
+    wrap_up: WrapUp,
     /// P22 Tier 4 cross-turn honesty: hash of the last zero-structured-call
     /// round's text. Identical consecutive zero-call rounds increment the
     /// streak below; any executed tool work clears both.
@@ -8685,18 +8807,14 @@ impl RunState {
             current_reasoning: String::new(),
             active_tools: HashSet::new(),
             model_stats: Vec::new(),
-            narration_nudged: false,
-            repetition_nudged: false,
-            thinking_spiral_nudged: false,
-            thinking_spiral_detected: false,
-            tool_loop_nudged: false,
+            nudges: DetectorNudges::default(),
+            steering: SteeringFlags::default(),
             claim_nudge_count: 0,
             claim_nudge_iteration: 0,
             repeat_calls: Arc::new(RepeatLedger::new()),
             zero_delta_discovery_streak: 0,
             discovery_paused: false,
             discovery_tool_names: HashSet::new(),
-            budget_warned: false,
             task_anchor: None,
             wrapup_nudge_count: 0,
             mission_rounds: 0,
@@ -8707,8 +8825,7 @@ impl RunState {
             mission_repeat_rounds: 0,
             seen_information: HashSet::new(),
             no_information_iterations: 0,
-            wrap_up_engaged: false,
-            wrap_up_truncated: false,
+            wrap_up: WrapUp::default(),
             last_zero_call_reply_hash: None,
             identical_zero_call_replies: 0,
         }
@@ -8736,9 +8853,9 @@ impl RunState {
         // A degenerate exit: a generation-loop detector fired, its nudge did
         // not recover the model, and the run never called a tool. Reported
         // out-of-band so the harness can steer instead of charging.
-        let degenerate_loop = (self.narration_nudged
-            || self.repetition_nudged
-            || self.thinking_spiral_nudged)
+        let degenerate_loop = (self.nudges.narration
+            || self.nudges.repetition
+            || self.nudges.thinking_spiral)
             && self.tool_records.is_empty();
         let reasoning = if self.reasoning_content.is_empty() && self.reasoning_blocks.is_empty() {
             None
@@ -8853,7 +8970,7 @@ fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usi
     if text.len() <= target_chars {
         return vec![(0, text.to_string())];
     }
-    let overlap = (target_chars as f32 * overlap_pct) as usize;
+    let overlap = f32_to_usize(usize_to_f32(target_chars) * overlap_pct);
     let step = target_chars.saturating_sub(overlap).max(1);
     let mut chunks = Vec::new();
     let mut pos = 0;
@@ -12558,7 +12675,7 @@ mod claim_nudge_tests {
     fn eligible_state() -> RunState {
         let mut state = RunState::new();
         state.tool_records.push(record("write_file", true));
-        state.tool_loop_nudged = true;
+        state.steering.tool_loop_nudged = true;
         state.final_text = "Now let me check the file again.".to_string();
         state.iterations = 10;
         state
@@ -12718,7 +12835,7 @@ mod claim_nudge_tests {
         // (b) missing — the softer loop-nudge rung has not fired yet.
         let a = agent();
         let mut state = eligible_state();
-        state.tool_loop_nudged = false;
+        state.steering.tool_loop_nudged = false;
         assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
 
         // (c) missing — the latest text already claims completion.
@@ -14371,11 +14488,11 @@ context 2 (attempt 4)", false)],
     #[test]
     fn degenerate_loop_flag_requires_nudge_and_zero_tools() {
         let mut state = RunState::new();
-        state.narration_nudged = true;
+        state.nudges.narration = true;
         assert!(state.into_response(false).degenerate_loop);
 
         let mut state = RunState::new();
-        state.narration_nudged = true;
+        state.nudges.narration = true;
         state.tool_records.push(record("exec", "x", "ok", true));
         assert!(!state.into_response(false).degenerate_loop);
 
