@@ -85,6 +85,33 @@ commands are on `PATH`.
 served it are credited — the first producer of the "used successfully" signal the memory system has
 priced since July.
 
+## Crashes and Silences Found by Cleaning Up
+
+A pass that took the workspace to zero compiler, clippy and rustdoc warnings turned up ten real
+bugs on the way. The ones you could have hit:
+
+**An app update left the old server running.** Updating replaced the app but not the daemon behind
+it, so a new UI kept talking to the previous release — with every bug that update was meant to fix.
+The installer stops the daemon now, and on startup the app checks the version of whatever answers
+on its port and replaces a server from another release.
+
+**A second Nanna could not open a browser.** Every Chromium was launched on one shared profile
+directory, and Chromium refuses to start on a profile another Chromium holds. It also insisted on
+Playwright's own downloaded browser when that backend was compiled in, ignoring the Chromium already
+installed — which read as "Browser 'chromium' is not installed".
+
+**With no model configured, chats failed without saying why.** Four separate paths — a chat turn,
+the older chat route, sub-agents and the startup heartbeat — sent requests naming no model at all.
+Every one of them now stops and names the setting to fix (Settings → Models).
+
+**Crashes on ordinary text.** A re-embed log line, the Telegram token preview and a chat-wedge
+class of bug all cut strings at a fixed byte offset, which panics when a character straddles it.
+An empty search query divided by zero. Asking for a sub-agent without a system prompt panicked
+outright.
+
+**A cron expression could hang the scheduler forever:** `0-30/0` never advanced, and a step near
+four billion wrapped around instead of ending.
+
 ## What This Release Does Not Do
 
 **None of this was driven through a live chat app.** There is no bot token on the build host. The
@@ -110,3 +137,7 @@ WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
 - **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
 - Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing
   imported it).
+- **3,331 → 0** clippy warnings (pedantic + nursery), **56 → 0** rustdoc warnings, and 0 build
+  warnings — with **no `#[allow]` left anywhere** in the workspace: the 36 that existed are gone and
+  what they hid is fixed. `--all-features` compiles for the first time, so the deno, playwright and
+  python paths are checked and tested too.
