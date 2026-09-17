@@ -600,8 +600,8 @@ pub async fn handle_window_close(
 /// # Errors
 ///
 /// Never returns `Err`; the `Result` is what Tauri requires of an async command
-/// that borrows `State`. A daemon that does not stop gracefully is killed;
-/// failures are logged.
+/// that borrows `State`. A sidecar daemon that does not stop gracefully is
+/// killed, and failures along the way are only logged.
 #[tauri::command]
 pub async fn stop_backend_for_update(
     state: State<'_, Arc<RwLock<AppState>>>,

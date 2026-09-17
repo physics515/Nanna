@@ -33,7 +33,7 @@ fn count_field(reply: &serde_json::Value, key: &str) -> usize {
 /// Share of `content_len` taken up by `matches` query hits, capped at 1.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "relevance is an f32 score on the wire; usize has no lossless conversion to f32, and the counts are converted exactly as the score always has been"
+    reason = "relevance is f32 on the wire and usize has no lossless conversion to f32; both counts are exact up to 2^24 (16 MiB of message content), past which the score only loses precision it cannot display"
 )]
 fn match_density(matches: usize, content_len: usize) -> f32 {
     (matches as f32 / content_len.max(1) as f32).min(1.0)
@@ -43,7 +43,7 @@ fn match_density(matches: usize, content_len: usize) -> f32 {
 /// type carries.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "MemoryItem's score fields are f32 on the wire; f64 has no lossless conversion to f32, and `as` rounds to the nearest f32, the intended narrowing"
+    reason = "std has no f64-to-f32 conversion but `as`; the daemon's scores are f32 widened to f64 in its JSON, so narrowing them back restores the exact value"
 )]
 const fn score_to_f32(score: f64) -> f32 {
     score as f32

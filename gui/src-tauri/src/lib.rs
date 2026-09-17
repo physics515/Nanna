@@ -362,9 +362,11 @@ macro_rules! command_handler {
 /// # Panics
 ///
 /// Panics when a global `tracing` subscriber is already installed in this
-/// process (the logging setup here installs one), and when Tauri fails to
-/// build the application — for example an invalid bundled `tauri.conf.json`
-/// or a main window that cannot be created. Neither has a UI yet to report to.
+/// process (the logging setup here installs one); when Tauri fails to build
+/// the application — an invalid bundled `tauri.conf.json`, or a plugin, the
+/// main window or the system tray failing to initialize; and when the bundle
+/// has no default window icon for the tray. None of these has a UI yet to
+/// report to.
 pub fn run() {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::SubscriberExt;
