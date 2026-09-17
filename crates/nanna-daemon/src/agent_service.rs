@@ -1240,7 +1240,10 @@ impl AgentService {
                     }))
                 },
                 // Enable auto-extraction if memory service is available
-                auto_extract_memories: has_memory,
+                analysis: nanna_agent::RunAnalysis {
+                    auto_extract_memories: has_memory,
+                    ..nanna_agent::RunAnalysis::default()
+                },
                 on_memory: if has_memory {
                     let ws_id_for_memory = workspace_id.clone();
                     Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
@@ -1281,7 +1284,10 @@ impl AgentService {
                 max_iterations: max_iterations_override,
                 attachments: attachments.clone(),
                 is_sub_agent,
-                all_tools_active: is_sub_agent,
+                tool_activation: nanna_agent::ToolActivation {
+                    all_tools_active: is_sub_agent,
+                    ..nanna_agent::ToolActivation::default()
+                },
                 // Capability transitions (provider benched, writes queued)
                 // reach the model once, in its next tool result.
                 degradations: self.degradations.clone(),

@@ -15,6 +15,7 @@ pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
 mod multi;
+mod numeric;
 pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
@@ -41,9 +42,9 @@ pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
     DegradationLedger, EmotionalContext, ExtractedMemory, MemoryCallback,
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RepeatLedger,
-    RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
+    RunAnalysis, RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
     TASK_ANCHOR_MAX_BYTES, TOOL_RESULT_CATEGORY, TaskComplexity,
-    ThinkingCallback, ThinkingMode, ToolCallRecord,
+    ThinkingCallback, ThinkingMode, ToolActivation, ToolCallRecord,
     budget_warning_message, claim_nudge_message, is_work_evidence_tool, min_viable_num_ctx,
     narration_nudge_message, repetition_nudge_message, thinking_spiral_nudge_message,
     tool_loop_nudge_message, wrapup_nudge_due, wrapup_nudge_message,

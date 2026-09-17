@@ -474,6 +474,12 @@ impl Supervisor {
     }
 
     /// Start a specific agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Stopped` when no agent with `agent_id` is
+    /// supervised. Starting an agent that is already running or starting is
+    /// a successful no-op.
     pub async fn start_agent(&self, agent_id: &str) -> Result<(), AgentError> {
         let mut agents = self.agents.write().await;
         let handle = agents.get_mut(agent_id)
@@ -483,7 +489,10 @@ impl Supervisor {
             return Ok(()); // Already running
         }
         
-        self.spawn_agent_task(handle).await;
+        self.spawn_agent_task(handle);
+        // Held from the state check through the spawn so two concurrent
+        // starts cannot both see a stopped agent and spawn it twice.
+        drop(agents);
         Ok(())
     }
 
@@ -613,7 +622,7 @@ impl Supervisor {
 
     // ---- Internal methods ----
 
-    async fn spawn_agent_task(&self, handle: &mut SupervisedAgentHandle) {
+    fn spawn_agent_task(&self, handle: &mut SupervisedAgentHandle) {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         handle.shutdown_tx = Some(shutdown_tx);
         handle.state = AgentState::Starting;
@@ -683,7 +692,9 @@ impl Supervisor {
             let agents = agents.read().await;
             let Some(handle) = agents.get(agent_id) else { return };
             let Some(hc) = &handle.config.health_check else { return };
-            (hc.clone(), handle.config.agent_config.clone(), handle.config.system_prompt.clone())
+            let probe = (hc.clone(), handle.config.agent_config.clone(), handle.config.system_prompt.clone());
+            drop(agents);
+            probe
         };
         
         // Perform health check probe
@@ -774,13 +785,15 @@ impl Supervisor {
                 return;
             }
             
-            match &handle.config.restart_policy {
+            let restart = match &handle.config.restart_policy {
                 RestartPolicy::Never => false,
                 RestartPolicy::Always | RestartPolicy::OnFailure => true,
                 RestartPolicy::ExponentialBackoff { max_restarts, .. } => {
                     handle.stats.restart_count < *max_restarts
                 }
-            }
+            };
+            drop(agents);
+            restart
         };
         
         if !should_restart {
@@ -792,6 +805,9 @@ impl Supervisor {
                     handle.state = AgentState::Terminated;
                     Self::emit_event_static(event_tx, agent_id, SupervisorEventType::RestartGaveUp { attempts }).await;
                 }
+            // The event is sent while the lock is still held, so the Terminated
+            // transition is announced before any other writer can change it.
+            drop(agents);
             return;
         }
         

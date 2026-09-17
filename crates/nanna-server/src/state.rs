@@ -613,7 +613,10 @@ impl AppState {
             });
 
             RunOptions {
-                auto_extract_memories: true,
+                analysis: nanna_agent::RunAnalysis {
+                    auto_extract_memories: true,
+                    ..nanna_agent::RunAnalysis::default()
+                },
                 on_memory: Some(on_memory),
                 ..Default::default()
             }

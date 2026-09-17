@@ -7,6 +7,8 @@
 //! *family prefix* so dated ids like `claude-opus-4-8` resolve. Local models
 //! (Ollama / on-device Burn) are free and intentionally return `None`.
 
+use crate::numeric::u64_to_f64;
+
 /// USD price per 1,000,000 tokens for one model, split by token class.
 ///
 /// Cache reads are billed far below fresh input; cache writes slightly above.
@@ -154,9 +156,8 @@ pub fn default_pricing(model_id: &str) -> Option<ModelPricing> {
 /// Pure arithmetic — no clock, no IO. `debug_assert`s guard the pricing
 /// invariants (finite, non-negative) on hot paths; the return is always
 /// non-negative.
-// Token counts are u64 but never approach f64's 2^52 exact-integer ceiling
-// (that's ~4.5 quadrillion tokens); the f64 cast is exact for any real usage.
-#[allow(clippy::cast_precision_loss)]
+// Token counts are u64 but never approach f64's 2^53 exact-integer ceiling
+// (that's ~9 quadrillion tokens); the f64 conversion is exact for any real usage.
 #[must_use]
 pub fn estimate_cost_usd(
     input_tokens: u64,
@@ -177,18 +178,19 @@ pub fn estimate_cost_usd(
     // Per-class cost in "USD * 1M tokens", summed then divided once. Kept as
     // explicit per-term locals so the sum is plain addition (no fused
     // multiply-add rewrite that would obscure the money math).
-    let input = input_tokens as f64 * pricing.input_usd_per_mtok;
-    let output = output_tokens as f64 * pricing.output_usd_per_mtok;
-    let cache_read = cache_read_tokens as f64 * pricing.cache_read_usd_per_mtok;
-    let cache_write = cache_write_tokens as f64 * pricing.cache_write_usd_per_mtok;
+    let input = u64_to_f64(input_tokens) * pricing.input_usd_per_mtok;
+    let output = u64_to_f64(output_tokens) * pricing.output_usd_per_mtok;
+    let cache_read = u64_to_f64(cache_read_tokens) * pricing.cache_read_usd_per_mtok;
+    let cache_write = u64_to_f64(cache_write_tokens) * pricing.cache_write_usd_per_mtok;
     let cost = (input + output + cache_read + cache_write) / TOKENS_PER_MILLION;
 
     debug_assert!(cost >= 0.0, "estimated cost must be non-negative");
     cost
 }
 
-/// [`estimate_cost_usd`] for a cache-write total that mixes lifetimes: the
-/// `cache_write_1h_tokens` share of `cache_write_tokens` is billed at the
+/// [`estimate_cost_usd`] for a cache-write total that mixes lifetimes.
+///
+/// The `cache_write_1h_tokens` share of `cache_write_tokens` is billed at the
 /// 1-hour rate ([`ModelPricing::with_hour_cache_write`], 2x input), the rest
 /// at the pricing's 5-minute rate.
 ///
