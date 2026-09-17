@@ -74,8 +74,8 @@ pub enum CredentialError {
 impl From<keyring::Error> for CredentialError {
     fn from(e: keyring::Error) -> Self {
         match e {
-            keyring::Error::NoEntry => CredentialError::NotFound,
-            _ => CredentialError::Keyring(e.to_string()),
+            keyring::Error::NoEntry => Self::NotFound,
+            _ => Self::Keyring(e.to_string()),
         }
     }
 }
@@ -102,7 +102,7 @@ pub struct SecureStore {
 impl SecureStore {
     /// Create a new secure store
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             allow_file_fallback: true,
             file_only: false,
@@ -112,7 +112,7 @@ impl SecureStore {
 
     /// Create without file fallback (keyring-only)
     #[must_use]
-    pub fn keyring_only() -> Self {
+    pub const fn keyring_only() -> Self {
         Self {
             allow_file_fallback: false,
             file_only: false,
@@ -135,6 +135,19 @@ impl SecureStore {
     }
 
     /// Get a credential from the keyring
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NotFound`] when the key is not stored, and
+    /// [`CredentialError::Keyring`] when the keyring entry cannot be opened, or
+    /// cannot be read and file fallback is disabled. When the keyring has no
+    /// entry or fails (with fallback enabled), or the store is file-only, the
+    /// file store's errors are returned instead.
+    /// The encrypted file store fails with [`CredentialError::NoHomeDir`] when no
+    /// data directory can be resolved, [`CredentialError::Io`] or
+    /// [`CredentialError::Json`] when its file (or a legacy plaintext file being
+    /// migrated) cannot be read, written or parsed, and
+    /// [`CredentialError::Crypto`] when it cannot be decrypted or encrypted.
     pub fn get(&self, key: &str) -> Result<String, CredentialError> {
         debug_assert!(!key.is_empty(), "credential key must not be empty");
         // File-only stores never touch the keyring.
@@ -168,6 +181,18 @@ impl SecureStore {
     }
     
     /// Store a credential in the keyring
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Keyring`] when the keyring entry cannot be
+    /// opened, or the write fails and file fallback is disabled. When the write
+    /// fails with fallback enabled, or the store is file-only, the file store's
+    /// errors are returned instead.
+    /// The encrypted file store fails with [`CredentialError::NoHomeDir`] when no
+    /// data directory can be resolved, [`CredentialError::Io`] or
+    /// [`CredentialError::Json`] when its file (or a legacy plaintext file being
+    /// migrated) cannot be read, written or parsed, and
+    /// [`CredentialError::Crypto`] when it cannot be decrypted or encrypted.
     pub fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
         debug_assert!(!key.is_empty(), "credential key must not be empty");
         // File-only stores never touch the keyring.
@@ -193,6 +218,19 @@ impl SecureStore {
     }
     
     /// Delete a credential from the keyring
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NotFound`] when the key is not stored, and
+    /// [`CredentialError::Keyring`] when the keyring entry cannot be opened or the
+    /// keyring delete fails for a reason other than a missing entry. When the
+    /// keyring has no entry (with fallback enabled), or the store is file-only,
+    /// the file store's errors are returned instead.
+    /// The encrypted file store fails with [`CredentialError::NoHomeDir`] when no
+    /// data directory can be resolved, [`CredentialError::Io`] or
+    /// [`CredentialError::Json`] when its file (or a legacy plaintext file being
+    /// migrated) cannot be read, written or parsed, and
+    /// [`CredentialError::Crypto`] when it cannot be decrypted or encrypted.
     pub fn delete(&self, key: &str) -> Result<(), CredentialError> {
         debug_assert!(!key.is_empty(), "credential key must not be empty");
         // File-only stores never touch the keyring.
@@ -222,11 +260,13 @@ impl SecureStore {
     }
     
     /// Check if a credential exists
+    #[must_use]
     pub fn exists(&self, key: &str) -> bool {
         self.get(key).is_ok()
     }
     
     /// List all stored credential keys (keyring doesn't support listing, so we check known keys)
+    #[must_use]
     pub fn list_keys(&self) -> Vec<String> {
         let known_keys = [
             keys::ANTHROPIC_API_KEY,
@@ -247,7 +287,7 @@ impl SecureStore {
         known_keys
             .iter()
             .filter(|k| self.exists(k))
-            .map(|k| k.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     }
 
@@ -407,17 +447,16 @@ impl SecureStore {
     fn file_encryption_key(&self) -> Result<[u8; 32], CredentialError> {
         // In file-only mode (tests/headless) never touch the OS keyring: the whole
         // point is determinism. Always use the colocated key file.
-        if !self.file_only {
-            if let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
+        if !self.file_only
+            && let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
                 match entry.get_password() {
                     Ok(b64) => {
-                        if let Ok(bytes) = base64_decode(&b64) {
-                            if bytes.len() == 32 {
+                        if let Ok(bytes) = base64_decode(&b64)
+                            && bytes.len() == 32 {
                                 let mut key = [0u8; 32];
                                 key.copy_from_slice(&bytes);
                                 return Ok(key);
                             }
-                        }
                     }
                     Err(keyring::Error::NoEntry) => {
                         let key = random_key()?;
@@ -428,7 +467,6 @@ impl SecureStore {
                     Err(_) => {}
                 }
             }
-        }
         let key_path = self
             .credentials_file_path()?
             .with_file_name("credentials.key");
@@ -508,19 +546,17 @@ impl OAuthCredential {
     /// Check if the token is expired (with 5-minute buffer)
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        if let Some(expires_at) = self.expires_at {
+        // No expiry info - assume valid
+        self.expires_at.is_some_and(|expires_at| {
             let now = chrono::Utc::now().timestamp_millis();
             // Add 5-minute buffer for safety
             expires_at < now + 5 * 60 * 1000
-        } else {
-            // No expiry info - assume valid
-            false
-        }
+        })
     }
 
     /// Check if the token can be refreshed
     #[must_use]
-    pub fn can_refresh(&self) -> bool {
+    pub const fn can_refresh(&self) -> bool {
         self.refresh_token.is_some()
     }
 
@@ -621,13 +657,13 @@ impl Default for ClaudeCredentialManager {
 impl ClaudeCredentialManager {
     /// Create a new credential manager
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { home_dir: None }
     }
 
     /// Create with a custom home directory (for testing)
     #[must_use]
-    pub fn with_home_dir(home_dir: PathBuf) -> Self {
+    pub const fn with_home_dir(home_dir: PathBuf) -> Self {
         Self {
             home_dir: Some(home_dir),
         }
@@ -658,9 +694,14 @@ impl ClaudeCredentialManager {
     /// 2. Windows Credential Manager (if on Windows, via keyring)
     /// 3. Linux Secret Service (if on Linux, via keyring)
     /// 4. Credentials file
+    ///
+    /// # Errors
+    ///
+    /// Any keyring failure falls through to the file, so only the file's errors
+    /// are returned: see [`Self::load_from_file`].
     pub fn load(&self) -> Result<LoadedCredential, CredentialError> {
         // Try platform-specific secure storage via keyring first
-        if let Ok(cred) = self.load_from_keyring() {
+        if let Ok(cred) = Self::load_from_keyring() {
             let source = if cfg!(target_os = "macos") {
                 CredentialSource::MacOsKeychain
             } else if cfg!(target_os = "windows") {
@@ -685,7 +726,7 @@ impl ClaudeCredentialManager {
     }
 
     /// Load credentials from the keyring (cross-platform)
-    fn load_from_keyring(&self) -> Result<OAuthCredential, CredentialError> {
+    fn load_from_keyring() -> Result<OAuthCredential, CredentialError> {
         let entry = Entry::new("Claude Code-credentials", "Claude Code")?;
         let json_str = entry.get_password()?;
         let data: ClaudeCredentialsFile = serde_json::from_str(&json_str)?;
@@ -694,6 +735,15 @@ impl ClaudeCredentialManager {
     }
 
     /// Load credentials from the file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NoHomeDir`] when neither `USERPROFILE` nor
+    /// `HOME` is set (and no home override was given),
+    /// [`CredentialError::NotFound`] when `~/.claude/.credentials.json` does not
+    /// exist or has no `claudeAiOauth` entry, [`CredentialError::Io`] when it
+    /// cannot be read, and [`CredentialError::Json`] when it is not valid JSON of
+    /// the expected shape.
     pub fn load_from_file(&self) -> Result<OAuthCredential, CredentialError> {
         let path = self.credentials_path()?;
 
@@ -711,6 +761,15 @@ impl ClaudeCredentialManager {
     }
 
     /// Save credentials to file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NoHomeDir`] when neither `USERPROFILE` nor
+    /// `HOME` is set (and no home override was given), [`CredentialError::Io`]
+    /// when the `.claude` directory cannot be created or the credentials file
+    /// cannot be read or written, and [`CredentialError::Json`] when the updated
+    /// file cannot be serialized. An existing file that does not parse is
+    /// replaced rather than reported.
     pub fn save_to_file(&self, credential: &OAuthCredential) -> Result<(), CredentialError> {
         let path = self.credentials_path()?;
 
@@ -743,6 +802,12 @@ impl ClaudeCredentialManager {
     }
 
     /// Save credentials to keyring
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Keyring`] when the Claude Code keyring entry
+    /// cannot be opened or written, and [`CredentialError::Json`] when the
+    /// credential cannot be serialized.
     pub fn save_to_keyring(&self, credential: &OAuthCredential) -> Result<(), CredentialError> {
         let entry = Entry::new("Claude Code-credentials", "Claude Code")?;
         
@@ -757,6 +822,12 @@ impl ClaudeCredentialManager {
     }
 
     /// Save credentials back to the source they were loaded from
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::save_to_file`]: always for
+    /// [`CredentialSource::File`], and for keyring sources only after the
+    /// keyring write failed and the file fallback failed too.
     pub fn save(&self, credential: &OAuthCredential, source: CredentialSource) -> Result<(), CredentialError> {
         match source {
             CredentialSource::File => self.save_to_file(credential),
@@ -775,16 +846,32 @@ impl ClaudeCredentialManager {
     }
 
     /// Refresh the OAuth token using Anthropic's token endpoint
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::RefreshFailed`] when `credential` has no refresh
+    /// token, the token request cannot be sent, the endpoint answers a
+    /// non-success status (its body is included), or the response is not a
+    /// token object.
     pub async fn refresh_token(
         &self,
         credential: &OAuthCredential,
     ) -> Result<OAuthCredential, CredentialError> {
+        const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            refresh_token: Option<String>,
+            expires_in: Option<i64>,
+            #[serde(rename = "subscriptionType")]
+            subscription_type: Option<String>,
+        }
+
         let refresh_token = credential
             .refresh_token
             .as_ref()
             .ok_or_else(|| CredentialError::RefreshFailed("No refresh token available".to_string()))?;
-
-        const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 
         // Build refresh request
         let client = reqwest::Client::new();
@@ -806,18 +893,8 @@ impl ClaudeCredentialManager {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(CredentialError::RefreshFailed(format!(
-                "Token refresh failed with status {}: {}",
-                status, body
+                "Token refresh failed with status {status}: {body}"
             )));
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: Option<String>,
-            expires_in: Option<i64>,
-            #[serde(rename = "subscriptionType")]
-            subscription_type: Option<String>,
         }
 
         let token_resp: TokenResponse = response
@@ -848,6 +925,13 @@ impl ClaudeCredentialManager {
     }
 
     /// Load credentials, refreshing if expired
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::load`]; [`CredentialError::Expired`] when the
+    /// loaded token is expired and has no refresh token; and the errors of
+    /// [`Self::refresh_token`] when a refresh is attempted and fails. Failing to
+    /// save a refreshed token is only logged.
     pub async fn load_and_refresh(&self) -> Result<LoadedCredential, CredentialError> {
         let loaded = self.load()?;
 
@@ -865,9 +949,8 @@ impl ClaudeCredentialManager {
                     credential: new_credential,
                     source: loaded.source,
                 });
-            } else {
-                return Err(CredentialError::Expired);
             }
+            return Err(CredentialError::Expired);
         }
 
         Ok(loaded)
@@ -1265,7 +1348,7 @@ mod tests {
         let cred = OAuthCredential {
             access_token: "test_token".to_string(),
             refresh_token: Some("refresh_token".to_string()),
-            expires_at: Some(1234567890000),
+            expires_at: Some(1_234_567_890_000),
             subscription_type: Some("pro".to_string()),
             account_id: None,
             organization_id: None,
@@ -1279,7 +1362,7 @@ mod tests {
 
         assert_eq!(loaded.access_token, "test_token");
         assert_eq!(loaded.refresh_token, Some("refresh_token".to_string()));
-        assert_eq!(loaded.expires_at, Some(1234567890000));
+        assert_eq!(loaded.expires_at, Some(1_234_567_890_000));
         assert_eq!(loaded.subscription_type, Some("pro".to_string()));
     }
     

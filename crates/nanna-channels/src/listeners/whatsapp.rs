@@ -1,6 +1,6 @@
-//! WhatsApp Web Bridge Listener
+//! `WhatsApp` Web Bridge Listener
 //!
-//! Connects to a WhatsApp Web bridge server for personal/regular accounts.
+//! Connects to a `WhatsApp` Web bridge server for personal/regular accounts.
 //! 
 //! Supports multiple bridge backends:
 //! - whatsapp-web.js based servers (wwebjs, baileys-api, etc.)
@@ -10,7 +10,7 @@
 //! - GET /status - connection status
 //! - GET /qr - QR code for linking (if not authenticated)
 //! - WebSocket or SSE endpoint for receiving messages
-//! - POST /send - for sending messages (handled by WhatsAppWebChannel)
+//! - POST /send - for sending messages (handled by `WhatsAppWebChannel`)
 
 use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
@@ -25,10 +25,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// WhatsApp Web bridge listener
+/// `WhatsApp` Web bridge listener
 pub struct WhatsAppWebListener {
     client: Client,
-    /// Base URL of the bridge server (e.g., "http://localhost:3000")
+    /// Base URL of the bridge server (e.g., "<http://localhost:3000>")
     api_url: String,
     /// Session/instance ID (some bridges support multiple sessions)
     session_id: String,
@@ -51,7 +51,7 @@ pub enum ReceiveMode {
 }
 
 impl WhatsAppWebListener {
-    /// Create a new WhatsApp Web listener
+    /// Create a new `WhatsApp` Web listener
     ///
     /// # Arguments
     /// * `api_url` - Base URL of the bridge server
@@ -73,7 +73,7 @@ impl WhatsAppWebListener {
 
     /// Set receive mode
     #[must_use]
-    pub fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
+    pub const fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
         self.receive_mode = mode;
         self
     }
@@ -100,7 +100,7 @@ impl WhatsAppWebListener {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| ListenerError::Connection(format!("Cannot reach bridge: {}", e)))?;
+            .map_err(|e| ListenerError::Connection(format!("Cannot reach bridge: {e}")))?;
 
         if !response.status().is_success() {
             // Try alternative endpoint format
@@ -111,7 +111,7 @@ impl WhatsAppWebListener {
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(|e| ListenerError::Connection(format!("Cannot reach bridge: {}", e)))?;
+                .map_err(|e| ListenerError::Connection(format!("Cannot reach bridge: {e}")))?;
 
             if !alt_response.status().is_success() {
                 return Err(ListenerError::Connection(format!(
@@ -123,13 +123,13 @@ impl WhatsAppWebListener {
             return alt_response
                 .json()
                 .await
-                .map_err(|e| ListenerError::Api(format!("Invalid status response: {}", e)));
+                .map_err(|e| ListenerError::Api(format!("Invalid status response: {e}")));
         }
 
         response
             .json()
             .await
-            .map_err(|e| ListenerError::Api(format!("Invalid status response: {}", e)))
+            .map_err(|e| ListenerError::Api(format!("Invalid status response: {e}")))
     }
 
     /// Parse incoming message from bridge
@@ -142,7 +142,7 @@ impl WhatsAppWebListener {
         }
 
         // Parse sender info
-        let sender_id = msg.from.clone().or(msg.sender.clone())?;
+        let sender_id = msg.from.clone().or_else(|| msg.sender.clone())?;
         let sender_name = msg.sender_name.or(msg.push_name);
         
         // Check if it's a group message
@@ -201,7 +201,7 @@ impl WhatsAppWebListener {
             let ws_stream = match connect_async(&url).await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
-                    let detail = format!("WebSocket connect failed: {}", e);
+                    let detail = format!("WebSocket connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -225,17 +225,15 @@ impl WhatsAppWebListener {
                         match msg {
                             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                                 // Parse the message
-                                if let Ok(bridge_msg) = serde_json::from_str::<BridgeEvent>(&text) {
-                                    if let Some(message) = bridge_msg.message {
-                                        if let Some(incoming) = self.parse_message(message) {
+                                if let Ok(bridge_msg) = serde_json::from_str::<BridgeEvent>(&text)
+                                    && let Some(message) = bridge_msg.message
+                                        && let Some(incoming) = self.parse_message(message) {
                                             debug!(msg_id = %incoming.id, "Received WhatsApp message");
                                             if sender.send(incoming).await.is_err() {
                                                 error!("Failed to send message to router");
                                                 return;
                                             }
                                         }
-                                    }
-                                }
                             }
                             Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
                                 debug!("Received ping");
@@ -292,7 +290,7 @@ impl WhatsAppWebListener {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let detail = format!("SSE connect failed: {}", e);
+                    let detail = format!("SSE connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -304,11 +302,11 @@ impl WhatsAppWebListener {
             if !response.status().is_success() {
                 let status = response.status();
                 if status.as_u16() == 401 || status.as_u16() == 403 {
-                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                    if cb.record_auth_failure(&format!("HTTP {status}")).await == BreakerAction::Stop {
                         break;
                     }
                 } else {
-                    let detail = format!("SSE connection returned HTTP {}", status);
+                    let detail = format!("SSE connection returned HTTP {status}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -340,19 +338,16 @@ impl WhatsAppWebListener {
                                     
                                     // Parse SSE event
                                     for line in event.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ") {
-                                            if let Ok(bridge_event) = serde_json::from_str::<BridgeEvent>(data) {
-                                                if let Some(message) = bridge_event.message {
-                                                    if let Some(incoming) = self.parse_message(message) {
+                                        if let Some(data) = line.strip_prefix("data: ")
+                                            && let Ok(bridge_event) = serde_json::from_str::<BridgeEvent>(data)
+                                                && let Some(message) = bridge_event.message
+                                                    && let Some(incoming) = self.parse_message(message) {
                                                         debug!(msg_id = %incoming.id, "Received WhatsApp message via SSE");
                                                         if sender.send(incoming).await.is_err() {
                                                             error!("Failed to send message to router");
                                                             return;
                                                         }
                                                     }
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -396,8 +391,8 @@ impl WhatsAppWebListener {
                     info!("WhatsApp poll receiver shutting down");
                     return;
                 }
-                _ = tokio::time::sleep(poll_interval) => {
-                    let poll_url = format!("{}?since={}", url, last_timestamp);
+                () = tokio::time::sleep(poll_interval) => {
+                    let poll_url = format!("{url}?since={last_timestamp}");
                     
                     match self.client.get(&poll_url).send().await {
                         Ok(response) => {
@@ -405,11 +400,10 @@ impl WhatsAppWebListener {
                                 cb.record_success().await;
                                 if let Ok(messages) = response.json::<Vec<BridgeMessage>>().await {
                                     for msg in messages {
-                                        if let Some(ts) = msg.timestamp {
-                                            if ts > last_timestamp {
+                                        if let Some(ts) = msg.timestamp
+                                            && ts > last_timestamp {
                                                 last_timestamp = ts;
                                             }
-                                        }
                                         
                                         if let Some(incoming) = self.parse_message(msg) {
                                             debug!(msg_id = %incoming.id, "Received WhatsApp message");
@@ -423,11 +417,11 @@ impl WhatsAppWebListener {
                             } else {
                                 let status = response.status();
                                 if status.as_u16() == 401 || status.as_u16() == 403 {
-                                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                                    if cb.record_auth_failure(&format!("HTTP {status}")).await == BreakerAction::Stop {
                                         break;
                                     }
                                 } else {
-                                    let detail = format!("Poll returned HTTP {}", status);
+                                    let detail = format!("Poll returned HTTP {status}");
                                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                                         break;
                                     }
@@ -451,7 +445,7 @@ impl WhatsAppWebListener {
 
 #[async_trait]
 impl Listener for WhatsAppWebListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "whatsapp-web"
     }
 

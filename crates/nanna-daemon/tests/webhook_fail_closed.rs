@@ -88,8 +88,10 @@ async fn every_unconfigured_channel_refuses_with_503() {
 
 #[tokio::test]
 async fn a_configured_channel_still_demands_proof() {
-    let mut config = WebhookConfig::default();
-    config.telegram_secret = Some("telegram-secret".to_string());
+    let mut config = WebhookConfig {
+        telegram_secret: Some("telegram-secret".to_string()),
+        ..WebhookConfig::default()
+    };
     config
         .generic_secrets
         .insert("hooks".to_string(), "generic-secret".to_string());
@@ -144,12 +146,14 @@ async fn a_blank_configured_secret_is_treated_as_unconfigured() {
     // `Some("")` is what a half-finished config leaves behind, and it is the
     // one shape that could authenticate everybody: comparing an empty secret
     // against an absent header is `"" == ""`.
-    let mut config = WebhookConfig::default();
-    config.telegram_secret = Some(String::new());
-    config.slack_signing_secret = Some("   ".to_string());
     let mut secrets = HashMap::new();
     secrets.insert("blank".to_string(), String::new());
-    config.generic_secrets = secrets;
+    let config = WebhookConfig {
+        telegram_secret: Some(String::new()),
+        slack_signing_secret: Some("   ".to_string()),
+        generic_secrets: secrets,
+        ..WebhookConfig::default()
+    };
 
     let (base, handle) = start(config).await;
     let client = reqwest::Client::new();

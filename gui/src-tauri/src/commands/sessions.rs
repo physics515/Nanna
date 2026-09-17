@@ -1,23 +1,33 @@
 //! Session management commands. The daemon owns nanna.db; these forward to it.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState, ChatMessage, SessionInfo, ToolCallInfo};
+use serde::Serialize;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// Create a new session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.create_in_workspace`
+/// request is dropped or times out. Fails with `Invalid daemon response: …`
+/// when the reply has no `session` object or that object has no `id` — which is
+/// also how a refusal reported in the reply surfaces.
 #[tauri::command]
 pub async fn create_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<SessionInfo, String> {
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
 
     let session_name = name.unwrap_or_else(|| {
         format!("Chat {}", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
     });
 
-    let result = state_guard
-        .backend
+    let result = backend
         .session_create_in_workspace(Some(&session_name), workspace_id.as_deref())
         .await?;
     let session = result
@@ -51,17 +61,23 @@ pub async fn create_session(
 /// List sessions for the current context.
 /// - `workspace_id = Some(id)`: sessions belonging to that workspace
 /// - `workspace_id = None`: all sessions (global view)
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.list` (or, with a
+/// workspace, `session.list_by_workspace`) request is dropped or times out. A
+/// reply without a `sessions` array lists nothing.
 #[tauri::command]
 pub async fn list_sessions(
     state: State<'_, Arc<RwLock<AppState>>>,
     workspace_id: Option<String>,
 ) -> Result<Vec<SessionInfo>, String> {
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
 
     let result = if let Some(ref ws_id) = workspace_id {
-        state_guard.backend.sessions_list_by_workspace(Some(ws_id.as_str())).await
+        backend.sessions_list_by_workspace(Some(ws_id.as_str())).await
     } else {
-        state_guard.backend.sessions_list().await
+        backend.sessions_list().await
     }?;
 
     let mut all_sessions: Vec<SessionInfo> = result
@@ -76,7 +92,11 @@ pub async fn list_sessions(
                         name: s.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string(),
                         created_at: s.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         updated_at: s.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        message_count: s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        // Saturates where `as` wrapped; a count past u32::MAX is unreachable.
+                        message_count: s
+                            .get("message_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
                         workspace_id: s.get("workspace_id").and_then(|v| v.as_str()).map(String::from),
                         workspace_name: s.get("workspace_name").and_then(|v| v.as_str()).map(String::from),
                         // Absent (not null) on an unpinned session — the daemon's
@@ -105,18 +125,23 @@ pub async fn list_sessions(
 }
 
 /// Get session history.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.history` request is
+/// dropped or times out. A reply without a `messages` array is an empty
+/// history, and malformed messages are skipped.
 #[tauri::command]
 pub async fn get_session_history(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
-    let state_guard = state.read().await;
     // Effectively no limit: the chat page must reload the WHOLE session on
     // remount — a cap here silently dropped history for long-horizon runs.
     // An explicit huge bound (rather than None) keeps one guarantee under
     // version skew: an older daemon defaulted None to 50.
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .session_history(&session_id, Some(1_000_000))
         .await?;
 
@@ -150,25 +175,38 @@ pub async fn get_session_history(
 }
 
 /// Delete a session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.delete` request is
+/// dropped or times out. A refusal the daemon reports in its reply (an unknown
+/// id, say) is not checked and still returns `Ok`.
 #[tauri::command]
 pub async fn delete_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard.backend.session_delete(&session_id).await?;
+    backend_handle(&state).await.session_delete(&session_id).await?;
     Ok(())
 }
 
 /// Delete all sessions.
+///
+/// # Errors
+///
+/// Returns `Failed to clear sessions: …` when the daemon cannot be reached or
+/// the `session.delete_all` request is dropped or times out.
 #[tauri::command]
 pub async fn clear_all_sessions(
     app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<usize, String> {
-    let state_guard = state.read().await;
-    let count = match state_guard.backend.sessions_delete_all().await {
-        Ok(result) => result.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+    let count = match backend_handle(&state).await.sessions_delete_all().await {
+        // Lossless on the 64-bit targets this ships for; saturates otherwise.
+        Ok(result) => result
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
         Err(e) => {
             warn!("Failed to clear daemon sessions: {e}");
             return Err(format!("Failed to clear sessions: {e}"));
@@ -190,6 +228,10 @@ pub struct ArchiveResult {
 /// The daemon auto-extracts memories from every turn as the conversation
 /// happens, so there is nothing extra to archive on delete — this simply deletes
 /// the session. (The client no longer runs its own extraction LLM pass.)
+///
+/// # Errors
+///
+/// Fails exactly as [`delete_session`] does.
 #[tauri::command]
 pub async fn archive_and_delete_session(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -204,27 +246,37 @@ pub async fn archive_and_delete_session(
 }
 
 /// Rename a session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.rename` request is
+/// dropped or times out. A refusal the daemon reports in its reply (an unknown
+/// id, say) is not checked and still returns `Ok`.
 #[tauri::command]
 pub async fn rename_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     name: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard.backend.session_rename(&session_id, &name).await?;
+    backend_handle(&state).await.session_rename(&session_id, &name).await?;
     Ok(())
 }
 
 /// Set or clear the workspace for a session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.set_workspace`
+/// request is dropped or times out. Also fails with the daemon's `message` when
+/// its reply reports an `error`.
 #[tauri::command]
 pub async fn set_session_workspace(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .session_set_workspace(&session_id, workspace_id.as_deref())
         .await?;
     if result.get("error").is_some() {
@@ -238,15 +290,20 @@ pub async fn set_session_workspace(
 /// `model = None` clears the pin and the chat follows the global `[llm]`
 /// default again. The pin covers chat replies only — the sub-agent,
 /// summarization and embedding models stay global.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.set_model` request
+/// is dropped or times out. Also fails with the daemon's `message` when it
+/// refuses the pin: an unknown session, or a model no live provider serves.
 #[tauri::command]
 pub async fn set_session_model(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     model: Option<String>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    let result = state_guard
-        .backend
+    let result = backend_handle(&state)
+        .await
         .session_set_model(&session_id, model.as_deref())
         .await?;
     // A refused pin — unknown session, or a model no live provider serves —
@@ -275,6 +332,14 @@ fn export_filter(format: &str) -> Option<(&'static str, &'static [&'static str])
 /// opened from Rust, so the destination path never comes from the webview —
 /// a command that wrote wherever the page asked would be a write-anywhere
 /// surface. Returns the saved path, or `None` when the dialog was cancelled.
+///
+/// # Errors
+///
+/// Fails when `format` is neither `markdown` nor `json`; when the daemon
+/// cannot be reached or the `session.export` request is dropped or times out;
+/// with the daemon's own `message` when it refuses to render the session; when
+/// the picked dialog entry is not a file path; and when writing that path
+/// fails. A cancelled dialog is `Ok(None)`, not an error.
 #[tauri::command]
 pub async fn export_session(
     app: tauri::AppHandle,
@@ -338,6 +403,13 @@ mod export_tests {
 
 /// This session's file checkpoints (files as they were before a tool wrote
 /// them), newest first. A daemon refusal comes back as `Err` with its message.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.file_history`
+/// request is dropped or times out, and with the daemon's own `message` when
+/// it refuses — file history not enabled on that daemon, or the history could
+/// not be read.
 #[tauri::command]
 pub async fn get_file_history(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -349,6 +421,7 @@ pub async fn get_file_history(
         .backend
         .session_file_history(&session_id, limit)
         .await?;
+    drop(state_guard);
     if result.get("error").is_some() {
         return Err(result["message"]
             .as_str()
@@ -360,6 +433,13 @@ pub async fn get_file_history(
 
 /// Restore one file checkpoint. Returns what the daemon did (`rewrote` /
 /// `removed`, with the path).
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.restore_file`
+/// request is dropped or times out, and with the daemon's own `message` when
+/// it refuses — file history not enabled on that daemon, an unknown
+/// checkpoint, or a restore that could not be written.
 #[tauri::command]
 pub async fn restore_file_checkpoint(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -371,6 +451,7 @@ pub async fn restore_file_checkpoint(
         .backend
         .session_restore_file(&session_id, checkpoint)
         .await?;
+    drop(state_guard);
     if result.get("error").is_some() {
         return Err(result["message"]
             .as_str()
@@ -385,14 +466,19 @@ pub async fn restore_file_checkpoint(
 /// Additive by contract: the daemon unions these into whatever active set the
 /// turn would have built anyway. An empty list clears the selection and
 /// restores byte-identical default tool behavior.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.set_tools` request
+/// is dropped or times out. Also fails with the daemon's `message` when it
+/// refuses the selection (an unknown session).
 #[tauri::command]
 pub async fn set_session_tools(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     tools: Vec<String>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    let result = state_guard.backend.session_set_tools(&session_id, tools).await?;
+    let result = backend_handle(&state).await.session_set_tools(&session_id, tools).await?;
     // The only daemon-side refusal is an unknown session; surface it rather
     // than leaving the picker showing a selection that was never recorded.
     if result.get("error").is_some() {
@@ -406,6 +492,12 @@ pub async fn set_session_tools(
 // =============================================================================
 
 /// Spawn a sub-agent session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.spawn_sub_session`
+/// request is dropped or times out. A refusal the daemon reports in its reply
+/// is passed through inside `Ok`.
 #[tauri::command]
 pub async fn spawn_sub_session(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -416,8 +508,7 @@ pub async fn spawn_sub_session(
     max_iterations: Option<usize>,
     timeout_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "session",
         "action": "spawn_sub_session",
         "task": task,
@@ -430,13 +521,18 @@ pub async fn spawn_sub_session(
 }
 
 /// List sub-sessions.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.list_sub_sessions`
+/// request is dropped or times out. A refusal the daemon reports in its reply
+/// is passed through inside `Ok`.
 #[tauri::command]
 pub async fn list_sub_sessions(
     state: State<'_, Arc<RwLock<AppState>>>,
     parent_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "session",
         "action": "list_sub_sessions",
         "parent_id": parent_id,
@@ -444,13 +540,18 @@ pub async fn list_sub_sessions(
 }
 
 /// Kill a sub-session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.kill_sub_session`
+/// request is dropped or times out. A refusal the daemon reports in its reply
+/// is passed through inside `Ok`.
 #[tauri::command]
 pub async fn kill_sub_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     target: String,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "session",
         "action": "kill_sub_session",
         "target": target,
@@ -458,13 +559,18 @@ pub async fn kill_sub_session(
 }
 
 /// Get sub-session status.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the
+/// `session.get_sub_session_status` request is dropped or times out. A refusal
+/// the daemon reports in its reply is passed through inside `Ok`.
 #[tauri::command]
 pub async fn get_sub_session_status(
     state: State<'_, Arc<RwLock<AppState>>>,
     target: String,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "session",
         "action": "get_sub_session_status",
         "target": target,
@@ -472,14 +578,19 @@ pub async fn get_sub_session_status(
 }
 
 /// Send a message to a sub-session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.send_to_sub_session`
+/// request is dropped or times out. A refusal the daemon reports in its reply
+/// is passed through inside `Ok`.
 #[tauri::command]
 pub async fn send_to_sub_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     target: String,
     message: String,
 ) -> Result<serde_json::Value, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.daemon_request(serde_json::json!({
+    backend_handle(&state).await.daemon_request(serde_json::json!({
         "type": "session",
         "action": "send_to_sub_session",
         "target": target,
@@ -489,14 +600,22 @@ pub async fn send_to_sub_session(
 
 /// Get session run state (in-flight streaming text, active tools).
 /// `light: true` skips the run journal — for periodic counter polls.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `session.get_run_state`
+/// request is dropped or times out. A refusal the daemon reports in its reply
+/// is passed through inside `Ok`.
 #[tauri::command]
 pub async fn get_session_run_state(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     light: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let state = state.read().await;
-    state.backend.session_get_run_state(&session_id, light.unwrap_or(false)).await
+    backend_handle(&state)
+        .await
+        .session_get_run_state(&session_id, light.unwrap_or(false))
+        .await
 }
 
 // =============================================================================
@@ -504,11 +623,15 @@ pub async fn get_session_run_state(
 // =============================================================================
 
 /// Cancel an active agent session.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `chat.cancel` request is
+/// dropped or times out. `Ok(false)` means no turn was running.
 #[tauri::command]
 pub async fn cancel_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
 ) -> Result<bool, String> {
-    let state_guard = state.read().await;
-    state_guard.backend.chat_cancel(&session_id).await
+    backend_handle(&state).await.chat_cancel(&session_id).await
 }

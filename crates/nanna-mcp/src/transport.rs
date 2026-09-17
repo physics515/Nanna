@@ -204,8 +204,8 @@ pub mod stdio {
         /// # Errors
         ///
         /// Returns error if process fails to spawn
-        pub async fn spawn(program: &str, args: &[&str]) -> Result<Self> {
-            Self::spawn_with_env(program, args, &[]).await
+        pub fn spawn(program: &str, args: &[&str]) -> Result<Self> {
+            Self::spawn_with_env(program, args, &[])
         }
 
         /// Spawn with environment variables
@@ -213,7 +213,7 @@ pub mod stdio {
         /// # Errors
         ///
         /// Returns error if process fails to spawn
-        pub async fn spawn_with_env(
+        pub fn spawn_with_env(
             program: &str,
             args: &[&str],
             env: &[(&str, &str)],
@@ -347,6 +347,9 @@ pub mod stdio {
                 stdin.write_all(line.as_bytes()).await?;
                 stdin.write_all(b"\n").await?;
                 stdin.flush().await?;
+                // Held across both writes and the flush so concurrent messages
+                // cannot interleave inside one line.
+                drop(stdin);
             }
 
             // Wait for response with timeout
@@ -355,8 +358,7 @@ pub mod stdio {
                 Ok(Err(_)) => Err(McpError::ConnectionClosed),
                 Err(_) => {
                     // Clean up pending request
-                    let mut pending = self.pending.lock().await;
-                    pending.remove(&id);
+                    self.pending.lock().await.remove(&id);
                     Err(McpError::Timeout)
                 }
             }
@@ -370,6 +372,9 @@ pub mod stdio {
             stdin.write_all(line.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await?;
+            // Held across both writes and the flush so concurrent messages
+            // cannot interleave inside one line.
+            drop(stdin);
             
             Ok(())
         }
@@ -377,8 +382,7 @@ pub mod stdio {
         async fn close(&self) -> Result<()> {
             let _ = self.shutdown_tx.send(()).await;
 
-            let mut child = self.child.lock().await;
-            let _ = child.kill().await;
+            let _ = self.child.lock().await.kill().await;
 
             Ok(())
         }
@@ -483,6 +487,7 @@ pub use stdio::StdioTransport;
 #[cfg(feature = "http")]
 pub mod http {
     use super::{async_trait, Arc, Mutex, JsonRpcResponse, Result, McpError, Transport, JsonRpcRequest, JsonRpcNotification};
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
@@ -596,7 +601,6 @@ pub mod http {
 
                                 // Process SSE events
                                 let mut stream = response.bytes_stream();
-                                use futures::StreamExt;
                                 
                                 let mut buffer = String::new();
                                 while let Some(chunk) = stream.next().await {
@@ -720,8 +724,7 @@ pub mod http {
                 && !text.is_empty()
                     && let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                         // Clean up pending
-                        let mut pending = self.pending.lock().await;
-                        pending.remove(&id);
+                        self.pending.lock().await.remove(&id);
                         return Ok(resp);
                     }
 
@@ -730,8 +733,7 @@ pub mod http {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err(McpError::ConnectionClosed),
                 Err(_) => {
-                    let mut pending = self.pending.lock().await;
-                    pending.remove(&id);
+                    self.pending.lock().await.remove(&id);
                     Err(McpError::Timeout)
                 }
             }

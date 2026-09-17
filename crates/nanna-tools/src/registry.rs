@@ -7,7 +7,11 @@ use crate::{
     format_tool_output,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+// Ordered maps serve the skill-audit report, which only exists with the
+// scripting feature.
+#[cfg(feature = "scripting")]
+use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -60,7 +64,7 @@ pub struct ToolRegistry {
     alias_targets: RwLock<HashMap<String, String>>,
     /// Default working directory for tool execution (global fallback)
     default_workdir: RwLock<Option<std::path::PathBuf>>,
-    /// Per-session working directories (session_id → root).
+    /// Per-session working directories (`session_id` → root).
     /// `Some(root)` pins the session there; `None` records that the session
     /// resolved to NO workspace, so it must not fall through to the global
     /// default that another session's turn may own.
@@ -164,11 +168,10 @@ impl ToolRegistry {
         // through to the global default here is the same destruction by
         // another door, because that default belongs to whoever activated a
         // workspace last.
-        if let Some(ref sid) = self.current_session_id().await {
-            if let Some(bound) = self.session_workdirs.read().await.get(sid) {
+        if let Some(ref sid) = self.current_session_id().await
+            && let Some(bound) = self.session_workdirs.read().await.get(sid) {
                 return bound.clone();
             }
-        }
         self.default_workdir.read().await.clone()
     }
 
@@ -258,7 +261,7 @@ impl ToolRegistry {
     /// `Nanna.sessionId()`, which is this value; the scheduler used to call
     /// `agent.chat(&session_id, ..)` without supplying it at all, so
     /// `Nanna.sessionId()` was null and every session-scoped `todo` call died
-    /// on "session scope requires session_id" (35 logged failures 2026-07-28 ..
+    /// on "session scope requires `session_id`" (35 logged failures 2026-07-28 ..
     /// 07-31, all of them `scheduled-heartbeat-*`).
     ///
     /// The binding covers the whole future and nothing else: the agent loop
@@ -284,8 +287,7 @@ impl ToolRegistry {
     pub async fn register<T: Tool + 'static>(&self, tool: T) {
         let definition = tool.definition();
         let name = definition.name.clone();
-        let mut tools = self.tools.write().await;
-        tools.insert(name.clone(), Arc::new(tool));
+        self.tools.write().await.insert(name.clone(), Arc::new(tool));
         info!("Registered tool: {}", name);
     }
 
@@ -293,8 +295,7 @@ impl ToolRegistry {
     pub async fn register_boxed(&self, tool: Arc<dyn Tool>) {
         let definition = tool.definition();
         let name = definition.name.clone();
-        let mut tools = self.tools.write().await;
-        tools.insert(name.clone(), tool);
+        self.tools.write().await.insert(name.clone(), tool);
         info!("Registered tool: {}", name);
     }
 
@@ -314,8 +315,10 @@ impl ToolRegistry {
             aliases.insert(alias.to_string());
             drop(aliases);
             // Store reverse mapping: alias → canonical target
-            let mut targets = self.alias_targets.write().await;
-            targets.insert(alias.to_string(), target.to_string());
+            self.alias_targets
+                .write()
+                .await
+                .insert(alias.to_string(), target.to_string());
             info!("Registered tool alias: {} -> {}", alias, target);
         } else {
             warn!(
@@ -445,8 +448,8 @@ impl ToolRegistry {
         // could never save it). Only fires when nothing registered matched
         // above, and only resolves when the target actually exists in this
         // registry, so a synonym can never shadow a real tool or invent one.
-        if let Some(target) = dialect_synonym(&lower) {
-            if let Some(tool) = tools.get(target) {
+        if let Some(target) = dialect_synonym(&lower)
+            && let Some(tool) = tools.get(target) {
                 info!(
                     requested = name,
                     resolved = target,
@@ -455,7 +458,6 @@ impl ToolRegistry {
                 );
                 return Some((target.to_string(), tool.clone()));
             }
-        }
 
         // Step 3: Fuzzy match — pick best if score ≥ 0.7 AND gap to second-best ≥ 0.1
         let mut best: Option<(String, f64, Arc<dyn Tool>)> = None;
@@ -477,6 +479,7 @@ impl ToolRegistry {
                 _ => {}
             }
         }
+        drop(tools);
 
         if let Some((key, score, tool)) = best {
             let gap = score - second_best_score;
@@ -528,7 +531,7 @@ impl ToolRegistry {
             })
             .map(|(name, t)| {
                 let mut def = t.definition();
-                def.name = name.clone(); // Override name to match registered key
+                def.name.clone_from(name); // Override name to match registered key
                 def
             })
             .collect()
@@ -553,18 +556,20 @@ impl ToolRegistry {
     /// Sorted by name so a caller rendering a list gets a stable order rather
     /// than `HashMap` iteration order, which reshuffles between calls.
     pub async fn inventory(&self) -> Vec<ToolInventoryEntry> {
-        let tools = self.tools.read().await;
-        let aliases = self.aliases.read().await;
-        let policy = self.policy.read().await;
-        let mut entries: Vec<ToolInventoryEntry> = tools
-            .iter()
-            .filter(|(name, _)| !aliases.contains(name.as_str()))
-            .map(|(name, tool)| ToolInventoryEntry {
-                enabled: policy.permits(name.as_str()),
-                description: tool.definition().description,
-                name: name.clone(),
-            })
-            .collect();
+        let mut entries: Vec<ToolInventoryEntry> = {
+            let tools = self.tools.read().await;
+            let aliases = self.aliases.read().await;
+            let policy = self.policy.read().await;
+            tools
+                .iter()
+                .filter(|(name, _)| !aliases.contains(name.as_str()))
+                .map(|(name, tool)| ToolInventoryEntry {
+                    enabled: policy.permits(name.as_str()),
+                    description: tool.definition().description,
+                    name: name.clone(),
+                })
+                .collect()
+        };
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         debug_assert!(
@@ -596,7 +601,7 @@ impl ToolRegistry {
             })
             .filter(|(name, _tool)| {
                 let is_alias = aliases.contains(name.as_str());
-                let is_capitalized_alias = is_alias && name.chars().any(|c| c.is_uppercase());
+                let is_capitalized_alias = is_alias && name.chars().any(char::is_uppercase);
 
                 // Skip capitalized aliases
                 if is_capitalized_alias {
@@ -606,11 +611,10 @@ impl ToolRegistry {
                 // For a lowercase alias: skip if canonical target is also in `names`
                 // (both would map to the same Claude Code tool name, e.g. read+read_file → Read)
                 if is_alias {
-                    if let Some(canonical) = alias_targets.get(name.as_str()) {
-                        if names.contains(canonical) {
+                    if let Some(canonical) = alias_targets.get(name.as_str())
+                        && names.contains(canonical) {
                             return false;
                         }
-                    }
                     return names.contains(name.as_str());
                 }
 
@@ -619,7 +623,7 @@ impl ToolRegistry {
             })
             .map(|(name, t)| {
                 let mut def = t.definition();
-                def.name = name.clone();
+                def.name.clone_from(name);
                 def
             })
             .collect()
@@ -711,7 +715,7 @@ impl ToolRegistry {
 
     /// Execute a tool call, recording exactly one audit record for it.
     ///
-    /// The audit lives here rather than inside [`Self::execute_call`] so that it
+    /// The audit lives here rather than inside `Self::execute_call` so that it
     /// cannot be bypassed by an early return: every exit — not-found, policy
     /// refusal, success, failure — flows back through this one point. That is
     /// the whole property an audit trail rests on, so it is enforced by the
@@ -1065,9 +1069,11 @@ const DIALECT_SYNONYMS: &[(&str, &str)] = &[
     ("subagent", "sub_agent"),
 ];
 
-/// Look up the canonical target for a dialect synonym (`name` must already be
-/// lowercased). Public so the agent loop's prose-call salvage can explain a
-/// mapping ("`list_files` → `list_dir`") in its corrective notice.
+/// Look up the canonical target for a dialect synonym.
+///
+/// `name` must already be lowercased. Public so the agent loop's prose-call
+/// salvage can explain a mapping ("`list_files` → `list_dir`") in its
+/// corrective notice.
 #[must_use]
 pub fn dialect_synonym(name: &str) -> Option<&'static str> {
     DIALECT_SYNONYMS
@@ -1086,7 +1092,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         let mut prev = i;
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
-            let cost = if ca == cb { 0 } else { 1 };
+            let cost = usize::from(ca != cb);
             let val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
             prev = row[j + 1];
             row[j + 1] = val;
@@ -1101,11 +1107,11 @@ fn normalized_similarity(a: &str, b: &str) -> f64 {
     if max_len == 0 {
         return 1.0;
     }
-    1.0 - (levenshtein(a, b) as f64 / max_len as f64)
+    1.0 - (crate::usize_to_f64(levenshtein(a, b)) / crate::usize_to_f64(max_len))
 }
 
-/// Find the largest byte index <= max_bytes that is a valid char boundary.
-/// Convert a camelCase string to snake_case.
+/// Find the largest byte index <= `max_bytes` that is a valid char boundary.
+/// Convert a camelCase string to `snake_case`.
 fn camel_to_snake(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
@@ -1121,9 +1127,9 @@ fn camel_to_snake(s: &str) -> String {
     result
 }
 
-/// Normalize parameter keys from camelCase to snake_case.
+/// Normalize parameter keys from camelCase to `snake_case`.
 ///
-/// Adds snake_case aliases for any camelCase keys without removing originals.
+/// Adds `snake_case` aliases for any camelCase keys without removing originals.
 /// Example: `{"filePath": "x"}` → `{"filePath": "x", "file_path": "x"}`
 fn normalize_param_keys(
     mut params: HashMap<String, serde_json::Value>,
@@ -1154,7 +1160,7 @@ fn normalize_param_keys(
 /// child — fires first, and it answers with elapsed time, which deadline fired,
 /// and what is on disk. A backstop pinned to the declared ceiling preempts that
 /// answer. It also loses when the two are nominally equal, because the inner
-/// handoff still costs something: observed as the backstop firing at 180_004 ms
+/// handoff still costs something: observed as the backstop firing at `180_004` ms
 /// with the tool's own account arriving 1.03 s later, to nobody.
 ///
 /// So derive the backstop from the deadline the engine will really enforce plus
@@ -1172,7 +1178,7 @@ fn backstop_timeout(timeout_secs: u64, parameters: &HashMap<String, Value>) -> s
 /// Without the scripting engine there is no inner deadline to outlive: this
 /// timer is the only one, so it fires exactly at the declared ceiling.
 #[cfg(not(feature = "scripting"))]
-fn backstop_timeout(
+const fn backstop_timeout(
     timeout_secs: u64,
     _parameters: &HashMap<String, Value>,
 ) -> std::time::Duration {
@@ -1266,7 +1272,7 @@ fn backstop_message(tool_name: &str, elapsed_ms: u128, limit_ms: u128) -> String
     )
 }
 
-fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();
     }
@@ -1600,8 +1606,7 @@ mod tests {
         let call = ToolCall {
             id: "test-1".to_string(),
             name: "echo".to_string(),
-            parameters: [("text".to_string(), Value::String("hello".to_string()))]
-                .into_iter()
+            parameters: std::iter::once(("text".to_string(), Value::String("hello".to_string())))
                 .collect(),
         };
 
@@ -1619,8 +1624,7 @@ mod tests {
         let call = ToolCall {
             id: "test-2".to_string(),
             name: "Echo".to_string(),
-            parameters: [("text".to_string(), Value::String("hi".to_string()))]
-                .into_iter()
+            parameters: std::iter::once(("text".to_string(), Value::String("hi".to_string())))
                 .collect(),
         };
 
@@ -1636,11 +1640,11 @@ mod tests {
         reg.register_alias("e", "echo").await;
 
         // Request both the alias and canonical — alias should be skipped
-        let names: HashSet<String> = ["echo", "e"].iter().map(|s| s.to_string()).collect();
+        let names: HashSet<String> = ["echo", "e"].iter().map(ToString::to_string).collect();
         let defs = reg.definitions_for_names(&names).await;
         let def_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 
-        assert_eq!(defs.len(), 1, "Should have 1 def, got: {:?}", def_names);
+        assert_eq!(defs.len(), 1, "Should have 1 def, got: {def_names:?}");
         assert_eq!(defs[0].name, "echo");
     }
 
@@ -1651,7 +1655,7 @@ mod tests {
         reg.register_alias("e", "echo").await;
 
         // Request ONLY the alias (not canonical) — alias should be included
-        let names: HashSet<String> = ["e"].iter().map(|s| s.to_string()).collect();
+        let names: HashSet<String> = std::iter::once("e").map(ToString::to_string).collect();
         let defs = reg.definitions_for_names(&names).await;
 
         assert_eq!(defs.len(), 1);
@@ -2274,8 +2278,7 @@ mod tests {
             .execute(ToolCall {
                 id: "slow-1".to_string(),
                 name: "slow".to_string(),
-                parameters: [("timeout".to_string(), Value::from(3))]
-                    .into_iter()
+                parameters: std::iter::once(("timeout".to_string(), Value::from(3)))
                     .collect(),
             })
             .await;
@@ -2295,9 +2298,8 @@ mod tests {
     #[cfg(feature = "scripting")]
     #[test]
     fn backstop_outlives_every_inner_deadline() {
-        let requested: HashMap<String, Value> = [("timeout".to_string(), Value::from(600))]
-            .into_iter()
-            .collect();
+        let requested: HashMap<String, Value> =
+            std::iter::once(("timeout".to_string(), Value::from(600))).collect();
         assert!(
             backstop_timeout(180, &requested) > std::time::Duration::from_secs(600),
             "a 600s command deadline must not be cut short by a 180s ceiling"

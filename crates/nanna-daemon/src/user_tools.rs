@@ -39,7 +39,7 @@ pub struct UserToolPermissions {
 
 impl From<UserToolPermissions> for ToolPermissions {
     fn from(p: UserToolPermissions) -> Self {
-        let mut perms = ToolPermissions::none()
+        let mut perms = Self::none()
             .with_net(p.net)
             .with_read(p.read.into_iter().map(PathBuf::from))
             .with_write(p.write.into_iter().map(PathBuf::from));
@@ -97,6 +97,12 @@ impl UserToolManager {
     }
 
     /// Load all user tools from disk
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the tools directory cannot be listed; the
+    /// cache has already been cleared by then. Individual files that cannot be
+    /// read or parsed are logged and skipped.
     pub async fn load_all(&self) -> Result<usize, std::io::Error> {
         let mut count = 0;
         let mut tools = self.tools.write().await;
@@ -105,7 +111,7 @@ impl UserToolManager {
         let entries = std::fs::read_dir(&self.tools_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         match serde_json::from_str::<UserToolMeta>(&content) {
@@ -121,6 +127,9 @@ impl UserToolManager {
                 }
             }
         }
+        // Held from the clear to the last insert: no reader ever sees the
+        // cache emptied mid-reload.
+        drop(tools);
 
         Ok(count)
     }
@@ -134,6 +143,13 @@ impl UserToolManager {
     }
 
     /// Create a new user tool
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, writing nothing, when the name is not a safe single
+    /// filename component, the source does not parse, the source has no
+    /// default export with a name and description, or a tool with that name
+    /// already exists; and when writing the tool file fails.
     pub async fn create_tool(
         &self,
         name: String,
@@ -193,6 +209,13 @@ impl UserToolManager {
     }
 
     /// Update an existing tool
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, changing nothing, when no tool has that name, or a new
+    /// source does not parse or has no default export with a name and
+    /// description; and when writing the tool file fails, in which case the
+    /// cached tool is left as it was.
     pub async fn update_tool(
         &self,
         name: &str,
@@ -244,12 +267,20 @@ impl UserToolManager {
         // Persist first; publish to the cache only after the write succeeds.
         self.save_tool(&updated).map_err(|e| e.to_string())?;
         tools.insert(name.to_string(), updated.clone());
+        // Held from the read to the insert, so two concurrent updates of one
+        // tool cannot both start from the same original and lose a write.
+        drop(tools);
 
         info!("Updated user tool: {}", name);
         Ok(updated)
     }
 
     /// Delete a tool
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no tool has that name, or when its file exists but
+    /// cannot be removed (the tool is already gone from the cache by then).
     pub async fn delete_tool(&self, name: &str) -> Result<(), String> {
         let mut tools = self.tools.write().await;
         tools.remove(name).ok_or_else(|| format!("Tool not found: {name}"))?;
@@ -258,6 +289,9 @@ impl UserToolManager {
         if path.exists() {
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
         }
+        // Held through the file removal, so a concurrent create of the same
+        // name cannot write its file in between and have it deleted here.
+        drop(tools);
 
         info!("Deleted user tool: {}", name);
         Ok(())
@@ -274,6 +308,11 @@ impl UserToolManager {
     }
 
     /// Test a tool with given input (doesn't save)
+    ///
+    /// # Errors
+    ///
+    /// Returns the script engine's failure, prefixed `✗ Execution failed:`,
+    /// when the source does not run or throws.
     pub async fn test_tool(
         &self,
         source: &str,
@@ -296,6 +335,12 @@ impl UserToolManager {
     }
 
     /// Create a Tool implementation for a user tool
+    ///
+    /// # Errors
+    ///
+    /// None today: wrapping stored metadata cannot fail, and a source problem
+    /// surfaces when the tool executes. The `Result` is what every caller
+    /// already handles.
     pub fn create_tool_impl(&self, meta: &UserToolMeta) -> Result<Arc<dyn Tool>, String> {
         let tool = ScriptedTool::new(&meta.name, &meta.source)
             .with_permissions(meta.permissions.clone().into());
@@ -329,12 +374,15 @@ impl UserToolManager {
                 }
             }
         }
+        // Held across the registrations, so the set registered is one
+        // consistent snapshot of the cache.
+        drop(tools);
         
         count
     }
 }
 
-/// Wrapper to make UserToolMeta implement Tool trait
+/// Wrapper to make `UserToolMeta` implement Tool trait
 struct UserToolWrapper {
     meta: UserToolMeta,
     tool: ScriptedTool,
@@ -344,11 +392,11 @@ struct UserToolWrapper {
 #[async_trait]
 impl Tool for UserToolWrapper {
     fn definition(&self) -> ToolDefinition {
-        let parameters = if let Some(ref schema) = self.meta.parameters {
-            parse_params_from_schema(schema)
-        } else {
-            vec![]
-        };
+        let parameters = self
+            .meta
+            .parameters
+            .as_ref()
+            .map_or_else(Vec::new, parse_params_from_schema);
         
         ToolDefinition {
             name: self.meta.name.clone(),
@@ -375,11 +423,11 @@ impl Tool for UserToolWrapper {
                     .unwrap_or("")
                     .to_string();
                 let s = map.get("success")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true);
                 // Pass through extra fields as structured data (e.g. "written" for write_file)
                 let mut extra = serde_json::Map::new();
-                for (k, v) in map.iter() {
+                for (k, v) in map {
                     if k != "content" && k != "success" {
                         extra.insert(k.clone(), v.clone());
                     }
@@ -477,12 +525,12 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
         
         for (name, prop) in properties {
             let param_type = match prop.get("type").and_then(|t| t.as_str()) {
-                Some("string") => ParameterType::String,
                 Some("integer") => ParameterType::Integer,
                 Some("number") => ParameterType::Number,
                 Some("boolean") => ParameterType::Boolean,
                 Some("array") => ParameterType::Array,
                 Some("object") => ParameterType::Object,
+                // "string", and any type this parser does not model.
                 _ => ParameterType::String,
             };
             

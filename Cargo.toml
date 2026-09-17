@@ -76,7 +76,7 @@ tauri-build = { path = "vendor/tauri-build" }
 [workspace.package]
 version = "0.3.21"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/physics515/Nanna"
 

@@ -341,7 +341,7 @@ mod tests {
     fn parse_status_handles_a_clean_tree() {
         let (branch, changed, elided) = parse_status("## main\n");
         assert_eq!(branch.as_deref(), Some("main"));
-        assert!(changed.is_empty());
+        assert_eq!(changed, [] as [std::string::String; 0]);
         assert_eq!(elided, 0);
     }
 

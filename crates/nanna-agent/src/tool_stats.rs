@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::numeric::{millis_u64, u64_to_f64};
+
 /// Maximum number of latency samples to keep per tool (ring buffer).
 const MAX_LATENCY_SAMPLES: usize = 200;
 /// Maximum number of output-size samples to keep per tool (ring buffer).
@@ -191,6 +193,7 @@ impl ToolStatsTracker {
                     .or_insert_with(|| SessionStats::new(sid));
                 session.tool_calls += 1;
             }
+            drop(inner);
             debug!(
                 tool = %obs.tool_name,
                 "📊 Tool stats recorded (short-circuited — breaker replay, not executed)"
@@ -238,6 +241,7 @@ impl ToolStatsTracker {
             session.tool_calls += 1;
             session.tool_time_ms += obs.duration_ms;
         }
+        drop(inner);
 
         if obs.duration_ms > 5_000 {
             warn!(
@@ -264,6 +268,7 @@ impl ToolStatsTracker {
         session.llm_time_ms += llm_time_ms;
         session.input_tokens += input_tokens;
         session.output_tokens += output_tokens;
+        drop(inner);
     }
 
     /// Record an iteration for a session.
@@ -272,6 +277,7 @@ impl ToolStatsTracker {
         let session = inner.sessions.entry(session_id.to_string())
             .or_insert_with(|| SessionStats::new(session_id));
         session.iterations += 1;
+        drop(inner);
     }
 
     /// Get summary statistics for all tracked tools.
@@ -306,16 +312,16 @@ impl ToolStatsTracker {
         let weighted_latency: u64 = all_summaries.iter()
             .map(|s| s.avg_latency_ms * s.call_count)
             .sum();
-        let avg_latency_ms = if total_calls > 0 { weighted_latency / total_calls } else { 0 };
-        let success_rate = if total_executed > 0 { total_success as f64 / total_executed as f64 } else { 1.0 };
+        let avg_latency_ms = weighted_latency.checked_div(total_calls).unwrap_or(0);
+        let success_rate = if total_executed > 0 { u64_to_f64(total_success) / u64_to_f64(total_executed) } else { 1.0 };
 
         // Top 5 slowest by P95
         let mut slowest = all_summaries.clone();
-        slowest.sort_by(|a, b| b.p95_latency_ms.cmp(&a.p95_latency_ms));
+        slowest.sort_by_key(|s| std::cmp::Reverse(s.p95_latency_ms));
         slowest.truncate(5);
 
         // Top 10 most-used
-        all_summaries.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        all_summaries.sort_by_key(|s| std::cmp::Reverse(s.call_count));
         let most_used: Vec<_> = all_summaries.iter().take(10).cloned().collect();
 
         // Top 5 most-failed (by error rate, min 2 calls)
@@ -324,8 +330,8 @@ impl ToolStatsTracker {
             .cloned()
             .collect();
         by_error.sort_by(|a, b| {
-            let rate_a = if a.call_count > 0 { a.failure_count as f64 / a.call_count as f64 } else { 0.0 };
-            let rate_b = if b.call_count > 0 { b.failure_count as f64 / b.call_count as f64 } else { 0.0 };
+            let rate_a = if a.call_count > 0 { u64_to_f64(a.failure_count) / u64_to_f64(a.call_count) } else { 0.0 };
+            let rate_b = if b.call_count > 0 { u64_to_f64(b.failure_count) / u64_to_f64(b.call_count) } else { 0.0 };
             rate_b.partial_cmp(&rate_a).unwrap_or(std::cmp::Ordering::Equal)
         });
         by_error.truncate(5);
@@ -339,6 +345,7 @@ impl ToolStatsTracker {
             total_input_tokens: inner.sessions.values().map(|s| s.input_tokens).sum(),
             total_output_tokens: inner.sessions.values().map(|s| s.output_tokens).sum(),
         };
+        drop(inner);
 
         GlobalToolStats {
             total_calls,
@@ -390,7 +397,7 @@ impl ToolStatsTracker {
                     match serde_json::from_value::<ToolStats>(value.clone()) {
                         Ok(mut stats) => {
                             // Map key is authoritative (DB entries omit `name`).
-                            stats.name = name.clone();
+                            stats.name.clone_from(name);
                             inner.tools.entry(name.clone()).or_insert(stats);
                             imported_tools += 1;
                         }
@@ -414,7 +421,7 @@ impl ToolStatsTracker {
                 for (sid, value) in sessions {
                     match serde_json::from_value::<SessionStats>(value.clone()) {
                         Ok(mut session) => {
-                            session.session_id = sid.clone();
+                            session.session_id.clone_from(sid);
                             inner.sessions.entry(sid.clone()).or_insert(session);
                             imported_sessions += 1;
                         }
@@ -474,7 +481,7 @@ impl ToolStats {
         // they can neither succeed nor fail.
         let executed = self.success_count + self.failure_count;
         let success_rate = if executed > 0 {
-            self.success_count as f64 / executed as f64
+            u64_to_f64(self.success_count) / u64_to_f64(executed)
         } else {
             1.0
         };
@@ -493,7 +500,7 @@ impl ToolStats {
 
         // Sort top errors by count (descending), take top 5
         let mut top_errors = self.errors.clone();
-        top_errors.sort_by(|a, b| b.1.cmp(&a.1));
+        top_errors.sort_by_key(|e| std::cmp::Reverse(e.1));
         top_errors.truncate(5);
 
         ToolStatsSummary {
@@ -543,10 +550,11 @@ fn percentile(data: &[u64], pct: usize) -> u64 {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    millis_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]

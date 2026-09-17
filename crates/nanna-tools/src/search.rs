@@ -24,7 +24,7 @@
 //!    the closest vocab term's stem stands in for it — catching typos like
 //!    `wirte file`.
 //! 4. **Score** — BM25 (k1 = 1.2, b = 0.75) over per-tool documents built from
-//!    name + description, with name tokens weighted 3x (see [`NAME_WEIGHT`]).
+//!    name + description, with name tokens weighted 3x (see `NAME_WEIGHT`).
 //!    Ties break by name, so ranking is fully deterministic.
 
 use rust_stemmers::{Algorithm, Stemmer};
@@ -43,7 +43,7 @@ const BM25_B: f64 = 0.75;
 /// enough that a query hitting a tool's name outranks any description-only
 /// match, without letting a name hit on one term drown a two-term description
 /// match — names are 1-3 tokens, descriptions dozens.
-const NAME_WEIGHT: usize = 3;
+const NAME_WEIGHT: f64 = 3.0;
 
 /// Minimum normalized similarity for the per-term fuzzy fallback — the same
 /// 0.7 threshold family `ToolRegistry::resolve_tool` applies to whole tool
@@ -175,7 +175,7 @@ fn osa_similarity(a: &str, b: &str) -> f64 {
     if max_len == 0 {
         return 1.0;
     }
-    1.0 - (osa_distance(a, b) as f64 / max_len as f64)
+    1.0 - (crate::usize_to_f64(osa_distance(a, b)) / crate::usize_to_f64(max_len))
 }
 
 /// One indexed document: weighted term frequencies + weighted length.
@@ -187,10 +187,11 @@ struct IndexedDoc<'a> {
     len: f64,
 }
 
-/// Search `docs` for `query`, returning up to `limit` hits ranked by BM25
-/// score (descending), ties broken by name (ascending) for determinism.
-/// Only positively-scoring documents are returned; an empty or non-matching
-/// query yields an empty vec.
+/// Search `docs` for `query`, returning up to `limit` hits ranked by BM25.
+///
+/// Hits are ordered by score (descending), ties broken by name (ascending) for
+/// determinism. Only positively-scoring documents are returned; an empty or
+/// non-matching query yields an empty vec.
 #[must_use]
 pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSearchHit> {
     if docs.is_empty() || limit == 0 {
@@ -228,8 +229,8 @@ pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSea
         let mut tf: HashMap<String, f64> = HashMap::new();
         let mut len = 0.0;
         for atom in atomize(&doc.name, &stemmer) {
-            *tf.entry(atom.term.clone()).or_insert(0.0) += NAME_WEIGHT as f64;
-            len += NAME_WEIGHT as f64;
+            *tf.entry(atom.term.clone()).or_insert(0.0) += NAME_WEIGHT;
+            len += NAME_WEIGHT;
             vocab.entry(atom.raw).or_insert(atom.term);
         }
         for atom in atomize(&doc.description, &stemmer) {
@@ -240,7 +241,7 @@ pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSea
         indexed.push(IndexedDoc { doc, tf, len });
     }
 
-    let n = indexed.len() as f64;
+    let n = crate::usize_to_f64(indexed.len());
     let total_len: f64 = indexed.iter().map(|d| d.len).sum();
     let avgdl = if total_len > 0.0 { total_len / n } else { 1.0 };
 
@@ -273,7 +274,7 @@ pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSea
         for (raw, term, raw_len) in &fuzzy_vocab {
             let max_len = atom_len.max(*raw_len);
             if max_len == 0
-                || atom_len.abs_diff(*raw_len) as f64 / max_len as f64
+                || crate::usize_to_f64(atom_len.abs_diff(*raw_len)) / crate::usize_to_f64(max_len)
                     > 1.0 - FUZZY_MIN_SIMILARITY
             {
                 continue;
@@ -303,9 +304,9 @@ pub fn search_docs(docs: &[SearchDoc], query: &str, limit: usize) -> Vec<ToolSea
         let mut score = 0.0;
         for term in &terms {
             let Some(&tf) = d.tf.get(term) else { continue };
-            let df = df(term) as f64;
-            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            let norm = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * d.len / avgdl);
+            let df = crate::usize_to_f64(df(term));
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+            let norm = BM25_K1.mul_add(1.0 - BM25_B + BM25_B * d.len / avgdl, tf);
             score += idf * (tf * (BM25_K1 + 1.0)) / norm;
         }
         if score > 0.0 {
@@ -470,9 +471,9 @@ mod tests {
 
     #[test]
     fn garbage_query_returns_empty() {
-        assert!(search_docs(&corpus(), "zzqqx", 10).is_empty());
-        assert!(search_docs(&corpus(), "", 10).is_empty());
-        assert!(search_docs(&corpus(), "  ~~!!  ", 10).is_empty());
+        assert_eq!(search_docs(&corpus(), "zzqqx", 10), Vec::<ToolSearchHit>::new());
+        assert_eq!(search_docs(&corpus(), "", 10), Vec::<ToolSearchHit>::new());
+        assert_eq!(search_docs(&corpus(), "  ~~!!  ", 10), Vec::<ToolSearchHit>::new());
     }
 
     // ---- bounds (Tiger Style: every cost has a derived ceiling) ----
@@ -507,7 +508,7 @@ mod tests {
             "oversized token took {:?} — prefilter regressed",
             started.elapsed()
         );
-        assert!(hits.is_empty());
+        assert_eq!(hits, Vec::<ToolSearchHit>::new());
     }
 
     #[test]
@@ -631,6 +632,6 @@ mod tests {
     #[tokio::test]
     async fn registry_search_empty_for_garbage() {
         let reg = seeded_registry().await;
-        assert!(reg.search_tools("zzqqx", 10).await.is_empty());
+        assert_eq!(reg.search_tools("zzqqx", 10).await, Vec::<ToolSearchHit>::new());
     }
 }

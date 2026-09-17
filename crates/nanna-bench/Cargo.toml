@@ -9,11 +9,14 @@ description = "Unified criterion harness for Nanna's six benchmark suites"
 publish = false
 
 [dependencies]
-# Criterion is the harness; suites pull in the crates they measure as needed.
-criterion = { version = "0.8", features = ["html_reports"] }
-nanna-simd = { path = "../nanna-simd" }
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
+
+[dev-dependencies]
+# Criterion is the harness; suites pull in the crates they measure as needed.
+# Bench targets are the only users, so these stay out of the library's graph.
+criterion = { version = "0.8", features = ["html_reports"] }
+nanna-simd = { path = "../nanna-simd" }
 
 [lib]
 bench = false

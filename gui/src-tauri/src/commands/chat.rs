@@ -1,14 +1,25 @@
 //! Chat message command. The daemon owns the agent loop, streaming, tools, and
 //! storage; this just forwards the turn and shapes the reply for the frontend.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::{backend_handle, AppState, ChatMessage, ToolCallInfo};
+use std::sync::Arc;
+use tauri::{AppHandle, State};
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
 /// Send a message through the daemon and return the assistant reply.
 ///
 /// Streaming (`stream-chunk` / `thinking-chunk` / `tool-call` / `model-status`)
 /// is delivered separately via the backend's event-forwarding task; this returns
 /// the final message once the daemon reports the turn complete.
+///
+/// # Errors
+///
+/// Returns `Daemon error: …` when the daemon cannot be reached, the connection
+/// drops, or the turn stops answering health pings (see
+/// [`DaemonClient::chat_send`](crate::daemon_client::DaemonClient::chat_send)),
+/// and when the reply reports an `error`. Returns `Invalid response format: …`
+/// when the reply has no `content` string.
 #[tauri::command]
 pub async fn send_message(
     _app: AppHandle,
@@ -19,10 +30,9 @@ pub async fn send_message(
 ) -> Result<ChatMessage, String> {
     info!("send_message: session={}, message_len={}", session_id, message.len());
 
-    let state_guard = state.read().await;
+    let backend = backend_handle(&state).await;
 
-    let result = match state_guard
-        .backend
+    let result = match backend
         .chat_send(&session_id, &message, attachments.unwrap_or_default())
         .await
     {

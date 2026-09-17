@@ -1,7 +1,7 @@
 //! Signal channel implementation via signald
 //!
 //! Communicates with signald daemon over Unix socket (or TCP on Windows).
-//! See: https://signald.org/
+//! See: <https://signald.org>/
 
 use crate::{
     Channel, ChannelCapabilities, ChannelError, ChannelFeatures, IncomingMessage, MessageContent,
@@ -62,12 +62,19 @@ impl SignalChannel {
     }
 
     /// Set incoming message channel.
+    #[must_use]
     pub fn with_incoming_channel(mut self, tx: mpsc::Sender<IncomingMessage>) -> Self {
         self.incoming_tx = Some(tx);
         self
     }
 
     /// Connect to signald.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if the TCP connection to signald's
+    /// socket address fails, and [`ChannelError::Send`] if writing the
+    /// `subscribe` request for this account fails.
     pub async fn connect(&self) -> Result<(), ChannelError> {
         info!(socket = %self.socket_path, "Connecting to signald");
 
@@ -126,8 +133,8 @@ impl SignalChannel {
 
         debug!(request = %json, "Sending to signald");
 
-        let mut writer = self.writer.lock().await;
-        let writer = writer
+        let mut guard = self.writer.lock().await;
+        let writer = guard
             .as_mut()
             .ok_or_else(|| ChannelError::Connection("Not connected".to_string()))?;
 
@@ -144,6 +151,9 @@ impl SignalChannel {
             .await
             .map_err(|e| ChannelError::Send(e.to_string()))?;
 
+        // Held across the body, newline and flush so concurrent requests cannot
+        // interleave their bytes on the socket.
+        drop(guard);
         Ok(())
     }
 
@@ -208,15 +218,12 @@ impl SignalChannel {
             // Check if this is an incoming message
             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
             
-            if msg_type == "IncomingMessage" {
-                if let Some(ref tx) = incoming_tx {
-                    if let Some(incoming) = Self::parse_incoming_message(&msg, &account) {
-                        if tx.send(incoming).await.is_err() {
+            if msg_type == "IncomingMessage"
+                && let Some(ref tx) = incoming_tx
+                    && let Some(incoming) = Self::parse_incoming_message(&msg, &account)
+                        && tx.send(incoming).await.is_err() {
                             warn!("Failed to send incoming message to channel");
                         }
-                    }
-                }
-            }
         }
 
         info!("signald reader task ended");
@@ -250,6 +257,13 @@ impl SignalChannel {
     // ========================================================================
 
     /// Send a message to a recipient.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if writing the request to signald
+    /// fails, no response arrives within 30 seconds, signald answers with an
+    /// `error`, or the response does not have the expected shape.
     pub async fn send_message(
         &self,
         recipient: &str,
@@ -274,6 +288,13 @@ impl SignalChannel {
     }
 
     /// Send a message to a group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if writing the request to signald
+    /// fails, no response arrives within 30 seconds, signald answers with an
+    /// `error`, or the response does not have the expected shape.
     pub async fn send_group_message(
         &self,
         group_id: &str,
@@ -295,6 +316,12 @@ impl SignalChannel {
     }
 
     /// React to a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if serializing the request or
+    /// writing it to signald fails. signald's reply is not awaited.
     pub async fn react(
         &self,
         recipient: &str,
@@ -328,6 +355,12 @@ impl SignalChannel {
     }
 
     /// Remove a reaction from a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if serializing the request or
+    /// writing it to signald fails. signald's reply is not awaited.
     pub async fn unreact(
         &self,
         recipient: &str,
@@ -359,7 +392,19 @@ impl SignalChannel {
     }
 
     /// Get linked devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if writing the request to signald
+    /// fails, no response arrives within 30 seconds, signald answers with an
+    /// `error`, or the response does not have the expected shape.
     pub async fn get_linked_devices(&self) -> Result<Vec<SignalDevice>, ChannelError> {
+        #[derive(Deserialize)]
+        struct Response {
+            devices: Vec<SignalDevice>,
+        }
+
         let request = SignaldRequest {
             r#type: "get_linked_devices".to_string(),
             id: Some(self.next_id()),
@@ -368,17 +413,24 @@ impl SignalChannel {
             ..Default::default()
         };
 
-        #[derive(Deserialize)]
-        struct Response {
-            devices: Vec<SignalDevice>,
-        }
-
         let result: Response = self.request(request).await?;
         Ok(result.devices)
     }
 
     /// List groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Connection`] if [`Self::connect`] has not
+    /// succeeded, and [`ChannelError::Send`] if writing the request to signald
+    /// fails, no response arrives within 30 seconds, signald answers with an
+    /// `error`, or the response does not have the expected shape.
     pub async fn list_groups(&self) -> Result<Vec<SignalGroup>, ChannelError> {
+        #[derive(Deserialize)]
+        struct Response {
+            groups: Vec<SignalGroup>,
+        }
+
         let request = SignaldRequest {
             r#type: "list_groups".to_string(),
             id: Some(self.next_id()),
@@ -386,11 +438,6 @@ impl SignalChannel {
             account: Some(self.account.clone()),
             ..Default::default()
         };
-
-        #[derive(Deserialize)]
-        struct Response {
-            groups: Vec<SignalGroup>,
-        }
 
         let result: Response = self.request(request).await?;
         Ok(result.groups)
@@ -433,8 +480,8 @@ impl Channel for SignalChannel {
         };
 
         // Check if recipient looks like a group ID
-        let result = if recipient.starts_with("group:") {
-            self.send_group_message(&recipient[6..], &text).await?
+        let result = if let Some(group_id) = recipient.strip_prefix("group:") {
+            self.send_group_message(group_id, &text).await?
         } else {
             self.send_message(recipient, &text).await?
         };
@@ -544,7 +591,7 @@ mod tests {
     fn test_parse_message_id() {
         let (recipient, ts) = parse_message_id("+1234567890:1234567890123").unwrap();
         assert_eq!(recipient, "+1234567890");
-        assert_eq!(ts, 1234567890123);
+        assert_eq!(ts, 1_234_567_890_123);
     }
 
     #[test]

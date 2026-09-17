@@ -26,7 +26,7 @@ pub struct McpToolResult {
 
 /// Longest tool name every provider Nanna routes to accepts.
 ///
-/// Anthropic and OpenAI both validate tool names against
+/// Anthropic and `OpenAI` both validate tool names against
 /// `^[a-zA-Z0-9_-]{1,64}$`; a name outside it rejects the WHOLE request, not
 /// just the tool, so one badly named MCP tool would break every turn.
 pub const WIRE_TOOL_NAME_CHARS_MAX: usize = 64;
@@ -81,7 +81,7 @@ pub fn wire_tool_name(server: &str, tool: &str) -> String {
 
 #[cfg(feature = "tools-integration")]
 mod tools_impl {
-    use super::*;
+    use super::{debug, warn, wire_tool_name, Transport, Arc, McpClient, McpTool, HashMap, ToolContent, RwLock, McpError};
     use async_trait::async_trait;
     use nanna_tools::{ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolResult};
     use serde_json::Value;
@@ -359,7 +359,7 @@ mod tools_impl {
             Ok(wrappers)
         }
 
-        /// Register all tools with a ToolRegistry
+        /// Register all tools with a `ToolRegistry`
         ///
         /// # Errors
         ///
@@ -374,6 +374,7 @@ mod tools_impl {
             for wrapper in wrappers.iter() {
                 registry.register_boxed(wrapper.clone()).await;
             }
+            drop(wrappers);
 
             Ok(count)
         }
@@ -406,8 +407,11 @@ mod tools_impl {
                 }
             }
 
-            let mut tool_wrappers = self.tool_wrappers.write().await;
-            *tool_wrappers = new_wrappers;
+            *self.tool_wrappers.write().await = new_wrappers;
+            // `clients` is held until the refreshed wrappers are published, as it
+            // always was: a concurrent `connect` waits for its client insert, so
+            // the tools it appends land after this replacement, not under it.
+            drop(clients);
 
             Ok(())
         }
@@ -422,6 +426,7 @@ mod tools_impl {
             for client in clients.values() {
                 client.close().await?;
             }
+            drop(clients);
             Ok(())
         }
     }
@@ -541,7 +546,7 @@ pub struct McpToolAdapter<T: Transport + 'static> {
 
 impl<T: Transport + 'static> McpToolAdapter<T> {
     /// Create a new adapter for an MCP tool
-    pub fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
+    pub const fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
         Self { client, tool }
     }
 
@@ -559,7 +564,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
 
     /// Get the input schema
     #[must_use]
-    pub fn input_schema(&self) -> &serde_json::Value {
+    pub const fn input_schema(&self) -> &serde_json::Value {
         &self.tool.input_schema
     }
 
@@ -650,7 +655,6 @@ impl<T: Transport + 'static> McpManager<T> {
     }
 
     /// Get all available tools
-    #[must_use]
     pub fn tools(&self) -> impl Iterator<Item = (&str, &McpToolAdapter<T>)> {
         self.tools.iter().map(|(k, v)| (k.as_str(), v))
     }
@@ -734,7 +738,7 @@ pub fn to_anthropic_format(tool: &McpTool) -> serde_json::Value {
     })
 }
 
-/// Convert an MCP tool to OpenAI tool format
+/// Convert an MCP tool to `OpenAI` tool format
 #[must_use]
 pub fn to_openai_format(tool: &McpTool) -> serde_json::Value {
     serde_json::json!({

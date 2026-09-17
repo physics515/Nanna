@@ -80,6 +80,18 @@ impl TaskRepository {
     /// Create a task. Validates scope, title, priority, parent, and
     /// dependencies (existence + bounds); a new task cannot introduce a
     /// dependency cycle because nothing depends on it yet.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Invalid`] if the scope/`scope_id` pairing is
+    /// invalid, the title is empty or longer than [`TASK_TITLE_MAX_BYTES`],
+    /// the priority is outside `1..=4`, there are more than [`TASK_DEPS_MAX`]
+    /// dependencies, the acceptance check is malformed, the scope already
+    /// holds [`TASKS_PER_SCOPE_MAX`] tasks, the parent is missing from the
+    /// scope or closed, the parent is at the depth limit, or a dependency is
+    /// missing from the scope or is an ancestor. Returns
+    /// [`StorageError::Database`] if a read or write fails, or
+    /// [`StorageError::NotFound`] if the inserted row cannot be read back. A
+    /// failure writing the `created` activity entry leaves the task created.
     pub async fn create(&self, mut new: NewTask) -> Result<Task, StorageError> {
         validate_scope(&new.scope, new.scope_id.as_deref())?;
         validate_title(&new.title)?;
@@ -192,6 +204,10 @@ impl TaskRepository {
     }
 
     /// Get one task with its derived `blocked` flag.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `id`, or
+    /// [`StorageError::Database`] if a read fails.
     pub async fn get(&self, id: i64) -> Result<Task, StorageError> {
         let mut task = self.get_raw(id).await?;
         if !task.depends_on.is_empty() {
@@ -206,6 +222,10 @@ impl TaskRepository {
 
     /// List tasks in a scope with derived `blocked` flags, ordered by
     /// hierarchy-friendly (`sort_order`, `id`).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the scope query fails or a row
+    /// does not decode.
     pub async fn list(
         &self,
         scope: &str,
@@ -233,6 +253,10 @@ impl TaskRepository {
     /// open, unblocked, a leaf (no open children) — ordered by
     /// `in_progress` first (resume what you started), then priority, due
     /// date, explicit order, and id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the scope query fails or a row
+    /// does not decode.
     pub async fn next(
         &self,
         scope: &str,
@@ -307,6 +331,17 @@ impl TaskRepository {
     /// Apply a partial update. `status` accepts only
     /// `pending | in_progress | cancelled`: `done` must go through
     /// [`complete`](Self::complete) and `blocked` is derived, never written.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if task `id` does not exist, and
+    /// [`StorageError::Invalid`] if the patch is rejected: status `done`,
+    /// `blocked`, or unknown; an invalid title, priority, or acceptance check;
+    /// more than [`TASK_DEPS_MAX`] dependencies; or a dependency or parent
+    /// change that names a task outside the scope, forms a cycle, moves the
+    /// task under a closed parent, exceeds [`TASK_DEPTH_MAX`], or makes a task
+    /// depend on its own ancestor. Returns [`StorageError::Database`] if a
+    /// read or write fails. The task row is written before the activity entry
+    /// and any cancel cascade, so a failure there leaves the update applied.
     pub async fn update(
         &self,
         id: i64,
@@ -314,114 +349,9 @@ impl TaskRepository {
         actor: Option<&str>,
     ) -> Result<Task, StorageError> {
         let mut task = self.get_raw(id).await?;
-        let mut changed: Vec<&'static str> = Vec::new();
-
-        if let Some(status) = &patch.status {
-            match status.as_str() {
-                "pending" | "in_progress" | "cancelled" => {
-                    if task.status != *status {
-                        changed.push("status");
-                    }
-                    task.status.clone_from(status);
-                    // Reopening a closed task must clear its completion stamp.
-                    if status != "cancelled" && task.completed_at.is_some() {
-                        task.completed_at = None;
-                    }
-                }
-                "done" => {
-                    return Err(StorageError::Invalid(
-                        "status 'done' is a verdict: use the complete/done action so the \
-                         acceptance check can run"
-                            .to_string(),
-                    ));
-                }
-                "blocked" => {
-                    return Err(StorageError::Invalid(
-                        "'blocked' is derived from depends_on and cannot be set directly; \
-                         add a dependency instead"
-                            .to_string(),
-                    ));
-                }
-                other => {
-                    return Err(StorageError::Invalid(format!("unknown status '{other}'")));
-                }
-            }
-        }
-        if let Some(title) = patch.title {
-            validate_title(&title)?;
-            if task.title != title {
-                changed.push("title");
-            }
-            task.title = title;
-        }
-        if let Some(description) = patch.description {
-            changed.push("description");
-            task.description = description;
-        }
-        if let Some(priority) = patch.priority {
-            validate_priority(priority)?;
-            if task.priority != priority {
-                changed.push("priority");
-            }
-            task.priority = priority;
-        }
-        if let Some(labels) = patch.labels {
-            changed.push("labels");
-            task.labels = labels;
-        }
-        if let Some(tool_scope) = patch.tool_scope {
-            changed.push("tool_scope");
-            task.tool_scope = tool_scope;
-        }
-        if let Some(due_at) = patch.due_at {
-            changed.push("due_at");
-            task.due_at = due_at;
-        }
-        if let Some(recurrence) = patch.recurrence {
-            changed.push("recurrence");
-            task.recurrence = recurrence;
-        }
-        if let Some(acceptance) = patch.acceptance {
-            // Same write-boundary rule as `create`: canonicalize, then store
-            // the canonical object (never the caller's raw value).
-            let acceptance = match &acceptance {
-                Some(check) => Some(admit_acceptance(check)?),
-                None => None,
-            };
-            changed.push("acceptance");
-            task.acceptance = acceptance;
-        }
-        if let Some(assignee) = patch.assignee {
-            changed.push("assignee");
-            task.assignee = assignee;
-        }
-        if let Some(project) = patch.project {
-            changed.push("project");
-            task.project = project;
-        }
-        if let Some(sort_order) = patch.sort_order {
-            if task.sort_order != sort_order {
-                changed.push("sort_order");
-            }
-            task.sort_order = sort_order;
-        }
-
         let needs_graph_check = patch.depends_on.is_some() || patch.parent_id.is_some();
         let parent_changed = patch.parent_id.is_some();
-        if let Some(depends_on) = patch.depends_on {
-            if depends_on.len() > TASK_DEPS_MAX {
-                return Err(StorageError::Invalid(format!(
-                    "too many dependencies: {} (max {TASK_DEPS_MAX})",
-                    depends_on.len()
-                )));
-            }
-            changed.push("depends_on");
-            task.depends_on = depends_on;
-        }
-        if let Some(parent_id) = patch.parent_id {
-            changed.push("parent_id");
-            task.parent_id = parent_id;
-        }
+        let changed = apply_patch(&mut task, patch)?;
 
         {
             // Validate and write under ONE connection guard: the mutex is the
@@ -436,72 +366,11 @@ impl TaskRepository {
                 // Evaluate the graph as it would be after this update.
                 by_id.insert(task.id, task.clone());
                 let borrow: HashMap<i64, &Task> = by_id.iter().map(|(k, v)| (*k, v)).collect();
-
-                for dep in &task.depends_on {
-                    if *dep == task.id {
-                        return Err(StorageError::Invalid(format!(
-                            "task #{} cannot depend on itself",
-                            task.id
-                        )));
-                    }
-                    if !borrow.contains_key(dep) {
-                        return Err(StorageError::Invalid(format!(
-                            "dependency task #{dep} not found in scope"
-                        )));
-                    }
-                }
-                check_dependency_cycle(&borrow, task.id)?;
-
-                if let Some(parent_id) = task.parent_id {
-                    if parent_id == task.id {
-                        return Err(StorageError::Invalid(format!(
-                            "task #{} cannot be its own parent",
-                            task.id
-                        )));
-                    }
-                    let Some(parent) = borrow.get(&parent_id) else {
-                        return Err(StorageError::Invalid(format!(
-                            "parent task #{parent_id} not found in scope"
-                        )));
-                    };
-                    if parent_changed && (parent.status == "done" || parent.status == "cancelled") {
-                        return Err(StorageError::Invalid(format!(
-                            "cannot move a task under {} task #{parent_id}",
-                            parent.status
-                        )));
-                    }
-                    check_parent_cycle(&borrow, task.id)?;
-
-                    if parent_changed {
-                        // Re-parenting must not push the moved subtree past
-                        // the depth bound.
-                        let new_depth = parent_depth(&borrow, parent_id)? + 1;
-                        let height = subtree_height(&borrow, task.id);
-                        if new_depth + height >= TASK_DEPTH_MAX {
-                            return Err(StorageError::Invalid(format!(
-                                "hierarchy depth limit {TASK_DEPTH_MAX} exceeded by re-parenting"
-                            )));
-                        }
-                    }
-                }
-
-                // The parent-completion invariant makes ancestors implicit
-                // dependents: no task in the (possibly re-parented) subtree
-                // may depend on one of its ancestors, or both wedge forever.
-                let ancestors = ancestor_chain(&borrow, task.parent_id);
-                check_ancestor_dependency(&borrow, &ancestors, &task.depends_on)?;
-                if parent_changed {
-                    for member_id in subtree_ids_from(&borrow, task.id) {
-                        if member_id == task.id {
-                            continue;
-                        }
-                        if let Some(member) = borrow.get(&member_id) {
-                            check_ancestor_dependency(&borrow, &ancestors, &member.depends_on)?;
-                        }
-                    }
-                }
+                check_graph_update(&borrow, &task, parent_changed)?;
             }
             write_task_with(&conn, &task).await?;
+            // Held from the graph check through the write (see above).
+            drop(conn);
         }
         if !changed.is_empty() {
             self.log_activity(
@@ -528,60 +397,7 @@ impl TaskRepository {
         // cancel; their subtrees are walked, so a grandchild with its own
         // check survives the same way.
         if changed.contains(&"status") && task.status == "cancelled" {
-            let scope_tasks = self
-                .load_scope(&task.scope, task.scope_id.as_deref())
-                .await?;
-            let acceptance_of: HashMap<i64, Option<serde_json::Value>> = scope_tasks
-                .iter()
-                .map(|t| (t.id, t.acceptance.clone()))
-                .chain(std::iter::once((task.id, task.acceptance.clone())))
-                .collect();
-            let mut queue: VecDeque<i64> = VecDeque::from([task.id]);
-            // Bounded by scope size: each task enters the queue at most once.
-            let mut seen: HashSet<i64> = HashSet::from([task.id]);
-            while let Some(current) = queue.pop_front() {
-                for t in &scope_tasks {
-                    if t.parent_id == Some(current) && seen.insert(t.id) {
-                        let own_contract = t.status != "done"
-                            && t.status != "cancelled"
-                            && t.acceptance.is_some()
-                            && acceptance_of
-                                .get(&current)
-                                .is_none_or(|parent_acc| parent_acc != &t.acceptance);
-                        if own_contract {
-                            let mut child = t.clone();
-                            child.parent_id = task.parent_id;
-                            self.write_task(&child).await?;
-                            self.log_activity(
-                                t.id,
-                                actor,
-                                "reparented",
-                                Some(serde_json::json!({
-                                    "cascade_from": task.id,
-                                    "old_parent": current,
-                                    "reason": "carries its own acceptance contract",
-                                })),
-                            )
-                            .await?;
-                            // Its subtree moves with it — do not descend.
-                            continue;
-                        }
-                        if t.status != "done" && t.status != "cancelled" {
-                            let mut child = t.clone();
-                            child.status = "cancelled".to_string();
-                            self.write_task(&child).await?;
-                            self.log_activity(
-                                t.id,
-                                actor,
-                                "cancelled",
-                                Some(serde_json::json!({ "cascade_from": task.id })),
-                            )
-                            .await?;
-                        }
-                        queue.push_back(t.id);
-                    }
-                }
-            }
+            self.cascade_cancel(&task, actor).await?;
         }
         self.get(id).await
     }
@@ -593,6 +409,13 @@ impl TaskRepository {
     /// and ancestors without acceptance checks auto-complete when their last
     /// open child finishes (a parent *with* an acceptance check must be
     /// completed explicitly so its own check runs).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `id`,
+    /// [`StorageError::Invalid`] if the task still has open children, or
+    /// [`StorageError::Database`] if a read or write fails. Once the task is
+    /// marked done it stays done: a later failure (activity log, ancestor
+    /// auto-completion) returns the error without undoing it.
     pub async fn complete(
         &self,
         id: i64,
@@ -681,6 +504,11 @@ impl TaskRepository {
     }
 
     /// Reopen a closed task (recurrence firing, or replan of a wrong verdict).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `id`, or
+    /// [`StorageError::Database`] if a read or write fails; a failed activity
+    /// entry leaves the task reopened.
     pub async fn reopen(&self, id: i64, actor: Option<&str>) -> Result<Task, StorageError> {
         let task = self.get_raw(id).await?;
         if task.status != "done" && task.status != "cancelled" {
@@ -700,6 +528,12 @@ impl TaskRepository {
 
     /// Append a working note (the durable scratchpad sub-agents leave
     /// findings in).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Invalid`] if the trimmed content is empty or
+    /// longer than [`TASK_NOTE_MAX_BYTES`], [`StorageError::NotFound`] if no
+    /// task has `task_id` or the new note cannot be read back, or
+    /// [`StorageError::Database`] if a read or write fails.
     pub async fn add_note(
         &self,
         task_id: i64,
@@ -732,7 +566,7 @@ impl TaskRepository {
                 (),
             )
             .await?;
-        if let Some(row) = rows.next().await? {
+        let note = if let Some(row) = rows.next().await? {
             Ok(TaskNote {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -742,10 +576,20 @@ impl TaskRepository {
             })
         } else {
             Err(StorageError::NotFound("note just created".to_string()))
-        }
+        };
+        // Held from the insert through the read-back: "newest row" is only
+        // this note while no other writer can interleave, and the cursor must
+        // be gone before the guard is.
+        drop(rows);
+        drop(conn);
+        note
     }
 
     /// Last `limit` notes for a task, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
     pub async fn notes(&self, task_id: i64, limit: i64) -> Result<Vec<TaskNote>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -765,11 +609,19 @@ impl TaskRepository {
                 created_at: row.get(4)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         notes.reverse();
         Ok(notes)
     }
 
     /// Last `limit` activity entries for a task, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode. Unparseable detail JSON loads as `None`.
     pub async fn activity(
         &self,
         task_id: i64,
@@ -795,12 +647,21 @@ impl TaskRepository {
                 created_at: row.get(5)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         entries.reverse();
         Ok(entries)
     }
 
     /// Record an activity entry (public so the harness can log run events
     /// like acceptance verdicts against the task).
+    ///
+    /// The task is not checked for existence.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the insert fails.
     pub async fn log_activity(
         &self,
         task_id: i64,
@@ -815,12 +676,18 @@ impl TaskRepository {
             turso::params![task_id, actor, action, detail_json.as_deref()],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
     /// Query tasks in a scope with the filter language
     /// (see [`task_filter`]). Evaluated in memory; `blocked` is derived
     /// before evaluation so `blocked` atoms see real state.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Invalid`] if `filter` does not parse (the
+    /// message carries the parser's reason), or [`StorageError::Database`] if
+    /// the scope query fails or a row does not decode.
     pub async fn query(
         &self,
         scope: &str,
@@ -839,6 +706,12 @@ impl TaskRepository {
 
     /// Delete a task and its whole subtree (notes + activity included), and
     /// strip dangling references from other tasks' `depends_on`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no task has `id`, or
+    /// [`StorageError::Database`] if a read or write fails. Nothing is rolled
+    /// back: rows deleted before a failure stay deleted, and a failure while
+    /// stripping references leaves some `depends_on` lists naming deleted ids.
     pub async fn delete(&self, id: i64, actor: Option<&str>) -> Result<u64, StorageError> {
         let task = self.get_raw(id).await?;
         let scope_tasks = self
@@ -895,6 +768,12 @@ impl TaskRepository {
     }
 
     /// Clear closed tasks (or every task) in a scope. Returns deleted count.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if a read or delete fails, or
+    /// [`StorageError::NotFound`] if a target is deleted concurrently between
+    /// its existence check and its delete. Subtrees cleared before a failure
+    /// stay cleared.
     pub async fn clear(
         &self,
         scope: &str,
@@ -937,6 +816,13 @@ impl TaskRepository {
     /// Import v0.1 JSON todo items (session-scoped flat list). `blocked`
     /// items become `pending` — blocked is derived now — with an activity
     /// entry preserving the old label. Returns imported count.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Invalid`] if an item is imported into an empty
+    /// `session_id` (a session scope needs an id) or a full scope, or
+    /// [`StorageError::Database`] if a read or write fails. Items imported
+    /// before a failure stay imported — and since the import skips any
+    /// non-empty scope, a retry will not finish it.
     pub async fn import_v01(
         &self,
         session_id: &str,
@@ -969,7 +855,9 @@ impl TaskRepository {
                     scope_id: Some(session_id.to_string()),
                     title,
                     priority: 3,
-                    sort_order: index as i64,
+                    // An enumerate index is below `items.len()`, which never
+                    // exceeds `isize::MAX`, so the fallback is unreachable.
+                    sort_order: i64::try_from(index).unwrap_or(i64::MAX),
                     ..NewTask::default()
                 })
                 .await?;
@@ -1012,6 +900,10 @@ impl TaskRepository {
     /// All completed tasks that carry a recurrence expression, across every
     /// scope. The daemon's recurrence sweep (one recurrence engine — the P8
     /// scheduler) computes the next occurrence and reopens due ones.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a row does not
+    /// decode.
     pub async fn list_recurring_closed(&self) -> Result<Vec<Task>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -1027,10 +919,18 @@ impl TaskRepository {
         while let Some(row) = rows.next().await? {
             tasks.push(decode_task_row(&row)?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         Ok(tasks)
     }
 
     /// (open, closed) counts for a scope — the progress line.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the scope query fails or a row
+    /// does not decode.
     pub async fn counts(
         &self,
         scope: &str,
@@ -1049,6 +949,66 @@ impl TaskRepository {
     // internals
     // ------------------------------------------------------------------
 
+    /// Close the open subtree of a just-cancelled `task` — see the comment at
+    /// the call site in [`Self::update`] for which children re-parent instead.
+    async fn cascade_cancel(&self, task: &Task, actor: Option<&str>) -> Result<(), StorageError> {
+        let scope_tasks = self
+            .load_scope(&task.scope, task.scope_id.as_deref())
+            .await?;
+        let acceptance_of: HashMap<i64, Option<serde_json::Value>> = scope_tasks
+            .iter()
+            .map(|t| (t.id, t.acceptance.clone()))
+            .chain(std::iter::once((task.id, task.acceptance.clone())))
+            .collect();
+        let mut queue: VecDeque<i64> = VecDeque::from([task.id]);
+        // Bounded by scope size: each task enters the queue at most once.
+        let mut seen: HashSet<i64> = HashSet::from([task.id]);
+        while let Some(current) = queue.pop_front() {
+            for t in &scope_tasks {
+                if t.parent_id == Some(current) && seen.insert(t.id) {
+                    let own_contract = t.status != "done"
+                        && t.status != "cancelled"
+                        && t.acceptance.is_some()
+                        && acceptance_of
+                            .get(&current)
+                            .is_none_or(|parent_acc| parent_acc != &t.acceptance);
+                    if own_contract {
+                        let mut child = t.clone();
+                        child.parent_id = task.parent_id;
+                        self.write_task(&child).await?;
+                        self.log_activity(
+                            t.id,
+                            actor,
+                            "reparented",
+                            Some(serde_json::json!({
+                                "cascade_from": task.id,
+                                "old_parent": current,
+                                "reason": "carries its own acceptance contract",
+                            })),
+                        )
+                        .await?;
+                        // Its subtree moves with it — do not descend.
+                        continue;
+                    }
+                    if t.status != "done" && t.status != "cancelled" {
+                        let mut child = t.clone();
+                        child.status = "cancelled".to_string();
+                        self.write_task(&child).await?;
+                        self.log_activity(
+                            t.id,
+                            actor,
+                            "cancelled",
+                            Some(serde_json::json!({ "cascade_from": task.id })),
+                        )
+                        .await?;
+                    }
+                    queue.push_back(t.id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn get_raw(&self, id: i64) -> Result<Task, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -1057,10 +1017,15 @@ impl TaskRepository {
                 turso::params![id],
             )
             .await?;
-        match rows.next().await? {
-            Some(row) => decode_task_row(&row),
-            None => Err(StorageError::NotFound(format!("Task: #{id}"))),
-        }
+        let task = rows.next().await?.map_or_else(
+            || Err(StorageError::NotFound(format!("Task: #{id}"))),
+            |row| decode_task_row(&row),
+        );
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        task
     }
 
     async fn load_scope(
@@ -1159,6 +1124,202 @@ async fn write_task_with(conn: &Connection, task: &Task) -> Result<(), StorageEr
     Ok(())
 }
 
+/// Apply `patch.status`, if present — the first field [`apply_patch`] checks,
+/// so a rejected status fails the patch before any other field is examined.
+fn apply_status_patch(
+    task: &mut Task,
+    patch: &TaskPatch,
+    changed: &mut Vec<&'static str>,
+) -> Result<(), StorageError> {
+    if let Some(status) = &patch.status {
+        match status.as_str() {
+            "pending" | "in_progress" | "cancelled" => {
+                if task.status != *status {
+                    changed.push("status");
+                }
+                task.status.clone_from(status);
+                // Reopening a closed task must clear its completion stamp.
+                if status != "cancelled" && task.completed_at.is_some() {
+                    task.completed_at = None;
+                }
+            }
+            "done" => {
+                return Err(StorageError::Invalid(
+                    "status 'done' is a verdict: use the complete/done action so the \
+                     acceptance check can run"
+                        .to_string(),
+                ));
+            }
+            "blocked" => {
+                return Err(StorageError::Invalid(
+                    "'blocked' is derived from depends_on and cannot be set directly; \
+                     add a dependency instead"
+                        .to_string(),
+                ));
+            }
+            other => {
+                return Err(StorageError::Invalid(format!("unknown status '{other}'")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply every field of `patch` to `task` in memory, validating each, and
+/// return the names of the fields that changed. Nothing is written here.
+fn apply_patch(task: &mut Task, patch: TaskPatch) -> Result<Vec<&'static str>, StorageError> {
+    let mut changed: Vec<&'static str> = Vec::new();
+    apply_status_patch(task, &patch, &mut changed)?;
+    if let Some(title) = patch.title {
+        validate_title(&title)?;
+        if task.title != title {
+            changed.push("title");
+        }
+        task.title = title;
+    }
+    if let Some(description) = patch.description {
+        changed.push("description");
+        task.description = description;
+    }
+    if let Some(priority) = patch.priority {
+        validate_priority(priority)?;
+        if task.priority != priority {
+            changed.push("priority");
+        }
+        task.priority = priority;
+    }
+    if let Some(labels) = patch.labels {
+        changed.push("labels");
+        task.labels = labels;
+    }
+    if let Some(tool_scope) = patch.tool_scope {
+        changed.push("tool_scope");
+        task.tool_scope = tool_scope;
+    }
+    if let Some(due_at) = patch.due_at {
+        changed.push("due_at");
+        task.due_at = due_at;
+    }
+    if let Some(recurrence) = patch.recurrence {
+        changed.push("recurrence");
+        task.recurrence = recurrence;
+    }
+    if let Some(acceptance) = patch.acceptance {
+        // Same write-boundary rule as `create`: canonicalize, then store
+        // the canonical object (never the caller's raw value).
+        let acceptance = match &acceptance {
+            Some(check) => Some(admit_acceptance(check)?),
+            None => None,
+        };
+        changed.push("acceptance");
+        task.acceptance = acceptance;
+    }
+    if let Some(assignee) = patch.assignee {
+        changed.push("assignee");
+        task.assignee = assignee;
+    }
+    if let Some(project) = patch.project {
+        changed.push("project");
+        task.project = project;
+    }
+    if let Some(sort_order) = patch.sort_order {
+        if task.sort_order != sort_order {
+            changed.push("sort_order");
+        }
+        task.sort_order = sort_order;
+    }
+
+    if let Some(depends_on) = patch.depends_on {
+        if depends_on.len() > TASK_DEPS_MAX {
+            return Err(StorageError::Invalid(format!(
+                "too many dependencies: {} (max {TASK_DEPS_MAX})",
+                depends_on.len()
+            )));
+        }
+        changed.push("depends_on");
+        task.depends_on = depends_on;
+    }
+    if let Some(parent_id) = patch.parent_id {
+        changed.push("parent_id");
+        task.parent_id = parent_id;
+    }
+    Ok(changed)
+}
+
+/// Validate a dependency/parent change against the scope as it would be after
+/// the update (`by_id` already holds the updated `task`). Pure: the caller
+/// holds the connection guard across this and the write.
+fn check_graph_update(
+    by_id: &HashMap<i64, &Task>,
+    task: &Task,
+    parent_changed: bool,
+) -> Result<(), StorageError> {
+    for dep in &task.depends_on {
+        if *dep == task.id {
+            return Err(StorageError::Invalid(format!(
+                "task #{} cannot depend on itself",
+                task.id
+            )));
+        }
+        if !by_id.contains_key(dep) {
+            return Err(StorageError::Invalid(format!(
+                "dependency task #{dep} not found in scope"
+            )));
+        }
+    }
+    check_dependency_cycle(by_id, task.id)?;
+
+    if let Some(parent_id) = task.parent_id {
+        if parent_id == task.id {
+            return Err(StorageError::Invalid(format!(
+                "task #{} cannot be its own parent",
+                task.id
+            )));
+        }
+        let Some(parent) = by_id.get(&parent_id) else {
+            return Err(StorageError::Invalid(format!(
+                "parent task #{parent_id} not found in scope"
+            )));
+        };
+        if parent_changed && (parent.status == "done" || parent.status == "cancelled") {
+            return Err(StorageError::Invalid(format!(
+                "cannot move a task under {} task #{parent_id}",
+                parent.status
+            )));
+        }
+        check_parent_cycle(by_id, task.id)?;
+
+        if parent_changed {
+            // Re-parenting must not push the moved subtree past
+            // the depth bound.
+            let new_depth = parent_depth(by_id, parent_id)? + 1;
+            let height = subtree_height(by_id, task.id);
+            if new_depth + height >= TASK_DEPTH_MAX {
+                return Err(StorageError::Invalid(format!(
+                    "hierarchy depth limit {TASK_DEPTH_MAX} exceeded by re-parenting"
+                )));
+            }
+        }
+    }
+
+    // The parent-completion invariant makes ancestors implicit
+    // dependents: no task in the (possibly re-parented) subtree
+    // may depend on one of its ancestors, or both wedge forever.
+    let ancestors = ancestor_chain(by_id, task.parent_id);
+    check_ancestor_dependency(by_id, &ancestors, &task.depends_on)?;
+    if parent_changed {
+        for member_id in subtree_ids_from(by_id, task.id) {
+            if member_id == task.id {
+                continue;
+            }
+            if let Some(member) = by_id.get(&member_id) {
+                check_ancestor_dependency(by_id, &ancestors, &member.depends_on)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_scope(scope: &str) -> String {
     let lower = scope.trim().to_lowercase();
     if lower.is_empty() {
@@ -1219,7 +1380,7 @@ fn validate_priority(priority: i64) -> Result<(), StorageError> {
 /// Every canonical acceptance shape, quoted verbatim in every parse error.
 ///
 /// serde names the Rust type it wanted ("expected internally tagged enum
-/// AcceptanceCheck") and never the shape, so a model has nothing to copy: the
+/// `AcceptanceCheck`") and never the shape, so a model has nothing to copy: the
 /// daemon logs hold 121 identical malformed acceptance calls. An error that
 /// carries the target shapes is the only version of this message that can end
 /// the loop on the next attempt.
@@ -1279,22 +1440,51 @@ pub fn canonicalize_acceptance(
 /// 50 valid task-adds bounced on this, each answered with a rephrased
 /// duplicate batch). Only exact non-negative integers coerce; a fractional
 /// or negative value is left alone for [`validate_acceptance`] to reject —
-/// the leniency is lossless by construction. The f64→u64 cast is exact for
-/// every value that passes the guards: integral, non-negative, and below
-/// 2^53 (far beyond any plausible timeout).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// the leniency is lossless by construction: [`exact_u64_below_2_pow_53`]
+/// admits only integral, non-negative values below 2^53 (far beyond any
+/// plausible timeout), and every one of those converts exactly.
 fn normalize_integral_timeout(value: &mut serde_json::Value) {
-    const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0; // 2^53
     if let Some(obj) = value.as_object_mut()
         && let Some(timeout) = obj.get_mut("timeout_secs")
         && !timeout.is_u64()
         && let Some(f) = timeout.as_f64()
-        && f.fract() == 0.0
-        && f >= 0.0
-        && f < MAX_EXACT_F64_INT
+        && let Some(whole) = exact_u64_below_2_pow_53(f)
     {
-        *timeout = serde_json::Value::from(f as u64);
+        *timeout = serde_json::Value::from(whole);
     }
+}
+
+/// The integer `f` denotes when it is integral, non-negative, and below 2^53;
+/// `None` for anything else (a fraction, a negative, NaN, an infinity, or an
+/// integer too large for every neighbour to be exact). `-0.0` denotes 0.
+///
+/// Read off the IEEE-754 bits instead of cast: no `TryFrom<f64>` exists for
+/// any integer type. A finite `f64` is `significand * 2^(exponent - 52)` with
+/// the significand's top bit at position 52, so a value in `[1, 2^53)` has an
+/// unbiased exponent in `0..=52`, is integral exactly when the
+/// `52 - exponent` bits below its binary point are zero, and then denotes the
+/// significand shifted right by that many bits — no step rounds. This admits
+/// exactly the values `f.fract() == 0.0 && (0.0..2^53).contains(&f)` admits,
+/// and returns the same integer `f as u64` would.
+fn exact_u64_below_2_pow_53(f: f64) -> Option<u64> {
+    const FRACTION_BITS: u64 = 52;
+    const EXPONENT_BIAS: u64 = 1023;
+    if f == 0.0 {
+        return Some(0); // +0.0 and -0.0 alike
+    }
+    if f.is_sign_negative() {
+        return None;
+    }
+    let bits = f.to_bits();
+    // The sign bit is clear, so the biased exponent is everything above the
+    // fraction. Below the bias is a fraction of one (or a subnormal); above
+    // bias + 52 is 2^53 or more, an infinity, or NaN.
+    let exponent = (bits >> FRACTION_BITS)
+        .checked_sub(EXPONENT_BIAS)
+        .filter(|&exponent| exponent <= FRACTION_BITS)?;
+    let significand = (bits & ((1 << FRACTION_BITS) - 1)) | (1 << FRACTION_BITS);
+    let fraction_shift = FRACTION_BITS - exponent;
+    (significand & ((1 << fraction_shift) - 1) == 0).then_some(significand >> fraction_shift)
 }
 
 /// Decode an acceptance object that arrived as a string: strict JSON first,
@@ -1438,13 +1628,12 @@ fn validate_acceptance(value: &serde_json::Value) -> Result<(), StorageError> {
     // timeout_secs must be an unsigned integer when present — the harness
     // deserializes it strictly, and a shape that validates here but fails to
     // parse there would wedge every run in the scope.
-    if let Some(timeout) = value.get("timeout_secs") {
-        if !timeout.is_u64() {
+    if let Some(timeout) = value.get("timeout_secs")
+        && !timeout.is_u64() {
             return Err(StorageError::Invalid(
                 "acceptance 'timeout_secs' must be an unsigned integer (seconds)".to_string(),
             ));
         }
-    }
     match kind {
         "command" => require_str("command"),
         "file_exists" => require_str("path"),
@@ -1594,7 +1783,9 @@ pub fn looks_like_path(token: &str) -> bool {
 }
 
 /// The workspace file every write tool reads user-declared file prohibitions
-/// from. Same directory as the write ratchet's ledger — one place holds the
+/// from.
+///
+/// Same directory as the write ratchet's ledger — one place holds the
 /// per-workspace state the tool layer consults before mutating.
 pub const DECLARED_INVARIANTS_FILE: &str = ".nanna/declared_invariants.json";
 
@@ -1785,7 +1976,7 @@ fn split_sentences(text: &str) -> Vec<&str> {
         let next = bytes.get(i + c.len_utf8());
         let ends_here = c == '\n'
             || next.is_none()
-            || next.is_some_and(|b| b.is_ascii_whitespace());
+            || next.is_some_and(u8::is_ascii_whitespace);
         if !ends_here {
             continue;
         }
@@ -1799,10 +1990,11 @@ fn split_sentences(text: &str) -> Vec<&str> {
     out
 }
 
-/// The canonical spelling of a declared glob: the SAME normalization the write
-/// ratchet's ledger key uses (backslashes to slashes, lowercase, no `./`
-/// prefix, no doubled or trailing separators), so one file has one identity on
-/// both sides of the contract.
+/// The canonical spelling of a declared glob.
+///
+/// It is the SAME normalization the write ratchet's ledger key uses
+/// (backslashes to slashes, lowercase, no `./` prefix, no doubled or trailing
+/// separators), so one file has one identity on both sides of the contract.
 #[must_use]
 pub fn normalize_invariant_glob(glob: &str) -> String {
     let mut key = glob.replace('\\', "/").to_lowercase();
@@ -2950,6 +3142,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn exact_u64_admits_only_exact_non_negative_integers_below_2_pow_53() {
+        // Admitted: every whole number below 2^53, including both zeros and
+        // the neighbours of the powers of two where the exponent changes.
+        for (f, whole) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (1.0, 1),
+            (60.0, 60),
+            (1_023.0, 1_023),
+            (1_024.0, 1_024),
+            (4_503_599_627_370_495.0, 4_503_599_627_370_495),
+            (4_503_599_627_370_496.0, 4_503_599_627_370_496),
+            (4_503_599_627_370_497.0, 4_503_599_627_370_497),
+            (9_007_199_254_740_991.0, 9_007_199_254_740_991),
+        ] {
+            assert_eq!(exact_u64_below_2_pow_53(f), Some(whole), "{f:?}");
+        }
+        for n in [2, 3, 255, 65_535, 1 << 31, u32::MAX] {
+            assert_eq!(exact_u64_below_2_pow_53(f64::from(n)), Some(u64::from(n)), "{n}");
+        }
+
+        // Refused: fractions, negatives, non-finite values, and 2^53 upward.
+        for f in [
+            0.5,
+            1.5,
+            60.5,
+            4_503_599_627_370_495.5,
+            5e-324,
+            f64::MIN_POSITIVE,
+            -1.0,
+            -60.0,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+            9_007_199_254_740_994.0,
+            1e300,
+            f64::MAX,
+        ] {
+            assert_eq!(exact_u64_below_2_pow_53(f), None, "{f:?}");
+        }
+    }
+
     #[tokio::test]
     async fn counts_reports_open_and_closed() {
         let (_s, repo) = repo().await;
@@ -2980,7 +3217,7 @@ mod tests {
         // costs a stat, but a false PROHIBITION would block real work.
         let noisy =
             serde_json::json!({"kind": "command", "command": "cargo test --all -p nanna"});
-        assert!(acceptance_referenced_paths(&noisy).is_empty());
+        assert_eq!(acceptance_referenced_paths(&noisy), [] as [std::string::String; 0]);
     }
 
     /// The instrument/subject split. A `file_exists` (or path-`regex`) check
@@ -2991,10 +3228,10 @@ mod tests {
     #[test]
     fn only_a_command_check_has_evidence_inputs() {
         let file = serde_json::json!({"kind": "file_exists", "path": "artifact.txt"});
-        assert!(acceptance_evidence_paths(&file).is_empty());
+        assert_eq!(acceptance_evidence_paths(&file), [] as [std::string::String; 0]);
         let path_regex =
             serde_json::json!({"kind": "regex", "pattern": "PASS", "path": "report.txt"});
-        assert!(acceptance_evidence_paths(&path_regex).is_empty());
+        assert_eq!(acceptance_evidence_paths(&path_regex), [] as [std::string::String; 0]);
         assert_eq!(
             acceptance_referenced_paths(&path_regex),
             vec!["report.txt".to_string()],

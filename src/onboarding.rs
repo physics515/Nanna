@@ -72,11 +72,10 @@ pub fn has_api_key(config: &Config) -> bool {
         &config.llm.provider,
         config.llm.api_key.as_deref(),
         |variable| {
-            if let Ok(v) = std::env::var(variable) {
-                if !v.trim().is_empty() {
+            if let Ok(v) = std::env::var(variable)
+                && !v.trim().is_empty() {
                     return Some(v);
                 }
-            }
             // Map the env-var name to the SecureStore key.
             let store_key = match variable {
                 "ANTHROPIC_API_KEY" => nanna_config::credentials::keys::ANTHROPIC_API_KEY,

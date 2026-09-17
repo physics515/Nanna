@@ -83,8 +83,7 @@ async fn daemon_boots_with_rebuilt_store_after_page_corruption() {
     let mut server = DaemonBuilder::new()
         .with_data_dir(&data_dir)
         .with_pid_file(false)
-        .build()
-        .await;
+        .build();
     server.open_storage().await;
 
     let report = server

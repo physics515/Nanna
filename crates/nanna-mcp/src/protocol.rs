@@ -497,7 +497,7 @@ mod tests {
         ] {
             let result = parse(json!({
                 "content": [{ "type": "text", "text": "ok" }],
-                "structuredContent": payload.clone(),
+                "structuredContent": payload,
             }));
             assert_eq!(
                 result.structured_content.as_ref(),

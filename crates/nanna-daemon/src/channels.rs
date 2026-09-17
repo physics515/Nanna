@@ -62,7 +62,7 @@ pub struct ChannelManager {
     router: Arc<RwLock<MessageRouter>>,
     /// Control plane reference for processing messages
     control: Arc<ControlPlane>,
-    /// Shared status manager reported via ChannelAction::Status
+    /// Shared status manager reported via `ChannelAction::Status`
     status_manager: Arc<StatusManager>,
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -70,12 +70,14 @@ pub struct ChannelManager {
 
 impl ChannelManager {
     /// Create a new channel manager that owns a fresh status manager.
+    #[must_use]
     pub fn new(control: Arc<ControlPlane>) -> Self {
         Self::with_status_manager(control, Arc::new(StatusManager::new()))
     }
 
     /// Create a channel manager that reports status through the given manager
     /// (typically the one attached to the control plane).
+    #[must_use]
     pub fn with_status_manager(control: Arc<ControlPlane>, status_manager: Arc<StatusManager>) -> Self {
         Self {
             listener_manager: RwLock::new(ListenerManager::new(1000)),
@@ -163,6 +165,9 @@ impl ChannelManager {
             } else {
                 info!("Slack Socket Mode listener configured");
             }
+            // Last listener: the outbound registration below needs only the
+            // router, which stays locked to the end of `configure`.
+            drop(lm);
 
             // Register outbound channel
             router.register(
@@ -192,6 +197,11 @@ impl ChannelManager {
     }
 
     /// Start processing incoming messages
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listener manager's inbound receiver was
+    /// already taken — i.e. this manager has been started before.
     pub async fn start(&mut self) -> Result<(), String> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -255,12 +265,9 @@ impl ChannelManager {
     /// This is `pub` so the webhook event processor in `server.rs` can call it
     /// directly after converting a `WebhookEvent` into an `IncomingMessage`.
     pub async fn process_message(msg: IncomingMessage, control: &Arc<ControlPlane>, router: &MessageRouter) {
-        let text = match &msg.content {
-            MessageContent::Text { text } => text.clone(),
-            _ => {
-                debug!("Ignoring non-text message from {}", msg.channel.provider);
-                return;
-            }
+        let text = if let MessageContent::Text { text } = &msg.content { text.clone() } else {
+            debug!("Ignoring non-text message from {}", msg.channel.provider);
+            return;
         };
         control.channel_counters.received(&msg.channel.provider);
 
@@ -318,18 +325,22 @@ impl ChannelManager {
             let _ = tx.send(()).await;
         }
         
-        let mut lm = self.listener_manager.write().await;
-        lm.stop_all().await;
+        self.listener_manager.write().await.stop_all().await;
         info!("All channel listeners stopped");
     }
 
     /// List running listeners
     pub async fn list_listeners(&self) -> Vec<String> {
         let lm = self.listener_manager.read().await;
-        lm.list().iter().map(|s| s.to_string()).collect()
+        lm.list().iter().map(std::string::ToString::to_string).collect()
     }
 
     /// Send a message through a channel
+    ///
+    /// # Errors
+    ///
+    /// Returns the router's error as text: no outbound channel is registered
+    /// for `channel.provider`, or the provider's own send failed.
     pub async fn send(&self, channel: ChannelId, content: MessageContent) -> Result<String, String> {
         let router = self.router.read().await;
         router
@@ -707,17 +718,17 @@ fn typing_abandon_after() -> std::time::Duration {
 /// outage each call can take the channel client's whole 30 s timeout, the
 /// forwarder would fall behind the event bus, and a skipped `message_end` is a
 /// reply never sent — far worse than a missing indicator. Bounded: at most one
-/// per session per [`TYPING_REFRESH`], each ending at that client timeout.
+/// per session per `TYPING_REFRESH`, each ending at that client timeout.
 fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: &ReplyChannel) {
     let router = Arc::clone(router);
     let session_id = session_id.to_string();
     let target = ChannelId::new(&route.provider, &route.id);
     tokio::spawn(async move {
         let router = router.read().await;
-        if let Some(channel) = router.get(&target.provider) {
-            if let Err(e) = channel.send_typing(&target).await {
-                debug!("typing indicator for {session_id} not sent: {e}");
-            }
+        if let Some(channel) = router.get(&target.provider)
+            && let Err(e) = channel.send_typing(&target).await
+        {
+            debug!("typing indicator for {session_id} not sent: {e}");
         }
     });
 }
@@ -767,12 +778,12 @@ fn spawn_reply_outbox(
 /// While a routed session's turn runs, the chat also shows "typing…": a
 /// Telegram user used to see nothing at all between sending a message and a
 /// reply minutes later. A turn's first event starts it; a tick every
-/// [`TYPING_REFRESH`] keeps it up through silent stretches (a long tool call);
-/// `message_end`, or no event for [`typing_abandon_after`], ends it. The map
+/// `TYPING_REFRESH` keeps it up through silent stretches (a long tool call);
+/// `message_end`, or no event for `typing_abandon_after`, ends it. The map
 /// holds only sessions mid-turn and is bounded by the channel session count.
 ///
 /// **The bus reader never waits on a provider.** Replies go to a FIFO task per
-/// chat ([`spawn_reply_outbox`]), so they stay in order within a chat while a
+/// chat (`spawn_reply_outbox`), so they stay in order within a chat while a
 /// send stuck in a 30 s provider timeout cannot make this loop fall behind the
 /// event bus — where a skipped `message_end` is another chat's lost reply.
 pub fn spawn_reply_forwarder(

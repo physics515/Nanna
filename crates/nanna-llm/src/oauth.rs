@@ -29,6 +29,14 @@ impl OAuthClient {
     /// Load credentials from Claude CLI and create an OAuth client
     ///
     /// This will automatically refresh the token if it's expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of
+    /// [`ClaudeCredentialManager::load_and_refresh`]: no credentials in the
+    /// keyring or the credentials file, an expired token with no refresh token
+    /// ([`CredentialError::Expired`]), or a refresh that the token endpoint
+    /// rejects.
     pub async fn load() -> Result<Self, CredentialError> {
         let manager = ClaudeCredentialManager::new();
         let loaded = manager.load_and_refresh().await?;
@@ -41,6 +49,14 @@ impl OAuthClient {
     }
 
     /// Load credentials without auto-refresh
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`ClaudeCredentialManager::load`]: no credentials
+    /// in the keyring or the credentials file, or a credentials file that
+    /// cannot be read or parsed. An expired token is loaded without complaint
+    /// — this call does no network work, so it cannot tell whether a refresh
+    /// would succeed.
     pub fn load_sync() -> Result<Self, CredentialError> {
         let manager = ClaudeCredentialManager::new();
         let loaded = manager.load()?;
@@ -61,6 +77,15 @@ impl OAuthClient {
     /// Refresh the token if needed
     ///
     /// Returns true if the token was refreshed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::RefreshFailed`] when the token has expired
+    /// but carries no refresh token, and otherwise the errors of
+    /// [`ClaudeCredentialManager::refresh_token`] — the token request could
+    /// not be sent, the endpoint answered a non-success status, or the
+    /// response was not a token object. Failing to write the refreshed token
+    /// back to its source is only logged: the fresh token is still returned.
     pub async fn refresh_if_needed(&mut self) -> Result<bool, CredentialError> {
         if !self.needs_refresh() {
             return Ok(false);
@@ -85,7 +110,7 @@ impl OAuthClient {
         Ok(true)
     }
 
-    /// Get an LlmClient using the current OAuth token
+    /// Get an `LlmClient` using the current OAuth token
     ///
     /// Call `refresh_if_needed()` first if you want to ensure the token is fresh.
     #[must_use]
@@ -112,12 +137,12 @@ impl OAuthClient {
     }
 }
 
-/// Create an LlmClient with auto-refreshed OAuth token
+/// Create an `LlmClient` with auto-refreshed OAuth token
 ///
 /// This is a convenience function that:
 /// 1. Loads credentials from Claude CLI
 /// 2. Refreshes the token if expired
-/// 3. Returns an LlmClient configured with the fresh token
+/// 3. Returns an `LlmClient` configured with the fresh token
 ///
 /// # Errors
 ///
@@ -129,10 +154,17 @@ pub async fn create_oauth_client() -> Result<LlmClient, CredentialError> {
     Ok(oauth.llm_client())
 }
 
-/// Create an LlmClient from Claude CLI credentials without network refresh
+/// Create an `LlmClient` from Claude CLI credentials without network refresh
 ///
 /// This loads credentials but doesn't attempt to refresh them.
 /// Useful when you want to check if credentials exist before doing async work.
+///
+/// # Errors
+///
+/// Returns the errors of [`OAuthClient::load_sync`] when the credentials
+/// cannot be loaded at all, and [`CredentialError::Expired`] when the loaded
+/// token has expired and carries no refresh token — the one case this
+/// no-network path can decide for itself.
 #[cfg(feature = "auto-refresh")]
 pub fn create_oauth_client_sync() -> Result<LlmClient, CredentialError> {
     let oauth = OAuthClient::load_sync()?;
@@ -159,7 +191,7 @@ mod tests {
                 println!("Expires in: {:?} seconds", client.seconds_until_expiry());
             }
             Err(e) => {
-                println!("Skipping test - no credentials: {}", e);
+                println!("Skipping test - no credentials: {e}");
             }
         }
     }

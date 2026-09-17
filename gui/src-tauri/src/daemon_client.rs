@@ -95,17 +95,24 @@ pub enum ResponseResult {
 }
 
 impl Response {
-    pub fn is_error(&self) -> bool {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
     
-    pub fn data(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn data(&self) -> Option<&Value> {
         match &self.result {
             ResponseResult::Success { data } => Some(data),
             ResponseResult::Error { .. } => None,
         }
     }
     
+    /// The success payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the daemon's `message` when the response is an error response.
     pub fn into_data(self) -> Result<Value, String> {
         match self.result {
             ResponseResult::Success { data } => Ok(data),
@@ -187,6 +194,21 @@ struct PendingRequest {
     tx: oneshot::Sender<Result<Value, String>>,
 }
 
+/// The handles a connection's background tasks (the message pump and the
+/// reconnection loop) share with the [`DaemonClient`] that spawned them.
+#[derive(Clone)]
+struct ConnectionShared {
+    config: DaemonClientConfig,
+    state: Arc<RwLock<ConnectionState>>,
+    mode: Arc<RwLock<ConnectionMode>>,
+    msg_tx: Arc<RwLock<Option<mpsc::Sender<Message>>>>,
+    pending: Arc<RwLock<HashMap<String, PendingRequest>>>,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    shutdown_tx: broadcast::Sender<()>,
+    /// Tracks whether a reconnection loop is running
+    reconnecting: Arc<RwLock<bool>>,
+}
+
 /// Daemon client for GUI
 pub struct DaemonClient {
     config: DaemonClientConfig,
@@ -202,6 +224,7 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Create a new daemon client
+    #[must_use]
     pub fn new(config: DaemonClientConfig) -> Self {
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(100);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -219,6 +242,13 @@ impl DaemonClient {
     }
     
     /// Try to connect to the daemon
+    ///
+    /// # Errors
+    ///
+    /// Returns `"Connection failed: …"` when the WebSocket handshake with the
+    /// configured URL fails (typically nothing is listening), and
+    /// `"Connection timeout"` when it does not complete within
+    /// `connect_timeout`. Either way the state is left `Disconnected`.
     pub async fn connect(&self) -> Result<(), String> {
         *self.state.write().await = ConnectionState::Connecting;
         
@@ -241,7 +271,7 @@ impl DaemonClient {
             Ok(Err(e)) => {
                 *self.state.write().await = ConnectionState::Disconnected;
                 warn!("Failed to connect to daemon: {}", e);
-                Err(format!("Connection failed: {}", e))
+                Err(format!("Connection failed: {e}"))
             }
             Err(_) => {
                 *self.state.write().await = ConnectionState::Disconnected;
@@ -266,21 +296,41 @@ impl DaemonClient {
         }
     }
     
+    /// Clone out every handle a connection's background tasks share with the
+    /// client, so a task can outlive the borrow of `self`.
+    fn shared(&self) -> ConnectionShared {
+        ConnectionShared {
+            config: self.config.clone(),
+            state: self.state.clone(),
+            mode: self.mode.clone(),
+            msg_tx: self.msg_tx.clone(),
+            pending: self.pending.clone(),
+            event_tx: self.event_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            reconnecting: self.reconnecting.clone(),
+        }
+    }
+
     async fn spawn_handler(&self, ws: WebSocketStream<MaybeTlsStream<TcpStream>>) {
+        Self::attach_connection(ws, self.shared(), false).await;
+    }
+
+    /// Install `ws` as the live connection and spawn the task that pumps it
+    /// until it closes, then runs [`Self::handle_disconnect`].
+    ///
+    /// `reconnected` only selects the disconnect log line, so a connection the
+    /// reconnect loop re-established stays distinguishable in the logs.
+    async fn attach_connection(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        shared: ConnectionShared,
+        reconnected: bool,
+    ) {
         let (mut ws_tx, mut ws_rx) = ws.split();
         let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(100);
 
-        *self.msg_tx.write().await = Some(msg_tx);
+        *shared.msg_tx.write().await = Some(msg_tx);
 
-        let pending = self.pending.clone();
-        let event_tx = self.event_tx.clone();
-        let state = self.state.clone();
-        let mode = self.mode.clone();
-        let reconnecting = self.reconnecting.clone();
-        let config = self.config.clone();
-        let msg_tx_holder = self.msg_tx.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let shutdown_tx = self.shutdown_tx.clone();
+        let mut shutdown_rx = shared.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             loop {
@@ -296,7 +346,7 @@ impl DaemonClient {
                     Some(msg) = ws_rx.next() => {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                Self::handle_message_static(&text, &pending, &event_tx).await;
+                                Self::handle_message_static(&text, &shared.pending, &shared.event_tx).await;
                             }
                             Ok(Message::Ping(data)) => {
                                 let _ = ws_tx.send(Message::Pong(data)).await;
@@ -322,65 +372,60 @@ impl DaemonClient {
                 }
             }
 
-            *state.write().await = ConnectionState::Disconnected;
-            info!("Disconnected from daemon");
-
-            // Fail all pending requests
-            {
-                let mut pending = pending.write().await;
-                for (_, req) in pending.drain() {
-                    let _ = req.tx.send(Err("Disconnected".to_string()));
-                }
-            }
-
-            // Start reconnection loop if auto_reconnect is enabled
-            if config.auto_reconnect {
-                // Check if reconnection loop is already running
-                let already_reconnecting = {
-                    let mut flag = reconnecting.write().await;
-                    if *flag {
-                        true
-                    } else {
-                        *flag = true;
-                        false
-                    }
-                };
-
-                if !already_reconnecting {
-                    Self::start_reconnect_loop(
-                        config,
-                        state,
-                        mode,
-                        msg_tx_holder,
-                        pending,
-                        event_tx,
-                        shutdown_tx,
-                        reconnecting,
-                    );
-                }
-            } else {
-                *mode.write().await = ConnectionMode::Embedded;
-                info!("Auto-reconnect disabled, falling back to embedded mode");
-            }
+            Self::handle_disconnect(shared, reconnected).await;
         });
     }
 
+    /// Settle a closed connection: mark the client disconnected, fail every
+    /// pending request, then either start the reconnection loop (unless one is
+    /// already running) or fall back to embedded mode.
+    async fn handle_disconnect(shared: ConnectionShared, reconnected: bool) {
+        *shared.state.write().await = ConnectionState::Disconnected;
+        if reconnected {
+            info!("Disconnected from daemon again");
+        } else {
+            info!("Disconnected from daemon");
+        }
+
+        // Fail all pending requests
+        {
+            let mut pending = shared.pending.write().await;
+            for (_, req) in pending.drain() {
+                let _ = req.tx.send(Err("Disconnected".to_string()));
+            }
+        }
+
+        // Start reconnection loop if auto_reconnect is enabled
+        if shared.config.auto_reconnect {
+            // Check if reconnection loop is already running
+            let already_reconnecting = {
+                let mut flag = shared.reconnecting.write().await;
+                if *flag {
+                    true
+                } else {
+                    *flag = true;
+                    false
+                }
+            };
+
+            if !already_reconnecting {
+                Self::start_reconnect_loop(shared);
+            }
+        } else {
+            // Only a first connection can get here: the reconnect loop runs
+            // only when `auto_reconnect` is set, and the config never changes.
+            *shared.mode.write().await = ConnectionMode::Embedded;
+            info!("Auto-reconnect disabled, falling back to embedded mode");
+        }
+    }
+
     /// Start a background task to periodically attempt reconnection
-    fn start_reconnect_loop(
-        config: DaemonClientConfig,
-        state: Arc<RwLock<ConnectionState>>,
-        mode: Arc<RwLock<ConnectionMode>>,
-        msg_tx: Arc<RwLock<Option<mpsc::Sender<Message>>>>,
-        pending: Arc<RwLock<HashMap<String, PendingRequest>>>,
-        event_tx: broadcast::Sender<DaemonEvent>,
-        shutdown_tx: broadcast::Sender<()>,
-        reconnecting: Arc<RwLock<bool>>,
-    ) {
+    fn start_reconnect_loop(shared: ConnectionShared) {
         tokio::spawn(async move {
             let reconnect_interval = Duration::from_secs(10);
             let max_attempts = 30; // Give up after ~5 minutes
             let mut attempt = 0;
-            let mut shutdown_rx = shutdown_tx.subscribe();
+            let mut shutdown_rx = shared.shutdown_tx.subscribe();
 
             info!("Starting reconnection loop (interval: {:?})", reconnect_interval);
 
@@ -389,7 +434,7 @@ impl DaemonClient {
 
                 // Wait before attempting reconnection
                 tokio::select! {
-                    _ = tokio::time::sleep(reconnect_interval) => {}
+                    () = tokio::time::sleep(reconnect_interval) => {}
                     _ = shutdown_rx.recv() => {
                         info!("Reconnection loop stopped by shutdown signal");
                         break;
@@ -399,110 +444,23 @@ impl DaemonClient {
                 // Check if we should give up
                 if attempt > max_attempts {
                     warn!("Max reconnection attempts ({}) reached, giving up", max_attempts);
-                    *mode.write().await = ConnectionMode::Embedded;
+                    *shared.mode.write().await = ConnectionMode::Embedded;
                     break;
                 }
 
-                *state.write().await = ConnectionState::Reconnecting;
+                *shared.state.write().await = ConnectionState::Reconnecting;
                 info!("Reconnection attempt {}/{}", attempt, max_attempts);
 
                 // Try to connect
-                let connect_future = connect_async_with_config(&config.url, Some(ws_config()), false);
-                match tokio::time::timeout(config.connect_timeout, connect_future).await {
+                let connect_future = connect_async_with_config(&shared.config.url, Some(ws_config()), false);
+                match tokio::time::timeout(shared.config.connect_timeout, connect_future).await {
                     Ok(Ok((ws, _))) => {
                         info!("Reconnected to daemon successfully");
-                        *state.write().await = ConnectionState::Connected;
-                        *mode.write().await = ConnectionMode::Daemon;
+                        *shared.state.write().await = ConnectionState::Connected;
+                        *shared.mode.write().await = ConnectionMode::Daemon;
 
                         // Spawn new handler for this connection
-                        let (mut ws_tx, mut ws_rx) = ws.split();
-                        let (new_msg_tx, mut msg_rx) = mpsc::channel::<Message>(100);
-                        *msg_tx.write().await = Some(new_msg_tx);
-
-                        let pending_clone = pending.clone();
-                        let event_tx_clone = event_tx.clone();
-                        let state_clone = state.clone();
-                        let mode_clone = mode.clone();
-                        let reconnecting_clone = reconnecting.clone();
-                        let config_clone = config.clone();
-                        let msg_tx_clone = msg_tx.clone();
-                        let shutdown_tx_clone = shutdown_tx.clone();
-                        let mut handler_shutdown_rx = shutdown_tx.subscribe();
-
-                        tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    Some(msg) = msg_rx.recv() => {
-                                        if ws_tx.send(msg).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Some(msg) = ws_rx.next() => {
-                                        match msg {
-                                            Ok(Message::Text(text)) => {
-                                                Self::handle_message_static(&text, &pending_clone, &event_tx_clone).await;
-                                            }
-                                            Ok(Message::Ping(data)) => {
-                                                let _ = ws_tx.send(Message::Pong(data)).await;
-                                            }
-                                            Ok(Message::Close(_)) => {
-                                                debug!("Server sent close");
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                error!("WebSocket error: {}", e);
-                                                break;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ = handler_shutdown_rx.recv() => {
-                                        debug!("Shutdown signal received");
-                                        let _ = ws_tx.close().await;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            *state_clone.write().await = ConnectionState::Disconnected;
-                            info!("Disconnected from daemon again");
-
-                            // Fail pending requests
-                            {
-                                let mut pending = pending_clone.write().await;
-                                for (_, req) in pending.drain() {
-                                    let _ = req.tx.send(Err("Disconnected".to_string()));
-                                }
-                            }
-
-                            // Start another reconnection loop
-                            if config_clone.auto_reconnect {
-                                let already = {
-                                    let mut flag = reconnecting_clone.write().await;
-                                    if *flag {
-                                        true
-                                    } else {
-                                        *flag = true;
-                                        false
-                                    }
-                                };
-
-                                if !already {
-                                    Self::start_reconnect_loop(
-                                        config_clone,
-                                        state_clone,
-                                        mode_clone,
-                                        msg_tx_clone,
-                                        pending_clone,
-                                        event_tx_clone,
-                                        shutdown_tx_clone,
-                                        reconnecting_clone,
-                                    );
-                                }
-                            } else {
-                                *mode_clone.write().await = ConnectionMode::Embedded;
-                            }
-                        });
+                        Self::attach_connection(ws, shared.clone(), true).await;
 
                         // Exit the reconnection loop - handler will manage future disconnects
                         break;
@@ -517,7 +475,7 @@ impl DaemonClient {
             }
 
             // Mark reconnection loop as done
-            *reconnecting.write().await = false;
+            *shared.reconnecting.write().await = false;
         });
     }
     
@@ -528,8 +486,8 @@ impl DaemonClient {
     ) {
         // Try to parse as Response first
         if let Ok(response) = serde_json::from_str::<Response>(text) {
-            let mut pending = pending.write().await;
-            if let Some(req) = pending.remove(&response.id) {
+            let waiting = pending.write().await.remove(&response.id);
+            if let Some(req) = waiting {
                 let result = response.into_data();
                 let _ = req.tx.send(result);
             } else {
@@ -568,6 +526,7 @@ impl DaemonClient {
     }
     
     /// Subscribe to daemon events
+    #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.event_tx.subscribe()
     }
@@ -575,17 +534,45 @@ impl DaemonClient {
     /// Sender side of the event bus. Used in embedded mode to inject events
     /// from the in-process `AgentService` so the same subscribers (the single
     /// Tauri event-forwarding task) see them exactly like daemon events.
+    #[must_use]
     pub fn event_sender(&self) -> broadcast::Sender<DaemonEvent> {
         self.event_tx.clone()
     }
     
     /// Send a request to the daemon with the default timeout
+    ///
+    /// # Errors
+    ///
+    /// - `"Not connected to daemon"` when the client is not in daemon mode
+    ///   (it never connected, or the reconnection loop gave up);
+    /// - `"No message sender"` when no connection has been installed yet;
+    /// - `"Send error: …"` when the connection's message pump has already
+    ///   ended;
+    /// - `"Disconnected"` when the connection drops before the reply arrives
+    ///   (every pending request is failed with it), or `"Response channel
+    ///   closed"` if the reply slot is discarded without an answer;
+    /// - `"Request timeout"` when no reply arrives within the configured
+    ///   `request_timeout` (5 minutes by default);
+    /// - the `message` of an error response.
+    ///
+    /// A refused action is *not* an error here: the daemon answers every
+    /// request it parsed with a successful reply and reports the refusal
+    /// inside it (`{"error": …, "message": …}`). Its only error response is
+    /// for a request it could not parse, and that carries no request id, so
+    /// such a request ends in `"Request timeout"`.
     pub async fn request(&self, action: Value) -> Result<Value, String> {
         self.request_with_timeout(action, self.config.request_timeout).await
     }
 
-    /// Send a request to the daemon with a specific timeout
-    async fn request_with_timeout(&self, action: Value, timeout: Duration) -> Result<Value, String> {
+    /// Register a pending request for `action` and hand it to the connection's
+    /// message pump. Returns the request id and the slot its reply lands in.
+    ///
+    /// The pending entry is registered before the send, so a reply can never
+    /// arrive for an id that is not yet waiting for it.
+    async fn send_request(
+        &self,
+        action: Value,
+    ) -> Result<(String, oneshot::Receiver<Result<Value, String>>), String> {
         if *self.mode.read().await != ConnectionMode::Daemon {
             return Err("Not connected to daemon".to_string());
         }
@@ -599,7 +586,7 @@ impl DaemonClient {
         let request = Request { id: id.clone(), action };
 
         let json = serde_json::to_string(&request)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+            .map_err(|e| format!("Serialization error: {e}"))?;
 
         // Create response channel
         let (tx, rx) = oneshot::channel();
@@ -612,19 +599,24 @@ impl DaemonClient {
 
         // Send request
         msg_tx.send(Message::Text(json.into())).await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
+
+        Ok((id, rx))
+    }
+
+    /// Send a request to the daemon with a specific timeout
+    async fn request_with_timeout(&self, action: Value, timeout: Duration) -> Result<Value, String> {
+        let (id, rx) = self.send_request(action).await?;
 
         // Wait for response with timeout
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
-                let mut pending = self.pending.write().await;
-                pending.remove(&id);
+                self.pending.write().await.remove(&id);
                 Err("Response channel closed".to_string())
             }
             Err(_) => {
-                let mut pending = self.pending.write().await;
-                pending.remove(&id);
+                self.pending.write().await.remove(&id);
                 Err("Request timeout".to_string())
             }
         }
@@ -640,59 +632,23 @@ impl DaemonClient {
         action: Value,
         session_id: &str,
     ) -> Result<Value, String> {
-        if *self.mode.read().await != ConnectionMode::Daemon {
-            return Err("Not connected to daemon".to_string());
-        }
-
-        let msg_tx = {
-            let guard = self.msg_tx.read().await;
-            guard.clone().ok_or_else(|| "No message sender".to_string())?
-        };
-
-        let id = uuid::Uuid::new_v4().to_string();
-        let request = Request {
-            id: id.clone(),
-            action,
-        };
-
-        let json = serde_json::to_string(&request)
-            .map_err(|e| format!("Serialization error: {}", e))?;
-
-        // Create response channel
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending request
-        {
-            let mut pending = self.pending.write().await;
-            pending.insert(id.clone(), PendingRequest { tx });
-        }
-
-        // Send request
-        msg_tx
-            .send(Message::Text(json.into()))
-            .await
-            .map_err(|e| format!("Send error: {}", e))?;
+        let (id, mut rx) = self.send_request(action).await?;
 
         // Health-check polling loop
-        let mut rx = rx;
         let mut missed_pings: u32 = 0;
 
         loop {
             tokio::select! {
                 // Branch A: response arrives
                 result = &mut rx => {
-                    return match result {
-                        Ok(result) => result,
-                        Err(_) => {
-                            let mut pending = self.pending.write().await;
-                            pending.remove(&id);
-                            Err("Response channel closed".to_string())
-                        }
+                    return if let Ok(result) = result { result } else {
+                        self.pending.write().await.remove(&id);
+                        Err("Response channel closed".to_string())
                     };
                 }
 
                 // Branch B: health-check interval fires
-                _ = tokio::time::sleep(HEALTH_POLL_INTERVAL) => {
+                () = tokio::time::sleep(HEALTH_POLL_INTERVAL) => {
                     let ping_payload = serde_json::json!({
                         "type": "session",
                         "action": "get_run_state",
@@ -704,7 +660,7 @@ impl DaemonClient {
                             missed_pings = 0;
                             let is_running = state
                                 .get("is_running")
-                                .and_then(|v| v.as_bool())
+                                .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
 
                             if !is_running {
@@ -720,8 +676,7 @@ impl DaemonClient {
                                 match tokio::time::timeout(IDLE_GRACE_PERIOD, &mut rx).await {
                                     Ok(Ok(result)) => return result,
                                     Ok(Err(_)) => {
-                                        let mut pending = self.pending.write().await;
-                                        pending.remove(&id);
+                                        self.pending.write().await.remove(&id);
                                         return Err("Response channel closed".to_string());
                                     }
                                     Err(_) => {
@@ -734,8 +689,7 @@ impl DaemonClient {
                                             "Grace period expired — IPC response not received, \
                                              but agent completed. Returning synthetic response."
                                         );
-                                        let mut pending = self.pending.write().await;
-                                        pending.remove(&id);
+                                        self.pending.write().await.remove(&id);
                                         // Return empty success — the GUI already has the streamed content
                                         return Ok(serde_json::json!({
                                             "status": "success",
@@ -763,11 +717,9 @@ impl DaemonClient {
                                 "Health ping failed"
                             );
                             if missed_pings >= MAX_MISSED_PINGS {
-                                let mut pending = self.pending.write().await;
-                                pending.remove(&id);
+                                self.pending.write().await.remove(&id);
                                 return Err(format!(
-                                    "Daemon unresponsive ({} missed health pings)",
-                                    missed_pings
+                                    "Daemon unresponsive ({missed_pings} missed health pings)"
                                 ));
                             }
                         }
@@ -787,6 +739,15 @@ impl DaemonClient {
     // =========================================================================
     
     /// Send a chat message (uses health-check polling instead of hard timeout)
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::request`] does, with one difference: there is no fixed
+    /// request timeout. Instead it fails with `"Daemon unresponsive (N missed health
+    /// pings)"` once three consecutive `session.get_run_state` pings (one every
+    /// 30 s, each allowed 15 s) go unanswered. A run the daemon reports as
+    /// finished whose reply then never arrives within the 60 s grace period is
+    /// answered with a synthetic empty success, not an error.
     pub async fn chat_send(&self, session_id: &str, content: &str, attachments: Vec<serde_json::Value>) -> Result<Value, String> {
         self.request_with_health_polling(
             serde_json::json!({
@@ -801,6 +762,11 @@ impl DaemonClient {
     }
     
     /// Cancel an active chat
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `chat.cancel` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn chat_cancel(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "chat",
@@ -810,6 +776,11 @@ impl DaemonClient {
     }
 
     /// Get system logs
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `system.logs` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn system_logs(&self, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",
@@ -820,6 +791,11 @@ impl DaemonClient {
     }
 
     /// List sessions
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -828,6 +804,11 @@ impl DaemonClient {
     }
 
     /// List sessions filtered by workspace
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.list_by_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_list_by_workspace(&self, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -837,6 +818,11 @@ impl DaemonClient {
     }
     
     /// Create a session
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_create(&self, name: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -846,6 +832,11 @@ impl DaemonClient {
     }
 
     /// Create a session in a specific workspace
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.create_in_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_create_in_workspace(&self, name: Option<&str>, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -856,6 +847,11 @@ impl DaemonClient {
     }
     
     /// Set or clear the workspace for a session
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_workspace` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -866,6 +862,11 @@ impl DaemonClient {
     }
 
     /// Set or clear the chat-model pin for a session
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_model` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_model(&self, session_id: &str, model: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -876,6 +877,11 @@ impl DaemonClient {
     }
 
     /// Render a session as a document (`markdown` or `json`) — `{format, filename, content}`.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.export` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_export(&self, session_id: &str, format: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -887,6 +893,11 @@ impl DaemonClient {
     }
 
     /// A session's file checkpoints, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.file_history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_file_history(
         &self,
         session_id: &str,
@@ -902,6 +913,11 @@ impl DaemonClient {
     }
 
     /// Restore one file checkpoint of a session.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.restore_file` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_restore_file(
         &self,
         session_id: &str,
@@ -921,6 +937,11 @@ impl DaemonClient {
     /// Additive by contract (the daemon unions them into the default active
     /// set); an empty list clears the selection and restores byte-identical
     /// default tool behavior.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.set_tools` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_set_tools(&self, session_id: &str, tools: Vec<String>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -931,6 +952,11 @@ impl DaemonClient {
     }
 
     /// Get session history
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -944,6 +970,11 @@ impl DaemonClient {
     /// Get session run state (in-flight streaming text, active tools).
     /// `light: true` omits the run journal — use it for periodic polls that
     /// only need counters, not the full multi-hour record.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.get_run_state` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_get_run_state(&self, session_id: &str, light: bool) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -954,6 +985,11 @@ impl DaemonClient {
     }
 
     /// Get system status
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `system.status` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn system_status(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",
@@ -966,6 +1002,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// Delete a session
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_delete(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -975,6 +1016,11 @@ impl DaemonClient {
     }
 
     /// Delete all sessions
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.delete_all` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn sessions_delete_all(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -983,6 +1029,11 @@ impl DaemonClient {
     }
 
     /// Rename a session
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.rename` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_rename(&self, session_id: &str, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -993,6 +1044,11 @@ impl DaemonClient {
     }
     
     /// Clear session history
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `session.clear` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn session_clear(&self, session_id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
@@ -1006,6 +1062,11 @@ impl DaemonClient {
     // =========================================================================
 
     /// List all memories
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_list(&self, scope: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1015,6 +1076,11 @@ impl DaemonClient {
     }
 
     /// Search memories
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.search` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_search(&self, query: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1025,6 +1091,11 @@ impl DaemonClient {
     }
     
     /// Get a specific memory
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1034,6 +1105,11 @@ impl DaemonClient {
     }
     
     /// Create a memory
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_create(&self, content: &str, tags: Option<Vec<String>>, importance: Option<u8>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1045,6 +1121,11 @@ impl DaemonClient {
     }
     
     /// Update a memory
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_update(&self, id: &str, content: Option<&str>, tags: Option<Vec<String>>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1056,6 +1137,11 @@ impl DaemonClient {
     }
     
     /// Delete a memory
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_delete(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1065,6 +1151,11 @@ impl DaemonClient {
     }
 
     /// Clear memories ("global", a workspace id, or None = all)
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.clear` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_clear(&self, scope: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1074,6 +1165,11 @@ impl DaemonClient {
     }
 
     /// Get memory stats
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.stats` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_stats(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1082,6 +1178,11 @@ impl DaemonClient {
     }
     
     /// Trigger memory consolidation
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `memory.consolidate` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn memory_consolidate(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
@@ -1094,6 +1195,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// List scheduled jobs
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1102,6 +1208,11 @@ impl DaemonClient {
     }
     
     /// Get job details
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1111,6 +1222,11 @@ impl DaemonClient {
     }
     
     /// Add a cron job
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.add` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_add(&self, schedule: &str, task: &str, name: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1122,6 +1238,11 @@ impl DaemonClient {
     }
     
     /// Update a job
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_update(&self, id: &str, schedule: Option<&str>, task: Option<&str>, enabled: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1134,6 +1255,11 @@ impl DaemonClient {
     }
     
     /// Remove a job
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.remove` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_remove(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1143,6 +1269,11 @@ impl DaemonClient {
     }
     
     /// Run a job immediately
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.run_now` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_run_now(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1152,6 +1283,11 @@ impl DaemonClient {
     }
     
     /// Get job history
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `scheduler.history` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn scheduler_history(&self, id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "scheduler",
@@ -1166,6 +1302,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// List all tools
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1179,6 +1320,11 @@ impl DaemonClient {
     /// hand (a toggle's new state) and never a choice of verb. The daemon's
     /// `enable`/`disable` split is an implementation detail of the wire format,
     /// so it is resolved here instead of at every call site.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.enable` / `tool.disable` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_set_enabled(&self, name: &str, enabled: bool) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1188,6 +1334,11 @@ impl DaemonClient {
     }
 
     /// Execute a tool
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.execute` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_execute(&self, name: &str, input: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1198,6 +1349,11 @@ impl DaemonClient {
     }
     
     /// Create a user tool
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_create(&self, name: &str, description: &str, code: &str, needs_shell: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1210,6 +1366,11 @@ impl DaemonClient {
     }
     
     /// Update a user tool
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_update(&self, name: &str, description: Option<&str>, code: Option<&str>, needs_shell: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1222,6 +1383,11 @@ impl DaemonClient {
     }
     
     /// Delete a user tool
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_delete(&self, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1231,6 +1397,11 @@ impl DaemonClient {
     }
     
     /// Test a user tool (without saving)
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.test` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_test(&self, code: &str, input: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1241,6 +1412,11 @@ impl DaemonClient {
     }
     
     /// List user-created tools
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.list_user` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_list_user(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1249,6 +1425,11 @@ impl DaemonClient {
     }
 
     /// Get tool source code
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `tool.get_source` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn tool_get_source(&self, name: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "tool",
@@ -1262,6 +1443,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// Get config (full or by path)
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_get(&self, path: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1271,6 +1457,11 @@ impl DaemonClient {
     }
     
     /// Set config value
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.set` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_set(&self, path: &str, value: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1281,6 +1472,11 @@ impl DaemonClient {
     }
     
     /// Reset config
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.reset` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_reset(&self, path: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1290,6 +1486,11 @@ impl DaemonClient {
     }
     
     /// Reload config from disk
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.reload` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_reload(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1298,6 +1499,11 @@ impl DaemonClient {
     }
     
     /// Export config
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.export` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_export(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1306,6 +1512,11 @@ impl DaemonClient {
     }
     
     /// Import config
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `config.import` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn config_import(&self, config: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "config",
@@ -1319,6 +1530,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// List workspaces
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1327,6 +1543,11 @@ impl DaemonClient {
     }
     
     /// Get workspace details
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.get` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_get(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1336,6 +1557,11 @@ impl DaemonClient {
     }
     
     /// Open/register a workspace
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.open` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_open(&self, path: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1345,6 +1571,11 @@ impl DaemonClient {
     }
     
     /// Close/unregister a workspace
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.close` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_close(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1354,6 +1585,11 @@ impl DaemonClient {
     }
     
     /// Set active workspace
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.set_active` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_set_active(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1363,6 +1599,11 @@ impl DaemonClient {
     }
     
     /// Clear active workspace (global mode)
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.clear_active` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_clear_active(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1371,6 +1612,11 @@ impl DaemonClient {
     }
     
     /// Reload workspace context
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.reload` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_reload(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1380,6 +1626,11 @@ impl DaemonClient {
     }
     
     /// Get workspace context (SOUL.md, USER.md, etc.)
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.get_context` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_get_context(&self, id: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1389,6 +1640,11 @@ impl DaemonClient {
     }
     
     /// Update workspace context file
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `workspace.update_context` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn workspace_update_context(&self, id: &str, file: &str, content: &str) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "workspace",
@@ -1404,6 +1660,11 @@ impl DaemonClient {
     // =========================================================================
     
     /// List channels
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `channel.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn channel_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "channel",
@@ -1412,6 +1673,11 @@ impl DaemonClient {
     }
     
     /// Get channel status
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `channel.status` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn channel_status(&self, id: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "channel",
@@ -1423,6 +1689,11 @@ impl DaemonClient {
     /// List tasks in a scope. The chat's task checklist reads the store this
     /// way — the store is the chat engine (P19), so the checklist is a view
     /// of the live run, not a separate task UI.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.list` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1434,6 +1705,11 @@ impl DaemonClient {
     }
 
     /// Create a new task.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.create` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_create(
         &self,
         title: &str,
@@ -1456,6 +1732,11 @@ impl DaemonClient {
     }
 
     /// Update a task (partial patch).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_update(&self, id: i64, patch: Value) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1466,6 +1747,11 @@ impl DaemonClient {
     }
 
     /// Mark a task as done (with optional acceptance check).
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.done` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_done(&self, id: i64, workdir: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1476,6 +1762,11 @@ impl DaemonClient {
     }
 
     /// Delete a task and its subtree.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.delete` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_delete(&self, id: i64) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",
@@ -1485,6 +1776,11 @@ impl DaemonClient {
     }
 
     /// Reorder a task by updating its priority.
+    ///
+    /// # Errors
+    ///
+    /// Fails only as [`Self::request`] does. The daemon reports a refused
+    /// `task.update` inside the `Ok` reply (an `error` field), not as an `Err`.
     pub async fn task_reorder(&self, id: i64, new_priority: i64) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "task",

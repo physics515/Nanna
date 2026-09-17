@@ -34,7 +34,9 @@ pub enum TaskType {
     /// Cron job with parsed schedule
     Cron {
         schedule: String,
-        parsed: Option<CronExpr>,
+        /// Boxed: five field sets make a `CronExpr` several times larger than
+        /// every other variant.
+        parsed: Option<Box<CronExpr>>,
         next_run: Option<DateTime<Utc>>,
     },
     /// One-shot delayed task
@@ -75,7 +77,7 @@ impl TaskType {
 
     /// The next wall-clock moment this task is due, where one is known.
     #[must_use]
-    pub fn next_run(&self) -> Option<DateTime<Utc>> {
+    pub const fn next_run(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::Cron { next_run, .. } => *next_run,
             Self::At { fire_at } => Some(*fire_at),
@@ -192,7 +194,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            heartbeat_interval: Duration::from_secs(1800), // 30 minutes
+            heartbeat_interval: Duration::from_mins(30), // 30 minutes
             heartbeat_enabled: true,
             // Do not command a `Read HEARTBEAT.md` here — that drove a read_file
             // tool call that hard-errored on a missing file (resolved to ~ with
@@ -351,10 +353,15 @@ impl Scheduler {
     }
 
     /// Load persisted cron jobs from storage.
+    ///
+    /// Returns 0 without touching anything when no storage is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error when listing the persisted cron jobs fails.
     pub async fn load_jobs(&self) -> Result<usize, nanna_storage::StorageError> {
-        let storage = match &self.storage {
-            Some(s) => s,
-            None => return Ok(0),
+        let Some(storage) = &self.storage else {
+            return Ok(0);
         };
 
         let jobs = storage.cron_jobs().list_all().await?;
@@ -365,6 +372,7 @@ impl Scheduler {
             let task = self.job_to_task(&job);
             tasks.insert(job.job_id, task);
         }
+        drop(tasks);
 
         info!("Loaded {} cron jobs from storage", count);
         Ok(count)
@@ -387,8 +395,8 @@ impl Scheduler {
             }
         } else {
             // Try to parse as cron expression
-            let parsed = CronExpr::parse(&job.schedule).ok();
-            let next_run = parsed.as_ref().and_then(|p| p.next_from_now());
+            let parsed = CronExpr::parse(&job.schedule).ok().map(Box::new);
+            let next_run = parsed.as_deref().and_then(super::cron::CronExpr::next_from_now);
             TaskType::Cron {
                 schedule: job.schedule.clone(),
                 parsed,
@@ -446,9 +454,8 @@ impl Scheduler {
 
     /// Save a task to persistent storage.
     async fn persist_task(&self, task: &ScheduledTask) -> Result<(), nanna_storage::StorageError> {
-        let storage = match &self.storage {
-            Some(s) => s,
-            None => return Ok(()),
+        let Some(storage) = &self.storage else {
+            return Ok(());
         };
 
         let schedule = task.task_type.schedule_label();
@@ -486,6 +493,11 @@ impl Scheduler {
     }
 
     /// Create a cron task from a schedule expression
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
+    /// a valid cron expression.
     pub fn cron_task(
         name: &str,
         schedule: &str,
@@ -499,7 +511,7 @@ impl Scheduler {
             name: name.to_string(),
             task_type: TaskType::Cron {
                 schedule: schedule.to_string(),
-                parsed: Some(parsed),
+                parsed: Some(Box::new(parsed)),
                 next_run,
             },
             payload: payload.to_string(),
@@ -527,17 +539,24 @@ impl Scheduler {
     /// Remove a task (from memory and storage)
     pub async fn remove_task(&self, task_id: &str) -> bool {
         // Remove from storage
-        if let Some(storage) = &self.storage {
-            if let Err(e) = storage.cron_jobs().delete(task_id).await {
+        if let Some(storage) = &self.storage
+            && let Err(e) = storage.cron_jobs().delete(task_id).await {
                 warn!("Failed to delete task {} from storage: {}", task_id, e);
             }
-        }
 
         let mut tasks = self.tasks.write().await;
         tasks.remove(task_id).is_some()
     }
 
     /// Update a task's schedule
+    ///
+    /// Returns `Ok(false)` when no task has `task_id`. The storage update is
+    /// best-effort and its failure is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CronError`] from [`CronExpr::parse`] when `schedule` is not
+    /// a valid cron expression; the task is left unchanged.
     pub async fn update_schedule(
         &self,
         task_id: &str,
@@ -550,7 +569,7 @@ impl Scheduler {
         if let Some(task) = tasks.get_mut(task_id) {
             task.task_type = TaskType::Cron {
                 schedule: schedule.to_string(),
-                parsed: Some(parsed),
+                parsed: Some(Box::new(parsed)),
                 next_run,
             };
 
@@ -572,11 +591,10 @@ impl Scheduler {
     /// Enable/disable a task (persisted)
     pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) {
         // Update storage
-        if let Some(storage) = &self.storage {
-            if let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
+        if let Some(storage) = &self.storage
+            && let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
                 warn!("Failed to update task {} enabled state: {}", task_id, e);
             }
-        }
 
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(task_id) {
@@ -637,10 +655,12 @@ impl Scheduler {
             matching.sort_by(|a, b| a.id.cmp(&b.id));
 
             // Skip the first one, return the rest for deletion
-            matching.into_iter()
+            let ids = matching.into_iter()
                 .skip(1)
                 .map(|t| t.id.clone())
-                .collect()
+                .collect();
+            drop(tasks);
+            ids
         };
 
         let count = task_ids.len();
@@ -661,7 +681,7 @@ impl Scheduler {
 
     /// Record a job run
     async fn record_run(&self, result: &TaskResult) {
-        record_run_in(&self.history, result).await;
+        record_run_in(&self.history, &result.task_id, result).await;
     }
 
     /// How often the loop looks for due work — the resolution of every
@@ -753,22 +773,7 @@ impl Scheduler {
                             let result = executor(task).await;
 
                             // Record heartbeat run
-                            {
-                                let mut hist = history.write().await;
-                                let runs = hist.entry("heartbeat".to_string()).or_default();
-                                runs.push(JobRun {
-                                    id: runs.len() as i64 + 1,
-                                    job_id: "heartbeat".to_string(),
-                                    started_at: result.started_at,
-                                    finished_at: Some(result.finished_at),
-                                    success: result.success,
-                                    output: result.output.clone(),
-                                    error: result.error.clone(),
-                                });
-                                if runs.len() > 100 {
-                                    runs.remove(0);
-                                }
-                            }
+                            record_run_in(&history, "heartbeat", &result).await;
 
                             if !result.success {
                                 warn!("Heartbeat failed: {:?}", result.error);
@@ -872,7 +877,7 @@ async fn run_due_task(
         "a run cannot finish before it starts"
     );
 
-    record_run_in(&history, &result).await;
+    record_run_in(&history, &result.task_id, &result).await;
 
     let next_run = {
         let mut tasks_guard = tasks.write().await;
@@ -975,13 +980,21 @@ async fn settle_in_storage(
     }
 }
 
-/// Append a run to the bounded per-job history.
-async fn record_run_in(history: &RwLock<HashMap<String, Vec<JobRun>>>, result: &TaskResult) {
+/// Append a run to the bounded per-job history, under `job_id`.
+///
+/// The id is explicit because the heartbeat files its runs under `heartbeat`
+/// rather than under a task id — it used to keep its own copy of this function
+/// for that, with its own bound.
+async fn record_run_in(
+    history: &RwLock<HashMap<String, Vec<JobRun>>>,
+    job_id: &str,
+    result: &TaskResult,
+) {
     let mut hist = history.write().await;
-    let runs = hist.entry(result.task_id.clone()).or_default();
+    let runs = hist.entry(job_id.to_string()).or_default();
     runs.push(JobRun {
-        id: runs.len() as i64 + 1,
-        job_id: result.task_id.clone(),
+        id: i64::try_from(runs.len()).unwrap_or(i64::MAX - 1) + 1,
+        job_id: job_id.to_string(),
         started_at: result.started_at,
         finished_at: Some(result.finished_at),
         success: result.success,
@@ -992,6 +1005,9 @@ async fn record_run_in(history: &RwLock<HashMap<String, Vec<JobRun>>>, result: &
         runs.remove(0);
     }
     debug_assert!(runs.len() <= JOB_HISTORY_RUNS_MAX);
+    // Held across the push and the trim together: a reader between them would
+    // see the history one run over its bound.
+    drop(hist);
 }
 
 /// Runs kept per job. The GUI's history view pages ten at a time; a hundred is
@@ -1006,7 +1022,7 @@ fn parse_at(schedule: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Parse interval string like "every_300s" into seconds
+/// Parse interval string like `every_300s` into seconds
 fn parse_interval(schedule: &str) -> Option<u64> {
     if schedule.starts_with("every_") && schedule.ends_with('s') {
         let num_str = &schedule[6..schedule.len() - 1];
@@ -1016,7 +1032,7 @@ fn parse_interval(schedule: &str) -> Option<u64> {
     }
 }
 
-/// Parse delay string like "delay_60s" into seconds
+/// Parse delay string like "`delay_60s`" into seconds
 fn parse_delay(schedule: &str) -> Option<u64> {
     if schedule.starts_with("delay_") && schedule.ends_with('s') {
         let num_str = &schedule[6..schedule.len() - 1];

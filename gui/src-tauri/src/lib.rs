@@ -17,27 +17,20 @@ pub mod commands;
 pub mod state;
 
 use backend::{Backend, BackendMode};
+use state::{backend_handle, AppState, CloseMode};
 
 use nanna_config::Config;
-use nanna_core::{
-    Workspace, WorkspaceRegistry, find_workspace_root, discover_workspaces,
-};
-use nanna_core::log_buffer::{LogBuffer, LogBufferLayer, LogEntry, LogSource};
-use serde::{Deserialize, Serialize};
+use nanna_core::{Workspace, WorkspaceRegistry};
+use nanna_core::log_buffer::{LogBuffer, LogBufferLayer, LogSource};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     menu::{MenuBuilder, MenuItemBuilder},
-    AppHandle, Emitter, Manager, State,
+    Emitter, Manager,
 };
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-
-// Re-export moved items at the crate root so sibling modules that `use crate::*`
-// keep resolving their existing paths.
-pub(crate) use commands::settings::*;
-pub(crate) use state::*;
 
 // =============================================================================
 // App Setup
@@ -146,61 +139,12 @@ async fn setup_state(
 /// output merged with the daemon's. ~5k entries x ~200 B is ~1 MB resident.
 const GUI_LOG_BUFFER_ENTRIES: usize = 5000;
 
-pub fn run() {
-    use tracing_subscriber::filter::LevelFilter;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    // Log to stdout AND into an in-memory buffer, so the GUI's own lines are
-    // visible on the Logs page (merged with the daemon's).
-    let log_buffer = LogBuffer::new(GUI_LOG_BUFFER_ENTRIES, LogSource::Embedded);
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nanna=info".parse().unwrap_or_else(|_| LevelFilter::INFO.into())),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .with(LogBufferLayer::new(log_buffer.clone()))
-        .init();
-
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .setup(|app| {
-            let handle = app.handle().clone();
-
-            setup_system_tray(app)?;
-
-            tauri::async_runtime::spawn(async move {
-                // Start and connect to the daemon sidecar. A failed connect is a
-                // hard, user-visible state (the frontend shows a "start the
-                // daemon" affordance); there is no embedded fallback.
-                let backend = Arc::new(Backend::new());
-                let mode = backend.init(&handle).await;
-                match mode {
-                    BackendMode::Daemon => info!("Backend connected to daemon"),
-                    BackendMode::Disconnected => {
-                        error!("Backend could not reach the daemon — the app will show a disconnected state until it connects");
-                    }
-                }
-
-                match setup_state(backend, log_buffer).await {
-                    Ok(state) => {
-                        handle.manage(Arc::new(RwLock::new(state)));
-                        info!("App state initialized successfully");
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize app state: {e}");
-                    }
-                }
-            });
-
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+/// The Tauri command table: every `#[tauri::command]` the frontend can
+/// `invoke`, by name. Kept out of [`run`] because it is a registry, not setup
+/// logic; expands to the `generate_handler!` closure `invoke_handler` takes.
+macro_rules! command_handler {
+    () => {
+        tauri::generate_handler![
             commands::chat::send_message,
             commands::sessions::create_session,
             commands::sessions::list_sessions,
@@ -406,7 +350,75 @@ pub fn run() {
             commands::tasks::complete_task,
             commands::tasks::delete_task,
             commands::tasks::reorder_task,
-        ])
+        ]
+    };
+}
+
+/// Build and run the Tauri application until it exits.
+///
+/// # Panics
+///
+/// Panics when a global `tracing` subscriber is already installed in this
+/// process (the logging setup here installs one); when Tauri fails to build
+/// the application — an invalid bundled `tauri.conf.json`, or a plugin, the
+/// main window or the system tray failing to initialize; and when the bundle
+/// has no default window icon for the tray. None of these has a UI yet to
+/// report to.
+pub fn run() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Log to stdout AND into an in-memory buffer, so the GUI's own lines are
+    // visible on the Logs page (merged with the daemon's).
+    let log_buffer = LogBuffer::new(GUI_LOG_BUFFER_ENTRIES, LogSource::Embedded);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("nanna=info".parse().unwrap_or_else(|_| LevelFilter::INFO.into())),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .with(LogBufferLayer::new(log_buffer.clone()))
+        .init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            setup_system_tray(app)?;
+
+            tauri::async_runtime::spawn(async move {
+                // Start and connect to the daemon sidecar. A failed connect is a
+                // hard, user-visible state (the frontend shows a "start the
+                // daemon" affordance); there is no embedded fallback.
+                let backend = Arc::new(Backend::new());
+                let mode = backend.init(&handle).await;
+                match mode {
+                    BackendMode::Daemon => info!("Backend connected to daemon"),
+                    BackendMode::Disconnected => {
+                        error!("Backend could not reach the daemon — the app will show a disconnected state until it connects");
+                    }
+                }
+
+                match setup_state(backend, log_buffer).await {
+                    Ok(state) => {
+                        handle.manage(Arc::new(RwLock::new(state)));
+                        info!("App state initialized successfully");
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize app state: {e}");
+                    }
+                }
+            });
+
+            Ok(())
+        })
+        .invoke_handler(command_handler!())
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
@@ -417,9 +429,9 @@ pub fn run() {
                 if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
                     let state = state.inner().clone();
                     tauri::async_runtime::block_on(async {
-                        let state_guard = state.read().await;
+                        let backend = backend_handle(&state).await;
                         info!("Shutting down backend...");
-                        state_guard.backend.shutdown().await;
+                        backend.shutdown().await;
                     });
                 }
             }

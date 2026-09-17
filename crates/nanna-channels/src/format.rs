@@ -14,7 +14,7 @@ use crate::{ChannelCapabilities, MessageContent};
 
 /// Adapt outgoing `content` to what `caps` can render.
 ///
-/// For a text message on a channel WITHOUT [`ChannelFeatures::MARKDOWN`], strip
+/// For a text message on a channel WITHOUT [`ChannelFeatures::MARKDOWN`](crate::ChannelFeatures::MARKDOWN), strip
 /// Markdown to plain text. Non-text content and Markdown-capable channels are
 /// returned unchanged.
 #[must_use]
@@ -236,7 +236,7 @@ pub fn split_for_length(text: &str, max_chars: usize) -> Vec<String> {
     }
 
     debug_assert!(chunks.iter().all(|c| c.chars().count() <= max_chars));
-    debug_assert!(!chunks.is_empty());
+    debug_assert_ne!(chunks, [] as [std::string::String; 0]);
     chunks
 }
 

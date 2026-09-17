@@ -1,14 +1,28 @@
 //! Channel configuration and status commands.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::state::AppState;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
+use tracing::info;
 
 /// Save channel configuration
+///
+/// # Errors
+///
+/// Returns `Missing <key>` when a key the channel requires is absent:
+/// `bot_token` (telegram, discord, slack), `application_id` and `public_key`
+/// (discord), `signing_secret` (slack), `phone_number` (signal) or
+/// `connection_method` (whatsapp). Returns `Unknown channel: …` for any other
+/// channel, and `Failed to save config: …` when `config.toml` cannot be written
+/// — the cached config has already changed by then.
 #[tauri::command]
 pub async fn save_channel_config(
     state: State<'_, Arc<RwLock<AppState>>>,
     channel: String,
-    config: HashMap<String, String>,
+    config: BTreeMap<String, String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
 
@@ -132,28 +146,39 @@ pub async fn save_channel_config(
                 allowed_contacts,
             });
         }
-        _ => return Err(format!("Unknown channel: {}", channel)),
+        _ => return Err(format!("Unknown channel: {channel}")),
     }
 
     // Save to disk
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("Saved {} channel configuration", channel);
     Ok(())
 }
 
 /// Test channel connection
+///
+/// # Errors
+///
+/// Returns `Telegram not configured` or `Discord not configured` when that
+/// channel has no saved config, and the body's decoding error when the service
+/// answers with success but a body that is not JSON. An unreachable service or
+/// an error status is `Ok` with `success: false`, and so is a channel that has
+/// no test.
 #[tauri::command]
 pub async fn test_channel_connection(
     state: State<'_, Arc<RwLock<AppState>>>,
     channel: String,
 ) -> Result<TestConnectionResult, String> {
-    let state_guard = state.read().await;
+    // A snapshot: the probes below make network calls, which must not hold
+    // the state lock.
+    let channels = state.read().await.config.channels.clone();
 
     match channel.to_lowercase().as_str() {
         "telegram" => {
-            let config = state_guard.config.channels.telegram.as_ref()
+            let config = channels.telegram.as_ref()
                 .ok_or("Telegram not configured")?;
 
             // Test by calling getMe
@@ -168,7 +193,7 @@ pub async fn test_channel_connection(
                         let username = data["result"]["username"].as_str().unwrap_or("unknown");
                         Ok(TestConnectionResult {
                             success: true,
-                            message: format!("Connected to @{}", username),
+                            message: format!("Connected to @{username}"),
                         })
                     } else {
                         Ok(TestConnectionResult {
@@ -179,12 +204,12 @@ pub async fn test_channel_connection(
                 }
                 Err(e) => Ok(TestConnectionResult {
                     success: false,
-                    message: format!("Connection failed: {}", e),
+                    message: format!("Connection failed: {e}"),
                 }),
             }
         }
         "discord" => {
-            let config = state_guard.config.channels.discord.as_ref()
+            let config = channels.discord.as_ref()
                 .ok_or("Discord not configured")?;
 
             // Test by calling /users/@me
@@ -203,7 +228,7 @@ pub async fn test_channel_connection(
                         let username = data["username"].as_str().unwrap_or("unknown");
                         Ok(TestConnectionResult {
                             success: true,
-                            message: format!("Connected as {}", username),
+                            message: format!("Connected as {username}"),
                         })
                     } else {
                         Ok(TestConnectionResult {
@@ -214,13 +239,13 @@ pub async fn test_channel_connection(
                 }
                 Err(e) => Ok(TestConnectionResult {
                     success: false,
-                    message: format!("Connection failed: {}", e),
+                    message: format!("Connection failed: {e}"),
                 }),
             }
         }
         _ => Ok(TestConnectionResult {
             success: false,
-            message: format!("Testing not implemented for {}", channel),
+            message: format!("Testing not implemented for {channel}"),
         }),
     }
 }
@@ -284,6 +309,11 @@ pub struct ChannelStatusEvent {
 }
 
 /// Get status of all configured channels
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_channel_status(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -300,12 +330,7 @@ pub async fn get_channel_status(
         enabled: config.channels.telegram.is_some(),
         status: if config.channels.telegram.is_some() { "ready" } else { "not_configured" }.to_string(),
         details: config.channels.telegram.as_ref().map(|t| {
-            let token_preview = if t.bot_token.len() > 10 {
-                format!("{}...{}", &t.bot_token[..5], &t.bot_token[t.bot_token.len()-4..])
-            } else {
-                "***".to_string()
-            };
-            format!("Bot token: {}", token_preview)
+            format!("Bot token: {}", token_preview(&t.bot_token))
         }),
     });
 
@@ -353,11 +378,17 @@ pub async fn get_channel_status(
             format!("Method: {}", w.connection_method)
         }),
     });
+    drop(state_guard);
 
     Ok(channels)
 }
 
 /// Get enhanced status for all channels with health metrics
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_enhanced_channel_status(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -381,12 +412,7 @@ pub async fn get_enhanced_channel_status(
 
         let details = match provider {
             "telegram" => config.channels.telegram.as_ref().map(|t| {
-                let token_preview = if t.bot_token.len() > 10 {
-                    format!("{}...{}", &t.bot_token[..5], &t.bot_token[t.bot_token.len()-4..])
-                } else {
-                    "***".to_string()
-                };
-                format!("Bot token: {}", token_preview)
+                format!("Bot token: {}", token_preview(&t.bot_token))
             }),
             "discord" => config.channels.discord.as_ref().map(|d| {
                 format!("App ID: {}", d.application_id)
@@ -422,17 +448,25 @@ pub async fn get_enhanced_channel_status(
             rate_limit_remaining_ms: None,
         });
     }
+    drop(state_guard);
 
     Ok(statuses)
 }
 
 /// Test connection for any channel
+///
+/// # Errors
+///
+/// Returns the HTTP client builder's error when the client cannot be built (no
+/// usable TLS backend, for example). Every per-channel failure is reported in
+/// the map as `success: false` instead.
 #[tauri::command]
 pub async fn test_all_channels(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<HashMap<String, TestConnectionResult>, String> {
-    let state_guard = state.read().await;
-    let config = &state_guard.config;
+    // A snapshot: the probes below make network calls, which must not hold
+    // the state lock.
+    let channels = state.read().await.config.channels.clone();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -440,191 +474,222 @@ pub async fn test_all_channels(
 
     let mut results = HashMap::new();
 
-    // Telegram
-    if let Some(telegram) = &config.channels.telegram {
-        let url = format!("https://api.telegram.org/bot{}/getMe", telegram.bot_token);
-        let result = match client.get(&url).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let data: serde_json::Value = response.json().await.unwrap_or_default();
-                    let username = data["result"]["username"].as_str().unwrap_or("unknown");
-                    TestConnectionResult {
-                        success: true,
-                        message: format!("Connected to @{}", username),
-                    }
-                } else if response.status().as_u16() == 429 {
-                    TestConnectionResult {
-                        success: false,
-                        message: "Rate limited".to_string(),
-                    }
-                } else {
-                    TestConnectionResult {
-                        success: false,
-                        message: format!("API error: {}", response.status()),
-                    }
-                }
-            }
-            Err(e) => TestConnectionResult {
-                success: false,
-                message: format!("Connection failed: {}", e),
-            },
-        };
-        results.insert("telegram".to_string(), result);
+    if let Some(telegram) = &channels.telegram {
+        results.insert("telegram".to_string(), probe_telegram(&client, telegram).await);
     }
-
-    // Discord
-    if let Some(discord) = &config.channels.discord {
-        let result = match client
-            .get("https://discord.com/api/v10/users/@me")
-            .header("Authorization", format!("Bot {}", discord.bot_token))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let data: serde_json::Value = response.json().await.unwrap_or_default();
-                    let username = data["username"].as_str().unwrap_or("unknown");
-                    TestConnectionResult {
-                        success: true,
-                        message: format!("Connected as {}", username),
-                    }
-                } else if response.status().as_u16() == 429 {
-                    TestConnectionResult {
-                        success: false,
-                        message: "Rate limited".to_string(),
-                    }
-                } else {
-                    TestConnectionResult {
-                        success: false,
-                        message: format!("API error: {}", response.status()),
-                    }
-                }
-            }
-            Err(e) => TestConnectionResult {
-                success: false,
-                message: format!("Connection failed: {}", e),
-            },
-        };
-        results.insert("discord".to_string(), result);
+    if let Some(discord) = &channels.discord {
+        results.insert("discord".to_string(), probe_discord(&client, discord).await);
     }
-
-    // Slack
-    if let Some(slack) = &config.channels.slack {
-        let result = match client
-            .post("https://slack.com/api/auth.test")
-            .header("Authorization", format!("Bearer {}", slack.bot_token))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let data: serde_json::Value = response.json().await.unwrap_or_default();
-                    if data["ok"].as_bool().unwrap_or(false) {
-                        let team = data["team"].as_str().unwrap_or("unknown");
-                        let user = data["user"].as_str().unwrap_or("unknown");
-                        TestConnectionResult {
-                            success: true,
-                            message: format!("Connected to {} as {}", team, user),
-                        }
-                    } else {
-                        let error = data["error"].as_str().unwrap_or("unknown error");
-                        TestConnectionResult {
-                            success: false,
-                            message: format!("Slack error: {}", error),
-                        }
-                    }
-                } else {
-                    TestConnectionResult {
-                        success: false,
-                        message: format!("HTTP error: {}", response.status()),
-                    }
-                }
-            }
-            Err(e) => TestConnectionResult {
-                success: false,
-                message: format!("Connection failed: {}", e),
-            },
-        };
-        results.insert("slack".to_string(), result);
+    if let Some(slack) = &channels.slack {
+        results.insert("slack".to_string(), probe_slack(&client, slack).await);
     }
-
-    // Signal - test signald or REST API
-    if let Some(signal) = &config.channels.signal {
-        let api_url = signal.api_url.as_deref().unwrap_or("http://localhost:8080");
-        let result = match client.get(format!("{}/v1/about", api_url)).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    TestConnectionResult {
-                        success: true,
-                        message: format!("Signal API available at {}", api_url),
-                    }
-                } else {
-                    TestConnectionResult {
-                        success: false,
-                        message: format!("Signal API error: {}", response.status()),
-                    }
-                }
-            }
-            Err(e) => TestConnectionResult {
-                success: false,
-                message: format!("Signal API not reachable: {}", e),
-            },
-        };
-        results.insert("signal".to_string(), result);
+    if let Some(signal) = &channels.signal {
+        results.insert("signal".to_string(), probe_signal(&client, signal).await);
     }
-
-    // WhatsApp - test based on connection method
-    if let Some(whatsapp) = &config.channels.whatsapp {
-        let result = if whatsapp.connection_method == "cloud_api" {
-            if let (Some(phone_id), Some(token)) = (&whatsapp.phone_number_id, &whatsapp.access_token) {
-                let url = format!(
-                    "https://graph.facebook.com/v18.0/{}/",
-                    phone_id
-                );
-                match client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            TestConnectionResult {
-                                success: true,
-                                message: "WhatsApp Cloud API connected".to_string(),
-                            }
-                        } else {
-                            TestConnectionResult {
-                                success: false,
-                                message: format!("API error: {}", response.status()),
-                            }
-                        }
-                    }
-                    Err(e) => TestConnectionResult {
-                        success: false,
-                        message: format!("Connection failed: {}", e),
-                    },
-                }
-            } else {
-                TestConnectionResult {
-                    success: false,
-                    message: "Missing phone_number_id or access_token".to_string(),
-                }
-            }
-        } else {
-            // Web bridge - just check if configured
-            TestConnectionResult {
-                success: true,
-                message: "Web bridge configured (QR auth required)".to_string(),
-            }
-        };
-        results.insert("whatsapp".to_string(), result);
+    if let Some(whatsapp) = &channels.whatsapp {
+        results.insert("whatsapp".to_string(), probe_whatsapp(&client, whatsapp).await);
     }
 
     Ok(results)
 }
 
+/// Telegram: `getMe` with the bot token.
+async fn probe_telegram(
+    client: &reqwest::Client,
+    telegram: &nanna_config::TelegramConfig,
+) -> TestConnectionResult {
+    let url = format!("https://api.telegram.org/bot{}/getMe", telegram.bot_token);
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                let data: serde_json::Value = response.json().await.unwrap_or_default();
+                let username = data["result"]["username"].as_str().unwrap_or("unknown");
+                TestConnectionResult {
+                    success: true,
+                    message: format!("Connected to @{username}"),
+                }
+            } else if response.status().as_u16() == 429 {
+                TestConnectionResult {
+                    success: false,
+                    message: "Rate limited".to_string(),
+                }
+            } else {
+                TestConnectionResult {
+                    success: false,
+                    message: format!("API error: {}", response.status()),
+                }
+            }
+        }
+        Err(e) => TestConnectionResult {
+            success: false,
+            message: format!("Connection failed: {e}"),
+        },
+    }
+}
+
+/// Discord: `/users/@me` with the bot token.
+async fn probe_discord(
+    client: &reqwest::Client,
+    discord: &nanna_config::DiscordConfig,
+) -> TestConnectionResult {
+    match client
+        .get("https://discord.com/api/v10/users/@me")
+        .header("Authorization", format!("Bot {}", discord.bot_token))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let data: serde_json::Value = response.json().await.unwrap_or_default();
+                let username = data["username"].as_str().unwrap_or("unknown");
+                TestConnectionResult {
+                    success: true,
+                    message: format!("Connected as {username}"),
+                }
+            } else if response.status().as_u16() == 429 {
+                TestConnectionResult {
+                    success: false,
+                    message: "Rate limited".to_string(),
+                }
+            } else {
+                TestConnectionResult {
+                    success: false,
+                    message: format!("API error: {}", response.status()),
+                }
+            }
+        }
+        Err(e) => TestConnectionResult {
+            success: false,
+            message: format!("Connection failed: {e}"),
+        },
+    }
+}
+
+/// Slack: `auth.test` with the bot token.
+async fn probe_slack(
+    client: &reqwest::Client,
+    slack: &nanna_config::SlackConfig,
+) -> TestConnectionResult {
+    match client
+        .post("https://slack.com/api/auth.test")
+        .header("Authorization", format!("Bearer {}", slack.bot_token))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let data: serde_json::Value = response.json().await.unwrap_or_default();
+                if data["ok"].as_bool().unwrap_or(false) {
+                    let team = data["team"].as_str().unwrap_or("unknown");
+                    let user = data["user"].as_str().unwrap_or("unknown");
+                    TestConnectionResult {
+                        success: true,
+                        message: format!("Connected to {team} as {user}"),
+                    }
+                } else {
+                    let error = data["error"].as_str().unwrap_or("unknown error");
+                    TestConnectionResult {
+                        success: false,
+                        message: format!("Slack error: {error}"),
+                    }
+                }
+            } else {
+                TestConnectionResult {
+                    success: false,
+                    message: format!("HTTP error: {}", response.status()),
+                }
+            }
+        }
+        Err(e) => TestConnectionResult {
+            success: false,
+            message: format!("Connection failed: {e}"),
+        },
+    }
+}
+
+/// Signal: the REST bridge's `/v1/about`.
+async fn probe_signal(
+    client: &reqwest::Client,
+    signal: &nanna_config::SignalConfig,
+) -> TestConnectionResult {
+    let api_url = signal.api_url.as_deref().unwrap_or("http://localhost:8080");
+    match client.get(format!("{api_url}/v1/about")).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                TestConnectionResult {
+                    success: true,
+                    message: format!("Signal API available at {api_url}"),
+                }
+            } else {
+                TestConnectionResult {
+                    success: false,
+                    message: format!("Signal API error: {}", response.status()),
+                }
+            }
+        }
+        Err(e) => TestConnectionResult {
+            success: false,
+            message: format!("Signal API not reachable: {e}"),
+        },
+    }
+}
+
+/// `WhatsApp`: the Cloud API phone-number endpoint for a `cloud_api` setup. A
+/// web-bridge setup cannot be probed without its QR login, so it only reports
+/// being configured.
+async fn probe_whatsapp(
+    client: &reqwest::Client,
+    whatsapp: &nanna_config::WhatsAppConfig,
+) -> TestConnectionResult {
+    if whatsapp.connection_method == "cloud_api" {
+        if let (Some(phone_id), Some(token)) = (&whatsapp.phone_number_id, &whatsapp.access_token) {
+            let url = format!(
+                "https://graph.facebook.com/v18.0/{phone_id}/"
+            );
+            match client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        TestConnectionResult {
+                            success: true,
+                            message: "WhatsApp Cloud API connected".to_string(),
+                        }
+                    } else {
+                        TestConnectionResult {
+                            success: false,
+                            message: format!("API error: {}", response.status()),
+                        }
+                    }
+                }
+                Err(e) => TestConnectionResult {
+                    success: false,
+                    message: format!("Connection failed: {e}"),
+                },
+            }
+        } else {
+            TestConnectionResult {
+                success: false,
+                message: "Missing phone_number_id or access_token".to_string(),
+            }
+        }
+    } else {
+        // Web bridge - just check if configured
+        TestConnectionResult {
+            success: true,
+            message: "Web bridge configured (QR auth required)".to_string(),
+        }
+    }
+}
+
 /// Subscribe to channel status updates (starts background polling)
+///
+/// # Errors
+///
+/// Never returns `Err`: the polling task is spawned and runs detached.
 #[tauri::command]
 pub async fn subscribe_channel_status(
     app: AppHandle,
@@ -643,17 +708,23 @@ pub async fn subscribe_channel_status(
         loop {
             tokio::time::sleep(interval).await;
 
-            let state_guard = state_arc.read().await;
-            let config = &state_guard.config;
+            // A snapshot: the probe below is a network call, which must not
+            // hold the state lock.
+            let telegram = state_arc.read().await.config.channels.telegram.clone();
 
             // Check Telegram
-            if let Some(telegram) = &config.channels.telegram {
+            if let Some(telegram) = &telegram {
                 let start = std::time::Instant::now();
                 let url = format!("https://api.telegram.org/bot{}/getMe", telegram.bot_token);
 
-                let (status, response_ms) = match client.get(&url).send().await {
-                    Ok(response) => {
-                        let ms = start.elapsed().as_millis() as f64;
+                let (status, response_ms) = client.get(&url).send().await.map_or(
+                    ("unavailable", None),
+                    |response| {
+                        // Exact: a u32 of milliseconds is 49 days, far past
+                        // any request, and every u32 converts to f64 exactly.
+                        let ms = f64::from(
+                            u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX),
+                        );
                         if response.status().is_success() {
                             ("connected", Some(ms))
                         } else if response.status().as_u16() == 429 {
@@ -661,9 +732,8 @@ pub async fn subscribe_channel_status(
                         } else {
                             ("degraded", Some(ms))
                         }
-                    }
-                    Err(_) => ("unavailable", None),
-                };
+                    },
+                );
 
                 let event = ChannelStatusEvent {
                     provider: "telegram".to_string(),
@@ -676,7 +746,7 @@ pub async fn subscribe_channel_status(
                         details: None,
                         connection_state: status.to_string(),
                         last_healthy: if status == "connected" { Some(chrono::Utc::now().timestamp_millis()) } else { None },
-                        consecutive_failures: if status == "connected" { 0 } else { 1 },
+                        consecutive_failures: u32::from(status != "connected"),
                         avg_response_ms: response_ms,
                         messages_sent_hour: 0,
                         messages_failed_hour: 0,
@@ -700,10 +770,46 @@ pub async fn subscribe_channel_status(
 }
 
 /// Unsubscribe from channel status updates
+///
+/// # Errors
+///
+/// Never returns `Err`.
 #[tauri::command]
 pub async fn unsubscribe_channel_status() -> Result<(), String> {
     // In a full implementation, we'd track the task handle and cancel it
     // For now, the task just continues running
     info!("Channel status subscription would be cancelled");
     Ok(())
+}
+
+/// A bot token shown as its first 5 and last 4 characters, or `***` when it is
+/// too short to reveal that much safely.
+///
+/// Counted in characters, not bytes: slicing the token at byte offsets panicked
+/// the command when a pasted token held a multi-byte character at a cut point.
+fn token_preview(token: &str) -> String {
+    let chars = token.chars().count();
+    if chars <= 10 {
+        return "***".to_string();
+    }
+    let head: String = token.chars().take(5).collect();
+    let tail: String = token.chars().skip(chars - 4).collect();
+    format!("{head}...{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_preview;
+
+    #[test]
+    fn token_preview_matches_the_old_ascii_output() {
+        assert_eq!(token_preview("123456789:ABCdefGHI"), "12345...fGHI");
+        assert_eq!(token_preview("0123456789"), "***");
+    }
+
+    #[test]
+    fn token_preview_never_splits_a_character() {
+        // A byte cut at 5 or at len-4 would land inside these characters.
+        assert_eq!(token_preview("1234é6789abcdé"), "1234é...bcdé");
+    }
 }

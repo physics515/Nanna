@@ -60,7 +60,7 @@ pub enum RestartPolicy {
 impl RestartPolicy {
     /// Create exponential backoff with sensible defaults
     #[must_use]
-    pub fn exponential_backoff() -> Self {
+    pub const fn exponential_backoff() -> Self {
         Self::ExponentialBackoff {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(300), // 5 minutes
@@ -169,7 +169,7 @@ const MAX_PROBE_ANSWER_BYTES: usize = 4096;
 /// substring test on the two most common letters in English. It passed on
 /// **"I am broken"**, **"not ok"**, **"Out of tokens"** and **"Something looks
 /// wrong"** — so an agent explicitly reporting that it was broken was recorded
-/// as healthy, and the whole failure_threshold state machine below it could
+/// as healthy, and the whole `failure_threshold` state machine below it could
 /// never fire. A liveness probe that cannot fail is worse than no probe,
 /// because it manufactures confidence.
 ///
@@ -342,7 +342,7 @@ impl SupervisedAgentConfig {
 
     /// Set restart policy
     #[must_use]
-    pub fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
+    pub const fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
         self.restart_policy = policy;
         self
     }
@@ -363,7 +363,7 @@ impl SupervisedAgentConfig {
 
     /// Set priority
     #[must_use]
-    pub fn with_priority(mut self, priority: i32) -> Self {
+    pub const fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
     }
@@ -474,16 +474,25 @@ impl Supervisor {
     }
 
     /// Start a specific agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Stopped` when no agent with `agent_id` is
+    /// supervised. Starting an agent that is already running or starting is
+    /// a successful no-op.
     pub async fn start_agent(&self, agent_id: &str) -> Result<(), AgentError> {
         let mut agents = self.agents.write().await;
         let handle = agents.get_mut(agent_id)
-            .ok_or_else(|| AgentError::Stopped)?;
+            .ok_or(AgentError::Stopped)?;
         
         if handle.state == AgentState::Running || handle.state == AgentState::Starting {
             return Ok(()); // Already running
         }
         
-        self.spawn_agent_task(handle).await;
+        self.spawn_agent_task(handle);
+        // Held from the state check through the spawn so two concurrent
+        // starts cannot both see a stopped agent and spawn it twice.
+        drop(agents);
         Ok(())
     }
 
@@ -613,7 +622,7 @@ impl Supervisor {
 
     // ---- Internal methods ----
 
-    async fn spawn_agent_task(&self, handle: &mut SupervisedAgentHandle) {
+    fn spawn_agent_task(&self, handle: &mut SupervisedAgentHandle) {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         handle.shutdown_tx = Some(shutdown_tx);
         handle.state = AgentState::Starting;
@@ -683,11 +692,13 @@ impl Supervisor {
             let agents = agents.read().await;
             let Some(handle) = agents.get(agent_id) else { return };
             let Some(hc) = &handle.config.health_check else { return };
-            (hc.clone(), handle.config.agent_config.clone(), handle.config.system_prompt.clone())
+            let probe = (hc.clone(), handle.config.agent_config.clone(), handle.config.system_prompt.clone());
+            drop(agents);
+            probe
         };
         
         // Perform health check probe
-        let context = AgentContext::new(&format!("{}-health", agent_id))
+        let context = AgentContext::new(format!("{agent_id}-health"))
             .with_system_prompt(system_prompt);
         let agent = Agent::new(agent_config, llm.clone(), tools.clone())
             .with_context(context);
@@ -774,25 +785,29 @@ impl Supervisor {
                 return;
             }
             
-            match &handle.config.restart_policy {
+            let restart = match &handle.config.restart_policy {
                 RestartPolicy::Never => false,
                 RestartPolicy::Always | RestartPolicy::OnFailure => true,
                 RestartPolicy::ExponentialBackoff { max_restarts, .. } => {
                     handle.stats.restart_count < *max_restarts
                 }
-            }
+            };
+            drop(agents);
+            restart
         };
         
         if !should_restart {
             // Give up on restart
             let mut agents = agents.write().await;
-            if let Some(handle) = agents.get_mut(agent_id) {
-                if handle.state == AgentState::Failed {
+            if let Some(handle) = agents.get_mut(agent_id)
+                && handle.state == AgentState::Failed {
                     let attempts = handle.stats.restart_count;
                     handle.state = AgentState::Terminated;
                     Self::emit_event_static(event_tx, agent_id, SupervisorEventType::RestartGaveUp { attempts }).await;
                 }
-            }
+            // The event is sent while the lock is still held, so the Terminated
+            // transition is announced before any other writer can change it.
+            drop(agents);
             return;
         }
         

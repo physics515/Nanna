@@ -421,7 +421,7 @@ fn embedding_specs(config: &Config) -> Vec<String> {
 ///
 /// The old check asked only whether a provider was *named*, and answered `ok`
 /// for the shipped defaults — `openai` / `text-embedding-3-small` with an empty
-/// priority list. On a machine with no OpenAI key the daemon then says, at boot
+/// priority list. On a machine with no `OpenAI` key the daemon then says, at boot
 /// and never again:
 ///
 /// > Embedding provider 'openai/text-embedding-3-small' skipped: no OpenAI API key
@@ -720,10 +720,10 @@ fn judge_anthropic_credential(
     let expiry = credential.seconds_until_expiry();
 
     if !credential.is_expired() {
-        let detail = match expiry {
-            Some(secs) => format!("stored OAuth credential valid for {}h", secs / 3600),
-            None => "stored OAuth credential carries no expiry".to_string(),
-        };
+        let detail = expiry.map_or_else(
+            || "stored OAuth credential carries no expiry".to_string(),
+            |secs| format!("stored OAuth credential valid for {}h", secs / 3600),
+        );
         return Check::ok(NAME, detail);
     }
 
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     /// A config whose embedders are all keyless and local, so tests never
-    /// depend on whether the developer happens to export an OpenAI key.
+    /// depend on whether the developer happens to export an `OpenAI` key.
     fn local_embedding_config() -> Config {
         let mut config = cfg();
         config.memory.embedding_priority = vec!["ollama/nomic-embed-text".to_string()];

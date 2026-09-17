@@ -304,6 +304,7 @@ impl AppStateBuilder {
         self
     }
 
+    #[must_use]
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = Some(Arc::new(tools));
         self
@@ -391,7 +392,7 @@ impl AppStateBuilder {
 
     /// Enable or disable the dreaming memory system.
     #[must_use]
-    pub fn dreaming(mut self, enable: bool) -> Self {
+    pub const fn dreaming(mut self, enable: bool) -> Self {
         self.enable_dreaming = enable;
         self
     }
@@ -405,7 +406,7 @@ impl AppStateBuilder {
 
     /// Enable or disable the scheduler.
     #[must_use]
-    pub fn scheduler(mut self, enable: bool) -> Self {
+    pub const fn scheduler(mut self, enable: bool) -> Self {
         self.enable_scheduler = enable;
         self
     }
@@ -571,7 +572,7 @@ impl AppState {
             .await;
 
         // Build run options with memory extraction if dreaming is enabled
-        let run_options = if let Some(dreaming) = &self.dreaming {
+        let run_options = self.dreaming.as_ref().map_or_else(RunOptions::default, |dreaming| {
             let dreaming = dreaming.clone();
             let session = session_id.to_string();
             let recent_memories = self.session_recent_memories.clone();
@@ -612,13 +613,14 @@ impl AppState {
             });
 
             RunOptions {
-                auto_extract_memories: true,
+                analysis: nanna_agent::RunAnalysis {
+                    auto_extract_memories: true,
+                    ..nanna_agent::RunAnalysis::default()
+                },
                 on_memory: Some(on_memory),
                 ..Default::default()
             }
-        } else {
-            RunOptions::default()
-        };
+        });
 
         // Run agent (scoped lock)
         let response = {
@@ -672,10 +674,10 @@ impl AppState {
             let full_executor: nanna_core::TaskExecutor = Arc::new(move |task: nanna_core::ScheduledTask| {
                 let dreaming = dreaming.clone();
                 Box::pin(async move {
+                    let start = std::time::Instant::now();
+                    let started_at = chrono::Utc::now();
                     // Check if it's a dreaming task
                     if nanna_core::is_dreaming_task(&task) {
-                        let start = std::time::Instant::now();
-                        let started_at = chrono::Utc::now();
                         tracing::info!("Starting memory consolidation (dreaming)...");
 
                         match dreaming.dream().await {
@@ -695,7 +697,7 @@ impl AppState {
                                     success: true,
                                     output: Some(output),
                                     error: None,
-                                    duration_ms: start.elapsed().as_millis() as u64,
+                                    duration_ms: elapsed_ms(start),
                                     started_at,
                                     finished_at,
                                 }
@@ -709,7 +711,7 @@ impl AppState {
                                     success: false,
                                     output: None,
                                     error: Some(e.to_string()),
-                                    duration_ms: start.elapsed().as_millis() as u64,
+                                    duration_ms: elapsed_ms(start),
                                     started_at,
                                     finished_at,
                                 }
@@ -717,8 +719,6 @@ impl AppState {
                         }
                     } else {
                         // Default executor for other tasks (heartbeat, etc.)
-                        let start = std::time::Instant::now();
-                        let started_at = chrono::Utc::now();
                         tracing::info!("Executing task: {} ({})", task.name, task.id);
                         let finished_at = chrono::Utc::now();
                         nanna_core::TaskResult {
@@ -727,7 +727,7 @@ impl AppState {
                             success: true,
                             output: Some(task.payload),
                             error: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
+                            duration_ms: elapsed_ms(start),
                             started_at,
                             finished_at,
                         }
@@ -747,6 +747,7 @@ impl AppState {
         }
 
         sched.start();
+        drop(sched);
         tracing::info!("Scheduler started");
     }
 
@@ -783,13 +784,10 @@ impl AppState {
             let mut sessions = self.session_recent_memories.write().await;
             // Ask, do not insert: looking up a session that never stored a
             // memory used to leave an empty entry behind for good.
-            match sessions.get_mut(&session_id) {
-                Some(memories) => {
-                    memories.retain(|m| m.is_recent(FEEDBACK_ATTRIBUTION_WINDOW));
-                    memories.clone()
-                }
-                None => Vec::new(),
-            }
+            sessions.get_mut(&session_id).map_or_else(Vec::new, |memories| {
+                memories.retain(|m| m.is_recent(FEEDBACK_ATTRIBUTION_WINDOW));
+                memories.clone()
+            })
         };
 
         if recent_memories.is_empty() {
@@ -833,6 +831,12 @@ const DEFAULT_SYSTEM_PROMPT: &str = r"You are Nanna — moon god of the digital 
 You have tools at your disposal. Use them when needed.
 
 Be helpful. Be competent. Don't waste words.";
+
+/// Milliseconds since `start`, saturating: a task would need to run for ~584
+/// million years to exceed `u64::MAX` milliseconds.
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 mod tests {

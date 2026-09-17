@@ -145,7 +145,7 @@ impl Tool for AnalyzeImageTool {
 
         let result = vision_fn(image.to_string(), prompt.to_string(), media_type.to_string())
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Vision analysis failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Vision analysis failed: {e}")))?;
 
         Ok(ToolResult::success(result))
     }
@@ -158,7 +158,7 @@ pub struct ScreenshotTool {
 
 impl ScreenshotTool {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {}
     }
 }
@@ -185,8 +185,7 @@ impl Tool for ScreenshotTool {
 
         // Placeholder - will be implemented with browser automation
         Err(ToolError::ExecutionFailed(format!(
-            "Screenshot tool not yet implemented. URL: {}",
-            url
+            "Screenshot tool not yet implemented. URL: {url}"
         )))
     }
 }

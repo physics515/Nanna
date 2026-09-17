@@ -63,7 +63,7 @@ enum SessionKind {
 /// Capture tools in preference order.
 ///
 /// Wayland first because that is what a modern Linux desktop runs and an X11
-/// tool under it captures nothing (or an XWayland surface, which is worse:
+/// tool under it captures nothing (or an `XWayland` surface, which is worse:
 /// it succeeds and returns the wrong thing).
 const CAPTURE_TOOLS: &[CaptureTool] = &[
     CaptureTool {
@@ -157,10 +157,6 @@ fn capture_refusal(target: &str) -> Option<String> {
 }
 
 /// Build `screenshot.capture`, or an empty map with no tool or no session.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
-)]
 pub fn build_screenshot_services(data_dir: &Path) -> HashMap<String, ServiceFn> {
     let Some((tool, executable)) = find_capture_tool() else {
         info!(

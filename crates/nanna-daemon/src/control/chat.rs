@@ -1,6 +1,8 @@
 //! Chat handlers for the [`ControlPlane`].
 
-use super::*;
+use std::fmt::Write as _;
+
+use super::{debug, json, warn, info, PathBuf, ControlPlane, Arc, ChatAction, Value, MessageRole};
 
 /// Everything a chat turn needs that is NOT required for the delivery ack:
 /// the assembled system prompt (persona, recall, conversation), the rendered
@@ -40,12 +42,11 @@ impl ControlPlane {
 
                 // Add user message to session — persisting it is the fact the
                 // delivery ack below certifies.
-                let _msg_id = match self.sessions.add_message(&session_id, MessageRole::User, &content).await {
-                    Some(id) => id,
-                    None => return json!({
+                let Some(_msg_id) = self.sessions.add_message(&session_id, MessageRole::User, &content).await else {
+                    return json!({
                         "error": "session_not_found",
                         "message": format!("Session {} not found", session_id)
-                    }),
+                    });
                 };
 
                 // Check if agent is available (a turn without one is born dead)
@@ -180,21 +181,20 @@ impl ControlPlane {
         // Auto-remember user message only when the user has opted in
         // (`[memory] auto_remember_messages = true`). Default is off so a
         // first-run install does not silently store conversation content.
-        if self.config.read().await.memory.auto_remember_messages {
-            if let Some(ref memory) = self.memory {
-                if content.split_whitespace().count() >= 3 {
-                    let meta = std::collections::HashMap::new();
-                    if let Err(e) = memory.remember_with_importance(content, meta, 1.0).await {
-                        debug!("Failed to auto-remember user message: {}", e);
-                    }
-                }
+        let auto_remember = self.config.read().await.memory.auto_remember_messages;
+        if auto_remember
+            && let Some(ref memory) = self.memory
+            && content.split_whitespace().count() >= 3
+        {
+            let meta = std::collections::HashMap::new();
+            if let Err(e) = memory.remember_with_importance(content, meta, 1.0).await {
+                debug!("Failed to auto-remember user message: {}", e);
             }
         }
 
         // Get session history (all messages *before* the one just added)
-        let session = match self.sessions.get(session_id).await {
-            Some(s) => s,
-            None => return Err(format!("Session {session_id} not found")),
+        let Some(session) = self.sessions.get(session_id).await else {
+            return Err(format!("Session {session_id} not found"));
         };
 
         // Prior messages = everything except the last one (the user message we just added)
@@ -214,6 +214,7 @@ impl ControlPlane {
                 persona: cfg.agent.persona.clone(),
                 user_profile: cfg.agent.user_profile.clone(),
             };
+            drop(cfg);
             let inj = persona.build_system_prompt_injection();
             if !inj.is_empty() {
                 system_prompt.push_str("
@@ -223,36 +224,7 @@ impl ControlPlane {
             }
         }
 
-        // Resolve workspace: session's workspace > globally active workspace.
-        //
-        // The session's id is VALIDATED against the registry first. An
-        // id the registry does not contain used to suppress the
-        // fallback and then fail every lookup silently: the turn ran
-        // with no workspace context, `workspace_root = None`, and
-        // whatever `default_workdir` some earlier code path had left on
-        // the tool registry — i.e. it executed in a different
-        // directory than anyone believed, with no error anywhere. A
-        // session pointing at a workspace that no longer exists must
-        // degrade to the active one loudly, not run somewhere random.
-        let (effective_ws_id, ws_source) = {
-            let registry = self.workspaces.read().await;
-            let session_ws = session
-                .workspace_id
-                .clone()
-                .filter(|id| registry.get(id).is_some());
-            if session.workspace_id.is_some() && session_ws.is_none() {
-                warn!(
-                    session_id = %session_id,
-                    missing = ?session.workspace_id,
-                    "session names a workspace the registry does not have — \
-                     falling back to the active workspace"
-                );
-            }
-            match session_ws {
-                Some(id) => (Some(id), "session"),
-                None => (registry.active().map(|ws| ws.id.clone()), "active"),
-            }
-        };
+        let (effective_ws_id, ws_source) = self.resolve_turn_workspace(session_id, &session).await;
 
         // The shared slot must name the session being prepared before anything
         // derived from it is written. Nothing in a run reads it any more — the
@@ -299,150 +271,23 @@ impl ControlPlane {
         // when nobody knows who is asking.
         agent.tools().bind_session_workdir(session_id, workspace_root.clone()).await;
 
-        // SAY which one won. The precedence itself is right, but it was
-        // silent, and a silent override is indistinguishable from a
-        // bug: activating a workspace over IPC appeared to work while
-        // every turn quietly used the session's instead. Three
-        // consecutive "fresh workspace" benchmark runs wrote into the
-        // FIRST workspace's directory before anyone noticed (one of
-        // them scored 0/42 while its artifact grew next door).
-        {
-            let registry = self.workspaces.read().await;
-            let active_id = registry.active().map(|ws| ws.id.clone());
-            let path = effective_ws_id
-                .as_ref()
-                .and_then(|id| registry.get(id))
-                .map(|ws| ws.path.display().to_string());
-            let overridden = ws_source == "session"
-                && active_id.is_some()
-                && active_id != effective_ws_id;
-            if overridden {
-                info!(
-                    session_id = %session_id,
-                    using = ?effective_ws_id,
-                    path = ?path,
-                    active_workspace = ?active_id,
-                    "chat turn uses the SESSION's workspace, overriding the active one"
-                );
-            } else {
-                info!(
-                    session_id = %session_id,
-                    source = ws_source,
-                    using = ?effective_ws_id,
-                    path = ?path,
-                    "chat turn workspace resolved"
-                );
-            }
-        }
+        self.log_turn_workspace(session_id, effective_ws_id.as_ref(), ws_source).await;
 
         // Inject workspace context (reload from disk so edits within the session are picked up)
-        let mut workspace_context: Option<String> = None;
-        if let Some(ref ws_id) = effective_ws_id {
-            {
-                let mut registry = self.workspaces.write().await;
-                if let Some(ws) = registry.get_mut(ws_id) {
-                    // The git-aware variant, and only here: this is the one
-                    // workspace the turn is bound to, so the two `git` calls it
-                    // costs are paid once per turn rather than once per
-                    // registered workspace at boot.
-                    if let Err(e) = ws.load_context_with_git().await {
-                        warn!("Failed to reload workspace context: {}", e);
-                    }
-                }
-            }
-            let registry = self.workspaces.read().await;
-            if let Some(ws) = registry.get(ws_id) {
-                // Add workspace root path prominently so model knows where to look
-                let ws_path = ws.path.display();
-                system_prompt.push_str(&format!(
-                    "\n\n## Active Workspace\n\
-                    **Root directory: {ws_path}**\n\
-                    All file operations and commands MUST use this directory as the base.\n\
-                    Use relative paths (resolved against {ws_path}) or absolute paths within it.\n\
-                    Do NOT search in home directory or other locations unless explicitly asked.\n"
-                ));
-
-                // Workspace files (README.md, AGENTS.md, ROADMAP.md, …) ride
-                // OUTSIDE the system prompt: as `AgentContext::workspace_context`
-                // each step bounds them at the model-window-derived cap
-                // (`workspace_context_cap_chars`) with a marker that announces
-                // the cut. Appended here they were unbounded — a long
-                // ROADMAP.md dominated a 16k window and read as a work order
-                // (observed live 2026-08-02: "mutex vs semaphore?" answered
-                // with a roadmap status report, next turn created roadmap
-                // todos unasked).
-                let ws_context = ws.context.build_system_prompt_injection();
-                if !ws_context.is_empty() {
-                    workspace_context = Some(ws_context);
-                }
-            }
-        }
+        let workspace_context = match effective_ws_id {
+            Some(ref ws_id) => self.inject_workspace_context(ws_id, &mut system_prompt).await,
+            None => None,
+        };
 
         // Add memory context if available (gate on message complexity)
-        let should_recall = content.split_whitespace().count() > 5
-            || content.contains('?')
-            || content.len() > 80;
-
-        if should_recall {
-            // Scoped recall: workspace sessions see global + workspace memories
-            let memories = agent.recall_memories_scoped(
-                content, 5, effective_ws_id.as_deref()
-            ).await;
-            if !memories.is_empty() {
-                // Dedup: skip memories whose content already appears in recent history
-                let recent_text: String = prior_messages.iter()
-                    .rev().take(4)
-                    .map(|m| m.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                let fresh_memories: Vec<_> = memories.into_iter()
-                    .filter(|m| {
-                        // Find a safe char boundary for the snippet (max 100 bytes)
-                        let max = m.content.len().min(100);
-                        let end = m.content.floor_char_boundary(max);
-                        let snippet = &m.content[..end];
-                        !recent_text.contains(snippet)
-                    })
-                    .collect();
-
-                if !fresh_memories.is_empty() {
-                    // Bounded per memory, and it must be.
-                    //
-                    // These go in VERBATIM. A merged entry may now hold
-                    // four maximum-size observations, so five recalled
-                    // memories could push ~136 KB into the system prompt
-                    // of a model with a 32 k window — the recall meant to
-                    // orient the turn would instead evict the plan it was
-                    // recalled to serve.
-                    //
-                    // The owner's rule already says what to do here:
-                    // context gets a summary, and recall is how you get
-                    // the whole thing. So cut at a char boundary and say
-                    // so, rather than silently truncating or silently
-                    // flooding.
-                    const RECALL_INJECT_MAX_CHARS: usize = 1_200;
-                    system_prompt.push_str("\n\n## Remembered Context\n");
-                    for mem in fresh_memories {
-                        if mem.content.chars().count() <= RECALL_INJECT_MAX_CHARS {
-                            system_prompt.push_str(&format!("- {}\n", mem.content));
-                            continue;
-                        }
-                        let head: String = mem
-                            .content
-                            .chars()
-                            .take(RECALL_INJECT_MAX_CHARS)
-                            .collect();
-                        system_prompt.push_str(&format!(
-                            "- {head}…\n  [OPENING {RECALL_INJECT_MAX_CHARS} CHARS of a \
-                             longer memory, shown so it cannot crowd out your context. \
-                             Nothing was lost — recall(\"{}\") returns it whole.]\n",
-                            mem.id
-                        ));
-                    }
-                }
-            }
-        }
+        Self::append_recalled_memories(
+            agent,
+            content,
+            effective_ws_id.as_deref(),
+            &prior_messages,
+            &mut system_prompt,
+        )
+        .await;
 
         // Update workspace ID for script services (memory scoping)
         if let Some(ref ws_arc) = self.services_workspace_id {
@@ -471,5 +316,215 @@ impl ControlPlane {
             chat_model: session.chat_model().map(str::to_string),
             chat_tools: session.chat_tools(),
         })
+    }
+
+    /// Resolve the turn's workspace: the session's own workspace when the
+    /// registry still has it, otherwise the globally active one. Returns the
+    /// id and which of the two supplied it (`"session"` or `"active"`).
+    ///
+    /// The session's id is VALIDATED against the registry first. An
+    /// id the registry does not contain used to suppress the
+    /// fallback and then fail every lookup silently: the turn ran
+    /// with no workspace context, `workspace_root = None`, and
+    /// whatever `default_workdir` some earlier code path had left on
+    /// the tool registry — i.e. it executed in a different
+    /// directory than anyone believed, with no error anywhere. A
+    /// session pointing at a workspace that no longer exists must
+    /// degrade to the active one loudly, not run somewhere random.
+    async fn resolve_turn_workspace(
+        &self,
+        session_id: &str,
+        session: &crate::session::Session,
+    ) -> (Option<String>, &'static str) {
+        let registry = self.workspaces.read().await;
+        let session_ws = session
+            .workspace_id
+            .clone()
+            .filter(|id| registry.get(id).is_some());
+        if session.workspace_id.is_some() && session_ws.is_none() {
+            warn!(
+                session_id = %session_id,
+                missing = ?session.workspace_id,
+                "session names a workspace the registry does not have — \
+                 falling back to the active workspace"
+            );
+        }
+        session_ws.map_or_else(
+            || (registry.active().map(|ws| ws.id.clone()), "active"),
+            |id| (Some(id), "session"),
+        )
+    }
+
+    /// SAY which workspace won. The precedence itself is right, but it was
+    /// silent, and a silent override is indistinguishable from a
+    /// bug: activating a workspace over IPC appeared to work while
+    /// every turn quietly used the session's instead. Three
+    /// consecutive "fresh workspace" benchmark runs wrote into the
+    /// FIRST workspace's directory before anyone noticed (one of
+    /// them scored 0/42 while its artifact grew next door).
+    async fn log_turn_workspace(
+        &self,
+        session_id: &str,
+        effective_ws_id: Option<&String>,
+        ws_source: &str,
+    ) {
+        let registry = self.workspaces.read().await;
+        let active_id = registry.active().map(|ws| ws.id.clone());
+        let path = effective_ws_id
+            .and_then(|id| registry.get(id))
+            .map(|ws| ws.path.display().to_string());
+        drop(registry);
+        let overridden = ws_source == "session"
+            && active_id.is_some()
+            && active_id.as_ref() != effective_ws_id;
+        if overridden {
+            info!(
+                session_id = %session_id,
+                using = ?effective_ws_id,
+                path = ?path,
+                active_workspace = ?active_id,
+                "chat turn uses the SESSION's workspace, overriding the active one"
+            );
+        } else {
+            info!(
+                session_id = %session_id,
+                source = ws_source,
+                using = ?effective_ws_id,
+                path = ?path,
+                "chat turn workspace resolved"
+            );
+        }
+    }
+
+    /// Reload `ws_id`'s context from disk (so edits within the session are
+    /// picked up), name its root in `system_prompt`, and hand back the bounded
+    /// workspace files that ride beside the prompt.
+    async fn inject_workspace_context(
+        &self,
+        ws_id: &str,
+        system_prompt: &mut String,
+    ) -> Option<String> {
+        {
+            let mut registry = self.workspaces.write().await;
+            if let Some(ws) = registry.get_mut(ws_id) {
+                // The git-aware variant, and only here: this is the one
+                // workspace the turn is bound to, so the two `git` calls it
+                // costs are paid once per turn rather than once per
+                // registered workspace at boot.
+                if let Err(e) = ws.load_context_with_git().await {
+                    warn!("Failed to reload workspace context: {}", e);
+                }
+            }
+        }
+        let registry = self.workspaces.read().await;
+        let ws = registry.get(ws_id)?;
+        // Add workspace root path prominently so model knows where to look
+        let ws_path = ws.path.display();
+        let _ = write!(
+            system_prompt,
+            "\n\n## Active Workspace\n\
+            **Root directory: {ws_path}**\n\
+            All file operations and commands MUST use this directory as the base.\n\
+            Use relative paths (resolved against {ws_path}) or absolute paths within it.\n\
+            Do NOT search in home directory or other locations unless explicitly asked.\n"
+        );
+
+        // Workspace files (README.md, AGENTS.md, ROADMAP.md, …) ride
+        // OUTSIDE the system prompt: as `AgentContext::workspace_context`
+        // each step bounds them at the model-window-derived cap
+        // (`workspace_context_cap_chars`) with a marker that announces
+        // the cut. Appended here they were unbounded — a long
+        // ROADMAP.md dominated a 16k window and read as a work order
+        // (observed live 2026-08-02: "mutex vs semaphore?" answered
+        // with a roadmap status report, next turn created roadmap
+        // todos unasked).
+        let ws_context = ws.context.build_system_prompt_injection();
+        drop(registry);
+        if ws_context.is_empty() {
+            None
+        } else {
+            Some(ws_context)
+        }
+    }
+
+    /// Recall memories relevant to `content` (gated on message complexity)
+    /// and append the ones recent history does not already show to
+    /// `system_prompt`, each bounded.
+    async fn append_recalled_memories(
+        agent: &crate::agent_service::AgentService,
+        content: &str,
+        workspace_id: Option<&str>,
+        prior_messages: &[crate::session::SessionMessage],
+        system_prompt: &mut String,
+    ) {
+        // Bounded per memory, and it must be.
+        //
+        // These go in VERBATIM. A merged entry may now hold
+        // four maximum-size observations, so five recalled
+        // memories could push ~136 KB into the system prompt
+        // of a model with a 32 k window — the recall meant to
+        // orient the turn would instead evict the plan it was
+        // recalled to serve.
+        //
+        // The owner's rule already says what to do here:
+        // context gets a summary, and recall is how you get
+        // the whole thing. So cut at a char boundary and say
+        // so, rather than silently truncating or silently
+        // flooding.
+        const RECALL_INJECT_MAX_CHARS: usize = 1_200;
+
+        let should_recall = content.split_whitespace().count() > 5
+            || content.contains('?')
+            || content.len() > 80;
+        if !should_recall {
+            return;
+        }
+
+        // Scoped recall: workspace sessions see global + workspace memories
+        let memories = agent.recall_memories_scoped(
+            content, 5, workspace_id
+        ).await;
+        if memories.is_empty() {
+            return;
+        }
+        // Dedup: skip memories whose content already appears in recent history
+        let recent_text: String = prior_messages.iter()
+            .rev().take(4)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let fresh_memories: Vec<_> = memories.into_iter()
+            .filter(|m| {
+                // Find a safe char boundary for the snippet (max 100 bytes)
+                let max = m.content.len().min(100);
+                let end = m.content.floor_char_boundary(max);
+                let snippet = &m.content[..end];
+                !recent_text.contains(snippet)
+            })
+            .collect();
+
+        if fresh_memories.is_empty() {
+            return;
+        }
+        system_prompt.push_str("\n\n## Remembered Context\n");
+        for mem in fresh_memories {
+            if mem.content.chars().count() <= RECALL_INJECT_MAX_CHARS {
+                let _ = writeln!(system_prompt, "- {}", mem.content);
+                continue;
+            }
+            let head: String = mem
+                .content
+                .chars()
+                .take(RECALL_INJECT_MAX_CHARS)
+                .collect();
+            let _ = write!(
+                system_prompt,
+                "- {head}…\n  [OPENING {RECALL_INJECT_MAX_CHARS} CHARS of a \
+                 longer memory, shown so it cannot crowd out your context. \
+                 Nothing was lost — recall(\"{}\") returns it whole.]\n",
+                mem.id
+            );
+        }
     }
 }

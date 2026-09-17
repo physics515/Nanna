@@ -180,6 +180,12 @@ impl DiscordChannel {
     // ========================================================================
 
     /// Send a message to a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord message object.
     pub async fn send_message(
         &self,
         channel_id: &str,
@@ -207,6 +213,12 @@ impl DiscordChannel {
     }
 
     /// Send an embed to a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord message object.
     pub async fn send_embed(
         &self,
         channel_id: &str,
@@ -225,6 +237,12 @@ impl DiscordChannel {
     }
 
     /// Edit a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord message object.
     pub async fn edit_message(
         &self,
         channel_id: &str,
@@ -244,6 +262,11 @@ impl DiscordChannel {
     }
 
     /// Delete a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<(), ChannelError> {
         self.delete(&format!("/channels/{channel_id}/messages/{message_id}"))
             .await
@@ -257,6 +280,11 @@ impl DiscordChannel {
     ///
     /// For custom emoji: `name:id` format
     /// For unicode emoji: URL-encoded emoji
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn add_reaction(
         &self,
         channel_id: &str,
@@ -271,6 +299,11 @@ impl DiscordChannel {
     }
 
     /// Remove own reaction from a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn remove_reaction(
         &self,
         channel_id: &str,
@@ -289,6 +322,12 @@ impl DiscordChannel {
     // ========================================================================
 
     /// Create a thread from a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord channel object.
     pub async fn create_message_thread(
         &self,
         channel_id: &str,
@@ -318,23 +357,44 @@ impl DiscordChannel {
     // ========================================================================
 
     /// Get channel info.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord channel object.
     pub async fn get_channel(&self, channel_id: &str) -> Result<DiscordChannelInfo, ChannelError> {
         self.get(&format!("/channels/{channel_id}")).await
     }
 
     /// Trigger typing indicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ChannelError> {
         self.post_empty(&format!("/channels/{channel_id}/typing"), serde_json::json!({}))
             .await
     }
 
     /// Pin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<(), ChannelError> {
         self.put_empty(&format!("/channels/{channel_id}/pins/{message_id}"))
             .await
     }
 
     /// Unpin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if the request cannot be sent or Discord
+    /// answers a non-success status (a 429 rate limit included).
     pub async fn unpin_message(&self, channel_id: &str, message_id: &str) -> Result<(), ChannelError> {
         self.delete(&format!("/channels/{channel_id}/pins/{message_id}"))
             .await
@@ -345,6 +405,12 @@ impl DiscordChannel {
     // ========================================================================
 
     /// Send a followup message to an interaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord message object.
     pub async fn send_followup(
         &self,
         interaction_token: &str,
@@ -363,6 +429,12 @@ impl DiscordChannel {
     }
 
     /// Edit the original interaction response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Discord answers HTTP 429, and
+    /// [`ChannelError::Send`] if the request cannot be sent, Discord answers any
+    /// other non-success status, or the response body is not a valid Discord message object.
     pub async fn edit_original(
         &self,
         interaction_token: &str,
@@ -580,7 +652,7 @@ impl Channel for DiscordChannel {
             }
             _ => {
                 // For other content types, send as text description
-                let text = format!("[Unsupported content type]");
+                let text = "[Unsupported content type]".to_string();
                 self.send_message(channel_id, &text, message.reply_to.as_deref())
                     .await?
             }
@@ -618,9 +690,8 @@ impl Channel for DiscordChannel {
             ));
         }
 
-        let text = match content {
-            MessageContent::Text { text } => text,
-            _ => return Err(ChannelError::Send("Can only edit text messages".to_string())),
+        let MessageContent::Text { text } = content else {
+            return Err(ChannelError::Send("Can only edit text messages".to_string()));
         };
 
         self.edit_message(parts[0], parts[1], &text).await?;

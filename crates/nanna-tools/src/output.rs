@@ -18,10 +18,10 @@ use serde_json::Value;
 ///    equality confirmation.
 /// 3. Otherwise keep the free-form `content` text the tool already produced.
 #[must_use]
-pub fn format_tool_output(
+pub fn format_tool_output<S: std::hash::BuildHasher>(
     result: &ToolResult,
     definition: Option<&ToolDefinition>,
-    params: &std::collections::HashMap<String, Value>,
+    params: &std::collections::HashMap<String, Value, S>,
 ) -> String {
     if !result.success {
         return result
@@ -47,7 +47,9 @@ pub fn format_tool_output(
 /// Accepted shapes: `output_mode="json"` (preferred), `json=true`, or
 /// `format="json"`. Missing / other values leave text-mode content alone.
 #[must_use]
-pub fn wants_json_output(params: &std::collections::HashMap<String, Value>) -> bool {
+pub fn wants_json_output<S: std::hash::BuildHasher>(
+    params: &std::collections::HashMap<String, Value, S>,
+) -> bool {
     if let Some(mode) = params
         .get("output_mode")
         .or_else(|| params.get("format"))

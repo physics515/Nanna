@@ -648,7 +648,7 @@ mod tests {
         // The newest copies survive.
         assert!(remaining
             .iter()
-            .all(|n| { n.ends_with("2") || n.ends_with("3") || n.ends_with("4") }));
+            .all(|n| { n.ends_with('2') || n.ends_with('3') || n.ends_with('4') }));
         // The pruned copy's sidecar went with it.
         assert!(!dir.join("nanna.db.corrupt-20260101-000000-wal").exists());
 
@@ -694,7 +694,7 @@ mod tests {
             salvage.memories.len() < 12,
             "the corrupted row is unreadable"
         );
-        assert!(!salvage.corrupt_ids.is_empty());
+        assert_ne!(salvage.corrupt_ids, [] as [i64; 0]);
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&dir);

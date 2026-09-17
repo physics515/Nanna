@@ -1,4 +1,4 @@
-//! Adapter to bridge nanna-tools memory traits with nanna-memory MemoryService
+//! Adapter to bridge nanna-tools memory traits with nanna-memory `MemoryService`
 
 use async_trait::async_trait;
 use nanna_agent::{ExtractedMemory, TOOL_RESULT_CATEGORY};
@@ -7,18 +7,18 @@ use nanna_tools::{MemoryResult, MemoryStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Adapter that implements MemoryStorage using the full MemoryService
+/// Adapter that implements `MemoryStorage` using the full `MemoryService`
 pub struct MemoryServiceAdapter {
     service: Arc<MemoryService>,
     workspace_id: Option<String>,
 }
 
 impl MemoryServiceAdapter {
-    pub fn new(service: Arc<MemoryService>) -> Self {
+    pub const fn new(service: Arc<MemoryService>) -> Self {
         Self { service, workspace_id: None }
     }
 
-    pub fn with_workspace(service: Arc<MemoryService>, workspace_id: Option<String>) -> Self {
+    pub const fn with_workspace(service: Arc<MemoryService>, workspace_id: Option<String>) -> Self {
         Self { service, workspace_id }
     }
 }
@@ -61,7 +61,7 @@ impl MemoryStorage for MemoryServiceAdapter {
         self.service
             .forget(id)
             .await
-            .map(|_| true)
+            .map(|()| true)
             .map_err(|e| e.to_string())
     }
 
@@ -255,7 +255,12 @@ mod tests {
     /// ASCII, so box-drawing output and every non-Latin script read as binary.
     #[test]
     fn box_drawing_and_non_latin_text_are_not_binary() {
-        let tree = "[exec → tree — ok] ".to_string() + &"├── src\n│   └── main.rs\n".repeat(20);
+        // `format!`, not `String + &String`: under `--all-features` the graph
+        // picks up smartstring (via deno_ast -> swc_ecma_lexer), whose
+        // `impl Add<SmartString<_>> for String` makes the `+` ambiguous, so
+        // the `&String -> &str` deref coercion is no longer attempted and the
+        // line stops compiling.
+        let tree = format!("[exec → tree — ok] {}", "├── src\n│   └── main.rs\n".repeat(20));
         assert!(!is_low_signal_memory(&tree));
         assert!(!is_low_signal_memory(
             "[read_file → notes.txt — ok] 本番データベースを直接呼び出さないこと"

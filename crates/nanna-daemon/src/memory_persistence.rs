@@ -1,4 +1,4 @@
-//! Turso-backed MemoryPersistence adapter
+//! Turso-backed `MemoryPersistence` adapter
 //!
 //! Bridges `nanna_memory::MemoryPersistence` ↔ `nanna_storage::MemoryRepository`,
 //! converting between `MemoryEntry` (in-memory type) and `Memory`/`NewMemory`
@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence, PendingChunk};
-use nanna_storage::{MemoryRepository, NewMemory, NewMemoryChunk};
+use nanna_storage::{MemoryFsrsUpdate, MemoryRepository, NewMemory, NewMemoryChunk};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -16,7 +16,8 @@ pub struct TursoMemoryPersistence {
 }
 
 impl TursoMemoryPersistence {
-    pub fn new(repo: MemoryRepository) -> Self {
+    #[must_use]
+    pub const fn new(repo: MemoryRepository) -> Self {
         Self { repo }
     }
 }
@@ -74,12 +75,11 @@ fn attach_buckets(entry: &mut MemoryEntry, buckets: Vec<(String, Vec<f32>)>) {
         // active vector and its bucket differ for the same model.
         entry.embeddings.entry(model).or_insert(vector);
     }
-    if entry.embedding.is_empty() {
-        if let Some(model) = entry.embedding_model.clone() {
-            if let Some(vector) = entry.embeddings.get(&model) {
-                entry.embedding = vector.clone();
-            }
-        }
+    if entry.embedding.is_empty()
+        && let Some(model) = entry.embedding_model.clone()
+        && let Some(vector) = entry.embeddings.get(&model)
+    {
+        entry.embedding = vector.clone();
     }
 }
 
@@ -100,6 +100,7 @@ fn attach_buckets(entry: &mut MemoryEntry, buckets: Vec<(String, Vec<f32>)>) {
 /// loaded entries — never backfilled either. The row stayed in the database
 /// forever, invisible. The log line said "skipped", which reads as "nothing to
 /// see", not "this memory is now unreachable for good".
+#[must_use]
 pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
     let embedding = mem.embedding.unwrap_or_default();
 
@@ -120,19 +121,17 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
             // Try Turso datetime format 'YYYY-MM-DD HH:MM:SS'
             chrono::NaiveDateTime::parse_from_str(&mem.created_at, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc().fixed_offset())
-                .map_err(|e| e)
         })
-        .map(|dt| dt.timestamp())
-        .unwrap_or(0);
+        .map_or(0, |dt| dt.timestamp());
 
     let fsrs = FsrsState {
         stability: mem.fsrs_stability,
         difficulty: mem.fsrs_difficulty,
         last_access: mem.fsrs_last_access,
-        access_count: mem.fsrs_access_count as u32,
+        access_count: crate::numeric::u32_clamped(mem.fsrs_access_count),
         importance: mem.fsrs_importance,
         storage_strength: mem.fsrs_storage_strength,
-        generation: mem.fsrs_generation as u32,
+        generation: crate::numeric::u32_clamped(mem.fsrs_generation),
     };
 
     MemoryEntry {
@@ -211,13 +210,15 @@ impl MemoryPersistence for TursoMemoryPersistence {
                 }
                 let _ = self.repo.update_fsrs(
                     &entry.id,
-                    entry.fsrs.stability,
-                    entry.fsrs.difficulty,
-                    entry.fsrs.last_access,
-                    i64::from(entry.fsrs.access_count),
-                    entry.fsrs.importance,
-                    entry.fsrs.storage_strength,
-                    i64::from(entry.fsrs.generation),
+                    &MemoryFsrsUpdate {
+                        stability: entry.fsrs.stability,
+                        difficulty: entry.fsrs.difficulty,
+                        last_access: entry.fsrs.last_access,
+                        access_count: i64::from(entry.fsrs.access_count),
+                        importance: entry.fsrs.importance,
+                        storage_strength: entry.fsrs.storage_strength,
+                        generation: i64::from(entry.fsrs.generation),
+                    },
                 ).await;
                 Ok(())
             }
@@ -275,14 +276,13 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     }
                 }
                 _ => {
-                    if let Some(model) = active_model {
-                        if let Err(e) = self
+                    if let Some(model) = active_model
+                        && let Err(e) = self
                             .repo
                             .enqueue_embedding(memory_id, c.ordinal, model)
                             .await
-                        {
-                            warn!("Could not queue chunk {memory_id}#{} : {e}", c.ordinal);
-                        }
+                    {
+                        warn!("Could not queue chunk {memory_id}#{} : {e}", c.ordinal);
                     }
                 }
             }
@@ -391,7 +391,7 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     // once, at the boundary, is the only place that cannot be
                     // forgotten by a later caller.
                     .map(|(memory_id, ordinal, distance)| {
-                        (memory_id, ordinal, 1.0 - distance as f32)
+                        (memory_id, ordinal, 1.0 - crate::numeric::f32_from_f64(distance))
                     })
                     .collect()
             })
@@ -429,13 +429,15 @@ impl MemoryPersistence for TursoMemoryPersistence {
         self.repo
             .update_fsrs(
                 id,
-                fsrs.stability,
-                fsrs.difficulty,
-                fsrs.last_access,
-                i64::from(fsrs.access_count),
-                fsrs.importance,
-                fsrs.storage_strength,
-                i64::from(fsrs.generation),
+                &MemoryFsrsUpdate {
+                    stability: fsrs.stability,
+                    difficulty: fsrs.difficulty,
+                    last_access: fsrs.last_access,
+                    access_count: i64::from(fsrs.access_count),
+                    importance: fsrs.importance,
+                    storage_strength: fsrs.storage_strength,
+                    generation: i64::from(fsrs.generation),
+                },
             )
             .await
             .map(|_| ())
@@ -629,7 +631,7 @@ mod tests {
     #[test]
     fn an_empty_stored_vector_is_not_bucketed_under_its_model() {
         let entry = db_memory_to_entry(stored_row("m2", Some(Vec::new()), Some("ollama:nomic")));
-        assert!(entry.embedding.is_empty());
+        assert_eq!(entry.embedding, Vec::<f32>::new());
         assert!(
             entry.embeddings.is_empty(),
             "an empty vector claims no model, whatever the column says"

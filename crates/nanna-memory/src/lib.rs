@@ -22,6 +22,68 @@ mod fsrs;
 pub mod retention;
 mod service;
 
+/// Integer <-> `f32` conversions for scores, averages and budgets, where std has
+/// no lossless route. Each one is exactly the `as` cast it replaced, kept in one
+/// place so the precision trade-off is stated once rather than at every site.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "std has no lossless integer -> f32 conversion (f32 is exact only below 2^24) and \
+              no f32 -> usize conversion at all; these values are similarity and FSRS scoring \
+              inputs, weight averages and a removal budget, for which the nearest f32 (and the \
+              saturating truncation of a product) is the intended result"
+)]
+mod lossy {
+    /// An integer as the nearest `f32` (ties to even), exactly as `as f32`.
+    pub trait LossyF32 {
+        fn lossy_f32(self) -> f32;
+    }
+
+    impl LossyF32 for usize {
+        fn lossy_f32(self) -> f32 {
+            self as f32
+        }
+    }
+
+    impl LossyF32 for u32 {
+        fn lossy_f32(self) -> f32 {
+            self as f32
+        }
+    }
+
+    impl LossyF32 for u64 {
+        fn lossy_f32(self) -> f32 {
+            self as f32
+        }
+    }
+
+    impl LossyF32 for i64 {
+        fn lossy_f32(self) -> f32 {
+            self as f32
+        }
+    }
+
+    /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
+    /// exactly as `as usize`.
+    pub const fn f32_to_usize(x: f32) -> usize {
+        x as usize
+    }
+
+    /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
+    /// exactly as `as i64`.
+    pub const fn f32_to_i64(x: f32) -> i64 {
+        x as i64
+    }
+}
+
+/// At most the first 40 bytes of `content`, cut back to a char boundary, for
+/// log lines. A raw `&content[..40]` panics when byte 40 lands inside a
+/// multi-byte character — the same crash class that once wedged a chat turn.
+fn preview(content: &str) -> &str {
+    &content[..content.floor_char_boundary(40)]
+}
+
 pub use activity::ActivityClock;
 
 pub use chunk_rank::{collapse_chunk_hits, ChunkHit};
@@ -122,9 +184,11 @@ pub struct LoadReport {
     pub expected: usize,
 }
 
-/// Health of the durable memory store after the startup load. `degraded` is true
-/// when any row was unreadable, so it can be surfaced instead of the silent
-/// "loaded 0 of N" that a whole-table corruption used to cause.
+/// Health of the durable memory store after the startup load.
+///
+/// `degraded` is true when any row was unreadable, so it can be surfaced
+/// instead of the silent "loaded 0 of N" that a whole-table corruption used to
+/// cause.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryStoreHealth {
     pub degraded: bool,
@@ -164,14 +228,14 @@ impl SearchCoverage {
     /// Entries the scan could not score. Never a "no match" — a row that was
     /// not compared was not consulted.
     #[must_use]
-    pub fn unsearchable(&self) -> usize {
+    pub const fn unsearchable(&self) -> usize {
         self.total.saturating_sub(self.comparable)
     }
 
     /// Whether every entry in the store was actually scored, so an empty
     /// result really does mean "nothing matched".
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.query_width_matches && self.unsearchable() == 0
     }
 }
@@ -353,7 +417,7 @@ pub trait MemoryPersistence: Send + Sync {
 /// failure has to be recorded against the durable queue, not against the
 /// chunk table — otherwise a provider that fails forever leaves no trace and
 /// the queue looks merely slow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingChunk {
     pub chunk_id: i64,
     pub memory_id: String,
@@ -462,7 +526,8 @@ impl Default for VectorStoreConfig {
 
 impl VectorStoreConfig {
     /// Create config with specified dimension
-    pub fn with_dimension(dim: usize) -> Self {
+    #[must_use]
+    pub const fn with_dimension(dim: usize) -> Self {
         Self {
             dimension: std::sync::atomic::AtomicUsize::new(dim),
             chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
@@ -727,8 +792,7 @@ impl VectorStore {
         if mismatched > 0 {
             let sample_dim = report.entries.iter()
                 .find(|e| e.embedding.len() != self.config.get_dimension())
-                .map(|e| e.embedding.len())
-                .unwrap_or(0);
+                .map_or(0, |e| e.embedding.len());
             warn!(
                 "Dimension mismatch loading from DB: {} of {} entries have {} dims (expected {}). \
                  They will be re-embedded.",
@@ -736,8 +800,7 @@ impl VectorStore {
             );
         }
 
-        let mut entries = self.entries.write().await;
-        *entries = report.entries;
+        *self.entries.write().await = report.entries;
         info!("Loaded {} entries from persistence backend", count);
         Ok(count)
     }
@@ -750,7 +813,7 @@ impl VectorStore {
 
     /// Check if GPU acceleration is available.
     #[must_use]
-    pub fn has_gpu(&self) -> bool {
+    pub const fn has_gpu(&self) -> bool {
         self.gpu.is_some() && self.gpu_pipeline.is_some()
     }
 
@@ -778,12 +841,11 @@ impl VectorStore {
         normalize_f32(&mut entry.embedding);
 
         // Write-through to persistence backend before updating in-memory cache
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.save_entry(&entry).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_entry(&entry).await {
                 warn!("Failed to persist memory entry {}: {}", entry.id, e);
                 // Non-fatal: continue with in-memory add
             }
-        }
 
         // Chunks follow the content, on EVERY path that writes content — not
         // just `remember`. The consolidation and dream paths mutate entries
@@ -859,6 +921,14 @@ impl VectorStore {
         query_embedding: &[f32],
         top_k: usize,
     ) -> (Vec<(MemoryEntry, f32)>, SearchCoverage) {
+        // Benchmark-calibrated threshold: GPU only wins with persistent buffers or
+        // very large vector counts. With per-search buffer upload, the ~750us fixed
+        // overhead means GPU needs >50k vectors to amortize the cost vs AVX-512.
+        //
+        // Previous threshold was 1000 — benchmarks showed GPU was 23x SLOWER there.
+        // See: docs/benchmarks/gpu-vs-simd-analysis.md
+        const GPU_THRESHOLD: usize = 50_000;
+
         if query_embedding.len() != self.config.get_dimension() {
             // Nothing was scanned. The store is not empty of matches, it is
             // unreachable at this width — say which.
@@ -904,27 +974,17 @@ impl VectorStore {
             query_width_matches: true,
         };
 
-        // Benchmark-calibrated threshold: GPU only wins with persistent buffers or
-        // very large vector counts. With per-search buffer upload, the ~750us fixed
-        // overhead means GPU needs >50k vectors to amortize the cost vs AVX-512.
-        //
-        // Previous threshold was 1000 — benchmarks showed GPU was 23x SLOWER there.
-        // See: docs/benchmarks/gpu-vs-simd-analysis.md
-        const GPU_THRESHOLD: usize = 50_000;
-
         // The GPU path flattens every embedding into one width-uniform buffer,
         // so a single stale or queued-for-backfill row (empty vector after a
         // rebind, old width after a provider switch) would misalign the whole
         // batch. Those rows can exist by design; when any is present, take the
         // SIMD path, which scores them at the stale floor row-by-row.
         let similarities: Vec<f32> = if entry_count >= GPU_THRESHOLD
-            && self.has_gpu()
+            && let (Some(gpu), Some(pipeline)) = (self.gpu.as_ref(), self.gpu_pipeline.as_ref())
             && entries.iter().all(|e| e.embedding.len() == query.len())
         {
             // GPU path: batch all vectors together
             debug!("Using GPU for {} vectors (above {} threshold)", entry_count, GPU_THRESHOLD);
-            let gpu = self.gpu.as_ref().unwrap();
-            let pipeline = self.gpu_pipeline.as_ref().unwrap();
 
             // Flatten all embeddings into a single buffer
             let vectors: Vec<f32> = entries
@@ -1043,12 +1103,11 @@ impl VectorStore {
         drop(entries);
 
         // Write-through: remove from persistence backend
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.remove_entry(id).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.remove_entry(id).await {
                 warn!("Failed to remove memory entry {} from persistence: {}", id, e);
                 // Non-fatal
             }
-        }
 
         Ok(())
     }
@@ -1083,15 +1142,14 @@ impl VectorStore {
         );
 
         // Write-through: one batched persistence call for the whole set.
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.remove_entries(ids).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.remove_entries(ids).await {
                 warn!(
                     "Failed to batch-remove {} memory entries from persistence: {}",
                     requested, e
                 );
                 // Non-fatal
             }
-        }
 
         removed
     }
@@ -1115,12 +1173,11 @@ impl VectorStore {
         drop(entries);
 
         // Write-through to persistence backend
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.update_entry_fsrs(id, &new_fsrs).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.update_entry_fsrs(id, &new_fsrs).await {
                 warn!("Failed to persist FSRS update for {}: {}", id, e);
                 // Non-fatal
             }
-        }
 
         Ok(())
     }
@@ -1251,11 +1308,10 @@ impl VectorStore {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
-        if let Some(expected) = expected_content {
-            if entry.content != expected {
+        if let Some(expected) = expected_content
+            && entry.content != expected {
                 return Ok(false);
             }
-        }
         entry.content = content.to_string();
         entry.embeddings.clear();
         if embedding.is_empty() {
@@ -1355,8 +1411,8 @@ impl VectorStore {
         }
 
         // Write-through: one batched persistence call for the whole set.
-        if let Some(ref db) = self.db {
-            if !removed_ids.is_empty() {
+        if let Some(ref db) = self.db
+            && !removed_ids.is_empty() {
                 let id_refs: Vec<&str> = removed_ids.iter().map(String::as_str).collect();
                 if let Err(e) = db.remove_entries(&id_refs).await {
                     warn!(
@@ -1367,7 +1423,6 @@ impl VectorStore {
                     // Non-fatal
                 }
             }
-        }
 
         removed
     }
@@ -1443,6 +1498,12 @@ impl VectorStore {
     /// Loads all entries regardless of embedding dimension. If the embedding
     /// model has changed, call [`MemoryService::probe_and_align_dimension`]
     /// after loading to re-embed mismatched entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Io`] when the file cannot be read and
+    /// [`MemoryError::Serialization`] when it is not a JSON array of memory
+    /// entries. The in-memory store is left untouched on either error.
     pub async fn load(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         let json = tokio::fs::read_to_string(path).await?;
         let loaded: Vec<MemoryEntry> = serde_json::from_str(&json)?;
@@ -1457,8 +1518,7 @@ impl VectorStore {
         if mismatched > 0 {
             let sample_dim = loaded.iter()
                 .find(|e| e.embedding.len() != self.config.get_dimension())
-                .map(|e| e.embedding.len())
-                .unwrap_or(0);
+                .map_or(0, |e| e.embedding.len());
             warn!(
                 "Dimension mismatch: {} of {} entries have {} dims (expected {}). \
                  They will be re-embedded after dimension probe.",
@@ -1466,9 +1526,9 @@ impl VectorStore {
             );
         }
 
-        let mut entries = self.entries.write().await;
-        *entries = loaded;
-        info!("Loaded {} entries from {:?}", entries.len(), path);
+        let count = loaded.len();
+        *self.entries.write().await = loaded;
+        info!("Loaded {} entries from {:?}", count, path);
         Ok(())
     }
 
@@ -1496,6 +1556,7 @@ impl VectorStore {
                 saved += 1;
             }
         }
+        drop(entries);
 
         info!("Flushed {}/{} entries to Turso", saved, total);
         Ok(saved)
@@ -1536,19 +1597,17 @@ impl VectorStore {
                     .unwrap_or_else(|| format!("legacy-{}d", entry.embedding.len()));
                 entry.embeddings.entry(key).or_insert_with(|| entry.embedding.clone());
             }
-            match entry.embeddings.get(model) {
-                Some(vector) => {
-                    entry.embedding = vector.clone();
-                    entry.embedding_model = Some(model.to_string());
-                    rebound += 1;
-                }
-                None => {
-                    entry.embedding.clear();
-                    entry.embedding_model = None;
-                    missing += 1;
-                }
+            if let Some(vector) = entry.embeddings.get(model) {
+                entry.embedding = vector.clone();
+                entry.embedding_model = Some(model.to_string());
+                rebound += 1;
+            } else {
+                entry.embedding.clear();
+                entry.embedding_model = None;
+                missing += 1;
             }
         }
+        drop(entries);
         (rebound, missing)
     }
 
@@ -1651,7 +1710,7 @@ impl VectorStore {
             "Re-embedding {} of {} entries ({} dims → {} dims)...",
             mismatched_count, total,
             entries.iter().find(|e| e.embedding.len() != expected_dim)
-                .map(|e| e.embedding.len()).unwrap_or(0),
+                .map_or(0, |e| e.embedding.len()),
             expected_dim
         );
 
@@ -1672,7 +1731,7 @@ impl VectorStore {
                     } else {
                         warn!(
                             "Re-embed returned wrong dimension for '{}': expected {}, got {}",
-                            &entry.content[..entry.content.len().min(40)],
+                            preview(&entry.content),
                             expected_dim, new_embedding.len()
                         );
                         failed += 1;
@@ -1681,7 +1740,7 @@ impl VectorStore {
                 Err(e) => {
                     warn!(
                         "Failed to re-embed '{}': {}",
-                        &entry.content[..entry.content.len().min(40)], e
+                        preview(&entry.content), e
                     );
                     failed += 1;
                 }
@@ -1698,6 +1757,9 @@ impl VectorStore {
             "Re-embedding complete: {} succeeded, {} failed, {} total entries",
             re_embedded, failed, entries.len()
         );
+        // Held across every re-embed and the retain, so no reader sees the
+        // store half re-embedded.
+        drop(entries);
 
         re_embedded
     }
@@ -1759,6 +1821,11 @@ impl VectorStore {
         workspace_id: Option<&str>,
         min_score: f32,
     ) -> HashMap<String, crate::chunk_rank::ChunkHit> {
+        /// Chunks fetched per memory wanted. Four is the point past which the
+        /// over-fetch stops changing which memories come back in practice,
+        /// while keeping the SQL scan bounded.
+        const CHUNK_OVERFETCH: usize = 4;
+
         let Some(ref db) = self.db else { return HashMap::new() };
         // No bound model means no way to say which vector space the query
         // lives in, and chunk vectors carry the model that made them. Refusing
@@ -1767,10 +1834,6 @@ impl VectorStore {
         if query.is_empty() || model.is_empty() || limit == 0 {
             return HashMap::new();
         }
-        /// Chunks fetched per memory wanted. Four is the point past which the
-        /// over-fetch stops changing which memories come back in practice,
-        /// while keeping the SQL scan bounded.
-        const CHUNK_OVERFETCH: usize = 4;
         let hits = db
             .search_chunks(query, model, limit.saturating_mul(CHUNK_OVERFETCH), workspace_id)
             .await
@@ -1792,10 +1855,13 @@ impl VectorStore {
         // First call for a model this process pays the pre-existing-work
         // sweep; after that the queue alone is consulted. Marked seeded only
         // on success, so a failed sweep is retried rather than skipped forever.
+        // A poisoned lock still holds a valid set: its critical sections are a
+        // single `contains`/`insert`, which leave it consistent even if they
+        // panicked.
         let seed = !self
             .seeded_models
             .lock()
-            .expect("seeded_models lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(model);
         match self.db {
             Some(ref db) => match db.chunks_needing_embedding(model, limit, seed).await {
@@ -1803,7 +1869,7 @@ impl VectorStore {
                     if seed {
                         self.seeded_models
                             .lock()
-                            .expect("seeded_models lock")
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(model.to_string());
                     }
                     work
@@ -1853,11 +1919,10 @@ impl VectorStore {
     /// Best-effort: a lost dequeue costs one redundant re-embed on the next
     /// drain, which is strictly better than a lost vector.
     pub async fn dequeue_embedding(&self, memory_id: &str, ordinal: i64, model: &str) {
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
+        if let Some(ref db) = self.db
+            && let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
                 debug!("Could not dequeue {memory_id}#{ordinal}: {e}");
             }
-        }
     }
 
     /// Note a failed embedding attempt against the durable queue.
@@ -1871,14 +1936,13 @@ impl VectorStore {
         model: &str,
         error: &str,
     ) {
-        if let Some(ref db) = self.db {
-            if let Err(e) = db
+        if let Some(ref db) = self.db
+            && let Err(e) = db
                 .record_embedding_failure(memory_id, ordinal, model, error)
                 .await
             {
                 debug!("Could not record embedding failure for {memory_id}#{ordinal}: {e}");
             }
-        }
     }
 
     /// Queue depth per model with the most recent error for each.
@@ -1909,6 +1973,11 @@ impl VectorStore {
     /// entry from the cache rather than the database because the cache is the
     /// authority on current content — a memory updated in this session has its
     /// new text here before the write-through completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no in-memory entry has `id`.
+    /// Failing to write the chunks is logged, not returned.
     pub async fn rechunk(&self, id: &str) -> Result<(), MemoryError> {
         let snapshot = {
             let entries = self.entries.read().await;
@@ -2047,13 +2116,22 @@ impl ConversationMemory {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        // Seconds since the epoch exceed i64::MAX only ~292 billion years from now.
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_never_splits_a_character() {
+        // 39 ASCII bytes then a 3-byte char straddling byte 40.
+        let text = format!("{}€ tail", "a".repeat(39));
+        assert_eq!(preview(&text), "a".repeat(39));
+        assert_eq!(preview("short"), "short");
+        assert_eq!(preview(&"b".repeat(50)), "b".repeat(40));
+    }
 
     fn store_of_width(width: usize) -> VectorStore {
         VectorStore::new(VectorStoreConfig {
@@ -2273,13 +2351,12 @@ mod tests {
     }
 
     fn chunking_store(db: &Arc<ChunkRecordingDb>, max_chars: usize) -> VectorStore {
-        let store = VectorStore::new(VectorStoreConfig {
+        VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(4),
             chunk_max_chars: std::sync::atomic::AtomicUsize::new(max_chars),
             use_f16: false,
         })
-        .with_persistence(db.clone());
-        store
+        .with_persistence(db.clone())
     }
 
     fn chunked_entry(id: &str, content: &str, embedding: Vec<f32>, model: Option<&str>) -> MemoryEntry {

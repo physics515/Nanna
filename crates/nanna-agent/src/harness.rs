@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use crate::cancel::CancelToken;
 use std::time::{Duration, Instant};
@@ -124,7 +126,7 @@ pub struct AcceptanceVerdict {
     /// against, so it says nothing about the work. It is emphatically NOT a
     /// hang: no hang finding is minted, the re-stake cap is not armed, and the
     /// next run of the check (against the re-baselined evidence) decides
-    /// normally. See [`EvidenceGuard`].
+    /// normally. See `EvidenceGuard`.
     #[serde(default)]
     pub evidence_changed: bool,
     /// First [`ACCEPTANCE_OUTPUT_EXCERPT_CHARS`] of what the check's command
@@ -290,6 +292,14 @@ impl AcceptanceCheck {
     /// Tolerates the one dialect models actually emit — the object handed over
     /// as a JSON *string* — by deferring to the store's own normalization, so
     /// the reader never accepts a shape the writer would reject.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the accepted shapes when the value is neither
+    /// an object nor a string that decodes to one (the store's
+    /// normalization), or when the object does not describe a valid check —
+    /// an unknown `kind`, a missing required field, or a mistyped one such as
+    /// a non-integer `timeout_secs`.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
         let canonical = nanna_storage::canonicalize_acceptance(value)?;
         serde_json::from_value(canonical)
@@ -328,8 +338,8 @@ impl AcceptanceCheck {
     #[must_use]
     pub fn self_check_command(&self) -> Option<&str> {
         match self {
-            Self::Command { command, .. } => Some(command),
-            Self::Regex {
+            Self::Command { command, .. }
+            | Self::Regex {
                 command: Some(command),
                 ..
             } => Some(command),
@@ -349,7 +359,7 @@ impl AcceptanceCheck {
     #[must_use]
     pub fn references_path(&self, touched: &str) -> bool {
         let normalized = touched.replace('\\', "/");
-        let Some(file_name) = normalized.split('/').filter(|c| !c.is_empty()).next_back() else {
+        let Some(file_name) = normalized.split('/').rfind(|c| !c.is_empty()) else {
             return false;
         };
         let mentions = |s: &str| s.replace('\\', "/").contains(file_name);
@@ -422,13 +432,10 @@ impl AcceptanceCheck {
         cap: Option<Duration>,
     ) -> AcceptanceVerdict {
         let capped_timeout = |configured: Duration| -> (Duration, bool) {
-            match cap {
-                Some(cap) => {
-                    let floored = cap.max(Duration::from_secs(1));
-                    (configured.min(floored), floored < configured)
-                }
-                None => (configured, false),
-            }
+            cap.map_or((configured, false), |cap| {
+                let floored = cap.max(Duration::from_secs(1));
+                (configured.min(floored), floored < configured)
+            })
         };
         match self {
             Self::Command {
@@ -592,9 +599,7 @@ fn fingerprint_paths(paths: Vec<String>, workdir: &Path) -> Vec<EvidenceFile> {
 /// matches: relative and absolute spellings of one file must collide.
 fn final_component(path: &str) -> String {
     path.replace('\\', "/")
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .next_back()
+        .split('/').rfind(|c| !c.is_empty())
         .unwrap_or("")
         .to_string()
 }
@@ -850,10 +855,11 @@ fn evidence_changed_finding(check: &AcceptanceCheck, verdict: &AcceptanceVerdict
         verdict.detail
     );
     if let Some(command) = check.self_check_command() {
-        finding.push_str(&format!(
+        let _ = write!(
+            finding,
             "\nThe check is: `{command}` — run it again now that the changed files are the \
              baseline, and the next verdict counts."
-        ));
+        );
     }
     finding
 }
@@ -1323,7 +1329,7 @@ pub struct LongHorizonConfig {
 impl Default for LongHorizonConfig {
     fn default() -> Self {
         Self {
-            max_wall_clock: Duration::from_secs(4 * 3600),
+            max_wall_clock: Duration::from_hours(4),
             max_total_tokens: None,
             max_steps_per_item: 5,
             max_replans_per_item: 2,
@@ -1506,10 +1512,11 @@ pub fn verified_digest(verified: &[VerifiedOutcome]) -> Option<String> {
         text.push_str(&line);
     }
     if omitted > 0 {
-        text.push_str(&format!(
+        let _ = writeln!(
+            text,
             "- …and {omitted} more verified item(s) not shown here — they are equally \
-             established; ask the task store for the full list before a wide rewrite.\n"
-        ));
+             established; ask the task store for the full list before a wide rewrite."
+        );
     }
     Some(text)
 }
@@ -1534,19 +1541,19 @@ pub fn build_step_prompt(
 ) -> String {
     let mut prompt = stable_prefix(goal);
     prompt.push_str("== CURRENT TASK ==\n");
-    prompt.push_str(&format!("Task #{}: {}\n", step.id, step.title));
-    if let Some(description) = &step.description {
-        if !description.is_empty() {
+    let _ = writeln!(prompt, "Task #{}: {}", step.id, step.title);
+    if let Some(description) = &step.description
+        && !description.is_empty() {
             prompt.push_str(description);
             prompt.push('\n');
         }
-    }
     match &step.acceptance {
         Some(check) => {
-            prompt.push_str(&format!(
-                "Done when (checked by the harness, not by you): {}\n",
+            let _ = writeln!(
+                prompt,
+                "Done when (checked by the harness, not by you): {}",
                 check.describe()
-            ));
+            );
             // Close the feedback loop INSIDE the step. Measured live
             // (gemma4:12b, 42-feature ladder): across two hours the model
             // never once ran its own acceptance command, even though the
@@ -1555,11 +1562,12 @@ pub fn build_step_prompt(
             // implementation repeatedly. Checking costs one `exec`; not
             // checking costs a whole step.
             if let Some(command) = check.self_check_command() {
-                prompt.push_str(&format!(
+                let _ = writeln!(
+                    prompt,
                     "Before you finish this step, RUN THAT CHECK YOURSELF: exec `{command}`. \
                      Read its output, fix what it reports, and run it again until it passes. \
-                     Do not end the step on an unverified guess.\n"
-                ));
+                     Do not end the step on an unverified guess."
+                );
             }
         }
         None => {
@@ -1572,24 +1580,22 @@ pub fn build_step_prompt(
     if !step.notes_tail.is_empty() {
         prompt.push_str("Working notes so far:\n");
         for note in &step.notes_tail {
-            prompt.push_str(&format!("- {note}\n"));
+            let _ = writeln!(prompt, "- {note}");
         }
     }
-    if let Some(last) = last_result {
-        if !last.is_empty() {
-            prompt.push_str(&format!("\n== LAST RESULT ==\n{last}\n"));
+    if let Some(last) = last_result
+        && !last.is_empty() {
+            let _ = writeln!(prompt, "\n== LAST RESULT ==\n{last}");
         }
-    }
     // Beside the last result, in the same recent-attention band: what must
     // survive this step. The digest is deliberately NOT part of the stable
     // prefix — it is state, it changes as work is verified, and it belongs
     // where a small model actually looks.
-    if let Some(digest) = verified_digest {
-        if !digest.is_empty() {
-            prompt.push_str(&format!("\n== VERIFIED WORKING (do not regress) ==\n{digest}"));
+    if let Some(digest) = verified_digest
+        && !digest.is_empty() {
+            let _ = write!(prompt, "\n== VERIFIED WORKING (do not regress) ==\n{digest}");
         }
-    }
-    prompt.push_str(&format!("\n{budget_line}\n"));
+    let _ = writeln!(prompt, "\n{budget_line}");
     prompt
 }
 
@@ -1599,23 +1605,25 @@ pub fn build_step_prompt(
 pub fn build_replan_prompt(goal: &str, step: &TaskStep, stall_summary: &str) -> String {
     let mut prompt = stable_prefix(goal);
     prompt.push_str("== REPLAN REQUIRED ==\n");
-    prompt.push_str(&format!(
-        "Task #{}: {} has made no verifiable progress ({stall_summary}).\n",
+    let _ = writeln!(
+        prompt,
+        "Task #{}: {} has made no verifiable progress ({stall_summary}).",
         step.id, step.title
-    ));
+    );
     // Describes the OPERATION, not a tool signature. Naming a tool and its
     // exact arguments in a prompt that may not ship that tool's schema is how
     // the model ends up obeying blind and guessing parameter names — measured
     // at 53-66% malformed calls. Discovery is how it gets the real signature.
-    prompt.push_str(&format!(
+    let _ = writeln!(
+        prompt,
         "Break it into 2-5 smaller subtasks, added to the task store as children of \
          task #{} — discover the task-management tool if you do not already have it. \
          Each subtask needs a machine-checkable acceptance condition (a command to run, \
          a file that must exist, or a pattern that must match) wherever possible. Make \
          the first subtask small enough to finish in one step. Do not attempt the work \
-         itself in this step — only decompose.\n",
+         itself in this step — only decompose.",
         step.id
-    ));
+    );
     prompt
 }
 
@@ -1850,88 +1858,8 @@ impl LongHorizonRunner {
         cancel: Option<CancelToken>,
         interjector: Option<&dyn Interjector>,
     ) -> LongHorizonReport {
-        let cfg = &self.config;
-        let mut interjected_items = 0usize;
-        let started = Instant::now();
-        let mut steps_taken = 0usize;
-        let mut tool_calls_total = 0usize;
-        let mut side_effect_tool_calls = 0usize;
-        let mut items_completed = 0usize;
-        let mut items_completed_unverified = 0usize;
-        let mut items_already_satisfied = 0usize;
-        let mut items_abandoned = 0usize;
-        let mut items_revived = 0usize;
-        let mut items_regressed_reopened = 0usize;
-        // Verdicts are per-moment; the drain sweep below and the MID-RUN
-        // sweep at each step boundary re-ask the environment about items this
-        // run closed with a check, so a later step that un-did verified work
-        // (or fixed abandoned work) is caught while there is still budget to
-        // act on it.
-        let mut verified_this_run: Vec<(i64, String, AcceptanceCheck)> = Vec::new();
-        let mut abandoned_this_run: Vec<(i64, String, AcceptanceCheck)> = Vec::new();
-        // Rebuilt at every drain sweep; the FINAL sweep's state ships on the
-        // report — an item revived later must not linger as "unmet".
-        let mut abandoned_unmet: Vec<AbandonedUnmet> = Vec::new();
-        // Append-only, and never rebuilt: an item with no check cannot be
-        // revived by any sweep, so what is recorded here at the moment of
-        // abandonment stays true for the rest of the run.
-        let mut abandoned_unverifiable: Vec<AbandonedUnverifiable> = Vec::new();
-        // Each item may be reopened at most once per run — the bound that
-        // makes BOTH sweeps (mid-run and drain) a fixpoint instead of a loop.
-        let mut reopened_once: HashSet<i64> = HashSet::new();
-        // The mid-run sweep's spend ledger: verification time the run has
-        // paid (prechecks + post-step verdicts) funds re-verification time
-        // (see `resweep_due` — re-asking may never out-spend asking).
-        let mut check_cost_paid = Duration::ZERO;
-        let mut check_runs = 0u32;
-        let mut sweep_cost_paid = Duration::ZERO;
-        // Pending "you un-did verified work" notice, consumed by the NEXT
-        // execute step's prompt — whatever item that step serves.
-        let mut regression_notice: Option<String> = None;
-        let mut precheck_ids: HashSet<i64> = cfg.precheck_acceptance_items.clone();
-        // Run-wide ledger of DECIDED check outcomes by check identity. A
-        // fail→pass flip anywhere (a pre-check on a re-proposed item, a
-        // post-step verdict, a sweep revival) is a verified environment
-        // change and replenishes every open item's fruitless budget — a
-        // check that flipped is progress even while another keeps failing
-        // identically (P22: one leg climbed 12→16 passing while its selected
-        // item's own check failed "the same way", earned zero credit, and was
-        // abandoned one minute after ten passes were proven).
-        let mut check_outcomes: HashMap<u64, bool> = HashMap::new();
-        // The knowledge half of the report (see `LongHorizonReport`).
-        let mut verified_outcomes: Vec<VerifiedOutcome> = Vec::new();
-        let mut acceptance_unknown = 0usize;
-        // Checks whose MOST RECENT run timed out, by identity. A member's
-        // next run gets the hang re-stake cap (see `run_with_timeout_cap`):
-        // the full ceiling was already spent once without an answer, so
-        // further runs may stake at most what this run has MEASURED real
-        // work (its longest step) or a real answer (its longest decided
-        // check) to cost — both measured terms, no constant, and the first
-        // decided verdict removes the member and lifts the cap. This is what
-        // keeps a hanging check from eating the run 600s at a time (the
-        // qwen leg lost 120 of 240 minutes exactly that way).
-        let mut hung_checks: HashSet<u64> = HashSet::new();
-        let mut longest_step = Duration::ZERO;
-        let mut longest_decided_check = Duration::ZERO;
-        let mut replans = 0usize;
-        let mut false_success_claims = 0usize;
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let mut consecutive_errors = 0usize;
-        let mut last_runner_error: Option<String> = None;
-        let mut progress: HashMap<i64, ItemProgress> = HashMap::new();
-        // Which items have seen which acceptance-failure signature, run-wide.
-        // One root cause billed as N item failures is the cascade this
-        // detects (observed 2026-08-08: 12 of 17 abandonments carried one
-        // byte-identical syntax error a single earlier write had introduced;
-        // another run lost 3 features to one broken helper) — when a
-        // signature recurs across items, each affected item's step context
-        // names the cluster so the model treats it as ONE bug.
-        let mut failure_owners: HashMap<u64, std::collections::BTreeSet<i64>> = HashMap::new();
-        // A verdict is only as trustworthy as the files it reads. The guard
-        // fingerprints each check's evidence before every run of it and
-        // demotes a pass whose inputs moved (see [`EvidenceGuard`]).
-        let mut evidence_guard = EvidenceGuard::default();
+        let mut run =
+            HarnessRun::new(&self.config, goal, source, runner, workdir, cancel, interjector);
 
         // USER-DECLARED FILE INVARIANTS. Durable file prohibitions the user
         // stated in the goal itself ("never create, edit or delete anything
@@ -1942,1338 +1870,1735 @@ impl LongHorizonRunner {
         materialize_declared_invariants(goal, workdir).await;
 
         let stop = loop {
-            if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                break StopReason::Cancelled;
-            }
-            if started.elapsed() >= cfg.max_wall_clock {
-                break StopReason::WallClockExhausted;
-            }
-            let tokens_used = input_tokens + output_tokens;
-            if cfg.max_total_tokens.is_some_and(|max| tokens_used >= max) {
-                break StopReason::TokenBudgetExhausted;
-            }
-
-            // The first available opportunity: admit anything the user sent
-            // while the previous step ran, BEFORE choosing the next item, so
-            // a fresh request is picked up by this very iteration rather
-            // than after the rest of the plan drains.
-            if let Some(interjector) = interjector {
-                match interjector.interject().await {
-                    Ok(0) => {}
-                    Ok(admitted) => {
-                        interjected_items += admitted;
-                    }
-                    // A failed admission must not kill work in flight; the
-                    // message stays pending and is retried next boundary.
-                    Err(message) => {
-                        tracing::warn!(%message, "interjection failed — retrying next step");
-                    }
-                }
-            }
-
-            // Re-anchor: the store, not the transcript, is the state.
-            let step = match source.next().await {
-                Ok(Some(step)) => step,
-                Ok(None) => {
-                    // DRAIN SWEEP. The plan is empty, but every closed
-                    // verdict was per-moment: later steps may have un-done
-                    // verified work (observed 2026-08-08: a record run's
-                    // final artifact held 8 of 37 verified sections) or
-                    // fixed what an abandoned item was stuck on (the same
-                    // logs show abandoned features whose commands were
-                    // implemented afterwards, with no path back). Re-ask the
-                    // environment — one cheap check per closed item — and
-                    // reopen what it contradicts; reopening at most once per
-                    // item makes this a fixpoint, not a loop.
-                    let mut reopened_any = false;
-                    abandoned_unmet.clear();
-                    for (id, title, check) in abandoned_this_run.clone() {
-                        if reopened_once.contains(&id) {
-                            continue;
-                        }
-                        let run_started = Instant::now();
-                        let hang_cap = hung_checks
-                            .contains(&check_identity(&check))
-                            .then(|| longest_step.max(longest_decided_check));
-                        // Re-hash BEFORE the run: the fingerprint has to
-                        // describe the inputs this run is about to read.
-                        let drift = evidence_guard.observe(&check, workdir);
-                        let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                        if let Some(sentence) = &drift {
-                            verdict = verdict.with_evidence_drift(sentence);
-                        }
-                        if !verdict.timed_out {
-                            hung_checks.remove(&check_identity(&check));
-                            longest_decided_check =
-                                longest_decided_check.max(run_started.elapsed());
-                        }
-                        if verdict.is_unknown() {
-                            // Unknown: not proof the goal is unmet, but it
-                            // still blocks "done" — carry the finding rather
-                            // than a false failure verdict.
-                            if verdict.timed_out {
-                                hung_checks.insert(check_identity(&check));
-                            }
-                            acceptance_unknown += 1;
-                            let detail = format!(
-                                "check produced no verdict — {}",
-                                text_head(&verdict.detail, 200)
-                            );
-                            abandoned_unmet.push(AbandonedUnmet { id, title, detail });
-                            continue;
-                        }
-                        note_check_outcome(&mut check_outcomes, &check, verdict.passed);
-                        if !verdict.passed {
-                            // Evidence for the mission loop: this walked-away
-                            // item's done-condition is still false, so the
-                            // goal is provably unmet however dry the planner
-                            // sounds. Bounded detail: one line is identity.
-                            let detail = text_head(&verdict.detail, 240).to_string();
-                            abandoned_unmet.push(AbandonedUnmet { id, title, detail });
-                        }
-                        if verdict.passed
-                            && source
-                                .reopen(id, "acceptance now passes — reviving abandoned item")
-                                .await
-                                .is_ok()
-                        {
-                            reopened_once.insert(id);
-                            // The check already passed: route it through the
-                            // precheck door so it completes verified without
-                            // spending a model step.
-                            precheck_ids.insert(id);
-                            progress.remove(&id);
-                            items_revived += 1;
-                            items_abandoned = items_abandoned.saturating_sub(1);
-                            reopened_any = true;
-                            let _ = source
-                                .log(
-                                    id,
-                                    "revived",
-                                    serde_json::json!({ "detail": verdict.detail }),
-                                )
-                                .await;
-                        }
-                    }
-                    for (id, _title, check) in verified_this_run.clone() {
-                        if reopened_once.contains(&id) {
-                            continue;
-                        }
-                        let run_started = Instant::now();
-                        let hang_cap = hung_checks
-                            .contains(&check_identity(&check))
-                            .then(|| longest_step.max(longest_decided_check));
-                        let drift = evidence_guard.observe(&check, workdir);
-                        let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                        if let Some(sentence) = &drift {
-                            verdict = verdict.with_evidence_drift(sentence);
-                        }
-                        if !verdict.timed_out {
-                            hung_checks.remove(&check_identity(&check));
-                            longest_decided_check =
-                                longest_decided_check.max(run_started.elapsed());
-                        }
-                        if verdict.is_unknown() {
-                            // Unknown: a silent re-check is not evidence the
-                            // verified work regressed — reopening on it would
-                            // charge the model for a wedged command (or for a
-                            // test file someone edited).
-                            if verdict.timed_out {
-                                hung_checks.insert(check_identity(&check));
-                            }
-                            acceptance_unknown += 1;
-                            continue;
-                        }
-                        note_check_outcome(&mut check_outcomes, &check, verdict.passed);
-                        if !verdict.passed
-                            && source
-                                .reopen(
-                                    id,
-                                    &format!(
-                                        "verified completion regressed — the acceptance \
-                                         check fails again: {}",
-                                        verdict.detail
-                                    ),
-                                )
-                                .await
-                                .is_ok()
-                        {
-                            reopened_once.insert(id);
-                            progress.remove(&id);
-                            items_completed = items_completed.saturating_sub(1);
-                            items_regressed_reopened += 1;
-                            reopened_any = true;
-                            let _ = source
-                                .log(
-                                    id,
-                                    "regressed",
-                                    serde_json::json!({ "detail": verdict.detail }),
-                                )
-                                .await;
-                        }
-                    }
-                    if reopened_any {
-                        continue;
-                    }
-                    break StopReason::AllTasksDone;
-                }
-                Err(message) => break StopReason::SourceError { message },
-            };
-            // Scoped so the pre-check below (which may `progress.remove`) is
-            // not fighting a live borrow of the same map.
-            let (is_replan, fruitless_steps, item_replans, precheck_due, hang_timeouts) = {
-                let item = progress.entry(step.id).or_default();
-                let precheck_due = !item.acceptance_prechecked;
-                item.acceptance_prechecked = true;
-                (
-                    item.steps_without_progress >= cfg.max_steps_per_item,
-                    item.steps_without_progress,
-                    item.replans,
-                    precheck_due,
-                    item.consecutive_check_timeouts,
-                )
-            };
-
-            if is_replan && item_replans >= cfg.max_replans_per_item {
-                // Grinding AND replanning failed — close the item and move on.
-                let (dry_replans, escalated_asks, last_result) = progress
-                    .get(&step.id)
-                    .map_or((0, 0, None), |item| {
-                        (
-                            item.dry_replans,
-                            item.escalated_asks,
-                            item.last_result.clone(),
-                        )
-                    });
-                let mut reason = format!(
-                    "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
-                );
-                // Say what the replan rungs actually returned. The old
-                // sentence described the outcome as though decomposition had
-                // happened: 84 instrumented firings produced ZERO subtasks,
-                // and every one of the 42 items abandoned behind them read
-                // "…and 2 replans" as if two plans had been made.
-                if dry_replans > 0 {
-                    reason.push_str(&format!(
-                        "; the decomposition ask came back with no subtasks {dry_replans} \
-                         time(s)"
-                    ));
-                    if escalated_asks > 0 {
-                        // Provably true wherever this gate fires: an item
-                        // whose check ever passed would have completed and
-                        // left `progress`, so it cannot reach abandonment.
-                        reason.push_str(
-                            ", and the escalated next-action ask that followed never got it \
-                             past its done-condition — both attempts to unstick it returned \
-                             nothing",
-                        );
-                    }
-                }
-                if hang_timeouts > 0 {
-                    reason.push_str(&format!(
-                        "; its acceptance check hung {hang_timeouts} consecutive time(s) with \
-                         no verdict — see the hang finding in its notes"
-                    ));
-                }
-                // Loud on purpose: abandonment used to reach only the store's
-                // activity log, and a run that silently gave up its one item
-                // read as "converged" in the daemon log (2026-08-08 forensics
-                // — recovering WHY took a database query; it should take a
-                // grep).
-                tracing::warn!(item = step.id, title = %step.title, %reason, "abandoning item");
-                if let Err(message) = source.abandon(step.id, &reason).await {
-                    break StopReason::SourceError { message };
-                }
-                items_abandoned += 1;
-                record_abandonment(
-                    &step,
-                    &reason,
-                    last_result,
-                    &mut abandoned_this_run,
-                    &mut abandoned_unverifiable,
-                );
-                progress.remove(&step.id);
-                continue;
-            }
-
-            let _ = source.start(step.id).await;
-
-            // Baseline this item's evidence BEFORE its step can touch it: the
-            // guard's whole value is that the fingerprint predates the work it
-            // judges. Idempotent — a check already baselined keeps the
-            // baseline the last verdict left, so re-selection never launders a
-            // modification made since.
-            if let Some(check) = &step.acceptance {
-                evidence_guard.ensure_baseline(check, workdir);
-            }
-
-            // ACCEPTANCE PRE-CHECK. The environment is the judge of "done";
-            // ask it before spending a step, not only after. When the
-            // done-condition already passes with nothing run, the work is
-            // provably already there and a step could only rediscover that.
-            //
-            // Opt-in (`precheck_acceptance_items`) because on a first plan a
-            // pre-passing condition means the check is wrong, not the work
-            // done — see the field's docs. Scoped to the exact ids the caller
-            // named rather than to "every item this run selects": the
-            // interjection poll above can add a USER'S message to the plan
-            // mid-round, and skipping that on a pre-passing condition would
-            // leave the user unanswered. Bounded to one execution per item per
-            // run by `acceptance_prechecked`, and each execution reuses
-            // `AcceptanceCheck::run`, so it inherits the same workdir
-            // resolution and the same clamped timeout as every other
-            // acceptance run — no second execution path to keep in sync.
-            let precheck = if precheck_due && precheck_ids.contains(&step.id) {
-                step.acceptance.as_ref()
-            } else {
-                None
-            };
-            if let Some(check) = precheck {
-                let check_started = Instant::now();
-                let hang_cap = hung_checks
-                    .contains(&check_identity(check))
-                    .then(|| longest_step.max(longest_decided_check));
-                let drift = evidence_guard.observe(check, workdir);
-                let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                if let Some(sentence) = &drift {
-                    verdict = verdict.with_evidence_drift(sentence);
-                }
-                check_cost_paid += check_started.elapsed();
-                check_runs += 1;
-                if verdict.is_unknown() {
-                    // Unknown, not failure: the item runs its step normally,
-                    // but it starts KNOWING what silenced the check — the
-                    // finding is the most useful thing the step could hear.
-                    let hung = verdict.timed_out;
-                    if hung {
-                        hung_checks.insert(check_identity(check));
-                    } else {
-                        hung_checks.remove(&check_identity(check));
-                        longest_decided_check =
-                            longest_decided_check.max(check_started.elapsed());
-                    }
-                    acceptance_unknown += 1;
-                    let item = progress.entry(step.id).or_default();
-                    let finding = if hung {
-                        item.consecutive_check_timeouts += 1;
-                        hanging_check_finding(check, &verdict, item.consecutive_check_timeouts)
-                    } else {
-                        evidence_changed_finding(check, &verdict)
-                    };
-                    item.last_result = Some(finding.clone());
-                    tracing::warn!(
-                        item = step.id,
-                        title = %step.title,
-                        hung,
-                        detail = %text_head(&verdict.detail, 240),
-                        "acceptance pre-check produced no usable verdict; carrying the \
-                         finding into the step"
-                    );
-                    let _ = source.add_note(step.id, &finding).await;
-                    let _ = source
-                        .log(
-                            step.id,
-                            if hung {
-                                "acceptance_timeout"
-                            } else {
-                                "acceptance_evidence_changed"
-                            },
-                            serde_json::json!({
-                                "detail": verdict.detail,
-                                "check": check.describe(),
-                                "precheck": true,
-                            }),
-                        )
-                        .await;
-                } else {
-                    hung_checks.remove(&check_identity(check));
-                    longest_decided_check = longest_decided_check.max(check_started.elapsed());
-                    if note_check_outcome(&mut check_outcomes, check, verdict.passed) {
-                        // Re-proposed work whose condition NOW passes after
-                        // failing earlier this run: the environment moved.
-                        // Every open item's fruitless budget replenishes below
-                        // (the completion path also runs — flip and completion
-                        // are the same event seen at two granularities).
-                        for open_item in progress.values_mut() {
-                            open_item.steps_without_progress = 0;
-                        }
-                        tracing::info!(
-                            item = step.id,
-                            check = %check.describe(),
-                            "check flipped fail→pass — verified environment change; \
-                             replenishing every open item's fruitless budget"
-                        );
-                    }
-                }
-                if verdict.passed {
-                    // What the environment confirmed AT THIS INSTANT, not just
-                    // that it confirmed something (see `verdict_artifacts`).
-                    let artifacts = verdict_artifacts(check, workdir);
-                    let detail = serde_json::json!({
-                        "verified": true,
-                        "verdict": verdict.detail,
-                        "output_head": verdict.output_head,
-                        "artifacts": artifacts,
-                        "already_satisfied": true,
-                        "steps_run": 0,
-                        "tokens_spent": 0,
-                    });
-                    let _ = source
-                        .log(
-                            step.id,
-                            "acceptance_already_satisfied",
-                            serde_json::json!({
-                                "detail": verdict.detail,
-                                "check": check.describe(),
-                            }),
-                        )
-                        .await;
-                    match source.complete(step.id, detail).await {
-                        Ok(()) => {
-                            consecutive_errors = 0;
-                            items_completed += 1;
-                            items_already_satisfied += 1;
-                            verified_this_run.push((step.id, step.title.clone(), check.clone()));
-                            // Knowledge, not a dry round: the passing verdict
-                            // rides the report so the continuation planner
-                            // hears WHAT is established instead of re-seeding
-                            // "assess starting state".
-                            verified_outcomes.push(VerifiedOutcome {
-                                id: step.id,
-                                title: step.title.clone(),
-                                detail: verified_detail(&verdict, &artifacts),
-                                already_satisfied: true,
-                            });
-                            progress.remove(&step.id);
-                            tracing::info!(
-                                item = step.id,
-                                title = %step.title,
-                                verdict = %verdict.detail,
-                                "acceptance already passed before any step — completing \
-                                 without running one"
-                            );
-                            continue;
-                        }
-                        Err(message) => {
-                            // Same containment as the post-step path: a
-                            // completion can legitimately fail (a concurrent
-                            // decomposition opened a child). Fall through and
-                            // run the step normally.
-                            let _ = source
-                                .log(
-                                    step.id,
-                                    "complete_failed",
-                                    serde_json::json!({ "error": message }),
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-
-            let item = progress.entry(step.id).or_default();
-
-            // ESCALATION, not a second identical ask. The decomposition rung
-            // already came back empty on this item, and re-asking the same
-            // question produced the same nothing: 84 instrumented firings,
-            // zero subtasks, split exactly half at the first attempt and half
-            // at the second. So the next rung changes the question — it puts
-            // the item's own last failing result in front of the model (the
-            // replan prompt is the only step prompt that never receives it)
-            // and asks for the single next concrete action instead of a plan.
-            //
-            // It runs as an EXECUTE step deliberately. The replan branch
-            // `continue`s ahead of every escalation the harness owns, so a
-            // zero-tool replan never rode the narration ladder and never got
-            // steered; and the abandonment gate fires one iteration later
-            // regardless, so a rung that could not replenish would be
-            // decorative. As an execute step it earns its budget back the
-            // ordinary way — a novel successful tool call or a check that
-            // flips resets the fruitless counter — while still spending one
-            // replan allowance below, so abandonment converges on exactly
-            // the schedule the decompose-only ladder had.
-            let escalate = is_replan && item.dry_replans > 0;
-
-            let (prompt, step_kind) = if is_replan && !escalate {
-                // A replan reached with the check currently hanging must aim
-                // the decomposition at the hang first — it is the standing
-                // reason no verdict can arrive.
-                let stall_summary = if item.consecutive_check_timeouts > 0 {
-                    format!(
-                        "the done-condition check has HUNG {} consecutive time(s) (killed at \
-                         its timeout, no verdict). The artifact blocks forever on something \
-                         this check runs — decompose so fixing the hang comes first",
-                        item.consecutive_check_timeouts
-                    )
-                } else {
-                    format!(
-                        "{} steps without the done-condition flipping",
-                        item.steps_without_progress
-                    )
-                };
-                (
-                    build_replan_prompt(goal, &step, &stall_summary),
-                    StepKind::Plan,
-                )
-            } else {
-                let line = budget_line(
-                    steps_taken,
-                    items_completed,
-                    tokens_used,
-                    cfg.max_total_tokens,
-                    started.elapsed(),
-                    cfg.max_wall_clock,
-                );
-                // A pending regression notice rides in with the last result:
-                // the model must hear "you un-did verified work" on its very
-                // NEXT step, whatever item that step serves — waiting for the
-                // regressed item itself to be selected would let it wander
-                // further from the wreckage first. One-shot: taken here,
-                // durably recorded on the reopened tasks either way.
-                let last_result = match (item.last_result.as_deref(), regression_notice.take()) {
-                    (Some(prev), Some(notice)) => Some(format!("{prev}\n\n{notice}")),
-                    (None, Some(notice)) => Some(notice),
-                    (prev, None) => prev.map(str::to_string),
-                };
-                // The escalation rides in the same band as the regression
-                // notice, and for the same reason: it is what the model must
-                // hear LAST, right after the result it is being asked to act
-                // on. Everything else about the prompt stays the ordinary
-                // execute prompt — the done-condition, the self-check line,
-                // the notes and the digest all still apply, because this rung
-                // is asking for work, not for a plan.
-                let last_result = if escalate {
-                    let escalation = stalled_escalation_text(
-                        item.steps_without_progress,
-                        item.consecutive_check_timeouts,
-                    );
-                    Some(match last_result {
-                        Some(prev) => format!("{prev}\n\n{escalation}"),
-                        None => escalation,
-                    })
-                } else {
-                    last_result
-                };
-                // The do-not-regress digest: verified state must reach the
-                // model that EDITS, not only the planner that plans.
-                let digest = verified_digest(&verified_outcomes);
-                (
-                    build_step_prompt(
-                        goal,
-                        &step,
-                        last_result.as_deref(),
-                        digest.as_deref(),
-                        &line,
-                    ),
-                    StepKind::Execute,
-                )
-            };
-
-            // Open-children count BEFORE a replan runs, so "did this replan
-            // actually decompose anything?" is answerable afterwards. Only
-            // taken for replan steps — an execute step has no such contract
-            // (the escalated rung included), and this is a store round-trip.
-            let subtasks_before = if is_replan && !escalate {
-                source.open_subtasks(step.id).await.unwrap_or(None)
-            } else {
-                None
-            };
-
-            let remaining_wall = cfg.max_wall_clock.saturating_sub(started.elapsed());
-            let request = StepRequest {
-                item_id: step.id,
-                step_index: steps_taken,
-                step_kind,
-                item_title: step.title.clone(),
-                prompt,
-                tool_scope: step.tool_scope.clone(),
-                token_budget: cfg.step_token_budget,
-                // No fixed iteration cap: the runner ends the step on
-                // progress exhaustion (see `step_token_budget`'s docs for the
-                // P22 evidence against a hard 8) and the run's wall clock
-                // rides in below as the real bound.
-                max_iterations: None,
-                max_wall_clock: Some(remaining_wall),
-                cancel: cancel.clone(),
-            };
-
-            let step_started = Instant::now();
-            let outcome = match runner.run_step(request).await {
-                Ok(outcome) => {
-                    consecutive_errors = 0;
-                    // One term of the hang re-stake cap: the largest cost
-                    // this run has measured for real work.
-                    longest_step = longest_step.max(step_started.elapsed());
-                    outcome
-                }
-                Err(message) => {
-                    consecutive_errors += 1;
-                    last_runner_error = Some(message.clone());
-                    let item = progress.entry(step.id).or_default();
-                    item.runner_errors += 1;
-                    // Poison containment: when the failure follows one item
-                    // (its prompt/notes deterministically break the model),
-                    // abandon that item and keep the run alive. Provider-wide
-                    // death still trips the run-level breaker below, whose
-                    // counter spans items.
-                    if item.runner_errors >= ITEM_RUNNER_ERRORS_MAX {
-                        let last_result = item.last_result.clone();
-                        let reason =
-                            format!("abandoned after persistent runner errors: {message}");
-                        if let Err(message) = source.abandon(step.id, &reason).await {
-                            break StopReason::SourceError { message };
-                        }
-                        items_abandoned += 1;
-                        // This site used to record NOTHING — not even for a
-                        // checked item, which then never reached either sweep
-                        // and so could be neither revived nor named as unmet.
-                        // A poisoned prompt says nothing about the world: if
-                        // later work satisfies this item's condition the sweep
-                        // must still be able to find it.
-                        record_abandonment(
-                            &step,
-                            &reason,
-                            last_result,
-                            &mut abandoned_this_run,
-                            &mut abandoned_unverifiable,
-                        );
-                        progress.remove(&step.id);
-                        continue;
-                    }
-                    if consecutive_errors >= cfg.max_consecutive_errors {
-                        break StopReason::RunnerErrors { message };
-                    }
-                    continue;
-                }
-            };
-            steps_taken += 1;
-            input_tokens += outcome.input_tokens;
-            output_tokens += outcome.output_tokens;
-            // Attribution material for the evidence guard: which paths this
-            // run has written through a tool that RECORDS what it wrote. Only
-            // ever used to decide whether "modified by this session" is a
-            // claim the run can back up.
-            evidence_guard.note_touched(&outcome.touched_paths);
-
-            let item = progress.entry(step.id).or_default();
-            item.tokens_spent += outcome.input_tokens + outcome.output_tokens;
-            if !outcome.tool_calls.is_empty() {
-                // The narration ladder counts CONSECUTIVE prose-only steps; a
-                // step that acted re-arms all three rungs.
-                item.narration_steps = 0;
-            }
-
-            if escalate {
-                // The escalated rung spends one replan allowance even though
-                // it ran as an execute step. Without that the item would
-                // escalate forever: `is_replan` is derived from the fruitless
-                // counter, which an unproductive escalated step does not
-                // reset, and only `replans` moves the abandonment gate. With
-                // it, the ladder is decompose → escalate → abandon on the
-                // default `max_replans_per_item: 2` — the same length it had
-                // when both rungs asked the same question.
-                item.replans += 1;
-                item.escalated_asks += 1;
-                replans += 1;
-                let _ = source
-                    .log(
-                        step.id,
-                        "replan_escalated",
-                        serde_json::json!({
-                            "replans": item.replans,
-                            "dry_replans": item.dry_replans,
-                            "asked": "next concrete action",
-                        }),
-                    )
-                    .await;
-                // Falls through: the verdict, the fruitless accounting and
-                // the narration ladder below all apply, which is the whole
-                // point of running this rung as a step.
-            } else if is_replan {
-                // The replan step adds subtasks through the store; the next
-                // next() will surface them. A replan that actually decomposed
-                // resets the grind counter so the new work gets a fresh
-                // allowance — but a DRY replan must not buy one.
-                //
-                // Observed live 2026-08-02 (session 05775d1d): a replan
-                // re-proposed the title the run had just abandoned, the store
-                // refused to resurrect it, and the reset handed the item
-                // another full allowance of fruitless steps — the item span
-                // grew by `max_steps_per_item` per empty replan instead of
-                // converging. With the reset withheld the item is still at
-                // its grind threshold, so the next iteration replans again
-                // and the existing `max_replans_per_item` rung reaches
-                // abandonment directly. A source that cannot report its
-                // children (`None`) is treated as productive, exactly as
-                // before.
-                let produced_work = match (subtasks_before, source.open_subtasks(step.id).await) {
-                    (Some(before), Ok(Some(after))) => after > before,
-                    _ => true,
-                };
-                item.replans += 1;
-                if produced_work {
-                    item.steps_without_progress = 0;
-                    item.last_result = None;
-                    item.last_tool_calls.clear();
-                } else {
-                    // Recorded, not just logged: the next stall rung on this
-                    // item reads it and changes the question rather than
-                    // asking this one again.
-                    item.dry_replans += 1;
-                    tracing::info!(
-                        item = step.id,
-                        replans = item.replans,
-                        "replan added no subtasks — not resetting the grind counter; the \
-                         next stall rung escalates instead of re-asking"
-                    );
-                }
-                replans += 1;
-                let _ = source
-                    .log(
-                        step.id,
-                        "replanned",
-                        serde_json::json!({
-                            "replans": item.replans,
-                            "produced_work": produced_work,
-                        }),
-                    )
-                    .await;
-                continue;
-            }
-
-            // Leave the step's findings in the store (the durable scratchpad),
-            // not in any transcript.
-            let tail = text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
-            if !tail.is_empty() {
-                let _ = source.add_note(step.id, &tail).await;
-            }
-
-            // A cancelled step is a truncated step: its text is not a
-            // verdictable claim, and an acceptance command run now is work
-            // after the user said stop. Findings are already noted above.
-            if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                break StopReason::Cancelled;
-            }
-
-            // Cross-step repetition = a stall the in-run detector cannot see.
-            let repeated = steps_repeat(&item.last_tool_calls, &outcome.tool_calls);
-            item.last_tool_calls.clone_from(&outcome.tool_calls);
-            tool_calls_total += outcome.tool_calls.len();
-            // Counted by NAME, not by outcome: a [`StepToolCall`] is a digest
-            // and carries no success flag. An attempted-but-failed `exec`
-            // therefore reads as "the step reached for the world", which errs
-            // toward letting a mission continue — the cheap mistake, since the
-            // opposite one ends a live mission a round early.
-            side_effect_tool_calls += outcome
-                .tool_calls
-                .iter()
-                .filter(|call| crate::loop_runner::is_work_evidence_tool(&call.name))
-                .count();
-
-            // Verdict time. With a check, the environment is the only judge.
-            match &step.acceptance {
-                Some(check) => {
-                    let check_started = Instant::now();
-                    let hang_cap = hung_checks
-                        .contains(&check_identity(check))
-                        .then(|| longest_step.max(longest_decided_check));
-                    // The step just ran; re-hash its check's evidence before
-                    // the verdict, so a step that edited what the check reads
-                    // cannot close the item in the same breath.
-                    let drift = evidence_guard.observe(check, workdir);
-                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                    if let Some(sentence) = &drift {
-                        verdict = verdict.with_evidence_drift(sentence);
-                    }
-                    check_cost_paid += check_started.elapsed();
-                    check_runs += 1;
-                    if !verdict.timed_out {
-                        hung_checks.remove(&check_identity(check));
-                        longest_decided_check =
-                            longest_decided_check.max(check_started.elapsed());
-                    }
-                    let _ = source
-                        .log(
-                            step.id,
-                            "acceptance_checked",
-                            serde_json::json!({
-                                "passed": verdict.passed,
-                                "detail": verdict.detail,
-                                "unknown": verdict.is_unknown(),
-                                "evidence_changed": verdict.evidence_changed,
-                            }),
-                        )
-                        .await;
-                    if verdict.is_unknown() {
-                        // UNKNOWN, not failed. The check said nothing about
-                        // the work, so nothing about the TIMEOUT may read as
-                        // failure: no failure signature, no refuted claim,
-                        // and never a charge for the hang itself. What the
-                        // run DID learn is that something hangs — surfaced as
-                        // a first-class carried finding — and the next run of
-                        // this check is cost-capped (`hung_checks`).
-                        //
-                        // The STEP beside the silent check is still a step,
-                        // and it is judged exactly like a step with no check
-                        // at all (the `None` arm below is the precedent):
-                        // novel successful evidence replenishes, a degenerate
-                        // loop rides the steering ladder, and an empty-handed
-                        // step charges as an empty-handed step. That is what
-                        // keeps the item converging on the NORMAL ladder
-                        // without ever counting unknowns into a verdict —
-                        // counting them (an earlier draft routed N
-                        // consecutive timeouts to the replan rung) is just
-                        // fabricating a failure from things that said
-                        // nothing. (P22 evidence both ways: qwen proved
-                        // tests 01–20 passing inside the very step whose
-                        // check then hung — novel evidence, replenishes; and
-                        // it burned 120 of 240 minutes re-staking 600s on
-                        // the same silent check — the cap's job.)
-                        //
-                        // The evidence-drift demotion enters here for exactly
-                        // the same reason and with exactly the same
-                        // consequences (no budget charge, no completion, no
-                        // flip credit) — but it is NOT a hang: no hang finding
-                        // is minted and the re-stake cap stays disarmed, or a
-                        // model whose test file simply changed would be sent
-                        // hunting a non-existent infinite loop.
-                        let hung = verdict.timed_out;
-                        if hung {
-                            hung_checks.insert(check_identity(check));
-                        }
-                        acceptance_unknown += 1;
-                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
-                        let degenerate =
-                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
-                        let steered = degenerate
-                            && item.narration_steps < NARRATION_LADDER_STEPS;
-                        if fresh_success {
-                            item.steps_without_progress = 0;
-                        } else if steered {
-                            item.narration_steps += 1;
-                        } else {
-                            item.steps_without_progress += 1;
-                            if repeated {
-                                item.steps_without_progress += 1;
-                            }
-                        }
-                        let mut finding = if hung {
-                            item.consecutive_check_timeouts += 1;
-                            hanging_check_finding(
-                                check,
-                                &verdict,
-                                item.consecutive_check_timeouts,
-                            )
-                        } else {
-                            item.consecutive_check_timeouts = 0;
-                            evidence_changed_finding(check, &verdict)
-                        };
-                        if degenerate {
-                            finding.push_str("\n\n");
-                            finding
-                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
-                        }
-                        tracing::warn!(
-                            item = step.id,
-                            title = %step.title,
-                            hung,
-                            consecutive = item.consecutive_check_timeouts,
-                            step_charged = !fresh_success && !steered,
-                            detail = %text_head(&verdict.detail, 240),
-                            "acceptance check produced no usable verdict — carrying the \
-                             finding forward and judging the step on its own evidence"
-                        );
-                        let _ = source.add_note(step.id, &finding).await;
-                        let _ = source
-                            .log(
-                                step.id,
-                                if hung {
-                                    "acceptance_timeout"
-                                } else {
-                                    "acceptance_evidence_changed"
-                                },
-                                serde_json::json!({
-                                    "detail": verdict.detail,
-                                    "consecutive": item.consecutive_check_timeouts,
-                                }),
-                            )
-                            .await;
-                        item.last_result = Some(finding);
-                    } else if verdict.passed {
-                        item.consecutive_check_timeouts = 0;
-                        if note_check_outcome(&mut check_outcomes, check, true) {
-                            for open_item in progress.values_mut() {
-                                open_item.steps_without_progress = 0;
-                            }
-                            tracing::info!(
-                                item = step.id,
-                                check = %check.describe(),
-                                "check flipped fail→pass — verified environment change; \
-                                 replenishing every open item's fruitless budget"
-                            );
-                        }
-                        let artifacts = verdict_artifacts(check, workdir);
-                        let item = progress.entry(step.id).or_default();
-                        let detail = serde_json::json!({
-                            "verified": true,
-                            "verdict": verdict.detail,
-                            "output_head": verdict.output_head,
-                            "artifacts": artifacts,
-                            "tokens_spent": item.tokens_spent,
-                        });
-                        match source.complete(step.id, detail).await {
-                            Ok(()) => {
-                                consecutive_errors = 0;
-                                items_completed += 1;
-                                verified_this_run.push((
-                                    step.id,
-                                    step.title.clone(),
-                                    check.clone(),
-                                ));
-                                verified_outcomes.push(VerifiedOutcome {
-                                    id: step.id,
-                                    title: step.title.clone(),
-                                    detail: verified_detail(&verdict, &artifacts),
-                                    already_satisfied: false,
-                                });
-                                progress.remove(&step.id);
-                            }
-                            Err(message) => {
-                                // A completion can legitimately fail (e.g. a
-                                // concurrent decomposition opened a child).
-                                // Retry via next() instead of killing the run.
-                                let _ = source
-                                    .log(
-                                        step.id,
-                                        "complete_failed",
-                                        serde_json::json!({ "error": message }),
-                                    )
-                                    .await;
-                                consecutive_errors += 1;
-                                if consecutive_errors >= cfg.max_consecutive_errors {
-                                    break StopReason::SourceError { message };
-                                }
-                            }
-                        }
-                    } else {
-                        item.consecutive_check_timeouts = 0;
-                        note_check_outcome(&mut check_outcomes, check, false);
-                        if step_claims_completion(&outcome.text) {
-                            // The model said done; the environment disagrees.
-                            false_success_claims += 1;
-                            let _ = source
-                                .log(
-                                    step.id,
-                                    "false_success_claim",
-                                    serde_json::json!({ "verdict": verdict.detail }),
-                                )
-                                .await;
-                        }
-                        let signature = failure_signature(&verdict.detail);
-                        let novel = item.seen_failure_signatures.insert(signature);
-                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
-                        let degenerate =
-                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
-                        let steered = degenerate
-                            && item.narration_steps < NARRATION_LADDER_STEPS;
-                        if novel && item.seen_failure_signatures.len() > 1 {
-                            // The check fails DIFFERENTLY than every earlier
-                            // attempt: the work moved the failure, which is
-                            // progress by the environment's own evidence.
-                            // The fruitless budget replenishes (same
-                            // principle as stream retries replenishing on
-                            // tool progress). A first-ever failure is the
-                            // baseline, not progress; a revisited signature
-                            // is oscillation and charges normally.
-                            item.steps_without_progress = 0;
-                        } else if fresh_success {
-                            // The success mirror of the rule above: the step
-                            // verifiably did NEW work on the world (a
-                            // successful side-effectful call this item has
-                            // never seen), so the environment's own evidence
-                            // says the item is moving even though its check
-                            // still fails the same way. Byte-identical
-                            // repeats never take this arm, so the rewrite
-                            // treadmill still converges on abandonment.
-                            item.steps_without_progress = 0;
-                        } else if steered {
-                            // A zero-tool degenerate loop is a steering
-                            // problem, not task evidence — route it to the
-                            // harness's escalation ladder (bounded by
-                            // NARRATION_LADDER_STEPS) and count it apart.
-                            item.narration_steps += 1;
-                        } else {
-                            item.steps_without_progress += 1;
-                            if repeated {
-                                item.steps_without_progress += 1;
-                            }
-                        }
-                        let mut step_result =
-                            failed_acceptance_result(check, &verdict, repeated);
-                        if degenerate {
-                            step_result.push_str("\n\n");
-                            step_result
-                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
-                            let _ = source
-                                .log(
-                                    step.id,
-                                    "narration_step",
-                                    serde_json::json!({
-                                        "narration_steps": item.narration_steps,
-                                        "charged": !steered,
-                                    }),
-                                )
-                                .await;
-                        }
-                        let cluster = failure_owners.entry(signature).or_default();
-                        cluster.insert(step.id);
-                        if cluster.len() > 1 {
-                            let others: Vec<String> = cluster
-                                .iter()
-                                .filter(|id| **id != step.id)
-                                .map(|id| format!("#{id}"))
-                                .collect();
-                            let _ = source
-                                .log(
-                                    step.id,
-                                    "shared_failure",
-                                    serde_json::json!({
-                                        "items": cluster.iter().copied().collect::<Vec<_>>(),
-                                    }),
-                                )
-                                .await;
-                            step_result.push_str(&format!(
-                                "\nNOTE: {} of this plan {} failing with this EXACT same \
-                                 error. That is one underlying bug, not {} separate ones — \
-                                 find and fix the shared cause, then re-run the checks.",
-                                others.join(", "),
-                                if others.len() == 1 { "is also" } else { "are also" },
-                                cluster.len(),
-                            ));
-                        }
-                        item.last_result = Some(step_result);
-                    }
-                }
-                None => {
-                    if step_claims_completion(&outcome.text) {
-                        let detail = serde_json::json!({
-                            "verified": false,
-                            "tokens_spent": item.tokens_spent,
-                        });
-                        match source.complete(step.id, detail).await {
-                            Ok(()) => {
-                                consecutive_errors = 0;
-                                items_completed += 1;
-                                items_completed_unverified += 1;
-                                let _ = source
-                                    .log(step.id, "completed_unverified", serde_json::Value::Null)
-                                    .await;
-                                progress.remove(&step.id);
-                            }
-                            Err(message) => {
-                                let _ = source
-                                    .log(
-                                        step.id,
-                                        "complete_failed",
-                                        serde_json::json!({ "error": message }),
-                                    )
-                                    .await;
-                                consecutive_errors += 1;
-                                if consecutive_errors >= cfg.max_consecutive_errors {
-                                    break StopReason::SourceError { message };
-                                }
-                            }
-                        }
-                    } else {
-                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
-                        let degenerate =
-                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
-                        let steered = degenerate
-                            && item.narration_steps < NARRATION_LADDER_STEPS;
-                        if fresh_success {
-                            // No check exists, but the environment's evidence
-                            // still counts: the step did NEW successful work,
-                            // so the item is moving even without a claim.
-                            item.steps_without_progress = 0;
-                        } else if steered {
-                            // Zero-tool degenerate loop: steer, count apart,
-                            // charge only past the ladder (same routing as
-                            // the checked arm above).
-                            item.narration_steps += 1;
-                        } else {
-                            item.steps_without_progress += 1;
-                            if repeated {
-                                item.steps_without_progress += 1;
-                            }
-                        }
-                        let mut step_result =
-                            text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
-                        if degenerate {
-                            if !step_result.is_empty() {
-                                step_result.push_str("\n\n");
-                            }
-                            step_result
-                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
-                            let _ = source
-                                .log(
-                                    step.id,
-                                    "narration_step",
-                                    serde_json::json!({
-                                        "narration_steps": item.narration_steps,
-                                        "charged": !steered,
-                                    }),
-                                )
-                                .await;
-                        }
-                        item.last_result = Some(step_result);
-                    }
-                }
-            }
-
-            // MID-RUN SWEEP — the drain sweep's live half. Waiting for
-            // AllTasksDone to re-ask the environment was proven insufficient
-            // on 2026-08-10: continuously-live missions (continuation keeps
-            // the plan non-empty for hours) destroyed their own verified work
-            // late in the run with nothing catching it — one leg held 22/42
-            // verified for three hours, then full-file rewrites collapsed it
-            // to 1/42 in the final hour. So re-ask at the step boundary too:
-            // IMMEDIATELY for items whose acceptance references a path this
-            // step just wrote, and periodically for everything else on a
-            // cadence derived from measured check cost (`resweep_due` — no
-            // fixed N). The current item is excluded: its own check just ran
-            // as this boundary's verdict. Reopens share `reopened_once` with
-            // the drain sweep, so each item is reopened at most once per run
-            // however it is caught.
-            let eligible: Vec<(i64, String, AcceptanceCheck)> = verified_this_run
-                .iter()
-                .filter(|(id, _, _)| *id != step.id && !reopened_once.contains(id))
-                .cloned()
-                .collect();
-            // The drain sweep's OTHER half, also run live: an abandoned item
-            // whose check now passes was fixed by later work, and waiting for
-            // plan exhaustion to notice both wasted the fix and hid the
-            // strongest replenishment signal the run has (a fail→pass flip).
-            let eligible_abandoned: Vec<(i64, String, AcceptanceCheck)> = abandoned_this_run
-                .iter()
-                .filter(|(id, _, _)| *id != step.id && !reopened_once.contains(id))
-                .cloned()
-                .collect();
-            if !eligible.is_empty() || !eligible_abandoned.is_empty() {
-                let estimated = if check_runs > 0 {
-                    (check_cost_paid / check_runs)
-                        * (eligible.len() + eligible_abandoned.len()) as u32
-                } else {
-                    Duration::ZERO
-                };
-                let full_due = resweep_due(sweep_cost_paid, check_cost_paid, estimated);
-                let targets =
-                    select_resweep_targets(eligible, full_due, &outcome.touched_paths);
-                let abandoned_targets = select_resweep_targets(
-                    eligible_abandoned,
-                    full_due,
-                    &outcome.touched_paths,
-                );
-                let mut regressions: Vec<(i64, String, String)> = Vec::new();
-                for (id, title, check) in abandoned_targets {
-                    if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                        break;
-                    }
-                    let sweep_started = Instant::now();
-                    let hang_cap = hung_checks
-                        .contains(&check_identity(&check))
-                        .then(|| longest_step.max(longest_decided_check));
-                    let drift = evidence_guard.observe(&check, workdir);
-                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                    if let Some(sentence) = &drift {
-                        verdict = verdict.with_evidence_drift(sentence);
-                    }
-                    sweep_cost_paid += sweep_started.elapsed();
-                    if !verdict.timed_out {
-                        hung_checks.remove(&check_identity(&check));
-                        longest_decided_check =
-                            longest_decided_check.max(sweep_started.elapsed());
-                    }
-                    if verdict.is_unknown() {
-                        if verdict.timed_out {
-                            hung_checks.insert(check_identity(&check));
-                        }
-                        acceptance_unknown += 1;
-                        continue;
-                    }
-                    let flipped = note_check_outcome(&mut check_outcomes, &check, verdict.passed);
-                    if flipped {
-                        // Verified environment change — replenish regardless
-                        // of whether the reopen below succeeds; the evidence
-                        // is the environment's, not the store's.
-                        for open_item in progress.values_mut() {
-                            open_item.steps_without_progress = 0;
-                        }
-                        tracing::info!(
-                            item = id,
-                            check = %check.describe(),
-                            "mid-run sweep: check flipped fail→pass — verified \
-                             environment change; replenishing every open item's \
-                             fruitless budget"
-                        );
-                    }
-                    if !verdict.passed {
-                        continue;
-                    }
-                    if source
-                        .reopen(id, "acceptance now passes — reviving abandoned item")
-                        .await
-                        .is_ok()
-                    {
-                        reopened_once.insert(id);
-                        // Route through the precheck door: it completes
-                        // verified on its next selection without a step.
-                        precheck_ids.insert(id);
-                        progress.remove(&id);
-                        items_revived += 1;
-                        items_abandoned = items_abandoned.saturating_sub(1);
-                        tracing::info!(
-                            item = id,
-                            title = %title,
-                            "mid-run sweep: abandoned item's check now passes — reviving"
-                        );
-                        let _ = source
-                            .log(
-                                id,
-                                "revived",
-                                serde_json::json!({
-                                    "detail": verdict.detail,
-                                    "mid_run": true,
-                                }),
-                            )
-                            .await;
-                    }
-                }
-                for (id, title, check) in targets {
-                    // A sweep is bookkeeping, not work — stop mid-sweep the
-                    // moment the user says stop; the loop head reports it.
-                    if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                        break;
-                    }
-                    let sweep_started = Instant::now();
-                    let hang_cap = hung_checks
-                        .contains(&check_identity(&check))
-                        .then(|| longest_step.max(longest_decided_check));
-                    let drift = evidence_guard.observe(&check, workdir);
-                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                    if let Some(sentence) = &drift {
-                        verdict = verdict.with_evidence_drift(sentence);
-                    }
-                    sweep_cost_paid += sweep_started.elapsed();
-                    if !verdict.timed_out {
-                        hung_checks.remove(&check_identity(&check));
-                        longest_decided_check =
-                            longest_decided_check.max(sweep_started.elapsed());
-                    }
-                    if verdict.is_unknown() {
-                        // Unknown — a silent re-check must not reopen verified
-                        // work as "regressed".
-                        if verdict.timed_out {
-                            hung_checks.insert(check_identity(&check));
-                        }
-                        acceptance_unknown += 1;
-                        continue;
-                    }
-                    note_check_outcome(&mut check_outcomes, &check, verdict.passed);
-                    if verdict.passed {
-                        continue;
-                    }
-                    if source
-                        .reopen(
-                            id,
-                            &format!(
-                                "verified completion regressed mid-run — the acceptance \
-                                 check fails again: {}",
-                                verdict.detail
-                            ),
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        reopened_once.insert(id);
-                        progress.remove(&id);
-                        items_completed = items_completed.saturating_sub(1);
-                        items_regressed_reopened += 1;
-                        let detail = text_head(&verdict.detail, 240).to_string();
-                        tracing::warn!(
-                            item = id,
-                            title = %title,
-                            detail = %detail,
-                            "mid-run sweep: verified item regressed — reopening"
-                        );
-                        let _ = source
-                            .log(
-                                id,
-                                "regressed",
-                                serde_json::json!({
-                                    "detail": verdict.detail,
-                                    "mid_run": true,
-                                }),
-                            )
-                            .await;
-                        // Durable context for whenever the item is next
-                        // selected, independent of the one-shot notice below.
-                        let _ = source
-                            .add_note(
-                                id,
-                                &format!(
-                                    "REOPENED mid-run: later work un-did this verified \
-                                     item — {detail}. Disk is truth; restore it."
-                                ),
-                            )
-                            .await;
-                        regressions.push((id, title, detail));
-                    }
-                }
-                if !regressions.is_empty() {
-                    let notice = regression_notice_text(&regressions);
-                    // Merge with a still-pending notice (possible when the
-                    // steps in between were replans, which do not consume
-                    // it) rather than dropping either; both halves are
-                    // screenful-bounded and the next execute step takes all.
-                    regression_notice = Some(match regression_notice.take() {
-                        Some(prev) => format!("{prev}\n\n{notice}"),
-                        None => notice,
-                    });
-                }
+            if let ControlFlow::Break(IterationEnd::Stop(reason)) = run.iteration().await {
+                break reason;
             }
         };
+        run.into_report(stop)
+    }
+}
 
-        let total_tokens = input_tokens + output_tokens;
+/// How one pass of the harness loop ended when it ended early.
+enum IterationEnd {
+    /// Go straight on to the next pass (the loop's `continue`).
+    Next,
+    /// End the run with this reason (the loop's `break`).
+    Stop(StopReason),
+}
+
+/// The outcome of one phase of a harness pass: `Continue` carries the phase's
+/// result on to the next phase, `Break` ends the pass (see [`IterationEnd`]).
+type Phase<T = ()> = ControlFlow<IterationEnd, T>;
+
+/// End the current pass and start the next one.
+const fn next_iteration<T>() -> Phase<T> {
+    ControlFlow::Break(IterationEnd::Next)
+}
+
+/// End the run with `reason`.
+const fn stop<T>(reason: StopReason) -> Phase<T> {
+    ControlFlow::Break(IterationEnd::Stop(reason))
+}
+
+/// Everything one [`LongHorizonRunner::run_with_interjector`] call keeps
+/// between passes of its loop: the caller's inputs and the run's ledgers.
+struct HarnessRun<'a> {
+    cfg: &'a LongHorizonConfig,
+    goal: &'a str,
+    source: &'a dyn TaskSource,
+    runner: &'a dyn StepRunner,
+    workdir: &'a Path,
+    cancel: Option<CancelToken>,
+    interjector: Option<&'a dyn Interjector>,
+    interjected_items: usize,
+    started: Instant,
+    steps_taken: usize,
+    tool_calls_total: usize,
+    side_effect_tool_calls: usize,
+    items_completed: usize,
+    items_completed_unverified: usize,
+    items_already_satisfied: usize,
+    items_abandoned: usize,
+    items_revived: usize,
+    items_regressed_reopened: usize,
+    // Verdicts are per-moment; the drain sweep below and the MID-RUN
+    // sweep at each step boundary re-ask the environment about items this
+    // run closed with a check, so a later step that un-did verified work
+    // (or fixed abandoned work) is caught while there is still budget to
+    // act on it.
+    verified_this_run: Vec<(i64, String, AcceptanceCheck)>,
+    abandoned_this_run: Vec<(i64, String, AcceptanceCheck)>,
+    // Rebuilt at every drain sweep; the FINAL sweep's state ships on the
+    // report — an item revived later must not linger as "unmet".
+    abandoned_unmet: Vec<AbandonedUnmet>,
+    // Append-only, and never rebuilt: an item with no check cannot be
+    // revived by any sweep, so what is recorded here at the moment of
+    // abandonment stays true for the rest of the run.
+    abandoned_unverifiable: Vec<AbandonedUnverifiable>,
+    // Each item may be reopened at most once per run — the bound that
+    // makes BOTH sweeps (mid-run and drain) a fixpoint instead of a loop.
+    reopened_once: HashSet<i64>,
+    // The mid-run sweep's spend ledger: verification time the run has
+    // paid (prechecks + post-step verdicts) funds re-verification time
+    // (see `resweep_due` — re-asking may never out-spend asking).
+    check_cost_paid: Duration,
+    check_runs: u32,
+    sweep_cost_paid: Duration,
+    // Pending "you un-did verified work" notice, consumed by the NEXT
+    // execute step's prompt — whatever item that step serves.
+    regression_notice: Option<String>,
+    precheck_ids: HashSet<i64>,
+    // Run-wide ledger of DECIDED check outcomes by check identity. A
+    // fail→pass flip anywhere (a pre-check on a re-proposed item, a
+    // post-step verdict, a sweep revival) is a verified environment
+    // change and replenishes every open item's fruitless budget — a
+    // check that flipped is progress even while another keeps failing
+    // identically (P22: one leg climbed 12→16 passing while its selected
+    // item's own check failed "the same way", earned zero credit, and was
+    // abandoned one minute after ten passes were proven).
+    check_outcomes: HashMap<u64, bool>,
+    // The knowledge half of the report (see `LongHorizonReport`).
+    verified_outcomes: Vec<VerifiedOutcome>,
+    acceptance_unknown: usize,
+    // Checks whose MOST RECENT run timed out, by identity. A member's
+    // next run gets the hang re-stake cap (see `run_with_timeout_cap`):
+    // the full ceiling was already spent once without an answer, so
+    // further runs may stake at most what this run has MEASURED real
+    // work (its longest step) or a real answer (its longest decided
+    // check) to cost — both measured terms, no constant, and the first
+    // decided verdict removes the member and lifts the cap. This is what
+    // keeps a hanging check from eating the run 600s at a time (the
+    // qwen leg lost 120 of 240 minutes exactly that way).
+    hung_checks: HashSet<u64>,
+    longest_step: Duration,
+    longest_decided_check: Duration,
+    replans: usize,
+    false_success_claims: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    consecutive_errors: usize,
+    last_runner_error: Option<String>,
+    progress: HashMap<i64, ItemProgress>,
+    // Which items have seen which acceptance-failure signature, run-wide.
+    // One root cause billed as N item failures is the cascade this
+    // detects (observed 2026-08-08: 12 of 17 abandonments carried one
+    // byte-identical syntax error a single earlier write had introduced;
+    // another run lost 3 features to one broken helper) — when a
+    // signature recurs across items, each affected item's step context
+    // names the cluster so the model treats it as ONE bug.
+    failure_owners: HashMap<u64, std::collections::BTreeSet<i64>>,
+    // A verdict is only as trustworthy as the files it reads. The guard
+    // fingerprints each check's evidence before every run of it and
+    // demotes a pass whose inputs moved (see [`EvidenceGuard`]).
+    evidence_guard: EvidenceGuard,
+}
+
+impl<'a> HarnessRun<'a> {
+    fn new(
+        cfg: &'a LongHorizonConfig,
+        goal: &'a str,
+        source: &'a dyn TaskSource,
+        runner: &'a dyn StepRunner,
+        workdir: &'a Path,
+        cancel: Option<CancelToken>,
+        interjector: Option<&'a dyn Interjector>,
+    ) -> Self {
+        Self {
+            cfg,
+            goal,
+            source,
+            runner,
+            workdir,
+            cancel,
+            interjector,
+            interjected_items: 0,
+            started: Instant::now(),
+            steps_taken: 0,
+            tool_calls_total: 0,
+            side_effect_tool_calls: 0,
+            items_completed: 0,
+            items_completed_unverified: 0,
+            items_already_satisfied: 0,
+            items_abandoned: 0,
+            items_revived: 0,
+            items_regressed_reopened: 0,
+            verified_this_run: Vec::new(),
+            abandoned_this_run: Vec::new(),
+            abandoned_unmet: Vec::new(),
+            abandoned_unverifiable: Vec::new(),
+            reopened_once: HashSet::new(),
+            check_cost_paid: Duration::ZERO,
+            check_runs: 0,
+            sweep_cost_paid: Duration::ZERO,
+            regression_notice: None,
+            precheck_ids: cfg.precheck_acceptance_items.clone(),
+            check_outcomes: HashMap::new(),
+            verified_outcomes: Vec::new(),
+            acceptance_unknown: 0,
+            hung_checks: HashSet::new(),
+            longest_step: Duration::ZERO,
+            longest_decided_check: Duration::ZERO,
+            replans: 0,
+            false_success_claims: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            consecutive_errors: 0,
+            last_runner_error: None,
+            progress: HashMap::new(),
+            failure_owners: HashMap::new(),
+            evidence_guard: EvidenceGuard::default(),
+        }
+    }
+
+    /// One pass of the loop: pick the next item, run a step on it, judge the
+    /// step, and sweep what earlier verdicts claimed.
+    async fn iteration(&mut self) -> Phase {
+        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return stop(StopReason::Cancelled);
+        }
+        if self.started.elapsed() >= self.cfg.max_wall_clock {
+            return stop(StopReason::WallClockExhausted);
+        }
+        let tokens_used = self.input_tokens + self.output_tokens;
+        if self.cfg.max_total_tokens.is_some_and(|max| tokens_used >= max) {
+            return stop(StopReason::TokenBudgetExhausted);
+        }
+
+        // The first available opportunity: admit anything the user sent
+        // while the previous step ran, BEFORE choosing the next item, so
+        // a fresh request is picked up by this very iteration rather
+        // than after the rest of the plan drains.
+        if let Some(interjector) = self.interjector {
+            match interjector.interject().await {
+                Ok(0) => {}
+                Ok(admitted) => {
+                    self.interjected_items += admitted;
+                }
+                // A failed admission must not kill work in flight; the
+                // message stays pending and is retried next boundary.
+                Err(message) => {
+                    tracing::warn!(%message, "interjection failed — retrying next step");
+                }
+            }
+        }
+
+        // Re-anchor: the store, not the transcript, is the state.
+        let step = match self.source.next().await {
+            Ok(Some(step)) => step,
+            Ok(None) => return self.drain_sweep().await,
+            Err(message) => return stop(StopReason::SourceError { message }),
+        };
+        // Scoped so the pre-check below (which may `progress.remove`) is
+        // not fighting a live borrow of the same map.
+        let (is_replan, fruitless_steps, item_replans, precheck_due, hang_timeouts) =
+            self.item_gate(&step);
+
+        if is_replan && item_replans >= self.cfg.max_replans_per_item {
+            return self
+                .abandon_exhausted(&step, fruitless_steps, item_replans, hang_timeouts)
+                .await;
+        }
+
+        let _ = self.source.start(step.id).await;
+
+        // Baseline this item's evidence BEFORE its step can touch it: the
+        // guard's whole value is that the fingerprint predates the work it
+        // judges. Idempotent — a check already baselined keeps the
+        // baseline the last verdict left, so re-selection never launders a
+        // modification made since.
+        if let Some(check) = &step.acceptance {
+            self.evidence_guard.ensure_baseline(check, self.workdir);
+        }
+
+        self.precheck(&step, precheck_due).await?;
+
+        let item = self.progress.entry(step.id).or_default();
+
+        // ESCALATION, not a second identical ask. The decomposition rung
+        // already came back empty on this item, and re-asking the same
+        // question produced the same nothing: 84 instrumented firings,
+        // zero subtasks, split exactly half at the first attempt and half
+        // at the second. So the next rung changes the question — it puts
+        // the item's own last failing result in front of the model (the
+        // replan prompt is the only step prompt that never receives it)
+        // and asks for the single next concrete action instead of a plan.
+        //
+        // It runs as an EXECUTE step deliberately. The replan branch
+        // `continue`s ahead of every escalation the harness owns, so a
+        // zero-tool replan never rode the narration ladder and never got
+        // steered; and the abandonment gate fires one iteration later
+        // regardless, so a rung that could not replenish would be
+        // decorative. As an execute step it earns its budget back the
+        // ordinary way — a novel successful tool call or a check that
+        // flips resets the fruitless counter — while still spending one
+        // replan allowance below, so abandonment converges on exactly
+        // the schedule the decompose-only ladder had.
+        let escalate = is_replan && item.dry_replans > 0;
+
+        let (prompt, step_kind) = self.step_prompt(&step, is_replan, escalate, tokens_used);
+
+        // Open-children count BEFORE a replan runs, so "did this replan
+        // actually decompose anything?" is answerable afterwards. Only
+        // taken for replan steps — an execute step has no such contract
+        // (the escalated rung included), and this is a store round-trip.
+        let subtasks_before = if is_replan && !escalate {
+            self.source.open_subtasks(step.id).await.unwrap_or(None)
+        } else {
+            None
+        };
+
+        let outcome = self.run_step(&step, prompt, step_kind).await?;
+        self.record_step(&step, &outcome, is_replan, escalate, subtasks_before)
+            .await?;
+        let repeated = self.file_step_findings(&step, &outcome).await?;
+        self.judge_step(&step, &outcome, repeated).await?;
+        self.mid_run_sweep(&step, &outcome).await;
+        ControlFlow::Continue(())
+    }
+
+    /// The plan is empty: re-ask the environment about every item this run
+    /// closed, then either go on (something reopened) or end the run.
+    async fn drain_sweep(&mut self) -> Phase {
+        // DRAIN SWEEP. The plan is empty, but every closed
+        // verdict was per-moment: later steps may have un-done
+        // verified work (observed 2026-08-08: a record run's
+        // final artifact held 8 of 37 verified sections) or
+        // fixed what an abandoned item was stuck on (the same
+        // logs show abandoned features whose commands were
+        // implemented afterwards, with no path back). Re-ask the
+        // environment — one cheap check per closed item — and
+        // reopen what it contradicts; reopening at most once per
+        // item makes this a fixpoint, not a loop.
+        self.abandoned_unmet.clear();
+        let revived = self.drain_abandoned().await;
+        let regressed = self.drain_verified().await;
+        if revived || regressed {
+            return next_iteration();
+        }
+        stop(StopReason::AllTasksDone)
+    }
+
+    /// The drain sweep over abandoned items: revive those whose check now
+    /// passes, and record those whose check still fails (or says nothing) as
+    /// unmet. Returns whether anything was revived.
+    async fn drain_abandoned(&mut self) -> bool {
+        let mut reopened_any = false;
+        for (id, title, check) in self.abandoned_this_run.clone() {
+            if self.reopened_once.contains(&id) {
+                continue;
+            }
+            let run_started = Instant::now();
+            let hang_cap = self.hung_checks
+                .contains(&check_identity(&check))
+                .then(|| self.longest_step.max(self.longest_decided_check));
+            // Re-hash BEFORE the run: the fingerprint has to
+            // describe the inputs this run is about to read.
+            let drift = self.evidence_guard.observe(&check, self.workdir);
+            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            if let Some(sentence) = &drift {
+                verdict = verdict.with_evidence_drift(sentence);
+            }
+            if !verdict.timed_out {
+                self.hung_checks.remove(&check_identity(&check));
+                self.longest_decided_check =
+                    self.longest_decided_check.max(run_started.elapsed());
+            }
+            if verdict.is_unknown() {
+                // Unknown: not proof the goal is unmet, but it
+                // still blocks "done" — carry the finding rather
+                // than a false failure verdict.
+                if verdict.timed_out {
+                    self.hung_checks.insert(check_identity(&check));
+                }
+                self.acceptance_unknown += 1;
+                let detail = format!(
+                    "check produced no verdict — {}",
+                    text_head(&verdict.detail, 200)
+                );
+                self.abandoned_unmet.push(AbandonedUnmet { id, title, detail });
+                continue;
+            }
+            note_check_outcome(&mut self.check_outcomes, &check, verdict.passed);
+            if !verdict.passed {
+                // Evidence for the mission loop: this walked-away
+                // item's done-condition is still false, so the
+                // goal is provably unmet however dry the planner
+                // sounds. Bounded detail: one line is identity.
+                let detail = text_head(&verdict.detail, 240).to_string();
+                self.abandoned_unmet.push(AbandonedUnmet { id, title, detail });
+            }
+            if verdict.passed
+                && self.source
+                    .reopen(id, "acceptance now passes — reviving abandoned item")
+                    .await
+                    .is_ok()
+            {
+                self.reopened_once.insert(id);
+                // The check already passed: route it through the
+                // precheck door so it completes verified without
+                // spending a model step.
+                self.precheck_ids.insert(id);
+                self.progress.remove(&id);
+                self.items_revived += 1;
+                self.items_abandoned = self.items_abandoned.saturating_sub(1);
+                reopened_any = true;
+                let _ = self.source
+                    .log(
+                        id,
+                        "revived",
+                        serde_json::json!({ "detail": verdict.detail }),
+                    )
+                    .await;
+            }
+        }
+        reopened_any
+    }
+
+    /// The drain sweep over verified completions: reopen those whose check
+    /// now fails. Returns whether anything was reopened.
+    async fn drain_verified(&mut self) -> bool {
+        let mut reopened_any = false;
+        for (id, _title, check) in self.verified_this_run.clone() {
+            if self.reopened_once.contains(&id) {
+                continue;
+            }
+            let run_started = Instant::now();
+            let hang_cap = self.hung_checks
+                .contains(&check_identity(&check))
+                .then(|| self.longest_step.max(self.longest_decided_check));
+            let drift = self.evidence_guard.observe(&check, self.workdir);
+            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            if let Some(sentence) = &drift {
+                verdict = verdict.with_evidence_drift(sentence);
+            }
+            if !verdict.timed_out {
+                self.hung_checks.remove(&check_identity(&check));
+                self.longest_decided_check =
+                    self.longest_decided_check.max(run_started.elapsed());
+            }
+            if verdict.is_unknown() {
+                // Unknown: a silent re-check is not evidence the
+                // verified work regressed — reopening on it would
+                // charge the model for a wedged command (or for a
+                // test file someone edited).
+                if verdict.timed_out {
+                    self.hung_checks.insert(check_identity(&check));
+                }
+                self.acceptance_unknown += 1;
+                continue;
+            }
+            note_check_outcome(&mut self.check_outcomes, &check, verdict.passed);
+            if !verdict.passed
+                && self.source
+                    .reopen(
+                        id,
+                        &format!(
+                            "verified completion regressed — the acceptance \
+                             check fails again: {}",
+                            verdict.detail
+                        ),
+                    )
+                    .await
+                    .is_ok()
+            {
+                self.reopened_once.insert(id);
+                self.progress.remove(&id);
+                self.items_completed = self.items_completed.saturating_sub(1);
+                self.items_regressed_reopened += 1;
+                reopened_any = true;
+                let _ = self.source
+                    .log(
+                        id,
+                        "regressed",
+                        serde_json::json!({ "detail": verdict.detail }),
+                    )
+                    .await;
+            }
+        }
+        reopened_any
+    }
+
+    /// The selected item's standing, marking its one pre-check as taken:
+    /// `(is_replan, fruitless_steps, item_replans, precheck_due,
+    /// hang_timeouts)`.
+    fn item_gate(&mut self, step: &TaskStep) -> (bool, usize, usize, bool, usize) {
+        let item = self.progress.entry(step.id).or_default();
+        let precheck_due = !item.acceptance_prechecked;
+        item.acceptance_prechecked = true;
+        (
+            item.steps_without_progress >= self.cfg.max_steps_per_item,
+            item.steps_without_progress,
+            item.replans,
+            precheck_due,
+            item.consecutive_check_timeouts,
+        )
+    }
+
+    /// Close an item that has spent its fruitless steps and its replans.
+    async fn abandon_exhausted(
+        &mut self,
+        step: &TaskStep,
+        fruitless_steps: usize,
+        item_replans: usize,
+        hang_timeouts: usize,
+    ) -> Phase {
+        // Grinding AND replanning failed — close the item and move on.
+        let (dry_replans, escalated_asks, last_result) = self.progress
+            .get(&step.id)
+            .map_or((0, 0, None), |item| {
+                (
+                    item.dry_replans,
+                    item.escalated_asks,
+                    item.last_result.clone(),
+                )
+            });
+        let mut reason = format!(
+            "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
+        );
+        // Say what the replan rungs actually returned. The old
+        // sentence described the outcome as though decomposition had
+        // happened: 84 instrumented firings produced ZERO subtasks,
+        // and every one of the 42 items abandoned behind them read
+        // "…and 2 replans" as if two plans had been made.
+        if dry_replans > 0 {
+            let _ = write!(
+                reason,
+                "; the decomposition ask came back with no subtasks {dry_replans} \
+                 time(s)"
+            );
+            if escalated_asks > 0 {
+                // Provably true wherever this gate fires: an item
+                // whose check ever passed would have completed and
+                // left `progress`, so it cannot reach abandonment.
+                reason.push_str(
+                    ", and the escalated next-action ask that followed never got it \
+                     past its done-condition — both attempts to unstick it returned \
+                     nothing",
+                );
+            }
+        }
+        if hang_timeouts > 0 {
+            let _ = write!(
+                reason,
+                "; its acceptance check hung {hang_timeouts} consecutive time(s) with \
+                 no verdict — see the hang finding in its notes"
+            );
+        }
+        // Loud on purpose: abandonment used to reach only the store's
+        // activity log, and a run that silently gave up its one item
+        // read as "converged" in the daemon log (2026-08-08 forensics
+        // — recovering WHY took a database query; it should take a
+        // grep).
+        tracing::warn!(item = step.id, title = %step.title, %reason, "abandoning item");
+        if let Err(message) = self.source.abandon(step.id, &reason).await {
+            return stop(StopReason::SourceError { message });
+        }
+        self.items_abandoned += 1;
+        record_abandonment(
+            step,
+            &reason,
+            last_result,
+            &mut self.abandoned_this_run,
+            &mut self.abandoned_unverifiable,
+        );
+        self.progress.remove(&step.id);
+        next_iteration()
+    }
+
+    /// Run the item's acceptance check before spending a step on it, and
+    /// complete the item without one when the check already passes.
+    async fn precheck(&mut self, step: &TaskStep, precheck_due: bool) -> Phase {
+        // ACCEPTANCE PRE-CHECK. The environment is the judge of "done";
+        // ask it before spending a step, not only after. When the
+        // done-condition already passes with nothing run, the work is
+        // provably already there and a step could only rediscover that.
+        //
+        // Opt-in (`precheck_acceptance_items`) because on a first plan a
+        // pre-passing condition means the check is wrong, not the work
+        // done — see the field's docs. Scoped to the exact ids the caller
+        // named rather than to "every item this run selects": the
+        // interjection poll above can add a USER'S message to the plan
+        // mid-round, and skipping that on a pre-passing condition would
+        // leave the user unanswered. Bounded to one execution per item per
+        // run by `acceptance_prechecked`, and each execution reuses
+        // `AcceptanceCheck::run`, so it inherits the same workdir
+        // resolution and the same clamped timeout as every other
+        // acceptance run — no second execution path to keep in sync.
+        let precheck = if precheck_due && self.precheck_ids.contains(&step.id) {
+            step.acceptance.as_ref()
+        } else {
+            None
+        };
+        if let Some(check) = precheck {
+            let check_started = Instant::now();
+            let hang_cap = self.hung_checks
+                .contains(&check_identity(check))
+                .then(|| self.longest_step.max(self.longest_decided_check));
+            let drift = self.evidence_guard.observe(check, self.workdir);
+            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            if let Some(sentence) = &drift {
+                verdict = verdict.with_evidence_drift(sentence);
+            }
+            self.check_cost_paid += check_started.elapsed();
+            self.check_runs += 1;
+            self.note_precheck_verdict(step, check, &verdict, check_started)
+                .await;
+            if verdict.passed {
+                // What the environment confirmed AT THIS INSTANT, not just
+                // that it confirmed something (see `verdict_artifacts`).
+                let artifacts = verdict_artifacts(check, self.workdir);
+                let detail = serde_json::json!({
+                    "verified": true,
+                    "verdict": verdict.detail,
+                    "output_head": verdict.output_head,
+                    "artifacts": artifacts,
+                    "already_satisfied": true,
+                    "steps_run": 0,
+                    "tokens_spent": 0,
+                });
+                let _ = self.source
+                    .log(
+                        step.id,
+                        "acceptance_already_satisfied",
+                        serde_json::json!({
+                            "detail": verdict.detail,
+                            "check": check.describe(),
+                        }),
+                    )
+                    .await;
+                match self.source.complete(step.id, detail).await {
+                    Ok(()) => {
+                        self.consecutive_errors = 0;
+                        self.items_completed += 1;
+                        self.items_already_satisfied += 1;
+                        self.verified_this_run.push((step.id, step.title.clone(), check.clone()));
+                        // Knowledge, not a dry round: the passing verdict
+                        // rides the report so the continuation planner
+                        // hears WHAT is established instead of re-seeding
+                        // "assess starting state".
+                        self.verified_outcomes.push(VerifiedOutcome {
+                            id: step.id,
+                            title: step.title.clone(),
+                            detail: verified_detail(&verdict, &artifacts),
+                            already_satisfied: true,
+                        });
+                        self.progress.remove(&step.id);
+                        tracing::info!(
+                            item = step.id,
+                            title = %step.title,
+                            verdict = %verdict.detail,
+                            "acceptance already passed before any step — completing \
+                             without running one"
+                        );
+                        return next_iteration();
+                    }
+                    Err(message) => {
+                        // Same containment as the post-step path: a
+                        // completion can legitimately fail (a concurrent
+                        // decomposition opened a child). Fall through and
+                        // run the step normally.
+                        let _ = self.source
+                            .log(
+                                step.id,
+                                "complete_failed",
+                                serde_json::json!({ "error": message }),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Book a pre-check verdict: carry a finding into the step when it said
+    /// nothing, or record the decided outcome.
+    async fn note_precheck_verdict(
+        &mut self,
+        step: &TaskStep,
+        check: &AcceptanceCheck,
+        verdict: &AcceptanceVerdict,
+        check_started: Instant,
+    ) {
+        if verdict.is_unknown() {
+            // Unknown, not failure: the item runs its step normally,
+            // but it starts KNOWING what silenced the check — the
+            // finding is the most useful thing the step could hear.
+            let hung = verdict.timed_out;
+            if hung {
+                self.hung_checks.insert(check_identity(check));
+            } else {
+                self.hung_checks.remove(&check_identity(check));
+                self.longest_decided_check =
+                    self.longest_decided_check.max(check_started.elapsed());
+            }
+            self.acceptance_unknown += 1;
+            let item = self.progress.entry(step.id).or_default();
+            let finding = if hung {
+                item.consecutive_check_timeouts += 1;
+                hanging_check_finding(check, verdict, item.consecutive_check_timeouts)
+            } else {
+                evidence_changed_finding(check, verdict)
+            };
+            item.last_result = Some(finding.clone());
+            tracing::warn!(
+                item = step.id,
+                title = %step.title,
+                hung,
+                detail = %text_head(&verdict.detail, 240),
+                "acceptance pre-check produced no usable verdict; carrying the \
+                 finding into the step"
+            );
+            let _ = self.source.add_note(step.id, &finding).await;
+            let _ = self.source
+                .log(
+                    step.id,
+                    if hung {
+                        "acceptance_timeout"
+                    } else {
+                        "acceptance_evidence_changed"
+                    },
+                    serde_json::json!({
+                        "detail": verdict.detail,
+                        "check": check.describe(),
+                        "precheck": true,
+                    }),
+                )
+                .await;
+        } else {
+            self.hung_checks.remove(&check_identity(check));
+            self.longest_decided_check = self.longest_decided_check.max(check_started.elapsed());
+            if note_check_outcome(&mut self.check_outcomes, check, verdict.passed) {
+                // Re-proposed work whose condition NOW passes after
+                // failing earlier this run: the environment moved.
+                // Every open item's fruitless budget replenishes below
+                // (the completion path also runs — flip and completion
+                // are the same event seen at two granularities).
+                for open_item in self.progress.values_mut() {
+                    open_item.steps_without_progress = 0;
+                }
+                tracing::info!(
+                    item = step.id,
+                    check = %check.describe(),
+                    "check flipped fail→pass — verified environment change; \
+                     replenishing every open item's fruitless budget"
+                );
+            }
+        }
+    }
+
+    /// The step's prompt and kind: a replan ask, or an execute step (the
+    /// escalated rung included).
+    fn step_prompt(
+        &mut self,
+        step: &TaskStep,
+        is_replan: bool,
+        escalate: bool,
+        tokens_used: u64,
+    ) -> (String, StepKind) {
+        let item = self.progress.entry(step.id).or_default();
+        if is_replan && !escalate {
+            // A replan reached with the check currently hanging must aim
+            // the decomposition at the hang first — it is the standing
+            // reason no verdict can arrive.
+            let stall_summary = if item.consecutive_check_timeouts > 0 {
+                format!(
+                    "the done-condition check has HUNG {} consecutive time(s) (killed at \
+                     its timeout, no verdict). The artifact blocks forever on something \
+                     this check runs — decompose so fixing the hang comes first",
+                    item.consecutive_check_timeouts
+                )
+            } else {
+                format!(
+                    "{} steps without the done-condition flipping",
+                    item.steps_without_progress
+                )
+            };
+            (
+                build_replan_prompt(self.goal, step, &stall_summary),
+                StepKind::Plan,
+            )
+        } else {
+            let line = budget_line(
+                self.steps_taken,
+                self.items_completed,
+                tokens_used,
+                self.cfg.max_total_tokens,
+                self.started.elapsed(),
+                self.cfg.max_wall_clock,
+            );
+            // A pending regression notice rides in with the last result:
+            // the model must hear "you un-did verified work" on its very
+            // NEXT step, whatever item that step serves — waiting for the
+            // regressed item itself to be selected would let it wander
+            // further from the wreckage first. One-shot: taken here,
+            // durably recorded on the reopened tasks either way.
+            let last_result = match (item.last_result.as_deref(), self.regression_notice.take()) {
+                (Some(prev), Some(notice)) => Some(format!("{prev}\n\n{notice}")),
+                (None, Some(notice)) => Some(notice),
+                (prev, None) => prev.map(str::to_string),
+            };
+            // The escalation rides in the same band as the regression
+            // notice, and for the same reason: it is what the model must
+            // hear LAST, right after the result it is being asked to act
+            // on. Everything else about the prompt stays the ordinary
+            // execute prompt — the done-condition, the self-check line,
+            // the notes and the digest all still apply, because this rung
+            // is asking for work, not for a plan.
+            let last_result = if escalate {
+                let escalation = stalled_escalation_text(
+                    item.steps_without_progress,
+                    item.consecutive_check_timeouts,
+                );
+                Some(match last_result {
+                    Some(prev) => format!("{prev}\n\n{escalation}"),
+                    None => escalation,
+                })
+            } else {
+                last_result
+            };
+            // The do-not-regress digest: verified state must reach the
+            // model that EDITS, not only the planner that plans.
+            let digest = verified_digest(&self.verified_outcomes);
+            (
+                build_step_prompt(
+                    self.goal,
+                    step,
+                    last_result.as_deref(),
+                    digest.as_deref(),
+                    &line,
+                ),
+                StepKind::Execute,
+            )
+        }
+    }
+
+    /// Run one step, containing runner errors to the item or the run.
+    async fn run_step(
+        &mut self,
+        step: &TaskStep,
+        prompt: String,
+        step_kind: StepKind,
+    ) -> Phase<StepOutcome> {
+        let remaining_wall = self.cfg.max_wall_clock.saturating_sub(self.started.elapsed());
+        let request = StepRequest {
+            item_id: step.id,
+            step_index: self.steps_taken,
+            step_kind,
+            item_title: step.title.clone(),
+            prompt,
+            tool_scope: step.tool_scope.clone(),
+            token_budget: self.cfg.step_token_budget,
+            // No fixed iteration cap: the runner ends the step on
+            // progress exhaustion (see `step_token_budget`'s docs for the
+            // P22 evidence against a hard 8) and the run's wall clock
+            // rides in below as the real bound.
+            max_iterations: None,
+            max_wall_clock: Some(remaining_wall),
+            cancel: self.cancel.clone(),
+        };
+
+        let step_started = Instant::now();
+        match self.runner.run_step(request).await {
+            Ok(outcome) => {
+                self.consecutive_errors = 0;
+                // One term of the hang re-stake cap: the largest cost
+                // this run has measured for real work.
+                self.longest_step = self.longest_step.max(step_started.elapsed());
+                ControlFlow::Continue(outcome)
+            }
+            Err(message) => {
+                self.consecutive_errors += 1;
+                self.last_runner_error = Some(message.clone());
+                let item = self.progress.entry(step.id).or_default();
+                item.runner_errors += 1;
+                // Poison containment: when the failure follows one item
+                // (its prompt/notes deterministically break the model),
+                // abandon that item and keep the run alive. Provider-wide
+                // death still trips the run-level breaker below, whose
+                // counter spans items.
+                if item.runner_errors >= ITEM_RUNNER_ERRORS_MAX {
+                    let last_result = item.last_result.clone();
+                    let reason =
+                        format!("abandoned after persistent runner errors: {message}");
+                    if let Err(message) = self.source.abandon(step.id, &reason).await {
+                        return stop(StopReason::SourceError { message });
+                    }
+                    self.items_abandoned += 1;
+                    // This site used to record NOTHING — not even for a
+                    // checked item, which then never reached either sweep
+                    // and so could be neither revived nor named as unmet.
+                    // A poisoned prompt says nothing about the world: if
+                    // later work satisfies this item's condition the sweep
+                    // must still be able to find it.
+                    record_abandonment(
+                        step,
+                        &reason,
+                        last_result,
+                        &mut self.abandoned_this_run,
+                        &mut self.abandoned_unverifiable,
+                    );
+                    self.progress.remove(&step.id);
+                    return next_iteration();
+                }
+                if self.consecutive_errors >= self.cfg.max_consecutive_errors {
+                    return stop(StopReason::RunnerErrors { message });
+                }
+                next_iteration()
+            }
+        }
+    }
+
+    /// Book a finished step's spend, and settle the replan rungs; a replan
+    /// step ends the pass here.
+    async fn record_step(
+        &mut self,
+        step: &TaskStep,
+        outcome: &StepOutcome,
+        is_replan: bool,
+        escalate: bool,
+        subtasks_before: Option<usize>,
+    ) -> Phase {
+        self.steps_taken += 1;
+        self.input_tokens += outcome.input_tokens;
+        self.output_tokens += outcome.output_tokens;
+        // Attribution material for the evidence guard: which paths this
+        // run has written through a tool that RECORDS what it wrote. Only
+        // ever used to decide whether "modified by this session" is a
+        // claim the run can back up.
+        self.evidence_guard.note_touched(&outcome.touched_paths);
+
+        let item = self.progress.entry(step.id).or_default();
+        item.tokens_spent += outcome.input_tokens + outcome.output_tokens;
+        if !outcome.tool_calls.is_empty() {
+            // The narration ladder counts CONSECUTIVE prose-only steps; a
+            // step that acted re-arms all three rungs.
+            item.narration_steps = 0;
+        }
+
+        if escalate {
+            // The escalated rung spends one replan allowance even though
+            // it ran as an execute step. Without that the item would
+            // escalate forever: `is_replan` is derived from the fruitless
+            // counter, which an unproductive escalated step does not
+            // reset, and only `replans` moves the abandonment gate. With
+            // it, the ladder is decompose → escalate → abandon on the
+            // default `max_replans_per_item: 2` — the same length it had
+            // when both rungs asked the same question.
+            item.replans += 1;
+            item.escalated_asks += 1;
+            self.replans += 1;
+            let _ = self.source
+                .log(
+                    step.id,
+                    "replan_escalated",
+                    serde_json::json!({
+                        "replans": item.replans,
+                        "dry_replans": item.dry_replans,
+                        "asked": "next concrete action",
+                    }),
+                )
+                .await;
+            // Falls through: the verdict, the fruitless accounting and
+            // the narration ladder below all apply, which is the whole
+            // point of running this rung as a step.
+        } else if is_replan {
+            // The replan step adds subtasks through the store; the next
+            // next() will surface them. A replan that actually decomposed
+            // resets the grind counter so the new work gets a fresh
+            // allowance — but a DRY replan must not buy one.
+            //
+            // Observed live 2026-08-02 (session 05775d1d): a replan
+            // re-proposed the title the run had just abandoned, the store
+            // refused to resurrect it, and the reset handed the item
+            // another full allowance of fruitless steps — the item span
+            // grew by `max_steps_per_item` per empty replan instead of
+            // converging. With the reset withheld the item is still at
+            // its grind threshold, so the next iteration replans again
+            // and the existing `max_replans_per_item` rung reaches
+            // abandonment directly. A source that cannot report its
+            // children (`None`) is treated as productive, exactly as
+            // before.
+            let produced_work = match (subtasks_before, self.source.open_subtasks(step.id).await) {
+                (Some(before), Ok(Some(after))) => after > before,
+                _ => true,
+            };
+            item.replans += 1;
+            if produced_work {
+                item.steps_without_progress = 0;
+                item.last_result = None;
+                item.last_tool_calls.clear();
+            } else {
+                // Recorded, not just logged: the next stall rung on this
+                // item reads it and changes the question rather than
+                // asking this one again.
+                item.dry_replans += 1;
+                tracing::info!(
+                    item = step.id,
+                    replans = item.replans,
+                    "replan added no subtasks — not resetting the grind counter; the \
+                     next stall rung escalates instead of re-asking"
+                );
+            }
+            self.replans += 1;
+            let _ = self.source
+                .log(
+                    step.id,
+                    "replanned",
+                    serde_json::json!({
+                        "replans": item.replans,
+                        "produced_work": produced_work,
+                    }),
+                )
+                .await;
+            return next_iteration();
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    /// Note the step's findings, stop if the run was cancelled, and count its
+    /// tool calls. Returns whether the step repeated the item's last one.
+    async fn file_step_findings(
+        &mut self,
+        step: &TaskStep,
+        outcome: &StepOutcome,
+    ) -> Phase<bool> {
+        // Leave the step's findings in the store (the durable scratchpad),
+        // not in any transcript.
+        let tail = text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
+        if !tail.is_empty() {
+            let _ = self.source.add_note(step.id, &tail).await;
+        }
+
+        // A cancelled step is a truncated step: its text is not a
+        // verdictable claim, and an acceptance command run now is work
+        // after the user said stop. Findings are already noted above.
+        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return stop(StopReason::Cancelled);
+        }
+
+        let item = self.progress.entry(step.id).or_default();
+        // Cross-step repetition = a stall the in-run detector cannot see.
+        let repeated = steps_repeat(&item.last_tool_calls, &outcome.tool_calls);
+        item.last_tool_calls.clone_from(&outcome.tool_calls);
+        self.tool_calls_total += outcome.tool_calls.len();
+        // Counted by NAME, not by outcome: a [`StepToolCall`] is a digest
+        // and carries no success flag. An attempted-but-failed `exec`
+        // therefore reads as "the step reached for the world", which errs
+        // toward letting a mission continue — the cheap mistake, since the
+        // opposite one ends a live mission a round early.
+        self.side_effect_tool_calls += outcome
+            .tool_calls
+            .iter()
+            .filter(|call| crate::loop_runner::is_work_evidence_tool(&call.name))
+            .count();
+        ControlFlow::Continue(repeated)
+    }
+
+    /// Judge the step: by its acceptance check when it has one, by its own
+    /// claim and evidence when it does not.
+    async fn judge_step(
+        &mut self,
+        step: &TaskStep,
+        outcome: &StepOutcome,
+        repeated: bool,
+    ) -> Phase {
+        // Verdict time. With a check, the environment is the only judge.
+        match &step.acceptance {
+            Some(check) => self.judge_checked(step, check, outcome, repeated).await,
+            None => self.judge_unchecked(step, outcome, repeated).await,
+        }
+    }
+
+    /// Run the item's acceptance check after its step and act on the verdict.
+    async fn judge_checked(
+        &mut self,
+        step: &TaskStep,
+        check: &AcceptanceCheck,
+        outcome: &StepOutcome,
+        repeated: bool,
+    ) -> Phase {
+        let check_started = Instant::now();
+        let hang_cap = self.hung_checks
+            .contains(&check_identity(check))
+            .then(|| self.longest_step.max(self.longest_decided_check));
+        // The step just ran; re-hash its check's evidence before
+        // the verdict, so a step that edited what the check reads
+        // cannot close the item in the same breath.
+        let drift = self.evidence_guard.observe(check, self.workdir);
+        let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+        if let Some(sentence) = &drift {
+            verdict = verdict.with_evidence_drift(sentence);
+        }
+        self.check_cost_paid += check_started.elapsed();
+        self.check_runs += 1;
+        if !verdict.timed_out {
+            self.hung_checks.remove(&check_identity(check));
+            self.longest_decided_check =
+                self.longest_decided_check.max(check_started.elapsed());
+        }
+        let _ = self.source
+            .log(
+                step.id,
+                "acceptance_checked",
+                serde_json::json!({
+                    "passed": verdict.passed,
+                    "detail": verdict.detail,
+                    "unknown": verdict.is_unknown(),
+                    "evidence_changed": verdict.evidence_changed,
+                }),
+            )
+            .await;
+        if verdict.is_unknown() {
+            self.judge_unknown(step, check, outcome, repeated, &verdict)
+                .await;
+            ControlFlow::Continue(())
+        } else if verdict.passed {
+            self.judge_passed(step, check, &verdict).await
+        } else {
+            self.judge_failed(step, check, outcome, repeated, &verdict)
+                .await;
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// The check said nothing: carry the finding and judge the step on its own
+    /// evidence.
+    async fn judge_unknown(
+        &mut self,
+        step: &TaskStep,
+        check: &AcceptanceCheck,
+        outcome: &StepOutcome,
+        repeated: bool,
+        verdict: &AcceptanceVerdict,
+    ) {
+        let item = self.progress.entry(step.id).or_default();
+        // UNKNOWN, not failed. The check said nothing about
+        // the work, so nothing about the TIMEOUT may read as
+        // failure: no failure signature, no refuted claim,
+        // and never a charge for the hang itself. What the
+        // run DID learn is that something hangs — surfaced as
+        // a first-class carried finding — and the next run of
+        // this check is cost-capped (`hung_checks`).
+        //
+        // The STEP beside the silent check is still a step,
+        // and it is judged exactly like a step with no check
+        // at all (the `None` arm below is the precedent):
+        // novel successful evidence replenishes, a degenerate
+        // loop rides the steering ladder, and an empty-handed
+        // step charges as an empty-handed step. That is what
+        // keeps the item converging on the NORMAL ladder
+        // without ever counting unknowns into a verdict —
+        // counting them (an earlier draft routed N
+        // consecutive timeouts to the replan rung) is just
+        // fabricating a failure from things that said
+        // nothing. (P22 evidence both ways: qwen proved
+        // tests 01–20 passing inside the very step whose
+        // check then hung — novel evidence, replenishes; and
+        // it burned 120 of 240 minutes re-staking 600s on
+        // the same silent check — the cap's job.)
+        //
+        // The evidence-drift demotion enters here for exactly
+        // the same reason and with exactly the same
+        // consequences (no budget charge, no completion, no
+        // flip credit) — but it is NOT a hang: no hang finding
+        // is minted and the re-stake cap stays disarmed, or a
+        // model whose test file simply changed would be sent
+        // hunting a non-existent infinite loop.
+        let hung = verdict.timed_out;
+        if hung {
+            self.hung_checks.insert(check_identity(check));
+        }
+        self.acceptance_unknown += 1;
+        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+        let degenerate =
+            outcome.degenerate_loop && outcome.tool_calls.is_empty();
+        let steered = degenerate
+            && item.narration_steps < NARRATION_LADDER_STEPS;
+        if fresh_success {
+            item.steps_without_progress = 0;
+        } else if steered {
+            item.narration_steps += 1;
+        } else {
+            item.steps_without_progress += 1;
+            if repeated {
+                item.steps_without_progress += 1;
+            }
+        }
+        let mut finding = if hung {
+            item.consecutive_check_timeouts += 1;
+            hanging_check_finding(
+                check,
+                verdict,
+                item.consecutive_check_timeouts,
+            )
+        } else {
+            item.consecutive_check_timeouts = 0;
+            evidence_changed_finding(check, verdict)
+        };
+        if degenerate {
+            finding.push_str("\n\n");
+            finding
+                .push_str(&narration_steering_text(item.narration_steps.max(1)));
+        }
+        tracing::warn!(
+            item = step.id,
+            title = %step.title,
+            hung,
+            consecutive = item.consecutive_check_timeouts,
+            step_charged = !fresh_success && !steered,
+            detail = %text_head(&verdict.detail, 240),
+            "acceptance check produced no usable verdict — carrying the \
+             finding forward and judging the step on its own evidence"
+        );
+        let _ = self.source.add_note(step.id, &finding).await;
+        let _ = self.source
+            .log(
+                step.id,
+                if hung {
+                    "acceptance_timeout"
+                } else {
+                    "acceptance_evidence_changed"
+                },
+                serde_json::json!({
+                    "detail": verdict.detail,
+                    "consecutive": item.consecutive_check_timeouts,
+                }),
+            )
+            .await;
+        item.last_result = Some(finding);
+    }
+
+    /// The check passed: complete the item on the environment's verdict.
+    async fn judge_passed(
+        &mut self,
+        step: &TaskStep,
+        check: &AcceptanceCheck,
+        verdict: &AcceptanceVerdict,
+    ) -> Phase {
+        let item = self.progress.entry(step.id).or_default();
+        item.consecutive_check_timeouts = 0;
+        if note_check_outcome(&mut self.check_outcomes, check, true) {
+            for open_item in self.progress.values_mut() {
+                open_item.steps_without_progress = 0;
+            }
+            tracing::info!(
+                item = step.id,
+                check = %check.describe(),
+                "check flipped fail→pass — verified environment change; \
+                 replenishing every open item's fruitless budget"
+            );
+        }
+        let artifacts = verdict_artifacts(check, self.workdir);
+        let item = self.progress.entry(step.id).or_default();
+        let detail = serde_json::json!({
+            "verified": true,
+            "verdict": verdict.detail,
+            "output_head": verdict.output_head,
+            "artifacts": artifacts,
+            "tokens_spent": item.tokens_spent,
+        });
+        match self.source.complete(step.id, detail).await {
+            Ok(()) => {
+                self.consecutive_errors = 0;
+                self.items_completed += 1;
+                self.verified_this_run.push((
+                    step.id,
+                    step.title.clone(),
+                    check.clone(),
+                ));
+                self.verified_outcomes.push(VerifiedOutcome {
+                    id: step.id,
+                    title: step.title.clone(),
+                    detail: verified_detail(verdict, &artifacts),
+                    already_satisfied: false,
+                });
+                self.progress.remove(&step.id);
+            }
+            Err(message) => {
+                // A completion can legitimately fail (e.g. a
+                // concurrent decomposition opened a child).
+                // Retry via next() instead of killing the run.
+                let _ = self.source
+                    .log(
+                        step.id,
+                        "complete_failed",
+                        serde_json::json!({ "error": message }),
+                    )
+                    .await;
+                self.consecutive_errors += 1;
+                if self.consecutive_errors >= self.cfg.max_consecutive_errors {
+                    return stop(StopReason::SourceError { message });
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The check failed: charge or replenish the item's budget and hand the
+    /// next step the verdict.
+    async fn judge_failed(
+        &mut self,
+        step: &TaskStep,
+        check: &AcceptanceCheck,
+        outcome: &StepOutcome,
+        repeated: bool,
+        verdict: &AcceptanceVerdict,
+    ) {
+        let item = self.progress.entry(step.id).or_default();
+        item.consecutive_check_timeouts = 0;
+        note_check_outcome(&mut self.check_outcomes, check, false);
+        if step_claims_completion(&outcome.text) {
+            // The model said done; the environment disagrees.
+            self.false_success_claims += 1;
+            let _ = self.source
+                .log(
+                    step.id,
+                    "false_success_claim",
+                    serde_json::json!({ "verdict": verdict.detail }),
+                )
+                .await;
+        }
+        let signature = failure_signature(&verdict.detail);
+        let novel = item.seen_failure_signatures.insert(signature);
+        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+        let degenerate =
+            outcome.degenerate_loop && outcome.tool_calls.is_empty();
+        let steered = degenerate
+            && item.narration_steps < NARRATION_LADDER_STEPS;
+        if novel && item.seen_failure_signatures.len() > 1 {
+            // The check fails DIFFERENTLY than every earlier
+            // attempt: the work moved the failure, which is
+            // progress by the environment's own evidence.
+            // The fruitless budget replenishes (same
+            // principle as stream retries replenishing on
+            // tool progress). A first-ever failure is the
+            // baseline, not progress; a revisited signature
+            // is oscillation and charges normally.
+            item.steps_without_progress = 0;
+        } else if fresh_success {
+            // The success mirror of the rule above: the step
+            // verifiably did NEW work on the world (a
+            // successful side-effectful call this item has
+            // never seen), so the environment's own evidence
+            // says the item is moving even though its check
+            // still fails the same way. Byte-identical
+            // repeats never take this arm, so the rewrite
+            // treadmill still converges on abandonment.
+            item.steps_without_progress = 0;
+        } else if steered {
+            // A zero-tool degenerate loop is a steering
+            // problem, not task evidence — route it to the
+            // harness's escalation ladder (bounded by
+            // NARRATION_LADDER_STEPS) and count it apart.
+            item.narration_steps += 1;
+        } else {
+            item.steps_without_progress += 1;
+            if repeated {
+                item.steps_without_progress += 1;
+            }
+        }
+        let mut step_result =
+            failed_acceptance_result(check, verdict, repeated);
+        if degenerate {
+            step_result.push_str("\n\n");
+            step_result
+                .push_str(&narration_steering_text(item.narration_steps.max(1)));
+            let _ = self.source
+                .log(
+                    step.id,
+                    "narration_step",
+                    serde_json::json!({
+                        "narration_steps": item.narration_steps,
+                        "charged": !steered,
+                    }),
+                )
+                .await;
+        }
+        let cluster = self.failure_owners.entry(signature).or_default();
+        cluster.insert(step.id);
+        if cluster.len() > 1 {
+            let others: Vec<String> = cluster
+                .iter()
+                .filter(|id| **id != step.id)
+                .map(|id| format!("#{id}"))
+                .collect();
+            let _ = self.source
+                .log(
+                    step.id,
+                    "shared_failure",
+                    serde_json::json!({
+                        "items": cluster.iter().copied().collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
+            let _ = write!(
+                step_result,
+                "\nNOTE: {} of this plan {} failing with this EXACT same \
+                 error. That is one underlying bug, not {} separate ones — \
+                 find and fix the shared cause, then re-run the checks.",
+                others.join(", "),
+                if others.len() == 1 { "is also" } else { "are also" },
+                cluster.len(),
+            );
+        }
+        item.last_result = Some(step_result);
+    }
+
+    /// No check exists: complete on the step's claim, or judge its evidence.
+    async fn judge_unchecked(
+        &mut self,
+        step: &TaskStep,
+        outcome: &StepOutcome,
+        repeated: bool,
+    ) -> Phase {
+        let item = self.progress.entry(step.id).or_default();
+        if step_claims_completion(&outcome.text) {
+            let detail = serde_json::json!({
+                "verified": false,
+                "tokens_spent": item.tokens_spent,
+            });
+            match self.source.complete(step.id, detail).await {
+                Ok(()) => {
+                    self.consecutive_errors = 0;
+                    self.items_completed += 1;
+                    self.items_completed_unverified += 1;
+                    let _ = self.source
+                        .log(step.id, "completed_unverified", serde_json::Value::Null)
+                        .await;
+                    self.progress.remove(&step.id);
+                }
+                Err(message) => {
+                    let _ = self.source
+                        .log(
+                            step.id,
+                            "complete_failed",
+                            serde_json::json!({ "error": message }),
+                        )
+                        .await;
+                    self.consecutive_errors += 1;
+                    if self.consecutive_errors >= self.cfg.max_consecutive_errors {
+                        return stop(StopReason::SourceError { message });
+                    }
+                }
+            }
+        } else {
+            let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+            let degenerate =
+                outcome.degenerate_loop && outcome.tool_calls.is_empty();
+            let steered = degenerate
+                && item.narration_steps < NARRATION_LADDER_STEPS;
+            if fresh_success {
+                // No check exists, but the environment's evidence
+                // still counts: the step did NEW successful work,
+                // so the item is moving even without a claim.
+                item.steps_without_progress = 0;
+            } else if steered {
+                // Zero-tool degenerate loop: steer, count apart,
+                // charge only past the ladder (same routing as
+                // the checked arm above).
+                item.narration_steps += 1;
+            } else {
+                item.steps_without_progress += 1;
+                if repeated {
+                    item.steps_without_progress += 1;
+                }
+            }
+            let mut step_result =
+                text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
+            if degenerate {
+                if !step_result.is_empty() {
+                    step_result.push_str("\n\n");
+                }
+                step_result
+                    .push_str(&narration_steering_text(item.narration_steps.max(1)));
+                let _ = self.source
+                    .log(
+                        step.id,
+                        "narration_step",
+                        serde_json::json!({
+                            "narration_steps": item.narration_steps,
+                            "charged": !steered,
+                        }),
+                    )
+                    .await;
+            }
+            item.last_result = Some(step_result);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The mid-run sweep at a step boundary (see the comment inside).
+    async fn mid_run_sweep(&mut self, step: &TaskStep, outcome: &StepOutcome) {
+        // MID-RUN SWEEP — the drain sweep's live half. Waiting for
+        // AllTasksDone to re-ask the environment was proven insufficient
+        // on 2026-08-10: continuously-live missions (continuation keeps
+        // the plan non-empty for hours) destroyed their own verified work
+        // late in the run with nothing catching it — one leg held 22/42
+        // verified for three hours, then full-file rewrites collapsed it
+        // to 1/42 in the final hour. So re-ask at the step boundary too:
+        // IMMEDIATELY for items whose acceptance references a path this
+        // step just wrote, and periodically for everything else on a
+        // cadence derived from measured check cost (`resweep_due` — no
+        // fixed N). The current item is excluded: its own check just ran
+        // as this boundary's verdict. Reopens share `reopened_once` with
+        // the drain sweep, so each item is reopened at most once per run
+        // however it is caught.
+        let eligible: Vec<(i64, String, AcceptanceCheck)> = self.verified_this_run
+            .iter()
+            .filter(|(id, _, _)| *id != step.id && !self.reopened_once.contains(id))
+            .cloned()
+            .collect();
+        // The drain sweep's OTHER half, also run live: an abandoned item
+        // whose check now passes was fixed by later work, and waiting for
+        // plan exhaustion to notice both wasted the fix and hid the
+        // strongest replenishment signal the run has (a fail→pass flip).
+        let eligible_abandoned: Vec<(i64, String, AcceptanceCheck)> = self.abandoned_this_run
+            .iter()
+            .filter(|(id, _, _)| *id != step.id && !self.reopened_once.contains(id))
+            .cloned()
+            .collect();
+        if !eligible.is_empty() || !eligible_abandoned.is_empty() {
+            let estimated = if self.check_runs > 0 {
+                // Saturating where `as` wrapped: the two differ only
+                // past u32::MAX re-sweep candidates, which no plan holds.
+                (self.check_cost_paid / self.check_runs)
+                    * u32::try_from(eligible.len() + eligible_abandoned.len())
+                        .unwrap_or(u32::MAX)
+            } else {
+                Duration::ZERO
+            };
+            let full_due = resweep_due(self.sweep_cost_paid, self.check_cost_paid, estimated);
+            let targets =
+                select_resweep_targets(eligible, full_due, &outcome.touched_paths);
+            let abandoned_targets = select_resweep_targets(
+                eligible_abandoned,
+                full_due,
+                &outcome.touched_paths,
+            );
+            self.revive_abandoned_mid_run(abandoned_targets).await;
+            let regressions = self.recheck_verified_mid_run(targets).await;
+            if !regressions.is_empty() {
+                let notice = regression_notice_text(&regressions);
+                // Merge with a still-pending notice (possible when the
+                // steps in between were replans, which do not consume
+                // it) rather than dropping either; both halves are
+                // screenful-bounded and the next execute step takes all.
+                self.regression_notice = Some(match self.regression_notice.take() {
+                    Some(prev) => format!("{prev}\n\n{notice}"),
+                    None => notice,
+                });
+            }
+        }
+    }
+
+    /// Mid-run: revive abandoned items whose check now passes.
+    async fn revive_abandoned_mid_run(
+        &mut self,
+        abandoned_targets: Vec<(i64, String, AcceptanceCheck)>,
+    ) {
+        for (id, title, check) in abandoned_targets {
+            if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                break;
+            }
+            let sweep_started = Instant::now();
+            let hang_cap = self.hung_checks
+                .contains(&check_identity(&check))
+                .then(|| self.longest_step.max(self.longest_decided_check));
+            let drift = self.evidence_guard.observe(&check, self.workdir);
+            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            if let Some(sentence) = &drift {
+                verdict = verdict.with_evidence_drift(sentence);
+            }
+            self.sweep_cost_paid += sweep_started.elapsed();
+            if !verdict.timed_out {
+                self.hung_checks.remove(&check_identity(&check));
+                self.longest_decided_check =
+                    self.longest_decided_check.max(sweep_started.elapsed());
+            }
+            if verdict.is_unknown() {
+                if verdict.timed_out {
+                    self.hung_checks.insert(check_identity(&check));
+                }
+                self.acceptance_unknown += 1;
+                continue;
+            }
+            let flipped = note_check_outcome(&mut self.check_outcomes, &check, verdict.passed);
+            if flipped {
+                // Verified environment change — replenish regardless
+                // of whether the reopen below succeeds; the evidence
+                // is the environment's, not the store's.
+                for open_item in self.progress.values_mut() {
+                    open_item.steps_without_progress = 0;
+                }
+                tracing::info!(
+                    item = id,
+                    check = %check.describe(),
+                    "mid-run sweep: check flipped fail→pass — verified \
+                     environment change; replenishing every open item's \
+                     fruitless budget"
+                );
+            }
+            if !verdict.passed {
+                continue;
+            }
+            if self.source
+                .reopen(id, "acceptance now passes — reviving abandoned item")
+                .await
+                .is_ok()
+            {
+                self.reopened_once.insert(id);
+                // Route through the precheck door: it completes
+                // verified on its next selection without a step.
+                self.precheck_ids.insert(id);
+                self.progress.remove(&id);
+                self.items_revived += 1;
+                self.items_abandoned = self.items_abandoned.saturating_sub(1);
+                tracing::info!(
+                    item = id,
+                    title = %title,
+                    "mid-run sweep: abandoned item's check now passes — reviving"
+                );
+                let _ = self.source
+                    .log(
+                        id,
+                        "revived",
+                        serde_json::json!({
+                            "detail": verdict.detail,
+                            "mid_run": true,
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Mid-run: reopen verified items whose check fails again. Returns the
+    /// regressions as `(id, title, detail)`.
+    async fn recheck_verified_mid_run(
+        &mut self,
+        targets: Vec<(i64, String, AcceptanceCheck)>,
+    ) -> Vec<(i64, String, String)> {
+        let mut regressions: Vec<(i64, String, String)> = Vec::new();
+        for (id, title, check) in targets {
+            // A sweep is bookkeeping, not work — stop mid-sweep the
+            // moment the user says stop; the loop head reports it.
+            if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                break;
+            }
+            let sweep_started = Instant::now();
+            let hang_cap = self.hung_checks
+                .contains(&check_identity(&check))
+                .then(|| self.longest_step.max(self.longest_decided_check));
+            let drift = self.evidence_guard.observe(&check, self.workdir);
+            let mut verdict = check.run_with_timeout_cap(self.workdir, hang_cap).await;
+            if let Some(sentence) = &drift {
+                verdict = verdict.with_evidence_drift(sentence);
+            }
+            self.sweep_cost_paid += sweep_started.elapsed();
+            if !verdict.timed_out {
+                self.hung_checks.remove(&check_identity(&check));
+                self.longest_decided_check =
+                    self.longest_decided_check.max(sweep_started.elapsed());
+            }
+            if verdict.is_unknown() {
+                // Unknown — a silent re-check must not reopen verified
+                // work as "regressed".
+                if verdict.timed_out {
+                    self.hung_checks.insert(check_identity(&check));
+                }
+                self.acceptance_unknown += 1;
+                continue;
+            }
+            note_check_outcome(&mut self.check_outcomes, &check, verdict.passed);
+            if verdict.passed {
+                continue;
+            }
+            if self.source
+                .reopen(
+                    id,
+                    &format!(
+                        "verified completion regressed mid-run — the acceptance \
+                         check fails again: {}",
+                        verdict.detail
+                    ),
+                )
+                .await
+                .is_ok()
+            {
+                self.reopened_once.insert(id);
+                self.progress.remove(&id);
+                self.items_completed = self.items_completed.saturating_sub(1);
+                self.items_regressed_reopened += 1;
+                let detail = text_head(&verdict.detail, 240).to_string();
+                tracing::warn!(
+                    item = id,
+                    title = %title,
+                    detail = %detail,
+                    "mid-run sweep: verified item regressed — reopening"
+                );
+                let _ = self.source
+                    .log(
+                        id,
+                        "regressed",
+                        serde_json::json!({
+                            "detail": verdict.detail,
+                            "mid_run": true,
+                        }),
+                    )
+                    .await;
+                // Durable context for whenever the item is next
+                // selected, independent of the one-shot notice below.
+                let _ = self.source
+                    .add_note(
+                        id,
+                        &format!(
+                            "REOPENED mid-run: later work un-did this verified \
+                             item — {detail}. Disk is truth; restore it."
+                        ),
+                    )
+                    .await;
+                regressions.push((id, title, detail));
+            }
+        }
+        regressions
+    }
+
+    /// The report for a run that stopped with `stop`.
+    fn into_report(self, stop: StopReason) -> LongHorizonReport {
+        let total_tokens = self.input_tokens + self.output_tokens;
         LongHorizonReport {
             stop,
-            steps_taken,
-            tool_calls: tool_calls_total,
-            side_effect_tool_calls,
-            items_completed,
-            items_completed_unverified,
-            items_revived,
-            items_regressed_reopened,
-            abandoned_unmet,
-            abandoned_unverifiable,
-            verified_outcomes,
-            acceptance_unknown,
-            items_already_satisfied,
-            items_abandoned,
-            last_runner_error,
-            replans,
-            false_success_claims,
-            input_tokens,
-            output_tokens,
-            wall_clock_secs: started.elapsed().as_secs(),
-            tokens_per_completed_item: if items_completed > 0 {
-                Some(total_tokens / items_completed as u64)
+            steps_taken: self.steps_taken,
+            tool_calls: self.tool_calls_total,
+            side_effect_tool_calls: self.side_effect_tool_calls,
+            items_completed: self.items_completed,
+            items_completed_unverified: self.items_completed_unverified,
+            items_revived: self.items_revived,
+            items_regressed_reopened: self.items_regressed_reopened,
+            abandoned_unmet: self.abandoned_unmet,
+            abandoned_unverifiable: self.abandoned_unverifiable,
+            verified_outcomes: self.verified_outcomes,
+            acceptance_unknown: self.acceptance_unknown,
+            items_already_satisfied: self.items_already_satisfied,
+            items_abandoned: self.items_abandoned,
+            last_runner_error: self.last_runner_error,
+            replans: self.replans,
+            false_success_claims: self.false_success_claims,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            wall_clock_secs: self.started.elapsed().as_secs(),
+            tokens_per_completed_item: if self.items_completed > 0 {
+                Some(total_tokens / self.items_completed as u64)
             } else {
                 None
             },
-            interjected_items,
+            interjected_items: self.interjected_items,
         }
     }
 }
+
 
 /// Feedback handed to the next step after a failed acceptance check —
 /// rendered verbatim into the `== LAST RESULT ==` block of the retry prompt.
@@ -3319,7 +3644,8 @@ fn failure_signature(detail: &str) -> u64 {
         .unwrap_or("");
     let normalized: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut hasher = std::hash::DefaultHasher::new();
-    normalized.hash(&mut hasher);
+    // Hashed as `str`, which is exactly how `String` hashes itself.
+    normalized.as_str().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3331,7 +3657,8 @@ fn check_identity(check: &AcceptanceCheck) -> u64 {
     use std::hash::{Hash, Hasher};
     let canonical = serde_json::to_string(check).unwrap_or_default();
     let mut hasher = std::hash::DefaultHasher::new();
-    canonical.hash(&mut hasher);
+    // Hashed as `str`, which is exactly how `String` hashes itself.
+    canonical.as_str().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3389,9 +3716,10 @@ fn hanging_check_finding(
         verdict.detail
     );
     if consecutive > 1 {
-        finding.push_str(&format!(
+        let _ = write!(
+            finding,
             "\nThat is {consecutive} consecutive hangs of this same check."
-        ));
+        );
     }
     finding.push_str(
         "\nTreat the hang itself as a FINDING about the artifact: something this command \
@@ -3400,10 +3728,11 @@ fn hanging_check_finding(
          the check.",
     );
     if let Some(command) = check.self_check_command() {
-        finding.push_str(&format!(
+        let _ = write!(
+            finding,
             "\nThe hanging command is: `{command}` (wrap it, e.g. `timeout 10 {command}`, \
              to see where it sticks)."
-        ));
+        );
     }
     finding
 }
@@ -3453,11 +3782,12 @@ fn stalled_escalation_text(fruitless_steps: usize, check_timeouts: usize) -> Str
          do it with a tool, then re-run the check."
     );
     if check_timeouts > 0 {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "\nThe check has also hung {check_timeouts} consecutive time(s) with no verdict, \
              so the one action to take is finding what it blocks on — reproduce it under a \
              short timeout first."
-        ));
+        );
     }
     text.push_str(
         "\nIf the task truly cannot be advanced here, say exactly what blocks it and what \
@@ -3488,11 +3818,12 @@ fn failed_acceptance_result(
         );
     }
     if let Some(command) = check.self_check_command() {
-        result.push_str(&format!(
+        let _ = write!(
+            result,
             "\nThat verdict came from the harness running: `{command}`\n\
              Before changing anything, read the file(s) this command runs (use read_file), \
              understand every assertion, then make them pass. Do not guess."
-        ));
+        );
     }
     result
 }
@@ -3525,7 +3856,9 @@ fn text_head(text: &str, max_bytes: usize) -> &str {
 }
 
 /// The filesystem path a tool call targeted, when the tool is one that
-/// writes a caller-named path (the write/edit family). `None` for everything
+/// writes a caller-named path (the write/edit family).
+///
+/// `None` for everything
 /// else — including `exec`, whose side effects are opaque to the caller; the
 /// periodic re-sweep is the backstop for those.
 ///
@@ -3625,9 +3958,10 @@ fn regression_notice_text(regressions: &[(i64, String, String)]) -> String {
         text.push_str(&line);
     }
     if omitted > 0 {
-        text.push_str(&format!(
-            "- …and {omitted} more (each reopened task carries its failing verdict)\n"
-        ));
+        let _ = writeln!(
+            text,
+            "- …and {omitted} more (each reopened task carries its failing verdict)"
+        );
     }
     text.push_str(footer);
     text
@@ -3697,6 +4031,7 @@ mod tests {
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.done = true;
             }
+            drop(items);
             self.completions.lock().await.push((id, detail));
             Ok(())
         }
@@ -3718,6 +4053,7 @@ mod tests {
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.abandoned = true;
             }
+            drop(items);
             self.abandon_reasons
                 .lock()
                 .await
@@ -3730,6 +4066,7 @@ mod tests {
                 item.done = false;
                 item.abandoned = false;
             }
+            drop(items);
             self.log_entries.lock().await.push((id, "reopened".to_string()));
             Ok(())
         }
@@ -4457,6 +4794,7 @@ mod tests {
         );
         // First attempt has no verdict yet — the enrichment is failure-only.
         assert!(!requests[0].prompt.contains("Done-condition NOT met"));
+        drop(requests);
     }
 
     // -----------------------------------------------------------------
@@ -4562,6 +4900,7 @@ mod tests {
             second.contains("first.txt (4 bytes"),
             "the verdict must carry artifact identity, not just 'a file exists': {second}"
         );
+        drop(requests);
     }
 
     /// The stored completion record must say what the environment confirmed at
@@ -4617,6 +4956,7 @@ mod tests {
             Some("PASS: all good"),
             "the head of what the check actually read: {detail}"
         );
+        drop(completions);
     }
 
     // -----------------------------------------------------------------
@@ -4707,6 +5047,7 @@ mod tests {
             log.iter().any(|(_, action)| action == "acceptance_evidence_changed"),
             "the demotion is greppable and distinct from a timeout: {log:?}"
         );
+        drop(log);
     }
 
     /// The mirror property, and the reason the guard is safe to run on every
@@ -4936,6 +5277,7 @@ mod tests {
         assert_eq!(detail["already_satisfied"], serde_json::json!(true));
         assert_eq!(detail["verified"], serde_json::json!(true));
         assert_eq!(detail["steps_run"], serde_json::json!(0));
+        drop(completions);
         assert!(
             source
                 .log_entries
@@ -4994,6 +5336,7 @@ mod tests {
             detail.get("already_satisfied").is_none(),
             "an ordinary completion, unmarked: {detail}"
         );
+        drop(completions);
     }
 
     /// The pre-check is OPT-IN, and the default is the bound: on a first plan
@@ -5123,6 +5466,7 @@ mod tests {
             "the user's item closed by running, not by being skipped: {}",
             interjected.1
         );
+        drop(completions);
     }
 
     #[tokio::test]
@@ -5141,6 +5485,29 @@ mod tests {
 
     #[tokio::test]
     async fn verified_completion_requires_the_acceptance_check_to_pass() {
+        struct Producer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for Producer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                if *calls == 2 {
+                    std::fs::write(&self.artifact, "done").unwrap();
+                }
+                drop(calls);
+                Ok(StepOutcome {
+                    text: "worked on it".to_string(),
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    tool_calls: vec![],
+                    touched_paths: vec![],
+                    degenerate_loop: false,
+                })
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default();
         source
@@ -5154,28 +5521,6 @@ mod tests {
             .await;
         // Step 1: model works but produces nothing. Step 2: file appears.
         let artifact = dir.path().join("artifact.txt");
-        struct Producer {
-            artifact: PathBuf,
-            calls: Mutex<usize>,
-        }
-        #[async_trait::async_trait]
-        impl StepRunner for Producer {
-            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
-                let mut calls = self.calls.lock().await;
-                *calls += 1;
-                if *calls == 2 {
-                    std::fs::write(&self.artifact, "done").unwrap();
-                }
-                Ok(StepOutcome {
-                    text: "worked on it".to_string(),
-                    input_tokens: 1000,
-                    output_tokens: 200,
-                    tool_calls: vec![],
-                    touched_paths: vec![],
-                    degenerate_loop: false,
-                })
-            }
-        }
         let runner = Producer {
             artifact,
             calls: Mutex::new(0),
@@ -5194,6 +5539,23 @@ mod tests {
 
     #[tokio::test]
     async fn drain_sweep_revives_an_abandoned_item_whose_check_now_passes() {
+        struct LateProducer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for LateProducer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                if *calls == 2 {
+                    std::fs::write(&self.artifact, "made by item 2").unwrap();
+                    return Ok(outcome("all wrapped up\nTASK COMPLETE"));
+                }
+                drop(calls);
+                Ok(outcome("grinding"))
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default();
         // Item 1 is stuck on a file that does not exist yet; item 2's work
@@ -5210,22 +5572,6 @@ mod tests {
             ))
             .await;
         source.push(step(2, "later work", None)).await;
-        struct LateProducer {
-            artifact: PathBuf,
-            calls: Mutex<usize>,
-        }
-        #[async_trait::async_trait]
-        impl StepRunner for LateProducer {
-            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
-                let mut calls = self.calls.lock().await;
-                *calls += 1;
-                if *calls == 2 {
-                    std::fs::write(&self.artifact, "made by item 2").unwrap();
-                    return Ok(outcome("all wrapped up\nTASK COMPLETE"));
-                }
-                Ok(outcome("grinding"))
-            }
-        }
         let runner = LateProducer {
             artifact: dir.path().join("x.txt"),
             calls: Mutex::new(0),
@@ -5249,28 +5595,15 @@ mod tests {
         let completions = source.completions.lock().await;
         let item1 = completions.iter().find(|(id, _)| *id == 1).unwrap();
         assert_eq!(item1.1["verified"], serde_json::json!(true));
+        drop(completions);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "revived"));
+        drop(log);
     }
 
     #[tokio::test]
     async fn drain_sweep_reopens_a_verified_item_that_later_work_un_did() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = MemorySource::default();
-        source
-            .push(step(
-                1,
-                "build artifact",
-                Some(AcceptanceCheck::FileExists {
-                    path: "y.txt".to_string(),
-                }),
-            ))
-            .await;
-        source.push(step(2, "destructive later work", None)).await;
-        // Call 1 creates the artifact (item 1 verifies), call 2 DELETES it
-        // (item 2 "succeeds" while silently un-doing verified work — the
-        // rewrite-erosion shape), call 3 restores it when item 1 comes back.
         struct Underminer {
             artifact: PathBuf,
             calls: Mutex<usize>,
@@ -5296,6 +5629,21 @@ mod tests {
                 }
             }
         }
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "build artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "y.txt".to_string(),
+                }),
+            ))
+            .await;
+        source.push(step(2, "destructive later work", None)).await;
+        // Call 1 creates the artifact (item 1 verifies), call 2 DELETES it
+        // (item 2 "succeeds" while silently un-doing verified work — the
+        // rewrite-erosion shape), call 3 restores it when item 1 comes back.
         let runner = Underminer {
             artifact: dir.path().join("y.txt"),
             calls: Mutex::new(0),
@@ -5311,6 +5659,7 @@ mod tests {
         assert_eq!(report.steps_taken, 3);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
+        drop(log);
     }
 
     // -----------------------------------------------------------------
@@ -5418,9 +5767,11 @@ mod tests {
             !requests[3].prompt.contains("un-did verified work"),
             "the notice is one-shot"
         );
+        drop(requests);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
+        drop(log);
         let notes = source.notes.lock().await;
         assert!(
             notes
@@ -5428,6 +5779,7 @@ mod tests {
                 .any(|(id, n)| *id == 1 && n.contains("REOPENED mid-run")),
             "the reopened item carries durable context"
         );
+        drop(notes);
     }
 
     #[tokio::test]
@@ -5527,7 +5879,7 @@ mod tests {
         // Full sweep due: everything, whatever was touched.
         assert_eq!(select_resweep_targets(eligible.clone(), true, &[]).len(), 2);
         // Not due, nothing touched: nothing to re-check.
-        assert!(select_resweep_targets(eligible.clone(), false, &[]).is_empty());
+        assert_eq!(select_resweep_targets(eligible.clone(), false, &[]), Vec::new());
         // Not due, one referenced path touched: exactly that item,
         // immediately — absolute spelling still collides with the check's
         // relative one.
@@ -5616,6 +5968,7 @@ mod tests {
         assert_eq!(report.items_completed_unverified, 1);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "completed_unverified"));
+        drop(log);
     }
 
     #[tokio::test]
@@ -5711,6 +6064,7 @@ mod tests {
         // progress exhaustion; wall clock is the bound that rides along.
         assert_eq!(exec.max_iterations, None);
         assert!(exec.max_wall_clock.is_some());
+        drop(requests);
     }
 
     /// Build a stalled item whose acceptance can never pass, with an
@@ -5864,11 +6218,11 @@ mod tests {
         );
 
         let requests = runner.inner.requests.lock().await;
-        let plans: Vec<_> = requests
+        let plans = requests
             .iter()
             .filter(|r| r.step_kind == StepKind::Plan)
-            .collect();
-        assert_eq!(plans.len(), 1, "the decomposition ask is never repeated");
+            .count();
+        assert_eq!(plans, 1, "the decomposition ask is never repeated");
 
         let escalated = requests.last().expect("four steps ran");
         assert_eq!(escalated.step_kind, StepKind::Execute);
@@ -5896,6 +6250,7 @@ mod tests {
                 && reason.contains("escalated next-action ask"),
             "the reason must say BOTH attempts came back empty: {reason}"
         );
+        drop(reasons);
     }
 
     /// REGRESSION: an abandoned item reached the report by NAME only if it
@@ -6251,6 +6606,7 @@ mod tests {
         let notes = source.notes.lock().await;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].1.contains("nanna-config"));
+        drop(notes);
     }
 
     // -----------------------------------------------------------------
@@ -6345,6 +6701,7 @@ mod tests {
                     *fail = false;
                     return Err("store unavailable".to_string());
                 }
+                drop(fail);
             }
             let batch = self.batches.lock().await.pop_front().unwrap_or_default();
             let admitted = batch.len();
@@ -6573,6 +6930,7 @@ TASK COMPLETE"))]);
         );
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "acceptance_timeout"));
+        drop(log);
     }
 
     /// The other half of "judged by its own evidence": while the check
@@ -6644,6 +7002,7 @@ TASK COMPLETE"))]);
             reasons.iter().all(|(_, r)| r.contains("runner errors")),
             "must die of script exhaustion, never of fruitlessness: {reasons:?}"
         );
+        drop(reasons);
     }
 
     /// Once a check has consumed its ENTIRE ceiling without answering,
@@ -6713,6 +7072,7 @@ TASK COMPLETE"))]);
                 std::fs::write(self.dir.join("flip.txt"), b"now exists").unwrap();
                 out.touched_paths = vec!["flip.txt".to_string()];
             }
+            drop(calls);
             Ok(out)
         }
     }
@@ -6865,6 +7225,7 @@ TASK COMPLETE"))]);
         drop(requests);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "narration_step"));
+        drop(log);
     }
 
     /// An already-satisfied pre-check completion is knowledge: the passing
@@ -6886,7 +7247,7 @@ TASK COMPLETE"))]);
             .await;
         let runner = ScriptedRunner::new(vec![]);
         let config = LongHorizonConfig {
-            precheck_acceptance_items: [7].into_iter().collect(),
+            precheck_acceptance_items: std::iter::once(7).collect(),
             ..fast_config()
         };
         let report = LongHorizonRunner::new(config)

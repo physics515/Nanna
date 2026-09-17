@@ -67,7 +67,7 @@ fn print_credentials_status(
 
 /// Persist an OAuth credential durably and point the config at OAuth mode.
 ///
-/// The SecureStore is the durable home — `Config::save` strips secrets from
+/// The `SecureStore` is the durable home — `Config::save` strips secrets from
 /// config.toml, so a login that only touches the config dies with the process.
 fn persist_oauth_credential(credential: &nanna_config::OAuthCredential) {
     if let Err(e) = nanna_config::SecureStore::new().save_anthropic_oauth(credential) {

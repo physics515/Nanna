@@ -8,21 +8,23 @@ use image::ImageFormat;
 use std::io::Cursor;
 use tracing::{debug, warn};
 
+use crate::numeric::{f32_to_u32, u64_to_f32};
+
 /// Maximum image size (in decoded bytes) per provider.
 /// Returns the limit for the given provider prefix, defaulting to the
 /// most restrictive (Anthropic's 5 MB) when unknown.
 fn max_image_bytes(provider: &str) -> usize {
     match provider {
-        "anthropic" => 5 * 1024 * 1024,
-        "openai" => 20 * 1024 * 1024,
-        "google" | "gemini" => 20 * 1024 * 1024,
+        "openai" | "google" | "gemini" => 20 * 1024 * 1024,
         "mistral" => 10 * 1024 * 1024,
-        _ => 5 * 1024 * 1024, // safe default
+        // "anthropic", and the safe default for anything unknown.
+        _ => 5 * 1024 * 1024,
     }
 }
 
 /// Extract the provider prefix from a model spec like `"anthropic/claude-sonnet-4-20250514"`.
 /// Returns `""` if there is no slash (which will map to the safe default).
+#[must_use]
 pub fn provider_from_model(model: &str) -> &str {
     model.split_once('/').map_or("", |(p, _)| p)
 }
@@ -93,8 +95,8 @@ pub fn fit_image_to_limit(
         let resized = if (scale - 1.0).abs() < f32::EPSILON {
             img.clone()
         } else {
-            let new_w = ((img.width() as f32) * scale) as u32;
-            let new_h = ((img.height() as f32) * scale) as u32;
+            let new_w = f32_to_u32(u64_to_f32(u64::from(img.width())) * scale);
+            let new_h = f32_to_u32(u64_to_f32(u64::from(img.height())) * scale);
             img.resize(
                 new_w.max(1),
                 new_h.max(1),
@@ -109,8 +111,8 @@ pub fn fit_image_to_limit(
         {
             // If JPEG encoding fails, try with lower quality via the encoder directly
             let mut buf2 = Vec::new();
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf2, quality);
-            if resized.write_with_encoder(encoder).is_err() {
+            let jpeg = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf2, quality);
+            if resized.write_with_encoder(jpeg).is_err() {
                 warn!("JPEG encoding failed on attempt {attempt}");
                 break;
             }
@@ -167,7 +169,7 @@ mod tests {
     #[test]
     fn test_small_image_passthrough() {
         // A tiny 1x1 white JPEG in base64
-        let tiny = base64::engine::general_purpose::STANDARD.encode(&[
+        let tiny = base64::engine::general_purpose::STANDARD.encode([
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46,
         ]);
         let (data, mt) = fit_image_to_limit(&tiny, "image/jpeg", "anthropic/claude-sonnet-4-20250514");

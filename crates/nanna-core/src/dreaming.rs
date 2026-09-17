@@ -51,7 +51,7 @@ impl Default for DreamingRuntimeConfig {
     }
 }
 
-/// Integrated dreaming runtime that combines DreamingService with LLM
+/// Integrated dreaming runtime that combines `DreamingService` with LLM
 pub struct DreamingRuntime {
     service: DreamingService,
     llm: Arc<LlmClient>,
@@ -65,6 +65,7 @@ impl DreamingRuntime {
     /// * `config` - Runtime configuration
     /// * `llm` - LLM client for summarization
     /// * `embed` - Embedding client for generating vector embeddings
+    #[must_use]
     pub fn new(
         config: DreamingRuntimeConfig,
         llm: Arc<LlmClient>,
@@ -90,6 +91,7 @@ impl DreamingRuntime {
     ///
     /// This is useful when you don't have an embedding client configured.
     /// Memory recall and smart ingest will not work without embeddings.
+    #[must_use]
     pub fn new_without_embeddings(config: DreamingRuntimeConfig, llm: Arc<LlmClient>) -> Self {
         let service = DreamingService::new(config.dreaming);
 
@@ -128,11 +130,16 @@ impl DreamingRuntime {
 
     /// Get reference to the underlying dreaming service
     #[must_use]
-    pub fn service(&self) -> &DreamingService {
+    pub const fn service(&self) -> &DreamingService {
         &self.service
     }
 
     /// Remember something
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`MemoryService::remember`]: a failed store write.
+    /// A missing or failing embedding provider is not an error.
     pub async fn remember(
         &self,
         content: &str,
@@ -142,6 +149,12 @@ impl DreamingRuntime {
     }
 
     /// Recall memories similar to a query
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`MemoryService::recall`], e.g.
+    /// [`MemoryError::NoEmbeddingProvider`](nanna_memory::MemoryError::NoEmbeddingProvider)
+    /// when no embedding provider is configured.
     pub async fn recall(
         &self,
         query: &str,
@@ -155,6 +168,12 @@ impl DreamingRuntime {
     }
 
     /// Apply feedback immediately without waiting for dreaming
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`MemoryService::promote`] or
+    /// [`MemoryService::demote`] (chosen by the feedback's sign) when the FSRS
+    /// update for `memory_id` fails, e.g. because no such memory exists.
     pub async fn apply_feedback(
         &self,
         memory_id: &str,
@@ -166,6 +185,13 @@ impl DreamingRuntime {
     /// Run the dreaming process (memory consolidation).
     ///
     /// This should be called periodically by the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`MemoryError::InvalidClusteringConfig`](nanna_memory::MemoryError::InvalidClusteringConfig)
+    /// when the consolidation config would let unrelated memories merge. Failed
+    /// feedback updates and summarizer calls are logged, not returned.
     pub async fn dream(&self) -> Result<DreamingStats, nanna_memory::MemoryError> {
         let llm = self.llm.clone();
         let model = self.model.clone();
@@ -185,11 +211,21 @@ impl DreamingRuntime {
     }
 
     /// Save memories to file
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`MemoryService::save`]: the file cannot be written
+    /// or the memories cannot be serialized.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), nanna_memory::MemoryError> {
         self.service.save(path).await
     }
 
     /// Load memories from file
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`MemoryService::load`]: the file cannot be read or
+    /// parsed.
     pub async fn load(&self, path: &std::path::Path) -> Result<(), nanna_memory::MemoryError> {
         self.service.load(path).await
     }
@@ -220,7 +256,7 @@ pub fn create_dreaming_executor(
                     success: false,
                     output: None,
                     error: Some("Not a dreaming task".to_string()),
-                    duration_ms: start.elapsed().as_millis() as u64,
+                    duration_ms: elapsed_ms(start),
                     started_at: now,
                     finished_at: now,
                 };
@@ -246,7 +282,7 @@ pub fn create_dreaming_executor(
                         success: true,
                         output: Some(output),
                         error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed_ms(start),
                         started_at,
                         finished_at,
                     }
@@ -260,7 +296,7 @@ pub fn create_dreaming_executor(
                         success: false,
                         output: None,
                         error: Some(e.to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed_ms(start),
                         started_at,
                         finished_at,
                     }
@@ -270,9 +306,15 @@ pub fn create_dreaming_executor(
     }
 }
 
+/// Milliseconds since `start`, saturating: a task would need to run for ~584
+/// million years to exceed `u64::MAX` milliseconds.
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[tokio::test]
     async fn test_dreaming_runtime_creation() {

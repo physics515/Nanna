@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nanna_agent::{Agent, AgentConfig, RunOptions};
+use nanna_agent::{Agent, AgentConfig, RunOptions, ToolActivation};
 use nanna_llm::LlmClient;
 use nanna_tools::{
     ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolRegistry, ToolResult,
@@ -175,7 +175,10 @@ async fn provider_unserved_tool_rejection_heals_by_activation() {
     // it is registered here, so the first request serves NO tools — the
     // exact precondition of the live failure.
     let options = RunOptions {
-        restrict_to_active_tools: true,
+        tool_activation: ToolActivation {
+            restrict_to_active_tools: true,
+            ..ToolActivation::default()
+        },
         ..Default::default()
     };
     let response = agent

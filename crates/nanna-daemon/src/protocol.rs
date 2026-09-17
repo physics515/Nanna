@@ -126,14 +126,23 @@ pub enum TaskAction {
         recurrence: Option<String>,
         #[serde(default)]
         depends_on: Option<Vec<i64>>,
+        /// Boxed because it is the whole reason this variant dwarfs the rest.
+        /// A `serde_json::Value` is 32 bytes with `serde_json`'s default
+        /// `BTreeMap`-backed map and ~72 with the `IndexMap` that
+        /// `preserve_order` swaps in — and something in the dependency graph
+        /// turns `preserve_order` on under `--all-features`. Inline, that made
+        /// `Create`, and through it `Action` (the type every IPC request is),
+        /// 368 bytes, so a `task.get {id}` cost as much to move as the largest
+        /// `task.create`. `Box` is transparent to serde: the wire JSON is
+        /// byte-for-byte what it was, including `null` for `None`.
         #[serde(default)]
-        acceptance: Option<serde_json::Value>,
+        acceptance: Option<Box<serde_json::Value>>,
         #[serde(default)]
         project: Option<String>,
         #[serde(default)]
         assignee: Option<String>,
     },
-    /// Partial update (status accepts pending|in_progress|cancelled)
+    /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,
         #[serde(default)]
@@ -675,7 +684,7 @@ pub enum SystemAction {
     /// unhardened logic in `get_ollama_models`); instead it sends this action
     /// to the daemon which uses the hardened `nanna_llm::probe_ollama`.
     ProbeOllama {
-        /// Base URL of the Ollama server (e.g. http://localhost:11434).
+        /// Base URL of the Ollama server (e.g. <http://localhost:11434>).
         /// The daemon resolves this from the config it was started with.
         base_url: String,
     },
@@ -746,12 +755,14 @@ impl Response {
     }
 
     /// Check if this response is an error
-    pub fn is_error(&self) -> bool {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
 
     /// Get the data if successful
-    pub fn data(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn data(&self) -> Option<&Value> {
         match &self.result {
             ResponseResult::Success { data } => Some(data),
             ResponseResult::Error { .. } => None,
@@ -759,6 +770,7 @@ impl Response {
     }
 
     /// Get the error message if failed
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         match &self.result {
             ResponseResult::Error { message, .. } => Some(message),
@@ -854,7 +866,7 @@ pub enum Event {
         session_id: String,
         /// Seconds since this turn started.
         elapsed_s: u64,
-        /// Coarse phase: planning | step_pending | streaming | thinking | tool.
+        /// Coarse phase: planning | `step_pending` | streaming | thinking | tool.
         phase: String,
         /// What the turn is waiting on right now, human-readable
         /// (e.g. "model output (ollama/qwen3.5:9b): last token 41s ago").
@@ -1030,7 +1042,7 @@ pub enum Event {
         scope: String,
         scope_id: Option<String>,
         task_id: Option<i64>,
-        /// started | completed | abandoned | acceptance_checked | replanned | ...
+        /// started | completed | abandoned | `acceptance_checked` | replanned | ...
         kind: String,
         detail: serde_json::Value,
     },
@@ -1125,29 +1137,29 @@ pub enum ControlAction {
 impl From<ControlAction> for Action {
     fn from(action: ControlAction) -> Self {
         match action {
-            ControlAction::ListSessions => Action::Session(SessionAction::List),
+            ControlAction::ListSessions => Self::Session(SessionAction::List),
             ControlAction::CreateSession { name } => {
-                Action::Session(SessionAction::Create { name })
+                Self::Session(SessionAction::Create { name })
             }
-            ControlAction::SwitchSession { id } => Action::Session(SessionAction::Switch { id }),
-            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search {
+            ControlAction::SwitchSession { id } => Self::Session(SessionAction::Switch { id }),
+            ControlAction::MemorySearch { query, limit } => Self::Memory(MemoryAction::Search {
                 query,
                 limit,
                 scope: None,
             }),
-            ControlAction::GetConfig => Action::Config(ConfigAction::Get { path: None }),
+            ControlAction::GetConfig => Self::Config(ConfigAction::Get { path: None }),
             ControlAction::SetConfig { path, value } => {
-                Action::Config(ConfigAction::Set { path, value })
+                Self::Config(ConfigAction::Set { path, value })
             }
-            ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => Action::Tool(ToolAction::Execute {
+            ControlAction::ListTools => Self::Tool(ToolAction::List),
+            ControlAction::RunTool { name, input } => Self::Tool(ToolAction::Execute {
                 name,
                 input,
                 session_id: None,
             }),
-            ControlAction::Status => Action::System(SystemAction::Status),
-            ControlAction::Restart => Action::System(SystemAction::Restart),
-            ControlAction::Shutdown => Action::System(SystemAction::Shutdown),
+            ControlAction::Status => Self::System(SystemAction::Status),
+            ControlAction::Restart => Self::System(SystemAction::Restart),
+            ControlAction::Shutdown => Self::System(SystemAction::Shutdown),
         }
     }
 }
@@ -1201,6 +1213,75 @@ mod tests {
                     Action::Session(SessionAction::SetModel { model: None, .. })
                 ),
                 "no model on the wire is the clear, not a parse error"
+            );
+        }
+    }
+
+    /// `TaskAction::Create::acceptance` is a `Box` purely to keep `Action`
+    /// small, and that is only allowed because `Box` is transparent to serde.
+    /// Pinned in both directions: a client's `task.create` still parses, and
+    /// the acceptance goes back out as itself rather than wrapped in anything.
+    /// If the box ever leaked into the wire it would show up here and nowhere
+    /// else — every client hand-writes this envelope.
+    ///
+    /// The re-serialized envelope is not byte-identical to the request, but
+    /// that predates the box and has nothing to do with it: no field carries
+    /// `skip_serializing_if`, so all thirteen omitted `Option`s come back as
+    /// explicit `null`. Round-tripping that output is what the assertion
+    /// checks, because `null` and absent are the same thing on the way in.
+    #[test]
+    fn a_boxed_acceptance_is_the_same_json_in_both_directions() {
+        let check = serde_json::json!({ "kind": "command", "command": "cargo test", "cwd": "." });
+        let raw = serde_json::json!({
+            "type": "task",
+            "action": "create",
+            "title": "build minidb",
+            "acceptance": check,
+        });
+
+        let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+        match &action {
+            Action::Task(TaskAction::Create { title, acceptance, .. }) => {
+                assert_eq!(title, "build minidb");
+                assert_eq!(
+                    acceptance.as_deref(),
+                    Some(&check),
+                    "the acceptance arrives whole through the box"
+                );
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+
+        let out = serde_json::to_value(&action).expect("create must serialize");
+        assert_eq!(out["acceptance"], check, "the box must not show up on the wire");
+        let again = serde_json::from_value::<Action>(out).expect("our own output must parse");
+        match again {
+            Action::Task(TaskAction::Create { acceptance, .. }) => {
+                assert_eq!(acceptance.as_deref(), Some(&check));
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+    }
+
+    /// The other half: no acceptance at all. `null` and an absent key both
+    /// mean "no check", and neither may round-trip into `Some(Value::Null)` —
+    /// which `task_create` would then hand to the harness parser as a shape to
+    /// reject, turning a plain task into a `bad_acceptance` error.
+    #[test]
+    fn a_null_or_absent_acceptance_is_no_acceptance() {
+        for raw in [
+            serde_json::json!({
+                "type": "task", "action": "create", "title": "t", "acceptance": null,
+            }),
+            serde_json::json!({ "type": "task", "action": "create", "title": "t" }),
+        ] {
+            let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+            assert!(
+                matches!(
+                    action,
+                    Action::Task(TaskAction::Create { acceptance: None, .. })
+                ),
+                "no acceptance on the wire is no check, not an empty one"
             );
         }
     }

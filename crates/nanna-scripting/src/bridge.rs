@@ -446,6 +446,7 @@ where
 
 impl NannaBridge {
     /// Create a new bridge with the given permissions
+    #[must_use]
     pub fn new(permissions: ToolPermissions) -> Self {
         Self {
             permissions,
@@ -478,11 +479,13 @@ impl NannaBridge {
     }
 
     /// Get the current session ID.
+    #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
     /// Get the default working directory as a string.
+    #[must_use]
     pub fn workdir(&self) -> Option<&str> {
         self.default_workdir.as_ref().and_then(|p| p.to_str())
     }
@@ -509,14 +512,13 @@ impl NannaBridge {
         let path = path.trim();
         
         // Expand ~ or ~/ (but not ~username which we don't support)
-        if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-            if let Some(home) = Self::home_dir() {
+        if (path == "~" || path.starts_with("~/") || path.starts_with("~\\"))
+            && let Some(home) = Self::home_dir() {
                 let rest = path.strip_prefix("~/")
                     .or_else(|| path.strip_prefix("~\\"))
                     .unwrap_or("");
                 return home.join(rest);
             }
-        }
         
         // An MSYS drive path the shell itself printed (`/d/Development/x`).
         //
@@ -670,7 +672,8 @@ impl NannaBridge {
     }
 
     /// Get stored tool definitions (for `Nanna.listTools()`)
-    pub fn list_tools(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn list_tools(&self) -> Option<&Value> {
         self.tool_definitions.as_ref()
     }
 
@@ -685,6 +688,11 @@ impl NannaBridge {
     }
 
     /// Call a registered service by name
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if no service named `name` is registered, or the
+    /// service's own error message if the call fails.
     pub async fn call_service(&self, name: &str, params: Value) -> std::result::Result<Value, String> {
         let service = self.services.get(name)
             .ok_or_else(|| format!("Service not found: {name}"))?;
@@ -694,11 +702,25 @@ impl NannaBridge {
     /// Execute a shell command (if permitted)
     ///
     /// `timeout_secs`: optional override for the execution timeout (default: 30s).
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::exec_with_timeout`].
     pub async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecResponse> {
         self.exec_with_timeout(command, workdir, None).await
     }
 
     /// Execute a shell command with an optional timeout override.
+    ///
+    /// A command that overruns its deadline is not an error: it is killed and
+    /// returned with `timed_out: true` and whatever it had printed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the tool lacks the `run`
+    /// permission or the platform (Android, iOS) has no shell, and
+    /// [`ScriptError::Bridge`] if the command cannot be spawned or waiting on
+    /// it fails.
     pub async fn exec_with_timeout(&self, command: &str, workdir: Option<&str>, timeout_secs: Option<u64>) -> Result<ExecResponse> {
         tracing::debug!(target: "bridge", "exec called: command={}, run_permission={}", command, self.permissions.run);
         
@@ -854,9 +876,26 @@ impl NannaBridge {
         // directly comparable.
         let started = std::time::Instant::now();
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+        Self::collect_exec(child, started, timeout).await
+    }
+
+    /// Wait for a spawned exec child under its deadline and collect its output.
+    ///
+    /// `started` is the wall clock taken before the spawn; `timeout` is the
+    /// deadline in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Bridge`] if waiting on the child fails. An
+    /// overrun is reported in the response, not as an error.
+    async fn collect_exec(
+        mut child: tokio::process::Child,
+        started: std::time::Instant,
+        timeout: u64,
+    ) -> Result<ExecResponse> {
         // Capture the pid *before* the wait future consumes the child, so a timeout
         // can kill the whole process tree rooted here (not just the shell).
         let pid = child.id();
@@ -971,7 +1010,7 @@ impl NannaBridge {
 
     /// Get the current platform (windows, darwin, linux)
     #[must_use]
-    pub fn platform() -> &'static str {
+    pub const fn platform() -> &'static str {
         if cfg!(windows) {
             "win32"
         } else if cfg!(target_os = "macos") {
@@ -986,6 +1025,13 @@ impl NannaBridge {
     }
 
     /// Fetch a URL (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if network access to the URL's host
+    /// is not permitted, and [`ScriptError::Bridge`] if the URL does not parse,
+    /// the method is not one of GET/POST/PUT/DELETE/PATCH, the request fails, or
+    /// the response body cannot be read.
     pub async fn fetch(&self, url: &str, options: Option<FetchOptions>) -> Result<FetchResponse> {
         // Parse URL to check host
         let parsed = url::Url::parse(url)
@@ -1047,6 +1093,12 @@ impl NannaBridge {
     }
 
     /// Read a file (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope, and [`ScriptError::Bridge`] if the file cannot be read
+    /// (including when its contents are not valid UTF-8).
     pub async fn read_file(&self, path: &str) -> Result<String> {
         let path = self.resolve_path(path);
         
@@ -1063,18 +1115,14 @@ impl NannaBridge {
     }
 
     /// Write a file (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Bridge`] if another write to the same path is in
+    /// progress in this process or the write itself fails, and
+    /// [`ScriptError::Permission`] if the resolved path is outside the tool's
+    /// write scope.
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        // Advisory file lock: prevent concurrent writes to the same path
-        let canonical = self.resolve_path(path).canonicalize().unwrap_or_else(|_| self.resolve_path(path));
-        {
-            let mut locks = FILE_WRITE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-            if locks.contains(&canonical) {
-                return Err(ScriptError::Bridge(
-                    format!("File is being written by another agent: {}", path)
-                ));
-            }
-            locks.insert(canonical.clone());
-        }
         // Ensure lock is released even on error
         struct FileGuard(std::path::PathBuf);
         impl Drop for FileGuard {
@@ -1083,6 +1131,18 @@ impl NannaBridge {
                     locks.remove(&self.0);
                 }
             }
+        }
+
+        // Advisory file lock: prevent concurrent writes to the same path
+        let canonical = self.resolve_path(path).canonicalize().unwrap_or_else(|_| self.resolve_path(path));
+        {
+            let mut locks = FILE_WRITE_LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if locks.contains(&canonical) {
+                return Err(ScriptError::Bridge(
+                    format!("File is being written by another agent: {path}")
+                ));
+            }
+            locks.insert(canonical.clone());
         }
         let _guard = FileGuard(canonical);
 
@@ -1107,11 +1167,10 @@ impl NannaBridge {
         }
 
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
                 tokio::fs::create_dir_all(parent).await.ok();
             }
-        }
 
         // Name the cause machine-readably. The OS message alone is localized
         // prose ("Access is denied." / "Permission denied"), so a caller that
@@ -1156,14 +1215,26 @@ impl NannaBridge {
     /// so an overflow-length return proves more entries exist). The bound
     /// exists because every returned entry is marshalled into the script
     /// engine one JS object at a time; unbounded listings of real workspaces
-    /// (hundreds of thousands of entries under node_modules/.git/target) blow
+    /// (hundreds of thousands of entries under `node_modules/.git/target`) blow
     /// the 30s script deadline before the script runs a single line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope. A flat listing returns [`ScriptError::Bridge`] if the
+    /// directory or one of its entries cannot be read; a recursive walk skips
+    /// entries it cannot read.
     pub async fn list_dir(
         &self,
         path: &str,
         recursive: bool,
         max_entries: Option<usize>,
     ) -> Result<Vec<DirEntry>> {
+        const IGNORE_DIRS: &[&str] = &[
+            "node_modules", "target", ".git", "__pycache__", ".venv",
+            "venv", "dist", "build", ".next", ".nuxt", ".cache",
+        ];
+
         let path = self.resolve_path(path);
 
         if !self.permissions.allows_read(&path) {
@@ -1172,11 +1243,6 @@ impl NannaBridge {
                 path.display()
             )));
         }
-
-        const IGNORE_DIRS: &[&str] = &[
-            "node_modules", "target", ".git", "__pycache__", ".venv",
-            "venv", "dist", "build", ".next", ".nuxt", ".cache",
-        ];
 
         let cap = max_entries.unwrap_or(usize::MAX);
         let mut entries = Vec::new();
@@ -1188,15 +1254,14 @@ impl NannaBridge {
                 .filter_entry(|e| {
                     e.file_name()
                         .to_str()
-                        .map_or(true, |name| !IGNORE_DIRS.contains(&name))
+                        .is_none_or(|name| !IGNORE_DIRS.contains(&name))
                 })
             {
                 if entries.len() >= cap {
                     break;
                 }
-                let entry = match result {
-                    Ok(e) => e,
-                    Err(_) => continue,
+                let Ok(entry) = result else {
+                    continue;
                 };
                 // Skip the root directory itself
                 if entry.depth() == 0 {
@@ -1224,7 +1289,7 @@ impl NannaBridge {
                 let entry_type = metadata.as_ref().map_or("unknown", |m| {
                     if m.is_dir() { "dir" } else if m.is_symlink() { "link" } else { "file" }
                 }).to_string();
-                let size = metadata.as_ref().map_or(0, |m| m.len());
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 let modified = metadata
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1243,6 +1308,12 @@ impl NannaBridge {
     }
 
     /// Get file/directory metadata (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the resolved path is outside the
+    /// tool's read scope, and [`ScriptError::Bridge`] if its metadata cannot be
+    /// read (for example, it does not exist).
     pub async fn stat(&self, path: &str) -> Result<FileStat> {
         let path = self.resolve_path(path);
 
@@ -1272,6 +1343,11 @@ impl NannaBridge {
     }
 
     /// Get environment variable (if permitted)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::Permission`] if the tool lacks the `env`
+    /// permission. An unset (or non-UTF-8) variable is `Ok(None)`.
     pub fn get_env(&self, key: &str) -> Result<Option<String>> {
         if !self.permissions.env {
             return Err(ScriptError::Permission(
@@ -1351,7 +1427,7 @@ pub struct FileStat {
     pub modified: Option<u64>,
 }
 
-/// Convert a walkdir entry to our DirEntry
+/// Convert a walkdir entry to our `DirEntry`
 fn dir_entry_from_walkdir(entry: &walkdir::DirEntry) -> Option<DirEntry> {
     let name = entry.path().to_string_lossy().to_string();
     let metadata = entry.metadata().ok()?;
@@ -1405,8 +1481,8 @@ fn strip_ansi_escapes(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip CSI sequence: ESC [ ... <final byte>
-            if let Some(next) = chars.next() {
-                if next == '[' {
+            if let Some(next) = chars.next()
+                && next == '[' {
                     // Consume until we hit a letter (the terminator)
                     for seq_char in chars.by_ref() {
                         if seq_char.is_ascii_alphabetic() {
@@ -1415,7 +1491,6 @@ fn strip_ansi_escapes(s: &str) -> String {
                     }
                 }
                 // else: other escape (ESC without [) — just skip the ESC and next char
-            }
         } else {
             result.push(c);
         }
@@ -1464,7 +1539,7 @@ mod tests {
 
     /// Reap bound: taskkill / `TerminateJobObject` is near-instant; 5s is a
     /// generous ceiling for a loaded CI machine, polled at 50ms.
-    #[allow(dead_code)] // used by the platform-specific test below
+    #[cfg(windows)] // only the Windows reap test below uses it
     const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks

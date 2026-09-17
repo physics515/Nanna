@@ -181,8 +181,7 @@ impl<T: Transport> McpClient<T> {
 
     /// Check if client is initialized
     async fn ensure_initialized(&self) -> Result<()> {
-        let init = self.initialized.read().await;
-        if !*init {
+        if !*self.initialized.read().await {
             return Err(McpError::NotInitialized);
         }
         Ok(())
@@ -231,8 +230,7 @@ impl<T: Transport> McpClient<T> {
         self.ensure_initialized().await?;
         let result = self.list_tools_internal().await?;
         let safe = Self::gate_tool_schemas(result.tools);
-        let mut tools = self.tools.write().await;
-        *tools = safe.clone();
+        self.tools.write().await.clone_from(&safe);
         Ok(safe)
     }
 
@@ -329,8 +327,7 @@ impl<T: Transport> McpClient<T> {
     pub async fn refresh_resources(&self) -> Result<Vec<Resource>> {
         self.ensure_initialized().await?;
         let result = self.list_resources_internal().await?;
-        let mut resources = self.resources.write().await;
-        *resources = result.resources.clone();
+        self.resources.write().await.clone_from(&result.resources);
         Ok(result.resources)
     }
 
@@ -386,8 +383,7 @@ impl<T: Transport> McpClient<T> {
     pub async fn refresh_prompts(&self) -> Result<Vec<Prompt>> {
         self.ensure_initialized().await?;
         let result = self.list_prompts_internal().await?;
-        let mut prompts = self.prompts.write().await;
-        *prompts = result.prompts.clone();
+        self.prompts.write().await.clone_from(&result.prompts);
         Ok(result.prompts)
     }
 
@@ -518,7 +514,7 @@ impl McpClient<crate::StdioTransport> {
     ///
     /// Returns error if spawn or initialization fails
     pub async fn spawn(program: &str, args: &[&str]) -> Result<Self> {
-        let transport = crate::StdioTransport::spawn(program, args).await?;
+        let transport = crate::StdioTransport::spawn(program, args)?;
         let client = Self::new(transport);
         client.initialize().await?;
         Ok(client)
@@ -534,7 +530,7 @@ impl McpClient<crate::StdioTransport> {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Result<Self> {
-        let transport = crate::StdioTransport::spawn_with_env(program, args, env).await?;
+        let transport = crate::StdioTransport::spawn_with_env(program, args, env)?;
         let client = Self::new(transport);
         client.initialize().await?;
         Ok(client)
@@ -565,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert!(!PROTOCOL_VERSION.is_empty());
+        assert_ne!(PROTOCOL_VERSION, "");
     }
 
     /// A transport whose `tools/list` reply encodes how many times it has been

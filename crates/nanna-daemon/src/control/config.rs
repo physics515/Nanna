@@ -1,6 +1,6 @@
 //! Config handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, warn, info, ControlPlane, Config, Event, ConfigAction, Value};
 
 impl ControlPlane {
     /// Push `[scheduler]` settings onto the **running** scheduler loop.
@@ -88,8 +88,8 @@ impl ControlPlane {
     pub(super) async fn handle_config(&self, _client_id: &str, action: ConfigAction) -> Value {
         match action {
             ConfigAction::Get { path } => {
-                let config = self.config.read().await;
-                let config_value = match serde_json::to_value(&*config) {
+                let serialized = serde_json::to_value(&*self.config.read().await);
+                let config_value = match serialized {
                     Ok(v) => v,
                     Err(e) => return json!({ "error": "serialize_failed", "message": e.to_string() }),
                 };
@@ -109,87 +109,7 @@ impl ControlPlane {
                     json!({ "config": config_value })
                 }
             }
-            ConfigAction::Set { path, value } => {
-                let mut config = self.config.write().await;
-                let mut config_value = match serde_json::to_value(&*config) {
-                    Ok(v) => v,
-                    Err(e) => return json!({ "error": "serialize_failed", "message": e.to_string() }),
-                };
-                
-                // Set nested value by path using a helper function
-                let parts: Vec<&str> = path.split('.').collect();
-                if parts.is_empty() {
-                    return json!({ "error": "invalid_path", "path": path });
-                }
-                
-                // Use pointer-based access for nested updates
-                fn set_nested(obj: &mut Value, parts: &[&str], value: Value) -> Result<(), String> {
-                    if parts.is_empty() {
-                        return Err("Empty path".to_string());
-                    }
-                    
-                    if parts.len() == 1 {
-                        // Final part - set the value
-                        if let Some(map) = obj.as_object_mut() {
-                            map.insert(parts[0].to_string(), value);
-                            Ok(())
-                        } else {
-                            Err("Parent is not an object".to_string())
-                        }
-                    } else {
-                        // Navigate deeper
-                        if let Some(map) = obj.as_object_mut() {
-                            let next = map.entry(parts[0]).or_insert(json!({}));
-                            set_nested(next, &parts[1..], value)
-                        } else {
-                            Err("Parent is not an object".to_string())
-                        }
-                    }
-                }
-                
-                if let Err(e) = set_nested(&mut config_value, &parts, value.clone()) {
-                    return json!({ "error": "set_failed", "message": e, "path": path });
-                }
-                
-                // Deserialize back to config
-                match serde_json::from_value::<Config>(config_value) {
-                    Ok(new_config) => {
-                        *config = new_config;
-
-                        // Save to disk if we have a path
-                        if let Some(ref config_path) = self.config_path {
-                            if let Err(e) = config.save_to(config_path) {
-                                warn!("Failed to save config: {}", e);
-                            } else {
-                                info!("Config saved to {:?}", config_path);
-                            }
-                        }
-
-                        // Propagate LLM config changes to agent service.
-                        // Whole-`[llm]` push, not just the model fields: a
-                        // `set` of e.g. `llm.summarization_priority` used to
-                        // land on disk and in `self.config` while the running
-                        // agent kept summarizing on the boot-time model.
-                        if path.starts_with("llm.") {
-                            if let Some(ref agent) = self.agent {
-                                agent.apply_llm_config(&config.llm).await;
-                            }
-                        }
-
-                        // Re-derive the router's provider set (registration is
-                        // not boot-only). Lock released first: resolution can
-                        // block on keyring/network.
-                        let snapshot = config.clone();
-                        drop(config);
-                        self.rebuild_llm_providers(&snapshot).await;
-                        self.apply_scheduler_settings(&snapshot).await;
-                        self.notify_config_changed();
-
-                        json!({ "status": "updated", "path": path })
-                    }
-                    Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
-                }
-            }
+            ConfigAction::Set { path, value } => self.config_set(path, value).await,
             ConfigAction::Reset { path } => {
                 let mut config = self.config.write().await;
 
@@ -200,10 +120,10 @@ impl ControlPlane {
                     *config = Config::default().with_env_overrides();
 
                     // Save to disk
-                    if let Some(ref config_path) = self.config_path {
-                        if let Err(e) = config.save_to(config_path) {
-                            warn!("Failed to save config: {}", e);
-                        }
+                    if let Some(ref config_path) = self.config_path
+                        && let Err(e) = config.save_to(config_path)
+                    {
+                        warn!("Failed to save config: {}", e);
                     }
 
                     // Propagate to agent service
@@ -248,10 +168,10 @@ impl ControlPlane {
                         *config = cfg.with_env_overrides();
                         
                         // Save to disk
-                        if let Some(ref config_path) = self.config_path {
-                            if let Err(e) = config.save_to(config_path) {
-                                warn!("Failed to save config: {}", e);
-                            }
+                        if let Some(ref config_path) = self.config_path
+                            && let Err(e) = config.save_to(config_path)
+                        {
+                            warn!("Failed to save config: {}", e);
                         }
                         
                         info!("Config imported");
@@ -274,5 +194,91 @@ impl ControlPlane {
                 }
             }
         }
+    }
+
+    /// `ConfigAction::Set`: write one dotted path, persist, and propagate the change live.
+    async fn config_set(&self, path: String, value: Value) -> Value {
+        let mut config = self.config.write().await;
+        let mut config_value = match serde_json::to_value(&*config) {
+            Ok(v) => v,
+            Err(e) => return json!({ "error": "serialize_failed", "message": e.to_string() }),
+        };
+
+        // Set nested value by path using a helper function
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.is_empty() {
+            return json!({ "error": "invalid_path", "path": path });
+        }
+
+        if let Err(e) = set_nested(&mut config_value, &parts, value.clone()) {
+            return json!({ "error": "set_failed", "message": e, "path": path });
+        }
+
+        // Deserialize back to config
+        match serde_json::from_value::<Config>(config_value) {
+            Ok(new_config) => {
+                *config = new_config;
+
+                // Save to disk if we have a path
+                if let Some(ref config_path) = self.config_path {
+                    if let Err(e) = config.save_to(config_path) {
+                        warn!("Failed to save config: {}", e);
+                    } else {
+                        info!("Config saved to {:?}", config_path);
+                    }
+                }
+
+                // Propagate LLM config changes to agent service.
+                // Whole-`[llm]` push, not just the model fields: a
+                // `set` of e.g. `llm.summarization_priority` used to
+                // land on disk and in `self.config` while the running
+                // agent kept summarizing on the boot-time model.
+                if path.starts_with("llm.")
+                    && let Some(ref agent) = self.agent
+                {
+                    agent.apply_llm_config(&config.llm).await;
+                }
+
+                // Re-derive the router's provider set (registration is
+                // not boot-only). Lock released first: resolution can
+                // block on keyring/network.
+                let snapshot = config.clone();
+                drop(config);
+                self.rebuild_llm_providers(&snapshot).await;
+                self.apply_scheduler_settings(&snapshot).await;
+                self.notify_config_changed();
+
+                json!({ "status": "updated", "path": path })
+            }
+            Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
+        }
+    }
+}
+
+/// Set `value` at the dotted `parts` path inside `obj`, creating intermediate
+/// objects as needed (pointer-based access for nested updates).
+fn set_nested(obj: &mut Value, parts: &[&str], value: Value) -> Result<(), String> {
+    if parts.is_empty() {
+        return Err("Empty path".to_string());
+    }
+    
+    if parts.len() == 1 {
+        // Final part - set the value
+        obj.as_object_mut().map_or_else(
+            || Err("Parent is not an object".to_string()),
+            |map| {
+                map.insert(parts[0].to_string(), value);
+                Ok(())
+            },
+        )
+    } else {
+        // Navigate deeper
+        obj.as_object_mut().map_or_else(
+            || Err("Parent is not an object".to_string()),
+            |map| {
+                let next = map.entry(parts[0]).or_insert(json!({}));
+                set_nested(next, &parts[1..], value)
+            },
+        )
     }
 }

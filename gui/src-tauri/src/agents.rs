@@ -8,7 +8,8 @@
 //! Live lifecycle events are not yet bridged to a Tauri `agent-event` feed, so
 //! `subscribe_agent_events` is a no-op; the page polls the query commands.
 
-use crate::AppState;
+use crate::backend::Backend;
+use crate::state::{backend_handle, AppState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,8 +64,7 @@ fn parse_ts(v: Option<&serde_json::Value>) -> i64 {
     match v {
         Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
         Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.timestamp())
-            .unwrap_or(0),
+            .map_or(0, |dt| dt.timestamp()),
         _ => 0,
     }
 }
@@ -100,9 +100,8 @@ fn sub_session_to_agent(v: &serde_json::Value) -> Option<AgentInfo> {
 }
 
 /// Fetch the daemon's sub-sessions and map them to `AgentInfo`.
-async fn fetch_agents(state: &AppState) -> Vec<AgentInfo> {
-    let result = state
-        .backend
+async fn fetch_agents(backend: &Backend) -> Vec<AgentInfo> {
+    let result = backend
         .daemon_request(serde_json::json!({
             "type": "session",
             "action": "list_sub_sessions",
@@ -126,12 +125,16 @@ async fn fetch_agents(state: &AppState) -> Vec<AgentInfo> {
 
 /// Get all agents grouped by workspace. Sub-sessions are not workspace-tagged,
 /// so they land in a single global cluster.
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon or a failed
+/// `session.list_sub_sessions` request reads as no agents.
 #[tauri::command]
 pub async fn get_agent_clusters(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<WorkspaceCluster>, String> {
-    let state = state.read().await;
-    let agents = fetch_agents(&state).await;
+    let agents = fetch_agents(&*backend_handle(&state).await).await;
     if agents.is_empty() {
         return Ok(Vec::new());
     }
@@ -153,32 +156,48 @@ pub async fn get_agent_clusters(
 }
 
 /// Get all agents as a flat list.
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon or a failed
+/// `session.list_sub_sessions` request reads as no agents.
 #[tauri::command]
 pub async fn get_all_agents(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<AgentInfo>, String> {
-    let state = state.read().await;
-    Ok(fetch_agents(&state).await)
+    Ok(fetch_agents(&*backend_handle(&state).await).await)
 }
 
 /// Get a specific agent by ID.
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon or a failed
+/// `session.list_sub_sessions` request reads as no agents. An unknown id is
+/// `Ok(None)`.
 #[tauri::command]
 pub async fn get_agent(
     state: State<'_, Arc<RwLock<AppState>>>,
     agent_id: String,
 ) -> Result<Option<AgentInfo>, String> {
-    let state = state.read().await;
-    Ok(fetch_agents(&state).await.into_iter().find(|a| a.id == agent_id))
+    Ok(fetch_agents(&*backend_handle(&state).await)
+        .await
+        .into_iter()
+        .find(|a| a.id == agent_id))
 }
 
 /// Get children of an agent.
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon or a failed
+/// `session.list_sub_sessions` request reads as no agents.
 #[tauri::command]
 pub async fn get_agent_children(
     state: State<'_, Arc<RwLock<AppState>>>,
     agent_id: String,
 ) -> Result<Vec<AgentInfo>, String> {
-    let state = state.read().await;
-    Ok(fetch_agents(&state)
+    Ok(fetch_agents(&*backend_handle(&state).await)
         .await
         .into_iter()
         .filter(|a| a.parent_id.as_deref() == Some(agent_id.as_str()))
@@ -186,12 +205,16 @@ pub async fn get_agent_children(
 }
 
 /// Get global agent statistics.
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon or a failed
+/// `session.list_sub_sessions` request reads as no agents.
 #[tauri::command]
 pub async fn get_agent_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<AgentStats, String> {
-    let state = state.read().await;
-    let agents = fetch_agents(&state).await;
+    let agents = fetch_agents(&*backend_handle(&state).await).await;
 
     let mut by_state: HashMap<String, usize> = HashMap::new();
     let mut by_role: HashMap<String, usize> = HashMap::new();
@@ -212,6 +235,13 @@ pub async fn get_agent_stats(
 }
 
 /// Cancel an agent (kills the underlying daemon sub-session).
+///
+/// # Errors
+///
+/// Returns the daemon's error when it is unreachable or rejects the
+/// `session.kill_sub_session` request. The daemon reports an unknown or
+/// unkillable id in the reply body, which this ignores: those still return
+/// `Ok(())`.
 #[tauri::command]
 pub async fn cancel_agent(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -219,9 +249,8 @@ pub async fn cancel_agent(
     reason: Option<String>,
 ) -> Result<(), String> {
     let _ = reason;
-    let state = state.read().await;
-    state
-        .backend
+    backend_handle(&state)
+        .await
         .daemon_request(serde_json::json!({
             "type": "session",
             "action": "kill_sub_session",
@@ -235,6 +264,11 @@ pub async fn cancel_agent(
 ///
 /// No-op: the daemon's sub-session lifecycle events are not yet bridged to a
 /// Tauri `agent-event` feed. The page polls the query commands instead.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn subscribe_agent_events(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -243,6 +277,11 @@ pub async fn subscribe_agent_events(
 }
 
 /// Clean up completed agents. No-op: the daemon manages sub-session lifetime.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn cleanup_completed_agents(
     _state: State<'_, Arc<RwLock<AppState>>>,
@@ -254,6 +293,11 @@ pub async fn cleanup_completed_agents(
 
 /// Get agents for a specific workspace. Sub-sessions are not workspace-tagged,
 /// so this returns an empty list.
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_workspace_agents(
     _state: State<'_, Arc<RwLock<AppState>>>,

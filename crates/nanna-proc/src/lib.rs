@@ -22,7 +22,7 @@
 //!    reads on Windows are synchronous reads on the blocking pool, it pinned
 //!    a blocking thread and hung runtime teardown for the sleeper's whole
 //!    lifetime (25+ minutes).
-//! 3. [`adopt_kill_on_close_job`] — the process-wide backstop: the daemon
+//! 3. `adopt_kill_on_close_job` — the process-wide backstop: the daemon
 //!    assigns *itself* to a kill-on-close job at startup, so no child ever
 //!    outlives an unclean daemon death (`taskkill /F`, crash, panic).
 //!
@@ -72,15 +72,18 @@ pub async fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        // pid is a fresh process-group id from the kernel: it fits i32, and a
-        // failed signal (group already gone) is exactly the no-op we want.
-        #[allow(clippy::cast_possible_wrap)]
-        let pgid = -(pid as i32);
+        // pid is a fresh process-group id from the kernel (the child leads
+        // its own group), so it fits pid_t and negating it cannot overflow. A
+        // pid that does not fit names no group we created: skip the signal,
+        // the same no-op a failed signal (group already gone) is.
+        let Ok(group_leader) = libc::pid_t::try_from(pid) else {
+            return;
+        };
         // SAFETY: kill(2) with a negative pgid signals a process group we
         // created; `process_group(0)` at spawn put the child in its own
         // group, so this can never reach our own.
         unsafe {
-            libc::kill(pgid, libc::SIGKILL);
+            libc::kill(-group_leader, libc::SIGKILL);
         }
     }
 }

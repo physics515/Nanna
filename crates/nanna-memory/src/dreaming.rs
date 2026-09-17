@@ -10,6 +10,7 @@ use crate::{
     ActivityClock, ConsolidationConfig, ConsolidationResult, EmbedFn, MemoryError, MemoryService,
     MemoryServiceConfig,
 };
+use crate::lossy::LossyF32;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,14 +158,15 @@ impl FeedbackTally {
     /// one rounding per term).
     // Counts are exact in f32 below 2^24; beyond that the rounding error is
     // ~1e-7 relative, absorbed by the ±1.0 clamp the dream loop applies.
-    #[allow(clippy::cast_precision_loss)]
-    const fn total_boost(&self) -> f32 {
-        let total = (self.helpful as f32).mul_add(feedback_boost(MemoryFeedback::Helpful), 0.0);
+    fn total_boost(&self) -> f32 {
+        let total = self.helpful.lossy_f32().mul_add(feedback_boost(MemoryFeedback::Helpful), 0.0);
         let total =
-            (self.unhelpful as f32).mul_add(feedback_boost(MemoryFeedback::Unhelpful), total);
-        let total = (self.used_successfully as f32)
+            self.unhelpful.lossy_f32().mul_add(feedback_boost(MemoryFeedback::Unhelpful), total);
+        let total = self
+            .used_successfully
+            .lossy_f32()
             .mul_add(feedback_boost(MemoryFeedback::UsedSuccessfully), total);
-        (self.caused_error as f32).mul_add(feedback_boost(MemoryFeedback::CausedError), total)
+        self.caused_error.lossy_f32().mul_add(feedback_boost(MemoryFeedback::CausedError), total)
     }
 }
 
@@ -198,7 +200,7 @@ pub struct DreamOutcome {
 pub struct DreamingService {
     config: DreamingConfig,
     memory: Arc<MemoryService>,
-    /// Pending feedback to apply (memory_id -> per-variant signal tally)
+    /// Pending feedback to apply (`memory_id` -> per-variant signal tally)
     pending_feedback: RwLock<HashMap<String, FeedbackTally>>,
     /// Monotonic record of the most recent user/agent activity, driving the idle
     /// gate in [`DreamingService::dream_if_idle`]. An `Arc` so the host (the
@@ -470,7 +472,7 @@ impl DreamingService {
 
     /// Record feedback for a memory (will be applied during dreaming).
     ///
-    /// Tallied into a fixed-size per-memory [`FeedbackTally`] — every signal
+    /// Tallied into a fixed-size per-memory `FeedbackTally` — every signal
     /// counts toward the aggregate the dream cycle applies, and the accumulator
     /// cannot grow with flood volume.
     pub async fn record_feedback(&self, memory_id: &str, feedback: MemoryFeedback) {
@@ -496,6 +498,10 @@ impl DreamingService {
     }
 
     /// Apply pending feedback immediately (doesn't wait for dreaming)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no memory has `memory_id`.
     pub async fn apply_feedback(
         &self,
         memory_id: &str,
@@ -654,6 +660,12 @@ impl DreamingService {
     }
 
     /// Remember something (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`crate::MemoryService::remember`]: the store write
+    /// fails (e.g. a vector whose width does not match the store). A missing or
+    /// failing embedding provider is not an error.
     pub async fn remember(
         &self,
         content: &str,
@@ -663,11 +675,21 @@ impl DreamingService {
     }
 
     /// Recall memories (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NoEmbeddingProvider`] when no embedding function is
+    /// configured, and [`MemoryError::Io`] when embedding the query fails.
     pub async fn recall(&self, query: &str) -> Result<Vec<crate::RecallResult>, MemoryError> {
         self.memory.recall(query).await
     }
 
     /// Forget a memory (delegates to memory service)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::NotFound`] when no memory has `id`. Failing to
+    /// remove it from the persistence backend is logged, not returned.
     pub async fn forget(&self, id: &str) -> Result<(), MemoryError> {
         self.memory.forget(id).await
     }
@@ -678,11 +700,23 @@ impl DreamingService {
     }
 
     /// Save memories to file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Serialization`] when the entries cannot be encoded
+    /// and [`MemoryError::Io`] when the temporary file cannot be written or
+    /// renamed over `path`.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.memory.save(path).await
     }
 
     /// Load memories from file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Io`] when the file cannot be read and
+    /// [`MemoryError::Serialization`] when it is not a JSON array of memory
+    /// entries.
     pub async fn load(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.memory.load(path).await
     }
@@ -705,7 +739,7 @@ where
     }
 }
 
-/// Trait for LLM summarization (implemented by LlmClient)
+/// Trait for LLM summarization (implemented by `LlmClient`)
 ///
 /// This is a simple trait that any LLM client can implement for memory consolidation.
 pub trait LlmSummarizer: Send + Sync {

@@ -1,11 +1,11 @@
 //! Audio backend wiring
 //!
-//! Connects TTS and transcription tools to OpenAI APIs.
+//! Connects TTS and transcription tools to `OpenAI` APIs.
 
 use super::audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 use std::sync::Arc;
 
-/// Create a TTS tool wired to OpenAI's TTS API.
+/// Create a TTS tool wired to `OpenAI`'s TTS API.
 ///
 /// Voices: alloy, echo, fable, onyx, nova, shimmer
 pub fn create_tts_tool(api_key: impl Into<String>, default_voice: Option<&str>) -> TextToSpeechTool {
@@ -42,7 +42,7 @@ pub fn create_tts_tool_with_dir(
     create_tts_tool(api_key, default_voice).with_output_dir(output_dir)
 }
 
-/// Create a transcription tool wired to OpenAI's Whisper API.
+/// Create a transcription tool wired to `OpenAI`'s Whisper API.
 pub fn create_transcribe_tool(api_key: impl Into<String>) -> TranscribeTool {
     TranscribeTool::new().with_transcribe_fn(create_transcribe_tool_fn(api_key))
 }
@@ -61,9 +61,9 @@ pub fn create_transcribe_tool_fn(api_key: impl Into<String>) -> TranscribeFn {
     })
 }
 
-/// Create both TTS and transcription tools wired to OpenAI.
+/// Create both TTS and transcription tools wired to `OpenAI`.
 ///
-/// Returns (tts_tool, transcribe_tool)
+/// Returns (`tts_tool`, `transcribe_tool`)
 pub fn create_audio_tools(
     api_key: impl Into<String>,
     default_voice: Option<&str>,

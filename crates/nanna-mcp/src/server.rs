@@ -3,7 +3,7 @@
 //! Exposes Nanna tools as an MCP server that external clients can connect to.
 //! Supports stdio transport (for CLI tools) and HTTP/SSE (for web clients).
 
-use crate::protocol::*;
+use crate::protocol::{CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult, ToolContent};
 use crate::{McpError, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -76,6 +76,7 @@ struct RegisteredResource {
 
 impl McpServer {
     /// Create a new MCP server
+    #[must_use]
     pub fn new(config: McpServerConfig) -> Self {
         Self {
             config,
@@ -94,8 +95,7 @@ impl McpServer {
         let name = tool.name.clone();
         let handler: ToolHandler = Arc::new(move |input| Box::pin(handler(input)));
 
-        let mut tools = self.tools.write().await;
-        tools.insert(
+        self.tools.write().await.insert(
             name.clone(),
             RegisteredTool {
                 definition: tool,
@@ -114,8 +114,7 @@ impl McpServer {
         let uri = resource.uri.clone();
         let handler: ResourceHandler = Arc::new(move |uri| Box::pin(handler(uri)));
 
-        let mut resources = self.resources.write().await;
-        resources.insert(
+        self.resources.write().await.insert(
             uri.clone(),
             RegisteredResource {
                 definition: resource,
@@ -128,8 +127,7 @@ impl McpServer {
     /// Register a prompt
     pub async fn register_prompt(&self, prompt: Prompt) {
         let name = prompt.name.clone();
-        let mut prompts = self.prompts.write().await;
-        prompts.insert(name.clone(), prompt);
+        self.prompts.write().await.insert(name.clone(), prompt);
         info!(prompt = %name, "Registered MCP prompt");
     }
 
@@ -185,35 +183,23 @@ impl McpServer {
                 },
             });
 
-        let tools = self.tools.read().await;
-        let resources = self.resources.read().await;
-        let prompts = self.prompts.read().await;
+        let has_tools = !self.tools.read().await.is_empty();
+        let has_resources = !self.resources.read().await.is_empty();
+        let has_prompts = !self.prompts.read().await.is_empty();
 
         let result = InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
-                tools: if tools.is_empty() {
-                    None
-                } else {
-                    Some(ToolsCapability {
-                        list_changed: false,
-                    })
-                },
-                resources: if resources.is_empty() {
-                    None
-                } else {
-                    Some(ResourcesCapability {
-                        subscribe: false,
-                        list_changed: false,
-                    })
-                },
-                prompts: if prompts.is_empty() {
-                    None
-                } else {
-                    Some(PromptsCapability {
-                        list_changed: false,
-                    })
-                },
+                tools: has_tools.then_some(ToolsCapability {
+                    list_changed: false,
+                }),
+                resources: has_resources.then_some(ResourcesCapability {
+                    subscribe: false,
+                    list_changed: false,
+                }),
+                prompts: has_prompts.then_some(PromptsCapability {
+                    list_changed: false,
+                }),
                 logging: Some(LoggingCapability {}),
                 experimental: None,
             },
@@ -228,9 +214,9 @@ impl McpServer {
     }
 
     async fn handle_list_tools(&self, _params: Option<Value>) -> Result<Value> {
-        let tools = self.tools.read().await;
+        let tools = self.tools.read().await.values().map(|t| t.definition.clone()).collect();
         let result = ListToolsResult {
-            tools: tools.values().map(|t| t.definition.clone()).collect(),
+            tools,
             next_cursor: None,
         };
         serde_json::to_value(result).map_err(Into::into)
@@ -242,23 +228,29 @@ impl McpServer {
             .transpose()?
             .ok_or_else(|| McpError::Protocol("Missing params for tools/call".to_string()))?;
 
-        let tools = self.tools.read().await;
-        let tool = tools
+        // Only the handler is taken out of the registry; the call itself runs
+        // without the lock, so a long-running tool does not hold off
+        // registrations (or, behind a queued registration, other calls).
+        let handler = self
+            .tools
+            .read()
+            .await
             .get(&params.name)
+            .map(|tool| Arc::clone(&tool.handler))
             .ok_or_else(|| McpError::ToolNotFound(params.name.clone()))?;
 
         let input = params
             .arguments
-            .unwrap_or(Value::Object(Default::default()));
-        let result = (tool.handler)(input).await?;
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+        let result = handler(input).await?;
 
         serde_json::to_value(result).map_err(Into::into)
     }
 
     async fn handle_list_resources(&self, _params: Option<Value>) -> Result<Value> {
-        let resources = self.resources.read().await;
+        let resources = self.resources.read().await.values().map(|r| r.definition.clone()).collect();
         let result = ListResourcesResult {
-            resources: resources.values().map(|r| r.definition.clone()).collect(),
+            resources,
             next_cursor: None,
         };
         serde_json::to_value(result).map_err(Into::into)
@@ -270,19 +262,23 @@ impl McpServer {
             .transpose()?
             .ok_or_else(|| McpError::Protocol("Missing params for resources/read".to_string()))?;
 
-        let resources = self.resources.read().await;
-        let resource = resources
+        // As in `handle_call_tool`: the read runs without the registry lock.
+        let handler = self
+            .resources
+            .read()
+            .await
             .get(&params.uri)
+            .map(|resource| Arc::clone(&resource.handler))
             .ok_or_else(|| McpError::ResourceNotFound(params.uri.clone()))?;
 
-        let result = (resource.handler)(params.uri).await?;
+        let result = handler(params.uri).await?;
         serde_json::to_value(result).map_err(Into::into)
     }
 
     async fn handle_list_prompts(&self, _params: Option<Value>) -> Result<Value> {
-        let prompts = self.prompts.read().await;
+        let prompts = self.prompts.read().await.values().cloned().collect();
         let result = ListPromptsResult {
-            prompts: prompts.values().cloned().collect(),
+            prompts,
             next_cursor: None,
         };
         serde_json::to_value(result).map_err(Into::into)
@@ -294,14 +290,17 @@ impl McpServer {
             .transpose()?
             .ok_or_else(|| McpError::Protocol("Missing params for prompts/get".to_string()))?;
 
-        let prompts = self.prompts.read().await;
-        let prompt = prompts
+        let description = self
+            .prompts
+            .read()
+            .await
             .get(&params.name)
+            .map(|prompt| prompt.description.clone())
             .ok_or_else(|| McpError::Protocol(format!("Prompt not found: {}", params.name)))?;
 
         // For now, return empty messages - prompts would need template expansion
         let result = GetPromptResult {
-            description: prompt.description.clone(),
+            description,
             messages: vec![],
         };
 
@@ -309,6 +308,14 @@ impl McpServer {
     }
 
     /// Run the server on stdio (for CLI integration)
+    ///
+    /// The loop ends, with `Ok`, when stdin reaches EOF or can no longer be
+    /// read; a line that is not a JSON-RPC request is logged and skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Serialization`] if a response cannot be serialised,
+    /// or [`McpError::Io`] if writing or flushing the response to stdout fails.
     pub async fn run_stdio(self: Arc<Self>) -> Result<()> {
         info!("Starting MCP server on stdio");
 
@@ -428,11 +435,11 @@ impl Default for McpServerBuilder {
 
 #[cfg(feature = "tools-integration")]
 pub mod tools_bridge {
-    use super::*;
+    use super::{info, McpServer, Arc, Result, Tool, Value, ToolContent, CallToolResult};
     use nanna_tools::{ToolCall, ToolRegistry};
     use std::collections::HashMap as StdHashMap;
 
-    /// Register all tools from a ToolRegistry with the MCP server.
+    /// Register all tools from a `ToolRegistry` with the MCP server.
     ///
     /// `registry.definitions()` already has the registry's [`ToolPolicy`]
     /// applied, so a tool denied by `[tools] disabled` is never advertised to
@@ -444,7 +451,7 @@ pub mod tools_bridge {
     ///
     /// # Errors
     ///
-    /// Returns [`McpError`] if a tool definition cannot be converted.
+    /// Returns [`McpError`](crate::McpError) if a tool definition cannot be converted.
     pub async fn register_tools_from_registry(
         server: &McpServer,
         registry: Arc<ToolRegistry>,
@@ -549,8 +556,7 @@ mod tests {
             })
             .await;
 
-        let tools = server.tools.read().await;
-        assert!(tools.contains_key("test_tool"));
+        assert!(server.tools.read().await.contains_key("test_tool"));
     }
 
     #[tokio::test]

@@ -183,3 +183,74 @@ impl ToolResult {
         self
     }
 }
+
+/// `n as f64`, spelled without a lossy cast.
+///
+/// Both 32-bit halves convert to `f64` exactly, scaling the high half by 2^32
+/// is exact, and IEEE-754 addition rounds the exact sum once (to nearest, ties
+/// to even) — the same single rounding `as` performs. The result is therefore
+/// bit-identical to `n as f64` for every `u64`, not merely close to it.
+pub(crate) fn u64_to_f64(n: u64) -> f64 {
+    let [h0, h1, h2, h3, l0, l1, l2, l3] = n.to_be_bytes();
+    let high = f64::from(u32::from_be_bytes([h0, h1, h2, h3])) * 4_294_967_296.0;
+    let low = f64::from(u32::from_be_bytes([l0, l1, l2, l3]));
+    high + low
+}
+
+/// `n as f64` for a count or length; see [`u64_to_f64`] for why it is exact.
+pub(crate) fn usize_to_f64(n: usize) -> f64 {
+    // `usize` is at most 64 bits wide on every target Rust supports, so this
+    // widening never loses a bit.
+    u64_to_f64(n as u64)
+}
+
+/// A JSON integer parameter as a `usize` count or index.
+///
+/// Exact wherever `usize` is 64 bits wide — every target this crate ships
+/// for — so it reads the same value the `as usize` it replaced did. Where
+/// `usize` is narrower it saturates instead of wrapping, so an oversized limit
+/// stays a large limit rather than turning into a small one.
+pub(crate) fn u64_to_usize(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::{u64_to_f64, u64_to_usize, usize_to_f64};
+
+    #[test]
+    fn u64_to_f64_is_exact_below_2_pow_53() {
+        assert_eq!(u64_to_f64(0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(u64_to_f64(1).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(u64_to_f64(4_294_967_296).to_bits(), 4_294_967_296.0_f64.to_bits());
+        assert_eq!(
+            u64_to_f64(9_007_199_254_740_991).to_bits(),
+            9_007_199_254_740_991.0_f64.to_bits()
+        );
+        assert_eq!(usize_to_f64(12_345).to_bits(), 12_345.0_f64.to_bits());
+    }
+
+    #[test]
+    fn u64_to_f64_rounds_like_as_above_2_pow_53() {
+        // 2^53 + 1 and 2^53 + 3 are ties; `as` rounds both to the even mantissa.
+        assert_eq!(
+            u64_to_f64(9_007_199_254_740_993).to_bits(),
+            9_007_199_254_740_992.0_f64.to_bits()
+        );
+        assert_eq!(
+            u64_to_f64(9_007_199_254_740_995).to_bits(),
+            9_007_199_254_740_996.0_f64.to_bits()
+        );
+        assert_eq!(
+            u64_to_f64(u64::MAX).to_bits(),
+            18_446_744_073_709_551_616.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn u64_to_usize_is_exact_on_this_target() {
+        assert_eq!(u64_to_usize(0), 0);
+        assert_eq!(u64_to_usize(50_000), 50_000);
+        assert_eq!(u64_to_usize(u64::from(u32::MAX)), 4_294_967_295);
+    }
+}

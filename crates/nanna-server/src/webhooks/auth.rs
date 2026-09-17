@@ -84,10 +84,12 @@ pub fn secret_matches(expected: &str, provided: Option<&str>) -> bool {
 /// replay guard that cannot establish an age must refuse, never wave through on
 /// an unknown one.
 pub fn timestamp_is_fresh(timestamp: &str) -> bool {
-    debug_assert!(
-        MAX_TIMESTAMP_AGE_SECS > 0,
-        "a zero window would reject every request, including legitimate ones"
-    );
+    const {
+        assert!(
+            MAX_TIMESTAMP_AGE_SECS > 0,
+            "a zero window would reject every request, including legitimate ones"
+        );
+    }
     debug_assert!(
         MAX_TIMESTAMP_HEADER_LEN >= i64::MAX.to_string().len(),
         "the header bound must still admit every representable timestamp"

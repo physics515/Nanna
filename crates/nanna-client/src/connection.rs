@@ -2,7 +2,7 @@
 
 use crate::{ClientError, Result};
 use futures_util::{SinkExt, StreamExt};
-use nanna_daemon::protocol::*;
+use nanna_daemon::protocol::{Event, Response, ResponseResult, Action, SubscribeAction, Request, SessionAction, ExportFormat, ChatAction, MemoryAction, ConfigAction, ToolAction, SystemAction, SchedulerAction, WorkspaceAction, ChannelAction};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +80,11 @@ pub struct Client {
 
 impl Client {
     /// Connect to the daemon
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Connection`] when the WebSocket handshake with
+    /// `config.url` fails, or [`ClientError::Timeout`] when it does not complete
+    /// within `config.connect_timeout`.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
         let (event_tx, _) = broadcast::channel::<Event>(100);
@@ -194,8 +199,8 @@ impl Client {
     ) {
         // Try to parse as Response first
         if let Ok(response) = serde_json::from_str::<Response>(text) {
-            let mut pending = pending.write().await;
-            if let Some(req) = pending.remove(&response.id) {
+            let req = pending.write().await.remove(&response.id);
+            if let Some(req) = req {
                 let result = match response.result {
                     ResponseResult::Success { data } => Ok(data),
                     ResponseResult::Error { code, message } => {
@@ -229,6 +234,7 @@ impl Client {
     }
     
     /// Subscribe to events
+    #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
     }
@@ -253,7 +259,7 @@ impl Client {
     /// that carry no session (config, memory, workspace, channel, connection)
     /// keep arriving — narrowing is about sessions, not about going quiet.
     ///
-    /// This is connection-wide, so every [`SessionEvents`] stream held over the
+    /// This is connection-wide, so every `SessionEvents` stream held over the
     /// same connection is affected: a stream for a session that was never named
     /// will simply stop yielding. [`Self::widen_to_all_sessions`] undoes it.
     ///
@@ -289,6 +295,18 @@ impl Client {
     }
     
     /// Send a request and wait for response
+    ///
+    /// # Errors
+    /// - [`ClientError::NotConnected`] when the client is not connected.
+    /// - [`ClientError::Protocol`] when the request cannot be serialised.
+    /// - [`ClientError::Request`] when the connection handler has already shut
+    ///   down (the outgoing queue is closed) or the response channel is dropped
+    ///   without an answer.
+    /// - [`ClientError::Connection`] when the connection drops while the request
+    ///   is pending.
+    /// - [`ClientError::Server`] when the daemon answers with an error.
+    /// - [`ClientError::Timeout`] when no response arrives within
+    ///   `config.request_timeout`.
     pub async fn request(&self, action: Action) -> Result<Value> {
         if !self.is_connected().await {
             return Err(ClientError::NotConnected);
@@ -319,8 +337,7 @@ impl Client {
             Ok(Err(_)) => Err(ClientError::Request("Response channel closed".to_string())),
             Err(_) => {
                 // Remove pending request on timeout
-                let mut pending = self.pending.write().await;
-                pending.remove(&id);
+                self.pending.write().await.remove(&id);
                 Err(ClientError::Timeout)
             }
         }
@@ -345,32 +362,38 @@ impl Client {
     // =========================================================================
     
     /// Get sessions API
-    pub fn sessions(&self) -> SessionsApi<'_> {
+    #[must_use]
+    pub const fn sessions(&self) -> SessionsApi<'_> {
         SessionsApi { client: self }
     }
     
     /// Get chat API
-    pub fn chat(&self) -> ChatApi<'_> {
+    #[must_use]
+    pub const fn chat(&self) -> ChatApi<'_> {
         ChatApi { client: self }
     }
     
     /// Get memory API
-    pub fn memory(&self) -> MemoryApi<'_> {
+    #[must_use]
+    pub const fn memory(&self) -> MemoryApi<'_> {
         MemoryApi { client: self }
     }
     
     /// Get config API
-    pub fn config(&self) -> ConfigApi<'_> {
+    #[must_use]
+    pub const fn config(&self) -> ConfigApi<'_> {
         ConfigApi { client: self }
     }
     
     /// Get tools API
-    pub fn tools(&self) -> ToolsApi<'_> {
+    #[must_use]
+    pub const fn tools(&self) -> ToolsApi<'_> {
         ToolsApi { client: self }
     }
     
     /// Get system API
-    pub fn system(&self) -> SystemApi<'_> {
+    #[must_use]
+    pub const fn system(&self) -> SystemApi<'_> {
         SystemApi { client: self }
     }
 
@@ -402,7 +425,7 @@ pub struct SessionsApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> SessionsApi<'a> {
+impl SessionsApi<'_> {
     pub async fn list(&self) -> Result<Value> {
         self.client.request(Action::Session(SessionAction::List)).await
     }
@@ -455,7 +478,7 @@ pub struct ChatApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> ChatApi<'a> {
+impl ChatApi<'_> {
     pub async fn send(&self, session_id: &str, content: &str) -> Result<Value> {
         self.client.request(Action::Chat(ChatAction::Send {
             session_id: session_id.to_string(),
@@ -482,7 +505,7 @@ pub struct MemoryApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> MemoryApi<'a> {
+impl MemoryApi<'_> {
     pub async fn search(&self, query: &str, limit: Option<usize>) -> Result<Value> {
         self.client.request(Action::Memory(MemoryAction::Search {
             query: query.to_string(),
@@ -525,7 +548,7 @@ pub struct ConfigApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> ConfigApi<'a> {
+impl ConfigApi<'_> {
     pub async fn get(&self, path: Option<&str>) -> Result<Value> {
         self.client.request(Action::Config(ConfigAction::Get { 
             path: path.map(String::from) 
@@ -553,7 +576,7 @@ pub struct ToolsApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> ToolsApi<'a> {
+impl ToolsApi<'_> {
     pub async fn list(&self) -> Result<Value> {
         self.client.request(Action::Tool(ToolAction::List)).await
     }
@@ -576,7 +599,7 @@ pub struct SystemApi<'a> {
     client: &'a Client,
 }
 
-impl<'a> SystemApi<'a> {
+impl SystemApi<'_> {
     pub async fn status(&self) -> Result<Value> {
         self.client.request(Action::System(SystemAction::Status)).await
     }

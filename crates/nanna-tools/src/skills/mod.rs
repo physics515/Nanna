@@ -41,6 +41,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Load a skill from a directory, returning a boxed Tool
+///
+/// # Errors
+///
+/// - [`ToolError::NotFound`] if the directory holds no `tool.ts`, `tool.js`,
+///   `tool.yaml` or `tool.yml`.
+/// - For a script: [`ToolError::ExecutionFailed`] if it cannot be read (or, in
+///   a build without the `scripting` feature, always), and
+///   [`ToolError::InvalidParams`] if it exports no manifest with a name and
+///   description.
+/// - For a manifest: [`ToolError::Io`] if it cannot be read, and
+///   [`ToolError::InvalidParams`] if it is invalid.
 pub async fn load_skill(skill_dir: &Path) -> Result<Arc<dyn Tool>, ToolError> {
     let source = discovery::detect_skill_source(skill_dir)?;
 
@@ -69,18 +80,30 @@ pub async fn load_skill(skill_dir: &Path) -> Result<Arc<dyn Tool>, ToolError> {
 /// and session id from at execute time — without it, `Nanna.workdir()` is
 /// null and relative paths in file/exec tools silently resolve to the HOME
 /// directory instead of the active workspace.
+///
+/// # Errors
+///
+/// The same as [`load_skill`]: [`ToolError::NotFound`] for a directory with no
+/// skill entry point, [`ToolError::ExecutionFailed`] or
+/// [`ToolError::InvalidParams`] for a script that cannot be read or has no
+/// manifest, and [`ToolError::Io`] or [`ToolError::InvalidParams`] for a
+/// manifest that cannot be read or is invalid.
 #[cfg(feature = "scripting")]
-pub async fn load_skill_with_services(
+pub async fn load_skill_with_services<S: std::hash::BuildHasher + Sync>(
     skill_dir: &Path,
-    services: &HashMap<String, nanna_scripting::ServiceFn>,
+    services: &HashMap<String, nanna_scripting::ServiceFn, S>,
     registry: Option<std::sync::Weak<crate::ToolRegistry>>,
 ) -> Result<Arc<dyn Tool>, ToolError> {
     let source = discovery::detect_skill_source(skill_dir)?;
 
     match source {
         SkillSource::Script(path) => {
+            let services = services
+                .iter()
+                .map(|(name, service)| (name.clone(), Arc::clone(service)))
+                .collect();
             let mut tool = scripted::ScriptedToolWrapper::from_file(&path).await?
-                .with_services(services.clone());
+                .with_services(services);
             if let Some(registry) = registry {
                 tool = tool.with_registry(registry);
             }

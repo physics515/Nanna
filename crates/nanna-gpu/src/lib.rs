@@ -310,15 +310,16 @@ impl CosineSimilaritySearch {
     ///
     /// # Errors
     ///
-    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read.
+    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read, and
+    /// `GpuError::InsufficientMemory` if the query length or the vector count
+    /// does not fit the shader's `u32` parameters.
     pub async fn search(
         &self,
         ctx: &GpuContext,
         query: &[f32],
         vectors: &[f32],
     ) -> Result<Vec<f32>, GpuError> {
-        let query_len = query.len() as u32;
-        let num_vectors = (vectors.len() / query.len()) as u32;
+        let (query_len, num_vectors) = shader_counts(query.len(), vectors.len())?;
 
         if num_vectors == 0 {
             return Ok(vec![]);
@@ -400,7 +401,7 @@ impl CosineSimilaritySearch {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             // Dispatch with ceiling division for workgroups
-            let workgroups = (num_vectors + 63) / 64;
+            let workgroups = num_vectors.div_ceil(64);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
@@ -434,6 +435,23 @@ impl CosineSimilaritySearch {
         staging_buffer.unmap();
 
         Ok(results)
+    }
+}
+
+/// The query length and vector count as the `u32`s the shader indexes with.
+///
+/// A count past `u32::MAX` would need a storage binding of more than 16 GiB,
+/// which no adapter's `max_storage_buffer_binding_size` allows, so refusing it
+/// replaces a silent truncation that could never reach a valid dispatch anyway.
+fn shader_counts(query_len: usize, vectors_len: usize) -> Result<(u32, u32), GpuError> {
+    // An empty query has no dimensions to compare, so there are no vectors to
+    // score; `vectors_len / 0` used to panic instead.
+    let num_vectors = vectors_len.checked_div(query_len).unwrap_or(0);
+    match (u32::try_from(query_len), u32::try_from(num_vectors)) {
+        (Ok(query_len), Ok(num_vectors)) => Ok((query_len, num_vectors)),
+        _ => Err(GpuError::InsufficientMemory(format!(
+            "search input exceeds the shader's u32 indexing: query length {query_len}, {num_vectors} vectors"
+        ))),
     }
 }
 
@@ -489,6 +507,12 @@ impl DeviceExt for wgpu::Device {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_empty_query_scores_nothing_instead_of_dividing_by_zero() {
+        assert_eq!(shader_counts(0, 12).unwrap(), (0, 0));
+        assert_eq!(shader_counts(3, 12).unwrap(), (3, 4));
+    }
+
     #[tokio::test]
     async fn test_gpu_context_creation() {
         // Skip if no GPU available (CI environments)
@@ -500,7 +524,7 @@ mod tests {
             Err(GpuError::NoAdapter) => {
                 println!("No GPU adapter found, skipping test");
             }
-            Err(e) => panic!("Unexpected error: {}", e),
+            Err(e) => panic!("Unexpected error: {e}"),
         }
     }
 }

@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
+
+use crate::numeric::millis_u64;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -353,6 +355,11 @@ impl AgentRegistry {
     }
 
     /// Spawn a sub-agent from a parent agent
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying a "Parent agent not found" message)
+    /// when `parent_id` is not a registered agent; nothing is registered then.
     pub async fn spawn_sub_agent(
         &self,
         parent_id: &str,
@@ -364,15 +371,17 @@ impl AgentRegistry {
         let system_prompt = system_prompt.into();
 
         // Get parent info
-        let (workspace, _) = {
-            let agents = self.agents.read().await;
-            let parent = agents.get(parent_id).ok_or_else(|| {
+        let workspace = self
+            .agents
+            .read()
+            .await
+            .get(parent_id)
+            .map(|parent| parent.workspace.clone())
+            .ok_or_else(|| {
                 AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!(
                     "Parent agent not found: {parent_id}"
                 )))
             })?;
-            (parent.workspace.clone(), parent.config.clone())
-        };
 
         let agent = RegisteredAgent::new(
             id.clone(),
@@ -481,7 +490,7 @@ impl AgentRegistry {
                 let old = agent.state;
                 agent.state = new_state;
                 agent.state_changed_at = chrono_timestamp();
-                agent.current_tool = tool_name.clone();
+                agent.current_tool.clone_from(&tool_name);
                 old
             } else {
                 return;
@@ -659,6 +668,7 @@ impl AgentRegistry {
         for agent in agents.values() {
             *counts.entry(agent.state).or_insert(0) += 1;
         }
+        drop(agents);
 
         counts
     }
@@ -676,6 +686,14 @@ impl AgentRegistry {
     // -------------------------------------------------------------------------
 
     /// Create and run an agent, tracking its lifecycle
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying an "Agent not found" message) when
+    /// `agent_id` is not registered. Otherwise returns whatever error the
+    /// agent's run ends with — an LLM request failure or a critical tool
+    /// failure — after marking the agent errored and emitting
+    /// [`LifecycleEvent::Error`].
     pub async fn run_agent(
         &self,
         agent_id: &str,
@@ -721,7 +739,7 @@ impl AgentRegistry {
         // Run agent
         match agent.run(message, options).await {
             Ok(response) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = millis_u64(start.elapsed());
                 self.complete(
                     agent_id,
                     &response.text,
@@ -733,7 +751,7 @@ impl AgentRegistry {
                 Ok(response)
             }
             Err(e) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = millis_u64(start.elapsed());
                 self.error(agent_id, &e.to_string(), duration_ms).await;
                 Err(e)
             }
@@ -741,6 +759,12 @@ impl AgentRegistry {
     }
 
     /// Spawn and run a sub-agent asynchronously
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying a "Parent agent not found" message)
+    /// when `parent_id` is not a registered agent. The run's own outcome,
+    /// success or failure, arrives on the returned receiver instead.
     pub async fn spawn_and_run(
         &self,
         parent_id: &str,
@@ -800,23 +824,27 @@ impl AgentRegistry {
             for id in &to_remove {
                 if let Some(agent) = agents.remove(id) {
                     // Remove from workspace tracking
-                    if let Some(ws) = &agent.workspace {
-                        if let Some(ws_list) = ws_agents.get_mut(ws) {
+                    if let Some(ws) = &agent.workspace
+                        && let Some(ws_list) = ws_agents.get_mut(ws) {
                             ws_list.retain(|i| i != id);
                         }
-                    }
 
                     // Remove from children tracking
-                    if let Some(parent_id) = &agent.parent_id {
-                        if let Some(child_list) = children.get_mut(parent_id) {
+                    if let Some(parent_id) = &agent.parent_id
+                        && let Some(child_list) = children.get_mut(parent_id) {
                             child_list.retain(|i| i != id);
                         }
-                    }
 
                     // Remove this agent's children entry
                     children.remove(id);
                 }
             }
+            // All three maps are pruned under one hold so no reader sees an
+            // agent gone from one map but still listed in another; released
+            // together, in the reverse of the order they were taken.
+            drop(children);
+            drop(ws_agents);
+            drop(agents);
 
             info!("Cleaned up {} completed agents", to_remove.len());
         }
@@ -880,7 +908,7 @@ impl SharedRegistryState {
 
         match agent.run(message, options).await {
             Ok(response) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = millis_u64(start.elapsed());
                 
                 {
                     let mut agents = self.agents.write().await;
@@ -903,7 +931,7 @@ impl SharedRegistryState {
                 Ok(response)
             }
             Err(e) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = millis_u64(start.elapsed());
 
                 {
                     let mut agents = self.agents.write().await;

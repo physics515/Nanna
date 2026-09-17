@@ -101,7 +101,6 @@ pub async fn summarizer_context_window_tokens(router: &LlmRouter, models: &[Stri
 ///
 /// The returned closure is `Send + Sync` and its future is `Send`, matching the
 /// bounds `nanna_memory::DreamingService` requires.
-#[must_use]
 pub fn summarize_with_failover(
     router: Arc<LlmRouter>,
     models: Vec<String>,
@@ -238,10 +237,10 @@ mod tests {
     #[test]
     fn empty_only_when_nothing_is_configured() {
         // The single case callers must report as unconfigured.
-        assert!(summarization_models(&[], &[]).is_empty());
+        assert_eq!(summarization_models(&[], &[]), Vec::<String>::new());
         // …and never otherwise.
-        assert!(!summarization_models(&v(&["a"]), &[]).is_empty());
-        assert!(!summarization_models(&[], &v(&["b"])).is_empty());
+        assert_ne!(summarization_models(&v(&["a"]), &[]), Vec::<String>::new());
+        assert_ne!(summarization_models(&[], &v(&["b"])), Vec::<String>::new());
     }
 
 }

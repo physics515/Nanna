@@ -44,7 +44,7 @@ async fn channel_status_reports_registered_state() {
             Action::Channel(ChannelAction::Status { id: None }),
         )
         .await;
-    assert!(all["channels"].as_array().unwrap().len() >= 1);
+    assert_ne!(all["channels"].as_array().unwrap(), &Vec::<Value>::new());
     assert_eq!(all["summary"]["connected"], 1);
     assert_eq!(all["summary"]["configured"], 1);
 
