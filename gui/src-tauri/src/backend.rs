@@ -219,6 +219,14 @@ impl Backend {
                             "done": true,
                         }));
                     }
+                    DaemonEvent::SessionMessageAdded { session_id, message_id, role, content } => {
+                        let _ = app.emit("session-message-added", serde_json::json!({
+                            "session_id": session_id,
+                            "message_id": message_id,
+                            "role": role,
+                            "content": content,
+                        }));
+                    }
                     DaemonEvent::ThinkingDelta { session_id, delta, .. } => {
                         let _ = app.emit("thinking-chunk", serde_json::json!({
                             "session_id": session_id,

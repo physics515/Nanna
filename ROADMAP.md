@@ -4131,7 +4131,7 @@ browser-automation crate, scheduler skills, and swarm coordinator all exist in-t
 also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — they error when called.)
 
 **A. Wire what's already built** (service registration + config, not new subsystems):
-- [ ] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
+- [x] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
       `Nanna.service("schedule.add"/…)` which is never registered. "Check back in 20 minutes"
       self-scheduling is the difference between an agent and a chatbot; ROADMAP:1721 already says
       "wire, don't duplicate". Add absolute-timestamp one-shots (fire once, auto-disable) while in there.
@@ -4174,6 +4174,48 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       live agent turn — i.e. a working model. This host has neither a cloud credential nor Ollama, so
       the one property that distinguishes "wired" from "half-wired" here is the one property that
       could not be checked. Build it on a host that can watch a reminder land.
+      **(2026-09-17) Landed — and verified on a host with no model, because delivery turned out not
+      to need one.** A reminder is text somebody already wrote, so firing it is a message, not an
+      agent turn: the executor's new `reminder` arm appends it to the originating session as an
+      assistant message (persisted, so it is in the next turn's history) and broadcasts the new
+      `Event::SessionMessageAdded`, which the GUI forwards as `session-message-added` and the chat
+      page appends. `target_session` got its first writer (`schedule.add`, fed by the skill's
+      `Nanna.sessionId()` — the run-scoped binding, not a process-wide cell) and first reader
+      (`deliver_reminder`). Reminders are a new **`TaskType::At`** one-shot persisted as `at_<rfc3339>`,
+      so a restart neither re-arms nor postpones them. Bounds: 100 pending (the listing is where they
+      all meet a model's context, ~2.5k tokens), 4 KiB text (re-read as history every later turn).
+      `schedule.cancel` touches only `reminder` jobs — an id of `memory_consolidation` answers "no
+      pending reminder has id …". `withheld_count` 16 → **0 skills missing a service anywhere**
+      (the audit ledger `KNOWN_MISSING_SERVICES` is now empty); on a bare host the 5 still withheld
+      are all credential/model-gated.
+      **Three defects surfaced on the way, two only by driving the real daemon:**
+      (1) **Every reminder a skill sent was refused** — Boa hands JS numbers over as JSON floats, so
+      `delay_secs: 3` arrived as `3.0` and a strict `as_i64` said "must be greater than zero". Now
+      parsed with the task services' lenient integer reader; pinned by a dialect test.
+      (2) **A direct `tool.execute` over IPC dropped a failed tool's message** — the reply carried
+      `output` (empty on failure) and not `error`, so every refusal read as `success:false, ""`.
+      `error` is now returned, and `execute` takes an optional `session_id` so a direct call runs in a
+      stated conversation instead of whichever one the daemon was last bound to.
+      (3) **Scheduler one-shots double-fired and re-armed on restart** (pre-existing, `Delayed`): a
+      due one-shot was re-spawned on every 30s tick until its run finished — **8 fires** in the
+      mutation check with the new claim removed — and a fired one stayed `enabled = 1` in storage, so
+      each daemon restart fired it again. One-shots are now claimed before spawning; a delivered one
+      is removed from memory and storage, a failed one kept disabled and persisted disabled.
+      Verified: 11 service + 4 scheduler unit tests (claim test proven to fail without the claim),
+      GUI parser/decision spec + `DaemonEvent` wire test, and the **real debug daemon over IPC**:
+      reminder set → `session_message_added` event and persisted history 7s later → job gone;
+      no-session / zero-delay / dreaming-id refusals each named; and a 20s reminder set, daemon
+      stopped (`clean_shutdown`), restarted 90s later → delivered 6s after boot with
+      "is 2 min late — Nanna was not running when it came due". GUI rendering itself NOT
+      WebDriver-verified (Linux harness still blocked on `WebKitWebDriver`).
+      - [ ] **A reminder set from a channel conversation (Telegram/Discord/…) lands in the daemon
+            session and is not known to reach the channel.** Delivery writes the session and
+            broadcasts to IPC clients, and nothing in that path calls the channel manager; not traced
+            further this run. Route `SessionMessageAdded` for channel-owned sessions to their channel.
+      - [ ] **Recurring tasks can still overlap themselves past a tick.** The new claim covers
+            one-shots only; a `Recurring` run slower than 30s (consolidation, heartbeat prompts) is
+            due again at the next tick — dreaming has its own in-flight latch for exactly this, other
+            recurring jobs do not. Generalise the claim to "not while a run of this id is in flight".
 - [x] **`browser.*` services registered — and the five contract mismatches closed.** *(2026-09-15)*
       All four browser skills are live; **4 skills withheld, down from 16 at the start of the run**,
       confirmed on the real daemon binary. The P8 "browser relay Chrome extension" (drive the user's

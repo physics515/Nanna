@@ -653,6 +653,10 @@ struct ScriptServiceDeps {
     /// The data dir desktop captures are written under. `None`, or no capture
     /// tool / display session, leaves `screenshot.capture` unregistered.
     screenshot_data_dir: Option<PathBuf>,
+    /// The late-bound scheduler and the sessions reminders are delivered
+    /// into. `None` leaves `schedule.*` unregistered, which withholds the three
+    /// reminder skills.
+    reminders: Option<(crate::reminder_service::SchedulerSlot, Arc<SessionManager>)>,
 }
 
 
@@ -671,6 +675,7 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         audio,
         browser_data_dir,
         screenshot_data_dir,
+        reminders,
     } = deps;
     let memory = &memory;
     use serde_json::{Value, json};
@@ -1154,6 +1159,14 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                 })
             }),
         );
+    }
+
+    // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
+    // these; the scheduler is built after this map, so it arrives by slot.
+    if let Some((scheduler, sessions)) = reminders {
+        services.extend(crate::reminder_service::build_reminder_services(
+            scheduler, sessions,
+        ));
     }
 
     // Desktop capture. The `screenshot` skill declares this; the Rust tool
@@ -1985,6 +1998,9 @@ pub struct DaemonServer {
     /// Late-bound handle to the control plane for consumers created
     /// before it exists (filled in run(), read by the agent service).
     control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
+    /// The scheduler, for the `schedule.*` services built before it exists.
+    /// Filled once in run(), right after the scheduler is constructed.
+    scheduler_slot: crate::reminder_service::SchedulerSlot,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -2136,6 +2152,7 @@ impl DaemonServer {
             sessions,
             _control: control,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
+            scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
             shutdown_tx,
@@ -2527,6 +2544,9 @@ impl DaemonServer {
             // one schedule period, which the log names.
             let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let agent_for_tasks = agent.clone();
+            let sessions_for_tasks = self.sessions.clone();
+            let events_for_tasks = self.ipc.event_sender();
+            let reminder_tick = scheduler.check_interval();
             let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
             let storage_for_tasks = self.storage.clone();
@@ -2556,6 +2576,8 @@ impl DaemonServer {
                 let chat_runs = chat_runs_for_tasks.clone();
                 let dream_in_flight = dream_in_flight_for_tasks.clone();
                 let scheduled_resume_parked = scheduled_resume_parked.clone();
+                let sessions = sessions_for_tasks.clone();
+                let events = events_for_tasks.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
@@ -2712,6 +2734,26 @@ impl DaemonServer {
                                 )
                             } else {
                                 (true, Some("Skipped (no storage)".to_string()), None)
+                            }
+                        }
+                        crate::reminder_service::REMINDER_TASK_NAME => {
+                            // Delivered as a message, never run as a prompt:
+                            // a reminder needs no model, and must not wait for
+                            // one (see `reminder_service`).
+                            match crate::reminder_service::deliver_reminder(
+                                &sessions,
+                                &events,
+                                &task,
+                                chrono::Utc::now(),
+                                reminder_tick,
+                            )
+                            .await
+                            {
+                                Ok(content) => (true, Some(content), None),
+                                Err(e) => {
+                                    warn!("{e}");
+                                    (false, None, Some(e))
+                                }
                             }
                         }
                         _ if task.payload.is_empty() => {
@@ -2926,7 +2968,14 @@ impl DaemonServer {
             scheduler = scheduler.with_executor(executor);
             scheduler.start();
             info!("Daemon scheduler started (heartbeat + cron runner)");
-            Arc::new(tokio::sync::RwLock::new(scheduler))
+            let scheduler = Arc::new(tokio::sync::RwLock::new(scheduler));
+            // `run` executes once per server, so the slot is empty here; a
+            // second fill would leave the reminder services on the first
+            // scheduler, which is the one still running.
+            if self.scheduler_slot.set(Arc::clone(&scheduler)).is_err() {
+                warn!("scheduler slot was already filled; reminders keep the first scheduler");
+            }
+            scheduler
         };
 
         // Create control plane with all services (including router for consolidation)
@@ -4104,6 +4153,7 @@ impl DaemonServer {
                 )),
                 browser_data_dir: Some(self.config.data_dir.clone()),
                 screenshot_data_dir: Some(self.config.data_dir.clone()),
+                reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
             });
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot

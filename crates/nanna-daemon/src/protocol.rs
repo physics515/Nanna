@@ -465,7 +465,16 @@ pub enum ToolAction {
     /// Disable a tool
     Disable { name: String },
     /// Execute a tool directly
-    Execute { name: String, input: Value },
+    Execute {
+        name: String,
+        input: Value,
+        /// The conversation the call runs in, as `Nanna.sessionId()` sees it.
+        /// Without it a direct call reads whatever session the daemon was last
+        /// interactively bound to — an arbitrary one — so a session-scoped tool
+        /// (`todo`, `remind`) would file its work under someone else's chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     /// Create a user tool
     Create {
         name: String,
@@ -755,6 +764,17 @@ pub enum Event {
         message_id: String,
         content: String,
     },
+    /// A complete message was appended to a session outside any streamed
+    /// turn — today, a reminder coming due. Streamed turns announce themselves
+    /// with `message_start`/`message_end`; this one had no turn, so without its
+    /// own event a client viewing the session would show nothing until reload.
+    SessionMessageAdded {
+        session_id: String,
+        message_id: String,
+        /// `user` | `assistant` | `system` | `tool`, as stored.
+        role: String,
+        content: String,
+    },
 
     // Thinking/reasoning events
     ThinkingDelta {
@@ -1001,6 +1021,7 @@ impl Event {
             Self::MessageStart { session_id, .. }
             | Self::MessageDelta { session_id, .. }
             | Self::MessageEnd { session_id, .. }
+            | Self::SessionMessageAdded { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::StepStarted { session_id, .. }
             | Self::ToolStart { session_id, .. }
@@ -1085,9 +1106,11 @@ impl From<ControlAction> for Action {
                 Action::Config(ConfigAction::Set { path, value })
             }
             ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => {
-                Action::Tool(ToolAction::Execute { name, input })
-            }
+            ControlAction::RunTool { name, input } => Action::Tool(ToolAction::Execute {
+                name,
+                input,
+                session_id: None,
+            }),
             ControlAction::Status => Action::System(SystemAction::Status),
             ControlAction::Restart => Action::System(SystemAction::Restart),
             ControlAction::Shutdown => Action::System(SystemAction::Shutdown),

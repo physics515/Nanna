@@ -261,6 +261,7 @@ import { useSessionState, type TimelineEntry } from '~/composables/useSessionSta
 import { useBackend } from '~/composables/useBackend'
 import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
 import { parseEditDiff } from '~/lib/editDiff'
+import { parseSessionMessageAdded, shouldAppendSessionMessage } from '~/lib/sessionMessageAdded'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {
@@ -491,6 +492,7 @@ let unlistenDaemonError: UnlistenFn | null = null
 let unlistenContextUsage: UnlistenFn | null = null
 let unlistenLivenessBeat: UnlistenFn | null = null
 let unlistenConfigChanged: UnlistenFn | null = null
+let unlistenSessionMessageAdded: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -931,6 +933,23 @@ onMounted(async () => {
     }
   })
 
+  // A message the daemon appended with no streamed turn around it — a
+  // reminder coming due. It is already persisted, so a chat opened later reads
+  // it from history; this only makes the open chat show it now.
+  unlistenSessionMessageAdded = await listen('session-message-added', (event) => {
+    const added = parseSessionMessageAdded(event.payload)
+    if (!added) return
+    const shownIds = messages.value.map(m => m.id)
+    if (!shouldAppendSessionMessage(added, currentSession.value?.id, shownIds)) return
+    messages.value.push({
+      id: added.message_id,
+      role: added.role,
+      content: added.content,
+      timestamp: new Date().toISOString(),
+    })
+    scrollToBottom(true)
+  })
+
   // Load initial session (listeners are already active to capture any events)
   await loadSession()
 })
@@ -961,6 +980,7 @@ onUnmounted(() => {
   if (unlistenContextUsage) unlistenContextUsage()
   if (unlistenLivenessBeat) unlistenLivenessBeat()
   if (unlistenConfigChanged) unlistenConfigChanged()
+  if (unlistenSessionMessageAdded) unlistenSessionMessageAdded()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null

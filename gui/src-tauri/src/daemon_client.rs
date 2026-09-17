@@ -121,6 +121,9 @@ pub enum DaemonEvent {
     MessageStart { session_id: String, message_id: String },
     MessageDelta { session_id: String, message_id: String, delta: String },
     MessageEnd { session_id: String, message_id: String, content: String },
+    /// A complete message appended to a session outside a streamed turn (a
+    /// reminder coming due). Mirrors `nanna_daemon::protocol::Event::SessionMessageAdded`.
+    SessionMessageAdded { session_id: String, message_id: String, role: String, content: String },
     ThinkingDelta { session_id: String, delta: String },
     ModelSwitch { model: String, reason: Option<String> },
     ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String>, #[serde(default)] tokens: Option<u64>, #[serde(default)] total_tokens: Option<u64> },
@@ -1528,6 +1531,28 @@ mod tests {
                 assert_eq!(last_tool.as_deref(), Some("exec"));
             }
             other => panic!("expected LivenessBeat, got {other:?}"),
+        }
+    }
+
+    /// The daemon's wire shape for a delivered reminder. Before this variant it
+    /// parsed as `Unknown` and the open chat showed nothing until reloaded.
+    #[test]
+    fn session_message_added_deserializes() {
+        let json = r#"{
+            "event": "session_message_added",
+            "session_id": "s-1",
+            "message_id": "m-1",
+            "role": "assistant",
+            "content": "⏰ Reminder: stretch"
+        }"#;
+        match serde_json::from_str::<DaemonEvent>(json).expect("event must parse") {
+            DaemonEvent::SessionMessageAdded { session_id, message_id, role, content } => {
+                assert_eq!(session_id, "s-1");
+                assert_eq!(message_id, "m-1");
+                assert_eq!(role, "assistant");
+                assert_eq!(content, "⏰ Reminder: stretch");
+            }
+            other => panic!("expected SessionMessageAdded, got {other:?}"),
         }
     }
 

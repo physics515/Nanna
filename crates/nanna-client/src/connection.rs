@@ -566,6 +566,7 @@ impl<'a> ToolsApi<'a> {
         self.client.request(Action::Tool(ToolAction::Execute {
             name: name.to_string(),
             input,
+            session_id: None,
         })).await
     }
 }

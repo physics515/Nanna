@@ -104,8 +104,10 @@ A fully local run needs none.
   wants an OpenAI key; **browsing** (`browser_action`, `browser_evaluate`, `browser_extract`,
   `browser_screenshot`) wants Chromium or Chrome installed; and **`screenshot`** wants a desktop
   capture tool (`grim`, `spectacle`, `maim`, `scrot`, `import`, or macOS `screencapture`) and a
-  display session. The three reminder tools (`remind`, `list_reminders`, `cancel_reminder`) are not
-  wired yet. Also includes `find_files` for locating a file by glob when you know its name but not
+  display session. **Reminders** (`remind`, `list_reminders`, `cancel_reminder`) need nothing: a
+  due reminder is posted into the conversation that set it and shows up live in an open chat; it
+  survives a restart, and one that came due while Nanna was not running is delivered at the next
+  boot and says how late it is. Also includes `find_files` for locating a file by glob when you know its name but not
   its path.
 - **Nanna can write its own tools** — `create_tool` authors a new JS/TS tool into the data directory
   and registers it live, callable in the same conversation with no restart; `edit_tool` changes one,
