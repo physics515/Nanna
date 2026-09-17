@@ -259,6 +259,50 @@ pub async fn set_session_model(
     Ok(())
 }
 
+/// This session's file checkpoints (files as they were before a tool wrote
+/// them), newest first. A daemon refusal comes back as `Err` with its message.
+#[tauri::command]
+pub async fn get_file_history(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let result = state_guard
+        .backend
+        .session_file_history(&session_id, limit)
+        .await?;
+    if result.get("error").is_some() {
+        return Err(result["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string());
+    }
+    Ok(result)
+}
+
+/// Restore one file checkpoint. Returns what the daemon did (`rewrote` /
+/// `removed`, with the path).
+#[tauri::command]
+pub async fn restore_file_checkpoint(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    checkpoint: u64,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let result = state_guard
+        .backend
+        .session_restore_file(&session_id, checkpoint)
+        .await?;
+    if result.get("error").is_some() {
+        return Err(result["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string());
+    }
+    Ok(result["restored"].clone())
+}
+
 /// Set or clear the user-selected extra tools for a session.
 ///
 /// Additive by contract: the daemon unions these into whatever active set the

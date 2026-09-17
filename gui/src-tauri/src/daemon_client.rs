@@ -872,6 +872,36 @@ impl DaemonClient {
         })).await
     }
 
+    /// A session's file checkpoints, newest first.
+    pub async fn session_file_history(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "file_history",
+            "id": session_id,
+            "limit": limit
+        }))
+        .await
+    }
+
+    /// Restore one file checkpoint of a session.
+    pub async fn session_restore_file(
+        &self,
+        session_id: &str,
+        checkpoint: u64,
+    ) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "restore_file",
+            "id": session_id,
+            "checkpoint": checkpoint
+        }))
+        .await
+    }
+
     /// Set or clear the user-selected extra tools for a session.
     ///
     /// Additive by contract (the daemon unions them into the default active

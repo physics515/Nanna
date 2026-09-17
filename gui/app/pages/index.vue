@@ -53,6 +53,7 @@
              confidently name a model this chat is not using. Fallback state
              and the rate-limited count are process-wide facts that hold for
              a pinned chat too, so the badge keeps reporting them. -->
+        <FileHistoryButton v-if="currentSession" :session-id="currentSession.id" />
         <SessionModelPicker v-if="currentSession" :session-id="currentSession.id" />
         <ModelStatusBadge :model-name-superseded="!!chatModel" class="shrink-0" />
       </NuiChatHeader>

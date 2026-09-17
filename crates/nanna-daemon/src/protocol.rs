@@ -333,6 +333,18 @@ pub enum SessionAction {
         #[serde(default)]
         tools: Vec<String>,
     },
+    /// This session's file checkpoints — each file as it was just before a
+    /// tool write replaced it — newest first.
+    FileHistory {
+        id: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Put a file back the way checkpoint `checkpoint` found it. The current
+    /// content is checkpointed first, so this is undoable.
+    RestoreFile { id: String, checkpoint: u64 },
 
     // --- Sub-Agent Sessions (#72) ---
     /// Spawn a sub-agent session

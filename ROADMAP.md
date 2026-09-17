@@ -4686,8 +4686,19 @@ asks permission or restricts her.)*:
             exists — but `write_file`'s verdict sentences and P22 Tier 3 recovery guidance name
             those files to the model, so it is a coordinated change to the skill's messages, not a
             deletion; measure on a mission leg before and after.
-      - [ ] **GUI rewind** — list a session's checkpoints in the run timeline and restore one with
+      - [x] **GUI rewind** — list a session's checkpoints in the run timeline and restore one with
             a click (the services exist; needs an IPC verb pair and a view).
+            *(2026-09-17)* IPC `session.file_history {id, path?, limit?}` and
+            `session.restore_file {id, checkpoint}` share the exact functions the `file_history`
+            skill's services use, so the GUI and the model can never disagree about what exists.
+            The chat header gains a **Files** button: a panel of this chat's checkpoints (file name,
+            size or "new file"), each with Restore behind a confirmation that says what will happen
+            ("put plan.md back to its 62-byte version" / "remove plan.md (a tool created it)").
+            Verified the verbs on the real daemon (write → clobber → list → restore → file
+            byte-identical; another session sees nothing; unknown checkpoint refused by name) and
+            the panel with 4 vitest (parser, wording, restore sends the clicked checkpoint of the
+            open chat only after confirming). Placed in the header rather than the run timeline —
+            the timeline is per message, and a restore is per chat. Not WebDriver-verified.
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.

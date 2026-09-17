@@ -54,7 +54,10 @@ fn matches_path(c: &Checkpoint, wanted: &str) -> bool {
     c.path == wanted || (wanted.is_relative() && c.path.ends_with(wanted))
 }
 
-async fn list(history: &FileHistory, params: &Value) -> Result<Value, String> {
+/// List a session's checkpoints: `{session_id, path?, limit?}` →
+/// `{checkpoints, total}`. Shared by the service and the `session.file_history`
+/// IPC verb, so the skill and the GUI can never disagree about what exists.
+pub(crate) async fn list(history: &FileHistory, params: &Value) -> Result<Value, String> {
     let limit = crate::tasks::opt_i64(params, "limit")?
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(LIST_DEFAULT)
@@ -89,7 +92,8 @@ async fn list(history: &FileHistory, params: &Value) -> Result<Value, String> {
     Ok(json!({ "checkpoints": shown, "total": matching.len() }))
 }
 
-async fn restore(history: &FileHistory, params: &Value) -> Result<Value, String> {
+/// Restore one checkpoint: `{session_id, checkpoint}`. Shared like [`list`].
+pub(crate) async fn restore(history: &FileHistory, params: &Value) -> Result<Value, String> {
     let Some(seq) = crate::tasks::opt_i64(params, "checkpoint")? else {
         return Err(
             "Nothing was restored: `checkpoint` is required. List them first; each has a number."

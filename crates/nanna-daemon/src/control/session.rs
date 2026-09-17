@@ -213,6 +213,26 @@ impl ControlPlane {
                     json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
                 }
             }
+            SessionAction::FileHistory { id, path, limit } => {
+                let Some(history) = nanna_scripting::file_history::installed() else {
+                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+                };
+                let params = json!({ "session_id": id, "path": path, "limit": limit });
+                match crate::file_history_service::list(history, &params).await {
+                    Ok(listed) => listed,
+                    Err(message) => json!({ "error": "file_history_failed", "message": message }),
+                }
+            }
+            SessionAction::RestoreFile { id, checkpoint } => {
+                let Some(history) = nanna_scripting::file_history::installed() else {
+                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+                };
+                let params = json!({ "session_id": id, "checkpoint": checkpoint });
+                match crate::file_history_service::restore(history, &params).await {
+                    Ok(restored) => json!({ "ok": true, "restored": restored }),
+                    Err(message) => json!({ "error": "restore_failed", "message": message }),
+                }
+            }
             SessionAction::Fork { id, name } => {
                 if let Some(original) = self.sessions.get(&id).await {
                     let mut forked = self.sessions.create(
