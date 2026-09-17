@@ -1,15 +1,15 @@
 {
-  "version": "0.3.19",
-  "notes": "Things that said they were working: a skill catalogue nothing ever parsed, a validator that validated nothing, a doctor that reported ok for a config its own daemon had given up on — plus find_files, and the first Linux build.",
-  "pub_date": "2026-09-14T16:51:12.010Z",
+  "version": "0.3.20",
+  "notes": "A quarter of the toolbox was never handed over: 16 of 44 bundled skills were withheld at every boot, now 3 — plus self-authored tools, vision/OCR, speech, browsing, and an OAuth client version that is current again.",
+  "pub_date": "2026-09-17T04:38:19Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWxHcHQ4OWZ2L2pISXRWODdTazNOY0ZCNDdPZ1RBRjhtUHF3Rm9SaTJ0a3Rna3I1ZnJ5M3l2Q3JUVDZiajVNbjNwZ20yNVhjakdFTnUydWJ6SXBhbndjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDA0NDk4CWZpbGU6TmFubmFfMC4zLjE5X3g2NC1zZXR1cC5leGUKMDdRTUVQY05YenVWU1hMYU9YREIyQjE4MEtCNTAwcVNzOXNjb0h3UitJUVpEaXFFY0dVbE9paTUwVWR2bkRtYUlwOHdIdXg4NFRlMUFJVWtMKzAyQlE9PQo=",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.19-beta.28/Nanna_0.3.19_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW84R1VucnA2bm5TemxrcDFWK2tRN0Vxd2pSSmpyNDRlUHFoYVRXMm9tNFp1c0t2dHRHbnFESTBPN0dmRk9IdEtQSjFkandja2J6WWRMTjZwRmZtVkFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NjE5ODYxCWZpbGU6TmFubmFfMC4zLjIwX3g2NC1zZXR1cC5leGUKRWpvbkE3eTlaczJHT1NmeDRZZ0V4MVUwTmxGZFFFV08rYlZXcDR6WFNNYzVjdVhZSUNUUEpsOTlxcmhPUUJlUitMN3V5TnJzRlF1a0x3R3lTcEVQQ1E9PQo=",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.20-beta.29/Nanna_0.3.20_x64-setup.exe"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXIwMjlrWldSVHlVZWFqNlN1WGxMU1hNemxtcWRTVkg0VU1hZXJkK21kU2F5WE4rRDdQOGhWL3dDNTcrSHFTMGpSREFsbnFzSjhGNGRNQlp4Q2F6VGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NDAyNjQ2CWZpbGU6TmFubmFfMC4zLjE5X2FtZDY0LkFwcEltYWdlCjd3Yi9UcGZHY1ZkMndMV21yNThHdmhKejNkTE80TlRMVm5tQWt2Wmx4b1dvTUo1SGtxSU83K001STF6QjR6Y0U5U2R0MVBKczFQdUNXbG1RajhQT0F3PT0K",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.19-beta.28/Nanna_0.3.19_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWdHZFFrZDFUU2UvWmkzT0J0WWFKMitkUzFIVytsWWxhblhzTWdKdUEzSldYU3IwUHRjL2hXeW1Uc2l3THZEZ0p1RVpFam90QkxqWWM4dDFISlJJTndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5NjE3Nzk4CWZpbGU6TmFubmFfMC4zLjIwX2FtZDY0LkFwcEltYWdlClhXcmtNMDd4OHhDVitlbXJFb0VObWorSVgycHN6T3p3TW4rblZvRUZMMVk4RWdWZkhUYkc0dFRsRzZyYzdNTGZjTW9IWjQ0RTFQc2N4dnVDbXVkdURRPT0K",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.20-beta.29/Nanna_0.3.20_amd64.AppImage"
     }
   }
 }
