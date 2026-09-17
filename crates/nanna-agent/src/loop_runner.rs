@@ -10309,18 +10309,20 @@ mod tests {
     fn repetition_detected_when_same_long_line_dominates() {
         // 12 copies of the same substantial line — a degenerate generation loop.
         let line = "I'll begin the nightly routine. Let me start by checking the lock file.";
-        let text = vec![line; 12].join("\n");
+        let text = [line; 12].join("\n");
         assert!(detect_repetition(&text));
     }
 
     #[test]
     fn repetition_not_detected_in_varied_text() {
         // 12 distinct substantial lines — a normal multi-line answer.
-        let text: String = (0..12)
-            .map(|i| {
-                format!("Step {i}: this line describes a distinct part of the work being done.\n")
-            })
-            .collect();
+        let text = (0..12).fold(String::new(), |mut text, i| {
+            let _ = writeln!(
+                text,
+                "Step {i}: this line describes a distinct part of the work being done."
+            );
+            text
+        });
         assert!(!detect_repetition(&text));
     }
 
@@ -10460,7 +10462,7 @@ mod tests {
     fn repetition_needs_enough_lines_to_judge() {
         // Fewer than 10 substantial lines is too little signal, even if identical.
         let line = "The same substantial line repeated a handful of times only here.";
-        let text = vec![line; 5].join("\n");
+        let text = [line; 5].join("\n");
         assert!(!detect_repetition(&text));
     }
 
@@ -10709,7 +10711,7 @@ mod tests {
         asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("read_file".into()));
         asm.on_tool_delta(1, r#"{"file_path":"a"#);
         // no on_block_stop(1)
-        assert!(asm.tool_uses.is_empty());
+        assert_eq!(asm.tool_uses, Vec::<(String, String, Value)>::new());
         assert!(asm.content_blocks.iter().all(|cb| tool_use_fields(cb).is_none()));
     }
 
@@ -11366,16 +11368,18 @@ mod memory_ingest_tests {
         let written = Arc::new(AtomicUsize::new(0));
         let stored = Arc::new(Mutex::new(String::new()));
 
-        let mut options = RunOptions::default();
-        options.on_memory = Some({
-            let written = Arc::clone(&written);
-            let stored = Arc::clone(&stored);
-            Box::new(move |memory: ExtractedMemory| {
-                written.fetch_add(1, Ordering::SeqCst);
-                stored.lock().unwrap().push_str(&memory.content);
-                Box::pin(async {})
-            })
-        });
+        let options = RunOptions {
+            on_memory: Some({
+                let written = Arc::clone(&written);
+                let stored = Arc::clone(&stored);
+                Box::new(move |memory: ExtractedMemory| {
+                    written.fetch_add(1, Ordering::SeqCst);
+                    stored.lock().unwrap().push_str(&memory.content);
+                    Box::pin(async {})
+                })
+            }),
+            ..RunOptions::default()
+        };
 
         let mut state = RunState::new();
         let uses = vec![(
@@ -11404,7 +11408,10 @@ mod memory_ingest_tests {
     async fn cancelling_mid_ingest_stops_the_writes() {
         // Distinct lines, so the collapse cannot merge them and the result is
         // genuinely many chunks.
-        let content: String = (0..3_000).map(|i| format!("distinct line {i}\n")).collect();
+        let content = (0..3_000).fold(String::new(), |mut content, i| {
+            let _ = writeln!(content, "distinct line {i}");
+            content
+        });
         let agent = agent_with(CannedTool {
             name: "chatty".to_string(),
             content: content.clone(),
@@ -11418,18 +11425,20 @@ mod memory_ingest_tests {
 
         let cancel = CancelToken::new();
         let written = Arc::new(AtomicUsize::new(0));
-        let mut options = RunOptions::default();
-        options.cancel = Some(cancel.clone());
-        options.on_memory = Some({
-            let written = Arc::clone(&written);
-            let cancel = cancel.clone();
-            Box::new(move |_memory: ExtractedMemory| {
-                // The user presses Stop while the first chunk is being written.
-                written.fetch_add(1, Ordering::SeqCst);
-                cancel.cancel();
-                Box::pin(async {})
-            })
-        });
+        let options = RunOptions {
+            cancel: Some(cancel.clone()),
+            on_memory: Some({
+                let written = Arc::clone(&written);
+                let cancel = cancel.clone();
+                Box::new(move |_memory: ExtractedMemory| {
+                    // The user presses Stop while the first chunk is being written.
+                    written.fetch_add(1, Ordering::SeqCst);
+                    cancel.cancel();
+                    Box::pin(async {})
+                })
+            }),
+            ..RunOptions::default()
+        };
 
         let mut state = RunState::new();
         let uses = vec![(
@@ -11589,7 +11598,7 @@ mod repeat_failure_breaker_tests {
     }
 
     /// Dispatch one `flaky` call through the real tool path and return its
-    /// tool_result block.
+    /// `tool_result` block.
     async fn run_once(agent: &Agent, state: &mut RunState, input: Value) -> ContentBlock {
         let uses = vec![(Uuid::new_v4().to_string(), "flaky".to_string(), input)];
         let mut blocks = agent
@@ -11782,8 +11791,7 @@ mod repeat_failure_breaker_tests {
         let err = agent
             .run("do the thing", RunOptions::default())
             .await
-            .err()
-            .expect("a below-floor window must fail the step, not run truncated");
+            .expect_err("a below-floor window must fail the step, not run truncated");
 
         // Loud: the stop reason names the numbers and the way back.
         let msg = err.to_string();
@@ -11811,7 +11819,7 @@ mod repeat_failure_breaker_tests {
 
     /// After a demotion to 4096, a step prompt assembled by the REAL request
     /// builder fits the new window: input estimate under the re-derived hard
-    /// limit, and the request's max_tokens claims only the remainder. The
+    /// limit, and the request's `max_tokens` claims only the remainder. The
     /// budgets come from `model_info_from_cache_or_unknown`, which is clamped
     /// by the live latch — the same source a fresh harness step reads.
     #[tokio::test]
@@ -11866,6 +11874,7 @@ mod repeat_failure_breaker_tests {
             ctx.hard_limit,
             request.max_tokens
         );
+        drop(ctx);
         // The step frame survived the ladder into the actual request, and the
         // compression announces itself ahead of it (the dropped history rides
         // in as a framed <previous_context> summary, never a silent gap).
@@ -11883,7 +11892,7 @@ mod repeat_failure_breaker_tests {
             "dropped history must announce itself in the request"
         );
         assert!(
-            texts.iter().any(|t| *t == "the step frame"),
+            texts.contains(&"the step frame"),
             "the pinned step frame must survive into the request"
         );
     }
@@ -11975,11 +11984,13 @@ mod repeat_failure_breaker_tests {
                 + 50
                 + (TASK_ANCHOR_MAX_BYTES * 10) / 32
         );
-        assert!(
-            MIN_OUTPUT_RESERVE_TOKENS <= 4_096 / 2,
-            "the minimum must fit even the smallest demotion bucket's \
-             half-window output cap"
-        );
+        const {
+            assert!(
+                MIN_OUTPUT_RESERVE_TOKENS <= 4_096 / 2,
+                "the minimum must fit even the smallest demotion bucket's \
+                 half-window output cap"
+            );
+        }
     }
 
     /// The min-viable-window derivation ([`min_viable_num_ctx`]): the value a
@@ -12111,8 +12122,7 @@ mod repeat_failure_breaker_tests {
                 },
             )
             .await
-            .err()
-            .expect("the LLM at port 9 must refuse the connection");
+            .expect_err("the LLM at port 9 must refuse the connection");
         assert!(
             !matches!(err, AgentError::ContextBelowFloor { .. }),
             "the pressure tier must fit 8192 — the floor must not fire: {err}"
@@ -12131,6 +12141,7 @@ mod repeat_failure_breaker_tests {
                 _ => None,
             })
             .expect("the reduction must announce itself in the transcript");
+        drop(ctx);
         // ...naming every dropped tool, keeping the work-evidence set.
         let dropped_part = note
             .split("Dropped from the request: ")
@@ -12184,8 +12195,7 @@ mod repeat_failure_breaker_tests {
                 },
             )
             .await
-            .err()
-            .expect("the LLM at port 9 must refuse the connection");
+            .expect_err("the LLM at port 9 must refuse the connection");
         assert!(!matches!(err, AgentError::ContextBelowFloor { .. }), "{err}");
 
         let ctx = agent.context.read().await;
@@ -12434,7 +12444,7 @@ mod zero_info_breaker_tests {
     }
 
     /// Dispatch one `steady` call through the real tool path and return its
-    /// tool_result block.
+    /// `tool_result` block.
     async fn run_once(agent: &Agent, state: &mut RunState, input: Value) -> ContentBlock {
         let uses = vec![(Uuid::new_v4().to_string(), "steady".to_string(), input)];
         let mut blocks = agent
@@ -13232,6 +13242,7 @@ mod run_long_ledger_tests {
                 entry.last_success_excerpt.is_empty(),
                 "a first sighting can never render a notice, so it carries no payload"
             );
+            drop(seen);
         }
 
         // The first REPEAT is where the payload starts being retained.
@@ -13241,6 +13252,7 @@ mod run_long_ledger_tests {
             let entry = seen.values().next().expect("one entry");
             assert_eq!(entry.identical_success_count, 2);
             assert_eq!(entry.last_success_excerpt, "workspace listing: src, tests");
+            drop(seen);
         }
 
         // Many more repeats across many more steps: still one entry.
@@ -13297,7 +13309,7 @@ mod claim_nudge_tests {
         }
     }
 
-    /// A RunState in the observed live shape (gemma4:12b, 2026-08-02): the
+    /// A `RunState` in the observed live shape (gemma4:12b, 2026-08-02): the
     /// real work SUCCEEDED, the loop nudge already fired, and the latest
     /// text still has no claim — all of (a) + (b) + (c).
     fn eligible_state() -> RunState {
@@ -13516,6 +13528,7 @@ mod claim_nudge_tests {
         assert_eq!(ctx.messages.len(), before + 1);
         let last =
             serde_json::to_string(ctx.messages.last().expect("injected message")).unwrap();
+        drop(ctx);
         assert!(last.contains("TASK COMPLETE on its own line"), "got: {last}");
         assert!(last.contains("\"user\""), "steering is user-role, got: {last}");
 
@@ -13527,7 +13540,7 @@ mod claim_nudge_tests {
         );
         // Nor did it touch the run's accumulated/final text.
         assert!(!state.final_text.contains("TASK COMPLETE"));
-        assert!(state.streamed_text.is_empty());
+        assert_eq!(state.streamed_text, "");
     }
 
     #[tokio::test]
@@ -13570,6 +13583,7 @@ mod claim_nudge_tests {
                     .contains("TASK COMPLETE on its own line")
             })
             .count();
+        drop(ctx);
         assert_eq!(injected, CLAIM_NUDGES_MAX);
     }
 
@@ -13677,6 +13691,7 @@ mod claim_nudge_tests {
         let ctx = a.context.read().await;
         let last =
             serde_json::to_string(ctx.messages.last().expect("injected message")).unwrap();
+        drop(ctx);
         assert!(
             last.contains("most recent side-effecting command reported failure"),
             "got: {last}"
@@ -14253,7 +14268,7 @@ mod prose_dialect_tests {
                     as JSON. Let me explain how tool calls work.";
         let scan = scan_prose_dialect(text);
         assert!(scan.calls.is_empty());
-        assert!(scan.result_spans.is_empty());
+        assert_eq!(scan.result_spans, Vec::<(usize, usize)>::new());
         assert_eq!(scan.fence_tokens, 0);
         assert!(!text_streams_prose_tool_calls(text));
     }
@@ -14831,7 +14846,8 @@ mod thinking_always_on_tests {
             cached_at: 0,
             provider: "anthropic".to_string(),
         };
-        let configured = AgentConfig::default().max_tokens as usize;
+        let max_tokens = AgentConfig::default().max_tokens;
+        let configured = max_tokens as usize;
         let answer = window_scaled_output_reserve(opus5.context_window, configured);
 
         let thinking = request_output_budget(
@@ -14850,12 +14866,12 @@ mod thinking_always_on_tests {
         );
 
         assert_eq!(
-            muted, configured as u32,
+            muted, max_tokens,
             "a non-thinking request asks for exactly the answer budget"
         );
         assert_eq!(
             thinking,
-            configured as u32 + ThinkingMode::Medium.budget_tokens().unwrap(),
+            max_tokens + ThinkingMode::Medium.budget_tokens().unwrap(),
             "a thinking request adds the reasoning budget on top, so the              answer keeps the full budget it was sized for"
         );
     }
@@ -14872,7 +14888,8 @@ mod thinking_always_on_tests {
             cached_at: 0,
             provider: "anthropic".to_string(),
         };
-        let configured = AgentConfig::default().max_tokens as usize;
+        let max_tokens = AgentConfig::default().max_tokens;
+        let configured = max_tokens as usize;
         let answer = window_scaled_output_reserve(info.context_window, configured);
 
         // Legacy models bound reasoning with `budget_tokens` instead, and that
@@ -14885,12 +14902,12 @@ mod thinking_always_on_tests {
                 ThinkingMode::Medium,
                 true
             ),
-            configured as u32
+            max_tokens
         );
         // Ollama bounds thinking inside num_predict; nothing to add.
         assert_eq!(
             request_output_budget("qwen3.5:9b", &info, answer, ThinkingMode::Medium, false),
-            configured as u32
+            max_tokens
         );
     }
 
