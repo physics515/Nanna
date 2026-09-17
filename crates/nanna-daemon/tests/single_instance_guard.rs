@@ -22,7 +22,7 @@ use std::path::Path;
 
 /// A daemon that claims nothing beyond the guard under test: no memory, no
 /// health or webhook ports, a private data dir. The PID file stays ON.
-async fn hermetic_daemon(data_dir: &Path, port: u16) -> DaemonServer {
+fn hermetic_daemon(data_dir: &Path, port: u16) -> DaemonServer {
     DaemonBuilder::new()
         .with_host("127.0.0.1")
         .with_port(port)
@@ -33,7 +33,6 @@ async fn hermetic_daemon(data_dir: &Path, port: u16) -> DaemonServer {
         .with_pid_file(true)
         .with_log_level("warn")
         .build()
-        .await
 }
 
 /// A refused instance must leave no trace of having started: no store opened
@@ -56,7 +55,7 @@ async fn run_refuses_a_held_ipc_port_before_touching_storage() {
     let port = holder.local_addr().unwrap().port();
     let data_dir = tempfile::tempdir().unwrap();
 
-    let mut duplicate = hermetic_daemon(data_dir.path(), port).await;
+    let mut duplicate = hermetic_daemon(data_dir.path(), port);
     let result = duplicate.run().await;
     drop(duplicate);
 
@@ -241,7 +240,7 @@ mod linux {
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = holder.local_addr().unwrap().port();
 
-        let mut duplicate = hermetic_daemon(data_dir.path(), port).await;
+        let mut duplicate = hermetic_daemon(data_dir.path(), port);
         let result = duplicate.run().await;
         drop(duplicate);
 

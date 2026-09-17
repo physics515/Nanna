@@ -3419,37 +3419,7 @@ impl DaemonServer {
 
         self.open_storage().await;
 
-        // Load sessions from Turso database
-        {
-            let loaded = self.sessions.load_from_db().await;
-            info!("Loaded {} sessions from database", loaded);
-        }
-
-        // If no sessions loaded from DB, check for legacy sessions.json migration
-        if self.sessions.count().await == 0 {
-            if let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await {
-                if !sessions.is_empty() {
-                    info!(
-                        "Migrating {} sessions from legacy sessions.json to database",
-                        sessions.len()
-                    );
-                    for session in sessions {
-                        self.sessions.restore(session).await;
-                    }
-                    if let Some(id) = default_id {
-                        self.sessions.set_default(&id).await;
-                    }
-                    // Mark as migrated
-                    self.persistence.mark_sessions_migrated().await;
-                }
-            }
-        }
-
-        // Create default session if none exist
-        if self.sessions.count().await == 0 {
-            let default_session = self.sessions.create(Some("Main".to_string())).await;
-            info!("Created default session: {}", default_session.id);
-        }
+        self.load_sessions().await;
 
         // ONE run registry, created before the services so the embedding
         // drain, the dream gate, the scheduler and the control plane all hold
@@ -6055,7 +6025,8 @@ impl DaemonBuilder {
 
     /// Assemble the server. Opens nothing: storage opens in
     /// [`DaemonServer::run`] once this process has claimed the instance.
-    pub async fn build(self) -> DaemonServer {
+    #[must_use]
+    pub fn build(self) -> DaemonServer {
         let mut server = DaemonServer::new(
             self.config,
             self.embedding,

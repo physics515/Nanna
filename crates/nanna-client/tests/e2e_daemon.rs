@@ -139,8 +139,7 @@ impl TestDaemon {
                 .with_webhook_server(false)
                 .with_pid_file(false)
                 .with_log_level("warn")
-                .build()
-                .await;
+                .build();
             // The receiver outlives this send; if it were gone the test has
             // already failed, so there is nothing to report here.
             let _ = bound_tx.send(server.ipc_bound_addr());
