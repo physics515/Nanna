@@ -23,14 +23,6 @@ pub fn millis_u64(duration: Duration) -> u64 {
 /// truncating to its low bits — for the counts and limits read from tool
 /// parameters here, "as many as possible" is the reading of an oversized
 /// number, where truncation would turn `2^32 + 5` into `5`.
-#[expect(
-    dead_code,
-    reason = "the callers are the five `params[\"limit\"] as usize` reads in \
-              server.rs; the v0.3.21-beta.30 merge restored that file's \
-              pre-cleanup copy, so they are casts again until it is re-split. \
-              Removing this attribute is part of that: with the calls back, \
-              the expectation goes unfulfilled and says so."
-)]
 pub fn usize_saturating(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
