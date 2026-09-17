@@ -28,6 +28,43 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Integer <-> float conversions for the VRAM fit and the token estimate, where
+/// std has no lossless route. Each is exactly the `as` cast it replaced, kept in
+/// one place so the precision trade-off is stated once.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "std has no lossless u64 -> f64 or usize -> f32 conversion and no f32 -> usize \
+              conversion at all; the inputs are VRAM byte counts (exact in f64 below 8 PiB) and \
+              character counts feeding a deliberately approximate token estimate, whose result \
+              is the saturating truncation of a non-negative ceil"
+)]
+mod lossy {
+    /// A byte count as the nearest `f64`, exactly as `as f64`.
+    pub const fn u64_to_f64(n: u64) -> f64 {
+        n as f64
+    }
+
+    /// A character count as the nearest `f32`, exactly as `as f32`.
+    pub const fn usize_to_f32(n: usize) -> f32 {
+        n as f32
+    }
+
+    /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
+    /// exactly as `as usize`.
+    pub const fn f32_to_usize(x: f32) -> usize {
+        x as usize
+    }
+}
+
+/// A provider-reported token count as the `u32` the usage events carry,
+/// saturating: no single request reports four billion tokens, so this never
+/// differs from the old truncating cast in practice.
+fn token_count_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Watches a token stream for a wedged runner emitting one token forever.
 ///
 /// Observed live 2026-07-27: thinking blocks of `"00000000000000…"` filling
@@ -338,7 +375,8 @@ impl ModelInfo {
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        // Seconds since the epoch exceed i64::MAX only ~292 billion years from now.
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Universal context floor when no provider has reported limits for a model.
@@ -380,7 +418,9 @@ pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInf
 }
 
 /// The context window the local runner will actually honour for `model` right
-/// now: `reported` (provider metadata / cache / config) clamped by the live
+/// now.
+///
+/// That is `reported` (provider metadata / cache / config) clamped by the live
 /// Ollama `num_ctx` latch. Models that were never sized by the Ollama path
 /// (cloud providers, unlatched local models) pass `reported` through unchanged.
 ///
@@ -393,10 +433,7 @@ pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInf
 /// 4-hour eval scored 1/42 against 4/42-per-hour at full context.
 #[must_use]
 pub fn effective_context_window(model: &str, reported: usize) -> usize {
-    match LlmClient::effective_num_ctx(model) {
-        Some(latched) => reported.min(latched as usize),
-        None => reported,
-    }
+    LlmClient::effective_num_ctx(model).map_or(reported, |latched| reported.min(latched as usize))
 }
 
 /// `info` with its window clamped to the live effective runner window for
@@ -434,10 +471,12 @@ pub fn clamp_model_info_to_effective_window(model: &str, mut info: ModelInfo) ->
 /// windows that would have fit.
 pub const NUM_CTX_QUANTUM: u32 = 512;
 
-/// The top of the demotion ladder — the largest window the VRAM sizing path
-/// can grant (its buckets are `[4096, 8192, 16384, 32768]`), so an unlatched
-/// model demoting for the first time walks down from the most it could ever
-/// have been given, exactly as the old bucket ladder did.
+/// The top of the demotion ladder.
+///
+/// It is the largest window the VRAM sizing path can grant (its buckets are
+/// `[4096, 8192, 16384, 32768]`), so an unlatched model demoting for the first
+/// time walks down from the most it could ever have been given, exactly as the
+/// old bucket ladder did.
 pub const NUM_CTX_CEILING: u32 = 32_768;
 
 /// Fallback minimum viable window for [`LlmClient::demote_context`] when the
@@ -456,11 +495,13 @@ pub const NUM_CTX_CEILING: u32 = 32_768;
 /// call sites that have no agent state to measure.
 pub const DEFAULT_MIN_VIABLE_NUM_CTX: u32 = 4_608;
 
-/// The provider clients' declared silence tolerance: how long a stream may go
-/// without delivering a single byte before the transport itself calls it dead
-/// (`reqwest`'s `read_timeout` on both the remote and the Ollama client — see
-/// `build_http_client` / `build_ollama_http_client`). This is deliberately the
-/// ONLY time bound on a stream: there is no total-request deadline, because a
+/// The provider clients' declared silence tolerance.
+///
+/// It is how long a stream may go without delivering a single byte before the
+/// transport itself calls it dead (`reqwest`'s `read_timeout` on both the remote
+/// and the Ollama client — see `build_http_client` /
+/// `build_ollama_http_client`). This is deliberately the ONLY time bound on a
+/// stream: there is no total-request deadline, because a
 /// healthy long generation never pauses between chunks for anywhere near this
 /// long, while it routinely exceeds any total cap.
 ///
@@ -617,6 +658,12 @@ impl ModelInfoCache {
     }
 
     /// Store model info in cache
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Io`] when the cache directory cannot be created or the
+    /// entry file cannot be written, and [`LlmError::Json`] when `info` cannot be
+    /// serialized.
     pub fn set(&self, info: &ModelInfo) -> Result<(), LlmError> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&self.cache_dir)?;
@@ -630,6 +677,11 @@ impl ModelInfoCache {
     }
 
     /// Clear all cached model info
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Io`] when the cache directory exists but cannot be
+    /// removed.
     pub fn clear(&self) -> Result<(), LlmError> {
         if self.cache_dir.exists() {
             std::fs::remove_dir_all(&self.cache_dir)?;
@@ -701,8 +753,15 @@ impl LlmError {
     #[must_use]
     pub fn should_fallback(&self) -> bool {
         match self {
-            // Rate limits - definitely fallback
-            Self::RateLimit { .. } => true,
+            // Rate limits - definitely fallback.
+            //
+            // A wedged runner used to arrive as Api{status:502} and so fell
+            // into the 502 case below. It is still exactly that fault — keep it
+            // falling back, or splitting the variant out would silently stop
+            // the router trying another model.
+            //
+            // Network errors - might be transient.
+            Self::RateLimit { .. } | Self::WedgedRunner { .. } | Self::Http(_) => true,
             Self::Api { status, message } => {
                 // 429 = rate limit
                 // 529 = overloaded (Anthropic)
@@ -715,13 +774,6 @@ impl LlmError {
                 let msg_lower = message.to_lowercase();
                 msg_lower.contains("rate limit") || msg_lower.contains("rate_limit")
             }
-            // A wedged runner used to arrive as Api{status:502} and so fell
-            // into the 502 arm above. It is still exactly that fault — keep it
-            // falling back, or splitting the variant out would silently stop
-            // the router trying another model.
-            Self::WedgedRunner { .. } => true,
-            // Network errors - might be transient
-            Self::Http(_) => true,
             // Don't fallback on auth errors, JSON errors, etc.
             _ => false,
         }
@@ -907,10 +959,7 @@ impl PaceState {
             _ => fallback_spacing,
         };
 
-        match since_last {
-            None => tokio::time::Duration::ZERO,
-            Some(elapsed) => spacing.saturating_sub(elapsed),
-        }
+        since_last.map_or(tokio::time::Duration::ZERO, |elapsed| spacing.saturating_sub(elapsed))
     }
 
     /// Fold a provider's rate-limit headers into the state.
@@ -1952,10 +2001,7 @@ fn to_claude_code_tool_name(name: &str) -> String {
     }
     // If no match, return original (with first letter capitalized for consistency)
     let mut chars = name.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-    }
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 /// Convert a tool name from Claude Code form back to original
@@ -2096,8 +2142,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // still faults under load and gets walked down by `demote_context`
         // (the caller demotes on the second fault of a run): the safety net
         // for an over-pin is the fault ladder, not the snapshot.
-        let start = match Self::env_num_ctx() {
-            Some(pinned) => {
+        let start = Self::env_num_ctx().map_or_else(
+            || Self::fit_context_to_free_vram(model).unwrap_or(16_384),
+            |pinned| {
                 tracing::info!(
                     model = %model,
                     pinned,
@@ -2106,9 +2153,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                      demote_context can still walk it lower on GPU faults"
                 );
                 pinned
-            }
-            None => Self::fit_context_to_free_vram(model).unwrap_or(16_384),
-        };
+            },
+        );
         Self::latch_num_ctx(model, start);
         start
     }
@@ -2222,6 +2268,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let clamped = stepped < clamp;
         let next = if clamped { clamp } else { stepped };
         guard.insert(key, next);
+        drop(guard);
         tracing::warn!(
             model,
             from = current,
@@ -2255,14 +2302,15 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// plus a reserve for the prefill compute buffer, give a bound that adapts
     /// to whatever else is on the card.
     fn fit_context_to_free_vram(model: &str) -> Option<u32> {
-        let free_bytes = Self::nvidia_free_vram_bytes()? as f64;
-        let weights_bytes = Self::ollama_model_size_bytes(model)? as f64;
+        const MIB: u64 = 1024 * 1024;
+        let free_bytes = Self::nvidia_free_vram_bytes()?;
+        let weights_bytes = Self::ollama_model_size_bytes(model)?;
         let (ours_resident, others_resident) = Self::ollama_resident_vram(model);
         let fitted = Self::fit_context_for_budget(
-            free_bytes,
-            weights_bytes,
-            ours_resident as f64,
-            others_resident as f64,
+            lossy::u64_to_f64(free_bytes),
+            lossy::u64_to_f64(weights_bytes),
+            lossy::u64_to_f64(ours_resident),
+            lossy::u64_to_f64(others_resident),
         );
         // Floor-fit on an EMPTY server is the orphaned-runner signature, so
         // name it instead of latching quietly. `ollama ps` reports the
@@ -2278,8 +2326,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         if fitted == Self::MIN_FIT_CTX && ours_resident + others_resident == 0 {
             tracing::warn!(
                 model,
-                free_mib = (free_bytes / (1024.0 * 1024.0)) as u64,
-                weights_mib = (weights_bytes / (1024.0 * 1024.0)) as u64,
+                // Integer division: identical to the float quotient's truncation
+                // for every byte count below 2^53 (8 PiB).
+                free_mib = free_bytes / MIB,
+                weights_mib = weights_bytes / MIB,
                 "num_ctx sized at the floor while `ollama ps` shows nothing \
                  resident — something invisible to Ollama is holding the \
                  card. Known cause: llama-server runner processes orphaned by \
@@ -2368,6 +2418,17 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         /// request cannot honour.
         const SLACK: f64 = 1.2 * 1024.0 * 1024.0 * 1024.0;
         const MAX_CTX: u32 = 32_768;
+        // Snap DOWN to a power-of-two bucket.
+        //
+        // Not cosmetic: Ollama keys a loaded model instance partly on its
+        // options, so a changed `num_ctx` evicts and reloads the model — tens
+        // of seconds of stall and a VRAM churn, mid-run. "Every turn" has to
+        // mean the value is *rechecked* every turn, not that it is free to
+        // wander: free VRAM drifting by a few hundred MB as the desktop
+        // breathes must not reload a 7.5 GB model. Buckets make the answer
+        // stable across ordinary drift while still moving when something real
+        // changes (a game starts, the embedder loads).
+        const BUCKETS: [u32; 4] = [32_768, 16_384, 8_192, 4_096];
 
         // Add back what THIS model already holds before subtracting what it
         // costs, so the answer does not depend on whether it happens to be
@@ -2386,23 +2447,14 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         if usable <= 0.0 {
             return Self::MIN_FIT_CTX;
         }
-        let raw = (usable / BYTES_PER_CTX_TOKEN) as u64;
+        // Tokens that fit, compared unrounded: for a whole bucket size `b`,
+        // `b <= raw` is exactly `b <= floor(raw)`, the old truncating cast.
+        let raw = usable / BYTES_PER_CTX_TOKEN;
 
-        // Snap DOWN to a power-of-two bucket.
-        //
-        // Not cosmetic: Ollama keys a loaded model instance partly on its
-        // options, so a changed `num_ctx` evicts and reloads the model — tens
-        // of seconds of stall and a VRAM churn, mid-run. "Every turn" has to
-        // mean the value is *rechecked* every turn, not that it is free to
-        // wander: free VRAM drifting by a few hundred MB as the desktop
-        // breathes must not reload a 7.5 GB model. Buckets make the answer
-        // stable across ordinary drift while still moving when something real
-        // changes (a game starts, the embedder loads).
-        const BUCKETS: [u32; 4] = [32_768, 16_384, 8_192, 4_096];
         let fitted = BUCKETS
             .iter()
             .copied()
-            .find(|b| u64::from(*b) <= raw)
+            .find(|b| f64::from(*b) <= raw)
             .unwrap_or(Self::MIN_FIT_CTX);
         fitted.clamp(Self::MIN_FIT_CTX, MAX_CTX)
     }
@@ -2482,7 +2534,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// to Ollama over v6 loopback (health probes and runner surgery already
     /// use 127.0.0.1) — the same v6 path where streams were cut
     /// mid-generation. Remote hosts pass through untouched.
-    fn normalize_ollama_url(url: String) -> String {
+    fn normalize_ollama_url(url: &str) -> String {
         url.replacen("://localhost", "://127.0.0.1", 1)
     }
 
@@ -2562,7 +2614,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             http: Self::build_ollama_http_client(),
             provider: Provider::Ollama,
             api_key: String::new(), // Ollama doesn't need auth
-            base_url: Self::normalize_ollama_url(base_url.into()),
+            base_url: Self::normalize_ollama_url(&Into::<String>::into(base_url)),
         }
     }
 
@@ -2572,7 +2624,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             http: Self::build_ollama_http_client(),
             provider: Provider::Ollama,
             api_key: api_key.into(),
-            base_url: Self::normalize_ollama_url(base_url.into()),
+            base_url: Self::normalize_ollama_url(&Into::<String>::into(base_url)),
         }
     }
 
@@ -2832,6 +2884,13 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Fetch model info from `OpenAI` API
     async fn fetch_openai_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        // OpenAI doesn't return context_window in their model endpoint
+        // So we use defaults with the model ID from the API
+        #[derive(Deserialize)]
+        struct OpenAIModelResponse {
+            id: String,
+        }
+
         let url = format!("{}/v1/models/{}", self.base_url, model);
 
         let response = self
@@ -2848,13 +2907,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             }
             let message = response.text().await.unwrap_or_default();
             return Err(LlmError::Api { status, message });
-        }
-
-        // OpenAI doesn't return context_window in their model endpoint
-        // So we use defaults with the model ID from the API
-        #[derive(Deserialize)]
-        struct OpenAIModelResponse {
-            id: String,
         }
 
         let api_response: OpenAIModelResponse = response.json().await?;
@@ -2907,20 +2959,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Fetch model info from `OpenRouter` API
     async fn fetch_openrouter_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
-        // OpenRouter has a models endpoint that lists all models
-        let url = format!("{}/v1/models", self.base_url);
-
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Ok(default_model_info(model, "openrouter"));
-        }
-
         #[derive(Deserialize)]
         struct OpenRouterModelsResponse {
             data: Vec<OpenRouterModel>,
@@ -2939,6 +2977,20 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         struct OpenRouterTopProvider {
             #[serde(default)]
             max_completion_tokens: Option<usize>,
+        }
+
+        // OpenRouter has a models endpoint that lists all models
+        let url = format!("{}/v1/models", self.base_url);
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Ok(default_model_info(model, "openrouter"));
         }
 
         let api_response: OpenRouterModelsResponse = response.json().await?;
@@ -3299,7 +3351,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     async fn complete_openai(&self, request: &CompletionRequest) -> Result<String, LlmError> {
-        pace_provider_requests(self.provider).await;
         #[derive(Serialize)]
         struct OpenAIRequest<'a> {
             model: &'a str,
@@ -3309,6 +3360,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             #[serde(skip_serializing_if = "Option::is_none")]
             temperature: Option<f32>,
         }
+
+        pace_provider_requests(self.provider).await;
 
         let body = OpenAIRequest {
             model: &request.model,
@@ -3440,7 +3493,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     async fn complete_ollama(&self, request: &CompletionRequest) -> Result<String, LlmError> {
-        pace_provider_requests(self.provider).await;
         // Ollama uses a slightly different format from OpenAI
         #[derive(Serialize)]
         struct OllamaMessage<'a> {
@@ -3477,6 +3529,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         struct OllamaResponseMessage {
             content: String,
         }
+
+        pace_provider_requests(self.provider).await;
 
         let messages: Vec<OllamaMessage> = request
             .messages
@@ -3627,9 +3681,9 @@ pub fn estimate_tokens_for_family(text: &str, family: TokenContentFamily) -> usi
         0
     } else {
         // ceil(ascii_chars / ratio) without float hacks in the hot edge cases.
-        ((ascii_chars as f32) / ratio).ceil() as usize
+        lossy::f32_to_usize((lossy::usize_to_f32(ascii_chars) / ratio).ceil())
     };
-    let wide_tokens = (wide_chars as f32 * TOKENS_PER_WIDE_CHAR).ceil() as usize;
+    let wide_tokens = lossy::f32_to_usize((lossy::usize_to_f32(wide_chars) * TOKENS_PER_WIDE_CHAR).ceil());
     // At least 1 token for non-empty input.
     (ascii_tokens + wide_tokens).max(1)
 }
@@ -3789,6 +3843,20 @@ pub struct RateLimitHeaders {
 }
 
 impl RateLimitHeaders {
+    /// The `RateLimitInfo` event a stream reports for these headers, when they
+    /// carry a token limit or a remaining-token count.
+    const fn stream_event(&self) -> Option<StreamEvent> {
+        if self.limit_tokens.is_some() || self.remaining_tokens.is_some() {
+            Some(StreamEvent::RateLimitInfo {
+                limit_tokens: self.limit_tokens,
+                remaining_tokens: self.remaining_tokens,
+                reset_secs: self.reset_tokens_secs,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Parse rate limit headers from an HTTP response.
     /// Handles both Anthropic and `OpenAI` header formats.
     #[must_use]
@@ -3892,7 +3960,9 @@ impl ModelLimits {
     /// Check if a request would likely exceed rate limits
     #[must_use]
     pub const fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
-        estimated_input_tokens as u32 > self.input_tokens_per_minute
+        // Compared widened rather than truncating the estimate: identical below
+        // four billion tokens, and an estimate above that now reads as exceeding.
+        estimated_input_tokens > self.input_tokens_per_minute as usize
     }
 
     /// Update limits from API response headers
@@ -4012,7 +4082,7 @@ impl EmbeddingClient {
             // ::1 first on Windows, and v6 loopback is where streams were
             // observed cut mid-transfer. The 2026-08-10 embed storm ran over
             // ::1 while every healthy component used 127.0.0.1.
-            base_url: LlmClient::normalize_ollama_url(base_url.into()),
+            base_url: LlmClient::normalize_ollama_url(&Into::<String>::into(base_url)),
             model: "nomic-embed-text".to_string(), // Good default for Ollama
         }
     }
@@ -4033,11 +4103,12 @@ impl EmbeddingClient {
     /// Override the base URL (e.g. for OpenRouter-compatible embedding endpoints).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        let url: String = url.into();
         self.base_url = match self.provider {
             // Keep the v4 loopback pin even when the URL arrives after
             // construction — same rationale as [`Self::ollama`].
-            EmbeddingProvider::Ollama => LlmClient::normalize_ollama_url(url.into()),
-            EmbeddingProvider::OpenAI => url.into(),
+            EmbeddingProvider::Ollama => LlmClient::normalize_ollama_url(&url),
+            EmbeddingProvider::OpenAI => url,
         };
         self
     }
@@ -4429,6 +4500,77 @@ impl StreamAccumulator {
     pub const fn has_content(&self) -> bool {
         !self.text.is_empty() || !self.thinking.is_empty() || !self.tool_calls.is_empty()
     }
+
+    /// The item to yield when a stream breaks mid-flight: a recoverable error
+    /// carrying the partial output when there is any, otherwise the bare error.
+    fn interrupted(&self, error: LlmError) -> Result<StreamEvent, LlmError> {
+        if self.has_content() {
+            Ok(StreamEvent::RecoverableError {
+                error,
+                partial_text: self.text.clone(),
+                partial_tool_calls: self.partial_tool_calls(),
+            })
+        } else {
+            Err(error)
+        }
+    }
+}
+
+/// The OAuth ("Claude Code") form of a streaming request: an array-based system
+/// prompt, and tool names remapped to Claude Code's canonical ones.
+fn oauth_stream_request(request: &AnthropicRequest) -> OAuthAnthropicRequest {
+    info!("Claude Code stealth mode: applying OAuth headers and array-based system prompt");
+
+    let mut oauth_req = OAuthAnthropicRequest::from_request(request, true);
+    oauth_req.stream = Some(true);
+
+    // Remap tool names to Claude Code format
+    if let Some(ref mut tools) = oauth_req.tools {
+        for tool in tools {
+            let old_name = tool.name.clone();
+            tool.name = to_claude_code_tool_name(&tool.name);
+            if old_name != tool.name {
+                debug!(old = %old_name, new = %tool.name, "Remapped tool name");
+            }
+        }
+    }
+
+    debug!(
+        system_blocks = oauth_req.system.len(),
+        tool_names = ?oauth_req.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
+        "OAuth streaming request prepared with array-based system prompt"
+    );
+
+    oauth_req
+}
+
+/// Authentication headers for a native Anthropic streaming request: Claude
+/// Code's exact header set for an OAuth token, `x-api-key` otherwise.
+fn with_stream_anthropic_auth(
+    request_builder: reqwest::RequestBuilder,
+    api_key: &str,
+    is_oauth: bool,
+) -> reqwest::RequestBuilder {
+    if is_oauth {
+        let token = get_raw_token(api_key);
+        request_builder
+            .header("Authorization", format!("Bearer {token}"))
+            .header("accept", "application/json")
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+            .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"))
+            .header("x-app", "cli")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+    } else {
+        request_builder.header("x-api-key", api_key)
+    }
+}
+
+/// Map a Claude Code tool name in an OAuth stream's `ContentBlockStart` back to
+/// the name the caller registered.
+fn restore_oauth_tool_name(event: &mut StreamEvent, original_tools: &[ToolDefinition]) {
+    if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = *event {
+        *name = from_claude_code_tool_name(name, original_tools);
+    }
 }
 
 /// Anthropic SSE event types
@@ -4570,50 +4712,14 @@ impl LlmClient {
         let original_tools = request.tools.clone().unwrap_or_default();
 
         // Prepare OAuth request with array-based system prompt
-        let oauth_request = if is_oauth {
-            info!("Claude Code stealth mode: applying OAuth headers and array-based system prompt");
-
-            let mut oauth_req = OAuthAnthropicRequest::from_request(&request, true);
-            oauth_req.stream = Some(true);
-
-            // Remap tool names to Claude Code format
-            if let Some(ref mut tools) = oauth_req.tools {
-                for tool in tools {
-                    let old_name = tool.name.clone();
-                    tool.name = to_claude_code_tool_name(&tool.name);
-                    if old_name != tool.name {
-                        debug!(old = %old_name, new = %tool.name, "Remapped tool name");
-                    }
-                }
-            }
-
-            debug!(
-                system_blocks = oauth_req.system.len(),
-                tool_names = ?oauth_req.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
-                "OAuth streaming request prepared with array-based system prompt"
-            );
-
-            Some(oauth_req)
-        } else {
-            None
-        };
+        let oauth_request = is_oauth.then(|| oauth_stream_request(&request));
 
         stream! {
-            let request_builder = http
-                .post(format!("{base_url}/v1/messages"));
-
-            let request_builder = if is_oauth {
-                let token = get_raw_token(&api_key);
-                request_builder
-                    .header("Authorization", format!("Bearer {token}"))
-                    .header("accept", "application/json")
-                    .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
-                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"))
-                    .header("x-app", "cli")
-                    .header("anthropic-dangerous-direct-browser-access", "true")
-            } else {
-                request_builder.header("x-api-key", &api_key)
-            };
+            let request_builder = with_stream_anthropic_auth(
+                http.post(format!("{base_url}/v1/messages")),
+                &api_key,
+                is_oauth,
+            );
 
             debug!(
                 is_oauth = is_oauth,
@@ -4623,20 +4729,13 @@ impl LlmClient {
                 "Sending Anthropic streaming request"
             );
 
+            let request_builder = request_builder
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json");
             let response = if let Some(ref oauth_req) = oauth_request {
-                request_builder
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(oauth_req)
-                    .send()
-                    .await
+                request_builder.json(oauth_req).send().await
             } else {
-                request_builder
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&request)
-                    .send()
-                    .await
+                request_builder.json(&request).send().await
             };
 
             let response = match response {
@@ -4651,13 +4750,8 @@ impl LlmClient {
                 }
             };
 
-            let rate_headers = RateLimitHeaders::from_headers(response.headers());
-            if rate_headers.limit_tokens.is_some() || rate_headers.remaining_tokens.is_some() {
-                yield Ok(StreamEvent::RateLimitInfo {
-                    limit_tokens: rate_headers.limit_tokens,
-                    remaining_tokens: rate_headers.remaining_tokens,
-                    reset_secs: rate_headers.reset_tokens_secs,
-                });
+            if let Some(info) = RateLimitHeaders::from_headers(response.headers()).stream_event() {
+                yield Ok(info);
             }
 
             if !response.status().is_success() {
@@ -4675,16 +4769,7 @@ impl LlmClient {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        let error = LlmError::Http(e.to_string());
-                        if accumulator.has_content() {
-                            yield Ok(StreamEvent::RecoverableError {
-                                error,
-                                partial_text: accumulator.text.clone(),
-                                partial_tool_calls: accumulator.partial_tool_calls(),
-                            });
-                        } else {
-                            yield Err(error);
-                        }
+                        yield accumulator.interrupted(LlmError::Http(e.to_string()));
                         return;
                     }
                 };
@@ -4692,26 +4777,16 @@ impl LlmClient {
                 match std::str::from_utf8(&chunk) {
                     Ok(s) => buffer.push_str(s),
                     Err(e) => {
-                        let error = LlmError::Stream(format!("Invalid UTF-8 in stream: {e}"));
-                        if accumulator.has_content() {
-                            yield Ok(StreamEvent::RecoverableError {
-                                error,
-                                partial_text: accumulator.text.clone(),
-                                partial_tool_calls: accumulator.partial_tool_calls(),
-                            });
-                        } else {
-                            yield Err(error);
-                        }
+                        yield accumulator.interrupted(LlmError::Stream(format!("Invalid UTF-8 in stream: {e}")));
                         return;
                     }
                 }
 
                 while let Some(event_str) = extract_sse_event(&mut buffer) {
                     if let Some(mut stream_event) = parse_sse_event(&event_str) {
-                        if is_oauth
-                            && let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
-                                *name = from_claude_code_tool_name(name, &original_tools);
-                            }
+                        if is_oauth {
+                            restore_oauth_tool_name(&mut stream_event, &original_tools);
+                        }
                         accumulator.process(&stream_event);
                         yield Ok(stream_event);
                     }
@@ -4720,10 +4795,9 @@ impl LlmClient {
 
             if !buffer.trim().is_empty()
                 && let Some(mut stream_event) = parse_sse_event(&buffer) {
-                    if is_oauth
-                        && let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
-                            *name = from_claude_code_tool_name(name, &original_tools);
-                        }
+                    if is_oauth {
+                        restore_oauth_tool_name(&mut stream_event, &original_tools);
+                    }
                     accumulator.process(&stream_event);
                     yield Ok(stream_event);
                 }
@@ -4785,8 +4859,7 @@ impl LlmClient {
             // Reuse OpenAI SSE parsing logic (same format as stream_openai)
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
-            let mut text_block_started = false;
-            let mut tool_calls_started: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
+            let mut state = OpenAiStreamState::default();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -4809,127 +4882,19 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    if line.is_empty() || !line.starts_with("data: ") {
-                        continue;
+                    let (events, finished) = state.on_line::<OpenAiChunkDelta>(&line);
+                    for event in events {
+                        yield Ok(event);
                     }
-
-                    let data = &line[6..];
-
-                    if data == "[DONE]" {
-                        if text_block_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                        }
-                        let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-                        stop_indices.sort_unstable();
-                        for idx in stop_indices {
-                            yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                        }
-                        yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+                    if finished {
                         return;
-                    }
-
-                    #[derive(Deserialize, Debug)]
-                    struct StreamChunk {
-                        choices: Vec<ChunkChoice>,
-                    }
-                    #[derive(Deserialize, Debug)]
-                    struct ChunkChoice {
-                        delta: Option<ChunkDelta>,
-                        finish_reason: Option<String>,
-                    }
-                    #[derive(Deserialize, Debug)]
-                    struct ChunkDelta {
-                        content: Option<String>,
-                        tool_calls: Option<Vec<ToolCallDelta>>,
-                    }
-                    #[derive(Deserialize, Debug)]
-                    struct ToolCallDelta {
-                        index: usize,
-                        id: Option<String>,
-                        function: Option<FunctionDelta>,
-                    }
-                    #[derive(Deserialize, Debug)]
-                    struct FunctionDelta {
-                        name: Option<String>,
-                        arguments: Option<String>,
-                    }
-
-                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        for choice in chunk.choices {
-                            if let Some(delta) = choice.delta {
-                                if let Some(text) = delta.content
-                                    && !text.is_empty() {
-                                        if !text_block_started {
-                                            text_block_started = true;
-                                            yield Ok(StreamEvent::ContentBlockStart {
-                                                index: 0,
-                                                content_type: "text".to_string(),
-                                                tool_id: None,
-                                                tool_name: None,
-                                            });
-                                        }
-                                        yield Ok(StreamEvent::TextDelta { index: 0, text });
-                                    }
-
-                                if let Some(tool_calls) = delta.tool_calls {
-                                    for tc in tool_calls {
-                                        let block_index = tc.index + 1;
-                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function)
-                                            && let Some(name) = &func.name {
-                                                if text_block_started {
-                                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                                                    text_block_started = false;
-                                                }
-                                                tool_calls_started.insert(block_index, (id.clone(), name.clone()));
-                                                yield Ok(StreamEvent::ContentBlockStart {
-                                                    index: block_index,
-                                                    content_type: "tool_use".to_string(),
-                                                    tool_id: Some(id.clone()),
-                                                    tool_name: Some(name.clone()),
-                                                });
-                                            }
-                                        if let Some(func) = &tc.function
-                                            && let Some(args) = &func.arguments
-                                                && !args.is_empty() {
-                                                    yield Ok(StreamEvent::ToolUseDelta {
-                                                        index: block_index,
-                                                        partial_json: args.clone(),
-                                                    });
-                                                }
-                                    }
-                                }
-                            }
-
-                            if let Some(reason) = choice.finish_reason {
-                                if text_block_started {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                                }
-                                let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-                                stop_indices.sort_unstable();
-                                for idx in stop_indices {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                                }
-                                let stop_reason = match reason.as_str() {
-                                    "tool_calls" => "tool_use",
-                                    "stop" => "end_turn",
-                                    other => other,
-                                };
-                                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                                return;
-                            }
-                        }
                     }
                 }
             }
 
             // Emit close events if stream ended without finish_reason
-            if text_block_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-            }
-            let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-            stop_indices.sort_unstable();
-            for idx in stop_indices {
-                yield Ok(StreamEvent::ContentBlockStop { index: idx });
+            for event in state.close_blocks() {
+                yield Ok(event);
             }
             yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
@@ -4953,60 +4918,7 @@ impl LlmClient {
             // Acquire before building the body: the wait is the point.
             let _slot = ollama_generation_slot(&base_url).acquire_owned().await;
 
-            let (messages_json, tools_json) = anthropic_to_ollama_request(&request);
-
-            let mut body = serde_json::json!({
-                "model": request.model,
-                "messages": messages_json,
-                "stream": true,
-            });
-
-            let mut options = serde_json::Map::new();
-            if let Some(temp) = request.temperature {
-                options.insert("temperature".to_string(), serde_json::json!(temp));
-            } else {
-                // See the non-streaming site: Modelfile thinking defaults run
-                // hot (1.0); 0.6 is Qwen's non-thinking recommendation and
-                // measurably reduces one-line code cramming.
-                options.insert("temperature".to_string(), serde_json::json!(0.6));
-            }
-            // Bound generation to the request's token budget. num_predict=-1
-            // (unlimited) let a degraded runner emit degenerate tokens without
-            // end; the caller's max_tokens already accounts for thinking room.
-            options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
-            // Size the context to the GPU as it is RIGHT NOW, every turn — see
-            // `resolve_num_ctx`. This is the path the agent loop takes, so a
-            // constant here is the one that actually decides whether a run
-            // survives: 32k was unrunnable for a 12B model on a 16 GB card
-            // sharing with the desktop, and it failed as
-            // `CUDA error: an illegal memory access was encountered` rather
-            // than as a clean allocation failure.
-            let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
-            tracing::info!(
-                model = %request.model,
-                num_ctx,
-                "sized ollama context to free VRAM (stream)"
-            );
-            options.insert("num_ctx".to_string(), serde_json::json!(num_ctx));
-            // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-
-            // mode anti-repetition default). Code REQUIRES repetition, and at
-            // 1.5 the model visibly degraded working multi-function files into
-            // semicolon one-liner slop (observed live, round-5 drive). 1.0
-            // keeps a mild guard; the loop's repetition/spiral detectors
-            // cover the rest.
-            options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
-        // repeat_penalty 1.1 (the Ollama default) punishes exactly the tokens
-        // Python repeats by design — newlines and indentation runs — and the
-        // model visibly compensates by cramming statements onto one line
-        // (observed live across rounds even at presence 1.0). Code presets
-        // use 1.0: no repetition penalty at all.
-        options.insert("repeat_penalty".to_string(), serde_json::json!(1.0));
-            if !options.is_empty() {
-                body["options"] = serde_json::Value::Object(options);
-            }
-            if let Some(tools) = tools_json {
-                body["tools"] = tools;
-            }
+            let body = Self::ollama_stream_body(&request);
 
             let mut req = http
                 .post(format!("{base_url}/api/chat"))
@@ -5038,15 +4950,7 @@ impl LlmClient {
             let mut buffer = String::new();
             let mut bytes_received = 0usize;
             let mut lines_parsed = 0usize;
-            let mut thinking_block_started = false;
-            let mut saw_stop_sentinel = false;
-            let mut text_block_started = false;
-            let mut tool_block_count = 0usize;
-            // Ollama thinking uses block index 0 (same as Anthropic);
-            // text starts at index 1 when thinking is present, or 0 otherwise.
-            let mut next_block_index = 0usize;
-            // Degenerate-repetition watch (see RepeatWatch).
-            let mut repeat_watch = RepeatWatch::default();
+            let mut state = OllamaStreamState::default();
             let mut last_line: Option<String> = None;
 
             while let Some(chunk_result) = byte_stream.next().await {
@@ -5086,253 +4990,81 @@ impl LlmClient {
                     // which is exactly the ambiguity that has cost two runs.
                     last_line = Some(line.clone());
 
-                    // Check for done
-                    let done = obj["done"].as_bool().unwrap_or(false);
-
-                    // Stream thinking content (qwen3 and other thinking models)
-                    // Ollama returns thinking tokens in message.thinking.
-                    // Emit proper ContentBlockStart/Stop to match Anthropic's block structure.
-                    // Cut a wedged runner short instead of waiting out its loop.
-                    if let Some(frag) = obj["message"]["thinking"]
-                        .as_str()
-                        .or_else(|| obj["message"]["content"].as_str())
-                        && let Some(run) = repeat_watch.observe(frag) {
-                            if thinking_block_started || text_block_started {
-                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                            }
-                            yield Err(LlmError::WedgedRunner {
-                                token: frag.to_string(),
-                                run,
-                                bytes_received,
-                            });
-                            return;
-                        }
-
-                    if let Some(thinking) = obj["message"]["thinking"].as_str()
-                        && !thinking.is_empty() {
-                            if !thinking_block_started {
-                                thinking_block_started = true;
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: next_block_index,
-                                    content_type: "thinking".to_string(),
-                                    tool_id: None,
-                                    tool_name: None,
-                                });
-                            }
-                            yield Ok(StreamEvent::ThinkingDelta { index: next_block_index, thinking: thinking.to_string() });
-                        }
-
-                    // Stream text content.
-                    // When text starts arriving and thinking was active, close the thinking block first.
-                    if let Some(content) = obj["message"]["content"].as_str() {
-                        // Gemma's reserved sentinels (`<unused0>`..`<unused98>`)
-                        // are stop markers the chat template is supposed to
-                        // consume. Ollama passes them through as ordinary
-                        // content and then simply stops the stream, with no
-                        // done=true — so the terminator we need arrives
-                        // disguised as text. Note it, drop it from the visible
-                        // output, and let the end-of-stream handler close the
-                        // turn cleanly instead of reporting an aborted
-                        // generation. Observed live 2026-07-28: 57 such 502s in
-                        // one gemma4:12b run, each discarding a complete reply.
-                        let content = if Self::is_gemma_stop_sentinel(content) {
-                            saw_stop_sentinel = true;
-                            tracing::info!("ollama: model stop sentinel seen (exact)");
-                            ""
-                        } else if let Some(prefix) = Self::strip_trailing_stop_sentinel(content) {
-                            // The sentinel can also arrive glued to the end of
-                            // real text ("...all tests pass.<unused50>"), where
-                            // an exact-match test never fires. Keep the words,
-                            // drop the marker, remember that the turn ended.
-                            saw_stop_sentinel = true;
-                            tracing::info!("ollama: model stop sentinel seen (trailing)");
-                            prefix
-                        } else {
-                            content
-                        };
-                        if !content.is_empty() {
-                            // Close thinking block when transitioning to text
-                            if thinking_block_started {
-                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                                thinking_block_started = false;
-                                next_block_index += 1;
-                            }
-                            if !text_block_started {
-                                text_block_started = true;
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: next_block_index,
-                                    content_type: "text".to_string(),
-                                    tool_id: None,
-                                    tool_name: None,
-                                });
-                            }
-                            yield Ok(StreamEvent::TextDelta { index: next_block_index, text: content.to_string() });
-                        }
+                    let (items, finished) = state.on_object(&obj, bytes_received);
+                    for item in items {
+                        yield item;
                     }
-
-                    // Tool calls: Ollama emits these in a message with done=false,
-                    // followed by a separate done=true message with empty content.
-                    // Process tool_calls from ANY message, not just the done message.
-                    if let Some(tool_calls) = obj["message"]["tool_calls"].as_array()
-                        && !tool_calls.is_empty() {
-                            // Close any open thinking/text blocks before tool calls
-                            if thinking_block_started {
-                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                                thinking_block_started = false;
-                                next_block_index += 1;
-                            }
-                            if text_block_started {
-                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                                text_block_started = false;
-                                next_block_index += 1;
-                            }
-
-                            for tc in tool_calls {
-                                tool_block_count += 1;
-                                let block_idx = next_block_index;
-                                next_block_index += 1;
-                                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                                let args = tc["function"]["arguments"].to_string();
-                                let id = tc["id"].as_str().map_or_else(|| format!("toolu_{tool_block_count:08x}"), String::from);
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: block_idx,
-                                    content_type: "tool_use".to_string(),
-                                    tool_id: Some(id),
-                                    tool_name: Some(name),
-                                });
-                                yield Ok(StreamEvent::ToolUseDelta {
-                                    index: block_idx,
-                                    partial_json: args,
-                                });
-                                yield Ok(StreamEvent::ContentBlockStop { index: block_idx });
-                            }
-                        }
-
-                    if done {
-                        // Close any remaining open blocks
-                        if thinking_block_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                            next_block_index += 1;
-                        }
-                        if text_block_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                            // next_block_index not needed after this
-                        }
-
-                        // Emit usage. Ollama reports BOTH sides only in the
-                        // final done message: prompt_eval_count (input) and
-                        // eval_count (output). The prompt side rides a late
-                        // MessageStart — the stream consumer records it by
-                        // assignment wherever it appears, and Ollama streams
-                        // never emit an earlier one. Omitting it zeroed
-                        // every per-request input count downstream (run
-                        // benchmarks and the context-usage indicator).
-                        if let Some(prompt_eval) = obj["prompt_eval_count"].as_u64() {
-                            yield Ok(StreamEvent::MessageStart {
-                                id: String::new(),
-                                model: obj["model"].as_str().unwrap_or("").to_string(),
-                                input_tokens: prompt_eval as u32,
-                                cache_read_tokens: 0,
-                                cache_creation_tokens: 0,
-                                cache_creation_1h_tokens: 0,
-                            });
-                        }
-                        // Emit output token count
-                        if let Some(eval_count) = obj["eval_count"].as_u64() {
-                            yield Ok(StreamEvent::MessageDelta {
-                                stop_reason: None,
-                                output_tokens: eval_count as u32,
-                            });
-                        }
-
-                        let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
-                        yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                    if finished {
                         return;
                     }
                 }
             }
 
-            // A final NDJSON object that arrived without its trailing newline
-            // would otherwise sit in `buffer` unparsed and be reported as an
-            // aborted generation. Cheap to honour, and it can only ever turn
-            // a false 502 into the success it actually was.
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
-                && obj["done"].as_bool().unwrap_or(false) {
-                    if thinking_block_started || text_block_started {
-                        yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                    }
-                    let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
-                    yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                    return;
-                }
-
-            // A sentinel-terminated stream is a COMPLETE turn.
-            //
-            // The check below exists for genuinely aborted generations, and it
-            // must stay — a degraded runner streams degenerate tokens and drops
-            // the connection, and delivering that as a successful reply is how
-            // garbage reached the GUI. But gemma ends its turn by EMITTING a
-            // reserved `<unusedNN>` token and then closing, which is a normal
-            // stop wearing an abort's clothing. The content before it is a
-            // finished reply; discarding it cost one run 57 complete responses
-            // and ultimately the whole benchmark.
-            if saw_stop_sentinel {
-                if thinking_block_started {
-                    yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                }
-                if text_block_started {
-                    yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-                }
-                let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
-                tracing::info!(
-                    bytes_received,
-                    lines_parsed,
-                    "ollama stream closed on a model stop sentinel rather than done=true"
-                );
-                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                return;
+            for item in state.finish(&buffer, last_line.as_deref(), bytes_received, lines_parsed) {
+                yield item;
             }
-
-            // The stream ended with no done=true terminator: an ABORTED
-            // generation. A degraded Ollama runner streams degenerate tokens
-            // and drops the stream with no final message (observed live) —
-            // closing "gracefully" here delivered that garbage to the GUI as
-            // a successful reply. Surface a retryable server error instead,
-            // mirroring the non-streaming done=false check.
-            if thinking_block_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-            }
-            if text_block_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
-            }
-            // Say what was left unparsed. A bare byte/line count cannot
-            // distinguish "the provider hung up mid-token" from "we dropped a
-            // terminator", and 68 of these in one night taught us nothing
-            // about which. A bounded tail of the residual buffer makes the
-            // next occurrence self-diagnosing.
-            let tail_note = match &last_line {
-                Some(line) => {
-                    let shown: String = line.chars().take(200).collect();
-                    format!(" Last line before the cut: {shown}")
-                }
-                None => " No NDJSON line was ever parsed.".to_string(),
-            };
-            let residue = buffer.trim();
-            let residue_note = if residue.is_empty() {
-                format!("nothing was left unparsed (the stream simply stopped).{tail_note}")
-            } else {
-                let tail: String = residue.chars().rev().take(160).collect::<Vec<_>>()
-                    .into_iter().rev().collect();
-                format!("{} unparsed bytes remained, ending: {tail}", residue.len())
-            };
-            yield Err(LlmError::from_api_response(
-                502,
-                format!(
-                    "Ollama stream ended without completion (no done=true) after \
-                     {bytes_received} bytes / {lines_parsed} NDJSON lines — {residue_note}"
-                ),
-            ));
         }
+    }
+
+    /// The `/api/chat` body for a streaming Ollama request: messages and tools
+    /// in Ollama's native shape, plus the sampling options and the `num_ctx`
+    /// sized for this request.
+    fn ollama_stream_body(request: &AnthropicRequest) -> serde_json::Value {
+        let (messages_json, tools_json) = anthropic_to_ollama_request(request);
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages_json,
+            "stream": true,
+        });
+
+        let mut options = serde_json::Map::new();
+        if let Some(temp) = request.temperature {
+            options.insert("temperature".to_string(), serde_json::json!(temp));
+        } else {
+            // See the non-streaming site: Modelfile thinking defaults run
+            // hot (1.0); 0.6 is Qwen's non-thinking recommendation and
+            // measurably reduces one-line code cramming.
+            options.insert("temperature".to_string(), serde_json::json!(0.6));
+        }
+        // Bound generation to the request's token budget. num_predict=-1
+        // (unlimited) let a degraded runner emit degenerate tokens without
+        // end; the caller's max_tokens already accounts for thinking room.
+        options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
+        // Size the context to the GPU as it is RIGHT NOW, every turn — see
+        // `resolve_num_ctx`. This is the path the agent loop takes, so a
+        // constant here is the one that actually decides whether a run
+        // survives: 32k was unrunnable for a 12B model on a 16 GB card
+        // sharing with the desktop, and it failed as
+        // `CUDA error: an illegal memory access was encountered` rather
+        // than as a clean allocation failure.
+        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
+        tracing::info!(
+            model = %request.model,
+            num_ctx,
+            "sized ollama context to free VRAM (stream)"
+        );
+        options.insert("num_ctx".to_string(), serde_json::json!(num_ctx));
+        // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-
+        // mode anti-repetition default). Code REQUIRES repetition, and at
+        // 1.5 the model visibly degraded working multi-function files into
+        // semicolon one-liner slop (observed live, round-5 drive). 1.0
+        // keeps a mild guard; the loop's repetition/spiral detectors
+        // cover the rest.
+        options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
+        // repeat_penalty 1.1 (the Ollama default) punishes exactly the tokens
+        // Python repeats by design — newlines and indentation runs — and the
+        // model visibly compensates by cramming statements onto one line
+        // (observed live across rounds even at presence 1.0). Code presets
+        // use 1.0: no repetition penalty at all.
+        options.insert("repeat_penalty".to_string(), serde_json::json!(1.0));
+        if !options.is_empty() {
+            body["options"] = serde_json::Value::Object(options);
+        }
+        if let Some(tools) = tools_json {
+            body["tools"] = tools;
+        }
+        body
     }
 
     /// Stream using OpenAI-compatible API (for `OpenAI`, `OpenRouter`, GitHub Models, Claude Proxy)
@@ -5351,116 +5083,8 @@ impl LlmClient {
             // Same pacing gate as the non-streaming paths — a streamed chat
             // request spends the same quota as any other.
             pace_provider_requests(provider).await;
-            // === Request types ===
-            #[derive(Serialize)]
-            struct OpenAIMessage {
-                role: String,
-                content: String,
-            }
 
-            #[derive(Serialize)]
-            struct OpenAITool {
-                #[serde(rename = "type")]
-                tool_type: String,
-                function: OpenAIFunction,
-            }
-
-            #[derive(Serialize)]
-            struct OpenAIFunction {
-                name: String,
-                description: String,
-                parameters: serde_json::Value,
-            }
-
-            #[derive(Serialize)]
-            struct OpenAIRequest {
-                model: String,
-                messages: Vec<OpenAIMessage>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                max_tokens: Option<u32>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                temperature: Option<f32>,
-                stream: bool,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                tools: Option<Vec<OpenAITool>>,
-            }
-
-            // === Response types ===
-            #[derive(Deserialize, Debug)]
-            struct StreamChunk {
-                choices: Vec<ChunkChoice>,
-            }
-
-            #[derive(Deserialize, Debug)]
-            struct ChunkChoice {
-                delta: Option<ChunkDelta>,
-                finish_reason: Option<String>,
-            }
-
-            #[derive(Deserialize, Debug)]
-            struct ChunkDelta {
-                content: Option<String>,
-    #[serde(rename = "role")]
-                _role: Option<String>,
-                tool_calls: Option<Vec<ToolCallDelta>>,
-            }
-
-            #[derive(Deserialize, Debug)]
-            struct ToolCallDelta {
-                index: usize,
-                id: Option<String>,
-                function: Option<FunctionDelta>,
-            }
-
-            #[derive(Deserialize, Debug)]
-            struct FunctionDelta {
-                name: Option<String>,
-                arguments: Option<String>,
-            }
-
-            // Convert messages to OpenAI format
-            let messages: Vec<OpenAIMessage> = request
-                .messages
-                .iter()
-                .map(|m| OpenAIMessage {
-                    role: match m.role {
-                        Role::System => "system".to_string(),
-                        Role::User => "user".to_string(),
-                        Role::Assistant => "assistant".to_string(),
-                    },
-                    content: m.content.clone(),
-                })
-                .collect();
-
-            // Convert tools to OpenAI format
-            let tools: Option<Vec<OpenAITool>> = if request.tools.is_empty() {
-                None
-            } else {
-                Some(request.tools.iter().filter_map(|v| {
-                    // Try to parse as ToolDefinition
-                    if let Ok(tool_def) = serde_json::from_value::<ToolDefinition>(v.clone()) {
-                        Some(OpenAITool {
-                            tool_type: "function".to_string(),
-                            function: OpenAIFunction {
-                                name: tool_def.name,
-                                description: tool_def.description,
-                                parameters: tool_def.input_schema,
-                            },
-                        })
-                    } else {
-                        None
-                    }
-                }).collect())
-            };
-
-            let body = OpenAIRequest {
-                model: request.model.clone(),
-                messages,
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-                stream: true,
-                tools,
-            };
+            let body = openai_stream_body(&request);
 
             let response = match http
                 .post(format!("{base_url}/v1/chat/completions"))
@@ -5489,8 +5113,7 @@ impl LlmClient {
             let mut buffer = String::new();
 
             // Track content blocks (text at index 0, tool calls at higher indices)
-            let mut text_block_started = false;
-            let mut tool_calls_started: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new(); // index -> (id, name)
+            let mut state = OpenAiStreamState::default();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -5514,115 +5137,19 @@ impl LlmClient {
                     let line = buffer[..line_end].trim().to_string();
                     buffer = buffer[line_end + 1..].to_string();
 
-                    if line.is_empty() || !line.starts_with("data: ") {
-                        continue;
+                    let (events, finished) = state.on_line::<OpenAiRoleCheckedDelta>(&line);
+                    for event in events {
+                        yield Ok(event);
                     }
-
-                    let data = &line[6..]; // Strip "data: "
-
-                    if data == "[DONE]" {
-                        // Close any open blocks
-                        if text_block_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                        }
-                        let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-                        stop_indices.sort_unstable();
-                        for idx in stop_indices {
-                            yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                        }
-                        yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+                    if finished {
                         return;
-                    }
-
-                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        for choice in chunk.choices {
-                            if let Some(delta) = choice.delta {
-                                // Handle text content
-                                if let Some(text) = delta.content
-                                    && !text.is_empty() {
-                                        if !text_block_started {
-                                            text_block_started = true;
-                                            yield Ok(StreamEvent::ContentBlockStart {
-                                                index: 0,
-                                                content_type: "text".to_string(),
-                                                tool_id: None,
-                                                tool_name: None,
-                                            });
-                                        }
-                                        yield Ok(StreamEvent::TextDelta { index: 0, text });
-                                    }
-
-                                // Handle tool calls
-                                if let Some(tool_calls) = delta.tool_calls {
-                                    for tc in tool_calls {
-                                        // Tool index offset by 1 (text is at 0)
-                                        let block_index = tc.index + 1;
-
-                                        // Check if this is a new tool call
-                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function)
-                                            && let Some(name) = &func.name {
-                                                // Close text block if open (tool calls come after text)
-                                                if text_block_started {
-                                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                                                    text_block_started = false;
-                                                }
-
-                                                // New tool call
-                                                tool_calls_started.insert(block_index, (id.clone(), name.clone()));
-                                                yield Ok(StreamEvent::ContentBlockStart {
-                                                    index: block_index,
-                                                    content_type: "tool_use".to_string(),
-                                                    tool_id: Some(id.clone()),
-                                                    tool_name: Some(name.clone()),
-                                                });
-                                            }
-
-                                        // Stream tool arguments
-                                        if let Some(func) = &tc.function
-                                            && let Some(args) = &func.arguments
-                                                && !args.is_empty() {
-                                                    yield Ok(StreamEvent::ToolUseDelta {
-                                                        index: block_index,
-                                                        partial_json: args.clone(),
-                                                    });
-                                                }
-                                    }
-                                }
-                            }
-
-                            // Check for stop
-                            if let Some(reason) = choice.finish_reason {
-                                // Close any open blocks
-                                if text_block_started {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                                }
-                                let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-                                stop_indices.sort_unstable();
-                                for idx in stop_indices {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                                }
-
-                                let stop_reason = match reason.as_str() {
-                                    "tool_calls" => "tool_use",
-                                    "stop" => "end_turn",
-                                    other => other,
-                                };
-                                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
-                                return;
-                            }
-                        }
                     }
                 }
             }
 
             // If we got here without MessageStop, emit it
-            if text_block_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-            }
-            let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
-            stop_indices.sort_unstable();
-            for idx in stop_indices {
-                yield Ok(StreamEvent::ContentBlockStop { index: idx });
+            for event in state.close_blocks() {
+                yield Ok(event);
             }
             yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
@@ -5642,54 +5169,12 @@ impl LlmClient {
         stream! {
             // Route to appropriate streaming method based on provider
             match provider {
-                Provider::Anthropic => {
+                // Ollama streaming builds the same AnthropicRequest and delegates to
+                // stream_anthropic, which already handles Ollama NDJSON streaming via
+                // stream_anthropic_via_ollama.
+                Provider::Anthropic | Provider::Ollama => {
                     // Convert to Anthropic format
-                    let system_msg = request
-                        .messages
-                        .iter()
-                        .find(|m| m.role == Role::System)
-                        .map(|m| m.content.clone());
-
-                    let messages: Vec<AnthropicMessage> = request
-                        .messages
-                        .iter()
-                        .filter(|m| m.role != Role::System)
-                        .map(|m| AnthropicMessage {
-                            role: match m.role {
-                                Role::User | Role::System => "user",
-                                Role::Assistant => "assistant",
-                            }.to_string(),
-                            content: vec![ContentBlock::Text { text: m.content.clone() }],
-                        })
-                        .collect();
-
-                    let mut all_messages = messages;
-                    all_messages.extend(request.anthropic_messages.clone());
-
-                    let tools = if request.tools.is_empty() {
-                        None
-                    } else {
-                        Some(request.tools.iter().filter_map(|v| {
-                            serde_json::from_value::<ToolDefinition>(v.clone()).ok()
-                        }).collect())
-                    };
-
-                    let anthropic_request = AnthropicRequest {
-                        context_limit: None,
-                        model: request.model.clone(),
-                        messages: all_messages,
-                        max_tokens: request.max_tokens.unwrap_or(4096),
-                        // Model-family correction happens at the dispatcher
-                        // (`conform_to_anthropic_contract`), which sees the
-                        // resolved model; pass the caller's value through.
-                        temperature: request.temperature,
-                        system: system_msg,
-                        tools,
-                        stream: Some(true),
-                        thinking: request.thinking.clone(),
-                        cache_control: None,
-                    };
-
+                    let anthropic_request = streaming_anthropic_request(&request);
                     let raw_stream = self.stream_anthropic(&anthropic_request);
                     tokio::pin!(raw_stream);
 
@@ -5697,15 +5182,7 @@ impl LlmClient {
                         match result {
                             Ok(event) => yield event,
                             Err(e) => {
-                                if e.should_fallback() {
-                                    yield StreamEvent::RecoverableError {
-                                        error: e,
-                                        partial_text: String::new(),
-                                        partial_tool_calls: Vec::new(),
-                                    };
-                                } else {
-                                    yield StreamEvent::Error { message: e.to_string() };
-                                }
+                                yield stream_error_event(e);
                                 return;
                             }
                         }
@@ -5720,82 +5197,7 @@ impl LlmClient {
                         match result {
                             Ok(event) => yield event,
                             Err(e) => {
-                                if e.should_fallback() {
-                                    yield StreamEvent::RecoverableError {
-                                        error: e,
-                                        partial_text: String::new(),
-                                        partial_tool_calls: Vec::new(),
-                                    };
-                                } else {
-                                    yield StreamEvent::Error { message: e.to_string() };
-                                }
-                                return;
-                            }
-                        }
-                    }
-                }
-                Provider::Ollama => {
-                    // Ollama streaming: build AnthropicRequest and delegate to stream_anthropic
-                    // which already handles Ollama NDJSON streaming via stream_anthropic_via_ollama
-                    let system_msg = request
-                        .messages
-                        .iter()
-                        .find(|m| m.role == Role::System)
-                        .map(|m| m.content.clone());
-
-                    let messages: Vec<AnthropicMessage> = request
-                        .messages
-                        .iter()
-                        .filter(|m| m.role != Role::System)
-                        .map(|m| AnthropicMessage {
-                            role: match m.role {
-                                Role::User | Role::System => "user",
-                                Role::Assistant => "assistant",
-                            }.to_string(),
-                            content: vec![ContentBlock::Text { text: m.content.clone() }],
-                        })
-                        .collect();
-
-                    let mut all_messages = messages;
-                    all_messages.extend(request.anthropic_messages.clone());
-
-                    let tools = if request.tools.is_empty() {
-                        None
-                    } else {
-                        Some(request.tools.iter().filter_map(|v| {
-                            serde_json::from_value::<ToolDefinition>(v.clone()).ok()
-                        }).collect())
-                    };
-
-                    let anthropic_request = AnthropicRequest {
-                        context_limit: None,
-                        model: request.model.clone(),
-                        messages: all_messages,
-                        max_tokens: request.max_tokens.unwrap_or(4096),
-                        temperature: request.temperature,
-                        system: system_msg,
-                        tools,
-                        stream: Some(true),
-                        thinking: request.thinking.clone(),
-                        cache_control: None,
-                    };
-
-                    let raw_stream = self.stream_anthropic(&anthropic_request);
-                    tokio::pin!(raw_stream);
-
-                    while let Some(result) = raw_stream.next().await {
-                        match result {
-                            Ok(event) => yield event,
-                            Err(e) => {
-                                if e.should_fallback() {
-                                    yield StreamEvent::RecoverableError {
-                                        error: e,
-                                        partial_text: String::new(),
-                                        partial_tool_calls: Vec::new(),
-                                    };
-                                } else {
-                                    yield StreamEvent::Error { message: e.to_string() };
-                                }
+                                yield stream_error_event(e);
                                 return;
                             }
                         }
@@ -5821,6 +5223,636 @@ impl LlmClient {
             while let Some(event) = base_stream.next().await {
                 accumulator.process(&event);
                 yield (event, accumulator.clone());
+            }
+        }
+    }
+}
+
+/// The streaming `AnthropicRequest` that [`LlmClient::stream`] sends for a
+/// `CompletionRequest` on the Anthropic and Ollama paths.
+fn streaming_anthropic_request(request: &CompletionRequest) -> AnthropicRequest {
+    let system_msg = request
+        .messages
+        .iter()
+        .find(|m| m.role == Role::System)
+        .map(|m| m.content.clone());
+
+    let messages: Vec<AnthropicMessage> = request
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|m| AnthropicMessage {
+            role: match m.role {
+                Role::User | Role::System => "user",
+                Role::Assistant => "assistant",
+            }.to_string(),
+            content: vec![ContentBlock::Text { text: m.content.clone() }],
+        })
+        .collect();
+
+    let mut all_messages = messages;
+    all_messages.extend(request.anthropic_messages.clone());
+
+    let tools = if request.tools.is_empty() {
+        None
+    } else {
+        Some(request.tools.iter().filter_map(|v| {
+            serde_json::from_value::<ToolDefinition>(v.clone()).ok()
+        }).collect())
+    };
+
+    AnthropicRequest {
+        context_limit: None,
+        model: request.model.clone(),
+        messages: all_messages,
+        max_tokens: request.max_tokens.unwrap_or(4096),
+        // Model-family correction happens at the dispatcher
+        // (`conform_to_anthropic_contract`), which sees the
+        // resolved model; pass the caller's value through.
+        temperature: request.temperature,
+        system: system_msg,
+        tools,
+        stream: Some(true),
+        thinking: request.thinking.clone(),
+        cache_control: None,
+    }
+}
+
+/// The event [`LlmClient::stream`] ends with when the provider stream fails:
+/// recoverable when the error warrants a fallback to another model.
+fn stream_error_event(e: LlmError) -> StreamEvent {
+    if e.should_fallback() {
+        StreamEvent::RecoverableError {
+            error: e,
+            partial_text: String::new(),
+            partial_tool_calls: Vec::new(),
+        }
+    } else {
+        StreamEvent::Error { message: e.to_string() }
+    }
+}
+
+// ============================================================================
+// Ollama streaming: NDJSON translation
+// ============================================================================
+
+/// Block and stop bookkeeping while translating an Ollama `/api/chat` NDJSON
+/// stream into Anthropic stream events.
+#[derive(Default)]
+struct OllamaStreamState {
+    thinking_block_started: bool,
+    saw_stop_sentinel: bool,
+    text_block_started: bool,
+    tool_block_count: usize,
+    /// Ollama thinking uses block index 0 (same as Anthropic);
+    /// text starts at index 1 when thinking is present, or 0 otherwise.
+    next_block_index: usize,
+    /// Degenerate-repetition watch (see `RepeatWatch`).
+    repeat_watch: RepeatWatch,
+}
+
+impl OllamaStreamState {
+    const fn stop_reason(&self) -> &'static str {
+        if self.tool_block_count > 0 { "tool_use" } else { "end_turn" }
+    }
+
+    /// Translate one parsed NDJSON object into the items to yield, in order,
+    /// and whether the stream is over (a wedged runner, or `done: true`).
+    fn on_object(
+        &mut self,
+        obj: &serde_json::Value,
+        bytes_received: usize,
+    ) -> (Vec<Result<StreamEvent, LlmError>>, bool) {
+        let mut items = Vec::new();
+
+        // Check for done
+        let done = obj["done"].as_bool().unwrap_or(false);
+
+        // Stream thinking content (qwen3 and other thinking models)
+        // Ollama returns thinking tokens in message.thinking.
+        // Emit proper ContentBlockStart/Stop to match Anthropic's block structure.
+        // Cut a wedged runner short instead of waiting out its loop.
+        if let Some(frag) = obj["message"]["thinking"]
+            .as_str()
+            .or_else(|| obj["message"]["content"].as_str())
+            && let Some(run) = self.repeat_watch.observe(frag) {
+                if self.thinking_block_started || self.text_block_started {
+                    items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+                }
+                items.push(Err(LlmError::WedgedRunner {
+                    token: frag.to_string(),
+                    run,
+                    bytes_received,
+                }));
+                return (items, true);
+            }
+
+        if let Some(thinking) = obj["message"]["thinking"].as_str()
+            && !thinking.is_empty() {
+                if !self.thinking_block_started {
+                    self.thinking_block_started = true;
+                    items.push(Ok(StreamEvent::ContentBlockStart {
+                        index: self.next_block_index,
+                        content_type: "thinking".to_string(),
+                        tool_id: None,
+                        tool_name: None,
+                    }));
+                }
+                items.push(Ok(StreamEvent::ThinkingDelta { index: self.next_block_index, thinking: thinking.to_string() }));
+            }
+
+        // Stream text content.
+        // When text starts arriving and thinking was active, close the thinking block first.
+        if let Some(content) = obj["message"]["content"].as_str() {
+            self.on_content(content, &mut items);
+        }
+
+        // Tool calls: Ollama emits these in a message with done=false,
+        // followed by a separate done=true message with empty content.
+        // Process tool_calls from ANY message, not just the done message.
+        if let Some(tool_calls) = obj["message"]["tool_calls"].as_array()
+            && !tool_calls.is_empty() {
+                self.on_tool_calls(tool_calls, &mut items);
+            }
+
+        if done {
+            // Close any remaining open blocks
+            if self.thinking_block_started {
+                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+                self.next_block_index += 1;
+            }
+            if self.text_block_started {
+                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+                // next_block_index not needed after this
+            }
+
+            // Emit usage. Ollama reports BOTH sides only in the
+            // final done message: prompt_eval_count (input) and
+            // eval_count (output). The prompt side rides a late
+            // MessageStart — the stream consumer records it by
+            // assignment wherever it appears, and Ollama streams
+            // never emit an earlier one. Omitting it zeroed
+            // every per-request input count downstream (run
+            // benchmarks and the context-usage indicator).
+            if let Some(prompt_eval) = obj["prompt_eval_count"].as_u64() {
+                items.push(Ok(StreamEvent::MessageStart {
+                    id: String::new(),
+                    model: obj["model"].as_str().unwrap_or("").to_string(),
+                    input_tokens: token_count_u32(prompt_eval),
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                }));
+            }
+            // Emit output token count
+            if let Some(eval_count) = obj["eval_count"].as_u64() {
+                items.push(Ok(StreamEvent::MessageDelta {
+                    stop_reason: None,
+                    output_tokens: token_count_u32(eval_count),
+                }));
+            }
+
+            items.push(Ok(StreamEvent::MessageStop { stop_reason: self.stop_reason().to_string() }));
+            return (items, true);
+        }
+        (items, false)
+    }
+
+    /// Append the events for a `message.content` fragment, dropping (and
+    /// remembering) a Gemma stop sentinel.
+    fn on_content(&mut self, content: &str, items: &mut Vec<Result<StreamEvent, LlmError>>) {
+        // Gemma's reserved sentinels (`<unused0>`..`<unused98>`)
+        // are stop markers the chat template is supposed to
+        // consume. Ollama passes them through as ordinary
+        // content and then simply stops the stream, with no
+        // done=true — so the terminator we need arrives
+        // disguised as text. Note it, drop it from the visible
+        // output, and let the end-of-stream handler close the
+        // turn cleanly instead of reporting an aborted
+        // generation. Observed live 2026-07-28: 57 such 502s in
+        // one gemma4:12b run, each discarding a complete reply.
+        let content = if LlmClient::is_gemma_stop_sentinel(content) {
+            self.saw_stop_sentinel = true;
+            tracing::info!("ollama: model stop sentinel seen (exact)");
+            ""
+        } else if let Some(prefix) = LlmClient::strip_trailing_stop_sentinel(content) {
+            // The sentinel can also arrive glued to the end of
+            // real text ("...all tests pass.<unused50>"), where
+            // an exact-match test never fires. Keep the words,
+            // drop the marker, remember that the turn ended.
+            self.saw_stop_sentinel = true;
+            tracing::info!("ollama: model stop sentinel seen (trailing)");
+            prefix
+        } else {
+            content
+        };
+        if !content.is_empty() {
+            // Close thinking block when transitioning to text
+            if self.thinking_block_started {
+                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+                self.thinking_block_started = false;
+                self.next_block_index += 1;
+            }
+            if !self.text_block_started {
+                self.text_block_started = true;
+                items.push(Ok(StreamEvent::ContentBlockStart {
+                    index: self.next_block_index,
+                    content_type: "text".to_string(),
+                    tool_id: None,
+                    tool_name: None,
+                }));
+            }
+            items.push(Ok(StreamEvent::TextDelta { index: self.next_block_index, text: content.to_string() }));
+        }
+    }
+
+    /// Append complete tool-use blocks for a message's `tool_calls`, closing any
+    /// open thinking or text block first.
+    fn on_tool_calls(&mut self, tool_calls: &[serde_json::Value], items: &mut Vec<Result<StreamEvent, LlmError>>) {
+        // Close any open thinking/text blocks before tool calls
+        if self.thinking_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+            self.thinking_block_started = false;
+            self.next_block_index += 1;
+        }
+        if self.text_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+            self.text_block_started = false;
+            self.next_block_index += 1;
+        }
+
+        for tc in tool_calls {
+            self.tool_block_count += 1;
+            let block_idx = self.next_block_index;
+            self.next_block_index += 1;
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let args = tc["function"]["arguments"].to_string();
+            let tool_block_count = self.tool_block_count;
+            let id = tc["id"].as_str().map_or_else(|| format!("toolu_{tool_block_count:08x}"), String::from);
+            items.push(Ok(StreamEvent::ContentBlockStart {
+                index: block_idx,
+                content_type: "tool_use".to_string(),
+                tool_id: Some(id),
+                tool_name: Some(name),
+            }));
+            items.push(Ok(StreamEvent::ToolUseDelta {
+                index: block_idx,
+                partial_json: args,
+            }));
+            items.push(Ok(StreamEvent::ContentBlockStop { index: block_idx }));
+        }
+    }
+
+    /// The items that end a stream whose body closed without a `done: true`
+    /// line: an unterminated final `done` object or a stop sentinel still close
+    /// the turn cleanly; anything else is reported as an aborted generation.
+    fn finish(
+        &self,
+        buffer: &str,
+        last_line: Option<&str>,
+        bytes_received: usize,
+        lines_parsed: usize,
+    ) -> Vec<Result<StreamEvent, LlmError>> {
+        let mut items = Vec::new();
+
+        // A final NDJSON object that arrived without its trailing newline
+        // would otherwise sit in `buffer` unparsed and be reported as an
+        // aborted generation. Cheap to honour, and it can only ever turn
+        // a false 502 into the success it actually was.
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim())
+            && obj["done"].as_bool().unwrap_or(false) {
+                if self.thinking_block_started || self.text_block_started {
+                    items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+                }
+                items.push(Ok(StreamEvent::MessageStop { stop_reason: self.stop_reason().to_string() }));
+                return items;
+            }
+
+        // A sentinel-terminated stream is a COMPLETE turn.
+        //
+        // The check below exists for genuinely aborted generations, and it
+        // must stay — a degraded runner streams degenerate tokens and drops
+        // the connection, and delivering that as a successful reply is how
+        // garbage reached the GUI. But gemma ends its turn by EMITTING a
+        // reserved `<unusedNN>` token and then closing, which is a normal
+        // stop wearing an abort's clothing. The content before it is a
+        // finished reply; discarding it cost one run 57 complete responses
+        // and ultimately the whole benchmark.
+        if self.saw_stop_sentinel {
+            if self.thinking_block_started {
+                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+            }
+            if self.text_block_started {
+                items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+            }
+            tracing::info!(
+                bytes_received,
+                lines_parsed,
+                "ollama stream closed on a model stop sentinel rather than done=true"
+            );
+            items.push(Ok(StreamEvent::MessageStop { stop_reason: self.stop_reason().to_string() }));
+            return items;
+        }
+
+        // The stream ended with no done=true terminator: an ABORTED
+        // generation. A degraded Ollama runner streams degenerate tokens
+        // and drops the stream with no final message (observed live) —
+        // closing "gracefully" here delivered that garbage to the GUI as
+        // a successful reply. Surface a retryable server error instead,
+        // mirroring the non-streaming done=false check.
+        if self.thinking_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+        }
+        if self.text_block_started {
+            items.push(Ok(StreamEvent::ContentBlockStop { index: self.next_block_index }));
+        }
+        // Say what was left unparsed. A bare byte/line count cannot
+        // distinguish "the provider hung up mid-token" from "we dropped a
+        // terminator", and 68 of these in one night taught us nothing
+        // about which. A bounded tail of the residual buffer makes the
+        // next occurrence self-diagnosing.
+        let tail_note = last_line.map_or_else(
+            || " No NDJSON line was ever parsed.".to_string(),
+            |line| {
+                let shown: String = line.chars().take(200).collect();
+                format!(" Last line before the cut: {shown}")
+            },
+        );
+        let residue = buffer.trim();
+        let residue_note = if residue.is_empty() {
+            format!("nothing was left unparsed (the stream simply stopped).{tail_note}")
+        } else {
+            let tail: String = residue.chars().rev().take(160).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            format!("{} unparsed bytes remained, ending: {tail}", residue.len())
+        };
+        items.push(Err(LlmError::from_api_response(
+            502,
+            format!(
+                "Ollama stream ended without completion (no done=true) after \
+                 {bytes_received} bytes / {lines_parsed} NDJSON lines — {residue_note}"
+            ),
+        )));
+        items
+    }
+}
+
+// ============================================================================
+// OpenAI-compatible streaming: request body and SSE translation
+// ============================================================================
+
+/// A message in a streaming OpenAI-compatible chat request.
+#[derive(Serialize)]
+struct OpenAiStreamMessage {
+    role: String,
+    content: String,
+}
+
+/// A tool in a streaming OpenAI-compatible chat request.
+#[derive(Serialize)]
+struct OpenAiStreamTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAiStreamFunction,
+}
+
+/// The function half of an [`OpenAiStreamTool`].
+#[derive(Serialize)]
+struct OpenAiStreamFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+/// The body [`LlmClient::stream_openai`] posts to `/v1/chat/completions`.
+#[derive(Serialize)]
+struct OpenAiStreamRequest {
+    model: String,
+    messages: Vec<OpenAiStreamMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiStreamTool>>,
+}
+
+/// Build the streaming chat body for `request`. Tool values that do not decode
+/// as a [`ToolDefinition`] are dropped.
+fn openai_stream_body(request: &CompletionRequest) -> OpenAiStreamRequest {
+    // Convert messages to OpenAI format
+    let messages: Vec<OpenAiStreamMessage> = request
+        .messages
+        .iter()
+        .map(|m| OpenAiStreamMessage {
+            role: match m.role {
+                Role::System => "system".to_string(),
+                Role::User => "user".to_string(),
+                Role::Assistant => "assistant".to_string(),
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+
+    // Convert tools to OpenAI format
+    let tools: Option<Vec<OpenAiStreamTool>> = if request.tools.is_empty() {
+        None
+    } else {
+        Some(request.tools.iter().filter_map(|v| {
+            // Try to parse as ToolDefinition
+            serde_json::from_value::<ToolDefinition>(v.clone()).ok().map(|tool_def| OpenAiStreamTool {
+                tool_type: "function".to_string(),
+                function: OpenAiStreamFunction {
+                    name: tool_def.name,
+                    description: tool_def.description,
+                    parameters: tool_def.input_schema,
+                },
+            })
+        }).collect())
+    };
+
+    OpenAiStreamRequest {
+        model: request.model.clone(),
+        messages,
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+        stream: true,
+        tools,
+    }
+}
+
+/// One `data:` chunk of an OpenAI-compatible chat-completions stream.
+#[derive(Deserialize, Debug)]
+struct OpenAiStreamChunk<D> {
+    choices: Vec<OpenAiChunkChoice<D>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiChunkChoice<D> {
+    delta: Option<D>,
+    finish_reason: Option<String>,
+}
+
+/// The delta of a stream chunk choice.
+#[derive(Deserialize, Debug)]
+struct OpenAiChunkDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+/// [`OpenAiChunkDelta`] as [`LlmClient::stream_openai`] decodes it: a present
+/// `role` must be a string, or the whole chunk is skipped.
+#[derive(Deserialize, Debug)]
+struct OpenAiRoleCheckedDelta {
+    content: Option<String>,
+    #[serde(rename = "role")]
+    _role: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+impl From<OpenAiRoleCheckedDelta> for OpenAiChunkDelta {
+    fn from(delta: OpenAiRoleCheckedDelta) -> Self {
+        Self {
+            content: delta.content,
+            tool_calls: delta.tool_calls,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<OpenAiFunctionDelta>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Block bookkeeping while translating an OpenAI-compatible SSE stream into
+/// Anthropic stream events: text is block 0, tool call `i` is block `i + 1`.
+#[derive(Default)]
+struct OpenAiStreamState {
+    text_block_started: bool,
+    /// Block index -> (id, name) of every tool call started so far.
+    tool_calls_started: std::collections::HashMap<usize, (String, String)>,
+}
+
+impl OpenAiStreamState {
+    /// `ContentBlockStop` for an open text block, then for every started tool
+    /// block in index order.
+    fn close_blocks(&self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if self.text_block_started {
+            events.push(StreamEvent::ContentBlockStop { index: 0 });
+        }
+        let mut stop_indices: Vec<usize> = self.tool_calls_started.keys().copied().collect();
+        stop_indices.sort_unstable();
+        for idx in stop_indices {
+            events.push(StreamEvent::ContentBlockStop { index: idx });
+        }
+        events
+    }
+
+    /// Translate one SSE line into the events to yield, in order, and whether
+    /// the message ended (`[DONE]` or a `finish_reason`). Lines that are not
+    /// `data:` lines, and chunks that do not decode as `D`, yield nothing.
+    fn on_line<D>(&mut self, line: &str) -> (Vec<StreamEvent>, bool)
+    where
+        D: serde::de::DeserializeOwned + Into<OpenAiChunkDelta>,
+    {
+        let Some(data) = line.strip_prefix("data: ") else {
+            return (Vec::new(), false);
+        };
+
+        if data == "[DONE]" {
+            // Close any open blocks
+            let mut events = self.close_blocks();
+            events.push(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+            return (events, true);
+        }
+
+        let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk<D>>(data) else {
+            return (Vec::new(), false);
+        };
+        let mut events = Vec::new();
+        for choice in chunk.choices {
+            if let Some(delta) = choice.delta {
+                self.on_delta(delta.into(), &mut events);
+            }
+
+            // Check for stop
+            if let Some(reason) = choice.finish_reason {
+                // Close any open blocks
+                events.extend(self.close_blocks());
+                let stop_reason = match reason.as_str() {
+                    "tool_calls" => "tool_use",
+                    "stop" => "end_turn",
+                    other => other,
+                };
+                events.push(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                return (events, true);
+            }
+        }
+        (events, false)
+    }
+
+    /// Append the events for one choice delta: text, then tool-call starts and
+    /// argument fragments.
+    fn on_delta(&mut self, delta: OpenAiChunkDelta, events: &mut Vec<StreamEvent>) {
+        // Handle text content
+        if let Some(text) = delta.content
+            && !text.is_empty() {
+                if !self.text_block_started {
+                    self.text_block_started = true;
+                    events.push(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_type: "text".to_string(),
+                        tool_id: None,
+                        tool_name: None,
+                    });
+                }
+                events.push(StreamEvent::TextDelta { index: 0, text });
+            }
+
+        // Handle tool calls
+        if let Some(tool_calls) = delta.tool_calls {
+            for tc in tool_calls {
+                // Tool index offset by 1 (text is at 0)
+                let block_index = tc.index + 1;
+
+                // Check if this is a new tool call
+                if let (Some(id), Some(func)) = (&tc.id, &tc.function)
+                    && let Some(name) = &func.name {
+                        // Close text block if open (tool calls come after text)
+                        if self.text_block_started {
+                            events.push(StreamEvent::ContentBlockStop { index: 0 });
+                            self.text_block_started = false;
+                        }
+
+                        // New tool call
+                        self.tool_calls_started.insert(block_index, (id.clone(), name.clone()));
+                        events.push(StreamEvent::ContentBlockStart {
+                            index: block_index,
+                            content_type: "tool_use".to_string(),
+                            tool_id: Some(id.clone()),
+                            tool_name: Some(name.clone()),
+                        });
+                    }
+
+                // Stream tool arguments
+                if let Some(func) = &tc.function
+                    && let Some(args) = &func.arguments
+                        && !args.is_empty() {
+                            events.push(StreamEvent::ToolUseDelta {
+                                index: block_index,
+                                partial_json: args.clone(),
+                            });
+                        }
             }
         }
     }
@@ -5858,6 +5890,98 @@ fn anthropic_to_ollama_request(request: &AnthropicRequest) -> (serde_json::Value
     anthropic_to_wire_request(request, ToolArgsWire::JsonObject)
 }
 
+/// Append the wire messages for an Anthropic user message: its text blocks as
+/// one user message, then each tool result as its own `tool` message.
+fn push_wire_user_messages(messages: &mut Vec<serde_json::Value>, msg: &AnthropicMessage) {
+    // User messages: may contain text and/or tool_result blocks
+    let mut text_parts = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                tool_results.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": if is_error.unwrap_or(false) {
+                        format!("Error: {content}")
+                    } else {
+                        content.clone()
+                    },
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    // Emit text parts as a user message
+    if !text_parts.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": text_parts.join("\n"),
+        }));
+    }
+    // Emit tool results as separate "tool" role messages
+    messages.extend(tool_results);
+}
+
+/// The wire message for an Anthropic assistant message: its text blocks joined
+/// as `content` (always present, `null` when empty) and its tool uses as
+/// `tool_calls`, with arguments encoded per `args_wire`.
+fn wire_assistant_message(msg: &AnthropicMessage, args_wire: ToolArgsWire) -> serde_json::Value {
+    // Assistant messages: may contain text and/or tool_use blocks
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::ToolUse { id, name, input } => {
+                let arguments = match args_wire {
+                    ToolArgsWire::JsonString => {
+                        serde_json::Value::String(input.to_string())
+                    }
+                    // Ollama native: pass the object through. A
+                    // non-object input would 400 the whole request,
+                    // so degrade it to {} rather than lose the turn.
+                    ToolArgsWire::JsonObject if input.is_object() => input.clone(),
+                    ToolArgsWire::JsonObject => {
+                        warn!(
+                            tool = %name,
+                            "tool_use input is not a JSON object; sending {{}} to Ollama"
+                        );
+                        serde_json::json!({})
+                    }
+                };
+                tool_calls.push(serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let mut assistant_msg = serde_json::json!({ "role": "assistant" });
+    // Always include `content` — some OpenAI-compatible providers
+    // (e.g. Arcee AI via OpenRouter) reject messages where it's missing,
+    // even when `tool_calls` is present.
+    if text_parts.is_empty() {
+        assistant_msg["content"] = serde_json::Value::Null;
+    } else {
+        assistant_msg["content"] = serde_json::json!(text_parts.join("\n"));
+    }
+    if !tool_calls.is_empty() {
+        assistant_msg["tool_calls"] = serde_json::json!(tool_calls);
+    }
+    assistant_msg
+}
+
 fn anthropic_to_wire_request(
     request: &AnthropicRequest,
     args_wire: ToolArgsWire,
@@ -5877,91 +6001,8 @@ fn anthropic_to_wire_request(
     for msg in &request.messages {
         let role = msg.role.as_str();
         match role {
-            "user" => {
-                // User messages: may contain text and/or tool_result blocks
-                let mut text_parts = Vec::new();
-                let mut tool_results = Vec::new();
-
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } => text_parts.push(text.clone()),
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                            tool_results.push(serde_json::json!({
-                                "role": "tool",
-                                "tool_call_id": tool_use_id,
-                                "content": if is_error.unwrap_or(false) {
-                                    format!("Error: {content}")
-                                } else {
-                                    content.clone()
-                                },
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Emit text parts as a user message
-                if !text_parts.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": text_parts.join("\n"),
-                    }));
-                }
-                // Emit tool results as separate "tool" role messages
-                messages.extend(tool_results);
-            }
-            "assistant" => {
-                // Assistant messages: may contain text and/or tool_use blocks
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } => text_parts.push(text.clone()),
-                        ContentBlock::ToolUse { id, name, input } => {
-                            let arguments = match args_wire {
-                                ToolArgsWire::JsonString => {
-                                    serde_json::Value::String(input.to_string())
-                                }
-                                // Ollama native: pass the object through. A
-                                // non-object input would 400 the whole request,
-                                // so degrade it to {} rather than lose the turn.
-                                ToolArgsWire::JsonObject if input.is_object() => input.clone(),
-                                ToolArgsWire::JsonObject => {
-                                    warn!(
-                                        tool = %name,
-                                        "tool_use input is not a JSON object; sending {{}} to Ollama"
-                                    );
-                                    serde_json::json!({})
-                                }
-                            };
-                            tool_calls.push(serde_json::json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments,
-                                }
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-
-                let mut assistant_msg = serde_json::json!({ "role": "assistant" });
-                // Always include `content` — some OpenAI-compatible providers
-                // (e.g. Arcee AI via OpenRouter) reject messages where it's missing,
-                // even when `tool_calls` is present.
-                if text_parts.is_empty() {
-                    assistant_msg["content"] = serde_json::Value::Null;
-                } else {
-                    assistant_msg["content"] = serde_json::json!(text_parts.join("\n"));
-                }
-                if !tool_calls.is_empty() {
-                    assistant_msg["tool_calls"] = serde_json::json!(tool_calls);
-                }
-                messages.push(assistant_msg);
-            }
+            "user" => push_wire_user_messages(&mut messages, msg),
+            "assistant" => messages.push(wire_assistant_message(msg, args_wire)),
             _ => {}
         }
     }
@@ -6024,10 +6065,10 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         other => other,
     };
 
-    let input_tokens = response["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-    let output_tokens = response["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+    let input_tokens = token_count_u32(response["usage"]["prompt_tokens"].as_u64().unwrap_or(0));
+    let output_tokens = token_count_u32(response["usage"]["completion_tokens"].as_u64().unwrap_or(0));
     // OpenAI returns cached tokens in usage.prompt_tokens_details.cached_tokens
-    let cache_read_input_tokens = response["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as u32;
+    let cache_read_input_tokens = token_count_u32(response["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0));
 
     Ok(AnthropicResponse {
         id: response["id"].as_str().unwrap_or("").to_string(),
@@ -6136,8 +6177,8 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
     };
 
     // Ollama provides eval_count, prompt_eval_count
-    let input_tokens = response["prompt_eval_count"].as_u64().unwrap_or(0) as u32;
-    let output_tokens = response["eval_count"].as_u64().unwrap_or(0) as u32;
+    let input_tokens = token_count_u32(response["prompt_eval_count"].as_u64().unwrap_or(0));
+    let output_tokens = token_count_u32(response["eval_count"].as_u64().unwrap_or(0));
 
     Ok(AnthropicResponse {
         id: format!("ollama-{}", current_timestamp()),
@@ -6812,9 +6853,6 @@ mod tests {
     }
 
     fn capture_info_logs(f: impl FnOnce()) -> String {
-        pin_global_log_level();
-        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
         #[derive(Clone, Default)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -6835,6 +6873,9 @@ mod tests {
                 self.clone()
             }
         }
+
+        pin_global_log_level();
+        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let sink = Sink::default();
         let subscriber = tracing_subscriber::fmt()
@@ -8122,6 +8163,7 @@ mod input_overflow_tests {
             lens[0],
             lens[1]
         );
+        drop(lens);
     }
 
     /// A provider that keeps reporting overflow whatever we send: the strict
