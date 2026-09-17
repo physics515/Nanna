@@ -11,8 +11,11 @@ use nanna_channels::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+use crate::protocol::Event;
+use crate::session::{ReplyChannel, SessionManager};
 
 /// Channel configuration from config.toml
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -204,6 +207,16 @@ impl ChannelManager {
         // Share the router Arc with the spawned task — no ownership transfer needed
         let router = Arc::clone(&self.router);
 
+        // Subscribed BEFORE the first message is processed, so no reply can be
+        // emitted into a bus nobody is listening to yet.
+        if let Some(events) = control.subscribe_events() {
+            spawn_reply_forwarder(Arc::clone(&control.sessions), events, Arc::clone(&router));
+        } else {
+            warn!(
+                "No event bus attached to the control plane; channel conversations will get no replies"
+            );
+        }
+
         // Spawn the message processing loop
         tokio::spawn(async move {
             loop {
@@ -223,7 +236,16 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Process an incoming message and send the agent response back to the originating channel.
+    /// Hand an incoming channel message to the agent.
+    ///
+    /// The reply is NOT read from the response here. `chat.send` is a delivery
+    /// ack (P22): the turn runs in a spawned task and its answer arrives as
+    /// `message_end` on the event bus, which [`spawn_reply_forwarder`] sends
+    /// back through the channel the session names. Reading `content` off the
+    /// ack — as this function did — answered every channel message with either
+    /// an empty string or "I encountered an error processing your message."
+    /// Only a refusal (no agent, a turn that could not start) is answered here,
+    /// with the daemon's own reason.
     ///
     /// This is `pub` so the webhook event processor in `server.rs` can call it
     /// directly after converting a `WebhookEvent` into an `IncomingMessage`.
@@ -241,46 +263,42 @@ impl ChannelManager {
             "{}:{}:{}",
             msg.channel.provider, msg.channel.id, msg.sender.id
         );
+        let sender_name = msg.sender.username.as_deref().unwrap_or(&msg.sender.id);
 
         info!(
             "Processing {} message from {} in session {}",
-            msg.channel.provider,
-            msg.sender.username.as_deref().unwrap_or(&msg.sender.id),
-            session_id
+            msg.channel.provider, sender_name, session_id
         );
 
-        // Send to control plane for processing
+        let route = ReplyChannel {
+            provider: msg.channel.provider.clone(),
+            id: msg.channel.id.clone(),
+        };
+        let name = format!("{} · {sender_name}", msg.channel.provider);
+        control
+            .sessions
+            .ensure_channel_session(&session_id, &name, &route)
+            .await;
+
         let action = ChatAction::Send {
             session_id: session_id.clone(),
             content: text,
             attachments: vec![],
         };
-
         let response = control
             .handle(&format!("channel:{}", msg.channel.provider), crate::protocol::Action::Chat(action))
             .await;
 
-        // Extract response content
-        let response_text = response
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("I encountered an error processing your message.");
-
-        debug!(
-            "Response for {}: {}",
-            session_id,
-            response_text.chars().take(100).collect::<String>()
-        );
-
-        // Send response back through the originating channel
+        let Some(refusal) = refusal_text(&response) else {
+            debug!("Turn accepted for {session_id}; the reply follows on the event bus");
+            return;
+        };
+        warn!("Channel turn for {session_id} was refused: {refusal}");
         let outgoing = OutgoingMessage {
             channel: msg.channel.clone(),
-            content: MessageContent::Text {
-                text: response_text.to_string(),
-            },
+            content: MessageContent::Text { text: refusal },
             reply_to: Some(msg.id.clone()),
         };
-
         if let Err(e) = router.send(outgoing).await {
             error!(
                 "Failed to send response to {}:{}: {}",
@@ -317,5 +335,336 @@ impl ChannelManager {
             })
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+/// The daemon's refusal of a channel turn, if the response is one. Pure.
+///
+/// A started or interjected turn is not a refusal: its reply comes later, on
+/// the event bus.
+fn refusal_text(response: &serde_json::Value) -> Option<String> {
+    let code = response.get("error")?.as_str().unwrap_or("error");
+    let message = response
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(code);
+    Some(format!("Nanna could not answer this message: {message}"))
+}
+
+/// The text an event asks to deliver to a conversation, with its session. Pure.
+///
+/// A finished turn (`message_end`) and a message appended outside a turn (a
+/// reminder) are replies; everything else — deltas, tool events, beats — is
+/// run mechanics a chat app cannot render. An empty `message_end` (a crashed
+/// or content-less turn) sends nothing rather than a blank message, which
+/// several providers reject outright.
+fn reply_text(event: &Event) -> Option<(&str, &str)> {
+    let (session_id, content) = match event {
+        Event::MessageEnd {
+            session_id,
+            content,
+            ..
+        } => (session_id, content),
+        Event::SessionMessageAdded {
+            session_id,
+            role,
+            content,
+            ..
+        } if role == "assistant" => (session_id, content),
+        _ => return None,
+    };
+    (!content.trim().is_empty()).then_some((session_id.as_str(), content.as_str()))
+}
+
+/// Forward replies for channel-routed sessions back through `router`.
+///
+/// One forwarder per router: the webhook processor shares the channel
+/// manager's router when there is one, and gets its own forwarder only when it
+/// builds a standalone router — so no reply is sent twice. Sessions without a
+/// reply route (GUI, CLI) are skipped; their clients read the same events.
+pub fn spawn_reply_forwarder(
+    sessions: Arc<SessionManager>,
+    mut events: broadcast::Receiver<Event>,
+    router: Arc<RwLock<MessageRouter>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "Channel reply forwarder fell behind the event bus; replies in the skipped events were not sent"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let Some((session_id, text)) = reply_text(&event) else {
+                continue;
+            };
+            let Some(route) = sessions.reply_channel(session_id).await else {
+                continue;
+            };
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new(&route.provider, &route.id),
+                content: MessageContent::Text {
+                    text: text.to_string(),
+                },
+                reply_to: None,
+            };
+            let router = router.read().await;
+            if let Err(e) = router.send(outgoing).await {
+                error!(
+                    "Failed to send reply for {session_id} to {}:{}: {e}",
+                    route.provider, route.id
+                );
+            }
+        }
+        debug!("Channel reply forwarder stopped: event bus closed");
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use nanna_channels::{Channel, ChannelCapabilities, ChannelError, Sender};
+    use std::time::Duration;
+
+    /// Records what a channel was asked to send, and where.
+    struct RecordingChannel {
+        sent: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn provider(&self) -> String {
+            "test".to_string()
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
+            if let MessageContent::Text { text } = message.content {
+                self.sent
+                    .lock()
+                    .expect("sent")
+                    .push((message.channel.id, text));
+            }
+            Ok("sent-1".to_string())
+        }
+    }
+
+    type Sent = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn recording_router() -> (Arc<RwLock<MessageRouter>>, Sent) {
+        let sent: Sent = Arc::default();
+        let mut router = MessageRouter::new();
+        router.register("test", Box::new(RecordingChannel { sent: sent.clone() }));
+        (Arc::new(RwLock::new(router)), sent)
+    }
+
+    fn incoming(text: &str) -> IncomingMessage {
+        IncomingMessage {
+            id: "in-1".to_string(),
+            channel: ChannelId::new("test", "chat-7"),
+            sender: Sender {
+                id: "user-3".to_string(),
+                name: None,
+                username: Some("ada".into()),
+            },
+            content: MessageContent::Text {
+                text: text.to_string(),
+            },
+            timestamp: 0,
+            reply_to: None,
+        }
+    }
+
+    const SESSION: &str = "test:chat-7:user-3";
+
+    async fn wait_for(sent: &Sent, count: usize) -> Vec<(String, String)> {
+        for _ in 0..200 {
+            let snapshot = sent.lock().expect("sent").clone();
+            if snapshot.len() >= count {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sent.lock().expect("sent").clone()
+    }
+
+    #[tokio::test]
+    async fn a_channel_message_creates_its_routed_session_and_a_refusal_says_why() {
+        let sessions = Arc::new(SessionManager::new());
+        let control = Arc::new(ControlPlane::new(sessions.clone()));
+        let (router, sent) = recording_router();
+
+        ChannelManager::process_message(incoming("hello there"), &control, &*router.read().await)
+            .await;
+
+        let session = sessions
+            .get(SESSION)
+            .await
+            .expect("the channel session exists");
+        assert_eq!(session.name.as_deref(), Some("test · ada"));
+        assert_eq!(session.messages.len(), 1, "the user's message was recorded");
+        assert_eq!(
+            sessions.reply_channel(SESSION).await,
+            Some(ReplyChannel {
+                provider: "test".into(),
+                id: "chat-7".into()
+            })
+        );
+        // No agent on this control plane: the channel user is told the real
+        // reason, not "I encountered an error processing your message."
+        let sent = sent.lock().expect("sent").clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "chat-7");
+        assert_eq!(
+            sent[0].1,
+            "Nanna could not answer this message: Agent service not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_message_reuses_the_session() {
+        let sessions = Arc::new(SessionManager::new());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "chat-7".into(),
+        };
+        assert!(
+            sessions
+                .ensure_channel_session(SESSION, "test · ada", &route)
+                .await
+        );
+        assert!(
+            !sessions
+                .ensure_channel_session(SESSION, "test · ada", &route)
+                .await
+        );
+        assert_eq!(sessions.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_reply_route_survives_a_restart() {
+        // A reminder a channel user set yesterday is delivered after today's
+        // restart only if the route was persisted, not kept in memory.
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let before = SessionManager::with_storage(storage.clone());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "chat-7".into(),
+        };
+        before
+            .ensure_channel_session(SESSION, "test · ada", &route)
+            .await;
+
+        let after = SessionManager::with_storage(storage);
+        assert!(after.load_from_db().await >= 1);
+        assert_eq!(after.reply_channel(SESSION).await, Some(route));
+    }
+
+    #[test]
+    fn only_finished_turns_and_appended_assistant_messages_are_replies() {
+        let end = Event::MessageEnd {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            content: "done".into(),
+        };
+        assert_eq!(reply_text(&end), Some(("s", "done")));
+        let blank = Event::MessageEnd {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            content: " \n".into(),
+        };
+        assert_eq!(reply_text(&blank), None);
+        let reminder = Event::SessionMessageAdded {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            role: "assistant".into(),
+            content: "⏰ Reminder: stretch".into(),
+        };
+        assert_eq!(reply_text(&reminder), Some(("s", "⏰ Reminder: stretch")));
+        let user = Event::SessionMessageAdded {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        assert_eq!(reply_text(&user), None);
+        let delta = Event::MessageDelta {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            delta: "d".into(),
+        };
+        assert_eq!(reply_text(&delta), None);
+    }
+
+    #[test]
+    fn a_started_or_interjected_turn_is_not_a_refusal() {
+        let started = crate::control::chat_harness::started_response("m-1");
+        assert_eq!(refusal_text(&started), None);
+        let refused = serde_json::json!({ "error": "chat_failed", "message": "no router" });
+        assert_eq!(
+            refusal_text(&refused).as_deref(),
+            Some("Nanna could not answer this message: no router")
+        );
+        let bare = serde_json::json!({ "error": "agent_unavailable" });
+        assert_eq!(
+            refusal_text(&bare).as_deref(),
+            Some("Nanna could not answer this message: agent_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn replies_and_reminders_reach_the_channel_that_owns_the_session() {
+        let sessions = Arc::new(SessionManager::new());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "chat-7".into(),
+        };
+        sessions
+            .ensure_channel_session(SESSION, "test · ada", &route)
+            .await;
+        let gui = sessions.create(None).await;
+        let (events_tx, events_rx) = broadcast::channel(16);
+        let (router, sent) = recording_router();
+        let forwarder = spawn_reply_forwarder(sessions.clone(), events_rx, router);
+
+        for (session_id, content) in [(gui.id.as_str(), "gui reply"), (SESSION, "the answer")] {
+            events_tx
+                .send(Event::MessageEnd {
+                    session_id: session_id.into(),
+                    message_id: "m".into(),
+                    content: content.into(),
+                })
+                .expect("a receiver");
+        }
+        events_tx
+            .send(Event::SessionMessageAdded {
+                session_id: SESSION.into(),
+                message_id: "r".into(),
+                role: "assistant".into(),
+                content: "⏰ Reminder: stretch".into(),
+            })
+            .expect("a receiver");
+
+        let delivered = wait_for(&sent, 2).await;
+        drop(events_tx);
+        forwarder
+            .await
+            .expect("forwarder exits when the bus closes");
+        assert_eq!(
+            delivered,
+            vec![
+                ("chat-7".to_string(), "the answer".to_string()),
+                ("chat-7".to_string(), "⏰ Reminder: stretch".to_string()),
+            ],
+            "the GUI session's reply is not sent to any channel"
+        );
     }
 }

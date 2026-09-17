@@ -338,6 +338,22 @@ const CHAT_MODEL_KEY: &str = "chat_model";
 /// before the feature existed.
 const CHAT_TOOLS_KEY: &str = "chat_tools";
 
+/// Metadata key holding the external channel a session's replies go back to:
+/// `{"provider": "telegram", "id": "<chat id>"}`.
+///
+/// Metadata rather than `Session::owner` because metadata is persisted and
+/// `owner` is not — a reply route that vanished on restart would strand every
+/// reminder a channel user set before it.
+const REPLY_CHANNEL_KEY: &str = "reply_channel";
+
+/// Where a channel conversation's replies are sent: provider plus that
+/// provider's chat/channel id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyChannel {
+    pub provider: String,
+    pub id: String,
+}
+
 /// A conversation session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -408,6 +424,19 @@ impl Session {
     /// `LlmRouter::client_for_model`.
     pub fn chat_model(&self) -> Option<&str> {
         self.metadata.get(CHAT_MODEL_KEY).and_then(serde_json::Value::as_str)
+    }
+
+    /// The external channel this session's replies go back to, if it is a
+    /// channel conversation. A malformed entry reads as none.
+    #[must_use]
+    pub fn reply_channel(&self) -> Option<ReplyChannel> {
+        let route = self.metadata.get(REPLY_CHANNEL_KEY)?;
+        let provider = route.get("provider")?.as_str()?;
+        let id = route.get("id")?.as_str()?;
+        (!provider.is_empty() && !id.is_empty()).then(|| ReplyChannel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        })
     }
 
     /// Tools the user manually added to this chat's context, if any.
@@ -944,6 +973,71 @@ impl SessionManager {
         session
     }
     
+    /// Make sure the session a channel conversation maps to exists and routes
+    /// its replies to `route`, creating it under that exact id when missing.
+    ///
+    /// A channel conversation is addressed by a key derived from the channel,
+    /// not by an id a client obtained from `session.create`, so nothing else
+    /// creates it — and `chat.send` refuses a session that does not exist.
+    /// Returns whether the session was created.
+    ///
+    /// # Panics
+    ///
+    /// On an empty session id or a route missing its provider or chat — both
+    /// are built by the caller from a message that already has them.
+    pub async fn ensure_channel_session(
+        &self,
+        session_id: &str,
+        name: &str,
+        route: &ReplyChannel,
+    ) -> bool {
+        assert!(!session_id.is_empty(), "a channel session needs an id");
+        assert!(
+            !route.provider.is_empty(),
+            "a reply route names its provider"
+        );
+        assert!(!route.id.is_empty(), "a reply route names its chat");
+        let value = serde_json::json!({ "provider": route.provider, "id": route.id });
+        let (row, created) = {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_id) {
+                if session.reply_channel().as_ref() == Some(route) {
+                    return false;
+                }
+                session
+                    .metadata
+                    .insert(REPLY_CHANNEL_KEY.to_string(), value);
+                session.updated_at = Utc::now();
+                let row = SessionRow::from(&*session);
+                drop(sessions);
+                (row, false)
+            } else {
+                let mut session = Session::with_id(session_id, Some(name.to_string()));
+                session
+                    .metadata
+                    .insert(REPLY_CHANNEL_KEY.to_string(), value);
+                let row = SessionRow::from(&session);
+                sessions.insert(session_id.to_string(), session);
+                drop(sessions);
+                (row, true)
+            }
+        };
+        // Written with the map unlocked, as `set_chat_model` does.
+        self.persist_row(&row).await;
+        if created {
+            info!(
+                "Created channel session {session_id} ({}:{})",
+                route.provider, route.id
+            );
+        }
+        created
+    }
+
+    /// The reply route of a session, read without cloning its messages.
+    pub async fn reply_channel(&self, session_id: &str) -> Option<ReplyChannel> {
+        self.sessions.read().await.get(session_id)?.reply_channel()
+    }
+
     /// Set or clear the workspace for an existing session
     pub async fn set_workspace(&self, session_id: &str, workspace_id: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;

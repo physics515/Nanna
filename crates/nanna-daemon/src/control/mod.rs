@@ -403,6 +403,11 @@ impl ControlPlane {
         }
     }
 
+    /// A new receiver on the daemon event bus, if one is attached.
+    pub fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Event>> {
+        self.event_tx.as_ref().map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
     /// Set the scheduler
     pub fn with_scheduler(mut self, scheduler: Arc<RwLock<Scheduler>>) -> Self {
         self.scheduler = Some(scheduler);

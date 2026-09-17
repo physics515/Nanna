@@ -1787,6 +1787,32 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
       `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
       and the **embedded-fallback** path (needs a GUI build).
+- [x] **Channel conversations were answered with an error — every message, since P22.** *(2026-09-17)*
+      `ChannelManager::process_message` (Telegram/Discord/Slack listeners AND the webhook processor)
+      read the reply from `chat.send`'s response `content`. Two things had made that impossible:
+      the `{provider}:{chat}:{sender}` session was **never created** — `chat.send` refuses a session
+      that does not exist, and nothing else creates one under a derived key — and since the P22 fast
+      ack (2026-08-14) the response is a **delivery ack with `content: ""`**, the answer arriving later
+      as `message_end` on the event bus. So a channel user got
+      `"I encountered an error processing your message."` (reproduced by a probe test against the
+      unmodified function), and with a session in place would have got an empty message.
+      Fixed at the architecture the rest of the daemon already uses: the channel session is created
+      on first contact with its **reply route persisted in session metadata** (`reply_channel`, not
+      the unpersisted `owner`, so it survives a restart — tested against real Turso storage), and ONE
+      **reply forwarder per router** subscribes to the event bus and sends each finished turn
+      (`message_end`) and each appended assistant message (a delivered reminder) to the channel its
+      session names. GUI/CLI sessions have no route and are skipped. A refused turn (no agent, turn
+      could not start) is answered immediately with the daemon's own reason
+      (`Nanna could not answer this message: Agent service not configured`). The webhook processor
+      shares the channel manager's router and forwarder when there is one and gets its own
+      otherwise, so no reply is sent twice. 6 tests (real `ControlPlane` + `SessionManager` + a
+      recording channel). **Not live-verified** — no bot token on this host; a real Telegram
+      round-trip is the remaining check.
+      - [ ] Live round-trip against a real bot (Telegram is cheapest): message in → `message_end` →
+            reply out, then a `remind` set from the chat arriving in the chat.
+      - [ ] `nanna-server`'s own Telegram/Discord/Slack handlers were not audited for the same
+            ack-as-reply assumption — check whether that server is still reachable in daemon mode
+            before spending time on it.
 - [~] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
       *(2026-08-23)* **The headline was stale; the hole it hid was real and is now fixed.** Both live
@@ -4208,10 +4234,13 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       stopped (`clean_shutdown`), restarted 90s later → delivered 6s after boot with
       "is 2 min late — Nanna was not running when it came due". GUI rendering itself NOT
       WebDriver-verified (Linux harness still blocked on `WebKitWebDriver`).
-      - [ ] **A reminder set from a channel conversation (Telegram/Discord/…) lands in the daemon
+      - [x] **A reminder set from a channel conversation (Telegram/Discord/…) lands in the daemon
             session and is not known to reach the channel.** Delivery writes the session and
             broadcasts to IPC clients, and nothing in that path calls the channel manager; not traced
             further this run. Route `SessionMessageAdded` for channel-owned sessions to their channel.
+            *(2026-09-17)* Done as part of the channel-reply fix below (P8, "Channel conversations were
+            answered with an error"): the reply forwarder sends both `message_end` and assistant
+            `session_message_added` to the channel a session names.
       - [x] **Recurring tasks can still overlap themselves past a tick.** The new claim covers
             one-shots only; a `Recurring` run slower than 30s (consolidation, heartbeat prompts) is
             due again at the next tick — dreaming has its own in-flight latch for exactly this, other

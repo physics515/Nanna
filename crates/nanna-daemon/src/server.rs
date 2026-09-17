@@ -3283,6 +3283,18 @@ impl DaemonServer {
                     }
                 }
 
+                // This router has no channel manager's forwarder behind it, so
+                // replies to webhook conversations need one of their own.
+                if let Some(events) = control.subscribe_events() {
+                    crate::channels::spawn_reply_forwarder(
+                        Arc::clone(&control.sessions),
+                        events,
+                        Arc::clone(&standalone_router),
+                    );
+                } else {
+                    warn!("No event bus attached; webhook conversations will get no replies");
+                }
+
                 standalone_router
             };
 
