@@ -4602,6 +4602,16 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.
+            *(2026-09-17, found while scoping this)* **`HttpTransport::connect` had undefined
+            behaviour.** It gave its SSE task a raw pointer to `transport.connected`, a field of a
+            local that `Ok(transport)` then moved — every later connect/disconnect write went
+            through a dangling pointer (the "safety" comment relied on the shutdown channel, which
+            does not stop the task while a stream is open). No caller yet, which is the only reason
+            it never bit. Fixed with an `Arc<AtomicBool>` and the `unsafe` removed; a test with a
+            local SSE server that answers *after* `connect` returns fails on the old code and passes
+            on the new (5/5 reruns). The flag is still write-only — nothing reads it — and the
+            transport is the deprecated 2024-11-05 HTTP+SSE one, so this item remains a rewrite, not
+            a config wiring job.
       - [ ] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
