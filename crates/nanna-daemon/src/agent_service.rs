@@ -114,16 +114,45 @@ struct ModelWalk {
 }
 
 impl ModelWalk {
-    fn new() -> Self {
+    /// A walk over `models`. An empty list means nothing is configured, and
+    /// the error says so rather than "no models available", which reads like
+    /// every provider being down.
+    fn new(models: &[String]) -> Self {
+        let last_error = if models.is_empty() {
+            "No model is configured: set [agent] model, or add provider credentials \
+             so a model priority list can be built"
+        } else {
+            "No models available"
+        };
         Self {
             index: 0,
             same_model_retries: 0,
             server_down_waits: 0,
-            last_error: String::from("No models available"),
+            last_error: last_error.to_string(),
             tried_models: Vec::new(),
             rate_limited_providers: HashSet::new(),
         }
     }
+}
+
+/// The models a chat walks: the priority list when there is one, otherwise the
+/// single default model — minus blank names.
+///
+/// A blank name is not a model. Before this filter a daemon with no model
+/// configured walked `[""]`, which routed to whichever provider claims
+/// unprefixed names and sent it a request naming no model (a debug-assertion
+/// panic in `prompt_cache_control`, a provider error in release).
+fn configured_models(model: &str, priority: &[String]) -> Vec<String> {
+    if priority.is_empty() {
+        named_models(&[model.to_string()])
+    } else {
+        named_models(priority)
+    }
+}
+
+/// `models` without blank or whitespace-only entries.
+fn named_models(models: &[String]) -> Vec<String> {
+    models.iter().filter(|m| !m.trim().is_empty()).cloned().collect()
 }
 
 /// Per-session queue that serializes chat processing.
@@ -1099,7 +1128,7 @@ impl AgentService {
         // Index-based walk so a transient provider fault can retry the SAME
         // model (`continue` without advancing) before falling down the
         // priority list — see [`ModelWalk`] for the bounds.
-        let mut walk = ModelWalk::new();
+        let mut walk = ModelWalk::new(&models_to_try);
 
         while walk.index < models_to_try.len() {
             let model = &models_to_try[walk.index];
@@ -1245,18 +1274,22 @@ impl AgentService {
     async fn models_to_try(&self, model_override: Option<&String>) -> Vec<String> {
         let base_models: Vec<String> = if let Some(model) = model_override {
             // Explicit model override (e.g., from sub-session) — use only that model
-            vec![model.clone()]
+            named_models(std::slice::from_ref(model))
         } else {
             let config = self.config.read().await;
-            if config.model_priority.is_empty() {
-                vec![config.model.clone()]
-            } else {
-                config.model_priority.clone()
-            }
+            configured_models(&config.model, &config.model_priority)
         };
 
         // Apply health-aware reordering: healthy models first, skip unhealthy ones
         self.router.health_sorted_models(&base_models).await
+    }
+
+    /// Whether any model is configured to run a prompt with. A daemon built
+    /// without one (no `[agent] model`, no credentials to derive a priority
+    /// list from) has nothing to send a scheduled prompt to.
+    pub async fn has_configured_model(&self) -> bool {
+        let config = self.config.read().await;
+        !configured_models(&config.model, &config.model_priority).is_empty()
     }
 
     /// Build the agent for one attempt on `model`: its config, and a context
@@ -2418,6 +2451,19 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_model_names_are_not_models() {
+        let none: Vec<String> = Vec::new();
+        // The default daemon config: no model, no priority list.
+        assert_eq!(configured_models("", &[]), none);
+        assert_eq!(configured_models("  ", &[]), none);
+        assert_eq!(configured_models("claude-opus-5", &[]), vec!["claude-opus-5"]);
+        // A priority list wins over the default model, blanks dropped.
+        let priority = vec![String::new(), "qwen3.5:9b".to_string(), " ".to_string()];
+        assert_eq!(configured_models("claude-opus-5", &priority), vec!["qwen3.5:9b"]);
+        assert_eq!(named_models(&[String::new()]), none);
+    }
 
     #[test]
     fn rate_limit_detection_covers_known_shapes() {

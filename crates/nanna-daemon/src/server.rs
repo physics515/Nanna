@@ -2330,6 +2330,13 @@ impl ScheduledTaskContext {
             );
             return (true, Some("Skipped (a run is in flight)".to_string()), None);
         }
+        // Nothing to run the prompt with: a daemon with no model configured
+        // would only fail every tick (and used to send a request naming no
+        // model at all).
+        if !self.agent.has_configured_model().await {
+            debug!("Skipping scheduled task '{}': no model is configured", task.name);
+            return (true, Some("Skipped (no model configured)".to_string()), None);
+        }
         // An autonomous agent run (heartbeat / cron / task
         // prompt) is the daemon actively using the model, so
         // it counts as activity too — defer the dream cycle
