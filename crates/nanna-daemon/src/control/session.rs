@@ -400,8 +400,10 @@ impl ControlPlane {
         });
 
         // Build system prompt (include workspace context so sub-agents know the codebase)
-        let sys_prompt =
-            system_prompt.unwrap_or_else(|| self.default_sub_session_prompt(&task));
+        let sys_prompt = match system_prompt {
+            Some(prompt) => prompt,
+            None => self.default_sub_session_prompt(&task).await,
+        };
 
         // Inherit the parent's root. Read it AS the parent wherever we know who
         // that is — outside any run scope this call reads the shared slot,
@@ -450,12 +452,16 @@ impl ControlPlane {
 
     /// The system prompt a sub-agent gets when the caller supplies none: the
     /// daemon prompt, the global persona, and the active workspace's context.
-    fn default_sub_session_prompt(&self, task: &str) -> String {
-        let base = self.system_prompt.blocking_read().clone();
+    // Async, not `blocking_read`: this runs inside the IPC handler's tokio
+    // task, where a blocking lock acquisition panics ("Cannot block the
+    // current thread from within a runtime") — which is what every sub-session
+    // spawned without an explicit system prompt used to do.
+    pub(super) async fn default_sub_session_prompt(&self, task: &str) -> String {
+        let base = self.system_prompt.read().await.clone();
 
         // Global persona / user profile
         let persona_inj = {
-            let cfg = self.config.blocking_read();
+            let cfg = self.config.read().await;
             nanna_core::GlobalPersona {
                 persona: cfg.agent.persona.clone(),
                 user_profile: cfg.agent.user_profile.clone(),
@@ -465,7 +471,7 @@ impl ControlPlane {
 
         // Inject workspace context so sub-agents see README.md, AGENTS.md, ROADMAP.md
         let ws_context = {
-            let registry = self.workspaces.blocking_read();
+            let registry = self.workspaces.read().await;
             registry.active()
                 .map(|ws| {
                     let mut ctx = String::new();

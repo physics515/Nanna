@@ -503,3 +503,15 @@ async fn gate_edges_are_never_lost_under_racing_claims() {
             .expect("waiter must not panic");
     }
 }
+
+#[tokio::test]
+async fn default_sub_session_prompt_builds_inside_the_runtime() {
+    // It used `blocking_read`, which panics inside a tokio task — and IPC
+    // handlers always run inside one, so every sub-session spawned without an
+    // explicit system prompt took the handler down.
+    let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    *cp.system_prompt.write().await = "BASE PROMPT".to_string();
+    let prompt = cp.default_sub_session_prompt("count the files").await;
+    assert!(prompt.starts_with("BASE PROMPT"));
+    assert!(prompt.ends_with("Your task: count the files"));
+}
