@@ -29,6 +29,15 @@ const WS_READ_DEADLINE_SECS: u64 = 45;
 /// Unique identifier for a connected client
 pub type ConnectionId = String;
 
+/// A request decoded off one connection, tagged with the connection it
+/// arrived on — what the accept loop hands the daemon's request loop.
+pub type TaggedRequest = (ConnectionId, Request);
+
+/// One connection's read half, after the WebSocket stream is split.
+type WsReader = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<TcpStream>,
+>;
+
 /// Configuration for the IPC server
 #[derive(Debug, Clone)]
 pub struct IpcServerConfig {
@@ -252,7 +261,7 @@ impl ReservedIpcPort {
 
     /// The bound address (the real port when the configured one was 0).
     #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
@@ -267,8 +276,8 @@ pub struct IpcServer {
     config: IpcServerConfig,
     clients: Arc<RwLock<HashMap<ConnectionId, ClientConnection>>>,
     session_filters: Arc<SessionFilters>,
-    request_tx: mpsc::Sender<(ConnectionId, Request)>,
-    request_rx: Arc<RwLock<Option<mpsc::Receiver<(ConnectionId, Request)>>>>,
+    request_tx: mpsc::Sender<TaggedRequest>,
+    request_rx: Arc<RwLock<Option<mpsc::Receiver<TaggedRequest>>>>,
     event_tx: broadcast::Sender<Event>,
     shutdown_tx: broadcast::Sender<()>,
     /// The address the listener actually bound, published once it listens.
@@ -278,6 +287,7 @@ pub struct IpcServer {
 
 impl IpcServer {
     /// Create a new IPC server
+    #[must_use]
     pub fn new(config: IpcServerConfig) -> Self {
         let (request_tx, request_rx) = mpsc::channel(1000);
         let (event_tx, _) = broadcast::channel(1000);
@@ -302,6 +312,21 @@ impl IpcServer {
     /// (it does not permit binding over a LISTENING socket, which is what a
     /// live daemon holds). On Windows, `SO_REUSEADDR` has dangerous semantics
     /// (allows hijacking), so we retry with a short delay instead.
+    ///
+    /// # Errors
+    ///
+    /// An `InvalidInput` error when `host:port` is not a socket address, and
+    /// the bind error when the port is already held — on Windows only after
+    /// the retries above are spent.
+    #[cfg_attr(
+        not(windows),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the async is the Windows retry ladder's sleep; every caller \
+                      awaits this on every platform, so the signature is shared"
+        )
+    )]
     pub async fn reserve_port(&self) -> Result<ReservedIpcPort, std::io::Error> {
         let addr: SocketAddr = self.address().parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -336,11 +361,13 @@ impl IpcServer {
     }
 
     /// Get the address the server will bind to
+    #[must_use]
     pub fn address(&self) -> String {
         format!("{}:{}", self.config.host, self.config.port)
     }
     
     /// Get a sender for broadcasting events to clients
+    #[must_use]
     pub fn event_sender(&self) -> broadcast::Sender<Event> {
         self.event_tx.clone()
     }
@@ -354,12 +381,18 @@ impl IpcServer {
         self.session_filters.clone()
     }
 
-    pub async fn take_request_receiver(&self) -> Option<mpsc::Receiver<(ConnectionId, Request)>> {
+    pub async fn take_request_receiver(&self) -> Option<mpsc::Receiver<TaggedRequest>> {
         let mut rx_lock = self.request_rx.write().await;
         rx_lock.take()
     }
     
     /// Send a response to a specific client
+    ///
+    /// # Errors
+    ///
+    /// The rendered error string when `client_id` is not connected, when the
+    /// response cannot be serialized, or when its connection's outgoing
+    /// channel is closed (the client went away mid-send).
     pub async fn send_response(&self, client_id: &str, response: Response) -> Result<(), String> {
         let clients = self.clients.read().await;
         if let Some(client) = clients.get(client_id) {
@@ -367,12 +400,12 @@ impl IpcServer {
             client.tx.send(Message::Text(msg.into())).await.map_err(|e| e.to_string())?;
             Ok(())
         } else {
-            Err(format!("Client not found: {}", client_id))
+            Err(format!("Client not found: {client_id}"))
         }
     }
     
     /// Broadcast an event to all subscribed clients
-    pub async fn broadcast_event(&self, event: Event) {
+    pub fn broadcast_event(&self, event: Event) {
         let _ = self.event_tx.send(event);
     }
     
@@ -392,6 +425,11 @@ impl IpcServer {
     }
     
     /// Run the IPC server
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::reserve_port`] and [`Self::serve`] return: the port is
+    /// held by another process, or the reserved socket cannot start listening.
     pub async fn run(self: &Arc<Self>) -> Result<(), std::io::Error> {
         let port = self.reserve_port().await?;
         self.serve(port).await
@@ -399,6 +437,12 @@ impl IpcServer {
 
     /// Serve on a port claimed earlier by [`Self::reserve_port`]: start
     /// listening, then accept until shutdown.
+    ///
+    /// # Errors
+    ///
+    /// The error from `listen` on the reserved socket, or from handing it to
+    /// tokio. Accept errors are logged and the loop continues, and shutdown
+    /// ends it with `Ok`.
     pub async fn serve(self: &Arc<Self>, port: ReservedIpcPort) -> Result<(), std::io::Error> {
         let addr = port.addr;
         let listener = port.listen()?;
@@ -514,10 +558,10 @@ impl IpcServer {
                         if !session_filters.delivers(&filtered_client_id, &event).await {
                             continue;
                         }
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                                break;
-                            }
+                        if let Ok(json) = serde_json::to_string(&event)
+                            && ws_tx.send(Message::Text(json.into())).await.is_err()
+                        {
+                            break;
                         }
                     }
                     else => break,
@@ -525,78 +569,8 @@ impl IpcServer {
             }
         });
         
-        // Handle incoming messages. Every await here is bounded: the server
-        // pings every WS_PING_INTERVAL_SECS (the pong resets the read
-        // deadline), and a peer silent past WS_READ_DEADLINE_SECS is dropped.
-        // Without this, a force-killed client (no Close frame, Windows TCP
-        // keepalive off) left `ws_rx.next()` pending forever.
-        let client_id_for_incoming = client_id.clone();
-        let mut ping_interval =
-            tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        'incoming: loop {
-            tokio::select! {
-                maybe_msg = tokio::time::timeout(
-                    std::time::Duration::from_secs(WS_READ_DEADLINE_SECS),
-                    ws_rx.next(),
-                ) => {
-                    let msg = match maybe_msg {
-                        Err(_elapsed) => {
-                            warn!(
-                                "Read deadline ({WS_READ_DEADLINE_SECS}s) exceeded for {} — dropping dead connection",
-                                client_id_for_incoming
-                            );
-                            break 'incoming;
-                        }
-                        Ok(None) => break 'incoming,
-                        Ok(Some(m)) => m,
-                    };
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            match serde_json::from_str::<Request>(&text) {
-                                Ok(request) => {
-                                    debug!("Request from {}: {:?}", client_id_for_incoming, request.action);
-                                    if request_tx.send((client_id_for_incoming.clone(), request)).await.is_err() {
-                                        break 'incoming;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Invalid request from {}: {}", client_id_for_incoming, e);
-                                    // Send error response
-                                    let error_response = Response::error(
-                                        "unknown".to_string(),
-                                        "parse_error",
-                                        format!("Invalid request: {}", e),
-                                    );
-                                    if let Ok(json) = serde_json::to_string(&error_response) {
-                                        let _ = msg_tx.send(Message::Text(json.into())).await;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Message::Ping(data)) => {
-                            let _ = msg_tx.send(Message::Pong(data)).await;
-                        }
-                        Ok(Message::Close(_)) => {
-                            debug!("Client {} sent close", client_id_for_incoming);
-                            break 'incoming;
-                        }
-                        Err(e) => {
-                            debug!("WebSocket error for {}: {}", client_id_for_incoming, e);
-                            break 'incoming;
-                        }
-                        _ => {}
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    // Server-initiated keepalive: forces the OS to notice a
-                    // dead peer even with TCP keepalive off.
-                    if msg_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        break 'incoming;
-                    }
-                }
-            }
-        }
+        // Read until the peer closes, errors, or goes silent.
+        pump_incoming(&client_id, &mut ws_rx, &msg_tx, &request_tx).await;
         
         // Cleanup
         outgoing_task.abort();
@@ -649,6 +623,88 @@ mod tests {
     }
 }
 
+/// Read one connection until it ends, forwarding decoded requests to the
+/// daemon's request queue.
+///
+/// Every await here is bounded: the server pings every
+/// `WS_PING_INTERVAL_SECS` (the pong resets the read deadline), and a peer
+/// silent past `WS_READ_DEADLINE_SECS` is dropped. Without this, a
+/// force-killed client (no Close frame, Windows TCP keepalive off) left
+/// `ws_rx.next()` pending forever.
+async fn pump_incoming(
+    client_id: &ConnectionId,
+    ws_rx: &mut WsReader,
+    msg_tx: &mpsc::Sender<Message>,
+    request_tx: &mpsc::Sender<TaggedRequest>,
+) {
+    let mut ping_interval =
+        tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    'incoming: loop {
+        tokio::select! {
+            maybe_msg = tokio::time::timeout(
+                std::time::Duration::from_secs(WS_READ_DEADLINE_SECS),
+                ws_rx.next(),
+            ) => {
+                let msg = match maybe_msg {
+                    Err(_elapsed) => {
+                        warn!(
+                            "Read deadline ({WS_READ_DEADLINE_SECS}s) exceeded for {} — dropping dead connection",
+                            client_id
+                        );
+                        break 'incoming;
+                    }
+                    Ok(None) => break 'incoming,
+                    Ok(Some(m)) => m,
+                };
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        match serde_json::from_str::<Request>(&text) {
+                            Ok(request) => {
+                                debug!("Request from {}: {:?}", client_id, request.action);
+                                if request_tx.send((client_id.clone(), request)).await.is_err() {
+                                    break 'incoming;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Invalid request from {}: {}", client_id, e);
+                                // Send error response
+                                let error_response = Response::error(
+                                    "unknown".to_string(),
+                                    "parse_error",
+                                    format!("Invalid request: {e}"),
+                                );
+                                if let Ok(json) = serde_json::to_string(&error_response) {
+                                    let _ = msg_tx.send(Message::Text(json.into())).await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Message::Ping(data)) => {
+                        let _ = msg_tx.send(Message::Pong(data)).await;
+                    }
+                    Ok(Message::Close(_)) => {
+                        debug!("Client {} sent close", client_id);
+                        break 'incoming;
+                    }
+                    Err(e) => {
+                        debug!("WebSocket error for {}: {}", client_id, e);
+                        break 'incoming;
+                    }
+                    _ => {}
+                }
+            }
+            _ = ping_interval.tick() => {
+                // Server-initiated keepalive: forces the OS to notice a
+                // dead peer even with TCP keepalive off.
+                if msg_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break 'incoming;
+                }
+            }
+        }
+    }
+}
+
 /// What an IPC connection forwards for one receive from the shared event broadcast:
 /// the event itself; for a connection that fell behind the bounded broadcast, an
 /// `Error` event saying how many it missed so the client can resync; `None` once the
@@ -694,7 +750,7 @@ mod session_filter_tests {
 
     #[test]
     fn a_narrowed_connection_receives_only_its_sessions() {
-        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let wanted: HashSet<String> = std::iter::once("a".to_string()).collect();
         assert!(delivers(Some(&wanted), &session_event("a")));
         assert!(
             !delivers(Some(&wanted), &session_event("b")),
@@ -705,7 +761,7 @@ mod session_filter_tests {
 
     #[test]
     fn narrowing_never_drops_events_that_carry_no_session() {
-        let wanted: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let wanted: HashSet<String> = std::iter::once("a".to_string()).collect();
         assert!(delivers(Some(&wanted), &Event::ConfigChanged));
         assert!(delivers(Some(&wanted), &Event::WorkspacesChanged));
     }
