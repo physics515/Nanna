@@ -4007,6 +4007,122 @@ fn show_mission_prod(state: &RunState, options: &RunOptions, claim_unverified: b
     }
 }
 
+/// What CONTEXT gets from a memory-targeted result, which memory has already
+/// received whole: the result inline (with its handle), or a head-and-tail
+/// stub naming the handle.
+fn memory_view_of_result(
+    options: &RunOptions,
+    name: &str,
+    input: &Value,
+    result_content: String,
+    threshold: usize,
+    source_id: &str,
+    ingested: Option<(usize, usize)>,
+) -> String {
+    const INLINE_CEILING: usize = 24_000;
+    // The episodic write already happened above, for every tool
+    // regardless of target. This arm now decides one thing only:
+    // what the model SEES in return.
+
+    // `inline: true` on the CALL says "I need this in front of
+    // me, not behind a handle". The model is the only one who
+    // knows whether it is about to reason over the whole thing
+    // or merely needs it kept — so the choice belongs to it,
+    // not to a byte threshold. It is still stored either way;
+    // inline changes what CONTEXT gets, never what memory gets.
+    //
+    // Not a free pass: the point of stubbing is that context is
+    // the scarce resource, and an inlined 200 KB result is how
+    // a run ends up compacting away its own plan. So the
+    // override is honoured up to a hard ceiling and then
+    // truncated with the handle still offered.
+    let wants_inline = input
+        .get("inline")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if wants_inline && result_content.len() > INLINE_CEILING {
+        let cut = truncate_boundary(&result_content, INLINE_CEILING);
+        format!(
+            "{}\n\n[inline was requested, but {} chars is past the {} -char \
+             ceiling that protects your context. The FULL result is in memory: \
+             recall(\"{}\") — add offset/limit to page through the rest. \
+             Nothing was lost.]",
+            &result_content[..cut],
+            result_content.len(),
+            INLINE_CEILING,
+            source_id
+        )
+    } else if wants_inline {
+        // Even a fully inlined result carries its handle: it
+        // IS in memory, and a result the model can read now but
+        // cannot address later is only half-stored.
+        if options.on_memory.is_some() {
+            format!("{result_content}\n[memory:{source_id}]")
+        } else {
+            result_content
+        }
+    } else if options.on_memory.is_some() && result_content.len() <= threshold {
+        // Small results stay readable inline — the point of the
+        // threshold — but they are stored too, so the handle
+        // goes with them. One short line buys the ability to
+        // recall this exact result later instead of hoping a
+        // similarity query rediscovers it.
+        format!("{result_content}\n[memory:{source_id}]")
+    } else if options.on_memory.is_some() && result_content.len() > threshold {
+        // The rows this result ACTUALLY became, not an estimate
+        // from its raw length: run-length collapse means a
+        // repetitive result is far fewer rows than its size
+        // suggests, and a cancelled ingest is fewer still.
+        let (chunk_count, chunks_planned) = ingested.unwrap_or((1, 1));
+        // Say that a result was stubbed and against what bound.
+        // The Context arm logs its compression; this arm logged
+        // nothing at all, which is why a threshold frozen at a
+        // constant for every model went unmeasured for months.
+        info!(
+            tool = name,
+            original_len = result_content.len(),
+            threshold,
+            "🗃️ Stubbed tool output to a memory handle ({} chars > {} threshold)",
+            result_content.len(),
+            threshold
+        );
+        let digest = extractive_summary(&result_content);
+        // The stub is a HANDLE, not a hint. It names the id
+        // that `recall` resolves, so retrieval is addressed
+        // rather than guessed — the whole point of keeping the
+        // result out of context is that it can be fetched back
+        // exactly, not searched for by remembering the right
+        // words. Says SUCCEEDED and "nothing was lost" up
+        // front: an unexplained stub reads as corruption and
+        // sends models into recovery spirals.
+        // The one case where "stored whole" is not true: a stop
+        // cut the ingest short. Say so rather than promise a
+        // handle that resolves to a fraction of the result.
+        let storage = if chunk_count < chunks_planned {
+            format!(
+                "was being stored in memory when the run was CANCELLED, so only \
+                 {chunk_count} of {chunks_planned} chunk(s) landed and the rest \
+                 is not recallable"
+            )
+        } else {
+            format!("was stored whole in memory as {chunk_count} chunk(s); \
+                     nothing was lost")
+        };
+        format!(
+            "{digest}\n\n[SUMMARY ONLY — the above is the head and tail of a \
+             {} -char result from '{}', which SUCCEEDED and {}. The middle is \
+             not shown here. recall(\"{}\") returns the full text; add \
+             offset/limit to page through it.]",
+            result_content.len(),
+            name,
+            storage,
+            source_id
+        )
+    } else {
+        result_content
+    }
+}
+
 /// Fence the result-shaped objects in a zero-tool-call reply that have no
 /// provenance in `prior` — in the reply text and in every text block.
 fn fence_fabricated_results(
@@ -6850,6 +6966,211 @@ impl Agent {
             ));
         }
 
+        let breaker_notices = Self::breaker_notices(state, options, &tool_calls_with_meta).await;
+        let results = match self
+            .dispatch_tool_calls(options, &tool_calls_with_meta, &breaker_notices)
+            .await
+        {
+            ControlFlow::Continue(results) => results,
+            ControlFlow::Break(interrupted) => return interrupted,
+        };
+
+        // Phase 3: Process results sequentially (callbacks, state updates, memory)
+        for (((id, name, input, _), (response, duration_ms)), short_circuited) in
+            tool_calls_with_meta
+                .into_iter()
+                .zip(results)
+                .zip(breaker_notices.iter().map(Option::is_some))
+        {
+            tool_results.push(
+                self.process_tool_result(
+                    state,
+                    options,
+                    (id, name, input),
+                    response,
+                    duration_ms,
+                    short_circuited,
+                )
+                .await,
+            );
+        }
+
+        // Capability transitions ride the NEXT tool result after they happen
+        // (P22 Tier 4): once, attached to work the model is already reading,
+        // then silence until the state changes again. Drained only when there
+        // is a result to attach to — a drain with nowhere to deliver would
+        // silently eat the notice.
+        if let Some(ledger) = options.degradations.as_deref()
+            && let Some(first) = tool_results.first_mut()
+            && let Some(notice) = ledger.drain()
+            && let ContentBlock::ToolResult { content, .. } = first
+        {
+            content.push_str("\n\n");
+            content.push_str(&notice);
+        }
+
+        tool_results
+    }
+
+    /// Phase 3 of tool execution, for one call: callbacks, statistics, state
+    /// and breaker bookkeeping, memory — and the tool result the model sees.
+    async fn process_tool_result(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        call: (String, String, Value),
+        response: ToolResponse,
+        duration_ms: u64,
+        short_circuited: bool,
+    ) -> ContentBlock {
+        let (id, name, input) = call;
+        self.report_tool_outcome(options, &id, &name, &response, duration_ms, short_circuited)
+            .await;
+        Self::note_discovery_outcome(state, &name, &response, short_circuited);
+        let struct_broken =
+            Self::record_tool_call(state, &id, &name, &input, &response, duration_ms);
+        Self::note_repeat_call_outcome(state, &name, &input, &response, short_circuited).await;
+        let result_notices =
+            Self::outcome_notices_for_call(state, &name, &input, &response, short_circuited)
+                .await;
+
+        // A completed exec is a fact proven by execution: the command ran
+        // to a definite exit status at a known time. Record it in the
+        // context's never-compressed slot so no later summarization pass
+        // can collapse the record of what was proven — the P22 chain's
+        // final link was exactly that collapse, followed by a rewrite
+        // over ten just-verified commands.
+        if !short_circuited
+            && let Some((subject, outcome)) = exec_verified_outcome(
+                &name,
+                &input,
+                response.result.success,
+                &response.result.content,
+                response.result.error.as_deref(),
+            ) {
+                let mut ctx = self.context.write().await;
+                ctx.record_verified_outcome(subject, outcome);
+            }
+
+        let result_content = if response.result.success {
+            response.result.content
+        } else {
+            format!(
+                "Error: {}",
+                response
+                    .result
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string())
+            )
+        };
+
+        let output_target = response.output_target;
+        // Auto (0) scales with the model's INPUT budget, which is what a
+        // tool result competes for.
+        //
+        // It used to scale with `max_tokens` — the requested OUTPUT budget
+        // — and `max_tokens` carries a hardcoded default that boot
+        // deliberately does not take from config, so the "dynamic"
+        // threshold was the constant 16,384 chars for every model. On a
+        // 1M-window model that is 0.4% of the window, and a whole-file read
+        // above it came back as 600 head chars and 400 tail chars.
+        //
+        // `hard_limit` is the live enforced input bound, so this also
+        // rebinds when the window is demoted on a GPU fault — the old
+        // value never moved.
+        //
+        // The fraction is the one already in the tree: the output reserve
+        // takes a quarter of the window (`window_scaled_output_reserve`),
+        // and one tool result should not claim more of the input than that.
+        // A quarter of N tokens is N chars at the ~4 chars/token this
+        // codebase estimates with.
+        let threshold = if self.config.context_result_threshold == 0 {
+            let input_budget_tokens = { self.context.read().await.hard_limit };
+            (input_budget_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
+        } else {
+            self.config.context_result_threshold
+        };
+
+        // Memory gets EVERYTHING. `output_target` decides only what CONTEXT
+        // gets — the two were conflated, and the `Context` arm below never
+        // called `on_memory` at all. In one measured run that erased `todo`
+        // (232 calls) and `discover_tools` (139) from the store entirely:
+        // the agent could not recall its own plan or which tools it had
+        // found, only the shell output in between.
+        //
+        // The one true exclusion is the memory tools themselves. Storing
+        // what `recall` returns would copy a memory back into memory on
+        // every read, and `remember`/`day_dream` have already written
+        // theirs — so those are skipped to avoid duplication, exactly and
+        // only those.
+        // 12 hex chars, not 8. The handle is resolved by first-match, so a
+        // collision does not fail — it silently returns SOMEONE ELSE'S tool
+        // result as though it were yours. 32 bits reaches a 50% chance of
+        // some collision at ~77k records, which one long run can approach;
+        // 48 bits pushes that to ~20M.
+        let source_id = Uuid::new_v4().to_string().replace('-', "")[..12].to_string();
+        let ingested = Self::ingest_tool_result(
+            options,
+            &name,
+            &input,
+            &result_content,
+            &source_id,
+            response.result.success,
+            struct_broken,
+        )
+        .await;
+
+        let final_content = match output_target {
+            OutputTarget::Context => {
+                self.compact_context_result(&name, result_content, threshold)
+                    .await
+            }
+            OutputTarget::Memory => memory_view_of_result(
+                options,
+                &name,
+                &input,
+                result_content,
+                threshold,
+                &source_id,
+                ingested,
+            ),
+        };
+
+        // The outcome-keyed notices ride the result they describe, the way
+        // the write skill's own STRUCTURE sentence does — appended, not
+        // injected as a separate turn, and never a gate on the call.
+        let final_content = if result_notices.is_empty() {
+            final_content
+        } else {
+            format!("{final_content}{result_notices}")
+        };
+
+        // Ensure tool result content is never empty (Anthropic rejects empty text blocks)
+        let final_content = if final_content.is_empty() {
+            "[No output]".to_string()
+        } else {
+            final_content
+        };
+
+        ContentBlock::ToolResult {
+            tool_use_id: id,
+            content: final_content,
+            is_error: if response.result.success {
+                None
+            } else {
+                Some(true)
+            },
+        }
+    }
+
+    /// Phase 1.5 of tool execution: decide, before dispatch, which calls the
+    /// discovery pause or a sibling breaker short-circuits (see the comment
+    /// inside). One entry per call: the notice to return instead, or `None`.
+    async fn breaker_notices(
+        state: &RunState,
+        options: &RunOptions,
+        tool_calls_with_meta: &[(String, String, Value, ToolCall)],
+    ) -> Vec<Option<String>> {
         // Phase 1.5: the sibling breakers — one rung above the tool-call-loop
         // nudge. A call shape that has already failed REPEAT_FAILURE_BREAKER_AFTER
         // times in a row is provably broken: executing it again costs real time
@@ -6948,7 +7269,17 @@ impl Agent {
             })
             .collect();
         drop(ledger);
+        breaker_notices
+    }
 
+    /// Phase 2 of tool execution: run every call in parallel, raced against
+    /// cancellation. `Break` carries the interrupted results a cancel leaves.
+    async fn dispatch_tool_calls(
+        &self,
+        options: &RunOptions,
+        tool_calls_with_meta: &[(String, String, Value, ToolCall)],
+        breaker_notices: &[Option<String>],
+    ) -> ControlFlow<Vec<ContentBlock>, Vec<(ToolResponse, u64)>> {
         // Phase 2: Execute all tools in parallel
         info!(
             "🚀 Executing {} tools in parallel",
@@ -7013,7 +7344,7 @@ impl Agent {
                         "Cancelled mid-tool-execution — abandoning in-flight tool calls"
                     );
                     let mut interrupted = Vec::new();
-                    for (id, name, _input, _) in &tool_calls_with_meta {
+                    for (id, name, _input, _) in tool_calls_with_meta {
                         // Close the UI's tool chips: every on_tool_start fired
                         // in Phase 1 gets its matching end.
                         if let Some(ref cb) = options.on_tool_end {
@@ -7025,723 +7356,567 @@ impl Agent {
                             is_error: Some(true),
                         });
                     }
-                    return interrupted;
+                    return ControlFlow::Break(interrupted);
                 }
             }
         } else {
             futures::future::join_all(tool_futures).await
         };
+        ControlFlow::Continue(results)
+    }
 
-        // Phase 3: Process results sequentially (callbacks, state updates, memory)
-        for (((id, name, input, _), (response, duration_ms)), short_circuited) in
-            tool_calls_with_meta
-                .into_iter()
-                .zip(results)
-                .zip(breaker_notices.iter().map(Option::is_some))
-        {
-            if duration_ms > 10_000 {
-                warn!(
-                    tool = %name,
-                    duration_ms,
-                    success = response.result.success,
-                    output_len = response.result.content.len(),
-                    "🐌 Very slow tool execution (>10s)"
-                );
-            } else if duration_ms > 5_000 {
-                warn!(
-                    tool = %name,
-                    duration_ms,
-                    "⚠️ Slow tool execution (>5s)"
-                );
+    /// Log a finished call's timing, record its tool statistics, and fire
+    /// `on_tool_end`.
+    async fn report_tool_outcome(
+        &self,
+        options: &RunOptions,
+        id: &str,
+        name: &str,
+        response: &ToolResponse,
+        duration_ms: u64,
+        short_circuited: bool,
+    ) {
+        if duration_ms > 10_000 {
+            warn!(
+                tool = %name,
+                duration_ms,
+                success = response.result.success,
+                output_len = response.result.content.len(),
+                "🐌 Very slow tool execution (>10s)"
+            );
+        } else if duration_ms > 5_000 {
+            warn!(
+                tool = %name,
+                duration_ms,
+                "⚠️ Slow tool execution (>5s)"
+            );
+        } else {
+            debug!(tool = %name, duration_ms, "Tool completed");
+        }
+
+        // Record tool stats. A short-circuited call gets its own outcome:
+        // the breaker replay is harness behavior, not a tool failure.
+        if let Some(ref tracker) = self.tool_stats {
+            let error_msg = if !response.result.success && !short_circuited {
+                response.result.error.clone()
             } else {
-                debug!(tool = %name, duration_ms, "Tool completed");
-            }
-
-            // Record tool stats. A short-circuited call gets its own outcome:
-            // the breaker replay is harness behavior, not a tool failure.
-            if let Some(ref tracker) = self.tool_stats {
-                let error_msg = if !response.result.success && !short_circuited {
-                    response.result.error.clone()
-                } else {
-                    None
-                };
-                tracker
-                    .record(crate::tool_stats::ToolObservation {
-                        tool_name: name.clone(),
-                        success: response.result.success,
-                        short_circuited,
-                        duration_ms,
-                        output_size: response.result.content.len(),
-                        error: error_msg,
-                        session_id: None, // Session ID not available at this level
-                    })
-                    .await;
-            }
-
-            // Notify via callback after execution
-            if let Some(ref cb) = options.on_tool_end {
-                let result_content = if response.result.success {
-                    &response.result.content
-                } else {
-                    response.result.error.as_deref().unwrap_or("Unknown error")
-                };
-                cb(
-                    &id,
-                    &name,
-                    result_content,
-                    response.result.success,
+                None
+            };
+            tracker
+                .record(crate::tool_stats::ToolObservation {
+                    tool_name: name.to_string(),
+                    success: response.result.success,
+                    short_circuited,
                     duration_ms,
-                    response.result.data.as_ref(),
-                );
-            }
+                    output_size: response.result.content.len(),
+                    error: error_msg,
+                    session_id: None, // Session ID not available at this level
+                })
+                .await;
+        }
 
-            // Check for activate_tools in structured data (from discover_tools
-            // or any future discovery-style skill).
-            if let Some(arr) = response
-                .result
-                .data
-                .as_ref()
-                .and_then(|data| data.get("activate_tools"))
-                .and_then(Value::as_array)
-            {
-                let mut newly_activated = 0usize;
-                for tool_name in arr.iter().filter_map(Value::as_str) {
-                    if state.active_tools.insert(tool_name.to_string()) {
-                        info!(tool = tool_name, "Activating tool via discovery");
-                        newly_activated += 1;
-                    }
-                }
-                // Zero-delta discovery bookkeeping. The name is learned
-                // semantically — whatever tool returned `activate_tools` IS
-                // a discovery tool, no name hard-coded — and lowercased so a
-                // case-variant call cannot dodge the paused-name check in
-                // Phase 1.5. A short-circuited call never reaches here (its
-                // notice response carries no data), so the streak counts
-                // only real executions.
-                state.discovery_tool_names.insert(name.to_lowercase());
-                if newly_activated == 0 {
-                    state.zero_delta_discovery_streak += 1;
-                    if state.zero_delta_discovery_streak >= ZERO_DELTA_DISCOVERY_BREAKER_AFTER
-                        && !state.discovery_paused
-                    {
-                        warn!(
-                            tool = %name,
-                            zero_delta_streak = state.zero_delta_discovery_streak,
-                            "⛔ Discovery paused: {} consecutive discovery calls \
-                             activated zero new tools",
-                            state.zero_delta_discovery_streak
-                        );
-                        state.discovery_paused = true;
-                    }
-                } else {
-                    // At least one NEW tool: discovery is earning its keep —
-                    // the streak restarts from zero.
-                    state.zero_delta_discovery_streak = 0;
+        // Notify via callback after execution
+        if let Some(ref cb) = options.on_tool_end {
+            let result_content = if response.result.success {
+                &response.result.content
+            } else {
+                response.result.error.as_deref().unwrap_or("Unknown error")
+            };
+            cb(
+                id,
+                name,
+                result_content,
+                response.result.success,
+                duration_ms,
+                response.result.data.as_ref(),
+            );
+        }
+    }
+
+    /// Discovery bookkeeping for one call: activate what it discovered, track
+    /// the zero-delta streak, and lift the pause on an unknown-tool failure.
+    fn note_discovery_outcome(
+        state: &mut RunState,
+        name: &str,
+        response: &ToolResponse,
+        short_circuited: bool,
+    ) {
+        // Check for activate_tools in structured data (from discover_tools
+        // or any future discovery-style skill).
+        if let Some(arr) = response
+            .result
+            .data
+            .as_ref()
+            .and_then(|data| data.get("activate_tools"))
+            .and_then(Value::as_array)
+        {
+            let mut newly_activated = 0usize;
+            for tool_name in arr.iter().filter_map(Value::as_str) {
+                if state.active_tools.insert(tool_name.to_string()) {
+                    info!(tool = tool_name, "Activating tool via discovery");
+                    newly_activated += 1;
                 }
             }
-
-            // Un-pause discovery on the one signal it can genuinely help
-            // with: the model asked for a tool that does not resolve. The
-            // unknown-tool error is raised in the dispatch path
-            // (`ToolRegistry::execute`) and its own guidance tells the model
-            // to use discover_tools, so the pause must lift before the model
-            // follows that guidance. The streak resets too: the un-pause
-            // grants a full fresh K-window to hunt for the missing tool.
-            if state.discovery_paused
-                && !short_circuited
-                && !response.result.success
-                && is_unknown_tool_error(response.result.error.as_deref())
-            {
-                info!(
-                    tool = %name,
-                    "🔓 Unknown tool requested — un-pausing discovery \
-                     (it may genuinely help now)"
-                );
-                state.discovery_paused = false;
+            // Zero-delta discovery bookkeeping. The name is learned
+            // semantically — whatever tool returned `activate_tools` IS
+            // a discovery tool, no name hard-coded — and lowercased so a
+            // case-variant call cannot dodge the paused-name check in
+            // Phase 1.5. A short-circuited call never reaches here (its
+            // notice response carries no data), so the streak counts
+            // only real executions.
+            state.discovery_tool_names.insert(name.to_lowercase());
+            if newly_activated == 0 {
+                state.zero_delta_discovery_streak += 1;
+                if state.zero_delta_discovery_streak >= ZERO_DELTA_DISCOVERY_BREAKER_AFTER
+                    && !state.discovery_paused
+                {
+                    warn!(
+                        tool = %name,
+                        zero_delta_streak = state.zero_delta_discovery_streak,
+                        "⛔ Discovery paused: {} consecutive discovery calls \
+                         activated zero new tools",
+                        state.zero_delta_discovery_streak
+                    );
+                    state.discovery_paused = true;
+                }
+            } else {
+                // At least one NEW tool: discovery is earning its keep —
+                // the streak restarts from zero.
                 state.zero_delta_discovery_streak = 0;
             }
+        }
 
-            // Strip write content from stored tool call record (same as context
-            // blocks), but report the outcome the call ACTUALLY had.
-            //
-            // This placeholder is what the persisted record and the GUI's Input
-            // pane show. It used to assert the bytes had landed whatever
-            // happened, so a card marked failed displayed an Input claiming
-            // success — and the write guards refuse writes routinely, which is
-            // the whole point of them. A refusal is not a write.
-            let stored_input = if is_write_tool(&name) {
-                let mut input = input.clone();
-                if let Some(obj) = input.as_object_mut()
-                    && let Some(content_val) = obj.get("content") {
-                        let size = content_val
-                            .as_str()
-                            .map_or_else(|| content_val.to_string().len(), str::len);
-                        let fate = if response.result.success {
-                            format!("{size} bytes were written to disk")
-                        } else {
-                            // Covers both a guard refusing the write and a
-                            // breaker short-circuiting it before dispatch: in
-                            // neither case did the bytes land, and the result
-                            // itself says which.
-                            format!(
-                                "{size} bytes were NOT written — the tool result below says why"
-                            )
-                        };
-                        obj.insert(
-                            "content".to_string(),
-                            Value::String(format!("[content omitted from context — {fate}]")),
-                        );
-                    }
-                input
-            } else {
-                input.clone()
-            };
+        // Un-pause discovery on the one signal it can genuinely help
+        // with: the model asked for a tool that does not resolve. The
+        // unknown-tool error is raised in the dispatch path
+        // (`ToolRegistry::execute`) and its own guidance tells the model
+        // to use discover_tools, so the pause must lift before the model
+        // follows that guidance. The streak resets too: the un-pause
+        // grants a full fresh K-window to hunt for the missing tool.
+        if state.discovery_paused
+            && !short_circuited
+            && !response.result.success
+            && is_unknown_tool_error(response.result.error.as_deref())
+        {
+            info!(
+                tool = %name,
+                "🔓 Unknown tool requested — un-pausing discovery \
+                 (it may genuinely help now)"
+            );
+            state.discovery_paused = false;
+            state.zero_delta_discovery_streak = 0;
+        }
+    }
 
-            // Read before anything moves out of the result: the memory tag
-            // below needs the same fact.
-            let struct_broken = structure_broken(&response.result);
-            state.tool_records.push(ToolCallRecord {
-                id: id.clone(),
-                name: name.clone(),
-                input: stored_input,
-                // A failing tool puts its message in `error` and leaves
-                // `content` empty, so building the record from `content` alone
-                // stored the NAME of what happened and none of the substance.
-                // The model saw the text; the loop's own memory of the turn did
-                // not, and two guards read this field:
-                //   - the repeat detector compares consecutive outputs, so a
-                //     command that failed two DIFFERENT ways compared equal on
-                //     "" and the user was told the result was identical;
-                //   - the novelty check hashes a failure's first line, so it
-                //     always hashed "" and a CHANGING error never counted as
-                //     progress — draining the step budget through exactly the
-                //     debugging loop the budget exists to fund.
-                // Unprefixed on purpose: an `Error: ` prefix defeats the
-                // exit-code parse downstream.
-                output: record_output(&response.result),
-                success: response.result.success,
-                duration_ms,
-                structure_broken: struct_broken,
-            });
-
-            // Sibling-breaker bookkeeping. A short-circuited call never ran,
-            // so it neither extends nor clears anything — only real executions
-            // count. A different input is a different key and is untouched,
-            // which is also why interleaving cannot dilute a streak: calls to
-            // other shapes land in other entries, so A-B-A-B extends A's
-            // streak exactly as A-A-A would.
-            // The two streaks reset each other: a success wipes the failure
-            // streak, a failure wipes the success-identity streak — a shape
-            // whose OWN outcome alternates is making some kind of progress and
-            // trips neither breaker.
-            if !short_circuited {
-                // A successful side-effectful call moves the world forward
-                // BEFORE this call's own bookkeeping records an epoch: the
-                // mutating shape itself stores the post-bump epoch (identical
-                // write spam still breaks), while every OTHER at-threshold
-                // shape now predates the bump and earns one probe.
-                if response.result.success && is_work_evidence_tool(&name) {
-                    state.repeat_calls.bump_epoch();
-                }
-                let key = repeat_call_key(&name, &input);
-                let current_epoch = state.repeat_calls.current_epoch();
-                let mut ledger = state.repeat_calls.write().await;
-                let entry = ledger.entry(key).or_default();
-                entry.last_execution_epoch = current_epoch;
-                if response.result.success {
-                    entry.failure_count = 0;
-                    entry.last_error.clear();
-                    let hash = result_content_hash(&response.result.content);
-                    if entry.last_success_hash == Some(hash) {
-                        entry.identical_success_count += 1;
-                        // The replay payload is stored on the FIRST repeat,
-                        // not the first sighting: a shape seen once can never
-                        // render a notice, and by now the bytes are identical
-                        // anyway, so this is lossless and keeps the long tail
-                        // of never-repeated shapes tiny in a run-long ledger.
-                        if entry.last_success_excerpt.is_empty() {
-                            let end = truncate_boundary(
-                                &response.result.content,
-                                BREAKER_REPLAY_MAX_BYTES,
-                            );
-                            entry.last_success_excerpt =
-                                response.result.content[..end].to_string();
-                            entry.last_success_len = response.result.content.len();
-                        }
+    /// Push the call's record — with any written content replaced by what
+    /// happened to it. Returns whether the result reports a structure break.
+    fn record_tool_call(
+        state: &mut RunState,
+        id: &str,
+        name: &str,
+        input: &Value,
+        response: &ToolResponse,
+        duration_ms: u64,
+    ) -> bool {
+        // Strip write content from stored tool call record (same as context
+        // blocks), but report the outcome the call ACTUALLY had.
+        //
+        // This placeholder is what the persisted record and the GUI's Input
+        // pane show. It used to assert the bytes had landed whatever
+        // happened, so a card marked failed displayed an Input claiming
+        // success — and the write guards refuse writes routinely, which is
+        // the whole point of them. A refusal is not a write.
+        let stored_input = if is_write_tool(name) {
+            let mut input = input.clone();
+            if let Some(obj) = input.as_object_mut()
+                && let Some(content_val) = obj.get("content") {
+                    let size = content_val
+                        .as_str()
+                        .map_or_else(|| content_val.to_string().len(), str::len);
+                    let fate = if response.result.success {
+                        format!("{size} bytes were written to disk")
                     } else {
-                        // A DIFFERENT result restarts the streak at 1 — a
-                        // poll that observes change is untouched.
-                        entry.identical_success_count = 1;
-                        entry.last_success_hash = Some(hash);
-                        entry.last_success_excerpt.clear();
-                        entry.last_success_len = 0;
+                        // Covers both a guard refusing the write and a
+                        // breaker short-circuiting it before dispatch: in
+                        // neither case did the bytes land, and the result
+                        // itself says which.
+                        format!(
+                            "{size} bytes were NOT written — the tool result below says why"
+                        )
+                    };
+                    obj.insert(
+                        "content".to_string(),
+                        Value::String(format!("[content omitted from context — {fate}]")),
+                    );
+                }
+            input
+        } else {
+            input.clone()
+        };
+
+        // Read before anything moves out of the result: the memory tag
+        // below needs the same fact.
+        let struct_broken = structure_broken(&response.result);
+        state.tool_records.push(ToolCallRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: stored_input,
+            // A failing tool puts its message in `error` and leaves
+            // `content` empty, so building the record from `content` alone
+            // stored the NAME of what happened and none of the substance.
+            // The model saw the text; the loop's own memory of the turn did
+            // not, and two guards read this field:
+            //   - the repeat detector compares consecutive outputs, so a
+            //     command that failed two DIFFERENT ways compared equal on
+            //     "" and the user was told the result was identical;
+            //   - the novelty check hashes a failure's first line, so it
+            //     always hashed "" and a CHANGING error never counted as
+            //     progress — draining the step budget through exactly the
+            //     debugging loop the budget exists to fund.
+            // Unprefixed on purpose: an `Error: ` prefix defeats the
+            // exit-code parse downstream.
+            output: record_output(&response.result),
+            success: response.result.success,
+            duration_ms,
+            structure_broken: struct_broken,
+        });
+        struct_broken
+    }
+
+    /// Sibling-breaker bookkeeping for one executed call (see the comment
+    /// inside).
+    async fn note_repeat_call_outcome(
+        state: &RunState,
+        name: &str,
+        input: &Value,
+        response: &ToolResponse,
+        short_circuited: bool,
+    ) {
+        // Sibling-breaker bookkeeping. A short-circuited call never ran,
+        // so it neither extends nor clears anything — only real executions
+        // count. A different input is a different key and is untouched,
+        // which is also why interleaving cannot dilute a streak: calls to
+        // other shapes land in other entries, so A-B-A-B extends A's
+        // streak exactly as A-A-A would.
+        // The two streaks reset each other: a success wipes the failure
+        // streak, a failure wipes the success-identity streak — a shape
+        // whose OWN outcome alternates is making some kind of progress and
+        // trips neither breaker.
+        if !short_circuited {
+            // A successful side-effectful call moves the world forward
+            // BEFORE this call's own bookkeeping records an epoch: the
+            // mutating shape itself stores the post-bump epoch (identical
+            // write spam still breaks), while every OTHER at-threshold
+            // shape now predates the bump and earns one probe.
+            if response.result.success && is_work_evidence_tool(name) {
+                state.repeat_calls.bump_epoch();
+            }
+            let key = repeat_call_key(name, input);
+            let current_epoch = state.repeat_calls.current_epoch();
+            let mut ledger = state.repeat_calls.write().await;
+            let entry = ledger.entry(key).or_default();
+            entry.last_execution_epoch = current_epoch;
+            if response.result.success {
+                entry.failure_count = 0;
+                entry.last_error.clear();
+                let hash = result_content_hash(&response.result.content);
+                if entry.last_success_hash == Some(hash) {
+                    entry.identical_success_count += 1;
+                    // The replay payload is stored on the FIRST repeat,
+                    // not the first sighting: a shape seen once can never
+                    // render a notice, and by now the bytes are identical
+                    // anyway, so this is lossless and keeps the long tail
+                    // of never-repeated shapes tiny in a run-long ledger.
+                    if entry.last_success_excerpt.is_empty() {
+                        let end = truncate_boundary(
+                            &response.result.content,
+                            BREAKER_REPLAY_MAX_BYTES,
+                        );
+                        entry.last_success_excerpt =
+                            response.result.content[..end].to_string();
+                        entry.last_success_len = response.result.content.len();
                     }
                 } else {
-                    entry.identical_success_count = 0;
-                    entry.last_success_hash = None;
+                    // A DIFFERENT result restarts the streak at 1 — a
+                    // poll that observes change is untouched.
+                    entry.identical_success_count = 1;
+                    entry.last_success_hash = Some(hash);
                     entry.last_success_excerpt.clear();
                     entry.last_success_len = 0;
-                    entry.failure_count += 1;
-                    entry.last_error = response
-                        .result
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Unknown error".to_string());
                 }
-                drop(ledger);
+            } else {
+                entry.identical_success_count = 0;
+                entry.last_success_hash = None;
+                entry.last_success_excerpt.clear();
+                entry.last_success_len = 0;
+                entry.failure_count += 1;
+                entry.last_error = response
+                    .result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string());
             }
+            drop(ledger);
+        }
+    }
 
-            // Two guards the argument-keyed bookkeeping above cannot see, both
-            // keyed on what came BACK rather than on what was sent. Only
-            // executed calls count: a short-circuited call produced a replay of
-            // something the model already had, and folding replays in would let
-            // a breaker manufacture its own streak.
-            let mut result_notices = String::new();
-            if !short_circuited {
-                // Record-then-report over this call's structural outcome —
-                // see `structural_notices_for_call` for why the order inside
-                // it is load-bearing.
-                result_notices.push_str(
-                    &structural_notices_for_call(
-                        &state.repeat_calls,
-                        &name,
-                        &input,
-                        &response.result,
-                    )
-                    .await,
-                );
+    /// The outcome-keyed notices one executed call earns (see the comment
+    /// inside), ready to append to its result.
+    async fn outcome_notices_for_call(
+        state: &RunState,
+        name: &str,
+        input: &Value,
+        response: &ToolResponse,
+        short_circuited: bool,
+    ) -> String {
+        // Two guards the argument-keyed bookkeeping above cannot see, both
+        // keyed on what came BACK rather than on what was sent. Only
+        // executed calls count: a short-circuited call produced a replay of
+        // something the model already had, and folding replays in would let
+        // a breaker manufacture its own streak.
+        let mut result_notices = String::new();
+        if !short_circuited {
+            // Record-then-report over this call's structural outcome —
+            // see `structural_notices_for_call` for why the order inside
+            // it is load-bearing.
+            result_notices.push_str(
+                &structural_notices_for_call(
+                    &state.repeat_calls,
+                    name,
+                    input,
+                    &response.result,
+                )
+                .await,
+            );
 
-                // Rewording a call that keeps returning the same thing. The
-                // per-shape streaks never build, because every rewording opens
-                // a fresh key — which is exactly what the model is doing.
-                //
-                // The write and memory families are excluded because their
-                // result text is a RECEIPT, not the information: what a
-                // `write_file` or a `remember` produced is on disk or in the
-                // store, and three receipts reading alike says nothing about
-                // whether the run is making progress. Everything that reports
-                // rather than mutates — `exec` above all, the tool the hanging
-                // script was launched with fifteen times — is covered.
-                // FAILURES only. The motivating evidence is entirely failing
-                // calls — one hanging script relaunched under nine different
-                // command strings — and folding successes in produces a false
-                // accusation on ordinary progressing work: three DIFFERENT
-                // successful commands that each print nothing (`mkdir -p`,
-                // `touch`, `git add`) all return the same empty output, and the
-                // model was told it had "worded them differently" to no effect.
-                // Restricting to failures keeps the whole motivating case and
-                // removes that.
-                if !is_claim_write_family(&name)
-                    && !is_memory_tool(&name)
-                    && let Some(record) = state.tool_records.last()
-                    && !record.success
+            // Rewording a call that keeps returning the same thing. The
+            // per-shape streaks never build, because every rewording opens
+            // a fresh key — which is exactly what the model is doing.
+            //
+            // The write and memory families are excluded because their
+            // result text is a RECEIPT, not the information: what a
+            // `write_file` or a `remember` produced is on disk or in the
+            // store, and three receipts reading alike says nothing about
+            // whether the run is making progress. Everything that reports
+            // rather than mutates — `exec` above all, the tool the hanging
+            // script was launched with fifteen times — is covered.
+            // FAILURES only. The motivating evidence is entirely failing
+            // calls — one hanging script relaunched under nine different
+            // command strings — and folding successes in produces a false
+            // accusation on ordinary progressing work: three DIFFERENT
+            // successful commands that each print nothing (`mkdir -p`,
+            // `touch`, `git add`) all return the same empty output, and the
+            // model was told it had "worded them differently" to no effect.
+            // Restricting to failures keeps the whole motivating case and
+            // removes that.
+            if !is_claim_write_family(name)
+                && !is_memory_tool(name)
+                && let Some(record) = state.tool_records.last()
+                && !record.success
+            {
+                let signature = name_outcome_signature(record);
+                if let Some(streak) = state
+                    .repeat_calls
+                    .record_name_outcome(name, &repeat_call_key(name, input), signature)
+                    .await
                 {
-                    let signature = name_outcome_signature(record);
-                    if let Some(streak) = state
-                        .repeat_calls
-                        .record_name_outcome(&name, &repeat_call_key(&name, &input), signature)
-                        .await
-                    {
+                    warn!(
+                        tool = %name,
+                        streak,
+                        "🔁 {} consecutive `{}` calls returned the same outcome across \
+                         different arguments — telling the model rewording is not the fix",
+                        streak,
+                        name
+                    );
+                    result_notices.push_str(&name_zero_info_notice(name, streak));
+                }
+            }
+        }
+        result_notices
+    }
+
+    /// Store the call's result in memory, run-length collapsed and chunked.
+    /// Returns `(rows written, rows planned)` when an ingest ran.
+    async fn ingest_tool_result(
+        options: &RunOptions,
+        name: &str,
+        input: &Value,
+        result_content: &str,
+        source_id: &str,
+        success: bool,
+        struct_broken: bool,
+    ) -> Option<(usize, usize)> {
+        // (rows written, rows this result became). The stub below promises
+        // a chunk count, and it used to ESTIMATE one by dividing the raw
+        // byte length — which the collapse below now deliberately makes
+        // wrong, and which a cancelled ingest makes wrong anyway. Carry the
+        // real numbers instead so the promise matches what the handle will
+        // actually reassemble.
+        let mut ingested: Option<(usize, usize)> = None;
+        if !is_memory_tool(name)
+            && let Some(ref on_memory) = options.on_memory {
+                // Run-length-collapse BEFORE chunking. Chunk count is
+                // driven by bytes and each chunk costs an embedding
+                // round-trip, a vector search and an insert — so a result
+                // that is one line repeated buys N rows' worth of cost for
+                // one line's worth of information. Lossless and reversible,
+                // so the stub's "nothing was lost" and the `source_id`
+                // reassembly path both stay true.
+                let ingest_content = collapse_repeated_lines(result_content);
+                let chunks = if ingest_content.len() > nanna_memory::MEMORY_CHUNK_MAX_CHARS {
+                    semantic_chunk(&ingest_content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15)
+                } else {
+                    vec![(0, ingest_content.to_string())]
+                };
+                let total_chunks = chunks.len();
+                ingested = Some((total_chunks, total_chunks));
+
+                // What the call WAS, so the episode is retrievable by its
+                // subject and not just by words in its output. A bare output
+                // blob answers "what did it say" but not "what did I do to
+                // that file, and did it work" — which is what a future step
+                // actually asks.
+                let target = input
+                    .get("file_path")
+                    .or_else(|| input.get("path"))
+                    .or_else(|| input.get("command"))
+                    .or_else(|| input.get("query"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        s.chars().take(CALL_IDENTIFICATION_WIDTH).collect::<String>()
+                    });
+                // A third outcome, because there are three. An edit that
+                // lands and breaks the file used to be tagged "ok", so the
+                // session's own record of the destroying event said it
+                // succeeded.
+                let outcome = if !success {
+                    "FAILED"
+                } else if struct_broken {
+                    "ok — DOES NOT PARSE"
+                } else {
+                    "ok"
+                };
+
+                for (idx, chunk_content) in &chunks {
+                    // Stop means stop, including the writing. Each chunk is
+                    // an embedding round-trip against the same local model
+                    // server that serves generation, so a big result keeps a
+                    // stopped session busy long after the user gave up on it
+                    // — observed live: still ingesting 34 minutes after the
+                    // stop had cancelled the session. Checked between whole
+                    // rows, so nothing is half-written: what already landed
+                    // stays, and the count carried forward says how much.
+                    if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
                         warn!(
                             tool = %name,
-                            streak,
-                            "🔁 {} consecutive `{}` calls returned the same outcome across \
-                             different arguments — telling the model rewording is not the fix",
-                            streak,
-                            name
+                            stored = *idx,
+                            total = total_chunks,
+                            "🛑 Cancelled mid-ingest — stopped after {} of {} memory chunks",
+                            idx,
+                            total_chunks
                         );
-                        result_notices.push_str(&name_zero_info_notice(&name, streak));
+                        ingested = Some((*idx, total_chunks));
+                        break;
                     }
+                    let mut tags = HashMap::new();
+                    tags.insert("tool".to_string(), name.to_string());
+                    tags.insert("source_id".to_string(), source_id.to_string());
+                    tags.insert("outcome".to_string(), outcome.to_string());
+                    if let Some(ref t) = target {
+                        tags.insert("target".to_string(), t.clone());
+                    }
+                    tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
+
+                    on_memory(ExtractedMemory {
+                        content: target.as_ref().map_or_else(
+                            || format!("[{name} — {outcome}] {chunk_content}"),
+                            |t| format!("[{name} → {t} — {outcome}] {chunk_content}"),
+                        ),
+                        category: TOOL_RESULT_CATEGORY.to_string(),
+                        // A tool result is always agent-observed, never a user statement.
+                        provenance: MemoryProvenance::Observed,
+                        tags: Some(tags),
+                    })
+                    .await;
                 }
             }
+        ingested
+    }
 
-            // A completed exec is a fact proven by execution: the command ran
-            // to a definite exit status at a known time. Record it in the
-            // context's never-compressed slot so no later summarization pass
-            // can collapse the record of what was proven — the P22 chain's
-            // final link was exactly that collapse, followed by a rewrite
-            // over ten just-verified commands.
-            if !short_circuited
-                && let Some((subject, outcome)) = exec_verified_outcome(
-                    &name,
-                    &input,
-                    response.result.success,
-                    &response.result.content,
-                    response.result.error.as_deref(),
-                ) {
-                    let mut ctx = self.context.write().await;
-                    ctx.record_verified_outcome(subject, outcome);
-                }
+    /// What CONTEXT gets from a context-targeted result: the whole result, or
+    /// — past `threshold` — its compression, summary or truncation.
+    async fn compact_context_result(
+        &self,
+        name: &str,
+        result_content: String,
+        threshold: usize,
+    ) -> String {
+        // Context-targeted tools: never store in memory, never stub.
+        // For large outputs: try LLMLingua compression → summarization → truncation.
+        // Compression walks `summarization_priority` (settings) with client failover.
+        if result_content.len() > threshold {
+            let compressed = crate::compressor::compress_with_priority(
+                &result_content,
+                4,
+                &self.config.summarization_priority,
+                |model_spec| self.create_client_for_model(model_spec),
+            )
+            .await;
 
-            let result_content = if response.result.success {
-                response.result.content
-            } else {
-                format!(
-                    "Error: {}",
-                    response
-                        .result
-                        .error
-                        .unwrap_or_else(|| "Unknown error".to_string())
-                )
-            };
-
-            let output_target = response.output_target;
-            // Auto (0) scales with the model's INPUT budget, which is what a
-            // tool result competes for.
-            //
-            // It used to scale with `max_tokens` — the requested OUTPUT budget
-            // — and `max_tokens` carries a hardcoded default that boot
-            // deliberately does not take from config, so the "dynamic"
-            // threshold was the constant 16,384 chars for every model. On a
-            // 1M-window model that is 0.4% of the window, and a whole-file read
-            // above it came back as 600 head chars and 400 tail chars.
-            //
-            // `hard_limit` is the live enforced input bound, so this also
-            // rebinds when the window is demoted on a GPU fault — the old
-            // value never moved.
-            //
-            // The fraction is the one already in the tree: the output reserve
-            // takes a quarter of the window (`window_scaled_output_reserve`),
-            // and one tool result should not claim more of the input than that.
-            // A quarter of N tokens is N chars at the ~4 chars/token this
-            // codebase estimates with.
-            let threshold = if self.config.context_result_threshold == 0 {
-                let input_budget_tokens = { self.context.read().await.hard_limit };
-                (input_budget_tokens / 4) * CHARS_PER_TOKEN_ESTIMATE
-            } else {
-                self.config.context_result_threshold
-            };
-
-            // Memory gets EVERYTHING. `output_target` decides only what CONTEXT
-            // gets — the two were conflated, and the `Context` arm below never
-            // called `on_memory` at all. In one measured run that erased `todo`
-            // (232 calls) and `discover_tools` (139) from the store entirely:
-            // the agent could not recall its own plan or which tools it had
-            // found, only the shell output in between.
-            //
-            // The one true exclusion is the memory tools themselves. Storing
-            // what `recall` returns would copy a memory back into memory on
-            // every read, and `remember`/`day_dream` have already written
-            // theirs — so those are skipped to avoid duplication, exactly and
-            // only those.
-            // 12 hex chars, not 8. The handle is resolved by first-match, so a
-            // collision does not fail — it silently returns SOMEONE ELSE'S tool
-            // result as though it were yours. 32 bits reaches a 50% chance of
-            // some collision at ~77k records, which one long run can approach;
-            // 48 bits pushes that to ~20M.
-            let source_id = Uuid::new_v4().to_string().replace('-', "")[..12].to_string();
-            // (rows written, rows this result became). The stub below promises
-            // a chunk count, and it used to ESTIMATE one by dividing the raw
-            // byte length — which the collapse below now deliberately makes
-            // wrong, and which a cancelled ingest makes wrong anyway. Carry the
-            // real numbers instead so the promise matches what the handle will
-            // actually reassemble.
-            let mut ingested: Option<(usize, usize)> = None;
-            if !is_memory_tool(&name)
-                && let Some(ref on_memory) = options.on_memory {
-                    // Run-length-collapse BEFORE chunking. Chunk count is
-                    // driven by bytes and each chunk costs an embedding
-                    // round-trip, a vector search and an insert — so a result
-                    // that is one line repeated buys N rows' worth of cost for
-                    // one line's worth of information. Lossless and reversible,
-                    // so the stub's "nothing was lost" and the `source_id`
-                    // reassembly path both stay true.
-                    let ingest_content = collapse_repeated_lines(&result_content);
-                    let chunks = if ingest_content.len() > nanna_memory::MEMORY_CHUNK_MAX_CHARS {
-                        semantic_chunk(&ingest_content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15)
-                    } else {
-                        vec![(0, ingest_content.to_string())]
-                    };
-                    let total_chunks = chunks.len();
-                    ingested = Some((total_chunks, total_chunks));
-
-                    // What the call WAS, so the episode is retrievable by its
-                    // subject and not just by words in its output. A bare output
-                    // blob answers "what did it say" but not "what did I do to
-                    // that file, and did it work" — which is what a future step
-                    // actually asks.
-                    let target = input
-                        .get("file_path")
-                        .or_else(|| input.get("path"))
-                        .or_else(|| input.get("command"))
-                        .or_else(|| input.get("query"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| {
-                            s.chars().take(CALL_IDENTIFICATION_WIDTH).collect::<String>()
-                        });
-                    // A third outcome, because there are three. An edit that
-                    // lands and breaks the file used to be tagged "ok", so the
-                    // session's own record of the destroying event said it
-                    // succeeded.
-                    let outcome = if !response.result.success {
-                        "FAILED"
-                    } else if struct_broken {
-                        "ok — DOES NOT PARSE"
-                    } else {
-                        "ok"
-                    };
-
-                    for (idx, chunk_content) in &chunks {
-                        // Stop means stop, including the writing. Each chunk is
-                        // an embedding round-trip against the same local model
-                        // server that serves generation, so a big result keeps a
-                        // stopped session busy long after the user gave up on it
-                        // — observed live: still ingesting 34 minutes after the
-                        // stop had cancelled the session. Checked between whole
-                        // rows, so nothing is half-written: what already landed
-                        // stays, and the count carried forward says how much.
-                        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                            warn!(
-                                tool = %name,
-                                stored = *idx,
-                                total = total_chunks,
-                                "🛑 Cancelled mid-ingest — stopped after {} of {} memory chunks",
-                                idx,
-                                total_chunks
-                            );
-                            ingested = Some((*idx, total_chunks));
-                            break;
-                        }
-                        let mut tags = HashMap::new();
-                        tags.insert("tool".to_string(), name.clone());
-                        tags.insert("source_id".to_string(), source_id.clone());
-                        tags.insert("outcome".to_string(), outcome.to_string());
-                        if let Some(ref t) = target {
-                            tags.insert("target".to_string(), t.clone());
-                        }
-                        tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
-
-                        on_memory(ExtractedMemory {
-                            content: target.as_ref().map_or_else(
-                                || format!("[{name} — {outcome}] {chunk_content}"),
-                                |t| format!("[{name} → {t} — {outcome}] {chunk_content}"),
-                            ),
-                            category: TOOL_RESULT_CATEGORY.to_string(),
-                            // A tool result is always agent-observed, never a user statement.
-                            provenance: MemoryProvenance::Observed,
-                            tags: Some(tags),
-                        })
-                        .await;
-                    }
-                }
-
-            let final_content = match output_target {
-                OutputTarget::Context => {
-                    // Context-targeted tools: never store in memory, never stub.
-                    // For large outputs: try LLMLingua compression → summarization → truncation.
-                    // Compression walks `summarization_priority` (settings) with client failover.
-                    if result_content.len() > threshold {
-                        let compressed = crate::compressor::compress_with_priority(
-                            &result_content,
-                            4,
-                            &self.config.summarization_priority,
-                            |model_spec| self.create_client_for_model(model_spec),
-                        )
-                        .await;
-
-                        if let Some(compressed) = compressed {
-                            if compressed.len() < result_content.len() / 2 {
-                                info!(
-                                    tool = name,
-                                    original_len = result_content.len(),
-                                    compressed_len = compressed.len(),
-                                    "🗜️ Compressed tool output ({} → {} chars)",
-                                    result_content.len(),
-                                    compressed.len()
-                                );
-                                compressed
-                            } else if let Some(summarized) =
-                                self.summarize_tool_output(&name, &result_content).await
-                            {
-                                summarized
-                            } else {
-                                let end = truncate_boundary(&result_content, threshold);
-                                format!(
-                                    "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
-                                     crowd out your limited context window, so only {end} \
-                                     chars are shown. The tool call SUCCEEDED in full and \
-                                     its effect is intact.]",
-                                    &result_content[..end],
-                                    result_content.len()
-                                )
-                            }
-                        } else if let Some(summarized) =
-                            self.summarize_tool_output(&name, &result_content).await
-                        {
-                            info!(
-                                tool = name,
-                                original_len = result_content.len(),
-                                summarized_len = summarized.len(),
-                                "📝 Summarized tool output ({} → {} chars)",
-                                result_content.len(),
-                                summarized.len()
-                            );
-                            summarized
-                        } else {
-                            // Fallback: truncate at a clean boundary
-                            let end = truncate_boundary(&result_content, threshold);
-                            format!(
-                                "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
-                                 crowd out your limited context window, so only {end} chars \
-                                 are shown. The tool call SUCCEEDED in full and its effect \
-                                 is intact. Use recall with a more specific query for \
-                                 particular details.]",
-                                &result_content[..end],
-                                result_content.len()
-                            )
-                        }
-                    } else {
-                        result_content
-                    }
-                }
-                OutputTarget::Memory => {
-                    // The episodic write already happened above, for every tool
-                    // regardless of target. This arm now decides one thing only:
-                    // what the model SEES in return.
-
-                    // `inline: true` on the CALL says "I need this in front of
-                    // me, not behind a handle". The model is the only one who
-                    // knows whether it is about to reason over the whole thing
-                    // or merely needs it kept — so the choice belongs to it,
-                    // not to a byte threshold. It is still stored either way;
-                    // inline changes what CONTEXT gets, never what memory gets.
-                    //
-                    // Not a free pass: the point of stubbing is that context is
-                    // the scarce resource, and an inlined 200 KB result is how
-                    // a run ends up compacting away its own plan. So the
-                    // override is honoured up to a hard ceiling and then
-                    // truncated with the handle still offered.
-                    let wants_inline = input
-                        .get("inline")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    const INLINE_CEILING: usize = 24_000;
-                    if wants_inline && result_content.len() > INLINE_CEILING {
-                        let cut = truncate_boundary(&result_content, INLINE_CEILING);
-                        format!(
-                            "{}\n\n[inline was requested, but {} chars is past the {} -char \
-                             ceiling that protects your context. The FULL result is in memory: \
-                             recall(\"{}\") — add offset/limit to page through the rest. \
-                             Nothing was lost.]",
-                            &result_content[..cut],
-                            result_content.len(),
-                            INLINE_CEILING,
-                            source_id
-                        )
-                    } else if wants_inline {
-                        // Even a fully inlined result carries its handle: it
-                        // IS in memory, and a result the model can read now but
-                        // cannot address later is only half-stored.
-                        if options.on_memory.is_some() {
-                            format!("{result_content}\n[memory:{source_id}]")
-                        } else {
-                            result_content
-                        }
-                    } else if options.on_memory.is_some() && result_content.len() <= threshold {
-                        // Small results stay readable inline — the point of the
-                        // threshold — but they are stored too, so the handle
-                        // goes with them. One short line buys the ability to
-                        // recall this exact result later instead of hoping a
-                        // similarity query rediscovers it.
-                        format!("{result_content}\n[memory:{source_id}]")
-                    } else if options.on_memory.is_some() && result_content.len() > threshold {
-                        // The rows this result ACTUALLY became, not an estimate
-                        // from its raw length: run-length collapse means a
-                        // repetitive result is far fewer rows than its size
-                        // suggests, and a cancelled ingest is fewer still.
-                        let (chunk_count, chunks_planned) = ingested.unwrap_or((1, 1));
-                        // Say that a result was stubbed and against what bound.
-                        // The Context arm logs its compression; this arm logged
-                        // nothing at all, which is why a threshold frozen at a
-                        // constant for every model went unmeasured for months.
-                        info!(
-                            tool = name,
-                            original_len = result_content.len(),
-                            threshold,
-                            "🗃️ Stubbed tool output to a memory handle ({} chars > {} threshold)",
-                            result_content.len(),
-                            threshold
-                        );
-                        let digest = extractive_summary(&result_content);
-                        // The stub is a HANDLE, not a hint. It names the id
-                        // that `recall` resolves, so retrieval is addressed
-                        // rather than guessed — the whole point of keeping the
-                        // result out of context is that it can be fetched back
-                        // exactly, not searched for by remembering the right
-                        // words. Says SUCCEEDED and "nothing was lost" up
-                        // front: an unexplained stub reads as corruption and
-                        // sends models into recovery spirals.
-                        // The one case where "stored whole" is not true: a stop
-                        // cut the ingest short. Say so rather than promise a
-                        // handle that resolves to a fraction of the result.
-                        let storage = if chunk_count < chunks_planned {
-                            format!(
-                                "was being stored in memory when the run was CANCELLED, so only \
-                                 {chunk_count} of {chunks_planned} chunk(s) landed and the rest \
-                                 is not recallable"
-                            )
-                        } else {
-                            format!("was stored whole in memory as {chunk_count} chunk(s); \
-                                     nothing was lost")
-                        };
-                        format!(
-                            "{digest}\n\n[SUMMARY ONLY — the above is the head and tail of a \
-                             {} -char result from '{}', which SUCCEEDED and {}. The middle is \
-                             not shown here. recall(\"{}\") returns the full text; add \
-                             offset/limit to page through it.]",
-                            result_content.len(),
-                            name,
-                            storage,
-                            source_id
-                        )
-                    } else {
-                        result_content
-                    }
-                }
-            };
-
-            // The outcome-keyed notices ride the result they describe, the way
-            // the write skill's own STRUCTURE sentence does — appended, not
-            // injected as a separate turn, and never a gate on the call.
-            let final_content = if result_notices.is_empty() {
-                final_content
-            } else {
-                format!("{final_content}{result_notices}")
-            };
-
-            // Ensure tool result content is never empty (Anthropic rejects empty text blocks)
-            let final_content = if final_content.is_empty() {
-                "[No output]".to_string()
-            } else {
-                final_content
-            };
-
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: id.clone(),
-                content: final_content,
-                is_error: if response.result.success {
-                    None
+            if let Some(compressed) = compressed {
+                if compressed.len() < result_content.len() / 2 {
+                    info!(
+                        tool = name,
+                        original_len = result_content.len(),
+                        compressed_len = compressed.len(),
+                        "🗜️ Compressed tool output ({} → {} chars)",
+                        result_content.len(),
+                        compressed.len()
+                    );
+                    compressed
+                } else if let Some(summarized) =
+                    self.summarize_tool_output(name, &result_content).await
+                {
+                    summarized
                 } else {
-                    Some(true)
-                },
-            });
+                    let end = truncate_boundary(&result_content, threshold);
+                    format!(
+                        "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
+                         crowd out your limited context window, so only {end} \
+                         chars are shown. The tool call SUCCEEDED in full and \
+                         its effect is intact.]",
+                        &result_content[..end],
+                        result_content.len()
+                    )
+                }
+            } else if let Some(summarized) =
+                self.summarize_tool_output(name, &result_content).await
+            {
+                info!(
+                    tool = name,
+                    original_len = result_content.len(),
+                    summarized_len = summarized.len(),
+                    "📝 Summarized tool output ({} → {} chars)",
+                    result_content.len(),
+                    summarized.len()
+                );
+                summarized
+            } else {
+                // Fallback: truncate at a clean boundary
+                let end = truncate_boundary(&result_content, threshold);
+                format!(
+                    "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
+                     crowd out your limited context window, so only {end} chars \
+                     are shown. The tool call SUCCEEDED in full and its effect \
+                     is intact. Use recall with a more specific query for \
+                     particular details.]",
+                    &result_content[..end],
+                    result_content.len()
+                )
+            }
+        } else {
+            result_content
         }
-
-        // Capability transitions ride the NEXT tool result after they happen
-        // (P22 Tier 4): once, attached to work the model is already reading,
-        // then silence until the state changes again. Drained only when there
-        // is a result to attach to — a drain with nowhere to deliver would
-        // silently eat the notice.
-        if let Some(ledger) = options.degradations.as_deref()
-            && let Some(first) = tool_results.first_mut()
-            && let Some(notice) = ledger.drain()
-            && let ContentBlock::ToolResult { content, .. } = first
-        {
-            content.push_str("\n\n");
-            content.push_str(&notice);
-        }
-
-        tool_results
     }
 
     /// Check if an error indicates the context length was exceeded.
