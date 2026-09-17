@@ -6768,7 +6768,7 @@ keep the phases readable; promote individual items into a phase when they become
       probe then repeated on a clean 30s cadence with a fresh client UUID each time. Shutdown was clean
       (`nanna-daemon.exit.json` → `"reason": "clean_shutdown"`).
 
-- [ ] *(found 2026-09-17)* **The GUI calls `std::env::set_var` from async Tauri commands.**
+- [~] *(found 2026-09-17)* **The GUI calls `std::env::set_var` from async Tauri commands.**
       `set_provider_api_key` sets `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/… in the GUI process "for this
       session", under `unsafe` blocks whose note says "single-threaded application context" — Tauri runs
       commands on a multi-threaded tokio runtime, and glibc `setenv` racing any concurrent `getenv` is
@@ -6777,6 +6777,13 @@ keep the phases readable; promote individual items into a phase when they become
       (already hydrated from the keyring) and drop the env writes, not to add a lock.
       Same day: the legacy `set_api_key` command was deleted — no frontend caller, and it lost the key
       (`save()` strips secrets and it never wrote the keyring) while logging "API key updated".
+      *(same day)* The five API keys no longer go through `set_var`: `set_provider_api_key` writes the
+      secure store and the GUI reads `config` (refilled from it). That also fixed a restart bug —
+      `get_openai_models` and the Brave "key set" badge read **only** env, so a stored key vanished
+      from them after the GUI restarted. Still on `set_var`: the Claude proxy URL/flag (env is its
+      only store — it needs a config field) and `OLLAMA_HOST`. Precedence note: an `OPENAI_API_KEY`
+      exported before launch now wins over a key typed into Settings in the GUI process, as it
+      already did in the daemon (`load_secrets_from_store` prefers env).
 - [ ] *(found 2026-09-17)* **The AppImage does not bundle on this Arch host — two host-tool causes,
       neither in our code.** `pnpm tauri build` produced `nanna-gui` and `Nanna_0.3.21_amd64.deb`, then
       `failed to run linuxdeploy`. Run by hand: (1) linuxdeploy's bundled `strip` rejects Arch's system

@@ -226,7 +226,8 @@ pub async fn get_extended_settings(
         claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
         claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
             .unwrap_or_else(|_| "http://localhost:3456".to_string()),
-        brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
+        brave_key_set: state_guard.config.tools.brave_api_key.is_some()
+            || std::env::var("BRAVE_API_KEY").is_ok(),
 
         // Anthropic OAuth status
         anthropic_oauth_logged_in: state_guard.config.llm.anthropic_oauth_token.is_some(),
@@ -356,28 +357,18 @@ pub async fn set_provider_api_key(
     let mut state_guard = state.write().await;
 
     // The daemon owns the live LLM clients and tool registry; persist the key to
-    // config (+ env for this process) and let the daemon reload.
+    // the secure store and let the daemon reload. This process reads keys from
+    // `state_guard.config` (refilled from the store below), not from its own
+    // environment: `set_var` from a command running on the multi-threaded
+    // runtime races every concurrent `getenv`, and an env copy was gone after a
+    // restart anyway — `get_openai_models` read only env, so a stored OpenAI key
+    // stopped listing models once the GUI restarted.
     match provider.as_str() {
-        "anthropic" => {
-            state_guard.config.llm.api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
-        }
-        "openai" => {
-            state_guard.config.llm.openai_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
-        }
-        "brave" => {
-            state_guard.config.tools.brave_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("BRAVE_API_KEY", &api_key); }
-        }
-        "openrouter" => {
-            state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
-        }
-        "github" => {
-            state_guard.config.llm.github_token = Some(api_key.clone());
-            unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
-        }
+        "anthropic" => state_guard.config.llm.api_key = Some(api_key.clone()),
+        "openai" => state_guard.config.llm.openai_api_key = Some(api_key.clone()),
+        "brave" => state_guard.config.tools.brave_api_key = Some(api_key.clone()),
+        "openrouter" => state_guard.config.llm.openrouter_api_key = Some(api_key.clone()),
+        "github" => state_guard.config.llm.github_token = Some(api_key.clone()),
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
             unsafe {
@@ -1075,9 +1066,13 @@ pub async fn get_anthropic_models(
 
 /// Fetch available models from OpenAI
 #[tauri::command]
-pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "No OpenAI API key configured")?;
+pub async fn get_openai_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    // Config first: it holds the keyring copy, which survives a restart.
+    let api_key = state.read().await.config.llm.openai_api_key.clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .ok_or("No OpenAI API key configured")?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
