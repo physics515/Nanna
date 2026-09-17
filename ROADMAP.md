@@ -4828,6 +4828,12 @@ asks permission or restricts her.)*:
       4 s tick refreshes every mid-turn session, and a session with no event for two beat intervals
       (60 s; a live turn always beats) is dropped, so a crashed turn cannot show "typing…" forever.
       Paused-time test over 10 s of silence and a dead turn; both halves mutation-checked.
+      Found in self-review before the PR: the first version awaited each typing call inside the
+      reply forwarder, so a provider outage (30 s client timeout per call) would let the forwarder
+      fall behind the event bus and **skip a `message_end` — a lost reply** to save an indicator.
+      Typing sends are detached tasks now (≤ one per session per 4 s, each ending at that timeout).
+      Cost: a typing call can land just after the reply, showing "typing…" for up to 5 s after
+      the answer on Telegram.
       - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
             now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
             calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview

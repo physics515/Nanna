@@ -700,15 +700,26 @@ fn typing_abandon_after() -> std::time::Duration {
     std::time::Duration::from_secs(crate::liveness::beat_interval_secs().saturating_mul(2))
 }
 
-/// Send one "typing…" for `route`; failures are logged, never retried.
-async fn send_typing_to(router: &RwLock<MessageRouter>, session_id: &str, route: &ReplyChannel) {
-    let router = router.read().await;
-    if let Some(channel) = router.get(&route.provider) {
-        let target = ChannelId::new(&route.provider, &route.id);
-        if let Err(e) = channel.send_typing(&target).await {
-            debug!("typing indicator for {session_id} not sent: {e}");
+/// Send one "typing…" for `route` on its own task; failures are logged,
+/// never retried.
+///
+/// Detached because the forwarder must never wait on it: during a provider
+/// outage each call can take the channel client's whole 30 s timeout, the
+/// forwarder would fall behind the event bus, and a skipped `message_end` is a
+/// reply never sent — far worse than a missing indicator. Bounded: at most one
+/// per session per [`TYPING_REFRESH`], each ending at that client timeout.
+fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: &ReplyChannel) {
+    let router = Arc::clone(router);
+    let session_id = session_id.to_string();
+    let target = ChannelId::new(&route.provider, &route.id);
+    tokio::spawn(async move {
+        let router = router.read().await;
+        if let Some(channel) = router.get(&target.provider) {
+            if let Err(e) = channel.send_typing(&target).await {
+                debug!("typing indicator for {session_id} not sent: {e}");
+            }
         }
-    }
+    });
 }
 
 /// Forward replies for channel-routed sessions back through `router`.
@@ -746,7 +757,7 @@ pub fn spawn_reply_forwarder(
                     for (session_id, state) in &mut typing {
                         if typing_due(Some(state.last_sent), now) {
                             state.last_sent = now;
-                            send_typing_to(&router, session_id, &state.route).await;
+                            send_typing_to(&router, session_id, &state.route);
                         }
                     }
                     continue;
@@ -769,7 +780,7 @@ pub fn spawn_reply_forwarder(
                     if let Some(state) = typing.get_mut(session_id) {
                         state.last_event = now;
                     } else if let Some(route) = sessions.reply_channel(session_id).await {
-                        send_typing_to(&router, session_id, &route).await;
+                        send_typing_to(&router, session_id, &route);
                         typing.insert(
                             session_id.to_string(),
                             Typing {
@@ -1331,9 +1342,11 @@ mod tests {
             })
             .expect("a receiver");
 
-        let delivered = wait_for(&sent, 2).await;
+        let mut delivered = wait_for(&sent, 2).await;
         drop(events_tx);
         forwarder.await.expect("forwarder exits");
+        // Typing is sent on its own task, so it may land on either side of the reply.
+        delivered.sort();
         assert_eq!(
             delivered,
             vec![
