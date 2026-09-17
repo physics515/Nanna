@@ -6765,6 +6765,18 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
+      - [ ] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
+            **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
+            plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
+            Linux they drive WebKitGTK without any `WebKitWebDriver` binary — which removes the
+            4.1-vs-6.0 ABI question entirely and needs no `sudo`. Default ports 4444 (the
+            intermediary) / 4445 (the plugin). The catch is that it is a dependency **compiled into
+            the app**, so the shape has to be a Cargo feature (e.g. `e2e-webdriver`) that CI and the
+            nightly enable and release bundles never do — a WebDriver port in a shipped build would
+            be a remote-control surface. Decide that shape, then point the shared harness at
+            `tauri-webdriver` instead of `tauri-driver`. Source:
+            [Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver),
+            crates.io `tauri-plugin-webdriver` / `tauri-webdriver`.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
