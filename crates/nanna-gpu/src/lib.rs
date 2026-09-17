@@ -444,7 +444,9 @@ impl CosineSimilaritySearch {
 /// which no adapter's `max_storage_buffer_binding_size` allows, so refusing it
 /// replaces a silent truncation that could never reach a valid dispatch anyway.
 fn shader_counts(query_len: usize, vectors_len: usize) -> Result<(u32, u32), GpuError> {
-    let num_vectors = vectors_len / query_len;
+    // An empty query has no dimensions to compare, so there are no vectors to
+    // score; `vectors_len / 0` used to panic instead.
+    let num_vectors = vectors_len.checked_div(query_len).unwrap_or(0);
     match (u32::try_from(query_len), u32::try_from(num_vectors)) {
         (Ok(query_len), Ok(num_vectors)) => Ok((query_len, num_vectors)),
         _ => Err(GpuError::InsufficientMemory(format!(
@@ -504,6 +506,12 @@ impl DeviceExt for wgpu::Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_query_scores_nothing_instead_of_dividing_by_zero() {
+        assert_eq!(shader_counts(0, 12).unwrap(), (0, 0));
+        assert_eq!(shader_counts(3, 12).unwrap(), (3, 4));
+    }
 
     #[tokio::test]
     async fn test_gpu_context_creation() {
