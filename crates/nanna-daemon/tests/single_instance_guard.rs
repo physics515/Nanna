@@ -194,7 +194,7 @@ mod linux {
         let pid_path = data_dir.path().join("nanna-daemon.pid");
         std::fs::write(&pid_path, daemon.pid().to_string()).unwrap();
 
-        let duplicate = PidFile::new(&data_dir.path().to_path_buf());
+        let duplicate = PidFile::new(data_dir.path());
         assert!(matches!(
             duplicate.acquire(),
             Err(PidFileError::AlreadyRunning(pid)) if pid == daemon.pid()
@@ -217,7 +217,7 @@ mod linux {
         let pid_path = data_dir.path().join("nanna-daemon.pid");
         std::fs::write(&pid_path, dead_pid.to_string()).unwrap();
 
-        let successor = PidFile::new(&data_dir.path().to_path_buf());
+        let successor = PidFile::new(data_dir.path());
         successor.acquire().unwrap();
         assert_eq!(
             std::fs::read_to_string(&pid_path).unwrap(),
