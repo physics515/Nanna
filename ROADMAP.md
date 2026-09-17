@@ -6036,10 +6036,21 @@ green. Known remainders, deliberately scoped rather than silently dropped:
       the only thing `expect` added was a second panic that destroys the record exactly
       when it is most wanted. New test poisons the mutex from a real panicking thread and
       asserts the earlier entry survives AND a later write still lands.
-- [ ] **No lift path for a declared file invariant**: once registered, a prohibition
+- [x] **No lift path for a declared file invariant**: once registered, a prohibition
       stands until the registry file is removed. "You can edit tests/ now" is exactly
       the permissive phrasing a conservative extractor must not act on, so lifting
       needs its own deliberate, `ask_user`-confirmed shape.
+      *(2026-09-17)* That shape, now that `ask_user` exists: a `lift_invariant` skill over an
+      `invariants.lift` service. It quotes the user's own sentence back ("You said: \"don't touch
+      tests/\" … Reply \"yes\" to lift it"), waits on the live turn like `ask_user`, and removes
+      every rule on that glob only for an **explicit yes** (`is_explicit_yes`: must start with a yes
+      word, no negation anywhere — "yes but not tests/unit", "wait, yes", "keep it" all keep the
+      rule). The registry travels as text through the script bridge both ways, so the rule lifted
+      is the one `write_file`'s guard enforces — **the first version resolved the path in the
+      service and found a different file, caught only by driving the real daemon.** The
+      `write_file`/`edit_file` refusals now name `lift_invariant` (skills bumped 0.1.17 / 0.1.11).
+      Tests: yes/no classifier, glob-exact removal, a live-registry service test for yes and a
+      hedged yes; real daemon: question posted quoting the sentence, rule untouched without a reply.
 - [ ] **Evidence hashing is anchored at run start, not at task-write time**: the
       repository layer has no workspace root to resolve a relative acceptance path,
       so the hash baseline is taken where the workdir is known instead.

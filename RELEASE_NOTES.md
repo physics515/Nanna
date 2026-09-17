@@ -57,6 +57,9 @@ conversation plus each file's first version, 256 MiB per conversation, 1 GiB ove
 (cancel what Nanna is doing in that chat), `/model <name>` to pin that conversation's model
 (`/model default` undoes it), `/help`.
 
+**Rules you set can be lifted — by you.** When a file rule you declared ("don't touch tests/")
+really blocks the work, Nanna can ask, quoting your own words; only a clear yes lifts it.
+
 **Export a chat** to Markdown or JSON from the session menu.
 
 **Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet

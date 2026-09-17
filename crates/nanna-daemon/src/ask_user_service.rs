@@ -101,18 +101,91 @@ fn parse_request(params: &Value) -> Result<AskRequest, String> {
     })
 }
 
-/// Build `session.ask_user`.
+/// Build `session.ask_user` and `invariants.lift`.
 #[must_use]
 pub fn build_ask_user_services(deps: AskUserDeps) -> HashMap<String, ServiceFn> {
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
+    let ask_deps = deps.clone();
     services.insert(
         "session.ask_user".to_string(),
         Arc::new(move |params: Value| {
-            let deps = deps.clone();
+            let deps = ask_deps.clone();
             Box::pin(async move { ask(&deps, &params).await })
         }),
     );
+    services.insert(
+        "invariants.lift".to_string(),
+        Arc::new(move |params: Value| {
+            let deps = deps.clone();
+            Box::pin(async move { lift_invariant(&deps, &params).await })
+        }),
+    );
     services
+}
+
+/// Lift a user-declared file prohibition — only on the user's explicit yes.
+///
+/// A declared invariant ("don't touch tests/") stood until its registry file
+/// was deleted by hand; `write_file` told the model `ask_user` was the escape
+/// hatch, and a yes changed nothing. This asks, quoting the user's own
+/// sentence, and hands back the registry without that rule only for an
+/// unambiguous yes ([`nanna_storage::is_explicit_yes`]).
+///
+/// The registry travels as text, both ways: the skill reads and writes it
+/// through the script bridge, which resolves `.nanna/…` exactly as
+/// `write_file`'s guard does. A service resolving the path itself found a
+/// different file (found by driving the real daemon), and one that wrote
+/// wherever it was pointed would be a write surface of its own.
+async fn lift_invariant(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
+    let existing = params
+        .get("registry")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let glob = params
+        .get("glob")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let matching = nanna_storage::declared_invariants_for(existing, glob);
+    let Some(first) = matching.first() else {
+        return Err(format!(
+            "Nothing was lifted: no declared invariant covers `{glob}`."
+        ));
+    };
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let question = format!(
+        "You said: \"{}\". Nanna asks to lift that rule for `{}`{}. Reply \"yes\" to lift it; anything else keeps it.",
+        first.source,
+        first.glob,
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" because: {reason}")
+        },
+    );
+    let mut ask_params = json!({ "question": question, "session_id": params.get("session_id") });
+    if let Some(wait) = params.get("wait_secs") {
+        ask_params["wait_secs"] = wait.clone();
+    }
+    let answer = ask(deps, &ask_params).await?;
+    let reply = answer
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !nanna_storage::is_explicit_yes(reply) {
+        return Ok(json!({ "lifted": false, "reply": reply, "reason": answer.get("reason") }));
+    }
+    let Some(updated) = nanna_storage::lift_declared_invariants(existing, glob) else {
+        return Ok(json!({ "lifted": false, "reason": "already_lifted" }));
+    };
+    debug_assert_eq!(
+        nanna_storage::declared_invariants_for(&updated, glob).len(),
+        0
+    );
+    Ok(json!({ "lifted": true, "glob": first.glob, "count": matching.len(), "registry": updated }))
 }
 
 async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
@@ -282,5 +355,76 @@ mod tests {
         assert_eq!(result["reason"], "no_answer_yet");
         let missing = ask(&deps, &json!({ "question": "q", "session_id": "nope" })).await;
         assert!(missing.unwrap_err().contains("does not exist"));
+    }
+
+    fn registry_with_tests_rule() -> String {
+        json!({ "version": 1, "invariants": [
+            { "kind": "read_only", "glob": "tests/", "source": "don't touch tests/", "scope": "session" }
+        ]})
+        .to_string()
+    }
+
+    async fn lift_with_reply(reply: &str) -> Value {
+        let (deps, _events) = deps();
+        let session = deps.sessions.create(None).await;
+        deps.chat_runs.try_claim(&session.id).await;
+        let pending = deps.chat_runs.pending_for(&session.id).await;
+        let reply = reply.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pending.push(reply).await;
+        });
+        let params = json!({
+            "session_id": session.id, "registry": registry_with_tests_rule(), "glob": "tests",
+            "reason": "a test is wrong", "wait_secs": 5
+        });
+        let result = lift_invariant(&deps, &params).await.expect("asked");
+        let asked = deps
+            .sessions
+            .get(&session.id)
+            .await
+            .expect("s")
+            .messages
+            .last()
+            .expect("q")
+            .content
+            .clone();
+        assert!(
+            asked.contains("You said: \"don't touch tests/\""),
+            "{asked}"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn a_yes_lifts_the_rule_and_anything_else_keeps_it() {
+        let lifted = lift_with_reply("yes").await;
+        assert_eq!(lifted["lifted"], true, "{lifted}");
+        let updated = lifted["registry"].as_str().expect("registry returned");
+        assert_eq!(
+            nanna_storage::declared_invariants_for(updated, "tests").len(),
+            0
+        );
+
+        let kept = lift_with_reply("yes but not the fixtures").await;
+        assert_eq!(kept["lifted"], false, "{kept}");
+        assert!(kept.get("registry").is_none(), "nothing to write back");
+    }
+
+    #[tokio::test]
+    async fn only_a_declared_rule_can_be_lifted() {
+        let (deps, _events) = deps();
+        let unknown = lift_invariant(
+            &deps,
+            &json!({ "registry": registry_with_tests_rule(), "glob": "src" }),
+        )
+        .await;
+        assert!(
+            unknown
+                .unwrap_err()
+                .contains("no declared invariant covers `src`")
+        );
+        let empty = lift_invariant(&deps, &json!({ "glob": "tests" })).await;
+        assert!(empty.is_err(), "no registry, no rule");
     }
 }
