@@ -702,6 +702,27 @@ struct ToolSurfaceDeps<'a> {
     chat_runs: &'a Arc<crate::control::chat_harness::ChatRunRegistry>,
 }
 
+/// What [`DaemonServer::build_control_plane`] needs from `run`'s locals.
+///
+/// The control plane is assembled from fourteen collaborators that `run` has
+/// already created, most of them `Arc`s; named fields keep the assembly honest
+/// the way [`ScriptServiceDeps`] does for the script services.
+struct ControlPlaneDeps {
+    agent: Arc<AgentService>,
+    memory: Option<Arc<MemoryService>>,
+    tools: Arc<ToolRegistry>,
+    router: Arc<LlmRouter>,
+    tools_dir: Option<PathBuf>,
+    workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>>,
+    turn_baselines: Arc<crate::tasks::TurnBaselines>,
+    scheduler: Arc<tokio::sync::RwLock<nanna_core::Scheduler>>,
+    model_stats: nanna_agent::ModelStatsTracker,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    degradations: Arc<nanna_agent::DegradationLedger>,
+    activity_clock: Arc<nanna_memory::ActivityClock>,
+    dreaming: Option<Arc<nanna_memory::DreamingService>>,
+}
+
 /// Everything [`build_script_services`] needs, named.
 ///
 /// It grew from seven positional parameters to thirteen in one run (2026-09-15),
@@ -2353,6 +2374,527 @@ fn flatten_scheduled_join(
     })
 }
 
+/// The user's `[memory]` dream-cycle settings, as the scheduled cycle reads them.
+#[derive(Clone, Copy)]
+struct DreamBudget {
+    /// Mirrors `[memory] max_compression_ratio`.
+    max_compression_ratio: f32,
+    /// Mirrors `[memory] min_remaining_memories`.
+    min_remaining_memories: usize,
+    /// Carried for the skip log only — the gate *decision* lives in the
+    /// [`nanna_memory::DreamingService`], built with both thresholds, so there
+    /// is no second copy of the policy here.
+    idle_threshold_secs: u64,
+}
+
+/// What the scheduled-task executor closure captures.
+///
+/// Ten collaborators, eight of them `Arc`s; named fields for the same reason
+/// [`ScriptServiceDeps`] has them.
+struct ScheduledTaskDeps {
+    agent: Arc<AgentService>,
+    router: Arc<LlmRouter>,
+    dreaming: Option<Arc<nanna_memory::DreamingService>>,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity_clock: Arc<nanna_memory::ActivityClock>,
+    storage: Option<Arc<nanna_storage::Storage>>,
+    sessions: Arc<SessionManager>,
+    events: broadcast::Sender<crate::protocol::Event>,
+    /// The scheduler's own tick, which the reminder delivery window is derived
+    /// from.
+    reminder_tick: Duration,
+    dream: DreamBudget,
+}
+
+/// What [`DaemonServer::start_scheduler`] needs from `run`'s locals.
+struct SchedulerDeps {
+    agent: Arc<AgentService>,
+    router: Arc<LlmRouter>,
+    dreaming: Option<Arc<nanna_memory::DreamingService>>,
+    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity_clock: Arc<nanna_memory::ActivityClock>,
+}
+
+/// The `memory_consolidation` scheduled task: at most one dream cycle, gated
+/// twice.
+///
+/// A live harness run is the opposite of idle however old the last user message
+/// is — dreaming rewrites the very scoped memories the run is using, and doing
+/// so mid-step deadlocked a live mission (2026-08-10, 316 tool-result memories
+/// folded under a running step) — and the in-flight latch stops a tick firing a
+/// second cycle while the first is still folding.
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn run_scheduled_consolidation(
+    dreaming: Option<&Arc<nanna_memory::DreamingService>>,
+    agent: &Arc<AgentService>,
+    router: &Arc<LlmRouter>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity: &Arc<nanna_memory::ActivityClock>,
+    dream_in_flight: &Arc<std::sync::atomic::AtomicBool>,
+    budget: DreamBudget,
+) -> (bool, Option<String>, Option<String>) {
+    let Some(dreaming) = dreaming else {
+        return (
+            true,
+            Some("Skipped (memory service unavailable)".to_string()),
+            None,
+        );
+    };
+    if chat_runs.any_active().await {
+        // A live harness run is the opposite of idle, however old the last user
+        // message is: dreaming rewrites the very scoped memories the run is
+        // using, and doing so mid-step deadlocked a live mission (2026-08-10,
+        // 316 tool-result memories folded under a running step).
+        return (true, Some("Skipped (mission live)".to_string()), None);
+    }
+    if dream_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return (
+            true,
+            Some("Skipped (dream already in flight)".to_string()),
+            None,
+        );
+    }
+
+    let outcome = dream_once(dreaming, agent, router, chat_runs, activity, budget).await;
+    // Released whatever the cycle returned: a cycle that errored must not wedge
+    // every later tick out of the latch.
+    dream_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    outcome
+}
+
+/// One dream cycle, with the latch already claimed by the caller.
+///
+/// The idle gate AND the full cycle (feedback flush -> FSRS testing-effect
+/// flush -> consolidate) both live in the one [`nanna_memory::DreamingService`].
+/// The daemon supplies only what it owns: its lock-free activity clock and a
+/// consolidation budget sized to *its* summarizer model. Dreaming competes with
+/// the live agent for that model and rewrites the store, so it still only runs
+/// during a lull (or under memory pressure).
+async fn dream_once(
+    dreaming: &Arc<nanna_memory::DreamingService>,
+    agent: &Arc<AgentService>,
+    router: &Arc<LlmRouter>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity: &Arc<nanna_memory::ActivityClock>,
+    budget: DreamBudget,
+) -> (bool, Option<String>, Option<String>) {
+    let DreamBudget {
+        max_compression_ratio: consolidation_max_ratio,
+        min_remaining_memories: consolidation_min_remaining,
+        idle_threshold_secs: dream_idle_threshold_secs,
+    } = budget;
+
+    // Read the summarization list LIVE, once per
+    // cycle: whatever the user last set is what
+    // this dream summarizes on. Falls back to the
+    // chat model exactly as the boot path did.
+    let live_cfg = agent.agent_config().await;
+    let summarization_models =
+        crate::dream_summarizer::summarization_models(
+            &live_cfg.summarization_priority,
+            std::slice::from_ref(&live_cfg.model),
+        );
+
+    // The idle gate AND the full dream cycle (feedback
+    // flush -> FSRS testing-effect flush -> consolidate)
+    // both live in the one `DreamingService`. The daemon
+    // supplies only what it owns: its lock-free activity
+    // clock and a consolidation budget sized to *its*
+    // summarizer model. Dreaming competes with the live
+    // agent for that model and rewrites the store, so it
+    // still only runs during a lull (or under pressure).
+    let idle = activity.idle();
+    // Size the budget to the SMALLEST window across
+    // the failover list: one prompt is built and
+    // then offered to each candidate in turn, so a
+    // budget fitted to the first model would
+    // overflow a smaller fallback.
+    let window_tokens =
+        crate::dream_summarizer::summarizer_context_window_tokens(
+            router,
+            &summarization_models,
+        )
+        .await;
+    let consolidation_config = scheduled_consolidation_config(
+        consolidation_max_ratio,
+        consolidation_min_remaining,
+        window_tokens,
+    );
+    // The any_active skip above gates the dream's
+    // START; this gates its MIDDLE (P22 Tier 4): a
+    // chat turn arriving mid-dream pauses the NEXT
+    // cluster's summarization until the turn
+    // releases, instead of contending with it for
+    // the model. Cluster boundaries are the natural
+    // yield points — a fold already in flight
+    // completes (the CAS guards own staleness),
+    // only new provider work waits. Dreaming is
+    // idle-time work by definition, so it pauses
+    // for a live turn whatever provider it
+    // summarizes on.
+    let inner_summarize =
+        crate::dream_summarizer::summarize_with_failover(
+            router.clone(),
+            summarization_models.clone(),
+        );
+    let summarize_gate = chat_runs.clone();
+    let summarize = move |prompt: String| {
+        let pending = inner_summarize(prompt);
+        let gate = summarize_gate.clone();
+        async move {
+            gate.wait_idle().await;
+            pending.await
+        }
+    };
+    match dreaming
+        .dream_if_triggered(idle, &consolidation_config, summarize)
+        .await
+    {
+        Ok(None) => {
+            let memory_count = dreaming.memory().count().await;
+            debug!(
+                "Skipping scheduled consolidation: system active \
+                 (idle {idle:?} < {dream_idle_threshold_secs}s, \
+                 {memory_count} memories)"
+            );
+            (
+                true,
+                Some(format!(
+                    "Skipped (active; idle {}s, {memory_count} memories)",
+                    idle.as_secs()
+                )),
+                None,
+            )
+        }
+        Ok(Some((trigger, stats))) => {
+            info!(
+                "Scheduled dream ({trigger:?}): {} processed, \
+                 {} merged, {} deduped, {} promoted, {} demoted",
+                stats.consolidation.memories_processed,
+                stats.consolidation.memories_merged,
+                stats.consolidation.memories_deduped,
+                stats.auto_promoted,
+                stats.auto_demoted,
+            );
+            (
+                true,
+                Some(format!(
+                    "Processed {} memories",
+                    stats.consolidation.memories_processed
+                )),
+                None,
+            )
+        }
+        Err(e) => {
+            error!("Scheduled consolidation failed: {e}");
+            (false, None, Some(e.to_string()))
+        }
+    }
+}
+
+/// A heartbeat or cron job, run as a full agent prompt (tools, memory, model
+/// fallback) in a task-scoped session that is not persisted to the session
+/// store.
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn run_scheduled_agent_prompt(
+    task: &nanna_core::ScheduledTask,
+    agent: &Arc<AgentService>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity: &Arc<nanna_memory::ActivityClock>,
+    scheduled_resume_parked: &Arc<std::sync::atomic::AtomicBool>,
+    sessions: &Arc<SessionManager>,
+    events: &broadcast::Sender<crate::protocol::Event>,
+) -> (bool, Option<String>, Option<String>) {
+    // Heartbeat and cron jobs run as full agent prompts
+    // (tools, memory, model fallback) in a task-scoped
+    // session that is not persisted to the session store.
+    let session_id = format!("scheduled-{}", task.id);
+    // Idle gate: never start an autonomous prompt on top
+    // of a live run. A local model server serves one
+    // generation at a time, so a heartbeat firing into a
+    // streaming chat gets the slot time-shared and the
+    // chat's generation CANCELLED — surfacing as a bogus
+    // "provider incident" the harness then heals against
+    // (observed live 2026-07-26). Skipping loses nothing:
+    // a heartbeat exists to work during a lull, and the
+    // next tick picks up whatever was due.
+    if agent.any_run_active().await {
+        debug!(
+            "Skipping scheduled task '{}': a run is already in flight",
+            task.name
+        );
+        return (true, Some("Skipped (a run is in flight)".to_string()), None);
+    }
+    if !agent.has_configured_model().await {
+        // Nothing to run the prompt with: a daemon with
+        // no model configured would only fail every tick
+        // (and used to send a request naming no model).
+        debug!(
+            "Skipping scheduled task '{}': no model is configured",
+            task.name
+        );
+        return (true, Some("Skipped (no model configured)".to_string()), None);
+    }
+
+    // An autonomous agent run (heartbeat / cron / task
+    // prompt) is the daemon actively using the model, so
+    // it counts as activity too — defer the dream cycle
+    // while it runs. Heartbeats are infrequent (30 min)
+    // vs the 5-min idle threshold, and memory pressure
+    // still overrides, so dreaming is not starved.
+    activity.record();
+    // Session scoping (the `with_run_session` binding
+    // that fixed 35 failed `todo` calls) now lives
+    // inside `run_scheduled_prompt_yielding`, carried
+    // by the run's own spawned future — a chat that
+    // starts during this run cannot see the scheduled
+    // session, nor vice versa.
+    let outcome = run_scheduled_prompt_yielding(
+        agent,
+        chat_runs,
+        &session_id,
+        &task.payload,
+    )
+    .await;
+    match outcome {
+        Some(Ok(result)) => {
+            let heartbeat_ok = task.name == "heartbeat"
+                && result.content.trim().contains("HEARTBEAT_OK");
+            if heartbeat_ok {
+                debug!("Heartbeat: OK (nothing to do)");
+            } else {
+                info!(
+                    "Scheduled task '{}' completed: {}",
+                    task.name,
+                    result.content.chars().take(200).collect::<String>()
+                );
+            }
+            if let Some(message) = scheduled_output_message(
+                &task.name,
+                &result.content,
+                heartbeat_ok,
+            ) && let Some(ref target) = task.target_session
+                && sessions
+                    .post_assistant_message(events, target, message)
+                    .await
+                    .is_none()
+            {
+                warn!(
+                    "Task '{}' posts to session {target}, which no longer \
+                     exists; its result is in the run history only",
+                    task.name
+                );
+            }
+            (true, Some(result.content), None)
+        }
+        Some(Err(e)) => {
+            error!("Scheduled task '{}' failed: {}", task.name, e.message);
+            (false, None, Some(e.message))
+        }
+        None => park_scheduled_resume(
+            task,
+            agent,
+            chat_runs,
+            activity,
+            scheduled_resume_parked,
+            &session_id,
+        ),
+    }
+}
+
+/// The scheduled run yielded the local provider to a live chat turn (P22 Tier
+/// 4). Resume on release.
+///
+/// ONE detached waiter re-runs the prompt when the registry goes idle —
+/// promptly, not at the next tick — and if a fresh user turn preempts the
+/// resumed run too, it parks again. That loop is bounded by user activity
+/// itself, not by a counter: every extra lap requires a new turn to have
+/// claimed the provider. The caller returns NOW because the heartbeat arm of
+/// the scheduler loop awaits it inline — parking there would stall every other
+/// scheduled task for as long as the chat runs.
+fn park_scheduled_resume(
+    task: &nanna_core::ScheduledTask,
+    agent: &Arc<AgentService>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    activity: &Arc<nanna_memory::ActivityClock>,
+    scheduled_resume_parked: &Arc<std::sync::atomic::AtomicBool>,
+    session_id: &str,
+) -> (bool, Option<String>, Option<String>) {
+    // The run yielded the local provider to a
+    // live chat turn (P22 Tier 4). Resume on
+    // release: ONE detached waiter re-runs the
+    // prompt when the registry goes idle —
+    // promptly, not at the next tick — and if
+    // a fresh user turn preempts the resumed
+    // run too, it parks again. That loop is
+    // bounded by user activity itself, not by
+    // a counter: every extra lap requires a
+    // new turn to have claimed the provider.
+    // The executor returns NOW because the
+    // heartbeat arm of the scheduler loop
+    // awaits it inline — parking here would
+    // stall every other scheduled task for as
+    // long as the chat runs.
+    if scheduled_resume_parked
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        let resume_agent = agent.clone();
+        let resume_runs = chat_runs.clone();
+        let resume_activity = activity.clone();
+        let resume_parked = scheduled_resume_parked.clone();
+        let resume_session = session_id.to_string();
+        let resume_payload = task.payload.clone();
+        let resume_name = task.name.clone();
+        tokio::spawn(async move {
+            loop {
+                resume_runs.wait_idle().await;
+                // The release tail unregisters
+                // the finished chat BEFORE
+                // releasing the registry, so an
+                // active run here is a NEW
+                // claimant — the slot is taken
+                // and the schedule covers the
+                // rest.
+                if resume_agent.any_run_active().await {
+                    debug!(
+                        task = %resume_name,
+                        "Yielded run superseded — the slot is \
+                         taken; the next tick owns the work"
+                    );
+                    break;
+                }
+                resume_activity.record();
+                match run_scheduled_prompt_yielding(
+                    &resume_agent,
+                    &resume_runs,
+                    &resume_session,
+                    &resume_payload,
+                )
+                .await
+                {
+                    Some(Ok(result)) => {
+                        let heartbeat_ok = resume_name
+                            == "heartbeat"
+                            && result
+                                .content
+                                .trim()
+                                .contains("HEARTBEAT_OK");
+                        if heartbeat_ok {
+                            debug!(
+                                "Heartbeat (resumed): OK \
+                                 (nothing to do)"
+                            );
+                        } else {
+                            info!(
+                                "Scheduled task '{}' completed \
+                                 after yielding: {}",
+                                resume_name,
+                                result
+                                    .content
+                                    .chars()
+                                    .take(200)
+                                    .collect::<String>()
+                            );
+                        }
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        error!(
+                            "Scheduled task '{}' failed after \
+                             yielding: {}",
+                            resume_name, e.message
+                        );
+                        break;
+                    }
+                    None => {
+                        // Preempted again — user
+                        // turns keep priority.
+                    }
+                }
+            }
+            resume_parked
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        (
+            true,
+            Some(
+                "Yielded to a live chat turn; resuming on release"
+                    .to_string(),
+            ),
+            None,
+        )
+    } else {
+        (
+            true,
+            Some(
+                "Yielded to a live chat turn; a resume is \
+                 already parked, the next tick covers this one"
+                    .to_string(),
+            ),
+            None,
+        )
+    }
+}
+
+/// The `task_recurrence_sweep` scheduled task (P15): the scheduler is the one
+/// recurrence engine, so recurring todo items are reopened here rather than by
+/// a second clock inside the task store.
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn run_recurrence_sweep(
+    storage: Option<&Arc<nanna_storage::Storage>>,
+) -> (bool, Option<String>, Option<String>) {
+    let Some(storage) = storage else {
+        return (true, Some("Skipped (no storage)".to_string()), None);
+    };
+    let reopened = crate::tasks::sweep_recurrences(storage).await;
+    if reopened > 0 {
+        info!("Recurrence sweep reopened {reopened} tasks");
+    }
+    (
+        true,
+        Some(format!("Reopened {reopened} recurring tasks")),
+        None,
+    )
+}
+
+/// A reminder: delivered as a message, never run as a prompt.
+///
+/// A reminder needs no model, and must not wait for one (see
+/// `reminder_service`).
+///
+/// Returns the scheduler's `(success, output, error)` triple.
+async fn deliver_scheduled_reminder(
+    sessions: &Arc<SessionManager>,
+    events: &broadcast::Sender<crate::protocol::Event>,
+    task: &nanna_core::ScheduledTask,
+    reminder_tick: Duration,
+) -> (bool, Option<String>, Option<String>) {
+    match crate::reminder_service::deliver_reminder(
+        sessions,
+        events,
+        task,
+        chrono::Utc::now(),
+        reminder_tick,
+    )
+    .await
+    {
+        Ok(content) => (true, Some(content), None),
+        Err(e) => {
+            warn!("{e}");
+            (false, None, Some(e))
+        }
+    }
+}
+
 /// The main daemon server
 pub struct DaemonServer {
     config: DaemonConfig,
@@ -2573,6 +3115,211 @@ impl DaemonServer {
         self.ipc.bound_addr()
     }
 
+    /// Start the cron runner.
+    ///
+    /// With daemon-first startup the daemon owns `nanna.db`, so it is the cron
+    /// runner (the GUI scheduler only runs in embedded mode). Loads persisted
+    /// jobs and runs heartbeat + memory consolidation, mirroring the GUI's
+    /// embedded schedule.
+    async fn start_scheduler(
+        &self,
+        deps: SchedulerDeps,
+    ) -> Arc<tokio::sync::RwLock<nanna_core::Scheduler>> {
+        let SchedulerDeps {
+            agent,
+            router,
+            dreaming,
+            chat_runs,
+            activity_clock,
+        } = deps;
+
+        // These three come from `[scheduler]` in the user's config, not from
+        // literals: the GUI's Scheduler tab writes them there and a config
+        // reload re-applies them to this very loop (see the control plane's
+        // config handler), so the toggles work without a daemon restart.
+        let scheduler_config = nanna_core::SchedulerConfig {
+            enabled: self.config.scheduler.enabled,
+            heartbeat_interval: std::time::Duration::from_secs(
+                nanna_core::clamp_heartbeat_secs(self.config.heartbeat_interval_secs),
+            ),
+            heartbeat_enabled: self.config.scheduler.heartbeat_enabled,
+            heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
+            max_concurrent: 4,
+            check_interval: std::time::Duration::from_secs(30),
+            default_timezone: "UTC".to_string(),
+        };
+        let mut scheduler = nanna_core::Scheduler::new(scheduler_config);
+        if let Some(ref storage) = self.storage {
+            scheduler = scheduler.with_storage(storage.clone());
+            match scheduler.load_jobs().await {
+                Ok(count) => info!("Loaded {count} cron jobs from storage"),
+                Err(e) => warn!("Failed to load cron jobs: {e}"),
+            }
+        } else {
+            info!("Scheduler running without persistence (no storage backend)");
+        }
+
+        let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
+        if deduped > 0 {
+            info!("Removed {deduped} duplicate consolidation tasks");
+        }
+        if !scheduler.has_task_named("memory_consolidation").await {
+            scheduler
+                .add_task(nanna_core::consolidation_task(Some(
+                    std::time::Duration::from_secs(3600),
+                )))
+                .await;
+            info!("Scheduled memory consolidation task (every 1 hour)");
+        }
+
+        // Task recurrence sweep (P15): the scheduler is the one recurrence
+        // engine — recurring todo items are reopened here, not by a second
+        // clock inside the task store.
+        if self.storage.is_some() {
+            let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
+            if deduped > 0 {
+                info!("Removed {deduped} duplicate recurrence sweep tasks");
+            }
+            if !scheduler.has_task_named("task_recurrence_sweep").await {
+                scheduler
+                    .add_task(nanna_core::recurring_task(
+                        "task_recurrence_sweep",
+                        std::time::Duration::from_secs(300),
+                        "Reopen recurring tasks whose next occurrence has arrived.",
+                    ))
+                    .await;
+                info!("Scheduled task recurrence sweep (every 5 minutes)");
+            }
+        }
+
+        let executor = Self::scheduled_task_executor(ScheduledTaskDeps {
+            reminder_tick: scheduler.check_interval(),
+            agent,
+            router,
+            dreaming,
+            chat_runs,
+            activity_clock,
+            storage: self.storage.clone(),
+            sessions: self.sessions.clone(),
+            events: self.ipc.event_sender(),
+            dream: DreamBudget {
+                max_compression_ratio: self.config.memory_max_compression_ratio,
+                min_remaining_memories: self.config.memory_min_remaining_memories,
+                idle_threshold_secs: self.config.dream_idle_threshold_secs,
+            },
+        });
+        scheduler = scheduler.with_executor(executor);
+        scheduler.start();
+        info!("Daemon scheduler started (heartbeat + cron runner)");
+        let scheduler = Arc::new(tokio::sync::RwLock::new(scheduler));
+        // `run` executes once per server, so the slot is empty here; a
+        // second fill would leave the reminder services on the first
+        // scheduler, which is the one still running.
+        if self.scheduler_slot.set(Arc::clone(&scheduler)).is_err() {
+            warn!("scheduler slot was already filled; reminders keep the first scheduler");
+        }
+        scheduler
+    }
+
+    /// The closure the scheduler calls for every due task.
+    ///
+    /// Nothing here is captured from a boot-time clone of the agent config: the
+    /// summarization list is read from the LIVE config at the top of each cycle,
+    /// because a boot clone survives every `config.set` — a user who repointed
+    /// summarization kept dreaming on the model they had at startup, the whole
+    /// class the P23 summarizer-pin fix closed on the chat path (2026-08-15:
+    /// 171/171 summarizations in the benchmark series ran on the wrong model). A
+    /// dream cycle runs minutes-to-hours apart, so one lock read per cycle costs
+    /// nothing measurable.
+    fn scheduled_task_executor(deps: ScheduledTaskDeps) -> nanna_core::TaskExecutor {
+        let ScheduledTaskDeps {
+            agent: agent_for_tasks,
+            router: router_for_tasks,
+            dreaming: dreaming_for_tasks,
+            chat_runs: chat_runs_for_tasks,
+            activity_clock: activity_for_tasks,
+            storage: storage_for_tasks,
+            sessions: sessions_for_tasks,
+            events: events_for_tasks,
+            reminder_tick,
+            dream,
+        } = deps;
+        // At most one yielded scheduled run waiting to resume. Not a quota — a
+        // dedup: reality already serializes scheduled runs (a live one makes
+        // every other tick skip), so a second waiter could only arise from an
+        // exotic interleaving, and dropping it costs one schedule period, which
+        // the log names.
+        let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // In-flight latch: the scheduler tick re-fired consolidation every 30s
+        // while the previous one was still folding (observed 2026-08-10: a fresh
+        // "Consolidation starting" per tick, none finishing) — one dream at a
+        // time.
+        let dream_in_flight_for_tasks = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        Arc::new(move |task| {
+            let agent = agent_for_tasks.clone();
+            let dreaming = dreaming_for_tasks.clone();
+            let router = router_for_tasks.clone();
+            let storage = storage_for_tasks.clone();
+            let activity = activity_for_tasks.clone();
+            let chat_runs = chat_runs_for_tasks.clone();
+            let dream_in_flight = dream_in_flight_for_tasks.clone();
+            let scheduled_resume_parked = scheduled_resume_parked.clone();
+            let sessions = sessions_for_tasks.clone();
+            let events = events_for_tasks.clone();
+            Box::pin(async move {
+                let start = std::time::Instant::now();
+                let started_at = chrono::Utc::now();
+                let (success, output, error) = match task.name.as_str() {
+                    "memory_consolidation" => {
+                        run_scheduled_consolidation(
+                            dreaming.as_ref(),
+                            &agent,
+                            &router,
+                            &chat_runs,
+                            &activity,
+                            &dream_in_flight,
+                            dream,
+                        )
+                        .await
+                    }
+                    "task_recurrence_sweep" => {
+                        run_recurrence_sweep(storage.as_ref()).await
+                    }
+                    crate::reminder_service::REMINDER_TASK_NAME => {
+                        deliver_scheduled_reminder(&sessions, &events, &task, reminder_tick).await
+                    }
+                    _ if task.payload.is_empty() => {
+                        debug!("Skipping task with empty payload: {}", task.name);
+                        (true, Some("Skipped (empty payload)".to_string()), None)
+                    }
+                    _ => {
+                        run_scheduled_agent_prompt(
+                            &task,
+                            &agent,
+                            &chat_runs,
+                            &activity,
+                            &scheduled_resume_parked,
+                            &sessions,
+                            &events,
+                        )
+                        .await
+                    }
+                };
+                nanna_core::TaskResult {
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
+                    success,
+                    output,
+                    error,
+                    duration_ms: crate::numeric::millis_u64(start.elapsed()),
+                    started_at,
+                    finished_at: chrono::Utc::now(),
+                }
+            })
+        })
+    }
+
     /// Run the daemon server
     ///
     /// # Errors
@@ -2586,6 +3333,150 @@ impl DaemonServer {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
 
+        self.install_panic_hook();
+
+        // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
+        // every exec/acceptance process inherits membership, so the OS reaps
+        // the whole tree when this process dies for any reason — clean stop,
+        // `taskkill /F`, or a crash. Closes the leak where daemon restarts
+        // orphaned in-flight `powershell.exe`/`bash.exe` children (89 counted
+        // on 2026-08-01). Survivable on failure: log and run uncontained.
+        #[cfg(windows)]
+        if crate::job::adopt_kill_on_close_job() {
+            info!("Job Object adopted — child processes cannot outlive the daemon");
+        } else {
+            warn!("Job Object adoption failed — exec children may outlive an unclean daemon exit");
+        }
+
+        // Ensure data directory exists
+        std::fs::create_dir_all(&self.config.data_dir)?;
+
+        self.acquire_pid_file()?;
+
+        self.arm_exit_reason_file();
+
+        self.load_sessions().await;
+
+        // ONE run registry, created before the services so the embedding
+        // drain, the dream gate, the scheduler and the control plane all hold
+        // the same handle: "a mission is live" must be one fact, not two.
+        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+        // ONE capability-transition ledger for the same reason — the provider
+        // plumbing records into the very ledger the step runners drain.
+        let degradations = Arc::new(nanna_agent::DegradationLedger::new());
+
+        // Initialize services
+        let (
+            tools,
+            memory,
+            agent,
+            router,
+            tools_dir,
+            workspace_id_for_services,
+            turn_baselines,
+            model_stats,
+        ) = self.init_services(&chat_runs, &degradations).await?;
+
+        self.recover_checkpoints(&agent).await;
+
+        // Shared activity clock: stamped by the control plane on every chat
+        // request, read by the scheduled dream cycle to gate on idleness. Made
+        // here so it is in scope for both the scheduler executor (below) and the
+        // control plane (built later); cloning the Arc shares the same clock.
+        let activity_clock = Arc::new(nanna_memory::ActivityClock::new());
+
+        let dreaming = self.build_dreaming(memory.as_ref(), &activity_clock);
+
+        // Dreaming must observe the very store the agent writes to, never a
+        // private copy — that identity is the whole point of the shared seam.
+        debug_assert_eq!(
+            dreaming.is_some(),
+            memory.is_some(),
+            "dreaming service must exist exactly when the memory store does"
+        );
+
+        // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
+        // is the cron runner (the GUI scheduler only runs in embedded mode).
+        // Loads persisted jobs and runs heartbeat + memory consolidation,
+        // mirroring the GUI's embedded schedule. (`chat_runs` was created
+        // before the services above, and is the same handle everywhere.)
+        // In-flight latch: the scheduler tick re-fired consolidation every
+        // 30s while the previous one was still folding (observed 2026-08-10:
+        // a fresh "Consolidation starting" per tick, none finishing) — one
+        // dream at a time.
+        let scheduler = self
+            .start_scheduler(SchedulerDeps {
+                agent: Arc::clone(&agent),
+                router: Arc::clone(&router),
+                dreaming: dreaming.clone(),
+                chat_runs: Arc::clone(&chat_runs),
+                activity_clock: Arc::clone(&activity_clock),
+            })
+            .await;
+
+        let (control, channel_status_manager) = self
+            .build_control_plane(ControlPlaneDeps {
+                agent,
+                memory: memory.clone(),
+                tools,
+                router,
+                tools_dir,
+                workspace_id_for_services,
+                turn_baselines,
+                scheduler,
+                model_stats,
+                chat_runs: Arc::clone(&chat_runs),
+                degradations: Arc::clone(&degradations),
+                activity_clock: Arc::clone(&activity_clock),
+                dreaming: dreaming.clone(),
+            })
+            .await;
+
+        // Take the request receiver from IPC server
+        let mut request_rx =
+            self.ipc.take_request_receiver().await.ok_or_else(|| {
+                crate::DaemonError::Ipc("Request receiver already taken".to_string())
+            })?;
+
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        let ipc_handle = self.spawn_ipc_server();
+
+        self.announce_memory_recovery();
+
+        let _health_state = self.spawn_health_server(&control, memory.as_ref()).await;
+
+        let channel_manager = self
+            .start_channel_manager(&control, &channel_status_manager)
+            .await;
+
+        self.spawn_webhook_server(&control, channel_manager.as_ref())
+            .await;
+
+        // Sessions are now persisted via Turso write-through on every mutation.
+        // No more periodic JSON auto-save — each create/message/delete/rename writes to DB immediately.
+
+        let stats_save_handle = self.spawn_stats_autosave(&control);
+
+        self.spawn_sub_agent_checkin();
+
+        // The configured address: with port 0 the real port is only known once
+        // the IPC task binds, and its own "listening" line reports that.
+        info!(
+            "Daemon ready. IPC server configured for ws://{}",
+            self.ipc.address()
+        );
+
+        self.serve_requests(&control, &mut request_rx, &mut shutdown_rx)
+            .await;
+
+        self.finish_shutdown(channel_manager, stats_save_handle, ipc_handle)
+            .await;
+        Ok(())
+    }
+
+    /// Route every panic through tracing, and record it in the exit-reason file.
+    fn install_panic_hook(&self) {
         // Route every panic through tracing BEFORE doing anything that can
         // spawn a task. The default hook prints to stderr, which a headless
         // daemon has nowhere useful to send — so a panicked task died with
@@ -2616,23 +3507,16 @@ impl DaemonServer {
             tracing::error!(%location, "PANIC: {payload}");
             previous_hook(info);
         }));
+    }
 
-        // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
-        // every exec/acceptance process inherits membership, so the OS reaps
-        // the whole tree when this process dies for any reason — clean stop,
-        // `taskkill /F`, or a crash. Closes the leak where daemon restarts
-        // orphaned in-flight `powershell.exe`/`bash.exe` children (89 counted
-        // on 2026-08-01). Survivable on failure: log and run uncontained.
-        #[cfg(windows)]
-        if crate::job::adopt_kill_on_close_job() {
-            info!("Job Object adopted — child processes cannot outlive the daemon");
-        } else {
-            warn!("Job Object adoption failed — exec children may outlive an unclean daemon exit");
-        }
-
-        // Ensure data directory exists
-        std::fs::create_dir_all(&self.config.data_dir)?;
-
+    /// Claim the single-instance PID file, when one is configured.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DaemonError::AlreadyRunning`] when another daemon holds it. Any
+    /// other failure is logged and the daemon continues uncontained — a
+    /// stat/write error on the PID path is not a reason not to serve.
+    fn acquire_pid_file(&self) -> Result<(), crate::DaemonError> {
         // Acquire PID file to prevent multiple instances
         if let Some(ref pid_file) = self.pid_file {
             match pid_file.acquire() {
@@ -2649,6 +3533,15 @@ impl DaemonServer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Report how the PREVIOUS daemon died, then claim the reason file for this
+    /// process.
+    ///
+    /// Called after the PID acquire so a duplicate instance that loses the race
+    /// can never touch the live daemon's record.
+    fn arm_exit_reason_file(&self) {
         // Terminal reason file: report how the PREVIOUS daemon died, then
         // claim the file for this process. Runs after the PID acquire so a
         // duplicate instance that loses the race can never touch the live
@@ -2668,7 +3561,11 @@ impl DaemonServer {
                 self.exit_reason.path()
             );
         }
+    }
 
+    /// Load sessions from Turso, migrating a legacy `sessions.json` if that is
+    /// all there is, and create the default session when there are none.
+    async fn load_sessions(&self) {
         // Load sessions from Turso database
         {
             let loaded = self.sessions.load_from_db().await;
@@ -2699,27 +3596,14 @@ impl DaemonServer {
             let default_session = self.sessions.create(Some("Main".to_string())).await;
             info!("Created default session: {}", default_session.id);
         }
+    }
 
-        // ONE run registry, created before the services so the embedding
-        // drain, the dream gate, the scheduler and the control plane all hold
-        // the same handle: "a mission is live" must be one fact, not two.
-        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
-        // ONE capability-transition ledger for the same reason — the provider
-        // plumbing records into the very ledger the step runners drain.
-        let degradations = Arc::new(nanna_agent::DegradationLedger::new());
-
-        // Initialize services
-        let (
-            tools,
-            memory,
-            agent,
-            router,
-            tools_dir,
-            workspace_id_for_services,
-            turn_baselines,
-            model_stats,
-        ) = self.init_services(&chat_runs, &degradations).await?;
-
+    /// Re-post the partial output of any run that crashed mid-turn.
+    ///
+    /// A checkpoint is deleted only after a SUCCESSFUL recovery (or when it
+    /// holds nothing recoverable) — deleting before or regardless of the parse
+    /// made any recovery failure a permanent data loss.
+    async fn recover_checkpoints(&self, agent: &Arc<AgentService>) {
         // Recover any orphaned checkpoints from the database.
         if let Some(ref storage) = self.storage {
             match storage.list_checkpoints().await {
@@ -2814,21 +3698,21 @@ impl DaemonServer {
                 }
             }
         }
+    }
 
-        // Shared activity clock: stamped by the control plane on every chat
-        // request, read by the scheduled dream cycle to gate on idleness. Made
-        // here so it is in scope for both the scheduler executor (below) and the
-        // control plane (built later); cloning the Arc shares the same clock.
-        let activity_clock = Arc::new(nanna_memory::ActivityClock::new());
-
-        // The single dreaming orchestrator (P13 unification). Built once here and
-        // shared by BOTH consolidation paths — the scheduled cycle below and the
-        // IPC `MemoryAction::Consolidate` handler — so they run the same
-        // multi-phase body over the same live store and accumulate pending
-        // feedback in one place. It reads the very `activity_clock` the control
-        // plane stamps, so its idle gate cannot drift from the daemon's own
-        // notion of "in use".
-        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.as_ref().map(|memory| {
+    /// The single dreaming orchestrator (P13 unification).
+    ///
+    /// Built once and shared by BOTH consolidation paths — the scheduled cycle
+    /// and the IPC `MemoryAction::Consolidate` handler — so they run the same
+    /// multi-phase body over the same live store and accumulate pending feedback
+    /// in one place. It reads the very `activity_clock` the control plane stamps,
+    /// so its idle gate cannot drift from the daemon's own notion of "in use".
+    fn build_dreaming(
+        &self,
+        memory: Option<&Arc<MemoryService>>,
+        activity_clock: &Arc<nanna_memory::ActivityClock>,
+    ) -> Option<Arc<nanna_memory::DreamingService>> {
+        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.map(|memory| {
             let dreaming_config = nanna_memory::DreamingConfig {
                 idle_threshold_secs: self.config.dream_idle_threshold_secs,
                 memory_pressure_count: self.config.dream_memory_pressure_count,
@@ -2839,7 +3723,7 @@ impl DaemonServer {
                     dreaming_config,
                     Arc::clone(memory),
                 )
-                .with_activity_clock(Arc::clone(&activity_clock)),
+                .with_activity_clock(Arc::clone(activity_clock)),
             )
         });
 
@@ -2849,544 +3733,34 @@ impl DaemonServer {
             warn!("dreaming slot was already filled; memory use feedback keeps the first service");
         }
 
-        // Dreaming must observe the very store the agent writes to, never a
-        // private copy — that identity is the whole point of the shared seam.
-        debug_assert_eq!(
-            dreaming.is_some(),
-            memory.is_some(),
-            "dreaming service must exist exactly when the memory store does"
-        );
+        dreaming
+    }
 
-        // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
-        // is the cron runner (the GUI scheduler only runs in embedded mode).
-        // Loads persisted jobs and runs heartbeat + memory consolidation,
-        // mirroring the GUI's embedded schedule. (`chat_runs` was created
-        // before the services above, and is the same handle everywhere.)
-        // In-flight latch: the scheduler tick re-fired consolidation every
-        // 30s while the previous one was still folding (observed 2026-08-10:
-        // a fresh "Consolidation starting" per tick, none finishing) — one
-        // dream at a time.
-        let dream_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let scheduler = {
-            // These three come from `[scheduler]` in the user's config, not from
-            // literals: the GUI's Scheduler tab writes them there and a config
-            // reload re-applies them to this very loop (see the control plane's
-            // config handler), so the toggles work without a daemon restart.
-            let scheduler_config = nanna_core::SchedulerConfig {
-                enabled: self.config.scheduler.enabled,
-                heartbeat_interval: std::time::Duration::from_secs(
-                    nanna_core::clamp_heartbeat_secs(self.config.heartbeat_interval_secs),
-                ),
-                heartbeat_enabled: self.config.scheduler.heartbeat_enabled,
-                heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
-                max_concurrent: 4,
-                check_interval: std::time::Duration::from_secs(30),
-                default_timezone: "UTC".to_string(),
-            };
-            let mut scheduler = nanna_core::Scheduler::new(scheduler_config);
-            if let Some(ref storage) = self.storage {
-                scheduler = scheduler.with_storage(storage.clone());
-                match scheduler.load_jobs().await {
-                    Ok(count) => info!("Loaded {count} cron jobs from storage"),
-                    Err(e) => warn!("Failed to load cron jobs: {e}"),
-                }
-            } else {
-                info!("Scheduler running without persistence (no storage backend)");
-            }
-
-            let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
-            if deduped > 0 {
-                info!("Removed {deduped} duplicate consolidation tasks");
-            }
-            if !scheduler.has_task_named("memory_consolidation").await {
-                scheduler
-                    .add_task(nanna_core::consolidation_task(Some(
-                        std::time::Duration::from_secs(3600),
-                    )))
-                    .await;
-                info!("Scheduled memory consolidation task (every 1 hour)");
-            }
-
-            // Task recurrence sweep (P15): the scheduler is the one recurrence
-            // engine — recurring todo items are reopened here, not by a second
-            // clock inside the task store.
-            if self.storage.is_some() {
-                let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
-                if deduped > 0 {
-                    info!("Removed {deduped} duplicate recurrence sweep tasks");
-                }
-                if !scheduler.has_task_named("task_recurrence_sweep").await {
-                    scheduler
-                        .add_task(nanna_core::recurring_task(
-                            "task_recurrence_sweep",
-                            std::time::Duration::from_secs(300),
-                            "Reopen recurring tasks whose next occurrence has arrived.",
-                        ))
-                        .await;
-                    info!("Scheduled task recurrence sweep (every 5 minutes)");
-                }
-            }
-
-            let chat_runs_for_tasks = chat_runs.clone();
-            let dream_in_flight_for_tasks = dream_in_flight.clone();
-            // At most one yielded scheduled run waiting to resume. Not a
-            // quota — a dedup: reality already serializes scheduled runs (a
-            // live one makes every other tick skip), so a second waiter could
-            // only arise from an exotic interleaving, and dropping it costs
-            // one schedule period, which the log names.
-            let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let agent_for_tasks = agent.clone();
-            let sessions_for_tasks = self.sessions.clone();
-            let events_for_tasks = self.ipc.event_sender();
-            let reminder_tick = scheduler.check_interval();
-            let dreaming_for_tasks = dreaming.clone();
-            let router_for_tasks = router.clone();
-            let storage_for_tasks = self.storage.clone();
-            // Capture the user's memory-compression settings for the scheduled
-            // dream cycle (Copy scalars, moved into the executor closure).
-            let consolidation_max_ratio = self.config.memory_max_compression_ratio;
-            let consolidation_min_remaining = self.config.memory_min_remaining_memories;
-            // Idle threshold is captured for the skip log only — the gate
-            // *decision* now lives in the DreamingService (built above with
-            // both thresholds), so there is no second copy of the policy here.
-            let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
-            let activity_for_tasks = activity_clock.clone();
-            // NOT captured here. The list is read from the live agent config at
-            // the top of each cycle instead: a boot clone survives every
-            // `config.set`, so a user who repointed summarization kept dreaming
-            // on the model they had at startup — the whole class the P23
-            // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
-            // summarizations in the benchmark series ran on the wrong model).
-            // A dream cycle runs minutes-to-hours apart, so one lock read per
-            // cycle costs nothing measurable.
-            let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
-                let agent = agent_for_tasks.clone();
-                let dreaming = dreaming_for_tasks.clone();
-                let router = router_for_tasks.clone();
-                let storage = storage_for_tasks.clone();
-                let activity = activity_for_tasks.clone();
-                let chat_runs = chat_runs_for_tasks.clone();
-                let dream_in_flight = dream_in_flight_for_tasks.clone();
-                let scheduled_resume_parked = scheduled_resume_parked.clone();
-                let sessions = sessions_for_tasks.clone();
-                let events = events_for_tasks.clone();
-                Box::pin(async move {
-                    let start = std::time::Instant::now();
-                    let started_at = chrono::Utc::now();
-                    let (success, output, error) = match task.name.as_str() {
-                        "memory_consolidation" => {
-                            if let Some(ref dreaming) = dreaming {
-                                if chat_runs.any_active().await {
-                                    // A live harness run is the opposite of
-                                    // idle, however old the last user message
-                                    // is: dreaming rewrites the very scoped
-                                    // memories the run is using, and doing so
-                                    // mid-step deadlocked a live mission
-                                    // (2026-08-10, 316 tool-result memories
-                                    // folded under a running step).
-                                    (true, Some("Skipped (mission live)".to_string()), None)
-                                } else if dream_in_flight
-                                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                                {
-                                    (
-                                        true,
-                                        Some("Skipped (dream already in flight)".to_string()),
-                                        None,
-                                    )
-                                } else {
-                                // Read the summarization list LIVE, once per
-                                // cycle: whatever the user last set is what
-                                // this dream summarizes on. Falls back to the
-                                // chat model exactly as the boot path did.
-                                let live_cfg = agent.agent_config().await;
-                                let summarization_models =
-                                    crate::dream_summarizer::summarization_models(
-                                        &live_cfg.summarization_priority,
-                                        std::slice::from_ref(&live_cfg.model),
-                                    );
-                                let outcome = {
-                                // The idle gate AND the full dream cycle (feedback
-                                // flush -> FSRS testing-effect flush -> consolidate)
-                                // both live in the one `DreamingService`. The daemon
-                                // supplies only what it owns: its lock-free activity
-                                // clock and a consolidation budget sized to *its*
-                                // summarizer model. Dreaming competes with the live
-                                // agent for that model and rewrites the store, so it
-                                // still only runs during a lull (or under pressure).
-                                let idle = activity.idle();
-                                // Size the budget to the SMALLEST window across
-                                // the failover list: one prompt is built and
-                                // then offered to each candidate in turn, so a
-                                // budget fitted to the first model would
-                                // overflow a smaller fallback.
-                                let window_tokens =
-                                    crate::dream_summarizer::summarizer_context_window_tokens(
-                                        &router,
-                                        &summarization_models,
-                                    )
-                                    .await;
-                                let consolidation_config = scheduled_consolidation_config(
-                                    consolidation_max_ratio,
-                                    consolidation_min_remaining,
-                                    window_tokens,
-                                );
-                                // The any_active skip above gates the dream's
-                                // START; this gates its MIDDLE (P22 Tier 4): a
-                                // chat turn arriving mid-dream pauses the NEXT
-                                // cluster's summarization until the turn
-                                // releases, instead of contending with it for
-                                // the model. Cluster boundaries are the natural
-                                // yield points — a fold already in flight
-                                // completes (the CAS guards own staleness),
-                                // only new provider work waits. Dreaming is
-                                // idle-time work by definition, so it pauses
-                                // for a live turn whatever provider it
-                                // summarizes on.
-                                let inner_summarize =
-                                    crate::dream_summarizer::summarize_with_failover(
-                                        router.clone(),
-                                        summarization_models.clone(),
-                                    );
-                                let summarize_gate = chat_runs.clone();
-                                let summarize = move |prompt: String| {
-                                    let pending = inner_summarize(prompt);
-                                    let gate = summarize_gate.clone();
-                                    async move {
-                                        gate.wait_idle().await;
-                                        pending.await
-                                    }
-                                };
-                                match dreaming
-                                    .dream_if_triggered(idle, &consolidation_config, summarize)
-                                    .await
-                                {
-                                    Ok(None) => {
-                                        let memory_count = dreaming.memory().count().await;
-                                        debug!(
-                                            "Skipping scheduled consolidation: system active \
-                                             (idle {idle:?} < {dream_idle_threshold_secs}s, \
-                                             {memory_count} memories)"
-                                        );
-                                        (
-                                            true,
-                                            Some(format!(
-                                                "Skipped (active; idle {}s, {memory_count} memories)",
-                                                idle.as_secs()
-                                            )),
-                                            None,
-                                        )
-                                    }
-                                    Ok(Some((trigger, stats))) => {
-                                        info!(
-                                            "Scheduled dream ({trigger:?}): {} processed, \
-                                             {} merged, {} deduped, {} promoted, {} demoted",
-                                            stats.consolidation.memories_processed,
-                                            stats.consolidation.memories_merged,
-                                            stats.consolidation.memories_deduped,
-                                            stats.auto_promoted,
-                                            stats.auto_demoted,
-                                        );
-                                        (
-                                            true,
-                                            Some(format!(
-                                                "Processed {} memories",
-                                                stats.consolidation.memories_processed
-                                            )),
-                                            None,
-                                        )
-                                    }
-                                    Err(e) => {
-                                        error!("Scheduled consolidation failed: {e}");
-                                        (false, None, Some(e.to_string()))
-                                    }
-                                }
-                                };
-                                dream_in_flight
-                                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                                outcome
-                                }
-                            } else {
-                                (
-                                    true,
-                                    Some("Skipped (memory service unavailable)".to_string()),
-                                    None,
-                                )
-                            }
-                        }
-                        "task_recurrence_sweep" => {
-                            if let Some(ref storage) = storage {
-                                let reopened = crate::tasks::sweep_recurrences(storage).await;
-                                if reopened > 0 {
-                                    info!("Recurrence sweep reopened {reopened} tasks");
-                                }
-                                (
-                                    true,
-                                    Some(format!("Reopened {reopened} recurring tasks")),
-                                    None,
-                                )
-                            } else {
-                                (true, Some("Skipped (no storage)".to_string()), None)
-                            }
-                        }
-                        crate::reminder_service::REMINDER_TASK_NAME => {
-                            // Delivered as a message, never run as a prompt:
-                            // a reminder needs no model, and must not wait for
-                            // one (see `reminder_service`).
-                            match crate::reminder_service::deliver_reminder(
-                                &sessions,
-                                &events,
-                                &task,
-                                chrono::Utc::now(),
-                                reminder_tick,
-                            )
-                            .await
-                            {
-                                Ok(content) => (true, Some(content), None),
-                                Err(e) => {
-                                    warn!("{e}");
-                                    (false, None, Some(e))
-                                }
-                            }
-                        }
-                        _ if task.payload.is_empty() => {
-                            debug!("Skipping task with empty payload: {}", task.name);
-                            (true, Some("Skipped (empty payload)".to_string()), None)
-                        }
-                        _ => {
-                            // Heartbeat and cron jobs run as full agent prompts
-                            // (tools, memory, model fallback) in a task-scoped
-                            // session that is not persisted to the session store.
-                            let session_id = format!("scheduled-{}", task.id);
-                            // Idle gate: never start an autonomous prompt on top
-                            // of a live run. A local model server serves one
-                            // generation at a time, so a heartbeat firing into a
-                            // streaming chat gets the slot time-shared and the
-                            // chat's generation CANCELLED — surfacing as a bogus
-                            // "provider incident" the harness then heals against
-                            // (observed live 2026-07-26). Skipping loses nothing:
-                            // a heartbeat exists to work during a lull, and the
-                            // next tick picks up whatever was due.
-                            if agent.any_run_active().await {
-                                debug!(
-                                    "Skipping scheduled task '{}': a run is already in flight",
-                                    task.name
-                                );
-                                (true, Some("Skipped (a run is in flight)".to_string()), None)
-                            } else if !agent.has_configured_model().await {
-                                // Nothing to run the prompt with: a daemon with
-                                // no model configured would only fail every tick
-                                // (and used to send a request naming no model).
-                                debug!(
-                                    "Skipping scheduled task '{}': no model is configured",
-                                    task.name
-                                );
-                                (true, Some("Skipped (no model configured)".to_string()), None)
-                            } else {
-                            // An autonomous agent run (heartbeat / cron / task
-                            // prompt) is the daemon actively using the model, so
-                            // it counts as activity too — defer the dream cycle
-                            // while it runs. Heartbeats are infrequent (30 min)
-                            // vs the 5-min idle threshold, and memory pressure
-                            // still overrides, so dreaming is not starved.
-                            activity.record();
-                            // Session scoping (the `with_run_session` binding
-                            // that fixed 35 failed `todo` calls) now lives
-                            // inside `run_scheduled_prompt_yielding`, carried
-                            // by the run's own spawned future — a chat that
-                            // starts during this run cannot see the scheduled
-                            // session, nor vice versa.
-                            let outcome = run_scheduled_prompt_yielding(
-                                &agent,
-                                &chat_runs,
-                                &session_id,
-                                &task.payload,
-                            )
-                            .await;
-                            match outcome {
-                                Some(Ok(result)) => {
-                                    let heartbeat_ok = task.name == "heartbeat"
-                                        && result.content.trim().contains("HEARTBEAT_OK");
-                                    if heartbeat_ok {
-                                        debug!("Heartbeat: OK (nothing to do)");
-                                    } else {
-                                        info!(
-                                            "Scheduled task '{}' completed: {}",
-                                            task.name,
-                                            result.content.chars().take(200).collect::<String>()
-                                        );
-                                    }
-                                    if let Some(message) = scheduled_output_message(
-                                        &task.name,
-                                        &result.content,
-                                        heartbeat_ok,
-                                    ) && let Some(ref target) = task.target_session
-                                        && sessions
-                                            .post_assistant_message(&events, target, message)
-                                            .await
-                                            .is_none()
-                                    {
-                                        warn!(
-                                            "Task '{}' posts to session {target}, which no longer \
-                                             exists; its result is in the run history only",
-                                            task.name
-                                        );
-                                    }
-                                    (true, Some(result.content), None)
-                                }
-                                Some(Err(e)) => {
-                                    error!("Scheduled task '{}' failed: {}", task.name, e.message);
-                                    (false, None, Some(e.message))
-                                }
-                                None => {
-                                    // The run yielded the local provider to a
-                                    // live chat turn (P22 Tier 4). Resume on
-                                    // release: ONE detached waiter re-runs the
-                                    // prompt when the registry goes idle —
-                                    // promptly, not at the next tick — and if
-                                    // a fresh user turn preempts the resumed
-                                    // run too, it parks again. That loop is
-                                    // bounded by user activity itself, not by
-                                    // a counter: every extra lap requires a
-                                    // new turn to have claimed the provider.
-                                    // The executor returns NOW because the
-                                    // heartbeat arm of the scheduler loop
-                                    // awaits it inline — parking here would
-                                    // stall every other scheduled task for as
-                                    // long as the chat runs.
-                                    if scheduled_resume_parked
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                        )
-                                        .is_ok()
-                                    {
-                                        let resume_agent = agent.clone();
-                                        let resume_runs = chat_runs.clone();
-                                        let resume_activity = activity.clone();
-                                        let resume_parked = scheduled_resume_parked.clone();
-                                        let resume_session = session_id.clone();
-                                        let resume_payload = task.payload.clone();
-                                        let resume_name = task.name.clone();
-                                        tokio::spawn(async move {
-                                            loop {
-                                                resume_runs.wait_idle().await;
-                                                // The release tail unregisters
-                                                // the finished chat BEFORE
-                                                // releasing the registry, so an
-                                                // active run here is a NEW
-                                                // claimant — the slot is taken
-                                                // and the schedule covers the
-                                                // rest.
-                                                if resume_agent.any_run_active().await {
-                                                    debug!(
-                                                        task = %resume_name,
-                                                        "Yielded run superseded — the slot is \
-                                                         taken; the next tick owns the work"
-                                                    );
-                                                    break;
-                                                }
-                                                resume_activity.record();
-                                                match run_scheduled_prompt_yielding(
-                                                    &resume_agent,
-                                                    &resume_runs,
-                                                    &resume_session,
-                                                    &resume_payload,
-                                                )
-                                                .await
-                                                {
-                                                    Some(Ok(result)) => {
-                                                        let heartbeat_ok = resume_name
-                                                            == "heartbeat"
-                                                            && result
-                                                                .content
-                                                                .trim()
-                                                                .contains("HEARTBEAT_OK");
-                                                        if heartbeat_ok {
-                                                            debug!(
-                                                                "Heartbeat (resumed): OK \
-                                                                 (nothing to do)"
-                                                            );
-                                                        } else {
-                                                            info!(
-                                                                "Scheduled task '{}' completed \
-                                                                 after yielding: {}",
-                                                                resume_name,
-                                                                result
-                                                                    .content
-                                                                    .chars()
-                                                                    .take(200)
-                                                                    .collect::<String>()
-                                                            );
-                                                        }
-                                                        break;
-                                                    }
-                                                    Some(Err(e)) => {
-                                                        error!(
-                                                            "Scheduled task '{}' failed after \
-                                                             yielding: {}",
-                                                            resume_name, e.message
-                                                        );
-                                                        break;
-                                                    }
-                                                    None => {
-                                                        // Preempted again — user
-                                                        // turns keep priority.
-                                                    }
-                                                }
-                                            }
-                                            resume_parked
-                                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                                        });
-                                        (
-                                            true,
-                                            Some(
-                                                "Yielded to a live chat turn; resuming on release"
-                                                    .to_string(),
-                                            ),
-                                            None,
-                                        )
-                                    } else {
-                                        (
-                                            true,
-                                            Some(
-                                                "Yielded to a live chat turn; a resume is \
-                                                 already parked, the next tick covers this one"
-                                                    .to_string(),
-                                            ),
-                                            None,
-                                        )
-                                    }
-                                }
-                            }
-                            }
-                        }
-                    };
-                    nanna_core::TaskResult {
-                        task_id: task.id.clone(),
-                        task_name: task.name.clone(),
-                        success,
-                        output,
-                        error,
-                        duration_ms: crate::numeric::millis_u64(start.elapsed()),
-                        started_at,
-                        finished_at: chrono::Utc::now(),
-                    }
-                })
-            });
-            scheduler = scheduler.with_executor(executor);
-            scheduler.start();
-            info!("Daemon scheduler started (heartbeat + cron runner)");
-            let scheduler = Arc::new(tokio::sync::RwLock::new(scheduler));
-            // `run` executes once per server, so the slot is empty here; a
-            // second fill would leave the reminder services on the first
-            // scheduler, which is the one still running.
-            if self.scheduler_slot.set(Arc::clone(&scheduler)).is_err() {
-                warn!("scheduler slot was already filled; reminders keep the first scheduler");
-            }
-            scheduler
-        };
+    /// Assemble the control plane, restore persisted workspaces onto it, and
+    /// publish it to the late-bound slot the sub-agent spawner reads.
+    ///
+    /// Returns the plane and the channel status manager attached to it, which
+    /// [`Self::start_channel_manager`] must share so `ChannelAction::Status` and
+    /// the channel listeners see the same state.
+    async fn build_control_plane(
+        &self,
+        deps: ControlPlaneDeps,
+    ) -> (Arc<ControlPlane>, Arc<nanna_channels::StatusManager>) {
+        let ControlPlaneDeps {
+            agent,
+            memory,
+            tools,
+            router,
+            tools_dir,
+            workspace_id_for_services,
+            turn_baselines,
+            scheduler,
+            model_stats,
+            chat_runs,
+            degradations,
+            activity_clock,
+            dreaming,
+        } = deps;
 
         // Create control plane with all services (including router for consolidation)
         let mut control = ControlPlane::with_all_services(
@@ -3427,6 +3801,45 @@ impl DaemonServer {
             control = control.with_storage(storage.clone()).await;
         }
 
+        self.restore_workspaces(&control).await;
+
+        // Wire model stats tracker into the router for health-aware routing.
+        // The control plane owns the canonical tracker; the router reads it.
+        if let Some(router) = control.router() {
+            router.set_stats(control.model_stats.clone()).await;
+            info!("Stats-informed routing enabled on LLM router");
+        }
+
+        // Shared channel status manager — attached before the Arc wrap so
+        // ChannelAction::Status and ChannelManager listeners see the same state.
+        let channel_status_manager = Arc::new(nanna_channels::StatusManager::new());
+        control.set_status_manager(Arc::clone(&channel_status_manager));
+
+        // Share the activity clock so chat requests stamp the same clock the
+        // scheduled dream cycle reads for its idle gate.
+        control.set_activity_clock(Arc::clone(&activity_clock));
+
+        // Share the ONE dreaming orchestrator, so an IPC-triggered consolidation
+        // runs the same multi-phase cycle the scheduler does (P13 unification).
+        if let Some(ref dreaming) = dreaming {
+            control.set_dreaming(Arc::clone(dreaming));
+        }
+
+        let control = Arc::new(control);
+        // Hand edits of config.toml apply without a restart.
+        control.spawn_config_watcher(self.shutdown_tx.subscribe());
+        *self.control_slot.write().await = Some(control.clone());
+
+        (control, channel_status_manager)
+    }
+
+    /// Re-register the workspaces the last session had, and seed the tool
+    /// working directory from whichever one was active.
+    ///
+    /// Without that seed a fresh daemon with a persisted active workspace left
+    /// `default_workdir` at `None` until the user re-selected it, so tools fell
+    /// back to the home dir instead of running "in the workspace you're in".
+    async fn restore_workspaces(&self, control: &ControlPlane) {
         // Load persisted workspaces from database
         if let Some(ref storage) = self.storage {
             match storage.workspaces().list().await {
@@ -3481,47 +3894,18 @@ impl DaemonServer {
                 }
             }
         }
+    }
 
-        // Wire model stats tracker into the router for health-aware routing.
-        // The control plane owns the canonical tracker; the router reads it.
-        if let Some(router) = control.router() {
-            router.set_stats(control.model_stats.clone()).await;
-            info!("Stats-informed routing enabled on LLM router");
-        }
-
-        // Shared channel status manager — attached before the Arc wrap so
-        // ChannelAction::Status and ChannelManager listeners see the same state.
-        let channel_status_manager = Arc::new(nanna_channels::StatusManager::new());
-        control.set_status_manager(Arc::clone(&channel_status_manager));
-
-        // Share the activity clock so chat requests stamp the same clock the
-        // scheduled dream cycle reads for its idle gate.
-        control.set_activity_clock(Arc::clone(&activity_clock));
-
-        // Share the ONE dreaming orchestrator, so an IPC-triggered consolidation
-        // runs the same multi-phase cycle the scheduler does (P13 unification).
-        if let Some(ref dreaming) = dreaming {
-            control.set_dreaming(Arc::clone(dreaming));
-        }
-
-        let control = Arc::new(control);
-        // Hand edits of config.toml apply without a restart.
-        control.spawn_config_watcher(self.shutdown_tx.subscribe());
-        *self.control_slot.write().await = Some(control.clone());
-
-        // Take the request receiver from IPC server
-        let mut request_rx =
-            self.ipc.take_request_receiver().await.ok_or_else(|| {
-                crate::DaemonError::Ipc("Request receiver already taken".to_string())
-            })?;
-
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-
-        // Spawn IPC server
+    /// Run the IPC listener, taking the daemon down if it ever fails.
+    ///
+    /// An IPC-less daemon is unreachable (no control plane) but would keep
+    /// running heartbeats and burning the LLM budget — observed live when a
+    /// second instance lost the port race.
+    fn spawn_ipc_server(&self) -> tokio::task::JoinHandle<()> {
         let ipc_server = self.ipc.clone();
         let ipc_shutdown = self.shutdown_tx.clone();
         let ipc_exit_reason = self.exit_reason.clone();
-        let ipc_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 // An IPC-less daemon is unreachable (no control plane) but
                 // would keep running heartbeats and burning the LLM budget —
@@ -3542,8 +3926,14 @@ impl DaemonServer {
                     std::process::exit(1);
                 }
             }
-        });
+        })
+    }
 
+    /// Tell subscribed clients about a startup quarantine + rebuild.
+    ///
+    /// Boot usually precedes any subscriber, so `/status` (health server +
+    /// control plane) carries the same facts for late-connecting clients.
+    fn announce_memory_recovery(&self) {
         // Announce a startup quarantine + rebuild to subscribed clients. Boot
         // usually precedes any subscriber, so /status (health server + control
         // plane) carries the same facts for late-connecting clients.
@@ -3555,9 +3945,15 @@ impl DaemonServer {
                     quarantine_path: report.quarantine_path.to_string_lossy().to_string(),
                 });
         }
+    }
 
-        // Spawn health HTTP server if enabled
-        let _health_state = if self.config.servers.health_server {
+    /// Serve `/status` and `/metrics`, seeded with the durable store's health.
+    async fn spawn_health_server(
+        &self,
+        control: &Arc<ControlPlane>,
+        memory: Option<&Arc<MemoryService>>,
+    ) -> Option<Arc<HealthState>> {
+        if self.config.servers.health_server {
             // Seed durable-memory-store health (load already ran in init_services),
             // so a corrupt/degraded store shows on /status, not just a boot log.
             //
@@ -3565,7 +3961,7 @@ impl DaemonServer {
             // one with corrupt rows: there is no durable store at all, so the
             // per-store health probe cannot report on it. Fold that in here or
             // the most complete failure is the one /status calls healthy.
-            let (mem_degraded, mem_corrupt) = if let Some(ref m) = memory {
+            let (mem_degraded, mem_corrupt) = if let Some(m) = memory {
                 let h = m.store_health().await;
                 (h.degraded || self.storage_error.is_some(), h.corrupt_rows)
             } else {
@@ -3586,7 +3982,7 @@ impl DaemonServer {
                 state = state
                     .with_memory_rebuild(report.memories_recovered, report.memories_expected);
             }
-            let control_for_metrics = Arc::clone(&control);
+            let control_for_metrics = Arc::clone(control);
             state = state.with_metrics(Arc::new(move || {
                 let control = Arc::clone(&control_for_metrics);
                 Box::pin(async move {
@@ -3625,18 +4021,25 @@ impl DaemonServer {
             Some(health_state)
         } else {
             None
-        };
+        }
+    }
 
-        // Start ChannelManager if any channels are configured.
+    /// Start the channel listeners (Telegram, Discord, Slack, …) when any are
+    /// configured, sharing `status_manager` with the control plane.
+    async fn start_channel_manager(
+        &self,
+        control: &Arc<ControlPlane>,
+        channel_status_manager: &Arc<nanna_channels::StatusManager>,
+    ) -> Option<Arc<ChannelManager>> {
         // This handles listener-based inbound (polling) and routes responses back out.
-        let channel_manager = if let Some(ref channels_config) = self.config.channels {
+        if let Some(ref channels_config) = self.config.channels {
             // Build a daemon-local ChannelsConfig from the nanna_config::ChannelsConfig.
             // We re-map from nanna_config types to the daemon-local types.
             let daemon_channels = build_daemon_channels_config(channels_config);
 
             let mut manager = ChannelManager::with_status_manager(
-                Arc::clone(&control),
-                Arc::clone(&channel_status_manager),
+                Arc::clone(control),
+                Arc::clone(channel_status_manager),
             );
             manager.configure(&daemon_channels).await;
 
@@ -3656,8 +4059,16 @@ impl DaemonServer {
             }
         } else {
             None
-        };
+        }
+    }
 
+    /// Serve inbound webhooks, routing them through the same pipeline the
+    /// channel listeners use.
+    async fn spawn_webhook_server(
+        &self,
+        control: &Arc<ControlPlane>,
+        channel_manager: Option<&Arc<ChannelManager>>,
+    ) {
         // Spawn webhook HTTP server if enabled
         if self.config.servers.webhook_server {
             let mut webhook_config = self.config.webhook.clone();
@@ -3680,7 +4091,7 @@ impl DaemonServer {
             // If a ChannelManager is running, share its router so outbound channels
             // (bot tokens) are already registered.  Otherwise create a standalone
             // router that may only cover providers registered via webhook config.
-            let webhook_router = if let Some(ref mgr) = channel_manager {
+            let webhook_router = if let Some(mgr) = channel_manager {
                 mgr.router()
             } else {
                 // No channel manager — create a standalone router.
@@ -3728,7 +4139,7 @@ impl DaemonServer {
 
             // Spawn webhook event processor — routes events through the same pipeline
             // as channel listener messages.
-            let control_for_webhooks = Arc::clone(&control);
+            let control_for_webhooks = Arc::clone(control);
             tokio::spawn(async move {
                 while let Some(event) = webhook_rx.recv().await {
                     debug!("Webhook event from {}: {:?}", event.source, event.message);
@@ -3770,14 +4181,13 @@ impl DaemonServer {
                 self.config.ipc.host, self.config.webhook_port
             );
         }
+    }
 
-        // Sessions are now persisted via Turso write-through on every mutation.
-        // No more periodic JSON auto-save — each create/message/delete/rename writes to DB immediately.
-
-        // Spawn model + tool stats auto-save task (every 5 minutes)
+    /// Persist model + tool stats every five minutes, and once more on shutdown.
+    fn spawn_stats_autosave(&self, control: &Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
         let stats_control = control.clone();
         let mut stats_shutdown = self.shutdown_tx.subscribe();
-        let stats_save_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 tokio::select! {
@@ -3794,8 +4204,15 @@ impl DaemonServer {
                     }
                 }
             }
-        });
+        })
+    }
 
+    /// Drain parent mailboxes for running sub-agents so questions don't go stale.
+    ///
+    /// When a sub-agent uses `ask_parent`, [`ParentChannelImpl`] answers it
+    /// directly via an LLM call; this task handles any orphaned mailbox messages
+    /// and provides visibility into long-running sub-agents.
+    fn spawn_sub_agent_checkin(&self) {
         // Spawn sub-agent check-in task: periodically check running sub-agents
         // and drain parent mailboxes so questions don't go stale.
         // When a sub-agent uses ask_parent, the ParentChannelImpl handles it directly
@@ -3841,21 +4258,21 @@ impl DaemonServer {
                 }
             });
         }
+    }
 
-        // The configured address: with port 0 the real port is only known once
-        // the IPC task binds, and its own "listening" line reports that.
-        info!(
-            "Daemon ready. IPC server configured for ws://{}",
-            self.ipc.address()
-        );
-
-        // Main event loop
-        //
-        // Every request is dispatched as a tokio task so the loop is purely
-        // a router — it never blocks.  The multi-threaded runtime (default
-        // for `Runtime::new()`) schedules tasks across worker threads, so
-        // concurrent requests (e.g. session creation while an agent is
-        // running) execute in parallel.
+    /// The main event loop: dispatch every request as a task and return when
+    /// shutdown is signalled.
+    ///
+    /// The loop is purely a router — it never blocks. The multi-threaded runtime
+    /// (the default for `Runtime::new()`) schedules the spawned tasks across
+    /// worker threads, so concurrent requests (e.g. session creation while an
+    /// agent is running) execute in parallel.
+    async fn serve_requests(
+        &self,
+        control: &Arc<ControlPlane>,
+        request_rx: &mut tokio::sync::mpsc::Receiver<(crate::ipc::ConnectionId, crate::protocol::Request)>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
         loop {
             tokio::select! {
                 Some((client_id, request)) = request_rx.recv() => {
@@ -3878,7 +4295,16 @@ impl DaemonServer {
                 }
             }
         }
+    }
 
+    /// Drain and stop: shut the IPC server, let the stats task take its final
+    /// save, release the PID file and record the clean exit.
+    async fn finish_shutdown(
+        &self,
+        channel_manager: Option<Arc<ChannelManager>>,
+        stats_save_handle: tokio::task::JoinHandle<()>,
+        ipc_handle: tokio::task::JoinHandle<()>,
+    ) {
         // Cleanup
         info!("Shutting down daemon...");
         self.ipc.shutdown();
@@ -3904,7 +4330,6 @@ impl DaemonServer {
         self.exit_reason.record_exit("clean_shutdown", None);
 
         info!("Daemon stopped");
-        Ok(())
     }
 
     /// Initialize all services
