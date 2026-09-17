@@ -656,7 +656,7 @@ pub enum SystemAction {
         /// Window in days (default 30, at most 366).
         #[serde(default)]
         days: Option<u32>,
-        /// `day` (default) or `month`.
+        /// `day` (default), `month`, or `session` (bucket label = session id).
         #[serde(default)]
         by: Option<String>,
     },

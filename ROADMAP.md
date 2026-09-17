@@ -5036,9 +5036,14 @@ asks permission or restricts her.)*:
       unknown/local models reported **unpriced and named**, never $0, so the total is labelled a
       floor. Tests: storage rollup against real Turso with backdated rows (day and month grouping,
       window, clamp), sink fan-out across tracker clones, pricing/unpriced rule; the verb answered
-      live on the debug daemon (empty log, invalid `by` refused). **Still open:** per-session rollups
-      (the sink has no session id to write — `RequestObservation` does not carry one), GUI surfacing,
-      and the spend **cap**, which is a gate and therefore an owner call under the no-gates rule.
+      live on the debug daemon (empty log, invalid `by` refused). **Still open:** GUI surfacing, and
+      the spend **cap**, which is a gate and therefore an owner call under the no-gates rule.
+      *(later the same day)* **Per-session rollups landed** without touching the agent loop: the sink
+      fires synchronously inside the run's own future, so `ToolRegistry::run_session_id()` (a new
+      registry-free read of the run-scoped task-local) names the conversation before the write is
+      spawned. `system.cost_rollup {by: "session"}` groups by it (an empty label = requests made
+      outside any conversation). Tests: the task-local is readable in a callback inside the run and
+      not across `spawn`; the storage rollup groups the logged rows under their session.
 - [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.

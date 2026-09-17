@@ -439,6 +439,14 @@ mod tests {
             by_month.iter().all(|b| b.period != "2001-01"),
             "outside the window"
         );
+        let by_session = storage
+            .model_usage_by(7, UsagePeriod::Session)
+            .await
+            .expect("rollup");
+        assert!(
+            by_session.iter().all(|b| b.period == "s"),
+            "every logged row named session s: {by_session:?}"
+        );
         let everything = storage
             .model_usage_buckets(u32::MAX, true)
             .await
@@ -788,30 +796,53 @@ impl Storage {
         days: u32,
         by_month: bool,
     ) -> Result<Vec<ModelUsageBucket>, StorageError> {
+        let period = if by_month {
+            UsagePeriod::Month
+        } else {
+            UsagePeriod::Day
+        };
+        self.model_usage_by(days, period).await
+    }
+
+    /// Model usage over the last `days` days grouped by `period` and model.
+    /// For [`UsagePeriod::Session`] the bucket's `period` is the session id
+    /// (empty for requests made outside any conversation).
+    ///
+    /// # Errors
+    ///
+    /// The query failed or a row did not have the expected shape.
+    pub async fn model_usage_by(
+        &self,
+        days: u32,
+        period: UsagePeriod,
+    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
         let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
-        // `created_at` is `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, so the
-        // period is a prefix of it and the cutoff compares as text.
-        let prefix_len: i64 = if by_month { 7 } else { 10 };
+        // `created_at` is `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, so a day or
+        // month is a prefix of it and the cutoff compares as text. The column
+        // is chosen from a closed enum, never from caller text.
+        let group_expr = match period {
+            UsagePeriod::Day => "substr(created_at, 1, 10)",
+            UsagePeriod::Month => "substr(created_at, 1, 7)",
+            UsagePeriod::Session => "COALESCE(session_id, '')",
+        };
         let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days)))
             .format("%Y-%m-%d 00:00:00")
             .to_string();
+        let sql = format!(
+            "SELECT {group_expr} AS period, model,
+                    CAST(COUNT(*) AS INTEGER),
+                    CAST(SUM(input_tokens) AS INTEGER),
+                    CAST(SUM(output_tokens) AS INTEGER),
+                    CAST(SUM(cache_read_tokens) AS INTEGER),
+                    CAST(SUM(cache_creation_tokens) AS INTEGER),
+                    CAST(SUM(cache_creation_1h_tokens) AS INTEGER)
+             FROM model_request_log
+             WHERE created_at >= ?1
+             GROUP BY period, model
+             ORDER BY period ASC, model ASC"
+        );
         let conn = self.conn.lock().await;
-        let mut rows = conn
-            .query(
-                "SELECT substr(created_at, 1, ?1) AS period, model,
-                        CAST(COUNT(*) AS INTEGER),
-                        CAST(SUM(input_tokens) AS INTEGER),
-                        CAST(SUM(output_tokens) AS INTEGER),
-                        CAST(SUM(cache_read_tokens) AS INTEGER),
-                        CAST(SUM(cache_creation_tokens) AS INTEGER),
-                        CAST(SUM(cache_creation_1h_tokens) AS INTEGER)
-                 FROM model_request_log
-                 WHERE created_at >= ?2
-                 GROUP BY period, model
-                 ORDER BY period ASC, model ASC",
-                turso::params![prefix_len, since],
-            )
-            .await?;
+        let mut rows = conn.query(&sql, turso::params![since]).await?;
         let mut buckets = Vec::new();
         while let Some(row) = rows.next().await? {
             let count = |index: usize| row.get::<i64>(index).map(|n| u64::try_from(n).unwrap_or(0));
@@ -1372,6 +1403,14 @@ impl Storage {
         ).await?;
         Ok(())
     }
+}
+
+/// How a usage rollup groups requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePeriod {
+    Day,
+    Month,
+    Session,
 }
 
 /// Longest window a usage rollup covers: a year and a day.

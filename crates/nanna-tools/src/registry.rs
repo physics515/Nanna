@@ -232,6 +232,17 @@ impl ToolRegistry {
         self.session_id.read().await.clone()
     }
 
+    /// The run-scoped session of the caller, if it is inside
+    /// [`Self::with_run_session`] — never the shared binding.
+    ///
+    /// For observers that fire inside a run but have no registry at hand (the
+    /// model-request sink attributes spend to a conversation this way). Must be
+    /// read on the run's own task: a task-local does not cross `tokio::spawn`.
+    #[must_use]
+    pub fn run_session_id() -> Option<String> {
+        RUN_SESSION_ID.try_with(Clone::clone).ok()
+    }
+
     /// Run `future` with `session_id` as the session every tool call inside it
     /// scopes to, leaving the shared binding untouched.
     ///
@@ -1850,6 +1861,28 @@ mod tests {
     }
 
     // --- run-scoped session ---
+
+    #[tokio::test]
+    async fn a_run_scoped_session_is_readable_without_a_registry_and_only_inside_the_run() {
+        assert_eq!(ToolRegistry::run_session_id(), None, "outside any run");
+        let inside = ToolRegistry::with_run_session("chat-9".to_string(), async {
+            // A synchronous callback fired inside the run, like the request sink.
+            let read_in_callback = || ToolRegistry::run_session_id();
+            read_in_callback()
+        })
+        .await;
+        assert_eq!(inside.as_deref(), Some("chat-9"));
+        let spawned = ToolRegistry::with_run_session("chat-9".to_string(), async {
+            tokio::spawn(async { ToolRegistry::run_session_id() })
+                .await
+                .expect("join")
+        })
+        .await;
+        assert_eq!(
+            spawned, None,
+            "a task-local does not cross spawn — read before spawning"
+        );
+    }
 
     #[tokio::test]
     async fn a_run_scoped_session_wins_and_leaves_the_shared_binding_alone() {

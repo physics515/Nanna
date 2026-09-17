@@ -4236,6 +4236,9 @@ impl DaemonServer {
             model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
                 let storage = Arc::clone(&storage);
                 let obs = obs.clone();
+                // Read here, on the run's task: the task-local does not cross
+                // the spawn below.
+                let session_id = ToolRegistry::run_session_id();
                 tokio::spawn(async move {
                     let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
                     let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
@@ -4251,7 +4254,7 @@ impl DaemonServer {
                             obs.cache_creation_1h_tokens.min(obs.cache_creation_tokens),
                             tier.as_deref(),
                             obs.escalated,
-                            None,
+                            session_id.as_deref(),
                         )
                         .await
                     {
