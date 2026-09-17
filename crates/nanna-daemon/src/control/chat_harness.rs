@@ -1930,10 +1930,10 @@ impl ControlPlane {
                     &session_id_owned,
                     MessageRole::Assistant,
                     &content,
-                    Vec::new(),
-                    None,
-                    timeline,
-                    None,
+                    crate::session::MessageDetails {
+                        timeline,
+                        ..crate::session::MessageDetails::default()
+                    },
                 )
                 .await;
 

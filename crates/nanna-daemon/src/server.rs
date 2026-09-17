@@ -2335,10 +2335,12 @@ impl DaemonServer {
                                         &session_id,
                                         crate::session::MessageRole::Assistant,
                                         &partial.content,
-                                        partial.tool_calls,
-                                        reasoning,
-                                        partial.timeline,
-                                        partial.usage,
+                                        crate::session::MessageDetails {
+                                            tool_calls: partial.tool_calls,
+                                            reasoning,
+                                            timeline: partial.timeline,
+                                            usage: partial.usage,
+                                        },
                                     )
                                     .await;
                                 info!("Recovered crashed run for session {}", session_id);
@@ -2387,10 +2389,12 @@ impl DaemonServer {
                                             session_id,
                                             crate::session::MessageRole::Assistant,
                                             &partial.content,
-                                            partial.tool_calls,
-                                            reasoning,
-                                            partial.timeline,
-                                            partial.usage,
+                                            crate::session::MessageDetails {
+                                                tool_calls: partial.tool_calls,
+                                                reasoning,
+                                                timeline: partial.timeline,
+                                                usage: partial.usage,
+                                            },
                                         )
                                         .await;
                                     info!(
@@ -3085,8 +3089,7 @@ impl DaemonServer {
                     recovered: report.memories_recovered,
                     expected: report.memories_expected,
                     quarantine_path: report.quarantine_path.to_string_lossy().to_string(),
-                })
-                .await;
+                });
         }
 
         // Spawn health HTTP server if enabled

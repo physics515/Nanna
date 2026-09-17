@@ -69,10 +69,10 @@ impl MessageRole {
     #[must_use]
     pub fn from_db_str(s: &str) -> Self {
         match s {
-            "user" => Self::User,
             "assistant" => Self::Assistant,
             "system" => Self::System,
             "tool" => Self::Tool,
+            // "user" itself, and any role string this build does not know.
             _ => Self::User,
         }
     }
@@ -218,7 +218,9 @@ fn char_floor_prefix(text: &str, bytes_max: usize) -> &str {
     text.get(..end).unwrap_or_default()
 }
 
-/// One entry in a run's chronological journal. A long-horizon run is not
+/// One entry in a run's chronological journal.
+///
+/// A long-horizon run is not
 /// "one thinking blob + one flat tool list + one text blob" — it is an
 /// interleaved sequence (think → call tools → think → speak → …), and for
 /// runs that heal through provider faults it can span many attempts. The
@@ -299,8 +301,19 @@ pub enum TimelineItem {
     },
 }
 
+/// Everything an assistant message can carry beyond its text: the tool calls
+/// it made, its reasoning, the run's chronological journal, and usage totals.
+#[derive(Debug, Clone, Default)]
+pub struct MessageDetails {
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub reasoning: Option<String>,
+    pub timeline: Vec<TimelineItem>,
+    pub usage: Option<RunUsage>,
+}
+
 /// Resource totals for one run, for benchmarking models against each other
 /// on identical tasks: total tokens spent and wall-clock time taken.
+///
 /// Token totals accumulate across EVERY healing attempt via the per-request
 /// usage callback — not just the attempt that finally succeeded. (Streams
 /// that die before the provider reports usage still under-count slightly;
@@ -396,6 +409,7 @@ impl Session {
     }
 
     /// Set the workspace ID for this session
+    #[must_use]
     pub fn with_workspace(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = Some(workspace_id.into());
         self
@@ -456,11 +470,14 @@ impl Session {
         &mut self,
         role: MessageRole,
         content: impl Into<String>,
-        tool_calls: Vec<ToolCallRecord>,
-        reasoning: Option<String>,
-        timeline: Vec<TimelineItem>,
-        usage: Option<RunUsage>,
+        details: MessageDetails,
     ) -> String {
+        let MessageDetails {
+            tool_calls,
+            reasoning,
+            timeline,
+            usage,
+        } = details;
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
             id: id.clone(),
@@ -535,7 +552,7 @@ impl Session {
     
     /// Get message count
     #[must_use]
-    pub fn message_count(&self) -> usize {
+    pub const fn message_count(&self) -> usize {
         self.messages.len()
     }
 }
@@ -860,6 +877,10 @@ impl SessionManager {
                 *default = Some(session_id);
             }
         }
+        // Both guards span the whole load, so no reader ever sees a
+        // half-loaded store or a default naming a session not yet inserted.
+        drop(default);
+        drop(sessions);
 
         info!("Loaded {} sessions from database", count);
         count
@@ -947,6 +968,11 @@ impl SessionManager {
         if default.is_none() {
             *default = Some(id.clone());
         }
+        // `sessions` stays held until the default is settled: a `delete` of
+        // this id cannot interleave between the insert and the default write
+        // and leave the default naming a session that no longer exists.
+        drop(default);
+        drop(sessions);
         
         info!("Created session: {} (workspace: {:?})", id, session.workspace_id);
         session
@@ -956,12 +982,12 @@ impl SessionManager {
     pub async fn set_workspace(&self, session_id: &str, workspace_id: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            session.workspace_id = workspace_id.clone();
+            session.workspace_id.clone_from(&workspace_id);
             // Persist to DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.set_daemon_session_workspace(session_id, workspace_id.as_deref()).await {
-                    warn!("Failed to persist workspace change for session {}: {}", session_id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.set_daemon_session_workspace(session_id, workspace_id.as_deref()).await
+            {
+                warn!("Failed to persist workspace change for session {}: {}", session_id, e);
             }
             true
         } else {
@@ -1014,7 +1040,9 @@ impl SessionManager {
         }
         session.updated_at = Utc::now();
         info!("Session {} chat model set to {:?}", session_id, session.chat_model());
-        Some(SessionRow::from(&*session))
+        let row = SessionRow::from(&*session);
+        drop(sessions);
+        Some(row)
     }
 
     /// Set or clear this session's user-selected extra tools (empty = no
@@ -1062,7 +1090,9 @@ impl SessionManager {
         }
         session.updated_at = Utc::now();
         info!("Session {} chat tools set to {:?}", session_id, session.chat_tools());
-        Some(SessionRow::from(&*session))
+        let row = SessionRow::from(&*session);
+        drop(sessions);
+        Some(row)
     }
 
     /// Get a session by ID
@@ -1079,10 +1109,10 @@ impl SessionManager {
             default.clone()
         };
         
-        if let Some(id) = default_id {
-            if let Some(session) = self.get(&id).await {
-                return session;
-            }
+        if let Some(id) = default_id
+            && let Some(session) = self.get(&id).await
+        {
+            return session;
         }
         
         // Create new default
@@ -1136,18 +1166,22 @@ impl SessionManager {
 
         if removed {
             // Delete from DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.delete_daemon_session(id).await {
-                    warn!("Failed to delete session {} from DB: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.delete_daemon_session(id).await
+            {
+                warn!("Failed to delete session {} from DB: {}", id, e);
             }
             // Clear default if it was this session
             let mut default = self.default_session.write().await;
             if default.as_deref() == Some(id) {
                 *default = sessions.keys().next().cloned();
             }
+            drop(default);
             info!("Deleted session: {}", id);
         }
+        // Held through the DB delete and the default reassignment, which reads
+        // the remaining keys: map, database and default change as one step.
+        drop(sessions);
 
         removed
     }
@@ -1171,6 +1205,11 @@ impl SessionManager {
         // Clear default session
         let mut default = self.default_session.write().await;
         *default = None;
+        // `sessions` stays held until the default is cleared, so a concurrent
+        // create cannot insert and become the default in between only to have
+        // that default wiped here.
+        drop(default);
+        drop(sessions);
 
         info!("Deleted all {} sessions", count);
         count
@@ -1183,10 +1222,10 @@ impl SessionManager {
             session.name = Some(name.clone());
             session.updated_at = Utc::now();
             // Persist to DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.rename_daemon_session(id, &name).await {
-                    warn!("Failed to persist rename for session {}: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.rename_daemon_session(id, &name).await
+            {
+                warn!("Failed to persist rename for session {}: {}", id, e);
             }
             true
         } else {
@@ -1200,10 +1239,10 @@ impl SessionManager {
         if let Some(session) = sessions.get_mut(id) {
             session.clear();
             // Clear from DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.clear_daemon_session_messages(id).await {
-                    warn!("Failed to clear messages for session {} in DB: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.clear_daemon_session_messages(id).await
+            {
+                warn!("Failed to clear messages for session {} in DB: {}", id, e);
             }
             true
         } else {
@@ -1233,15 +1272,12 @@ impl SessionManager {
         session_id: &str,
         role: MessageRole,
         content: impl Into<String>,
-        tool_calls: Vec<ToolCallRecord>,
-        reasoning: Option<String>,
-        timeline: Vec<TimelineItem>,
-        usage: Option<RunUsage>,
+        details: MessageDetails,
     ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_full_message(role, content, tool_calls, reasoning, timeline, usage);
+            let msg_id = session.add_full_message(role, content, details);
             // Persist the new message synchronously
             if let Some(msg) = session.messages.last() {
                 self.persist_message(session_id, msg).await;
@@ -1266,23 +1302,19 @@ impl SessionManager {
     /// Subscribe a channel to a session
     pub async fn subscribe(&self, session_id: &str, channel_id: ChannelId) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
+        sessions.get_mut(session_id).is_some_and(|session| {
             session.subscribe(channel_id);
             true
-        } else {
-            false
-        }
+        })
     }
     
     /// Unsubscribe a channel from a session
     pub async fn unsubscribe(&self, session_id: &str, channel_id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
+        sessions.get_mut(session_id).is_some_and(|session| {
             session.unsubscribe(channel_id);
             true
-        } else {
-            false
-        }
+        })
     }
     
     /// Get all sessions a channel is subscribed to
@@ -1333,6 +1365,10 @@ impl SessionManager {
         if default.is_none() {
             *default = Some(id);
         }
+        // Same ordering as `create_in_workspace`: the insert and the default
+        // settle together.
+        drop(default);
+        drop(sessions);
     }
     
     /// Set the default session ID
@@ -1429,10 +1465,7 @@ impl SessionManager {
     pub async fn list_sub_sessions(&self, parent_id: Option<&str>) -> Vec<SubSessionInfo> {
         let subs = self.sub_sessions.read().await;
         subs.values()
-            .filter(|s| match parent_id {
-                Some(pid) => s.parent_id.as_deref() == Some(pid),
-                None => true,
-            })
+            .filter(|s| parent_id.is_none_or(|pid| s.parent_id.as_deref() == Some(pid)))
             .cloned()
             .collect()
     }
@@ -1457,16 +1490,14 @@ impl SessionManager {
     /// Send a message to a session's mailbox
     pub async fn send_to_mailbox(&self, session_id: &str, from: &str, content: String) -> bool {
         let mut mailboxes = self.mailboxes.write().await;
-        if let Some(mailbox) = mailboxes.get_mut(session_id) {
+        mailboxes.get_mut(session_id).is_some_and(|mailbox| {
             mailbox.push(MailboxMessage {
                 from: from.to_string(),
                 content,
                 timestamp: Utc::now(),
             });
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Drain all messages from a session's mailbox
@@ -1503,6 +1534,10 @@ impl SessionManager {
             subs.remove(id);
             mailboxes.remove(id);
         }
+        // Both maps are swept under one acquisition, so no reader sees a
+        // sub-session without its mailbox or the reverse.
+        drop(mailboxes);
+        drop(subs);
 
         if !to_remove.is_empty() {
             info!("Cleaned up {} completed sub-sessions", to_remove.len());
@@ -1517,7 +1552,7 @@ impl SessionManager {
 /// whatever text their source held. Slicing one at a fixed byte index panics
 /// when the id is shorter than the limit or when the index lands inside a
 /// multi-byte character, and a panic here would take the whole daemon down.
-fn floor_boundary(s: &str, max: usize) -> usize {
+const fn floor_boundary(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -1609,7 +1644,7 @@ mod tests {
     /// chat — they must survive not just navigation (see
     /// `tasks::tests::tool_calls_survive_navigation_via_run_buffers`) but a
     /// full daemon restart. The timeline journal persisted with the message
-    /// must round-trip through Turso intact: a fresh SessionManager over the
+    /// must round-trip through Turso intact: a fresh `SessionManager` over the
     /// same database restores the message with its tool call, input, output
     /// and verdict in place.
     #[tokio::test]
@@ -1663,10 +1698,10 @@ mod tests {
                 &session.id,
                 MessageRole::Assistant,
                 "there is one file: file.txt",
-                Vec::new(),
-                None,
-                timeline,
-                None,
+                MessageDetails {
+                    timeline,
+                    ..MessageDetails::default()
+                },
             )
             .await;
 
@@ -1841,10 +1876,10 @@ mod tests {
                 &session.id,
                 MessageRole::Assistant,
                 "done",
-                Vec::new(),
-                None,
-                timeline,
-                None,
+                MessageDetails {
+                    timeline,
+                    ..MessageDetails::default()
+                },
             )
             .await;
 
