@@ -1786,7 +1786,7 @@ pub struct DaemonConfig {
     pub memory_min_remaining_memories: usize,
     /// Seconds of idle (no chat activity) before the scheduled dream cycle may
     /// run (mirrors `[memory] dream_idle_threshold_secs`). Gated via the shared
-    /// [`ActivityClock`] + `nanna_memory::dream_trigger`.
+    /// [`ActivityClock`](nanna_memory::ActivityClock) + `nanna_memory::dream_trigger`.
     pub dream_idle_threshold_secs: u64,
     /// Live memory count that forces a dream cycle regardless of idle time
     /// (mirrors `[memory] dream_memory_pressure_count`; `0` disables).
@@ -1895,7 +1895,7 @@ impl DaemonConfig {
     /// Where the per-call tool audit trail is written.
     ///
     /// One definition, because two consumers need it and they are built in
-    /// different places: `init_services` hands it to the [`JsonlAuditSink`], and
+    /// different places: `init_services` hands it to the [`JsonlAuditSink`](nanna_tools::JsonlAuditSink), and
     /// the control plane needs it to serve the trail back to a client. Deriving
     /// it twice is how the reader ends up looking somewhere the writer never
     /// wrote — and note this hangs off `data_dir`, which `--data-dir` moves, so

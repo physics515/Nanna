@@ -718,7 +718,7 @@ fn typing_abandon_after() -> std::time::Duration {
 /// outage each call can take the channel client's whole 30 s timeout, the
 /// forwarder would fall behind the event bus, and a skipped `message_end` is a
 /// reply never sent — far worse than a missing indicator. Bounded: at most one
-/// per session per [`TYPING_REFRESH`], each ending at that client timeout.
+/// per session per `TYPING_REFRESH`, each ending at that client timeout.
 fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: &ReplyChannel) {
     let router = Arc::clone(router);
     let session_id = session_id.to_string();
@@ -778,12 +778,12 @@ fn spawn_reply_outbox(
 /// While a routed session's turn runs, the chat also shows "typing…": a
 /// Telegram user used to see nothing at all between sending a message and a
 /// reply minutes later. A turn's first event starts it; a tick every
-/// [`TYPING_REFRESH`] keeps it up through silent stretches (a long tool call);
-/// `message_end`, or no event for [`typing_abandon_after`], ends it. The map
+/// `TYPING_REFRESH` keeps it up through silent stretches (a long tool call);
+/// `message_end`, or no event for `typing_abandon_after`, ends it. The map
 /// holds only sessions mid-turn and is bounded by the channel session count.
 ///
 /// **The bus reader never waits on a provider.** Replies go to a FIFO task per
-/// chat ([`spawn_reply_outbox`]), so they stay in order within a chat while a
+/// chat (`spawn_reply_outbox`), so they stay in order within a chat while a
 /// send stuck in a 30 s provider timeout cannot make this loop fall behind the
 /// event bus — where a skipped `message_end` is another chat's lost reply.
 pub fn spawn_reply_forwarder(
