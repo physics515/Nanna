@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{CronJob, JobRun, Memory, MemoryChunk, MemoryEventRow, MemoryFsrsUpdate, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMemoryEvent, NewMessage, Session, StorageError, WorkspaceRecord};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -15,6 +15,11 @@ impl SessionRepository {
         Self { conn }
     }
 
+    /// Create a session, or bump `updated_at` if `session_id` already exists.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert or the read-back fails,
+    /// or [`StorageError::NotFound`] if the row cannot be read back.
     pub async fn create(
         &self,
         session_id: &str,
@@ -24,6 +29,12 @@ impl SessionRepository {
         self.create_with_workspace(session_id, channel, user_id, None, None).await
     }
 
+    /// Create a session in a workspace, or bump `updated_at` if `session_id`
+    /// already exists (the existing row's other columns are kept).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert or the read-back fails,
+    /// or [`StorageError::NotFound`] if the row cannot be read back.
     pub async fn create_with_workspace(
         &self,
         session_id: &str,
@@ -45,6 +56,12 @@ impl SessionRepository {
         self.get(session_id).await
     }
 
+    /// Fetch one session by id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no session has `session_id`, or
+    /// [`StorageError::Database`] if the query fails or a column does not
+    /// decode. Unparseable metadata loads as `None`.
     pub async fn get(&self, session_id: &str) -> Result<Session, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -56,7 +73,7 @@ impl SessionRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
+        let session = if let Some(row) = rows.next().await? {
             let metadata_str: Option<String> = row.get(6)?;
             Ok(Session {
                 id: row.get(0)?,
@@ -71,9 +88,19 @@ impl SessionRepository {
             })
         } else {
             Err(StorageError::NotFound(format!("Session: {session_id}")))
-        }
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        session
     }
 
+    /// The `limit` most recently updated sessions, newest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable metadata loads as `None`.
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<Session>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -100,11 +127,19 @@ impl SessionRepository {
                 name: row.get(8)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(sessions)
     }
 
     /// List sessions for a specific workspace (or global if `workspace_id` is None)
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable metadata loads as `None`.
     pub async fn list_by_workspace(&self, workspace_id: Option<&str>, limit: i64) -> Result<Vec<Session>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -140,27 +175,39 @@ impl SessionRepository {
                 name: row.get(8)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(sessions)
     }
 
     /// Update session name
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_name(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
             turso::params![name, session_id],
         ).await?;
+        drop(conn);
         Ok(())
     }
 
     /// Update session workspace
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
             turso::params![workspace_id, session_id],
         ).await?;
+        drop(conn);
         Ok(())
     }
 }
@@ -175,6 +222,12 @@ impl MessageRepository {
         Self { conn }
     }
 
+    /// Insert a message, touch its session, and return the stored row.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the insert, the session touch, or
+    /// the read-back fails, or [`StorageError::NotFound`] if the read-back
+    /// finds no row. Statements that succeeded before a failure stay applied.
     pub async fn create(&self, msg: NewMessage) -> Result<Message, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -212,7 +265,7 @@ impl MessageRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
+        let message = if let Some(row) = rows.next().await? {
             let metadata_str: Option<String> = row.get(9)?;
             Ok(Message {
                 id: row.get(0)?,
@@ -228,9 +281,20 @@ impl MessageRepository {
             })
         } else {
             Err(StorageError::NotFound("Message just created".to_string()))
-        }
+        };
+        // Held from the insert through the read-back: "newest row" is only
+        // this message while no other writer can interleave, and the cursor
+        // must be gone before the guard is.
+        drop(rows);
+        drop(conn);
+        message
     }
 
+    /// Up to `limit` messages of a session, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable metadata loads as `None`.
     pub async fn get_by_session(
         &self,
         session_id: &str,
@@ -262,6 +326,10 @@ impl MessageRepository {
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(messages)
     }
@@ -295,23 +363,35 @@ fn decode_memory_row(
         metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
         tags,
         workspace_id: row.get(9)?,
-        fsrs_stability: row.get::<f64>(10)? as f32,
-        fsrs_difficulty: row.get::<f64>(11)? as f32,
+        fsrs_stability: f32_from_real(row.get::<f64>(10)?),
+        fsrs_difficulty: f32_from_real(row.get::<f64>(11)?),
         fsrs_last_access: row.get(12)?,
         fsrs_access_count: row.get(13)?,
-        fsrs_importance: row.get::<f64>(14)? as f32,
-        fsrs_storage_strength: row.get::<f64>(15)? as f32,
+        fsrs_importance: f32_from_real(row.get::<f64>(14)?),
+        fsrs_storage_strength: f32_from_real(row.get::<f64>(15)?),
         fsrs_generation: row.get(16)?,
     })
 }
 
-fn decode_embedding(bytes: Option<Vec<u8>>) -> Option<Vec<f32>> {
-    bytes.map(|bytes| {
-        bytes
-            .as_chunks::<4>().0.iter()
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
-    })
+/// Narrow a `REAL` column back to the `f32` it was written from.
+///
+/// Every `f32` this crate stores goes in as `f64::from(f32)`, which is exact,
+/// so for those rows this narrowing is exact too. `as` is the only f64 to f32
+/// conversion the language has (there is no `TryFrom`); anything else rounds
+/// to the nearest `f32`, exactly as the per-field casts this replaces did.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "no lossless f64 -> f32 conversion exists; columns are written from f32 via f64::from, so the round-trip is exact"
+)]
+const fn f32_from_real(value: f64) -> f32 {
+    value as f32
+}
+
+fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>().0.iter()
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 /// Result of a salvaging bulk load: the rows that decoded, the ids skipped as
@@ -470,6 +550,7 @@ impl MemoryRepository {
         let conn = self.conn.lock().await;
         conn.execute(PUT_MEMORY_VECTOR, turso::params![memory_id.to_string(), model.to_string(), blob, dim])
             .await?;
+        drop(conn);
         Ok(())
     }
 
@@ -507,6 +588,9 @@ impl MemoryRepository {
         // the overwrite is cosmetic — the pre-overwrite bytes remain readable
         // in the log. Same reasoning, and the same call, as the delete path.
         Self::checkpoint_truncate(&conn).await;
+        // Held from the zeroing through the checkpoint: the guard is the
+        // transaction.
+        drop(conn);
         Ok(())
     }
 
@@ -526,9 +610,12 @@ impl MemoryRepository {
         while let Some(row) = rows.next().await? {
             let model: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
-            out.push((model, decode_embedding(Some(blob)).unwrap_or_default()));
+            out.push((model, decode_embedding(&blob)));
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -549,9 +636,12 @@ impl MemoryRepository {
             let id: String = row.get(0)?;
             let model: String = row.get(1)?;
             let blob: Vec<u8> = row.get(2)?;
-            out.push((id, model, decode_embedding(Some(blob)).unwrap_or_default()));
+            out.push((id, model, decode_embedding(&blob)));
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -568,7 +658,10 @@ impl MemoryRepository {
             let n: i64 = row.get(1)?;
             out.push((model, usize::try_from(n).unwrap_or(0)));
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -596,6 +689,7 @@ impl MemoryRepository {
             turso::params![memory_id.to_string(), ordinal, model.to_string(), blob, dim],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
@@ -631,6 +725,7 @@ impl MemoryRepository {
             turso::params![memory_id.to_string(), ordinal, model.to_string()],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
@@ -659,7 +754,10 @@ impl MemoryRepository {
         while let Some(row) = rows.next().await? {
             out.push((row.get(0)?, row.get(1)?));
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -679,6 +777,7 @@ impl MemoryRepository {
             turso::params![memory_id.to_string(), ordinal, model.to_string()],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
@@ -708,6 +807,7 @@ impl MemoryRepository {
             ],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
@@ -744,6 +844,7 @@ impl MemoryRepository {
             keep.iter().map(|m| turso::Value::Text(m.clone())).collect();
         let conn = self.conn.lock().await;
         let n = conn.execute(&sql, params).await?;
+        drop(conn);
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
@@ -764,7 +865,10 @@ impl MemoryRepository {
             let err: Option<String> = row.get(2).ok();
             out.push((model, usize::try_from(n).unwrap_or(0), err));
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -868,6 +972,9 @@ impl MemoryRepository {
             // the pre-overwrite pages readable in the WAL indefinitely.
             Self::checkpoint_truncate(&conn).await;
         }
+        // Held from the first delete through the checkpoint: the guard is the
+        // transaction that keeps two chunkings from ever coexisting.
+        drop(conn);
         Ok(chunks.len())
     }
 
@@ -884,7 +991,10 @@ impl MemoryRepository {
         while let Some(row) = rows.next().await? {
             out.push(Self::decode_chunk_row(&row)?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         debug_assert!(
             out.windows(2).all(|w| w[0].ordinal < w[1].ordinal),
             "ordinals must be strictly increasing (unique index + ORDER BY)"
@@ -908,7 +1018,10 @@ impl MemoryRepository {
             Some(row) => row.get::<i64>(0)?,
             None => 0,
         };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
@@ -944,7 +1057,10 @@ impl MemoryRepository {
         while let Some(row) = rows.next().await? {
             out.push(Self::decode_chunk_row(&row)?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -962,6 +1078,9 @@ impl MemoryRepository {
     ///
     /// # Errors
     /// Returns [`StorageError`] if the update fails.
+    ///
+    /// # Panics
+    /// Panics if `model` is empty.
     pub async fn restore_chunk_vectors(&self, model: &str) -> Result<usize, StorageError> {
         assert!(!model.is_empty(), "restoring must name a model");
         let conn = self.conn.lock().await;
@@ -973,6 +1092,9 @@ impl MemoryRepository {
             turso::params![model.to_string()],
         )
         .await?;
+        // Held across the restore and the dequeue: the guard is the
+        // transaction, so the drain never sees restored work still queued.
+        drop(conn);
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
@@ -1018,6 +1140,9 @@ impl MemoryRepository {
                 turso::params![blob, model.to_string(), chunk_id],
             )
             .await?;
+        // Held across bucket, dequeue, and active copy: the guard is the
+        // transaction.
+        drop(conn);
         Ok(n > 0)
     }
 
@@ -1098,7 +1223,11 @@ impl MemoryRepository {
                 updated_at: String::new(),
             });
         }
+        // Held from the seeding through the drained cursor: seeding and
+        // reading the queue are one transaction, and an open `Rows` on the
+        // shared connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -1126,7 +1255,10 @@ impl MemoryRepository {
         while let Some(row) = rows.next().await? {
             out.push(row.get::<String>(0)?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
         drop(rows);
+        drop(conn);
         Ok(out)
     }
 
@@ -1254,6 +1386,13 @@ impl MemoryRepository {
         Self { conn }
     }
 
+    /// Insert a memory and its tags, and return the stored row.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the memory insert, a tag insert,
+    /// or the read-back fails (a duplicate `memory_id` fails the insert), or
+    /// [`StorageError::NotFound`] if the read-back finds no row. Statements
+    /// that succeeded before a failure stay applied.
     pub async fn create(&self, mem: NewMemory) -> Result<Memory, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1303,6 +1442,12 @@ impl MemoryRepository {
         self.get(&memory_id).await
     }
 
+    /// Fetch one memory, with its tags, by `memory_id`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no memory has `memory_id`, or
+    /// [`StorageError::Database`] if either query fails or a column does not
+    /// decode. Unparseable metadata loads as `None`.
     pub async fn get(&self, memory_id: &str) -> Result<Memory, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1317,9 +1462,9 @@ impl MemoryRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
+        let memory = if let Some(row) = rows.next().await? {
             let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-            let embedding = decode_embedding(embedding_bytes);
+            let embedding = embedding_bytes.as_deref().map(decode_embedding);
             let metadata_str: Option<String> = row.get(8)?;
 
             // Get tags
@@ -1338,9 +1483,20 @@ impl MemoryRepository {
             Ok(decode_memory_row(&row, embedding, metadata_str, tags)?)
         } else {
             Err(StorageError::NotFound(format!("Memory: {memory_id}")))
-        }
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        memory
     }
 
+    /// The `limit` most recently updated memories, newest first, without tags.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or any row does
+    /// not decode — one bad row fails the whole list. Unparseable metadata
+    /// loads as `None`.
     pub async fn list_all(&self, limit: i64) -> Result<Vec<Memory>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1358,15 +1514,24 @@ impl MemoryRepository {
         let mut memories = Vec::new();
         while let Some(row) = rows.next().await? {
             let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-            let embedding = decode_embedding(embedding_bytes);
+            let embedding = embedding_bytes.as_deref().map(decode_embedding);
             let metadata_str: Option<String> = row.get(8)?;
             memories.push(decode_memory_row(&row, embedding, metadata_str, Vec::new())?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(memories)
     }
 
     /// Load ALL entries efficiently (no limit) — for populating the in-memory cache on startup.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or any row does
+    /// not decode — one corrupt row fails the whole load (see
+    /// [`Self::bulk_load_salvage`]).
     pub async fn bulk_load(&self) -> Result<Vec<Memory>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1384,10 +1549,14 @@ impl MemoryRepository {
         let mut memories = Vec::new();
         while let Some(row) = rows.next().await? {
             let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-            let embedding = decode_embedding(embedding_bytes);
+            let embedding = embedding_bytes.as_deref().map(decode_embedding);
             let metadata_str: Option<String> = row.get(8)?;
             memories.push(decode_memory_row(&row, embedding, metadata_str, Vec::new())?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(memories)
     }
@@ -1402,6 +1571,11 @@ impl MemoryRepository {
     /// own and skips + records the ones that fail. If even the id scan fails
     /// (whole-btree corruption) it returns `Err`, so the caller can surface a
     /// fully-degraded store rather than a silent empty one.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] only if the id scan fails; a row
+    /// that fails to load is skipped and listed in
+    /// [`BulkLoadReport::corrupt_ids`] instead.
     pub async fn bulk_load_salvage(&self) -> Result<BulkLoadReport, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1431,7 +1605,7 @@ impl MemoryRepository {
                     .await?;
                 if let Some(row) = rows.next().await? {
                     let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-                    let embedding = decode_embedding(embedding_bytes);
+                    let embedding = embedding_bytes.as_deref().map(decode_embedding);
                     let metadata_str: Option<String> = row.get(8)?;
                     Ok(Some(decode_memory_row(&row, embedding, metadata_str, Vec::new())?))
                 } else {
@@ -1449,6 +1623,9 @@ impl MemoryRepository {
                 }
             }
         }
+        // Held across the id scan and every per-row load; each load's cursor
+        // is dropped when its async block ends, so none is open here.
+        drop(conn);
 
         if !corrupt_ids.is_empty() {
             tracing::warn!(
@@ -1464,29 +1641,36 @@ impl MemoryRepository {
     }
 
     /// Count total memories in the database.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails.
     pub async fn count(&self) -> Result<i64, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query("SELECT COUNT(*) FROM memories", ())
             .await?;
-        if let Some(row) = rows.next().await? {
-            Ok(row.get(0)?)
+        let count = if let Some(row) = rows.next().await? {
+            row.get(0)?
         } else {
-            Ok(0)
-        }
+            0
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(count)
     }
 
     /// Update FSRS state for a memory entry identified by `memory_id`.
+    ///
+    /// Returns `true` when a row was updated.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_fsrs(
         &self,
         memory_id: &str,
-        stability: f32,
-        difficulty: f32,
-        last_access: i64,
-        access_count: i64,
-        importance: f32,
-        storage_strength: f32,
-        generation: i64,
+        fsrs: &MemoryFsrsUpdate,
     ) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
         let result = conn
@@ -1498,17 +1682,18 @@ impl MemoryRepository {
                     updated_at = datetime('now')
                  WHERE memory_id = ?8",
                 turso::params![
-                    f64::from(stability),
-                    f64::from(difficulty),
-                    last_access,
-                    access_count,
-                    f64::from(importance),
-                    f64::from(storage_strength),
-                    generation,
+                    f64::from(fsrs.stability),
+                    f64::from(fsrs.difficulty),
+                    fsrs.last_access,
+                    fsrs.access_count,
+                    f64::from(fsrs.importance),
+                    f64::from(fsrs.storage_strength),
+                    fsrs.generation,
                     memory_id,
                 ],
             )
             .await?;
+        drop(conn);
         Ok(result > 0)
     }
 
@@ -1609,6 +1794,11 @@ impl MemoryRepository {
     }
 
     /// Update content text for a memory entry.
+    ///
+    /// Returns `true` when a row was updated.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_content(&self, memory_id: &str, content: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
         let result = conn
@@ -1617,6 +1807,7 @@ impl MemoryRepository {
                 turso::params![content, memory_id],
             )
             .await?;
+        drop(conn);
         Ok(result > 0)
     }
 
@@ -1645,6 +1836,7 @@ impl MemoryRepository {
                 turso::params![bytes, embedding_model, memory_id],
             )
             .await?;
+        drop(conn);
         Ok(result > 0)
     }
 
@@ -1713,6 +1905,9 @@ impl MemoryRepository {
         }
         // One checkpoint for the whole batch (not per row).
         Self::checkpoint_truncate(&conn).await;
+        // Held from the first overwrite through the checkpoint: the guard is
+        // the transaction.
+        drop(conn);
         debug_assert!(
             deleted <= ids.len() as u64,
             "cannot delete more rows than ids given"
@@ -1860,6 +2055,9 @@ impl MemoryRepository {
 
         // Step 2: collapse + truncate the WAL so the pre-overwrite frame is gone.
         Self::checkpoint_truncate(&conn).await;
+        // Held from the overwrite through the checkpoint: the guard is the
+        // transaction.
+        drop(conn);
 
         Ok(result > 0)
     }
@@ -1905,6 +2103,11 @@ impl ConfigRepository {
         Self { conn }
     }
 
+    /// The raw value stored under `key`, if any.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or the value does
+    /// not decode as text.
     pub async fn get(&self, key: &str) -> Result<Option<String>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1912,13 +2115,22 @@ impl ConfigRepository {
             .query("SELECT value FROM config WHERE key = ?1", turso::params![key])
             .await?;
 
-        if let Some(row) = rows.next().await? {
-            Ok(Some(row.get(0)?))
+        let value = if let Some(row) = rows.next().await? {
+            Some(row.get(0)?)
         } else {
-            Ok(None)
-        }
+            None
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(value)
     }
 
+    /// Store `value` under `key`, replacing any previous value.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert fails.
     pub async fn set(&self, key: &str, value: &str) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1928,17 +2140,29 @@ impl ConfigRepository {
             turso::params![key, value],
         )
         .await?;
+        drop(conn);
 
         Ok(())
     }
 
+    /// Remove `key`; removing an absent key is not an error.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         conn.execute("DELETE FROM config WHERE key = ?1", turso::params![key])
             .await?;
+        drop(conn);
         Ok(())
     }
 
+    /// The value under `key`, decoded from JSON.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the read fails, or
+    /// [`StorageError::Serialization`] if the stored text is not JSON that
+    /// deserializes into `T`.
     pub async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
@@ -1950,7 +2174,16 @@ impl ConfigRepository {
         }
     }
 
-    pub async fn set_json<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), StorageError> {
+    /// Store `value` under `key` as JSON.
+    ///
+    /// `T: Sync` because `value` is borrowed across the write's `.await`;
+    /// without it the returned future is not `Send`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Serialization`] if `T`'s `Serialize` impl fails
+    /// (e.g. a map with non-string keys), or [`StorageError::Database`] if the
+    /// write fails.
+    pub async fn set_json<T: serde::Serialize + Sync>(&self, key: &str, value: &T) -> Result<(), StorageError> {
         let json = serde_json::to_string(value)?;
         self.set(key, &json).await
     }
@@ -1966,6 +2199,12 @@ impl CronJobRepository {
         Self { conn }
     }
 
+    /// Create a job, or overwrite its schedule, task, enabled flag, next run,
+    /// and metadata if `job_id` already exists.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert or the read-back fails,
+    /// or [`StorageError::NotFound`] if the row cannot be read back.
     pub async fn create(&self, job: NewCronJob) -> Result<CronJob, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -1996,6 +2235,13 @@ impl CronJobRepository {
         self.get(&job.job_id).await
     }
 
+    /// Fetch one job by id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NotFound`] if no job has `job_id`, or
+    /// [`StorageError::Database`] if the query fails or a column does not
+    /// decode. An unparseable stored task loads as `null`, and unparseable
+    /// metadata as `None`.
     pub async fn get(&self, job_id: &str) -> Result<CronJob, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2007,7 +2253,7 @@ impl CronJobRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
+        let job = if let Some(row) = rows.next().await? {
             let task_str: String = row.get(3)?;
             let metadata_str: Option<String> = row.get(8)?;
             let enabled: i64 = row.get(4)?;
@@ -2025,9 +2271,19 @@ impl CronJobRepository {
             })
         } else {
             Err(StorageError::NotFound(format!("CronJob: {job_id}")))
-        }
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        job
     }
 
+    /// Every enabled job, soonest `next_run` first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable task/metadata JSON loads as `null`/`None`.
     pub async fn list_enabled(&self) -> Result<Vec<CronJob>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2057,10 +2313,19 @@ impl CronJobRepository {
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(jobs)
     }
 
+    /// Every job, newest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode. Unparseable task/metadata JSON loads as `null`/`None`.
     pub async fn list_all(&self) -> Result<Vec<CronJob>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2090,10 +2355,18 @@ impl CronJobRepository {
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(jobs)
     }
 
+    /// Record a run time and the next scheduled one.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn update_last_run(&self, job_id: &str, last_run: &str, next_run: Option<&str>) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2102,10 +2375,15 @@ impl CronJobRepository {
             turso::params![last_run, next_run, job_id],
         )
         .await?;
+        drop(conn);
 
         Ok(())
     }
 
+    /// Enable or disable a job.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2114,10 +2392,15 @@ impl CronJobRepository {
             turso::params![enabled, job_id],
         )
         .await?;
+        drop(conn);
 
         Ok(())
     }
 
+    /// Delete a job; returns `true` when a row was removed.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2127,6 +2410,7 @@ impl CronJobRepository {
                 turso::params![job_id],
             )
             .await?;
+        drop(conn);
 
         Ok(result > 0)
     }
@@ -2143,6 +2427,10 @@ impl JobRunRepository {
     }
 
     /// Record a new job run
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the insert or the read-back
+    /// fails, or [`StorageError::NotFound`] if the read-back finds no row.
     pub async fn create(&self, run: NewJobRun) -> Result<JobRun, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2170,7 +2458,7 @@ impl JobRunRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
+        let job_run = if let Some(row) = rows.next().await? {
             let success: i64 = row.get(4)?;
             Ok(JobRun {
                 id: row.get(0)?,
@@ -2184,10 +2472,20 @@ impl JobRunRepository {
             })
         } else {
             Err(StorageError::NotFound("JobRun just created".to_string()))
-        }
+        };
+        // Held from the insert through the read-back: "newest row" is only
+        // this run while no other writer can interleave, and the cursor must
+        // be gone before the guard is.
+        drop(rows);
+        drop(conn);
+        job_run
     }
 
     /// Get runs for a specific job
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode.
     pub async fn list_by_job(&self, job_id: &str, limit: i64) -> Result<Vec<JobRun>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2213,11 +2511,19 @@ impl JobRunRepository {
                 duration_ms: row.get(7)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(runs)
     }
 
     /// Get recent runs across all jobs
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode.
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<JobRun>, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2243,11 +2549,18 @@ impl JobRunRepository {
                 duration_ms: row.get(7)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
 
         Ok(runs)
     }
 
     /// Delete old runs for a job (keep only the most recent N)
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn cleanup(&self, job_id: &str, keep: i64) -> Result<i64, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2259,11 +2572,17 @@ impl JobRunRepository {
                 turso::params![job_id, keep],
             )
             .await?;
+        drop(conn);
 
-        Ok(result as i64)
+        // A row count cannot exceed `i64::MAX` (rowids are i64), so the
+        // fallback is unreachable.
+        Ok(i64::try_from(result).unwrap_or(i64::MAX))
     }
 
     /// Delete all runs for a job
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn delete_by_job(&self, job_id: &str) -> Result<i64, StorageError> {
         let conn = self.conn.lock().await;
 
@@ -2273,8 +2592,11 @@ impl JobRunRepository {
                 turso::params![job_id],
             )
             .await?;
+        drop(conn);
 
-        Ok(result as i64)
+        // A row count cannot exceed `i64::MAX` (rowids are i64), so the
+        // fallback is unreachable.
+        Ok(i64::try_from(result).unwrap_or(i64::MAX))
     }
 }
 
@@ -2290,6 +2612,10 @@ impl WorkspaceRepository {
     }
 
     /// List all registered workspaces
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode.
     pub async fn list(&self) -> Result<Vec<WorkspaceRecord>, StorageError> {
         let conn = self.conn.lock().await;
         let mut rows = conn
@@ -2310,10 +2636,18 @@ impl WorkspaceRepository {
                 last_accessed: row.get(5)?,
             });
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         Ok(workspaces)
     }
 
     /// Get a workspace by ID
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the query fails or a column does
+    /// not decode.
     pub async fn get(&self, id: &str) -> Result<Option<WorkspaceRecord>, StorageError> {
         let conn = self.conn.lock().await;
         let id = id.to_string();
@@ -2324,21 +2658,31 @@ impl WorkspaceRepository {
             )
             .await?;
 
-        if let Some(row) = rows.next().await? {
-            Ok(Some(WorkspaceRecord {
+        let workspace = if let Some(row) = rows.next().await? {
+            Some(WorkspaceRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
                 active: row.get::<i64>(3)? != 0,
                 created_at: row.get(4)?,
                 last_accessed: row.get(5)?,
-            }))
+            })
         } else {
-            Ok(None)
-        }
+            None
+        };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
+        Ok(workspace)
     }
 
     /// Insert or update a workspace (upsert by path)
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the upsert fails — including when
+    /// a workspace with a different `id` already holds `record.path`, since
+    /// `path` is unique and the conflict target is `id`.
     pub async fn upsert(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         let id = record.id.clone();
@@ -2356,10 +2700,14 @@ impl WorkspaceRepository {
             turso::params![id, name, path, active],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
     /// Remove a workspace by ID
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the delete fails.
     pub async fn delete(&self, id: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
         let id = id.to_string();
@@ -2369,10 +2717,14 @@ impl WorkspaceRepository {
                 turso::params![id],
             )
             .await?;
+        drop(conn);
         Ok(affected > 0)
     }
 
     /// Clear the active flag on all workspaces
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if the update fails.
     pub async fn clear_active(&self) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -2380,10 +2732,17 @@ impl WorkspaceRepository {
             turso::params![],
         )
         .await?;
+        drop(conn);
         Ok(())
     }
 
     /// Set a workspace as active (clears others first)
+    ///
+    /// Returns `false` when no workspace has `id` — every flag is cleared
+    /// regardless.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Database`] if either update fails.
     pub async fn set_active(&self, id: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
         // Clear all
@@ -2397,6 +2756,9 @@ impl WorkspaceRepository {
                 turso::params![id],
             )
             .await?;
+        // Held across clear-all and set-one: the guard is the transaction, so
+        // no reader sees the moment between them with nothing active.
+        drop(conn);
         Ok(affected > 0)
     }
 }
@@ -2485,6 +2847,7 @@ impl MemoryEventRepository {
                 ],
             )
             .await?;
+        drop(conn);
         Ok(affected > 0)
     }
 
@@ -2553,6 +2916,10 @@ impl MemoryEventRepository {
             Some(row) => row.get::<i64>(0)?,
             None => 0,
         };
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         debug_assert!(count >= 0, "a row count cannot be negative");
         Ok(count)
     }
@@ -2574,6 +2941,10 @@ impl MemoryEventRepository {
         while let Some(row) = rows.next().await? {
             out.push(row_to_memory_event(&row)?);
         }
+        // Held until the cursor is gone: an open `Rows` on the shared
+        // connection swallows later writes.
+        drop(rows);
+        drop(conn);
         debug_assert!(out.len() <= limit, "the page cap must hold");
         Ok(out)
     }
@@ -2612,9 +2983,9 @@ fn row_to_memory_event(row: &turso::Row) -> Result<MemoryEventRow, StorageError>
         workspace_id: row.get(4)?,
         content: row.get(5)?,
         content_len_chars: row.get(6)?,
-        embedding: decode_embedding(row.get(7)?),
+        embedding: row.get::<Option<Vec<u8>>>(7)?.as_deref().map(decode_embedding),
         embedding_model: row.get(8)?,
-        salience: row.get::<f64>(9)? as f32,
+        salience: f32_from_real(row.get::<f64>(9)?),
         created_at: row.get(10)?,
         // A row whose lineage JSON is unreadable is still a real episode; the
         // timeline loses the link, not the event. Failing the whole page here
