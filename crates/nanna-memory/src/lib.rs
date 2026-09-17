@@ -69,6 +69,12 @@ mod lossy {
     pub const fn f32_to_usize(x: f32) -> usize {
         x as usize
     }
+
+    /// `x` truncated toward zero, saturating at the bounds and mapping NaN to 0,
+    /// exactly as `as i64`.
+    pub const fn f32_to_i64(x: f32) -> i64 {
+        x as i64
+    }
 }
 
 /// At most the first 40 bytes of `content`, cut back to a char boundary, for
