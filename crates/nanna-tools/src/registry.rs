@@ -7,7 +7,11 @@ use crate::{
     format_tool_output,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+// Ordered maps serve the skill-audit report, which only exists with the
+// scripting feature.
+#[cfg(feature = "scripting")]
+use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1163,7 +1167,7 @@ fn backstop_timeout(timeout_secs: u64, parameters: &HashMap<String, Value>) -> s
 /// Without the scripting engine there is no inner deadline to outlive: this
 /// timer is the only one, so it fires exactly at the declared ceiling.
 #[cfg(not(feature = "scripting"))]
-fn backstop_timeout(
+const fn backstop_timeout(
     timeout_secs: u64,
     _parameters: &HashMap<String, Value>,
 ) -> std::time::Duration {

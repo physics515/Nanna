@@ -255,7 +255,10 @@ mod tests {
     /// ASCII, so box-drawing output and every non-Latin script read as binary.
     #[test]
     fn box_drawing_and_non_latin_text_are_not_binary() {
-        let tree = "[exec → tree — ok] ".to_string() + &"├── src\n│   └── main.rs\n".repeat(20);
+        // `format!`, not `String + &String`: with every feature enabled the
+        // graph pulls in smartstring, whose `Add` impl for String makes that
+        // expression ambiguous and the crate stop compiling.
+        let tree = format!("[exec → tree — ok] {}", "├── src\n│   └── main.rs\n".repeat(20));
         assert!(!is_low_signal_memory(&tree));
         assert!(!is_low_signal_memory(
             "[read_file → notes.txt — ok] 本番データベースを直接呼び出さないこと"

@@ -69,13 +69,16 @@ impl Default for DaemonManagerConfig {
 /// owns the sidecar spawn, so the process_group(0)-at-spawn contract behind
 /// `nanna_proc`'s group kill does not hold here; the caller's
 /// `CommandChild::kill()` covers the direct child.
-// async for the Windows walk's await; the Unix no-op body has none.
-#[cfg_attr(not(windows), allow(clippy::unused_async))]
+#[cfg(windows)]
 async fn kill_sidecar_tree(pid: u32) {
-    #[cfg(windows)]
     nanna_proc::kill_process_tree(pid).await;
-    #[cfg(not(windows))]
-    let _ = pid;
+}
+
+/// The Unix no-op. It returns a ready future rather than being an `async fn`
+/// with nothing to await, so callers `.await` both platforms the same way.
+#[cfg(not(windows))]
+fn kill_sidecar_tree(_pid: u32) -> std::future::Ready<()> {
+    std::future::ready(())
 }
 
 /// Request id of the version probe; the reply is matched on it.

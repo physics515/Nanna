@@ -17,7 +17,8 @@ include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
 
 /// Parse a semver version string into (major, minor, patch) tuple.
 /// Returns None if the string is not a valid semver triple.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     // Strip leading 'v' if present
     let v = v.strip_prefix('v').unwrap_or(v);
@@ -35,7 +36,8 @@ fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Returns true if `embedded` version is strictly greater than `installed`.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn is_newer_version(embedded: &str, installed: &str) -> bool {
     match (parse_semver(embedded), parse_semver(installed)) {
         (Some(e), Some(i)) => e > i,
@@ -46,7 +48,8 @@ fn is_newer_version(embedded: &str, installed: &str) -> bool {
 
 /// Extract the version field from a tool.ts source string.
 /// Looks for `version: "x.y.z"` or `version: 'x.y.z'` in the source.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn extract_version_from_source(source: &str) -> Option<String> {
     // Reuse the same pattern as extract_string_field in nanna-scripting
     let patterns = [
@@ -68,6 +71,8 @@ fn extract_version_from_source(source: &str) -> Option<String> {
 }
 
 /// Directory name, under this crate, holding the bundled JS/TS skills.
+/// Only the debug-build source-tree fallback reads it.
+#[cfg(debug_assertions)]
 const DEV_SKILLS_DIR_NAME: &str = "default-skills";
 
 /// In debug builds, fall back to the source tree's `default-skills` directory.

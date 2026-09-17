@@ -1528,7 +1528,7 @@ mod tests {
 
     /// Reap bound: taskkill / `TerminateJobObject` is near-instant; 5s is a
     /// generous ceiling for a loaded CI machine, polled at 50ms.
-    #[allow(dead_code)] // used by the platform-specific test below
+    #[cfg(windows)] // only the Windows reap test below uses it
     const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks
