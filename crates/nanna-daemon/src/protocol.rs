@@ -878,6 +878,13 @@ pub enum Event {
     SessionDeleted {
         id: String,
     },
+    /// Every message of a session was removed (`session.clear`, or `/new` from
+    /// a chat app); the session itself, its name and its model pin remain. An
+    /// open view of it must empty, or it keeps showing a conversation the
+    /// next turn no longer sees.
+    SessionCleared {
+        id: String,
+    },
     SessionRenamed {
         id: String,
         name: String,
@@ -1061,6 +1068,7 @@ impl Event {
             | Self::ContextUsage { session_id, .. } => Some(session_id),
             Self::SessionCreated { id, .. }
             | Self::SessionDeleted { id }
+            | Self::SessionCleared { id }
             | Self::SessionRenamed { id, .. } => Some(id),
             Self::Error { session_id, .. } => session_id.as_deref(),
             Self::WorkspacesChanged

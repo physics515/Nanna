@@ -581,7 +581,7 @@ async fn start_over(control: &ControlPlane, session_id: &str) -> String {
             .to_string();
     }
     let dropped_park = control.chat_runs.clear_park(session_id).await.is_some();
-    if !control.sessions.clear(session_id).await {
+    if !control.clear_session(session_id).await {
         return "This conversation could not be found, so nothing was cleared.".to_string();
     }
     if dropped_park {
@@ -989,7 +989,8 @@ mod tests {
     #[tokio::test]
     async fn new_forgets_the_conversation_but_keeps_the_pin() {
         let sessions = Arc::new(SessionManager::new());
-        let control = Arc::new(ControlPlane::new(sessions.clone()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let control = Arc::new(ControlPlane::new(sessions.clone()).with_event_tx(event_tx));
         let (router, sent) = recording_router();
         let router = router.read().await;
         ChannelManager::process_message(incoming("/model ollama/qwen3.5:9b"), &control, &router)
@@ -1028,6 +1029,15 @@ mod tests {
         assert_eq!(replies.len(), 3, "{replies:?}");
         assert!(replies[1].contains("Send /stop first"), "{}", replies[1]);
         assert!(replies[2].starts_with("Started over"), "{}", replies[2]);
+        let cleared: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event, Event::SessionCleared { .. }))
+            .collect();
+        assert_eq!(
+            cleared.len(),
+            1,
+            "only the clear that happened is announced: {cleared:?}"
+        );
+        assert_eq!(cleared[0].session_id(), Some(SESSION));
     }
 
     #[test]

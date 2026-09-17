@@ -22,6 +22,7 @@ impl ControlPlane {
                 event,
                 Event::SessionCreated { .. }
                     | Event::SessionDeleted { .. }
+                    | Event::SessionCleared { .. }
                     | Event::SessionRenamed { .. }
             ),
             "only session lifecycle events go through here"
@@ -29,6 +30,16 @@ impl ControlPlane {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(event);
         }
+    }
+
+    /// Remove every message of a session and tell connected clients. The one
+    /// clear path for IPC `session.clear` and a chat app's `/new`.
+    pub(crate) async fn clear_session(&self, id: &str) -> bool {
+        let cleared = self.sessions.clear(id).await;
+        if cleared {
+            self.notify_session_event(Event::SessionCleared { id: id.to_string() });
+        }
+        cleared
     }
 
     pub(super) async fn handle_session(&self, client_id: &str, action: SessionAction) -> Value {
@@ -103,7 +114,7 @@ impl ControlPlane {
                 json!({ "status": "deleted", "count": count })
             }
             SessionAction::Clear { id } => {
-                if self.sessions.clear(&id).await {
+                if self.clear_session(&id).await {
                     json!({ "status": "cleared", "id": id })
                 } else {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })

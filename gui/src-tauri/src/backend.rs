@@ -227,6 +227,11 @@ impl Backend {
                             "content": content,
                         }));
                     }
+                    DaemonEvent::SessionCleared { id } => {
+                        let _ = app.emit("session-cleared", serde_json::json!({
+                            "session_id": id,
+                        }));
+                    }
                     DaemonEvent::ThinkingDelta { session_id, delta, .. } => {
                         let _ = app.emit("thinking-chunk", serde_json::json!({
                             "session_id": session_id,

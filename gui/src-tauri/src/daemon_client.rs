@@ -124,6 +124,9 @@ pub enum DaemonEvent {
     /// A complete message appended to a session outside a streamed turn (a
     /// reminder coming due). Mirrors `nanna_daemon::protocol::Event::SessionMessageAdded`.
     SessionMessageAdded { session_id: String, message_id: String, role: String, content: String },
+    /// Every message of a session was removed (`session.clear`, or `/new` from a
+    /// chat app). Mirrors `nanna_daemon::protocol::Event::SessionCleared`.
+    SessionCleared { id: String },
     ThinkingDelta { session_id: String, delta: String },
     ModelSwitch { model: String, reason: Option<String> },
     ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String>, #[serde(default)] tokens: Option<u64>, #[serde(default)] total_tokens: Option<u64> },
@@ -1572,6 +1575,17 @@ mod tests {
                 assert_eq!(last_tool.as_deref(), Some("exec"));
             }
             other => panic!("expected LivenessBeat, got {other:?}"),
+        }
+    }
+
+    /// A chat app's `/new` empties the session; before this variant the event
+    /// parsed as `Unknown` and an open chat kept showing the old conversation.
+    #[test]
+    fn session_cleared_deserializes() {
+        let json = r#"{ "event": "session_cleared", "id": "telegram:1:2" }"#;
+        match serde_json::from_str::<DaemonEvent>(json).expect("event must parse") {
+            DaemonEvent::SessionCleared { id } => assert_eq!(id, "telegram:1:2"),
+            other => panic!("expected SessionCleared, got {other:?}"),
         }
     }
 

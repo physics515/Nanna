@@ -4772,8 +4772,11 @@ asks permission or restricts her.)*:
       per chat, so before this a Telegram user could never leave a long, confused history. It
       empties the messages, drops a provider-outage park (or it would resume into the empty
       conversation), keeps the model pin, reply route and reminders, and is **refused while a
-      turn runs** ("Send /stop first") — test mutation-checked. Not done: an open GUI view of that
-      session is not told (`session.clear` over IPC has no event either).
+      turn runs** ("Send /stop first") — test mutation-checked. Follow-up the same day: a clear —
+      `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
+      `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
+      daemon instead of showing a conversation the next turn no longer sees (daemon event test,
+      Tauri parse test, 2 vitest; not WebDriver-verified).
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.

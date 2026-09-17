@@ -263,6 +263,7 @@ import { useBackend } from '~/composables/useBackend'
 import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
 import { parseEditDiff } from '~/lib/editDiff'
 import { parseSessionMessageAdded, shouldAppendSessionMessage } from '~/lib/sessionMessageAdded'
+import { shouldReloadForClear } from '~/lib/sessionCleared'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {
@@ -494,6 +495,7 @@ let unlistenContextUsage: UnlistenFn | null = null
 let unlistenLivenessBeat: UnlistenFn | null = null
 let unlistenConfigChanged: UnlistenFn | null = null
 let unlistenSessionMessageAdded: UnlistenFn | null = null
+let unlistenSessionCleared: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -951,6 +953,13 @@ onMounted(async () => {
     scrollToBottom(true)
   })
 
+  // The open conversation was emptied elsewhere (a chat app's /new, another
+  // client's session.clear): re-read it so the view matches what the next turn sees.
+  unlistenSessionCleared = await listen('session-cleared', (event) => {
+    if (!shouldReloadForClear(event.payload, currentSession.value?.id)) return
+    void loadSession()
+  })
+
   // Load initial session (listeners are already active to capture any events)
   await loadSession()
 })
@@ -982,6 +991,7 @@ onUnmounted(() => {
   if (unlistenLivenessBeat) unlistenLivenessBeat()
   if (unlistenConfigChanged) unlistenConfigChanged()
   if (unlistenSessionMessageAdded) unlistenSessionMessageAdded()
+  if (unlistenSessionCleared) unlistenSessionCleared()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null
