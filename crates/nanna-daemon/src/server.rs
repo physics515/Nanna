@@ -657,6 +657,9 @@ struct ScriptServiceDeps {
     /// into. `None` leaves `schedule.*` unregistered, which withholds the three
     /// reminder skills.
     reminders: Option<(crate::reminder_service::SchedulerSlot, Arc<SessionManager>)>,
+    /// Sessions, the event bus and the run registry `session.ask_user` posts
+    /// through and waits on. `None` withholds the `ask_user` skill.
+    ask_user: Option<crate::ask_user_service::AskUserDeps>,
 }
 
 
@@ -676,6 +679,7 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         browser_data_dir,
         screenshot_data_dir,
         reminders,
+        ask_user,
     } = deps;
     let memory = &memory;
     use serde_json::{Value, json};
@@ -1166,6 +1170,11 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
     services.extend(crate::file_history_service::build_file_history_services(
         nanna_scripting::file_history::installed(),
     ));
+
+    // Clarifying questions, answered by the user's next message to a live turn.
+    if let Some(deps) = ask_user {
+        services.extend(crate::ask_user_service::build_ask_user_services(deps));
+    }
 
     // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
     // these; the scheduler is built after this map, so it arrives by slot.
@@ -4199,6 +4208,11 @@ impl DaemonServer {
                 browser_data_dir: Some(self.config.data_dir.clone()),
                 screenshot_data_dir: Some(self.config.data_dir.clone()),
                 reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
+                ask_user: Some(crate::ask_user_service::AskUserDeps {
+                    sessions: Arc::clone(&self.sessions),
+                    events: self.ipc.event_sender(),
+                    chat_runs: Arc::clone(chat_runs),
+                }),
             });
             // Fill the slot before any skill can be executed. `set` returning
             // an error would mean the map was filled twice, which cannot

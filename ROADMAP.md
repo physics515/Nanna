@@ -4602,12 +4602,30 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
 restriction rails — "nanna is a god, it's her call what she wants to do." The original "safety & trust" group
 is dissolved; what stays below is only what protects Nanna's own work and keeps her agency HERS — none of it
 asks permission or restricts her.)*:
-- [ ] **Clarifying questions across channels** (owner-requested 2026-07-24: "nanna should be able to ask
+- [x] **Clarifying questions across channels** (owner-requested 2026-07-24: "nanna should be able to ask
       clarifying questions") — an `ask_user` tool Nanna calls when SHE judges a request ambiguous: the
       question reaches the user's active channel (GUI, Telegram, …), the task parks in the P15 blocked state,
       and the run resumes when the answer arrives. Sub-agents already have exactly this shape toward their
       parent (`ask_parent`, crates/nanna-tools/src/builtin/ask_parent.rs) — the user-facing analog is the
       missing piece. Her choice to ask, about intent — never a required checkpoint before acting.
+      *(2026-09-17) Landed as an `ask_user` skill over `session.ask_user`, with no new plumbing into
+      the agent loop.* The question is appended to the conversation and announced with
+      `session_message_added`, so it shows in an open GUI chat and — via the channel reply forwarder
+      from the same run — arrives in Telegram/Discord/Slack. The answer is **the user's next message
+      to the live turn**: while a turn runs, `chat.send` already queues a new message for the run
+      (`PendingMessages`); `ask_user` waits on that queue, drains what arrives (so it is not also
+      interjected) and returns it as the tool result, and the turn continues with it. Bounded: waits
+      `wait_secs` (default 600, max 1800 = the scheduler's default check-in period), then says no
+      reply came yet and to proceed on best judgement — a later reply is still admitted into the run.
+      With no live turn it posts and returns at once, saying the answer will start a new turn.
+      Deviation from the sketch above, deliberately: no P15 "blocked" park — waiting inside the tool
+      call keeps the run's context and plan intact with zero harness changes, and the model is never
+      stranded because the wait is bounded. Verified: 4 service tests against the real
+      `ChatRunRegistry` (answer consumed from the queue after 300 ms, no-live-turn returns
+      immediately, unanswered wait ends and says so, unknown session refused) and on the real daemon
+      (skill → service → persisted question + `session_message_added`, no model calls). **Not
+      verified:** a model choosing to ask, and a reply arriving mid-turn end to end — both need a
+      live turn.
 - [x] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
