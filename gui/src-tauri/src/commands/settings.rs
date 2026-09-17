@@ -1540,9 +1540,9 @@ pub async fn get_anthropic_models(
 ///
 /// # Errors
 ///
-/// Returns `No OpenAI API key configured` when `OPENAI_API_KEY` is unset (the
-/// config cache is not consulted). Fails with the HTTP client builder's error
-/// when the client cannot be built, `Failed to fetch OpenAI models: …` when the
+/// Returns `No OpenAI API key configured` when neither the config nor
+/// `OPENAI_API_KEY` has a key. Fails with the HTTP client builder's error when
+/// the client cannot be built, `Failed to fetch OpenAI models: …` when the
 /// request fails, `OpenAI API error <status>: <body>` for a non-success status,
 /// and `Failed to parse OpenAI response: …` when the body is not the expected
 /// model list.
@@ -1564,27 +1564,6 @@ pub async fn get_openai_models(
     let api_key = state.read().await.config.llm.openai_api_key.clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or("No OpenAI API key configured")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch OpenAI models: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {status}: {body}"));
-    }
-
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "No OpenAI API key configured")?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
