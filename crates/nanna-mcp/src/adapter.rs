@@ -327,6 +327,7 @@ mod tools_impl {
             for wrapper in wrappers.iter() {
                 registry.register_boxed(wrapper.clone()).await;
             }
+            drop(wrappers);
 
             Ok(count)
         }
@@ -359,8 +360,11 @@ mod tools_impl {
                 }
             }
 
-            let mut tool_wrappers = self.tool_wrappers.write().await;
-            *tool_wrappers = new_wrappers;
+            *self.tool_wrappers.write().await = new_wrappers;
+            // `clients` is held until the refreshed wrappers are published, as it
+            // always was: a concurrent `connect` waits for its client insert, so
+            // the tools it appends land after this replacement, not under it.
+            drop(clients);
 
             Ok(())
         }
@@ -375,6 +379,7 @@ mod tools_impl {
             for client in clients.values() {
                 client.close().await?;
             }
+            drop(clients);
             Ok(())
         }
     }
@@ -603,7 +608,6 @@ impl<T: Transport + 'static> McpManager<T> {
     }
 
     /// Get all available tools
-    #[must_use]
     pub fn tools(&self) -> impl Iterator<Item = (&str, &McpToolAdapter<T>)> {
         self.tools.iter().map(|(k, v)| (k.as_str(), v))
     }

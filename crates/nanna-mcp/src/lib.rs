@@ -16,7 +16,7 @@
 //! ```ignore
 //! use nanna_mcp::{McpClient, StdioTransport};
 //!
-//! let transport = StdioTransport::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]).await?;
+//! let transport = StdioTransport::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])?;
 //! let client = McpClient::new(transport);
 //! client.initialize().await?;
 //!
