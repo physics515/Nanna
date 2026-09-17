@@ -4834,13 +4834,20 @@ asks permission or restricts her.)*:
       Typing sends are detached tasks now (≤ one per session per 4 s, each ending at that timeout).
       Cost: a typing call can land just after the reply, showing "typing…" for up to 5 s after
       the answer on Telegram.
-      - [ ] *(found in the same review)* **The reply send itself is still awaited inside the
+      - [x] *(found in the same review)* **The reply send itself is still awaited inside the
             forwarder.** The event bus holds 1000 events (`ipc.rs`); a turn streams a delta per
             chunk, so while one chat's reply send sits in a 30 s provider timeout, another session's
             long streamed turn can overrun the buffer and its `message_end` is skipped (`Lagged`
             is only logged). Not changed tonight because replies are order-sensitive per chat (a
             reminder vs. an answer). Shape: a per-route FIFO task (bounded queue, spawned on first
             reply, idle-exits), so sends stay ordered within a chat and never block the bus reader.
+            *(same night)* Done in that shape: `spawn_reply_outbox`, queue bound
+            `REMINDERS_PENDING_MAX + 2` (every reminder of one chat coming due during an outage, plus
+            the turn's answer and one `ask_user` question), 60 s idle exit with respawn on the next
+            reply, a full queue drops with an error log and a `send_failed` count. Test: chat A's
+            send hangs while chat B's turn streams 64 events into a 16-slot bus — B's answer arrives
+            and A's is sent once released; **against the previous forwarder the same test loses B's
+            reply** (`[]`). 5/5 reruns.
       - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
             now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
             calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview

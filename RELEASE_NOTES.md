@@ -105,7 +105,7 @@ WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
 
 ## Numbers
 
-- **2,105 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
+- **2,106 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
 - **3 → 0** bundled tools withheld for want of a daemon service.
 - **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
 - Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing

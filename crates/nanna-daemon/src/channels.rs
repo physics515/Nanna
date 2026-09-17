@@ -722,6 +722,41 @@ fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: 
     });
 }
 
+/// Most replies one chat may have waiting to be sent.
+///
+/// Derived from what can come due at once for one conversation while its
+/// provider is unreachable: every pending reminder
+/// ([`crate::reminder_service::REMINDERS_PENDING_MAX`]), the running turn's
+/// answer, and one `ask_user` question from that turn. Past it a reply is
+/// dropped with an error log rather than queued without bound.
+const REPLY_QUEUE_MAX: usize = crate::reminder_service::REMINDERS_PENDING_MAX + 2;
+
+/// How long a chat's reply task waits for more before exiting. A new reply
+/// respawns it, so this only bounds idle tasks; it is not a delivery deadline.
+const REPLY_TASK_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Start the task that sends one chat's replies in order.
+fn spawn_reply_outbox(
+    router: Arc<RwLock<MessageRouter>>,
+    counters: Arc<crate::channel_counters::ChannelCounters>,
+) -> mpsc::Sender<OutgoingMessage> {
+    let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(REPLY_QUEUE_MAX);
+    tokio::spawn(async move {
+        while let Ok(Some(outgoing)) = tokio::time::timeout(REPLY_TASK_IDLE, rx.recv()).await {
+            let provider = outgoing.channel.provider.clone();
+            let target = outgoing.channel.id.clone();
+            let router = router.read().await;
+            if let Err(e) = router.send(outgoing).await {
+                counters.send_failed(&provider);
+                error!("Failed to send reply to {provider}:{target}: {e}");
+            } else {
+                counters.sent(&provider);
+            }
+        }
+    });
+    tx
+}
+
 /// Forward replies for channel-routed sessions back through `router`.
 ///
 /// One forwarder per router: the webhook processor shares the channel
@@ -735,6 +770,11 @@ fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: 
 /// [`TYPING_REFRESH`] keeps it up through silent stretches (a long tool call);
 /// `message_end`, or no event for [`typing_abandon_after`], ends it. The map
 /// holds only sessions mid-turn and is bounded by the channel session count.
+///
+/// **The bus reader never waits on a provider.** Replies go to a FIFO task per
+/// chat ([`spawn_reply_outbox`]), so they stay in order within a chat while a
+/// send stuck in a 30 s provider timeout cannot make this loop fall behind the
+/// event bus — where a skipped `message_end` is another chat's lost reply.
 pub fn spawn_reply_forwarder(
     sessions: Arc<SessionManager>,
     mut events: broadcast::Receiver<Event>,
@@ -743,6 +783,8 @@ pub fn spawn_reply_forwarder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut typing: std::collections::HashMap<String, Typing> =
+            std::collections::HashMap::new();
+        let mut outboxes: std::collections::HashMap<ChannelId, mpsc::Sender<OutgoingMessage>> =
             std::collections::HashMap::new();
         let mut tick = tokio::time::interval(TYPING_REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -802,22 +844,35 @@ pub fn spawn_reply_forwarder(
             let Some(route) = sessions.reply_channel(session_id).await else {
                 continue;
             };
-            let outgoing = OutgoingMessage {
-                channel: ChannelId::new(&route.provider, &route.id),
+            let channel = ChannelId::new(&route.provider, &route.id);
+            let mut outgoing = OutgoingMessage {
+                channel: channel.clone(),
                 content: MessageContent::Text {
                     text: text.to_string(),
                 },
                 reply_to: None,
             };
-            let router = router.read().await;
-            if let Err(e) = router.send(outgoing).await {
-                counters.send_failed(&route.provider);
-                error!(
-                    "Failed to send reply for {session_id} to {}:{}: {e}",
-                    route.provider, route.id
-                );
-            } else {
-                counters.sent(&route.provider);
+            // At most two attempts: the second only after replacing a task that
+            // exited idle, whose fresh queue cannot be closed or full.
+            for _ in 0..2 {
+                let outbox = outboxes.entry(channel.clone()).or_insert_with(|| {
+                    spawn_reply_outbox(Arc::clone(&router), Arc::clone(&counters))
+                });
+                match outbox.try_send(outgoing) {
+                    Ok(()) => break,
+                    Err(mpsc::error::TrySendError::Closed(returned)) => {
+                        outboxes.remove(&channel);
+                        outgoing = returned;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        counters.send_failed(&route.provider);
+                        error!(
+                            "Reply for {session_id} to {}:{} dropped: {REPLY_QUEUE_MAX} replies already waiting for that chat",
+                            route.provider, route.id
+                        );
+                        break;
+                    }
+                }
             }
         }
         debug!("Channel reply forwarder stopped: event bus closed");
@@ -1403,6 +1458,102 @@ mod tests {
             "a turn with no events stops showing typing"
         );
 
+        drop(events_tx);
+        forwarder.await.expect("forwarder exits");
+    }
+
+    /// Sends to chat `stuck` hang until released; everything else is recorded.
+    struct StuckChannel {
+        sent: Sent,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Channel for StuckChannel {
+        fn provider(&self) -> String {
+            "test".to_string()
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+        async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
+            if message.channel.id == "stuck" {
+                self.release.notified().await;
+            }
+            if let MessageContent::Text { text } = message.content {
+                self.sent
+                    .lock()
+                    .expect("sent")
+                    .push((message.channel.id, text));
+            }
+            Ok("sent-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stuck_chat_does_not_cost_another_chat_its_reply() {
+        let sessions = Arc::new(SessionManager::new());
+        for (session, chat) in [("test:stuck:u", "stuck"), (SESSION, "chat-7")] {
+            let route = ReplyChannel {
+                provider: "test".into(),
+                id: chat.into(),
+            };
+            sessions.ensure_channel_session(session, "t", &route).await;
+        }
+        let sent: Sent = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut router = MessageRouter::new();
+        router.register(
+            "test",
+            Box::new(StuckChannel {
+                sent: sent.clone(),
+                release: release.clone(),
+            }),
+        );
+        let (events_tx, events_rx) = broadcast::channel(16);
+        let counters = Arc::new(crate::channel_counters::ChannelCounters::default());
+        let forwarder = spawn_reply_forwarder(
+            sessions.clone(),
+            events_rx,
+            Arc::new(RwLock::new(router)),
+            counters,
+        );
+
+        let end = |session: &str, content: &str| Event::MessageEnd {
+            session_id: session.into(),
+            message_id: "m".into(),
+            content: content.into(),
+        };
+        events_tx
+            .send(end("test:stuck:u", "never mind"))
+            .expect("a receiver");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Another chat's turn streams more events than the bus holds.
+        for i in 0..64 {
+            events_tx
+                .send(Event::MessageDelta {
+                    session_id: SESSION.into(),
+                    message_id: "m".into(),
+                    delta: format!("{i}"),
+                })
+                .expect("a receiver");
+            tokio::task::yield_now().await;
+        }
+        events_tx
+            .send(end(SESSION, "the answer"))
+            .expect("a receiver");
+
+        let delivered = wait_for(&sent, 1).await;
+        assert!(
+            delivered.contains(&("chat-7".to_string(), "the answer".to_string())),
+            "the other chat's reply arrived while the first is stuck: {delivered:?}"
+        );
+        release.notify_one();
+        let delivered = wait_for(&sent, 2).await;
+        assert!(
+            delivered.contains(&("stuck".to_string(), "never mind".to_string())),
+            "the stuck reply is still sent once the provider answers: {delivered:?}"
+        );
         drop(events_tx);
         forwarder.await.expect("forwarder exits");
     }
