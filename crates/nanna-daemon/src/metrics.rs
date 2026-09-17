@@ -32,6 +32,7 @@ pub struct MetricsSnapshot {
     pub tools: Vec<ToolStatsSummary>,
     pub models: Vec<ModelStatsSummary>,
     pub mcp_servers: Vec<McpServerState>,
+    pub channels: Vec<(String, crate::channel_counters::ChannelCount)>,
 }
 
 /// Escape a label value per the exposition format: backslash, quote, newline.
@@ -230,6 +231,45 @@ fn render_mcp(out: &mut String, servers: &[McpServerState]) {
     }
 }
 
+fn render_channels(out: &mut String, channels: &[(String, crate::channel_counters::ChannelCount)]) {
+    if channels.is_empty() {
+        return;
+    }
+    family(
+        out,
+        "nanna_channel_messages_total",
+        "counter",
+        "Channel messages received and replies sent.",
+    );
+    for (name, count) in channels {
+        let name = label(name);
+        let _ = writeln!(
+            out,
+            "nanna_channel_messages_total{{channel=\"{name}\",direction=\"received\"}} {}",
+            count.received
+        );
+        let _ = writeln!(
+            out,
+            "nanna_channel_messages_total{{channel=\"{name}\",direction=\"sent\"}} {}",
+            count.sent
+        );
+    }
+    family(
+        out,
+        "nanna_channel_send_failures_total",
+        "counter",
+        "Replies that could not be sent to a channel.",
+    );
+    for (name, count) in channels {
+        let _ = writeln!(
+            out,
+            "nanna_channel_send_failures_total{{channel=\"{}\"}} {}",
+            label(name),
+            count.send_failures
+        );
+    }
+}
+
 /// Render a snapshot. Pure.
 #[must_use]
 pub fn render_metrics(snapshot: &MetricsSnapshot) -> String {
@@ -238,6 +278,7 @@ pub fn render_metrics(snapshot: &MetricsSnapshot) -> String {
     render_tools(&mut out, &snapshot.tools);
     render_models(&mut out, &snapshot.models);
     render_mcp(&mut out, &snapshot.mcp_servers);
+    render_channels(&mut out, &snapshot.channels);
     debug_assert!(out.ends_with('\n'), "the format is newline-terminated");
     out
 }
@@ -300,8 +341,26 @@ mod tests {
                 },
             ],
             memory_entries: Some(10),
+            channels: vec![(
+                "telegram".into(),
+                crate::channel_counters::ChannelCount {
+                    received: 4,
+                    sent: 3,
+                    send_failures: 1,
+                },
+            )],
             ..Default::default()
         });
+        assert!(
+            text.contains(
+                "nanna_channel_messages_total{channel=\"telegram\",direction=\"received\"} 4\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("nanna_channel_send_failures_total{channel=\"telegram\"} 1\n"),
+            "{text}"
+        );
         assert!(
             text.contains("nanna_tool_calls_total{tool=\"read_file\",outcome=\"success\"} 7\n"),
             "{text}"

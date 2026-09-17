@@ -32,6 +32,7 @@ impl ControlPlane {
             tools: self.tool_stats.summaries().await,
             models: self.model_stats.summaries().await,
             mcp_servers,
+            channels: self.channel_counters.snapshot(),
         }
     }
 

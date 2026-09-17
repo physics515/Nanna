@@ -1644,6 +1644,10 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       series count is bounded by configuration. Verified by scraping the live debug daemon.
       Remaining from the original list: request-duration histograms (the trackers keep p95, not
       buckets) and channel message/error counters (the channel path has no counters yet).
+      *(2026-09-17, later)* Channel counters landed: `nanna_channel_messages_total{channel,direction}`
+      and `nanna_channel_send_failures_total{channel}`, counted where a channel message crosses the
+      daemon boundary (inbound + immediate replies in `process_message`, turn answers and reminders
+      in the reply forwarder); names bounded at 16 then folded into `other`. Only histograms remain.
 - [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
 - [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by

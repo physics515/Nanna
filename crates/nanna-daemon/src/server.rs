@@ -3312,6 +3312,7 @@ impl DaemonServer {
                         Arc::clone(&control.sessions),
                         events,
                         Arc::clone(&standalone_router),
+                        Arc::clone(&control.channel_counters),
                     );
                 } else {
                     warn!("No event bus attached; webhook conversations will get no replies");

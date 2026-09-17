@@ -210,7 +210,12 @@ impl ChannelManager {
         // Subscribed BEFORE the first message is processed, so no reply can be
         // emitted into a bus nobody is listening to yet.
         if let Some(events) = control.subscribe_events() {
-            spawn_reply_forwarder(Arc::clone(&control.sessions), events, Arc::clone(&router));
+            spawn_reply_forwarder(
+                Arc::clone(&control.sessions),
+                events,
+                Arc::clone(&router),
+                Arc::clone(&control.channel_counters),
+            );
         } else {
             warn!(
                 "No event bus attached to the control plane; channel conversations will get no replies"
@@ -257,6 +262,7 @@ impl ChannelManager {
                 return;
             }
         };
+        control.channel_counters.received(&msg.channel.provider);
 
         // Generate deterministic session ID from channel + sender
         let session_id = format!(
@@ -285,7 +291,7 @@ impl ChannelManager {
         // here, never sent to the model.
         if let Some(command) = parse_channel_command(&text) {
             let reply = run_channel_command(command, control, &session_id).await;
-            send_reply(router, &msg, reply).await;
+            send_reply(router, &control.channel_counters, &msg, reply).await;
             return;
         }
 
@@ -303,7 +309,7 @@ impl ChannelManager {
             return;
         };
         warn!("Channel turn for {session_id} was refused: {refusal}");
-        send_reply(router, &msg, refusal).await;
+        send_reply(router, &control.channel_counters, &msg, refusal).await;
     }
 
     /// Stop all listeners
@@ -338,7 +344,12 @@ impl ChannelManager {
 }
 
 /// Answer `msg` in the channel it came from.
-async fn send_reply(router: &MessageRouter, msg: &IncomingMessage, text: String) {
+async fn send_reply(
+    router: &MessageRouter,
+    counters: &crate::channel_counters::ChannelCounters,
+    msg: &IncomingMessage,
+    text: String,
+) {
     debug_assert!(!text.trim().is_empty(), "a reply says something");
     let outgoing = OutgoingMessage {
         channel: msg.channel.clone(),
@@ -346,10 +357,13 @@ async fn send_reply(router: &MessageRouter, msg: &IncomingMessage, text: String)
         reply_to: Some(msg.id.clone()),
     };
     if let Err(e) = router.send(outgoing).await {
+        counters.send_failed(&msg.channel.provider);
         error!(
             "Failed to send response to {}:{}: {}",
             msg.channel.provider, msg.channel.id, e
         );
+    } else {
+        counters.sent(&msg.channel.provider);
     }
 }
 
@@ -596,6 +610,7 @@ pub fn spawn_reply_forwarder(
     sessions: Arc<SessionManager>,
     mut events: broadcast::Receiver<Event>,
     router: Arc<RwLock<MessageRouter>>,
+    counters: Arc<crate::channel_counters::ChannelCounters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -625,10 +640,13 @@ pub fn spawn_reply_forwarder(
             };
             let router = router.read().await;
             if let Err(e) = router.send(outgoing).await {
+                counters.send_failed(&route.provider);
                 error!(
                     "Failed to send reply for {session_id} to {}:{}: {e}",
                     route.provider, route.id
                 );
+            } else {
+                counters.sent(&route.provider);
             }
         }
         debug!("Channel reply forwarder stopped: event bus closed");
@@ -735,6 +753,13 @@ mod tests {
         assert_eq!(
             sent[0].1,
             "Nanna could not answer this message: Agent service not configured"
+        );
+        let counted = control.channel_counters.snapshot();
+        assert_eq!(counted.len(), 1, "{counted:?}");
+        assert_eq!(
+            (counted[0].1.received, counted[0].1.sent),
+            (1, 1),
+            "{counted:?}"
         );
     }
 
@@ -1009,7 +1034,9 @@ mod tests {
         let gui = sessions.create(None).await;
         let (events_tx, events_rx) = broadcast::channel(16);
         let (router, sent) = recording_router();
-        let forwarder = spawn_reply_forwarder(sessions.clone(), events_rx, router);
+        let counters = Arc::new(crate::channel_counters::ChannelCounters::default());
+        let forwarder =
+            spawn_reply_forwarder(sessions.clone(), events_rx, router, counters.clone());
 
         for (session_id, content) in [(gui.id.as_str(), "gui reply"), (SESSION, "the answer")] {
             events_tx
@@ -1042,5 +1069,8 @@ mod tests {
             ],
             "the GUI session's reply is not sent to any channel"
         );
+        let counted = counters.snapshot();
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].1.sent, 2, "both deliveries counted: {counted:?}");
     }
 }

@@ -60,6 +60,7 @@ pub mod reminder_service;
 pub mod mcp_startup;
 pub mod file_history_service;
 pub mod metrics;
+pub mod channel_counters;
 pub mod user_tools;
 pub mod webhook;
 

@@ -116,6 +116,8 @@ pub struct ControlPlane {
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
     pub(crate) chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    /// Channel messages in and out, for `/metrics`.
+    pub(crate) channel_counters: Arc<crate::channel_counters::ChannelCounters>,
     /// Per-session liveness ledgers (P22): current phase, last tool, last
     /// side-effecting call, stop state — stamped by the chat sink, read by
     /// the liveness beat and the `session.liveness` verb.
@@ -167,6 +169,7 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
@@ -230,6 +233,7 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
@@ -295,6 +299,7 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
