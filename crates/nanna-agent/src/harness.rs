@@ -3856,7 +3856,9 @@ fn text_head(text: &str, max_bytes: usize) -> &str {
 }
 
 /// The filesystem path a tool call targeted, when the tool is one that
-/// writes a caller-named path (the write/edit family). `None` for everything
+/// writes a caller-named path (the write/edit family).
+///
+/// `None` for everything
 /// else — including `exec`, whose side effects are opaque to the caller; the
 /// periodic re-sweep is the backstop for those.
 ///
@@ -4029,6 +4031,7 @@ mod tests {
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.done = true;
             }
+            drop(items);
             self.completions.lock().await.push((id, detail));
             Ok(())
         }
@@ -4050,6 +4053,7 @@ mod tests {
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.abandoned = true;
             }
+            drop(items);
             self.abandon_reasons
                 .lock()
                 .await
@@ -4062,6 +4066,7 @@ mod tests {
                 item.done = false;
                 item.abandoned = false;
             }
+            drop(items);
             self.log_entries.lock().await.push((id, "reopened".to_string()));
             Ok(())
         }
@@ -4789,6 +4794,7 @@ mod tests {
         );
         // First attempt has no verdict yet — the enrichment is failure-only.
         assert!(!requests[0].prompt.contains("Done-condition NOT met"));
+        drop(requests);
     }
 
     // -----------------------------------------------------------------
@@ -4894,6 +4900,7 @@ mod tests {
             second.contains("first.txt (4 bytes"),
             "the verdict must carry artifact identity, not just 'a file exists': {second}"
         );
+        drop(requests);
     }
 
     /// The stored completion record must say what the environment confirmed at
@@ -4949,6 +4956,7 @@ mod tests {
             Some("PASS: all good"),
             "the head of what the check actually read: {detail}"
         );
+        drop(completions);
     }
 
     // -----------------------------------------------------------------
@@ -5039,6 +5047,7 @@ mod tests {
             log.iter().any(|(_, action)| action == "acceptance_evidence_changed"),
             "the demotion is greppable and distinct from a timeout: {log:?}"
         );
+        drop(log);
     }
 
     /// The mirror property, and the reason the guard is safe to run on every
@@ -5268,6 +5277,7 @@ mod tests {
         assert_eq!(detail["already_satisfied"], serde_json::json!(true));
         assert_eq!(detail["verified"], serde_json::json!(true));
         assert_eq!(detail["steps_run"], serde_json::json!(0));
+        drop(completions);
         assert!(
             source
                 .log_entries
@@ -5326,6 +5336,7 @@ mod tests {
             detail.get("already_satisfied").is_none(),
             "an ordinary completion, unmarked: {detail}"
         );
+        drop(completions);
     }
 
     /// The pre-check is OPT-IN, and the default is the bound: on a first plan
@@ -5455,6 +5466,7 @@ mod tests {
             "the user's item closed by running, not by being skipped: {}",
             interjected.1
         );
+        drop(completions);
     }
 
     #[tokio::test]
@@ -5473,6 +5485,29 @@ mod tests {
 
     #[tokio::test]
     async fn verified_completion_requires_the_acceptance_check_to_pass() {
+        struct Producer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for Producer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                if *calls == 2 {
+                    std::fs::write(&self.artifact, "done").unwrap();
+                }
+                drop(calls);
+                Ok(StepOutcome {
+                    text: "worked on it".to_string(),
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    tool_calls: vec![],
+                    touched_paths: vec![],
+                    degenerate_loop: false,
+                })
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default();
         source
@@ -5486,28 +5521,6 @@ mod tests {
             .await;
         // Step 1: model works but produces nothing. Step 2: file appears.
         let artifact = dir.path().join("artifact.txt");
-        struct Producer {
-            artifact: PathBuf,
-            calls: Mutex<usize>,
-        }
-        #[async_trait::async_trait]
-        impl StepRunner for Producer {
-            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
-                let mut calls = self.calls.lock().await;
-                *calls += 1;
-                if *calls == 2 {
-                    std::fs::write(&self.artifact, "done").unwrap();
-                }
-                Ok(StepOutcome {
-                    text: "worked on it".to_string(),
-                    input_tokens: 1000,
-                    output_tokens: 200,
-                    tool_calls: vec![],
-                    touched_paths: vec![],
-                    degenerate_loop: false,
-                })
-            }
-        }
         let runner = Producer {
             artifact,
             calls: Mutex::new(0),
@@ -5526,6 +5539,23 @@ mod tests {
 
     #[tokio::test]
     async fn drain_sweep_revives_an_abandoned_item_whose_check_now_passes() {
+        struct LateProducer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for LateProducer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                if *calls == 2 {
+                    std::fs::write(&self.artifact, "made by item 2").unwrap();
+                    return Ok(outcome("all wrapped up\nTASK COMPLETE"));
+                }
+                drop(calls);
+                Ok(outcome("grinding"))
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default();
         // Item 1 is stuck on a file that does not exist yet; item 2's work
@@ -5542,22 +5572,6 @@ mod tests {
             ))
             .await;
         source.push(step(2, "later work", None)).await;
-        struct LateProducer {
-            artifact: PathBuf,
-            calls: Mutex<usize>,
-        }
-        #[async_trait::async_trait]
-        impl StepRunner for LateProducer {
-            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
-                let mut calls = self.calls.lock().await;
-                *calls += 1;
-                if *calls == 2 {
-                    std::fs::write(&self.artifact, "made by item 2").unwrap();
-                    return Ok(outcome("all wrapped up\nTASK COMPLETE"));
-                }
-                Ok(outcome("grinding"))
-            }
-        }
         let runner = LateProducer {
             artifact: dir.path().join("x.txt"),
             calls: Mutex::new(0),
@@ -5581,28 +5595,15 @@ mod tests {
         let completions = source.completions.lock().await;
         let item1 = completions.iter().find(|(id, _)| *id == 1).unwrap();
         assert_eq!(item1.1["verified"], serde_json::json!(true));
+        drop(completions);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "revived"));
+        drop(log);
     }
 
     #[tokio::test]
     async fn drain_sweep_reopens_a_verified_item_that_later_work_un_did() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = MemorySource::default();
-        source
-            .push(step(
-                1,
-                "build artifact",
-                Some(AcceptanceCheck::FileExists {
-                    path: "y.txt".to_string(),
-                }),
-            ))
-            .await;
-        source.push(step(2, "destructive later work", None)).await;
-        // Call 1 creates the artifact (item 1 verifies), call 2 DELETES it
-        // (item 2 "succeeds" while silently un-doing verified work — the
-        // rewrite-erosion shape), call 3 restores it when item 1 comes back.
         struct Underminer {
             artifact: PathBuf,
             calls: Mutex<usize>,
@@ -5628,6 +5629,21 @@ mod tests {
                 }
             }
         }
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "build artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "y.txt".to_string(),
+                }),
+            ))
+            .await;
+        source.push(step(2, "destructive later work", None)).await;
+        // Call 1 creates the artifact (item 1 verifies), call 2 DELETES it
+        // (item 2 "succeeds" while silently un-doing verified work — the
+        // rewrite-erosion shape), call 3 restores it when item 1 comes back.
         let runner = Underminer {
             artifact: dir.path().join("y.txt"),
             calls: Mutex::new(0),
@@ -5643,6 +5659,7 @@ mod tests {
         assert_eq!(report.steps_taken, 3);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
+        drop(log);
     }
 
     // -----------------------------------------------------------------
@@ -5750,9 +5767,11 @@ mod tests {
             !requests[3].prompt.contains("un-did verified work"),
             "the notice is one-shot"
         );
+        drop(requests);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
+        drop(log);
         let notes = source.notes.lock().await;
         assert!(
             notes
@@ -5760,6 +5779,7 @@ mod tests {
                 .any(|(id, n)| *id == 1 && n.contains("REOPENED mid-run")),
             "the reopened item carries durable context"
         );
+        drop(notes);
     }
 
     #[tokio::test]
@@ -5859,7 +5879,7 @@ mod tests {
         // Full sweep due: everything, whatever was touched.
         assert_eq!(select_resweep_targets(eligible.clone(), true, &[]).len(), 2);
         // Not due, nothing touched: nothing to re-check.
-        assert!(select_resweep_targets(eligible.clone(), false, &[]).is_empty());
+        assert_eq!(select_resweep_targets(eligible.clone(), false, &[]), Vec::new());
         // Not due, one referenced path touched: exactly that item,
         // immediately — absolute spelling still collides with the check's
         // relative one.
@@ -5948,6 +5968,7 @@ mod tests {
         assert_eq!(report.items_completed_unverified, 1);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "completed_unverified"));
+        drop(log);
     }
 
     #[tokio::test]
@@ -6043,6 +6064,7 @@ mod tests {
         // progress exhaustion; wall clock is the bound that rides along.
         assert_eq!(exec.max_iterations, None);
         assert!(exec.max_wall_clock.is_some());
+        drop(requests);
     }
 
     /// Build a stalled item whose acceptance can never pass, with an
@@ -6196,11 +6218,11 @@ mod tests {
         );
 
         let requests = runner.inner.requests.lock().await;
-        let plans: Vec<_> = requests
+        let plans = requests
             .iter()
             .filter(|r| r.step_kind == StepKind::Plan)
-            .collect();
-        assert_eq!(plans.len(), 1, "the decomposition ask is never repeated");
+            .count();
+        assert_eq!(plans, 1, "the decomposition ask is never repeated");
 
         let escalated = requests.last().expect("four steps ran");
         assert_eq!(escalated.step_kind, StepKind::Execute);
@@ -6228,6 +6250,7 @@ mod tests {
                 && reason.contains("escalated next-action ask"),
             "the reason must say BOTH attempts came back empty: {reason}"
         );
+        drop(reasons);
     }
 
     /// REGRESSION: an abandoned item reached the report by NAME only if it
@@ -6583,6 +6606,7 @@ mod tests {
         let notes = source.notes.lock().await;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].1.contains("nanna-config"));
+        drop(notes);
     }
 
     // -----------------------------------------------------------------
@@ -6677,6 +6701,7 @@ mod tests {
                     *fail = false;
                     return Err("store unavailable".to_string());
                 }
+                drop(fail);
             }
             let batch = self.batches.lock().await.pop_front().unwrap_or_default();
             let admitted = batch.len();
@@ -6905,6 +6930,7 @@ TASK COMPLETE"))]);
         );
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "acceptance_timeout"));
+        drop(log);
     }
 
     /// The other half of "judged by its own evidence": while the check
@@ -6976,6 +7002,7 @@ TASK COMPLETE"))]);
             reasons.iter().all(|(_, r)| r.contains("runner errors")),
             "must die of script exhaustion, never of fruitlessness: {reasons:?}"
         );
+        drop(reasons);
     }
 
     /// Once a check has consumed its ENTIRE ceiling without answering,
@@ -7045,6 +7072,7 @@ TASK COMPLETE"))]);
                 std::fs::write(self.dir.join("flip.txt"), b"now exists").unwrap();
                 out.touched_paths = vec!["flip.txt".to_string()];
             }
+            drop(calls);
             Ok(out)
         }
     }
@@ -7197,6 +7225,7 @@ TASK COMPLETE"))]);
         drop(requests);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "narration_step"));
+        drop(log);
     }
 
     /// An already-satisfied pre-check completion is knowledge: the passing
@@ -7218,7 +7247,7 @@ TASK COMPLETE"))]);
             .await;
         let runner = ScriptedRunner::new(vec![]);
         let config = LongHorizonConfig {
-            precheck_acceptance_items: [7].into_iter().collect(),
+            precheck_acceptance_items: std::iter::once(7).collect(),
             ..fast_config()
         };
         let report = LongHorizonRunner::new(config)
