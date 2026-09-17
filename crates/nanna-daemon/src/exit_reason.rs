@@ -7,10 +7,10 @@
 //! published a 0/42 score for a daemon that was dead for 96% of the window.
 //!
 //! Mechanism (a classic dirty bit):
-//! - On startup, AFTER the PID file is acquired (so a losing duplicate can
-//!   never clobber the live daemon's record), the daemon reads whatever the
-//!   previous process left, logs it, and overwrites the file with a
-//!   `state: running` marker.
+//! - On startup, AFTER the PID file and the IPC port are claimed (so a
+//!   losing duplicate can never clobber the live daemon's record), the daemon
+//!   reads whatever the previous process left, logs it, and overwrites the
+//!   file with a `state: running` marker.
 //! - Every deliberate exit path (clean shutdown drain, panic hook, signal /
 //!   ctrl handler, IPC-server hard exit) overwrites the marker with
 //!   `state: exited` plus a reason. Last writer wins.
@@ -20,8 +20,8 @@
 //!
 //! The writer is disarmed until the startup marker lands: `record_exit` and
 //! the panic hook are no-ops in a process that never owned the file, so a
-//! second instance that fails the PID race (or is Ctrl-C'd while losing it)
-//! cannot overwrite the live daemon's record.
+//! second instance that fails the PID or port claim (or is Ctrl-C'd while
+//! losing it) cannot overwrite the live daemon's record.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,7 +147,7 @@ impl ExitReasonFile {
     }
 
     /// Write the `running` startup marker and arm the terminal writers.
-    /// Call exactly once, after the PID file is acquired.
+    /// Call exactly once, after the PID file and the IPC port are claimed.
     pub fn mark_running(&self) {
         self.write(ExitReasonRecord {
             state: ExitState::Running,

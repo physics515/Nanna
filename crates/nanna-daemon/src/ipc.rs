@@ -213,6 +213,55 @@ impl SessionFilters {
     }
 }
 
+/// The IPC port, bound but not yet listening.
+///
+/// Daemon startup reserves the port BEFORE opening storage, so an instance
+/// that can never serve IPC (the port is held — usually by a live daemon)
+/// exits before it touches `nanna.db`, instead of surfacing first as a turso
+/// lock failure and dying only after the router and memory service were built
+/// (2026-09-17). Bound-not-listening claims the port against a listening
+/// daemon while connects are still refused, so a client polling for readiness
+/// keeps reading "accepts a connection" as "serving".
+///
+/// On Unix the claim is exclusive against a LISTENING socket only: an instance
+/// that skipped the PID guard could still bind with `SO_REUSEADDR` and listen
+/// first, and this port's `listen` then fails — the pre-reservation failure,
+/// arbitrated late instead of early.
+pub struct ReservedIpcPort {
+    socket: socket2::Socket,
+    addr: SocketAddr,
+}
+
+impl ReservedIpcPort {
+    fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        let addr = socket
+            .local_addr()?
+            .as_socket()
+            .unwrap_or(addr);
+        Ok(Self { socket, addr })
+    }
+
+    /// The bound address (the real port when the configured one was 0).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn listen(self) -> Result<TcpListener, std::io::Error> {
+        self.socket.listen(128)?;
+        TcpListener::from_std(self.socket.into())
+    }
+}
+
 /// IPC Server for daemon communication
 pub struct IpcServer {
     config: IpcServerConfig,
@@ -242,36 +291,21 @@ impl IpcServer {
         }
     }
     
-    /// Bind a TCP listener, retrying on transient port conflicts.
+    /// Claim the IPC port without accepting connections yet.
     ///
-    /// On Unix, sets SO_REUSEADDR so TIME_WAIT sockets don't block restart.
-    /// On Windows, SO_REUSEADDR has dangerous semantics (allows hijacking),
-    /// so we retry with a short delay instead.
-    async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
-        let socket_addr: std::net::SocketAddr = addr.parse()
+    /// On Unix, sets `SO_REUSEADDR` so `TIME_WAIT` sockets don't block restart
+    /// (it does not permit binding over a LISTENING socket, which is what a
+    /// live daemon holds). On Windows, `SO_REUSEADDR` has dangerous semantics
+    /// (allows hijacking), so we retry with a short delay instead.
+    pub async fn reserve_port(&self) -> Result<ReservedIpcPort, std::io::Error> {
+        let addr: SocketAddr = self.address().parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-        // On Unix, use SO_REUSEADDR for fast restart
-        #[cfg(unix)]
-        {
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(socket_addr),
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            socket.set_reuse_address(true)?;
-            socket.set_nonblocking(true)?;
-            socket.bind(&socket_addr.into())?;
-            socket.listen(128)?;
-            return TcpListener::from_std(socket.into());
-        }
-
-        // On Windows, retry with delay if port is temporarily unavailable
         #[cfg(windows)]
         {
             for attempt in 0..5 {
-                match TcpListener::bind(&socket_addr).await {
-                    Ok(listener) => return Ok(listener),
+                match ReservedIpcPort::bind(addr) {
+                    Ok(port) => return Ok(port),
                     Err(e) if attempt < 4 => {
                         warn!("IPC bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -282,9 +316,8 @@ impl IpcServer {
             unreachable!()
         }
 
-        // Fallback for other platforms
-        #[cfg(not(any(unix, windows)))]
-        TcpListener::bind(&socket_addr).await
+        #[cfg(not(windows))]
+        ReservedIpcPort::bind(addr)
     }
 
     /// Get the address the server will bind to
@@ -345,8 +378,15 @@ impl IpcServer {
     
     /// Run the IPC server
     pub async fn run(self: &Arc<Self>) -> Result<(), std::io::Error> {
-        let addr = self.address();
-        let listener = Self::bind_with_reuse(&addr).await?;
+        let port = self.reserve_port().await?;
+        self.serve(port).await
+    }
+
+    /// Serve on a port claimed earlier by [`Self::reserve_port`]: start
+    /// listening, then accept until shutdown.
+    pub async fn serve(self: &Arc<Self>, port: ReservedIpcPort) -> Result<(), std::io::Error> {
+        let addr = port.addr;
+        let listener = port.listen()?;
         info!("IPC server listening on ws://{}", addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
