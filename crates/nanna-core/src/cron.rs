@@ -254,10 +254,12 @@ fn parse_field(field: &str, name: &str, min: u32, max: u32) -> Result<HashSet<u3
                 });
             }
 
-            let mut v = min;
-            while v <= max {
-                values.insert(v);
-                v += step;
+            // `checked_add`: a step near `u32::MAX` must end the walk, not
+            // wrap back into range and loop forever in a release build.
+            let mut v = Some(min);
+            while let Some(current) = v.filter(|&c| c <= max) {
+                values.insert(current);
+                v = current.checked_add(step);
             }
         } else if part.contains('/') {
             // Range with step: 0-30/10
@@ -275,12 +277,21 @@ fn parse_field(field: &str, name: &str, min: u32, max: u32) -> Result<HashSet<u3
                 message: format!("Invalid step: {}", parts[1]),
             })?;
 
+            // Same rule as `*/0`: a zero step never advances, so the walk
+            // below would never end.
+            if step == 0 {
+                return Err(CronError::InvalidField {
+                    field: name.to_string(),
+                    message: "Step cannot be 0".to_string(),
+                });
+            }
+
             let (start, end) = parse_range(range, name, min, max)?;
 
-            let mut v = start;
-            while v <= end {
-                values.insert(v);
-                v += step;
+            let mut v = Some(start);
+            while let Some(current) = v.filter(|&c| c <= end) {
+                values.insert(current);
+                v = current.checked_add(step);
             }
         } else if part.contains('-') {
             // Range: 1-5
@@ -405,6 +416,24 @@ mod tests {
         assert!(expr.minutes.contains(&30));
         assert!(expr.minutes.contains(&45));
         assert_eq!(expr.minutes.len(), 4);
+    }
+
+    #[test]
+    fn zero_step_is_rejected_in_a_range_too() {
+        // `0-30/0` used to loop forever: only `*/0` was checked.
+        assert!(CronExpr::parse("0-30/0 * * * *").is_err());
+        assert!(CronExpr::parse("*/0 * * * *").is_err());
+    }
+
+    #[test]
+    fn huge_step_ends_the_walk_instead_of_wrapping() {
+        // 1 + u32::MAX overflowed: a panic in debug, a wrap back to 0 and an
+        // endless loop in release.
+        let expr = CronExpr::parse("1-30/4294967295 * * * *").unwrap();
+        assert_eq!(expr.minutes.len(), 1);
+        assert!(expr.minutes.contains(&1));
+        let expr = CronExpr::parse("*/4294967295 * * * *").unwrap();
+        assert_eq!(expr.minutes.len(), 1);
     }
 
     #[test]
