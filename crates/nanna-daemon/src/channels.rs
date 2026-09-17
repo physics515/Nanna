@@ -382,6 +382,8 @@ enum ChannelCommand<'a> {
     Status,
     /// `/stop` — cancel the turn running in this chat.
     Stop,
+    /// `/new` — start this chat over: forget the conversation so far.
+    New,
     /// `/help` or `/start` (what Telegram sends when a chat opens).
     Help,
 }
@@ -400,6 +402,7 @@ fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
         "/status" => return Some(ChannelCommand::Status),
         "/help" | "/start" => return Some(ChannelCommand::Help),
         "/stop" => return Some(ChannelCommand::Stop),
+        "/new" => return Some(ChannelCommand::New),
         "/model" => {}
         _ => return None,
     }
@@ -420,6 +423,7 @@ const CHANNEL_HELP: &str = "Commands:\n\
 /status — whether Nanna is up, busy in this chat, and able to answer\n\
 /model — the model this chat uses; /model <name> pins one; /model default undoes it\n\
 /stop — stop what Nanna is working on in this chat\n\
+/new — start this chat over (Nanna forgets the conversation so far; reminders and the model pin stay)\n\
 /help — this list\n\
 Anything else is a message to Nanna.";
 
@@ -511,6 +515,7 @@ async fn run_channel_command(
             let response = control.handle_chat_cancel_for_channel(session_id).await;
             stop_reply(&response)
         }
+        ChannelCommand::New => start_over(control, session_id).await,
         ChannelCommand::ShowModel => {
             // A rare command; cloning the session to read one key is fine.
             let Some(session) = sessions.get(session_id).await else {
@@ -560,6 +565,29 @@ fn stop_reply(response: &serde_json::Value) -> String {
         Some("not_active") => "Nothing is running in this chat.".to_string(),
         _ => refusal_text(response)
             .unwrap_or_else(|| "The stop request got an answer Nanna did not recognise; nothing is known to have stopped.".to_string()),
+    }
+}
+
+/// `/new`: empty the chat's conversation so the next message starts fresh.
+///
+/// Refused while a turn runs — clearing under a live turn would leave it
+/// appending to a history that no longer holds its own question. A parked turn
+/// (waiting on a provider outage) is dropped too, or it would resume into the
+/// emptied conversation. The model pin and reminders belong to the chat, not to
+/// the conversation, so they stay.
+async fn start_over(control: &ControlPlane, session_id: &str) -> String {
+    if control.chat_runs.is_active(session_id).await {
+        return "Nanna is still working on your last message. Send /stop first, then /new."
+            .to_string();
+    }
+    let dropped_park = control.chat_runs.clear_park(session_id).await.is_some();
+    if !control.sessions.clear(session_id).await {
+        return "This conversation could not be found, so nothing was cleared.".to_string();
+    }
+    if dropped_park {
+        "Started over. The reply that was waiting for a model provider was dropped too.".to_string()
+    } else {
+        "Started over — your next message begins a new conversation.".to_string()
     }
 }
 
@@ -881,6 +909,8 @@ mod tests {
         assert_eq!(parse_channel_command("/help"), Some(Help));
         assert_eq!(parse_channel_command("/start"), Some(Help));
         assert_eq!(parse_channel_command("/stop"), Some(Stop));
+        assert_eq!(parse_channel_command("/new@NannaBot"), Some(New));
+        assert_eq!(parse_channel_command("/news today"), None);
         for message in [
             "/statuses",
             "/models",
@@ -954,6 +984,50 @@ mod tests {
                 .messages
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn new_forgets_the_conversation_but_keeps_the_pin() {
+        let sessions = Arc::new(SessionManager::new());
+        let control = Arc::new(ControlPlane::new(sessions.clone()));
+        let (router, sent) = recording_router();
+        let router = router.read().await;
+        ChannelManager::process_message(incoming("/model ollama/qwen3.5:9b"), &control, &router)
+            .await;
+        sessions
+            .add_message(
+                SESSION,
+                crate::session::MessageRole::User,
+                "an earlier question",
+            )
+            .await
+            .expect("message");
+
+        assert!(
+            control.chat_runs.try_claim(SESSION).await,
+            "the test turn claims"
+        );
+        ChannelManager::process_message(incoming("/new"), &control, &router).await;
+        assert_eq!(
+            sessions.get(SESSION).await.expect("session").messages.len(),
+            1,
+            "a running turn keeps its history"
+        );
+        control.chat_runs.release(SESSION).await;
+
+        ChannelManager::process_message(incoming("/new"), &control, &router).await;
+        let session = sessions.get(SESSION).await.expect("session");
+        assert!(session.messages.is_empty());
+        assert_eq!(session.chat_model(), Some("ollama/qwen3.5:9b"));
+        let replies: Vec<String> = sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(replies.len(), 3, "{replies:?}");
+        assert!(replies[1].contains("Send /stop first"), "{}", replies[1]);
+        assert!(replies[2].starts_with("Started over"), "{}", replies[2]);
     }
 
     #[test]

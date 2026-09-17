@@ -54,7 +54,7 @@ is itself undoable; restoring a file a tool created removes it. Bounded: 100 rec
 conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall.
 
 **Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/stop`
-(cancel what Nanna is doing in that chat), `/model <name>` to pin that conversation's model
+(cancel what Nanna is doing in that chat), `/new` (start the chat over), `/model <name>` to pin that conversation's model
 (`/model default` undoes it), `/help`.
 
 **Rules you set can be lifted — by you.** When a file rule you declared ("don't touch tests/")

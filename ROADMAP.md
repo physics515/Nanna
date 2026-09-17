@@ -4768,6 +4768,12 @@ asks permission or restricts her.)*:
       can anything answer) and **`/stop`**, which cancels this chat's turn through the same arm as
       IPC `chat.cancel` and says whether anything was running. A message sent mid-run already joins
       the run (interjection). "Approve" stays out — no approval gates by owner decision.
+      *(2026-09-17)* **`/new`** starts a chat over: a channel conversation is one fixed session
+      per chat, so before this a Telegram user could never leave a long, confused history. It
+      empties the messages, drops a provider-outage park (or it would resume into the empty
+      conversation), keeps the model pin, reply route and reminders, and is **refused while a
+      turn runs** ("Send /stop first") — test mutation-checked. Not done: an open GUI view of that
+      session is not told (`session.clear` over IPC has no event either).
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.
