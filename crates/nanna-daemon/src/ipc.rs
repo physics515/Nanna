@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
 use tracing::{debug, error, info, warn};
 
@@ -225,6 +225,9 @@ pub struct IpcServer {
     request_rx: Arc<RwLock<Option<RequestReceiver>>>,
     event_tx: broadcast::Sender<Event>,
     shutdown_tx: broadcast::Sender<()>,
+    /// The address the listener actually bound, published once `run` binds.
+    /// With port 0 this is the only way to learn the port the OS chose.
+    bound_tx: watch::Sender<Option<std::net::SocketAddr>>,
 }
 
 impl IpcServer {
@@ -234,6 +237,7 @@ impl IpcServer {
         let (request_tx, request_rx) = mpsc::channel(1000);
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let (bound_tx, _) = watch::channel(None);
         
         Self {
             config,
@@ -243,6 +247,7 @@ impl IpcServer {
             session_filters: Arc::new(SessionFilters::new()),
             event_tx,
             shutdown_tx,
+            bound_tx,
         }
     }
     
@@ -294,6 +299,16 @@ impl IpcServer {
     async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
         let socket_addr = Self::socket_addr(addr)?;
         TcpListener::bind(&socket_addr).await
+    }
+
+    /// The address the listener bound: `None` until `run` has bound it.
+    ///
+    /// Port 0 asks the OS for a free port, and this is how a caller learns
+    /// which one. Choosing a port up front and releasing it before the server
+    /// binds races with every other process picking ports the same way.
+    #[must_use]
+    pub fn bound_addr(&self) -> watch::Receiver<Option<std::net::SocketAddr>> {
+        self.bound_tx.subscribe()
     }
 
     /// Get the address the server will bind to
@@ -374,7 +389,9 @@ impl IpcServer {
         let listener = Self::bind_with_reuse(&addr)?;
         #[cfg(not(unix))]
         let listener = Self::bind_with_reuse(&addr).await?;
-        info!("IPC server listening on ws://{}", addr);
+        let bound = listener.local_addr()?;
+        self.bound_tx.send_replace(Some(bound));
+        info!("IPC server listening on ws://{bound}");
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -572,6 +589,29 @@ mod tests {
         let config = IpcServerConfig::default();
         assert_eq!(config.port, 5149);
         assert_eq!(config.host, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn port_zero_publishes_the_port_the_os_chose() {
+        let server = Arc::new(IpcServer::new(IpcServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            ..IpcServerConfig::default()
+        }));
+        let mut bound = server.bound_addr();
+        assert_eq!(*bound.borrow(), None, "nothing is bound before run");
+
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        bound.changed().await.expect("run publishes the bound address");
+        let addr = (*bound.borrow()).expect("a bound address");
+        assert_ne!(addr.port(), 0, "the published port is the real one");
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the published address accepts connections");
+
+        server.shutdown();
+        task.await.expect("run task").expect("run ends cleanly on shutdown");
     }
 }
 

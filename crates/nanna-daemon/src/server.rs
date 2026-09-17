@@ -2550,6 +2550,13 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    /// The address the IPC listener bound, `None` until `run` binds it. See
+    /// [`IpcServer::bound_addr`]: with port 0 this reports the chosen port.
+    #[must_use]
+    pub fn ipc_bound_addr(&self) -> tokio::sync::watch::Receiver<Option<std::net::SocketAddr>> {
+        self.ipc.bound_addr()
+    }
+
     /// Resolve one `provider/model` spec to a live embedding client.
     ///
     /// `None` means the provider's credential is absent — the entry is skipped
