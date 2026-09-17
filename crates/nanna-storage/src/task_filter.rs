@@ -103,6 +103,16 @@ enum Token {
 }
 
 /// Parse a filter query into an expression tree.
+///
+/// # Errors
+/// Returns [`FilterError::TooLong`] if `input` exceeds
+/// [`FILTER_INPUT_MAX_BYTES`], [`FilterError::Empty`] if it holds no tokens,
+/// [`FilterError::TooDeep`] if the parser would recurse [`FILTER_DEPTH_MAX`]
+/// levels (each operator and parenthesis adds levels), and
+/// [`FilterError::UnexpectedToken`], [`FilterError::UnexpectedEnd`],
+/// [`FilterError::UnknownKeyword`], or [`FilterError::InvalidDate`] for
+/// malformed syntax, an unrecognized keyword, or a date that is not
+/// `YYYY-MM-DD`.
 pub fn parse(input: &str) -> Result<FilterExpr, FilterError> {
     if input.len() > FILTER_INPUT_MAX_BYTES {
         return Err(FilterError::TooLong(input.len()));
@@ -295,81 +305,87 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterError> {
                 tokens.push(Token::Atom(FilterAtom::Project(word)));
                 i = next;
             }
-            _ => {
-                let word_start = i;
-                let (word, next) = take_word(&chars, i);
-                if word.is_empty() {
-                    return Err(FilterError::UnexpectedToken(c.to_string()));
-                }
-                let lower = word.to_lowercase();
-                // `search:` swallows free text up to the next operator; accept
-                // both `search: foo` and `search:foo`.
-                if lower.starts_with("search:") {
-                    let (text, after) = take_until_operator(&chars, word_start);
-                    let body = text.get("search:".len()..).unwrap_or("").trim();
-                    if body.is_empty() {
-                        return Err(FilterError::UnexpectedEnd("search text"));
-                    }
-                    tokens.push(Token::Atom(FilterAtom::Search(body.to_string())));
-                    i = after;
-                    continue;
-                }
-                i = next;
-                match lower.as_str() {
-                    "p1" => tokens.push(Token::Atom(FilterAtom::Priority(1))),
-                    "p2" => tokens.push(Token::Atom(FilterAtom::Priority(2))),
-                    "p3" => tokens.push(Token::Atom(FilterAtom::Priority(3))),
-                    "p4" => tokens.push(Token::Atom(FilterAtom::Priority(4))),
-                    "overdue" => tokens.push(Token::Atom(FilterAtom::Overdue)),
-                    "today" => tokens.push(Token::Atom(FilterAtom::Today)),
-                    "subtask" => tokens.push(Token::Atom(FilterAtom::Subtask)),
-                    "blocked" => tokens.push(Token::Atom(FilterAtom::Blocked)),
-                    "pending" | "in_progress" | "done" | "cancelled" => {
-                        tokens.push(Token::Atom(FilterAtom::Status(lower)));
-                    }
-                    "no" => {
-                        let (follow, after) = take_word(&chars, skip_ws(&chars, i));
-                        match follow.to_lowercase().as_str() {
-                            "date" => tokens.push(Token::Atom(FilterAtom::NoDate)),
-                            "label" => tokens.push(Token::Atom(FilterAtom::NoLabel)),
-                            other => {
-                                return Err(FilterError::UnknownKeyword(format!("no {other}")));
-                            }
-                        }
-                        i = after;
-                    }
-                    "due" => {
-                        // Accept `due before: DATE` / `due after:DATE` — the
-                        // colon may or may not be followed by a space.
-                        let (text, after) = take_until_operator(&chars, i);
-                        i = after;
-                        let lower_rest = text.to_lowercase();
-                        let (build, raw_date): (fn(String) -> FilterAtom, &str) =
-                            if lower_rest.starts_with("before:") {
-                                (
-                                    FilterAtom::DueBefore,
-                                    text.get("before:".len()..).unwrap_or(""),
-                                )
-                            } else if lower_rest.starts_with("after:") {
-                                (
-                                    FilterAtom::DueAfter,
-                                    text.get("after:".len()..).unwrap_or(""),
-                                )
-                            } else {
-                                return Err(FilterError::UnknownKeyword(format!("due {text}")));
-                            };
-                        let date = raw_date.trim().to_string();
-                        if !is_iso_date(&date) {
-                            return Err(FilterError::InvalidDate(date));
-                        }
-                        tokens.push(Token::Atom(build(date)));
-                    }
-                    other => return Err(FilterError::UnknownKeyword(other.to_string())),
-                }
-            }
+            _ => i = lex_word(&chars, i, &mut tokens)?,
         }
     }
     Ok(tokens)
+}
+
+/// Lex one bare word starting at `start` (a keyword, a `search:` phrase, or
+/// a `no …` / `due …` pair), push its atom, and return the index after it.
+///
+/// Always consumes at least one char on success, which is what bounds the
+/// loop in [`lex`].
+fn lex_word(chars: &[char], start: usize, tokens: &mut Vec<Token>) -> Result<usize, FilterError> {
+    let (word, next) = take_word(chars, start);
+    if word.is_empty() {
+        return Err(FilterError::UnexpectedToken(chars[start].to_string()));
+    }
+    let lower = word.to_lowercase();
+    // `search:` swallows free text up to the next operator; accept
+    // both `search: foo` and `search:foo`.
+    if lower.starts_with("search:") {
+        let (text, after) = take_until_operator(chars, start);
+        let body = text.get("search:".len()..).unwrap_or("").trim();
+        if body.is_empty() {
+            return Err(FilterError::UnexpectedEnd("search text"));
+        }
+        tokens.push(Token::Atom(FilterAtom::Search(body.to_string())));
+        return Ok(after);
+    }
+    let mut i = next;
+    match lower.as_str() {
+        "p1" => tokens.push(Token::Atom(FilterAtom::Priority(1))),
+        "p2" => tokens.push(Token::Atom(FilterAtom::Priority(2))),
+        "p3" => tokens.push(Token::Atom(FilterAtom::Priority(3))),
+        "p4" => tokens.push(Token::Atom(FilterAtom::Priority(4))),
+        "overdue" => tokens.push(Token::Atom(FilterAtom::Overdue)),
+        "today" => tokens.push(Token::Atom(FilterAtom::Today)),
+        "subtask" => tokens.push(Token::Atom(FilterAtom::Subtask)),
+        "blocked" => tokens.push(Token::Atom(FilterAtom::Blocked)),
+        "pending" | "in_progress" | "done" | "cancelled" => {
+            tokens.push(Token::Atom(FilterAtom::Status(lower)));
+        }
+        "no" => {
+            let (follow, after) = take_word(chars, skip_ws(chars, i));
+            match follow.to_lowercase().as_str() {
+                "date" => tokens.push(Token::Atom(FilterAtom::NoDate)),
+                "label" => tokens.push(Token::Atom(FilterAtom::NoLabel)),
+                other => {
+                    return Err(FilterError::UnknownKeyword(format!("no {other}")));
+                }
+            }
+            i = after;
+        }
+        "due" => {
+            // Accept `due before: DATE` / `due after:DATE` — the
+            // colon may or may not be followed by a space.
+            let (text, after) = take_until_operator(chars, i);
+            i = after;
+            let lower_rest = text.to_lowercase();
+            let (build, raw_date): (fn(String) -> FilterAtom, &str) =
+                if lower_rest.starts_with("before:") {
+                    (
+                        FilterAtom::DueBefore,
+                        text.get("before:".len()..).unwrap_or(""),
+                    )
+                } else if lower_rest.starts_with("after:") {
+                    (
+                        FilterAtom::DueAfter,
+                        text.get("after:".len()..).unwrap_or(""),
+                    )
+                } else {
+                    return Err(FilterError::UnknownKeyword(format!("due {text}")));
+                };
+            let date = raw_date.trim().to_string();
+            if !is_iso_date(&date) {
+                return Err(FilterError::InvalidDate(date));
+            }
+            tokens.push(Token::Atom(build(date)));
+        }
+        other => return Err(FilterError::UnknownKeyword(other.to_string())),
+    }
+    Ok(i)
 }
 
 const fn skip_ws(chars: &[char], start: usize) -> usize {
