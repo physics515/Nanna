@@ -144,6 +144,17 @@ pub struct SignalResponse {
     pub group_id: Option<String>,
 }
 
+impl SignalResponse {
+    /// A response that sends nothing (for envelopes the agent does not answer).
+    const fn empty() -> Self {
+        Self {
+            message: None,
+            recipient: None,
+            group_id: None,
+        }
+    }
+}
+
 /// Handle incoming Signal webhook
 pub async fn handle(
     State(state): State<AppState>,
@@ -173,26 +184,18 @@ pub async fn handle(
     let envelope = &webhook.envelope;
 
     // Skip non-data messages (typing, receipts, etc.)
-    let data_message = if let Some(dm) = &envelope.data_message { dm } else {
+    let Some(data_message) = &envelope.data_message else {
         // Check for sync message (message sent from another device)
         if envelope.sync_message.is_some() {
             debug!("Ignoring sync message");
         }
-        return Ok(Json(SignalResponse {
-            message: None,
-            recipient: None,
-            group_id: None,
-        }));
+        return Ok(Json(SignalResponse::empty()));
     };
 
     // Skip reactions
     if data_message.reaction.is_some() {
         debug!("Ignoring reaction");
-        return Ok(Json(SignalResponse {
-            message: None,
-            recipient: None,
-            group_id: None,
-        }));
+        return Ok(Json(SignalResponse::empty()));
     }
 
     // Extract message text
@@ -200,11 +203,7 @@ pub async fn handle(
         Some(t) if !t.is_empty() => t.as_str(),
         _ => {
             debug!("No text content in message");
-            return Ok(Json(SignalResponse {
-                message: None,
-                recipient: None,
-                group_id: None,
-            }));
+            return Ok(Json(SignalResponse::empty()));
         }
     };
 
@@ -222,19 +221,16 @@ pub async fn handle(
         .unwrap_or_else(|| sender.clone());
 
     // Check if it's a group message
-    let (session_id, group_id, recipient) = if let Some(group) = &data_message.group_info {
-        (
-            format!("signal:group:{}", group.group_id),
-            Some(group.group_id.clone()),
-            None,
-        )
-    } else {
-        (
-            format!("signal:{sender}"),
-            None,
-            Some(sender.clone()),
-        )
-    };
+    let (session_id, group_id, recipient) = data_message.group_info.as_ref().map_or_else(
+        || (format!("signal:{sender}"), None, Some(sender.clone())),
+        |group| {
+            (
+                format!("signal:group:{}", group.group_id),
+                Some(group.group_id.clone()),
+                None,
+            )
+        },
+    );
 
     info!(
         "Signal message from {} ({}): {}",

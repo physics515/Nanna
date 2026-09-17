@@ -28,10 +28,8 @@ pub fn server_port(flag: Option<u16>, config: &Config) -> u16 {
     port
 }
 
-/// Run the HTTP server
-pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
-    let (llm, tools, storage) = init_components(config).await?;
-
+/// Build the legacy `Nanna` bot instance the HTTP server state still carries.
+async fn build_bot(config: &Config) -> anyhow::Result<Nanna> {
     // Get API key for bot - default to Anthropic
     let env_var = match config.llm.provider.as_str() {
         "openai" => "OPENAI_API_KEY",
@@ -67,6 +65,15 @@ pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Res
     } else {
         info!("CPU-only mode (SIMD active)");
     }
+
+    Ok(bot)
+}
+
+/// Run the HTTP server
+pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
+    let (llm, tools, storage) = init_components(config).await?;
+
+    let bot = build_bot(config).await?;
 
     // Get Telegram token from config or environment
     let telegram_token = config

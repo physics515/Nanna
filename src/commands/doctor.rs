@@ -601,10 +601,10 @@ fn judge_anthropic_credential(
     let expiry = credential.seconds_until_expiry();
 
     if !credential.is_expired() {
-        let detail = match expiry {
-            Some(secs) => format!("stored OAuth credential valid for {}h", secs / 3600),
-            None => "stored OAuth credential carries no expiry".to_string(),
-        };
+        let detail = expiry.map_or_else(
+            || "stored OAuth credential carries no expiry".to_string(),
+            |secs| format!("stored OAuth credential valid for {}h", secs / 3600),
+        );
         return Check::ok(NAME, detail);
     }
 
