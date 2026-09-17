@@ -326,12 +326,7 @@ pub async fn get_channel_status(
         enabled: config.channels.telegram.is_some(),
         status: if config.channels.telegram.is_some() { "ready" } else { "not_configured" }.to_string(),
         details: config.channels.telegram.as_ref().map(|t| {
-            let token_preview = if t.bot_token.len() > 10 {
-                format!("{}...{}", &t.bot_token[..5], &t.bot_token[t.bot_token.len()-4..])
-            } else {
-                "***".to_string()
-            };
-            format!("Bot token: {token_preview}")
+            format!("Bot token: {}", token_preview(&t.bot_token))
         }),
     });
 
@@ -413,12 +408,7 @@ pub async fn get_enhanced_channel_status(
 
         let details = match provider {
             "telegram" => config.channels.telegram.as_ref().map(|t| {
-                let token_preview = if t.bot_token.len() > 10 {
-                    format!("{}...{}", &t.bot_token[..5], &t.bot_token[t.bot_token.len()-4..])
-                } else {
-                    "***".to_string()
-                };
-                format!("Bot token: {token_preview}")
+                format!("Bot token: {}", token_preview(&t.bot_token))
             }),
             "discord" => config.channels.discord.as_ref().map(|d| {
                 format!("App ID: {}", d.application_id)
@@ -786,4 +776,36 @@ pub async fn unsubscribe_channel_status() -> Result<(), String> {
     // For now, the task just continues running
     info!("Channel status subscription would be cancelled");
     Ok(())
+}
+
+/// A bot token shown as its first 5 and last 4 characters, or `***` when it is
+/// too short to reveal that much safely.
+///
+/// Counted in characters, not bytes: slicing the token at byte offsets panicked
+/// the command when a pasted token held a multi-byte character at a cut point.
+fn token_preview(token: &str) -> String {
+    let chars = token.chars().count();
+    if chars <= 10 {
+        return "***".to_string();
+    }
+    let head: String = token.chars().take(5).collect();
+    let tail: String = token.chars().skip(chars - 4).collect();
+    format!("{head}...{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_preview;
+
+    #[test]
+    fn token_preview_matches_the_old_ascii_output() {
+        assert_eq!(token_preview("123456789:ABCdefGHI"), "12345...fGHI");
+        assert_eq!(token_preview("0123456789"), "***");
+    }
+
+    #[test]
+    fn token_preview_never_splits_a_character() {
+        // A byte cut at 5 or at len-4 would land inside these characters.
+        assert_eq!(token_preview("1234é6789abcdé"), "1234é...bcdé");
+    }
 }
