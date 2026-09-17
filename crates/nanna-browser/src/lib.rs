@@ -256,16 +256,31 @@ pub trait Browser: Send + Sync {
 
 /// Create a browser with the given configuration
 ///
-/// Uses Playwright for Firefox/WebKit, CDP for Chromium (if only CDP is enabled).
+/// CDP drives Chromium; Playwright drives Firefox and `WebKit`.
+///
+/// Chromium goes to CDP even when both backends are compiled: CDP launches the
+/// Chromium already on the machine (the one `find_browser_executable` looked
+/// for, and whose presence is why the browser tools are offered at all), while
+/// Playwright ignores that executable and requires its own downloaded build
+/// (`playwright install`). Preferring Playwright there turned a working
+/// system Chromium into `Browser 'chromium' is not installed`.
 ///
 /// # Errors
 ///
 /// Returns `BrowserError::UnsupportedBrowser` if the requested backend is not compiled in.
 pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, BrowserError> {
+    #[cfg(all(feature = "cdp", feature = "playwright"))]
+    {
+        if config.browser_type == BrowserType::Chromium {
+            return Ok(Arc::new(cdp::CdpBrowser::new(config)));
+        }
+        Ok(Arc::new(playwright::PlaywrightBrowser::new(config)))
+    }
+
     // Playwright supports all browsers. This block is the whole body whenever
-    // the feature is on — the two below are cfg'd out by `not(playwright)` and
-    // `not(any(..))` — so it is the tail expression and needs no `return`.
-    #[cfg(feature = "playwright")]
+    // the feature is on without CDP — the others are cfg'd out — so it is the
+    // tail expression and needs no `return`.
+    #[cfg(all(feature = "playwright", not(feature = "cdp")))]
     {
         Ok(Arc::new(playwright::PlaywrightBrowser::new(config)))
     }
