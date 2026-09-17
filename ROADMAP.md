@@ -6780,7 +6780,8 @@ keep the phases readable; promote individual items into a phase when they become
       *(same day)* The five API keys no longer go through `set_var`: `set_provider_api_key` writes the
       secure store and the GUI reads `config` (refilled from it). That also fixed a restart bug —
       `get_openai_models` and the Brave "key set" badge read **only** env, so a stored key vanished
-      from them after the GUI restarted. Still on `set_var`: `OLLAMA_HOST`, and the Claude proxy
+      from them after the GUI restarted. `OLLAMA_HOST`'s `set_var` was dead too (nothing in the GUI process reads it) and is gone. Still on
+      `set_var`: the Claude proxy
       URL/flag — which turned out to be **a setting nothing consumes**: no crate reads
       `CLAUDE_PROXY_ENABLED`/`CLAUDE_PROXY_URL`, so the Settings → Models "Claude Proxy" toggle changes
       the GUI's own environment, drives its health check, and routes no request through the proxy

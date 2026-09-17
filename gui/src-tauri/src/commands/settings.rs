@@ -860,9 +860,9 @@ pub async fn set_ollama_host(
         }
     }
     let _ = state_guard.backend.config_reload().await;
-
-    // Also set env var for current session
-    unsafe { std::env::set_var("OLLAMA_HOST", &host); }
+    // No `OLLAMA_HOST` copy in this process's environment: nothing in the GUI
+    // reads it (the daemon is a separate process and reads the config file),
+    // and `set_var` here raced concurrent `getenv` on the multi-threaded runtime.
 
     Ok(format!("Ollama host saved: {}", host))
 }
