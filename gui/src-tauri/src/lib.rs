@@ -384,6 +384,7 @@ pub fn run() {
             commands::system::set_close_mode,
             commands::system::handle_window_close,
             commands::system::perform_quit,
+            commands::system::stop_backend_for_update,
             // Scheduler / Cron jobs
             commands::scheduler::list_cron_jobs,
             commands::scheduler::create_cron_job,

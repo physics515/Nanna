@@ -78,6 +78,90 @@ async fn kill_sidecar_tree(pid: u32) {
     let _ = pid;
 }
 
+/// Request id of the version probe; the reply is matched on it.
+const VERSION_PROBE_ID: &str = "daemon-manager-version";
+
+/// End-to-end ceiling on one version probe: connect, ask, read the reply.
+/// The same 2 s the graceful-shutdown connect gets, plus 1 s for the reply —
+/// `system version` is a constant built into the daemon binary, with no I/O.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long an evicted daemon gets to release the port. A graceful stop
+/// cancels any in-flight turn and saves stats before exiting; `stop()` allows
+/// 5 s for the same thing on a daemon it owns and then tree-kills it. We did
+/// not spawn this one and cannot kill it, so it gets twice that.
+const EVICTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What answered on the daemon port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortOccupant {
+    /// Nothing accepted a connection.
+    Nobody,
+    /// A daemon accepted. `version` is `None` when it did not report one in
+    /// time — still mid-init, or too old to know the request.
+    Daemon { version: Option<String> },
+}
+
+/// The occupant's version when it is a daemon from a *different* release.
+/// An occupant that did not report a version is never called stale.
+fn stale_version<'a>(occupant: &'a PortOccupant, ours: &str) -> Option<&'a str> {
+    match occupant {
+        PortOccupant::Daemon { version: Some(theirs) } if theirs != ours => Some(theirs),
+        _ => None,
+    }
+}
+
+/// The daemon's answer to the version probe.
+#[derive(Debug, PartialEq, Eq)]
+struct VersionReply {
+    /// `None` when the reply carried no version (an error response).
+    version: Option<String>,
+}
+
+/// Parse one IPC frame; `None` unless it is the reply to the probe.
+fn version_from_reply(text: &str) -> Option<VersionReply> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("id").and_then(serde_json::Value::as_str) != Some(VERSION_PROBE_ID) {
+        return None;
+    }
+    let version = value
+        .pointer("/result/data/version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(VersionReply { version })
+}
+
+/// Connect to `url` and ask whatever is there for its version.
+async fn probe_occupant(url: &str) -> PortOccupant {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let Ok(Ok((mut ws, _))) =
+        tokio::time::timeout_at(deadline, tokio_tungstenite::connect_async(url)).await
+    else {
+        return PortOccupant::Nobody;
+    };
+    let request = serde_json::json!({
+        "id": VERSION_PROBE_ID,
+        "action": { "type": "system", "action": "version" }
+    });
+    let mut version = None;
+    if ws.send(Message::Text(request.to_string().into())).await.is_ok() {
+        // Unsolicited event frames may arrive first; skip until the reply.
+        while let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, ws.next()).await {
+            if let Message::Text(text) = frame
+                && let Some(reply) = version_from_reply(&text)
+            {
+                version = reply.version;
+                break;
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    PortOccupant::Daemon { version }
+}
+
 /// Manages the daemon sidecar process
 pub struct DaemonManager {
     config: DaemonManagerConfig,
@@ -122,8 +206,9 @@ impl DaemonManager {
         }
         
         *self.state.write().await = DaemonState::Starting;
+        self.evict_stale_daemon(env!("CARGO_PKG_VERSION")).await;
         info!("Starting nanna-daemon sidecar...");
-        
+
         // Spawn the sidecar
         let shell = app.shell();
         info!("Creating sidecar command for nanna-daemon...");
@@ -245,12 +330,52 @@ impl DaemonManager {
         }
     }
     
+    /// Shut down a daemon from a different release that is holding our port.
+    ///
+    /// An app update replaces the GUI and its sidecar binary, but a daemon
+    /// that outlived the old GUI keeps port 5149 and the `nanna.db` lock. The
+    /// new sidecar then cannot bind, exits, and the GUI would attach to the old
+    /// daemon — a v0.3.20 UI driving a v0.3.19 server, still running every bug
+    /// the update shipped to fix (2026-09-17). Evicting it first lets the new
+    /// sidecar start.
+    ///
+    /// Only a daemon that *reports* a different version is touched. One that
+    /// cannot be identified is left alone: attaching to it is the old
+    /// behaviour, and shutting down something we cannot name is worse.
+    async fn evict_stale_daemon(&self, ours: &str) {
+        let url = self.ws_url();
+        let occupant = probe_occupant(&url).await;
+        let Some(theirs) = stale_version(&occupant, ours) else {
+            return;
+        };
+        warn!(
+            "A v{theirs} daemon is running on {url}, but this app is v{ours} — asking it to shut down so the matching daemon can start"
+        );
+        if !self.request_graceful_shutdown().await {
+            error!("Could not deliver a shutdown request to the v{theirs} daemon on {url}");
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + EVICTION_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            if probe_occupant(&url).await == PortOccupant::Nobody {
+                info!("The v{theirs} daemon released {url}");
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        error!(
+            "The v{theirs} daemon on {url} is still running {}s after a shutdown request — the app will be talking to a server from a different release",
+            EVICTION_TIMEOUT.as_secs()
+        );
+    }
+
     /// Wait for daemon to be ready (accepting connections)
     async fn wait_for_ready(&self) -> bool {
         let url = self.ws_url();
         let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
-        
+
         let mut child_exited = false;
+        let mut evicted = false;
         while tokio::time::Instant::now() < deadline {
             // A dead child can still mean a healthy daemon: the sidecar
             // exits AlreadyRunning when a standalone daemon holds the
@@ -264,19 +389,24 @@ impl DaemonManager {
                     url
                 );
             }
-            // Try to connect
-            match tokio_tungstenite::connect_async(&url).await {
-                Ok((mut ws, _)) => {
-                    // Connected! Close and return success
-                    let _ = futures_util::SinkExt::close(&mut ws).await;
+            match probe_occupant(&url).await {
+                PortOccupant::Nobody => {
+                    // Not ready yet, wait and retry
+                    sleep(Duration::from_millis(200)).await;
+                }
+                occupant @ PortOccupant::Daemon { .. } => {
+                    // A daemon from another release can win the port between
+                    // the pre-spawn check and here. Evict it once; answering
+                    // is not the same as being ours.
+                    if stale_version(&occupant, env!("CARGO_PKG_VERSION")).is_some() && !evicted {
+                        evicted = true;
+                        self.evict_stale_daemon(env!("CARGO_PKG_VERSION")).await;
+                        continue;
+                    }
                     if child_exited {
                         info!("Attached to an existing daemon instance on {}", url);
                     }
                     return true;
-                }
-                Err(_) => {
-                    // Not ready yet, wait and retry
-                    sleep(Duration::from_millis(200)).await;
                 }
             }
         }
@@ -381,16 +511,26 @@ impl DaemonManager {
             loop {
                 sleep(config.health_check_interval).await;
                 
+                // `Crashed` is watched too. When the app attaches to a daemon
+                // it did not spawn, its own sidecar exits *after* readiness and
+                // the Terminated handler flips Running → Crashed. Skipping that
+                // state meant the attached daemon's death was never noticed and
+                // nothing was ever restarted.
                 let state = *manager.state.read().await;
-                if state != DaemonState::Running {
+                if !matches!(state, DaemonState::Running | DaemonState::Crashed) {
                     continue;
                 }
-                
+
                 // Health check: try to connect
                 let url = manager.ws_url();
                 match tokio_tungstenite::connect_async(&url).await {
                     Ok((mut ws, _)) => {
                         let _ = futures_util::SinkExt::close(&mut ws).await;
+                        if state == DaemonState::Crashed {
+                            // Our sidecar is gone, but the daemon we attached
+                            // to is alive and answering.
+                            *manager.state.write().await = DaemonState::Running;
+                        }
                         debug!("Daemon health check: OK");
                     }
                     Err(e) => {
@@ -421,5 +561,75 @@ impl Drop for DaemonManager {
     fn drop(&mut self) {
         // Note: async drop not possible, but child will be killed when dropped
         info!("DaemonManager dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn daemon(version: Option<&str>) -> PortOccupant {
+        PortOccupant::Daemon { version: version.map(str::to_string) }
+    }
+
+    #[test]
+    fn only_a_daemon_reporting_another_version_is_stale() {
+        assert_eq!(stale_version(&daemon(Some("0.3.19")), "0.3.20"), Some("0.3.19"));
+        assert_eq!(stale_version(&daemon(Some("0.3.20")), "0.3.20"), None);
+        // Unidentified: attach as before rather than shut down a stranger.
+        assert_eq!(stale_version(&daemon(None), "0.3.20"), None);
+        assert_eq!(stale_version(&PortOccupant::Nobody, "0.3.20"), None);
+    }
+
+    #[test]
+    fn version_is_read_only_from_the_probe_reply() {
+        let reply = r#"{"id":"daemon-manager-version","result":{"status":"success","data":{"version":"0.3.19","name":"nanna-daemon"}}}"#;
+        assert_eq!(version_from_reply(reply), Some(VersionReply { version: Some("0.3.19".to_string()) }));
+
+        let error = r#"{"id":"daemon-manager-version","result":{"status":"error","code":"x","message":"y"}}"#;
+        assert_eq!(version_from_reply(error), Some(VersionReply { version: None }));
+
+        let other = r#"{"id":"something-else","result":{"status":"success","data":{"version":"9.9.9"}}}"#;
+        assert_eq!(version_from_reply(other), None);
+        assert_eq!(version_from_reply(r#"{"event":"heartbeat"}"#), None);
+        assert_eq!(version_from_reply("not json"), None);
+    }
+
+    /// Serve one connection the way a daemon would: an unsolicited event
+    /// first, then the reply to the version request.
+    async fn fake_daemon(version: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Some(Ok(Message::Text(request))) = ws.next().await else { return };
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request.pointer("/action/action"), Some(&serde_json::json!("version")));
+            let event = serde_json::json!({ "event": "heartbeat" });
+            let reply = serde_json::json!({
+                "id": request["id"],
+                "result": { "status": "success", "data": { "version": version } }
+            });
+            let _ = ws.send(Message::Text(event.to_string().into())).await;
+            let _ = ws.send(Message::Text(reply.to_string().into())).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_version_past_unsolicited_events() {
+        let url = fake_daemon("0.3.19").await;
+        assert_eq!(probe_occupant(&url).await, daemon(Some("0.3.19")));
+    }
+
+    #[tokio::test]
+    async fn probe_of_a_closed_port_finds_nobody() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert_eq!(probe_occupant(&url).await, PortOccupant::Nobody);
     }
 }

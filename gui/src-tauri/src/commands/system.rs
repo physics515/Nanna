@@ -478,6 +478,24 @@ pub async fn handle_window_close(
     }
 }
 
+/// Stop the daemon before an update is installed.
+///
+/// Installing ends this process without an exit event: Windows' installer
+/// exits the app itself, and elsewhere the frontend calls `relaunch()`, which
+/// restarts without running the `ExitRequested` hook that stops the sidecar.
+/// A daemon left running keeps the port and the database lock, so the updated
+/// app attached to the old server instead of starting its own (2026-09-17).
+/// Called after the download succeeds, so a failed download never costs the
+/// user their daemon; a failed install is recovered with `init_backend`.
+#[tauri::command]
+pub async fn stop_backend_for_update(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    info!("Stopping the daemon before installing an update...");
+    state.read().await.backend.shutdown().await;
+    Ok(())
+}
+
 /// Perform actual quit (called after user confirms or preference is quit)
 #[tauri::command]
 pub async fn perform_quit(
