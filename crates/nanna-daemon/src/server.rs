@@ -684,6 +684,24 @@ type ToolAuthoringDeps = (
     Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
 );
 
+/// What [`DaemonServer::load_script_tool_surface`] needs from `init_services`'s
+/// locals.
+///
+/// A struct rather than nine positional references, for exactly the reason
+/// [`ScriptServiceDeps`] is one: several are `Arc`s of different inner types
+/// that the compiler would let a caller transpose in pairs.
+struct ToolSurfaceDeps<'a> {
+    tools: &'a Arc<ToolRegistry>,
+    tools_dir: Option<&'a PathBuf>,
+    router: &'a Arc<LlmRouter>,
+    memory: &'a Option<Arc<MemoryService>>,
+    session_history: &'a SharedSessionHistory,
+    workspace_id_for_services: &'a Arc<tokio::sync::RwLock<Option<String>>>,
+    turn_baselines: &'a Arc<crate::tasks::TurnBaselines>,
+    shared_agent_config: &'a Arc<tokio::sync::RwLock<AgentServiceConfig>>,
+    chat_runs: &'a Arc<crate::control::chat_harness::ChatRunRegistry>,
+}
+
 /// Everything [`build_script_services`] needs, named.
 ///
 /// It grew from seven positional parameters to thirteen in one run (2026-09-15),
@@ -3912,587 +3930,14 @@ impl DaemonServer {
         ),
         crate::DaemonError,
     > {
-        // Create LLM router with all available providers. The same resolution
-        // + construction runs again on every control-plane config mutation
-        // (see `control::config`), so a provider the user authenticates after
-        // boot registers without a daemon restart — registration used to be
-        // boot-only, leaving the GUI and daemon split-brained about which
-        // providers exist.
-        let router = LlmRouter::new();
-        let creds = crate::llm_router::ProviderCredentials::resolve(&self.config.llm).await;
-        router.rebuild(&creds);
-
-        let available = router.available_providers();
-        if available.is_empty() {
-            return Err(crate::DaemonError::Config(
-                "No LLM providers configured. Please set up at least one provider (Anthropic, OpenAI, OpenRouter, or Ollama).".to_string()
-            ));
-        }
-        info!(
-            "LLM router initialized with {} providers: {:?}",
-            available.len(),
-            available
-        );
-        let router = Arc::new(router);
+        let router = self.init_llm_router().await?;
 
         // Create empty tool registry — all tools loaded from disk
         let tools = Arc::new(ToolRegistry::new());
 
-        // Resolve tools directory (env var > config > dev fallback > {data_dir}/tools/)
-        let tools_dir = if self.config.use_script_tools {
-            let config_dir = self.config.tools_dir.as_deref();
-            let resolved = nanna_tools::skills::defaults::resolve_tools_dir(config_dir)
-                .unwrap_or_else(|| self.config.data_dir.join("tools"));
+        let tools_dir = self.resolve_tools_directory();
 
-            // Bootstrap default skills into the tools directory if needed.
-            // In debug builds this is a no-op (tools load from source tree).
-            // In release builds, embedded skills are extracted on first run.
-            let bootstrapped = nanna_tools::skills::defaults::bootstrap_default_skills(&resolved);
-            if bootstrapped > 0 {
-                info!(
-                    "Bootstrapped {} default skills into {:?}",
-                    bootstrapped, resolved
-                );
-            }
-
-            if resolved.is_dir() {
-                let granted_count = nanna_tools::skills::defaults::ensure_permissions(&resolved);
-                if granted_count > 0 {
-                    warn!(
-                        granted_count,
-                        "Wrote the default permissions.json for {} tool(s) that declared none",
-                        granted_count
-                    );
-                }
-                info!("Tools directory: {:?}", resolved);
-            } else {
-                warn!("Tools directory does not exist: {:?}", resolved);
-            }
-            Some(resolved)
-        } else {
-            None
-        };
-
-        // Initialize memory service with embeddings if enabled
-        let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
-            // Resolve the ordered provider list the user actually configured.
-            //
-            // `embedding_priority` is authoritative and is walked in order:
-            // the first entry whose credential resolves becomes primary, the
-            // rest become fallbacks in the same order. Failover happens ONLY on
-            // error, exactly like `model_priority` for chat, so one model
-            // embeds at a time.
-            //
-            // What this replaces: a single configured provider plus THREE
-            // hardcoded fallbacks appended by credential sniffing —
-            // `text-embedding-3-small` (1536) for OpenAI and
-            // `openai/text-embedding-3-small` (1536) for OpenRouter. Those were
-            // injected whether or not the user wanted them, which is how a paid
-            // 1536-dim embedder ended up live on an install whose config asked
-            // for a free one first and a 768-dim local model second.
-            let specs: Vec<String> = if self.embedding.priority.is_empty() {
-                let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
-                info!("No embedding_priority configured; using the single pair '{legacy}'");
-                vec![legacy]
-            } else {
-                self.embedding.priority.clone()
-            };
-
-            let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
-                .iter()
-                .filter_map(|spec| self.embedding_provider_for(spec))
-                .collect();
-
-            // Queue rows for models no longer in the list can never drain and
-            // would pollute queue health forever. Pruned only when something
-            // resolved — an empty resolution means a missing key, and wiping
-            // the queue over a missing key would turn a config hiccup into
-            // lost work tracking.
-            if !resolved.is_empty()
-                && let Some(ref storage) = self.storage
-            {
-                let keep: Vec<String> = resolved.iter().map(|(info, _)| info.to_string()).collect();
-                match storage.memories().retain_queue_models(&keep).await {
-                    Ok(0) => {}
-                    Ok(n) => info!("Dropped {n} queued embeddings for models no longer configured"),
-                    Err(e) => warn!("Could not prune the embedding queue: {e}"),
-                }
-            }
-
-            let primary_client = resolved.first().cloned();
-            let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
-
-            if primary_client.is_none() && !specs.is_empty() {
-                warn!(
-                    "No embedding provider in embedding_priority could be resolved ({} entries tried) — \
-                     memory will be written without vectors and queued for backfill",
-                    specs.len()
-                );
-            }
-
-            match primary_client {
-                Some((primary_info, primary)) => {
-                    // Build the embedding router with fallback providers
-                    let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
-
-                    // Fallbacks are the REST OF THE USER'S LIST, in their
-                    // order — not a credential sweep. The list is the whole
-                    // policy: what to try, and in what sequence.
-                    for (info, client) in fallbacks {
-                        info!("Embedding fallback: {info}");
-                        embed_router = embed_router.with_fallback(info, client);
-                    }
-
-                    info!(
-                        "Embedding router: {} providers configured",
-                        embed_router.provider_count()
-                    );
-                    let embed_router = Arc::new(embed_router);
-
-                    // Create embedding function that routes through the EmbeddingRouter.
-                    let router_for_fn = embed_router.clone();
-                    // Placeholder for memory service — set after construction via lazy init
-                    let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
-                        Arc::new(tokio::sync::OnceCell::new());
-                    let mem_cell_for_fn = memory_for_reembed.clone();
-                    // One drain at a time, process-wide — see `drain_backfill`.
-                    let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
-                    let drain_serial_for_fn = drain_serial.clone();
-                    let chat_runs_for_fn = chat_runs.clone();
-                    let ledger_for_fn = degradations.clone();
-
-                    let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
-                        let router = router_for_fn.clone();
-                        let text = text.to_string();
-                        let mem_cell = mem_cell_for_fn.clone();
-                        let drain_serial = drain_serial_for_fn.clone();
-                        let chat_runs = chat_runs_for_fn.clone();
-                        let ledger = ledger_for_fn.clone();
-                        Box::pin(async move {
-                            let attempted = router.embed_one(&text).await;
-
-                            // Capability transitions reach the model once, in
-                            // its next tool result (P22 Tier 4). The seam is
-                            // HERE — the one place every embed outcome passes —
-                            // because "no provider answered" is the moment
-                            // memory writes start landing vectorless, and the
-                            // first success afterwards is the moment they stop.
-                            // The ledger dedups by state, so the steady flow of
-                            // successes (and repeated failures) records nothing.
-                            match &attempted {
-                                Err(reason) => ledger.set(
-                                    "memory-embeddings",
-                                    "degraded",
-                                    format!(
-                                        "[capability notice — memory embeddings DEGRADED: no \
-                                         embedding provider is answering ({reason}). Memory and \
-                                         tool-result writes still SUCCEED and are stored in full — \
-                                         the Turso store remains the source of truth — but new \
-                                         entries are queued for embedding backfill, so semantic \
-                                         recall may miss them until a provider recovers. This \
-                                         notice will not repeat unless the state changes.]"
-                                    ),
-                                ),
-                                Ok(_) => ledger.set(
-                                    "memory-embeddings",
-                                    "healthy",
-                                    "[capability notice — memory embeddings RESTORED: an \
-                                     embedding provider is answering again; queued entries are \
-                                     backfilling and new writes are searchable normally.]",
-                                ),
-                            }
-
-                            let (embedding, switched_to) = attempted?;
-
-                            // Provider switched — realign the store BEFORE this
-                            // write is allowed to land, so it validates against
-                            // the new binding rather than the dead provider's.
-                            //
-                            // The router reports the switch to exactly ONE
-                            // caller (the one whose call flipped the live
-                            // active index), so this is stampede-safe without
-                            // any generation bookkeeping here. And the vector
-                            // in hand came from `switched_to` itself, so
-                            // `(model, embedding.len())` is a consistent pair
-                            // by construction — reading the active provider
-                            // back from the router here could race a second
-                            // switch and rebind the store to a torn
-                            // (new model, old width) state. That torn state is
-                            // the 2026-08-02 incident: model rebound, width
-                            // latch stale, every write failing
-                            // "expected 2048, got 768" for minutes.
-                            if let Some(provider) = switched_to
-                                && let Some(mem) = mem_cell.get()
-                            {
-                                let model = provider.to_string();
-                                // The new provider's input window, memoized by
-                                // the router — one `/api/show` per provider per
-                                // process, and it travels WITH the model and
-                                // width for the same reason those two do. A
-                                // chunk sized for the old window is not
-                                // rejected by the new embedder, it is silently
-                                // truncated.
-                                let window = router.context_window_for(&provider).await;
-                                tracing::info!(
-                                    "Embedding provider changed — rebinding the store to \
-                                     '{}' ({} dims)",
-                                    model,
-                                    embedding.len()
-                                );
-
-                                // Rebinding is a hash lookup per entry: no
-                                // network, no re-embed, and a switch BACK to a
-                                // model used earlier is free because its bucket
-                                // was retained.
-                                let (_, missing) =
-                                    mem.rebind_embeddings(&model, embedding.len(), window).await;
-
-                                // Whatever this model has never embedded gets
-                                // filled in lazily, in bounded passes, while
-                                // the run continues. It must not be done
-                                // inline: the store can hold thousands of
-                                // entries and the provider we just failed over
-                                // to may be the rate-limited one.
-                                //
-                                // Unconditional for the same reason as the
-                                // startup bind: `missing` counts ROW vectors,
-                                // and the chunk queue is independent of it. A
-                                // flap back to a model whose row buckets were
-                                // all retained reports zero missing while its
-                                // chunk vectors are still stamped with the
-                                // other provider, and a drain interrupted
-                                // partway leaves exactly that state.
-                                let _ = missing;
-                                let mem = mem.clone();
-                                let chat_runs = chat_runs.clone();
-                                let drain_serial = drain_serial.clone();
-                                tokio::spawn(async move {
-                                    drain_backfill(&mem, &model, &chat_runs, &drain_serial)
-                                        .await;
-                                });
-                            }
-
-                            Ok(embedding)
-                        })
-                    });
-
-                    // Seed the embedding dimension by probing the router.
-                    //
-                    // A probe failure must NOT stop the daemon: Nanna is
-                    // offline-capable by default, so an unreachable or unkeyed
-                    // embedding provider degrades memory — it does not refuse
-                    // to boot. The seed only has to be a valid positive
-                    // dimension: real vectors always come from the provider,
-                    // and the background `probe_and_align_dimension` below
-                    // corrects the store (re-embedding any mismatched entries)
-                    // as soon as a provider answers. Probing here is purely an
-                    // optimization — when it succeeds the store is right
-                    // immediately and nothing is ever re-embedded.
-                    let seed_dimension = nanna_memory::MemoryServiceConfig::default().dimension;
-                    let dimension = match Self::probe_embedding_dimension(&embed_router).await {
-                        Ok(dim) => {
-                            info!(
-                                "Memory service using probed dimension {} for model {}",
-                                dim, self.embedding.model
-                            );
-                            dim
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Could not probe the embedding dimension ({e}). Starting anyway with a \
-                                 provisional dimension of {seed_dimension}; memory will re-align \
-                                 automatically once an embedding provider is reachable. To enable \
-                                 embeddings, run a local Ollama with `ollama pull {}` or set an \
-                                 OpenAI/OpenRouter key.",
-                                self.embedding.model
-                            );
-                            seed_dimension
-                        }
-                    };
-                    assert!(dimension > 0, "embedding dimension must be positive");
-                    let config = nanna_memory::MemoryServiceConfig {
-                        dimension,
-                        ..Default::default()
-                    };
-
-                    // Wire up Turso persistence if storage is available.
-                    // The persistence adapter is constructed here and attached to the
-                    // MemoryService so all writes are automatically mirrored to Turso.
-                    let memory_service = if let Some(ref storage) = self.storage {
-                        let repo = storage.memories();
-                        let db = Arc::new(TursoMemoryPersistence::new(repo));
-                        nanna_memory::MemoryService::new(config)
-                            .with_embed_fn(embed_fn)
-                            .with_persistence(db)
-                    } else {
-                        warn!(
-                            "No storage backend available — memory will NOT be persisted to Turso"
-                        );
-                        nanna_memory::MemoryService::new(config).with_embed_fn(embed_fn)
-                    };
-
-                    // One-time migration: if memories.json exists and Turso is empty,
-                    // load from JSON into in-memory cache then save each entry to Turso.
-                    let json_path = self.memory_path.as_ref();
-                    let should_migrate = if let (Some(path), Some(storage)) =
-                        (json_path, &self.storage)
-                    {
-                        if path.exists() {
-                            match storage.memories().count().await {
-                                Ok(0) => true,
-                                Ok(n) => {
-                                    info!(
-                                        "Turso already has {} memories — skipping JSON migration",
-                                        n
-                                    );
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!("Could not check Turso memory count: {}", e);
-                                    false
-                                }
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if should_migrate {
-                        let path = json_path.unwrap();
-                        info!(
-                            "Migrating memories from {:?} to Turso (one-time migration)",
-                            path
-                        );
-                        match memory_service.load(path).await {
-                            Ok(()) => {
-                                let count = memory_service.count().await;
-                                info!("Loaded {} memories from JSON, flushing to Turso...", count);
-                                // Flush all entries to Turso
-                                match memory_service.flush_to_db().await {
-                                    Ok(n) => info!("Flushed {} memories to Turso", n),
-                                    Err(e) => warn!("Failed to flush memories to Turso: {}", e),
-                                }
-                                // Rename the JSON file so we don't re-migrate next time
-                                let migrated_path = path.with_extension("json.migrated");
-                                if let Err(e) = tokio::fs::rename(path, &migrated_path).await {
-                                    warn!("Could not rename migrated JSON file: {}", e);
-                                } else {
-                                    info!(
-                                        "Renamed {:?} → {:?} (migration complete)",
-                                        path, migrated_path
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "JSON migration failed: {}. Will attempt to load from Turso.",
-                                    e
-                                );
-                            }
-                        }
-                    }
-
-                    // Load from Turso into the in-memory cache (normal startup path).
-                    // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
-                    if !should_migrate {
-                        match memory_service.load_from_db().await {
-                            Ok(count) => {
-                                info!("Loaded {} memories from Turso", count);
-                            }
-                            Err(nanna_memory::MemoryError::Persistence(ref e))
-                                if e.contains("No persistence backend") =>
-                            {
-                                // No storage configured — silently skip
-                            }
-                            Err(e) => {
-                                warn!("Failed to load memories from Turso: {}", e);
-                            }
-                        }
-                    }
-
-                    info!("Memory service initialized with Turso persistence and embedding router");
-                    let memory_arc = Arc::new(memory_service);
-
-                    // Probe the actual embedding dimension from the model IN THE
-                    // BACKGROUND. The probe's first embed call can take ~a minute
-                    // when the local embedding model is cold (Ollama loads it on
-                    // demand), and it used to block startup past the GUI's
-                    // daemon-ready timeout — forcing an embedded fallback while an
-                    // orphaned daemon kept running. `probe_and_align_dimension`
-                    // takes `&self` on the Arc'd service specifically so it can run
-                    // at runtime; a mismatched dimension is corrected (and entries
-                    // re-embedded) as soon as the probe completes.
-                    {
-                        let memory_for_probe = memory_arc.clone();
-                        // Name the model the router actually bound — not the
-                        // legacy `embedding.model` config field, which the
-                        // priority list overrides. A log that names the wrong
-                        // model sends whoever reads it to debug a provider that
-                        // is not even running.
-                        let model_name = primary_info.to_string();
-                        // Bind the store to the model that is about to write to
-                        // it, BEFORE any probe or write. Without this the first
-                        // entries of a session get bucketed under `None` — they
-                        // would be re-embedded on the next switch instead of
-                        // being reusable, which is the whole point of buckets.
-                        let bind_provider = embed_router.active_provider().await;
-                        let bind_model = bind_provider.to_string();
-                        let memory_for_bind = memory_arc.clone();
-                        let router_for_bind = embed_router.clone();
-                        let chat_runs_for_bind = chat_runs.clone();
-                        let drain_serial_for_bind = drain_serial.clone();
-                        tokio::spawn(async move {
-                            // The probed (or seeded) dimension and the model's
-                            // input window travel WITH the model — the binding
-                            // is one triple, never three independently-updated
-                            // latches. Resolved inside the spawn because it
-                            // costs a request, and startup must not block on it.
-                            let window =
-                                router_for_bind.context_window_for(&bind_provider).await;
-                            let (_, _missing) = memory_for_bind
-                                .rebind_embeddings(&bind_model, dimension, window)
-                                .await;
-                            // Unconditional, NOT gated on missing row vectors.
-                            // The two queues are independent: after the chunk
-                            // migration every existing memory has a row vector
-                            // and no chunks at all, so `missing == 0` while the
-                            // entire store is unchunked. Gating on the row
-                            // count would leave it that way forever. Both
-                            // drains no-op immediately when their queue is
-                            // empty, so the unconditional call costs one query
-                            // each on a store that is already complete.
-                            drain_backfill(
-                                &memory_for_bind,
-                                &bind_model,
-                                &chat_runs_for_bind,
-                                &drain_serial_for_bind,
-                            )
-                            .await;
-                        });
-                        // One supervisor for the daemon's life: it turns the
-                        // end of every turn into a drain opportunity, which is
-                        // what closes the "parked until the next binding event"
-                        // gap `store_unembedded` documents -- the backlog
-                        // `drain_queued_vectors` is budgeted not to sweep.
-                        // Spawned beside the startup bind because that is where
-                        // the binding, the run registry and the drain mutex are
-                        // all in scope.
-                        let memory_for_supervisor = memory_arc.clone();
-                        let chat_runs_for_supervisor = chat_runs.clone();
-                        let drain_serial_for_supervisor = drain_serial.clone();
-                        tokio::spawn(supervise_idle_backfill(
-                            memory_for_supervisor,
-                            chat_runs_for_supervisor,
-                            drain_serial_for_supervisor,
-                        ));
-                        let chat_runs_for_probe = chat_runs.clone();
-                        let drain_serial_for_probe = drain_serial.clone();
-                        tokio::spawn(async move {
-                            match memory_for_probe.probe_and_align_dimension().await {
-                                Ok(actual_dim) => {
-                                    if actual_dim == dimension {
-                                        debug!(
-                                            "Embedding dimension confirmed: {actual_dim} for model {model_name}"
-                                        );
-                                    } else {
-                                        info!(
-                                            "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
-                                        );
-                                        // Writes that landed under the stale
-                                        // width were queued for backfill, not
-                                        // failed — drain them now that the
-                                        // binding is honest.
-                                        if let Some(model) =
-                                            memory_for_probe.active_embedding_model().await
-                                        {
-                                            drain_backfill(
-                                                &memory_for_probe,
-                                                &model,
-                                                &chat_runs_for_probe,
-                                                &drain_serial_for_probe,
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Could not probe embedding dimension (model may be loading): {e}. \
-                                         Using static dimension {dimension}."
-                                    );
-                                }
-                            }
-                        });
-                    }
-
-                    // Wire the memory service into the embed_fn's OnceCell
-                    // so provider-switch re-embedding can find it
-                    let _ = memory_for_reembed.set(memory_arc.clone());
-
-                    // One long-lived worker for the vectors a live turn parks.
-                    // It sleeps on the queue's notify and costs nothing until a
-                    // tool result is ingested; see `drain_queued_vectors` for
-                    // why it is a separate drain and what bounds it.
-                    let memory_for_queue = memory_arc.clone();
-                    let drain_serial_for_queue = drain_serial.clone();
-                    tokio::spawn(async move {
-                        drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
-                    });
-
-                    Some(memory_arc)
-                }
-                None => {
-                    // No provider resolved — but memory does NOT switch off.
-                    // The service runs with persistence and no embedder:
-                    // writes land in Turso with no vector, exactly the
-                    // queued-for-backfill state the loader and the drain
-                    // already handle, and they become searchable the moment a
-                    // provider is configured and the daemon restarts. The old
-                    // arm returned `None` here, which contradicted the warn
-                    // above it promising vectorless writes — and quietly
-                    // discarded every memory of a session that merely had a
-                    // missing API key.
-                    warn!(
-                        "No embedding provider available — memory runs WITHOUT vectors: writes \
-                         persist and queue for backfill, recall is unavailable until an \
-                         embedding provider is configured"
-                    );
-                    // The model finds out the same way the operator does —
-                    // once, in its first tool result, not on every write.
-                    degradations.set(
-                        "memory-embeddings",
-                        "degraded",
-                        "[capability notice — memory embeddings are OFF: no embedding provider \
-                         is configured. Memory and tool-result writes still SUCCEED and persist \
-                         in full — the Turso store is the source of truth — but they carry no \
-                         vectors, so semantic recall is unavailable until a provider is \
-                         configured. This notice will not repeat unless the state changes.]",
-                    );
-                    let config = nanna_memory::MemoryServiceConfig::default();
-                    let memory_service = if let Some(ref storage) = self.storage {
-                        let repo = storage.memories();
-                        let db = Arc::new(TursoMemoryPersistence::new(repo));
-                        nanna_memory::MemoryService::new(config).with_persistence(db)
-                    } else {
-                        // No storage either: in-RAM only, still better than
-                        // dropping writes on the floor for the session.
-                        nanna_memory::MemoryService::new(config)
-                    };
-                    match memory_service.load_from_db().await {
-                        Ok(count) => info!("Loaded {count} memories from Turso (no embedder yet)"),
-                        Err(nanna_memory::MemoryError::Persistence(ref e))
-                            if e.contains("No persistence backend") => {}
-                        Err(e) => warn!("Failed to load memories from Turso: {e}"),
-                    }
-                    Some(Arc::new(memory_service))
-                }
-            }
-        } else {
-            info!("Memory service disabled in config");
-            None
-        };
+        let memory = self.init_memory_service(chat_runs, degradations).await;
 
         // ONE config for every long-lived collaborator below. The sub-agent
         // spawner and the script summarizer are constructed BEFORE the agent
@@ -4511,43 +3956,7 @@ impl DaemonServer {
         // (persists it + feeds the router). Cloning shares state
         // (Arc<RwLock<_>> inside).
         let model_stats = nanna_agent::ModelStatsTracker::new();
-        // Keep the per-request history too: lifetime totals cannot be split
-        // back into days, and `system.cost_rollup` prices days. The table
-        // existed with no writer until this sink.
-        if let Some(ref storage) = self.storage {
-            let storage = Arc::clone(storage);
-            model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
-                let storage = Arc::clone(&storage);
-                let obs = obs.clone();
-                // Read here, on the run's task: the task-local does not cross
-                // the spawn below.
-                let session_id = ToolRegistry::run_session_id();
-                tokio::spawn(async move {
-                    let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
-                    let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
-                    if let Err(e) = storage
-                        .log_model_request(&nanna_storage::NewModelRequest {
-                            model: &obs.model,
-                            success: obs.success,
-                            latency_ms,
-                            input_tokens: obs.input_tokens,
-                            output_tokens: obs.output_tokens,
-                            cache_read_tokens: obs.cache_read_tokens,
-                            cache_creation_tokens: obs.cache_creation_tokens,
-                            cache_creation_1h_tokens: obs
-                                .cache_creation_1h_tokens
-                                .min(obs.cache_creation_tokens),
-                            tier: tier.as_deref(),
-                            escalated: obs.escalated,
-                            session_id: session_id.as_deref(),
-                        })
-                        .await
-                    {
-                        warn!("Failed to log model request: {e}");
-                    }
-                });
-            }));
-        }
+        self.install_request_sink(&model_stats);
 
         // Build script services and load all tools from disk
         let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =
@@ -4556,135 +3965,21 @@ impl DaemonServer {
         // baseline) and the `tasks.*` services (whose `tasks.add` reads it).
         // Two registries would compile and silently guard nothing.
         let turn_baselines = Arc::new(crate::tasks::TurnBaselines::new());
-        {
-            let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
-                if router.available_providers().is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(AgentSpawnerImpl {
-                        router: router.clone(),
-                        // The live config, not a snapshot of it — see
-                        // `AgentSpawnerImpl::agent_config_src`.
-                        agent_config_src: Arc::clone(&shared_agent_config),
-                        control: self.control_slot.clone(),
-                    }))
-                };
-
-            // `[memory] ocr_model_priority` already means "vision-capable
-            // models, tried in order" — an existing documented setting, so
-            // `vision.analyze` reads it rather than inventing a second one.
-            let vision_models = self.config.vision_model_priority.clone();
-
-            // The authoring services load a tool they just wrote with the same
-            // services every bundled skill gets. That map is the one being
-            // built, so it reaches them through a slot filled immediately
-            // below — a runtime-authored tool must not be the only one in the
-            // daemon that cannot call a service.
-            let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
-                Arc::new(std::sync::OnceLock::new());
-            // Author into the data dir, never into wherever skills happen to be
-            // *loaded* from. In a debug build `resolve_tools_dir` returns the
-            // source tree, so `tools.create` would have written a new skill
-            // directory into the checkout — untracked files appearing in the
-            // repo because an agent made a tool. Loading from source is
-            // deliberate and stays; writing to it is not.
-            let authoring_dir = self.config.data_dir.join("tools");
-            let tool_authoring = Some((
-                authoring_dir.clone(),
-                Arc::downgrade(&tools),
-                Arc::clone(&authoring_slot),
-            ));
-
-            // Before any skill runs: the bridge snapshots into this store on
-            // every script write from here on.
-            let file_history_root = self.config.data_dir.join("file-history");
-            if nanna_scripting::file_history::install(file_history_root.clone()) {
-                info!(
-                    "File history (pre-write snapshots) at {}",
-                    file_history_root.display()
-                );
-            }
-
-            let services = build_script_services(ScriptServiceDeps {
-                memory: memory.clone(),
-                spawner: spawner_arc,
-                session_history: session_history.clone(),
-                workspace_id: workspace_id_for_services.clone(),
-                storage: self.storage.clone(),
-                turn_baselines: turn_baselines.clone(),
-                summarizer: Some((router.clone(), Arc::clone(&shared_agent_config))),
-                tool_authoring,
-                vision: Some((router.clone(), vision_models.clone())),
-                pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
-                audio: Some((
-                    self.config.llm.openai_api_key.clone(),
-                    self.config.data_dir.clone(),
-                )),
-                browser_data_dir: Some(self.config.data_dir.clone()),
-                screenshot_data_dir: Some(self.config.data_dir.clone()),
-                reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
-                feedback: Some(Arc::clone(&self.dreaming_slot)),
-                ask_user: Some(crate::ask_user_service::AskUserDeps {
-                    sessions: Arc::clone(&self.sessions),
-                    events: self.ipc.event_sender(),
-                    chat_runs: Arc::clone(chat_runs),
-                }),
-            });
-            // Fill the slot before any skill can be executed. `set` returning
-            // an error would mean the map was filled twice, which cannot
-            // happen here and would leave the authoring services reading a
-            // stale map if it did.
-            if authoring_slot.set(services.clone()).is_err() {
-                warn!(
-                    "tool-authoring service map was already filled; authored tools may not reach services"
-                );
-            }
-
-            if let Some(ref dir) = tools_dir
-                && dir.is_dir()
-            {
-                let loaded = tools.load_skills_with_services(dir, &services).await;
-                info!("Loaded {} tools from {:?}", loaded, dir);
-            }
-
-            // Tools authored at runtime live in the data dir. In a release
-            // build that is the same directory as above and this is skipped; in
-            // a debug build it is the other half of the tool surface, and
-            // without it an authored tool would be callable for one session and
-            // gone after a restart.
-            if authoring_dir.is_dir()
-                && tools_dir.as_ref() != Some(&authoring_dir)
-            {
-                let loaded = tools
-                    .load_skills_with_services(&authoring_dir, &services)
-                    .await;
-                if loaded > 0 {
-                    info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
-                }
-            }
-        }
+        self.load_script_tool_surface(ToolSurfaceDeps {
+            tools: &tools,
+            tools_dir: tools_dir.as_ref(),
+            router: &router,
+            memory: &memory,
+            session_history: &session_history,
+            workspace_id_for_services: &workspace_id_for_services,
+            turn_baselines: &turn_baselines,
+            shared_agent_config: &shared_agent_config,
+            chat_runs,
+        })
+        .await;
 
         // Register common aliases for Claude Code compatibility (after tools are loaded)
-        tools.register_alias("read", "read_file").await;
-        tools.register_alias("Read", "read_file").await;
-        tools.register_alias("write", "write_file").await;
-        tools.register_alias("Write", "write_file").await;
-        tools.register_alias("edit", "edit_file").await;
-        tools.register_alias("Edit", "edit_file").await;
-        tools.register_alias("bash", "exec").await;
-        tools.register_alias("Bash", "exec").await;
-        tools.register_alias("glob", "list_dir").await;
-        tools.register_alias("Glob", "list_dir").await;
-        tools.register_alias("ls", "list_dir").await;
-        tools.register_alias("task", "sub_agent").await;
-        tools.register_alias("Task", "sub_agent").await;
-        tools.register_alias("sub-agent", "sub_agent").await;
-        tools.register_alias("Sub-Agent", "sub_agent").await;
-
-        {
-            let tool_count = tools.definitions().await.len();
-            info!("Tool registry: {} tools (including aliases)", tool_count);
-        }
+        Self::register_tool_aliases(&tools).await;
 
         // MCP servers register their tools as each handshake completes; the
         // count above is the tool surface before them.
@@ -4731,36 +4026,7 @@ impl DaemonServer {
             info!("Registered ask_parent tool for sub-agent communication");
         }
 
-        // Apply the tool allow/deny policy. Built from `[tools] enabled/disabled`
-        // and enforced by the registry AFTER alias/fuzzy resolution, so a denied
-        // tool cannot be reached via an alias (`Bash` → `exec`), a case variant,
-        // or a fuzzy near-miss. Skipped entirely when unrestricted.
-        let policy = build_tool_policy(
-            self.config.tool_allowlist.as_deref(),
-            &self.config.tool_denylist,
-        );
-        if !policy.is_unrestricted() {
-            tools.set_policy(policy).await;
-        }
-
-        // Attach the per-call audit trail. It sits on the registry rather than
-        // on the agent loop deliberately: the loop is only one of the callers
-        // (chat harness, task tool, scheduled runs and the MCP bridge all call
-        // the registry directly), and an audit that saw only one of them would
-        // be worse than none — it would read as a complete account.
-        if self.config.tool_audit.log {
-            let path = self.config.tool_audit_path();
-            let sink = nanna_tools::JsonlAuditSink::new(
-                path.clone(),
-                nanna_tools::ToolAuditConfig {
-                    include_values: self.config.tool_audit.log_values,
-                    ..Default::default()
-                },
-            );
-            tools.set_audit_sink(Some(Arc::new(sink))).await;
-            info!(path = %path.display(), values = self.config.tool_audit.log_values,
-                  "Tool audit trail enabled");
-        }
+        self.apply_tool_policy_and_audit(&tools).await;
 
         // Create agent service with multi-provider router
         let event_tx = self.ipc.event_sender();
@@ -4795,6 +4061,926 @@ impl DaemonServer {
             turn_baselines,
             model_stats,
         ))
+    }
+
+    /// Build the script-service map and load every skill that can reach it.
+    ///
+    /// Both directories are loaded: the resolved tools dir (the source tree in a
+    /// debug build, the extracted defaults in a release build) and the data
+    /// dir's `tools/`, where runtime-authored skills are written. In a release
+    /// build they are the same path and the second load is skipped; in a debug
+    /// build the second is the other half of the tool surface, and without it an
+    /// authored tool would be callable for one session and gone after a restart.
+    async fn load_script_tool_surface(&self, deps: ToolSurfaceDeps<'_>) {
+        let ToolSurfaceDeps {
+            tools,
+            tools_dir,
+            router,
+            memory,
+            session_history,
+            workspace_id_for_services,
+            turn_baselines,
+            shared_agent_config,
+            chat_runs,
+        } = deps;
+
+        let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
+            if router.available_providers().is_empty() {
+                None
+            } else {
+                Some(Arc::new(AgentSpawnerImpl {
+                    router: router.clone(),
+                    // The live config, not a snapshot of it — see
+                    // `AgentSpawnerImpl::agent_config_src`.
+                    agent_config_src: Arc::clone(shared_agent_config),
+                    control: self.control_slot.clone(),
+                }))
+            };
+
+        // `[memory] ocr_model_priority` already means "vision-capable
+        // models, tried in order" — an existing documented setting, so
+        // `vision.analyze` reads it rather than inventing a second one.
+        let vision_models = self.config.vision_model_priority.clone();
+
+        // The authoring services load a tool they just wrote with the same
+        // services every bundled skill gets. That map is the one being
+        // built, so it reaches them through a slot filled immediately
+        // below — a runtime-authored tool must not be the only one in the
+        // daemon that cannot call a service.
+        let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
+            Arc::new(std::sync::OnceLock::new());
+        // Author into the data dir, never into wherever skills happen to be
+        // *loaded* from. In a debug build `resolve_tools_dir` returns the
+        // source tree, so `tools.create` would have written a new skill
+        // directory into the checkout — untracked files appearing in the
+        // repo because an agent made a tool. Loading from source is
+        // deliberate and stays; writing to it is not.
+        let authoring_dir = self.config.data_dir.join("tools");
+        let tool_authoring = Some((
+            authoring_dir.clone(),
+            Arc::downgrade(tools),
+            Arc::clone(&authoring_slot),
+        ));
+
+        // Before any skill runs: the bridge snapshots into this store on
+        // every script write from here on.
+        let file_history_root = self.config.data_dir.join("file-history");
+        if nanna_scripting::file_history::install(file_history_root.clone()) {
+            info!(
+                "File history (pre-write snapshots) at {}",
+                file_history_root.display()
+            );
+        }
+
+        let services = build_script_services(ScriptServiceDeps {
+            memory: memory.clone(),
+            spawner: spawner_arc,
+            session_history: session_history.clone(),
+            workspace_id: workspace_id_for_services.clone(),
+            storage: self.storage.clone(),
+            turn_baselines: turn_baselines.clone(),
+            summarizer: Some((router.clone(), Arc::clone(shared_agent_config))),
+            tool_authoring,
+            vision: Some((router.clone(), vision_models.clone())),
+            pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(router, &vision_models),
+            audio: Some((
+                self.config.llm.openai_api_key.clone(),
+                self.config.data_dir.clone(),
+            )),
+            browser_data_dir: Some(self.config.data_dir.clone()),
+            screenshot_data_dir: Some(self.config.data_dir.clone()),
+            reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
+            feedback: Some(Arc::clone(&self.dreaming_slot)),
+            ask_user: Some(crate::ask_user_service::AskUserDeps {
+                sessions: Arc::clone(&self.sessions),
+                events: self.ipc.event_sender(),
+                chat_runs: Arc::clone(chat_runs),
+            }),
+        });
+        // Fill the slot before any skill can be executed. `set` returning
+        // an error would mean the map was filled twice, which cannot
+        // happen here and would leave the authoring services reading a
+        // stale map if it did.
+        if authoring_slot.set(services.clone()).is_err() {
+            warn!(
+                "tool-authoring service map was already filled; authored tools may not reach services"
+            );
+        }
+
+        if let Some(dir) = tools_dir
+            && dir.is_dir()
+        {
+            let loaded = tools.load_skills_with_services(dir, &services).await;
+            info!("Loaded {} tools from {:?}", loaded, dir);
+        }
+
+        // Tools authored at runtime live in the data dir. In a release
+        // build that is the same directory as above and this is skipped; in
+        // a debug build it is the other half of the tool surface, and
+        // without it an authored tool would be callable for one session and
+        // gone after a restart.
+        if authoring_dir.is_dir()
+            && tools_dir != Some(&authoring_dir)
+        {
+            let loaded = tools
+                .load_skills_with_services(&authoring_dir, &services)
+                .await;
+            if loaded > 0 {
+                info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
+            }
+        }
+    }
+
+    /// The LLM router, rebuilt from every credential the config file and the
+    /// secure store between them can resolve.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DaemonError::Config`] when not one provider resolved — a daemon
+    /// with no model to call can only fail every request, so it refuses to boot
+    /// rather than look healthy.
+    async fn init_llm_router(&self) -> Result<Arc<LlmRouter>, crate::DaemonError> {
+        // Create LLM router with all available providers. The same resolution
+        // + construction runs again on every control-plane config mutation
+        // (see `control::config`), so a provider the user authenticates after
+        // boot registers without a daemon restart — registration used to be
+        // boot-only, leaving the GUI and daemon split-brained about which
+        // providers exist.
+        let router = LlmRouter::new();
+        let creds = crate::llm_router::ProviderCredentials::resolve(&self.config.llm).await;
+        router.rebuild(&creds);
+
+        let available = router.available_providers();
+        if available.is_empty() {
+            return Err(crate::DaemonError::Config(
+                "No LLM providers configured. Please set up at least one provider (Anthropic, OpenAI, OpenRouter, or Ollama).".to_string()
+            ));
+        }
+        info!(
+            "LLM router initialized with {} providers: {:?}",
+            available.len(),
+            available
+        );
+        let router = Arc::new(router);
+
+        Ok(router)
+    }
+
+    /// Where skills are loaded from: env var > config > dev fallback >
+    /// `{data_dir}/tools/`, with the bundled defaults extracted on first run.
+    /// `None` when `[tools] use_script_tools` is off.
+    fn resolve_tools_directory(&self) -> Option<PathBuf> {
+        if self.config.use_script_tools {
+            let config_dir = self.config.tools_dir.as_deref();
+            let resolved = nanna_tools::skills::defaults::resolve_tools_dir(config_dir)
+                .unwrap_or_else(|| self.config.data_dir.join("tools"));
+
+            // Bootstrap default skills into the tools directory if needed.
+            // In debug builds this is a no-op (tools load from source tree).
+            // In release builds, embedded skills are extracted on first run.
+            let bootstrapped = nanna_tools::skills::defaults::bootstrap_default_skills(&resolved);
+            if bootstrapped > 0 {
+                info!(
+                    "Bootstrapped {} default skills into {:?}",
+                    bootstrapped, resolved
+                );
+            }
+
+            if resolved.is_dir() {
+                let granted_count = nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                if granted_count > 0 {
+                    warn!(
+                        granted_count,
+                        "Wrote the default permissions.json for {} tool(s) that declared none",
+                        granted_count
+                    );
+                }
+                info!("Tools directory: {:?}", resolved);
+            } else {
+                warn!("Tools directory does not exist: {:?}", resolved);
+            }
+            Some(resolved)
+        } else {
+            None
+        }
+    }
+
+    /// The memory service, or `None` when memory is switched off in config.
+    ///
+    /// Always `Some` once memory is enabled, even with no embedding provider —
+    /// see [`Self::memory_without_embedder`] for why a missing key must not
+    /// discard a session's memories.
+    async fn init_memory_service(
+        &self,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+        degradations: &Arc<nanna_agent::DegradationLedger>,
+    ) -> Option<Arc<MemoryService>> {
+        if !self.config.enable_memory {
+            info!("Memory service disabled in config");
+            return None;
+        }
+
+        // Resolve the ordered provider list the user actually configured.
+        //
+        // `embedding_priority` is authoritative and is walked in order:
+        // the first entry whose credential resolves becomes primary, the
+        // rest become fallbacks in the same order. Failover happens ONLY on
+        // error, exactly like `model_priority` for chat, so one model
+        // embeds at a time.
+        //
+        // What this replaces: a single configured provider plus THREE
+        // hardcoded fallbacks appended by credential sniffing —
+        // `text-embedding-3-small` (1536) for OpenAI and
+        // `openai/text-embedding-3-small` (1536) for OpenRouter. Those were
+        // injected whether or not the user wanted them, which is how a paid
+        // 1536-dim embedder ended up live on an install whose config asked
+        // for a free one first and a 768-dim local model second.
+        let specs: Vec<String> = if self.embedding.priority.is_empty() {
+            let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
+            info!("No embedding_priority configured; using the single pair '{legacy}'");
+            vec![legacy]
+        } else {
+            self.embedding.priority.clone()
+        };
+
+        let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
+            .iter()
+            .filter_map(|spec| self.embedding_provider_for(spec))
+            .collect();
+
+        // Queue rows for models no longer in the list can never drain and
+        // would pollute queue health forever. Pruned only when something
+        // resolved — an empty resolution means a missing key, and wiping
+        // the queue over a missing key would turn a config hiccup into
+        // lost work tracking.
+        if !resolved.is_empty()
+            && let Some(ref storage) = self.storage
+        {
+            let keep: Vec<String> = resolved.iter().map(|(info, _)| info.to_string()).collect();
+            match storage.memories().retain_queue_models(&keep).await {
+                Ok(0) => {}
+                Ok(n) => info!("Dropped {n} queued embeddings for models no longer configured"),
+                Err(e) => warn!("Could not prune the embedding queue: {e}"),
+            }
+        }
+
+        let primary_client = resolved.first().cloned();
+        let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
+
+        if primary_client.is_none() && !specs.is_empty() {
+            warn!(
+                "No embedding provider in embedding_priority could be resolved ({} entries tried) — \
+                 memory will be written without vectors and queued for backfill",
+                specs.len()
+            );
+        }
+
+        let Some((primary_info, primary)) = primary_client else {
+            return self.memory_without_embedder(degradations).await;
+        };
+
+        let embed_router = Self::build_embedding_router(&primary_info, primary, fallbacks);
+
+        // Placeholder for memory service — set after construction via lazy init
+        let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        // One drain at a time, process-wide — see `drain_backfill`.
+        let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
+        let embed_fn = Self::build_embed_fn(
+            &embed_router,
+            &memory_for_reembed,
+            &drain_serial,
+            chat_runs,
+            degradations,
+        );
+
+        let dimension = self.probe_or_seed_dimension(&embed_router).await;
+        let config = nanna_memory::MemoryServiceConfig {
+            dimension,
+            ..Default::default()
+        };
+
+        // Wire up Turso persistence if storage is available.
+        // The persistence adapter is constructed here and attached to the
+        // MemoryService so all writes are automatically mirrored to Turso.
+        let memory_service = if let Some(ref storage) = self.storage {
+            let repo = storage.memories();
+            let db = Arc::new(TursoMemoryPersistence::new(repo));
+            nanna_memory::MemoryService::new(config)
+                .with_embed_fn(embed_fn)
+                .with_persistence(db)
+        } else {
+            warn!(
+                "No storage backend available — memory will NOT be persisted to Turso"
+            );
+            nanna_memory::MemoryService::new(config).with_embed_fn(embed_fn)
+        };
+
+        self.load_persisted_memories(&memory_service).await;
+
+        info!("Memory service initialized with Turso persistence and embedding router");
+        let memory_arc = Arc::new(memory_service);
+
+        // Probe the actual embedding dimension from the model IN THE
+        // BACKGROUND. The probe's first embed call can take ~a minute
+        // when the local embedding model is cold (Ollama loads it on
+        // demand), and it used to block startup past the GUI's
+        // daemon-ready timeout — forcing an embedded fallback while an
+        // orphaned daemon kept running. `probe_and_align_dimension`
+        // takes `&self` on the Arc'd service specifically so it can run
+        // at runtime; a mismatched dimension is corrected (and entries
+        // re-embedded) as soon as the probe completes.
+        Self::spawn_embedding_maintenance(
+            &memory_arc,
+            &embed_router,
+            dimension,
+            &primary_info,
+            chat_runs,
+            &drain_serial,
+        )
+        .await;
+
+        // Wire the memory service into the embed_fn's OnceCell
+        // so provider-switch re-embedding can find it
+        let _ = memory_for_reembed.set(memory_arc.clone());
+
+        // One long-lived worker for the vectors a live turn parks.
+        // It sleeps on the queue's notify and costs nothing until a
+        // tool result is ingested; see `drain_queued_vectors` for
+        // why it is a separate drain and what bounds it.
+        let memory_for_queue = memory_arc.clone();
+        let drain_serial_for_queue = drain_serial.clone();
+        tokio::spawn(async move {
+            drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
+        });
+
+        Some(memory_arc)
+    }
+
+    /// The resolved list's first entry is primary; the rest are fallbacks in
+    /// the user's own order.
+    ///
+    /// Fallbacks are the REST OF THE USER'S LIST, not a credential sweep: the
+    /// list is the whole policy — what to try, and in what sequence.
+    fn build_embedding_router(
+        primary_info: &EmbeddingProviderInfo,
+        primary: Arc<nanna_llm::EmbeddingClient>,
+        fallbacks: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)>,
+    ) -> Arc<EmbeddingRouter> {
+        // Build the embedding router with fallback providers
+        let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
+
+        // Fallbacks are the REST OF THE USER'S LIST, in their
+        // order — not a credential sweep. The list is the whole
+        // policy: what to try, and in what sequence.
+        for (info, client) in fallbacks {
+            info!("Embedding fallback: {info}");
+            embed_router = embed_router.with_fallback(info, client);
+        }
+
+        info!(
+            "Embedding router: {} providers configured",
+            embed_router.provider_count()
+        );
+        Arc::new(embed_router)
+    }
+
+    /// The store's embed function: one seam every embedding outcome passes
+    /// through, which is why the capability ledger and the provider-switch
+    /// rebind both live here rather than at the call sites.
+    fn build_embed_fn(
+        embed_router: &Arc<EmbeddingRouter>,
+        memory_for_reembed: &Arc<tokio::sync::OnceCell<Arc<MemoryService>>>,
+        drain_serial: &Arc<tokio::sync::Mutex<()>>,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+        degradations: &Arc<nanna_agent::DegradationLedger>,
+    ) -> nanna_memory::EmbedFn {
+        // Create embedding function that routes through the EmbeddingRouter.
+        let router_for_fn = embed_router.clone();
+        let mem_cell_for_fn = memory_for_reembed.clone();
+        let drain_serial_for_fn = drain_serial.clone();
+        let chat_runs_for_fn = chat_runs.clone();
+        let ledger_for_fn = degradations.clone();
+
+        let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
+            let router = router_for_fn.clone();
+            let text = text.to_string();
+            let mem_cell = mem_cell_for_fn.clone();
+            let drain_serial = drain_serial_for_fn.clone();
+            let chat_runs = chat_runs_for_fn.clone();
+            let ledger = ledger_for_fn.clone();
+            Box::pin(async move {
+                let attempted = router.embed_one(&text).await;
+
+                // Capability transitions reach the model once, in
+                // its next tool result (P22 Tier 4). The seam is
+                // HERE — the one place every embed outcome passes —
+                // because "no provider answered" is the moment
+                // memory writes start landing vectorless, and the
+                // first success afterwards is the moment they stop.
+                // The ledger dedups by state, so the steady flow of
+                // successes (and repeated failures) records nothing.
+                match &attempted {
+                    Err(reason) => ledger.set(
+                        "memory-embeddings",
+                        "degraded",
+                        format!(
+                            "[capability notice — memory embeddings DEGRADED: no \
+                             embedding provider is answering ({reason}). Memory and \
+                             tool-result writes still SUCCEED and are stored in full — \
+                             the Turso store remains the source of truth — but new \
+                             entries are queued for embedding backfill, so semantic \
+                             recall may miss them until a provider recovers. This \
+                             notice will not repeat unless the state changes.]"
+                        ),
+                    ),
+                    Ok(_) => ledger.set(
+                        "memory-embeddings",
+                        "healthy",
+                        "[capability notice — memory embeddings RESTORED: an \
+                         embedding provider is answering again; queued entries are \
+                         backfilling and new writes are searchable normally.]",
+                    ),
+                }
+
+                let (embedding, switched_to) = attempted?;
+
+                // Provider switched — realign the store BEFORE this
+                // write is allowed to land, so it validates against
+                // the new binding rather than the dead provider's.
+                //
+                // The router reports the switch to exactly ONE
+                // caller (the one whose call flipped the live
+                // active index), so this is stampede-safe without
+                // any generation bookkeeping here. And the vector
+                // in hand came from `switched_to` itself, so
+                // `(model, embedding.len())` is a consistent pair
+                // by construction — reading the active provider
+                // back from the router here could race a second
+                // switch and rebind the store to a torn
+                // (new model, old width) state. That torn state is
+                // the 2026-08-02 incident: model rebound, width
+                // latch stale, every write failing
+                // "expected 2048, got 768" for minutes.
+                if let Some(provider) = switched_to
+                    && let Some(mem) = mem_cell.get()
+                {
+                    let model = provider.to_string();
+                    // The new provider's input window, memoized by
+                    // the router — one `/api/show` per provider per
+                    // process, and it travels WITH the model and
+                    // width for the same reason those two do. A
+                    // chunk sized for the old window is not
+                    // rejected by the new embedder, it is silently
+                    // truncated.
+                    let window = router.context_window_for(&provider).await;
+                    tracing::info!(
+                        "Embedding provider changed — rebinding the store to \
+                         '{}' ({} dims)",
+                        model,
+                        embedding.len()
+                    );
+
+                    // Rebinding is a hash lookup per entry: no
+                    // network, no re-embed, and a switch BACK to a
+                    // model used earlier is free because its bucket
+                    // was retained.
+                    let (_, missing) =
+                        mem.rebind_embeddings(&model, embedding.len(), window).await;
+
+                    // Whatever this model has never embedded gets
+                    // filled in lazily, in bounded passes, while
+                    // the run continues. It must not be done
+                    // inline: the store can hold thousands of
+                    // entries and the provider we just failed over
+                    // to may be the rate-limited one.
+                    //
+                    // Unconditional for the same reason as the
+                    // startup bind: `missing` counts ROW vectors,
+                    // and the chunk queue is independent of it. A
+                    // flap back to a model whose row buckets were
+                    // all retained reports zero missing while its
+                    // chunk vectors are still stamped with the
+                    // other provider, and a drain interrupted
+                    // partway leaves exactly that state.
+                    let _ = missing;
+                    let mem = mem.clone();
+                    let chat_runs = chat_runs.clone();
+                    let drain_serial = drain_serial.clone();
+                    tokio::spawn(async move {
+                        drain_backfill(&mem, &model, &chat_runs, &drain_serial)
+                            .await;
+                    });
+                }
+
+                Ok(embedding)
+            })
+        });
+
+        embed_fn
+    }
+
+    /// The dimension the store starts on: the provider's own answer when it
+    /// responds, the provisional seed when it does not.
+    async fn probe_or_seed_dimension(&self, embed_router: &EmbeddingRouter) -> usize {
+        // Seed the embedding dimension by probing the router.
+        //
+        // A probe failure must NOT stop the daemon: Nanna is
+        // offline-capable by default, so an unreachable or unkeyed
+        // embedding provider degrades memory — it does not refuse
+        // to boot. The seed only has to be a valid positive
+        // dimension: real vectors always come from the provider,
+        // and the background `probe_and_align_dimension` below
+        // corrects the store (re-embedding any mismatched entries)
+        // as soon as a provider answers. Probing here is purely an
+        // optimization — when it succeeds the store is right
+        // immediately and nothing is ever re-embedded.
+        let seed_dimension = nanna_memory::MemoryServiceConfig::default().dimension;
+        let dimension = match Self::probe_embedding_dimension(embed_router).await {
+            Ok(dim) => {
+                info!(
+                    "Memory service using probed dimension {} for model {}",
+                    dim, self.embedding.model
+                );
+                dim
+            }
+            Err(e) => {
+                warn!(
+                    "Could not probe the embedding dimension ({e}). Starting anyway with a \
+                     provisional dimension of {seed_dimension}; memory will re-align \
+                     automatically once an embedding provider is reachable. To enable \
+                     embeddings, run a local Ollama with `ollama pull {}` or set an \
+                     OpenAI/OpenRouter key.",
+                    self.embedding.model
+                );
+                seed_dimension
+            }
+        };
+        assert!(dimension > 0, "embedding dimension must be positive");
+
+        dimension
+    }
+
+    /// Fill the in-memory cache from Turso, migrating a legacy `memories.json`
+    /// exactly once if one is there and the table is empty.
+    async fn load_persisted_memories(&self, memory_service: &nanna_memory::MemoryService) {
+        // One-time migration: if memories.json exists and Turso is empty,
+        // load from JSON into in-memory cache then save each entry to Turso.
+        let json_path = self.memory_path.as_ref();
+        let should_migrate = if let (Some(path), Some(storage)) =
+            (json_path, &self.storage)
+        {
+            if path.exists() {
+                match storage.memories().count().await {
+                    Ok(0) => true,
+                    Ok(n) => {
+                        info!(
+                            "Turso already has {} memories — skipping JSON migration",
+                            n
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        warn!("Could not check Turso memory count: {}", e);
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_migrate {
+            let path = json_path.unwrap();
+            info!(
+                "Migrating memories from {:?} to Turso (one-time migration)",
+                path
+            );
+            match memory_service.load(path).await {
+                Ok(()) => {
+                    let count = memory_service.count().await;
+                    info!("Loaded {} memories from JSON, flushing to Turso...", count);
+                    // Flush all entries to Turso
+                    match memory_service.flush_to_db().await {
+                        Ok(n) => info!("Flushed {} memories to Turso", n),
+                        Err(e) => warn!("Failed to flush memories to Turso: {}", e),
+                    }
+                    // Rename the JSON file so we don't re-migrate next time
+                    let migrated_path = path.with_extension("json.migrated");
+                    if let Err(e) = tokio::fs::rename(path, &migrated_path).await {
+                        warn!("Could not rename migrated JSON file: {}", e);
+                    } else {
+                        info!(
+                            "Renamed {:?} → {:?} (migration complete)",
+                            path, migrated_path
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "JSON migration failed: {}. Will attempt to load from Turso.",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Load from Turso into the in-memory cache (normal startup path).
+        // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
+        if !should_migrate {
+            match memory_service.load_from_db().await {
+                Ok(count) => {
+                    info!("Loaded {} memories from Turso", count);
+                }
+                Err(nanna_memory::MemoryError::Persistence(ref e))
+                    if e.contains("No persistence backend") =>
+                {
+                    // No storage configured — silently skip
+                }
+                Err(e) => {
+                    warn!("Failed to load memories from Turso: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Bind the store to the model that is about to write to it, arm the
+    /// idle-backfill supervisor, and correct the dimension in the background.
+    async fn spawn_embedding_maintenance(
+        memory_arc: &Arc<MemoryService>,
+        embed_router: &Arc<EmbeddingRouter>,
+        dimension: usize,
+        primary_info: &EmbeddingProviderInfo,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+        drain_serial: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let memory_for_probe = memory_arc.clone();
+        // Name the model the router actually bound — not the
+        // legacy `embedding.model` config field, which the
+        // priority list overrides. A log that names the wrong
+        // model sends whoever reads it to debug a provider that
+        // is not even running.
+        let model_name = primary_info.to_string();
+        // Bind the store to the model that is about to write to
+        // it, BEFORE any probe or write. Without this the first
+        // entries of a session get bucketed under `None` — they
+        // would be re-embedded on the next switch instead of
+        // being reusable, which is the whole point of buckets.
+        let bind_provider = embed_router.active_provider().await;
+        let bind_model = bind_provider.to_string();
+        let memory_for_bind = memory_arc.clone();
+        let router_for_bind = embed_router.clone();
+        let chat_runs_for_bind = chat_runs.clone();
+        let drain_serial_for_bind = drain_serial.clone();
+        tokio::spawn(async move {
+            // The probed (or seeded) dimension and the model's
+            // input window travel WITH the model — the binding
+            // is one triple, never three independently-updated
+            // latches. Resolved inside the spawn because it
+            // costs a request, and startup must not block on it.
+            let window =
+                router_for_bind.context_window_for(&bind_provider).await;
+            let (_, _missing) = memory_for_bind
+                .rebind_embeddings(&bind_model, dimension, window)
+                .await;
+            // Unconditional, NOT gated on missing row vectors.
+            // The two queues are independent: after the chunk
+            // migration every existing memory has a row vector
+            // and no chunks at all, so `missing == 0` while the
+            // entire store is unchunked. Gating on the row
+            // count would leave it that way forever. Both
+            // drains no-op immediately when their queue is
+            // empty, so the unconditional call costs one query
+            // each on a store that is already complete.
+            drain_backfill(
+                &memory_for_bind,
+                &bind_model,
+                &chat_runs_for_bind,
+                &drain_serial_for_bind,
+            )
+            .await;
+        });
+        // One supervisor for the daemon's life: it turns the
+        // end of every turn into a drain opportunity, which is
+        // what closes the "parked until the next binding event"
+        // gap `store_unembedded` documents -- the backlog
+        // `drain_queued_vectors` is budgeted not to sweep.
+        // Spawned beside the startup bind because that is where
+        // the binding, the run registry and the drain mutex are
+        // all in scope.
+        let memory_for_supervisor = memory_arc.clone();
+        let chat_runs_for_supervisor = chat_runs.clone();
+        let drain_serial_for_supervisor = drain_serial.clone();
+        tokio::spawn(supervise_idle_backfill(
+            memory_for_supervisor,
+            chat_runs_for_supervisor,
+            drain_serial_for_supervisor,
+        ));
+        let chat_runs_for_probe = chat_runs.clone();
+        let drain_serial_for_probe = drain_serial.clone();
+        tokio::spawn(async move {
+            match memory_for_probe.probe_and_align_dimension().await {
+                Ok(actual_dim) => {
+                    if actual_dim == dimension {
+                        debug!(
+                            "Embedding dimension confirmed: {actual_dim} for model {model_name}"
+                        );
+                    } else {
+                        info!(
+                            "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
+                        );
+                        // Writes that landed under the stale
+                        // width were queued for backfill, not
+                        // failed — drain them now that the
+                        // binding is honest.
+                        if let Some(model) =
+                            memory_for_probe.active_embedding_model().await
+                        {
+                            drain_backfill(
+                                &memory_for_probe,
+                                &model,
+                                &chat_runs_for_probe,
+                                &drain_serial_for_probe,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not probe embedding dimension (model may be loading): {e}. \
+                         Using static dimension {dimension}."
+                    );
+                }
+            }
+        });
+    }
+
+    /// Memory with persistence and no embedder.
+    ///
+    /// Writes land in Turso with no vector — exactly the queued-for-backfill
+    /// state the loader and the drain already handle — and they become
+    /// searchable the moment a provider is configured and the daemon restarts.
+    /// This arm used to return `None`, which contradicted the warning promising
+    /// vectorless writes and quietly discarded every memory of a session that
+    /// merely had a missing API key.
+    async fn memory_without_embedder(
+        &self,
+        degradations: &Arc<nanna_agent::DegradationLedger>,
+    ) -> Option<Arc<MemoryService>> {
+        // No provider resolved — but memory does NOT switch off.
+        // The service runs with persistence and no embedder:
+        // writes land in Turso with no vector, exactly the
+        // queued-for-backfill state the loader and the drain
+        // already handle, and they become searchable the moment a
+        // provider is configured and the daemon restarts. The old
+        // arm returned `None` here, which contradicted the warn
+        // above it promising vectorless writes — and quietly
+        // discarded every memory of a session that merely had a
+        // missing API key.
+        warn!(
+            "No embedding provider available — memory runs WITHOUT vectors: writes \
+             persist and queue for backfill, recall is unavailable until an \
+             embedding provider is configured"
+        );
+        // The model finds out the same way the operator does —
+        // once, in its first tool result, not on every write.
+        degradations.set(
+            "memory-embeddings",
+            "degraded",
+            "[capability notice — memory embeddings are OFF: no embedding provider \
+             is configured. Memory and tool-result writes still SUCCEED and persist \
+             in full — the Turso store is the source of truth — but they carry no \
+             vectors, so semantic recall is unavailable until a provider is \
+             configured. This notice will not repeat unless the state changes.]",
+        );
+        let config = nanna_memory::MemoryServiceConfig::default();
+        let memory_service = if let Some(ref storage) = self.storage {
+            let repo = storage.memories();
+            let db = Arc::new(TursoMemoryPersistence::new(repo));
+            nanna_memory::MemoryService::new(config).with_persistence(db)
+        } else {
+            // No storage either: in-RAM only, still better than
+            // dropping writes on the floor for the session.
+            nanna_memory::MemoryService::new(config)
+        };
+        match memory_service.load_from_db().await {
+            Ok(count) => info!("Loaded {count} memories from Turso (no embedder yet)"),
+            Err(nanna_memory::MemoryError::Persistence(ref e))
+                if e.contains("No persistence backend") => {}
+            Err(e) => warn!("Failed to load memories from Turso: {e}"),
+        }
+        Some(Arc::new(memory_service))
+    }
+
+    /// Mirror every provider request into the per-request history table.
+    ///
+    /// Lifetime totals cannot be split back into days and `system.cost_rollup`
+    /// prices days, so the table needs its own writer; it had none until this
+    /// sink.
+    fn install_request_sink(&self, model_stats: &nanna_agent::ModelStatsTracker) {
+        // Keep the per-request history too: lifetime totals cannot be split
+        // back into days, and `system.cost_rollup` prices days. The table
+        // existed with no writer until this sink.
+        if let Some(ref storage) = self.storage {
+            let storage = Arc::clone(storage);
+            model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
+                let storage = Arc::clone(&storage);
+                let obs = obs.clone();
+                // Read here, on the run's task: the task-local does not cross
+                // the spawn below.
+                let session_id = ToolRegistry::run_session_id();
+                tokio::spawn(async move {
+                    let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
+                    let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
+                    if let Err(e) = storage
+                        .log_model_request(&nanna_storage::NewModelRequest {
+                            model: &obs.model,
+                            success: obs.success,
+                            latency_ms,
+                            input_tokens: obs.input_tokens,
+                            output_tokens: obs.output_tokens,
+                            cache_read_tokens: obs.cache_read_tokens,
+                            cache_creation_tokens: obs.cache_creation_tokens,
+                            cache_creation_1h_tokens: obs
+                                .cache_creation_1h_tokens
+                                .min(obs.cache_creation_tokens),
+                            tier: tier.as_deref(),
+                            escalated: obs.escalated,
+                            session_id: session_id.as_deref(),
+                        })
+                        .await
+                    {
+                        warn!("Failed to log model request: {e}");
+                    }
+                });
+            }));
+        }
+    }
+
+    /// Claude Code-compatible aliases, registered after the tools they point at.
+    async fn register_tool_aliases(tools: &Arc<ToolRegistry>) {
+        // Register common aliases for Claude Code compatibility (after tools are loaded)
+        tools.register_alias("read", "read_file").await;
+        tools.register_alias("Read", "read_file").await;
+        tools.register_alias("write", "write_file").await;
+        tools.register_alias("Write", "write_file").await;
+        tools.register_alias("edit", "edit_file").await;
+        tools.register_alias("Edit", "edit_file").await;
+        tools.register_alias("bash", "exec").await;
+        tools.register_alias("Bash", "exec").await;
+        tools.register_alias("glob", "list_dir").await;
+        tools.register_alias("Glob", "list_dir").await;
+        tools.register_alias("ls", "list_dir").await;
+        tools.register_alias("task", "sub_agent").await;
+        tools.register_alias("Task", "sub_agent").await;
+        tools.register_alias("sub-agent", "sub_agent").await;
+        tools.register_alias("Sub-Agent", "sub_agent").await;
+
+        {
+            let tool_count = tools.definitions().await.len();
+            info!("Tool registry: {} tools (including aliases)", tool_count);
+        }
+    }
+
+    /// The allow/deny policy and the per-call audit trail, both attached to the
+    /// registry rather than the agent loop: the loop is only one of the callers
+    /// (chat harness, task tool, scheduled runs and the MCP bridge all call the
+    /// registry directly), and an audit that saw only one of them would be worse
+    /// than none — it would read as a complete account.
+    async fn apply_tool_policy_and_audit(&self, tools: &Arc<ToolRegistry>) {
+        // Apply the tool allow/deny policy. Built from `[tools] enabled/disabled`
+        // and enforced by the registry AFTER alias/fuzzy resolution, so a denied
+        // tool cannot be reached via an alias (`Bash` → `exec`), a case variant,
+        // or a fuzzy near-miss. Skipped entirely when unrestricted.
+        let policy = build_tool_policy(
+            self.config.tool_allowlist.as_deref(),
+            &self.config.tool_denylist,
+        );
+        if !policy.is_unrestricted() {
+            tools.set_policy(policy).await;
+        }
+
+        // Attach the per-call audit trail. It sits on the registry rather than
+        // on the agent loop deliberately: the loop is only one of the callers
+        // (chat harness, task tool, scheduled runs and the MCP bridge all call
+        // the registry directly), and an audit that saw only one of them would
+        // be worse than none — it would read as a complete account.
+        if self.config.tool_audit.log {
+            let path = self.config.tool_audit_path();
+            let sink = nanna_tools::JsonlAuditSink::new(
+                path.clone(),
+                nanna_tools::ToolAuditConfig {
+                    include_values: self.config.tool_audit.log_values,
+                    ..Default::default()
+                },
+            );
+            tools.set_audit_sink(Some(Arc::new(sink))).await;
+            info!(path = %path.display(), values = self.config.tool_audit.log_values,
+                  "Tool audit trail enabled");
+        }
     }
 }
 
