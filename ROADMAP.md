@@ -4664,8 +4664,8 @@ asks permission or restricts her.)*:
       mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
       protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
       rewind is not (Fork already exists).
-      - [ ] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
-            already ships, in the wrong place.** `write_file` parks the outgoing version at
+      - [x] *(research 2026-09-11 — what exists, and a bounded design to copy)* **Half of this
+            already ships, in the wrong place.** *(Implemented 2026-09-17 — see the note below.)* `write_file` parks the outgoing version at
             `<file>.__prev__` (ONE slot, overwritten each write) plus the richest earlier version
             at `<file>.__best__` — both *inside the user's tree*, and `edit_file` parks nothing.
             Claude Code's checkpointing is the shape to copy: a copy of each file taken *before*
