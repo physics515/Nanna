@@ -651,6 +651,15 @@ pub enum SystemAction {
         tool_name: Option<String>,
         hours: Option<u32>,
     },
+    /// Estimated model spend per day or month, from the request log.
+    CostRollup {
+        /// Window in days (default 30, at most 366).
+        #[serde(default)]
+        days: Option<u32>,
+        /// `day` (default) or `month`.
+        #[serde(default)]
+        by: Option<String>,
+    },
     /// Get daily tool stats time-series (for graphs)
     ToolStatsDaily {
         tool_name: Option<String>,

@@ -4228,6 +4228,38 @@ impl DaemonServer {
         // (persists it + feeds the router). Cloning shares state
         // (Arc<RwLock<_>> inside).
         let model_stats = nanna_agent::ModelStatsTracker::new();
+        // Keep the per-request history too: lifetime totals cannot be split
+        // back into days, and `system.cost_rollup` prices days. The table
+        // existed with no writer until this sink.
+        if let Some(ref storage) = self.storage {
+            let storage = Arc::clone(storage);
+            model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
+                let storage = Arc::clone(&storage);
+                let obs = obs.clone();
+                tokio::spawn(async move {
+                    let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
+                    let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
+                    if let Err(e) = storage
+                        .log_model_request(
+                            &obs.model,
+                            obs.success,
+                            latency_ms,
+                            obs.input_tokens,
+                            obs.output_tokens,
+                            obs.cache_read_tokens,
+                            obs.cache_creation_tokens,
+                            obs.cache_creation_1h_tokens.min(obs.cache_creation_tokens),
+                            tier.as_deref(),
+                            obs.escalated,
+                            None,
+                        )
+                        .await
+                    {
+                        warn!("Failed to log model request: {e}");
+                    }
+                });
+            }));
+        }
 
         // Build script services and load all tools from disk
         let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =

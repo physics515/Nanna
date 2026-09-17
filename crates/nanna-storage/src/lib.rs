@@ -362,6 +362,92 @@ const fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Usage rolls up per day and per month, prices from the 1-hour column, and
+    /// ignores what falls outside the window.
+    #[tokio::test]
+    async fn model_usage_rolls_up_by_day_and_month() {
+        let storage = Storage::in_memory().await.expect("storage");
+        for (model, input, writes, writes_1h) in [
+            ("claude-opus-5", 100, 40, 10),
+            ("claude-opus-5", 50, 0, 0),
+            ("ollama/qwen3.5:9b", 7, 0, 0),
+            ("claude-opus-5", 1, 0, 0),
+        ] {
+            storage
+                .log_model_request(
+                    model,
+                    true,
+                    10,
+                    input,
+                    5,
+                    0,
+                    writes,
+                    writes_1h,
+                    None,
+                    false,
+                    Some("s"),
+                )
+                .await
+                .expect("log");
+        }
+        // Row 3 happened three days ago; row 4 is older than any window asked for.
+        let conn = storage.conn.lock().await;
+        let three_days_ago = (chrono::Utc::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        conn.execute(
+            "UPDATE model_request_log SET created_at = ?1 WHERE id = 3",
+            turso::params![three_days_ago.as_str()],
+        )
+        .await
+        .expect("backdate");
+        conn.execute(
+            "UPDATE model_request_log SET created_at = '2001-01-01 00:00:00' WHERE id = 4",
+            (),
+        )
+        .await
+        .expect("backdate");
+        drop(conn);
+
+        let by_day = storage.model_usage_buckets(7, false).await.expect("rollup");
+        assert_eq!(by_day.len(), 2, "{by_day:?}");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let opus = by_day
+            .iter()
+            .find(|b| b.model == "claude-opus-5")
+            .expect("opus");
+        assert_eq!(opus.period, today);
+        assert_eq!(
+            (
+                opus.requests,
+                opus.input_tokens,
+                opus.cache_write_tokens,
+                opus.cache_write_1h_tokens
+            ),
+            (2, 150, 40, 10)
+        );
+        let local = by_day
+            .iter()
+            .find(|b| b.model == "ollama/qwen3.5:9b")
+            .expect("local");
+        assert_eq!(local.period, three_days_ago[..10]);
+        assert!(by_day[0].period <= by_day[1].period, "oldest first");
+
+        let by_month = storage.model_usage_buckets(7, true).await.expect("rollup");
+        assert!(by_month.iter().all(|b| b.period.len() == 7), "{by_month:?}");
+        assert!(
+            by_month.iter().all(|b| b.period != "2001-01"),
+            "outside the window"
+        );
+        let everything = storage
+            .model_usage_buckets(u32::MAX, true)
+            .await
+            .expect("clamped");
+        assert!(
+            everything.iter().all(|b| b.period != "2001-01"),
+            "clamped to a year"
+        );
+    }
     #[tokio::test]
     async fn test_storage_creation() {
         let storage = Storage::in_memory().await.unwrap();
@@ -656,15 +742,21 @@ impl Storage {
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_creation_tokens: u32,
+        cache_creation_1h_tokens: u32,
         tier: Option<&str>,
         escalated: bool,
         session_id: Option<&str>,
     ) -> Result<(), StorageError> {
+        debug_assert!(
+            cache_creation_1h_tokens <= cache_creation_tokens,
+            "the 1-hour share is a subset of the write total"
+        );
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO model_request_log (model, success, latency_ms, input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens, tier, escalated, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens, tier,
+                escalated, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             turso::params![
                 model,
                 success as i64,
@@ -673,12 +765,70 @@ impl Storage {
                 output_tokens as i64,
                 cache_read_tokens as i64,
                 cache_creation_tokens as i64,
+                i64::from(cache_creation_1h_tokens),
                 tier.unwrap_or(""),
                 escalated as i64,
                 session_id.unwrap_or("")
             ],
         ).await?;
         Ok(())
+    }
+
+    /// Model usage summed per day (`YYYY-MM-DD`) or month (`YYYY-MM`) and
+    /// model, oldest first, over the last `days` days.
+    ///
+    /// Rows are bounded by periods × models: `days` is clamped to 366, and the
+    /// model set is whatever was configured and used.
+    ///
+    /// # Errors
+    ///
+    /// The query failed or a row did not have the expected shape.
+    pub async fn model_usage_buckets(
+        &self,
+        days: u32,
+        by_month: bool,
+    ) -> Result<Vec<ModelUsageBucket>, StorageError> {
+        let days = days.clamp(1, USAGE_BUCKET_DAYS_MAX);
+        // `created_at` is `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, so the
+        // period is a prefix of it and the cutoff compares as text.
+        let prefix_len: i64 = if by_month { 7 } else { 10 };
+        let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days)))
+            .format("%Y-%m-%d 00:00:00")
+            .to_string();
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT substr(created_at, 1, ?1) AS period, model,
+                        CAST(COUNT(*) AS INTEGER),
+                        CAST(SUM(input_tokens) AS INTEGER),
+                        CAST(SUM(output_tokens) AS INTEGER),
+                        CAST(SUM(cache_read_tokens) AS INTEGER),
+                        CAST(SUM(cache_creation_tokens) AS INTEGER),
+                        CAST(SUM(cache_creation_1h_tokens) AS INTEGER)
+                 FROM model_request_log
+                 WHERE created_at >= ?2
+                 GROUP BY period, model
+                 ORDER BY period ASC, model ASC",
+                turso::params![prefix_len, since],
+            )
+            .await?;
+        let mut buckets = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let count = |index: usize| row.get::<i64>(index).map(|n| u64::try_from(n).unwrap_or(0));
+            buckets.push(ModelUsageBucket {
+                period: row.get::<String>(0)?,
+                model: row.get::<String>(1)?,
+                requests: count(2)?,
+                input_tokens: count(3)?,
+                output_tokens: count(4)?,
+                cache_read_tokens: count(5)?,
+                cache_write_tokens: count(6)?,
+                cache_write_1h_tokens: count(7)?,
+            });
+        }
+        drop(rows);
+        drop(conn);
+        Ok(buckets)
     }
 
     // =========================================================================
@@ -1222,6 +1372,24 @@ impl Storage {
         ).await?;
         Ok(())
     }
+}
+
+/// Longest window a usage rollup covers: a year and a day.
+pub const USAGE_BUCKET_DAYS_MAX: u32 = 366;
+
+/// Model usage summed over one period for one model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelUsageBucket {
+    /// `YYYY-MM-DD` or `YYYY-MM` (UTC).
+    pub period: String,
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// The 1-hour share of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
 }
 
 /// Time-bucketed tool statistics (hourly or daily).

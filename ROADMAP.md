@@ -5022,9 +5022,23 @@ asks permission or restricts her.)*:
       `Usage` + `MessageStartUsage`, carry it through `StreamEvent::MessageStart` and
       `RequestObservation`, keep a separate 1h total in `model_stats`, and price the two parts
       separately.
-- [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
+- [~] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
       cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
       visibility more than a per-terminal-session number.
+      *(2026-09-17) Day/month rollups landed — after finding the table they need was never written.*
+      `model_request_log` (migration 006) had a `Storage::log_model_request` and **no caller anywhere**,
+      so there was no per-request history to split into days. `ModelStatsTracker` now takes a set-once
+      request sink, and the daemon's sink writes every observation (spawned, never blocking the
+      request path). Migration 016 adds the per-request 1-hour cache-write share so a day prices
+      exactly as the lifetime totals do. `Storage::model_usage_buckets(days, by_month)` sums per
+      `YYYY-MM-DD` / `YYYY-MM` and model (window clamped to 366 days), and IPC
+      `system.cost_rollup {days?, by?: day|month}` prices each bucket from the reference table —
+      unknown/local models reported **unpriced and named**, never $0, so the total is labelled a
+      floor. Tests: storage rollup against real Turso with backdated rows (day and month grouping,
+      window, clamp), sink fan-out across tracker clones, pricing/unpriced rule; the verb answered
+      live on the debug daemon (empty log, invalid `by` refused). **Still open:** per-session rollups
+      (the sink has no session id to write — `RequestObservation` does not carry one), GUI surfacing,
+      and the spend **cap**, which is a gate and therefore an owner call under the no-gates rule.
 - [~] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
       part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
       field found by the audit.

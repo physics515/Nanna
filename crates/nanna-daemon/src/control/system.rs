@@ -224,6 +224,25 @@ impl ControlPlane {
                     json!({ "buckets": [], "error": "Storage not available" })
                 }
             }
+            SystemAction::CostRollup { days, by } => {
+                let Some(ref storage) = self.storage else {
+                    return json!({ "error": "storage_unavailable", "message": "Cost rollups need the request log in storage" });
+                };
+                let by_month = match by.as_deref() {
+                    None | Some("day") => false,
+                    Some("month") => true,
+                    Some(other) => {
+                        return json!({ "error": "invalid_period", "message": format!("`by` must be \"day\" or \"month\" (got {other:?})") });
+                    }
+                };
+                match storage
+                    .model_usage_buckets(days.unwrap_or(30), by_month)
+                    .await
+                {
+                    Ok(usage) => json!(crate::cost_rollup::price_buckets(usage)),
+                    Err(e) => json!({ "error": "rollup_failed", "message": e.to_string() }),
+                }
+            }
             SystemAction::ToolStatsDaily { tool_name, days } => {
                 if let Some(ref storage) = self.storage {
                     match storage.get_tool_stats_daily(tool_name.as_deref(), days.unwrap_or(30)).await {
