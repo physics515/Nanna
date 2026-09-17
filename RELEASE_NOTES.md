@@ -36,7 +36,9 @@ every restart. Both are gone.
 was complete and nothing ever launched it. Configured servers now start at boot, in the background.
 On the way: MCP tools were named `server:tool`, and the colon is invalid for both Anthropic and
 OpenAI, which reject the *whole request* over it — the first MCP tool anyone added would have failed
-every turn. They are named `mcp__server__tool` now.
+every turn. They are named `mcp__server__tool` now. A server that needs a token lists it in
+`secret_env` and you store it with `nanna mcp secret set <server> <VAR>` — it stays in the OS
+keyring and only that server receives it.
 
 **A failed tool call over IPC said nothing.** A direct tool call that failed answered `success:
 false` with an empty string; the reason was dropped. It is returned now.
@@ -102,7 +104,7 @@ WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
 
 ## Numbers
 
-- **2,096 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
+- **2,101 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
 - **3 → 0** bundled tools withheld for want of a daemon service.
 - **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
 - Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing

@@ -976,6 +976,7 @@ mod tests {
                 command: (*command).to_string(),
                 args: Vec::new(),
                 enabled: true,
+                secret_env: Vec::new(),
             })
             .collect();
         config

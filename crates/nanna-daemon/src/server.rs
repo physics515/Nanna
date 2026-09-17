@@ -4410,6 +4410,7 @@ impl DaemonServer {
             Arc::clone(&tools),
             Arc::clone(&self.mcp_status),
             self.shutdown_tx.subscribe(),
+            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
         )
         .await;
 

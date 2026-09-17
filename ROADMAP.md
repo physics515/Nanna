@@ -4612,9 +4612,20 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             on the new (5/5 reruns). The flag is still write-only — nothing reads it — and the
             transport is the deprecated 2024-11-05 HTTP+SSE one, so this item remains a rewrite, not
             a config wiring job.
-      - [ ] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
+      - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
+            *(2026-09-17)* `secret_env = ["VAR", …]` names the variables; values live in the secure
+            store under `mcp.<server>.<VAR>`, set by `nanna mcp secret set|delete <server> <VAR>`
+            (hidden prompt, or stdin when piped — never argv, which `ps` shows). All-or-nothing per
+            server: a missing, blank, repeated or malformed name refuses that server with the exact
+            command to fix it, under the server's own name in `system.status`; the others start, and a
+            config without `secret_env` never touches the keyring at boot. The CLI notes when a stored
+            secret is not listed by any server. Tests: resolver, name rules, startup refusal, CLI
+            target/wiring notes. **Real daemon:** fixture server started, the one missing its token
+            reported `not_started` with `nanna mcp secret set needs_token …`; the real CLI refused
+            `BAD-NAME`. Not exercised: a stored value reaching a child — that needs a write to the
+            operator's keyring, which a nightly run does not do. Not yet in `nanna doctor`.
       - [x] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
             server as started / failed-with-reason; today that lives only in the boot log.
             *(2026-09-17)* `nanna doctor` half done: an offline `mcp.servers` check judges the

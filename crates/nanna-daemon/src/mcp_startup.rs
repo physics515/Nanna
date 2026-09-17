@@ -63,6 +63,11 @@ fn record_outcome(servers: &mut [McpServerState], name: &str, outcome: Result<us
 /// The servers are shut down when `shutdown` fires, so their child processes
 /// do not outlive a clean daemon exit.
 ///
+/// `secret` looks a `secret_env` value up by store key — the secure store in the
+/// daemon. It is called only for servers that list secrets, so a config without
+/// them never touches the keyring at boot. A server missing one is reported
+/// `not_started` with the command that sets it, and the others still start.
+///
 /// # Panics
 ///
 /// Never in practice: the assertion restates the bound
@@ -72,19 +77,38 @@ pub async fn spawn_mcp_servers(
     tools: Arc<ToolRegistry>,
     status: McpStatus,
     mut shutdown: broadcast::Receiver<()>,
+    secret: impl Fn(&str) -> Option<String>,
 ) -> usize {
-    let (start, skipped) = config.startable();
+    let (startable, skipped) = config.startable();
+    let mut start = Vec::with_capacity(startable.len());
+    // Unlike `skipped`, these have a well-formed, unique name to report under.
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for entry in startable {
+        match entry.resolve_secret_env(&secret) {
+            Ok(env) => start.push((entry, env)),
+            Err(reason) => refused.push((entry.name.trim().to_string(), reason)),
+        }
+    }
+    for (_, reason) in &refused {
+        warn!("{reason}");
+    }
     for reason in &skipped {
         warn!("{reason}");
     }
     {
         let mut servers = status.write().await;
         servers.clear();
-        servers.extend(start.iter().map(|entry| McpServerState {
+        servers.extend(start.iter().map(|(entry, _)| McpServerState {
             name: entry.name.trim().to_string(),
             state: "starting",
             tools: 0,
             detail: None,
+        }));
+        servers.extend(refused.into_iter().map(|(name, reason)| McpServerState {
+            name,
+            state: "not_started",
+            tools: 0,
+            detail: Some(reason),
         }));
         servers.extend(skipped.iter().map(|reason| McpServerState {
             name: String::new(),
@@ -96,13 +120,15 @@ pub async fn spawn_mcp_servers(
     if start.is_empty() {
         return 0;
     }
+    let count = start.len();
     let mut integration = McpIntegration::new();
-    for entry in &start {
+    for (entry, env) in start {
         integration.add_server(
-            McpServerConfig::new(entry.name.trim(), entry.command.trim()).args(entry.args.clone()),
+            McpServerConfig::new(entry.name.trim(), entry.command.trim())
+                .args(entry.args.clone())
+                .env(env),
         );
     }
-    let count = start.len();
     assert!(
         count <= nanna_config::MCP_SERVERS_MAX,
         "startable() enforces the bound"
@@ -182,11 +208,18 @@ mod tests {
                 command: " ".into(),
                 args: Vec::new(),
                 enabled: true,
+                secret_env: Vec::new(),
             }],
         };
         let (_tx, rx) = broadcast::channel(1);
-        let started =
-            spawn_mcp_servers(&config, Arc::new(ToolRegistry::new()), status.clone(), rx).await;
+        let started = spawn_mcp_servers(
+            &config,
+            Arc::new(ToolRegistry::new()),
+            status.clone(),
+            rx,
+            |_| panic!("no server lists a secret, so the store is not read"),
+        )
+        .await;
         assert_eq!(started, 0);
         let servers = status.read().await.clone();
         assert_eq!(servers.len(), 1);
@@ -196,6 +229,41 @@ mod tests {
                 .detail
                 .as_deref()
                 .is_some_and(|d| d.contains("has no command"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_missing_a_secret_is_not_started_and_says_how_to_set_it() {
+        let status = McpStatus::default();
+        let config = McpConfig {
+            servers: vec![nanna_config::McpServerEntry {
+                name: "github".into(),
+                command: "npx".into(),
+                args: Vec::new(),
+                enabled: true,
+                secret_env: vec!["GITHUB_TOKEN".into()],
+            }],
+        };
+        let (_tx, rx) = broadcast::channel(1);
+        let started = spawn_mcp_servers(
+            &config,
+            Arc::new(ToolRegistry::new()),
+            status.clone(),
+            rx,
+            |_| None,
+        )
+        .await;
+        assert_eq!(started, 0, "nothing is spawned without its token");
+        let servers = status.read().await.clone();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "github", "reported under its own name");
+        assert_eq!(servers[0].state, "not_started");
+        assert!(
+            servers[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("nanna mcp secret set github GITHUB_TOKEN")),
+            "{servers:?}"
         );
     }
 }

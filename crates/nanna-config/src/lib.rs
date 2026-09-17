@@ -14,7 +14,7 @@ pub use infer::{
 pub mod bind;
 /// MCP servers started at boot (`[mcp]`).
 pub mod mcp;
-pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry};
+pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
