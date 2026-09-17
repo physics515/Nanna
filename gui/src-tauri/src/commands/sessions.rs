@@ -259,6 +259,83 @@ pub async fn set_session_model(
     Ok(())
 }
 
+/// The save-dialog filter for an export format. Pure. `None` for a format the
+/// daemon does not render, which is refused before anything is asked for.
+fn export_filter(format: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match format {
+        "markdown" => Some(("Markdown", &["md"])),
+        "json" => Some(("JSON", &["json"])),
+        _ => None,
+    }
+}
+
+/// Export a session to a file the user picks.
+///
+/// The daemon renders the document (it owns the store); the save dialog is
+/// opened from Rust, so the destination path never comes from the webview —
+/// a command that wrote wherever the page asked would be a write-anywhere
+/// surface. Returns the saved path, or `None` when the dialog was cancelled.
+#[tauri::command]
+pub async fn export_session(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    format: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some((filter_name, extensions)) = export_filter(&format) else {
+        return Err(format!(
+            "Unknown export format {format:?}; use markdown or json"
+        ));
+    };
+    let rendered = {
+        let state_guard = state.read().await;
+        state_guard
+            .backend
+            .session_export(&session_id, &format)
+            .await?
+    };
+    if rendered.get("error").is_some() {
+        return Err(rendered["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string());
+    }
+    let content = rendered["content"].as_str().unwrap_or_default().to_string();
+    let filename = rendered["filename"]
+        .as_str()
+        .unwrap_or("session")
+        .to_string();
+    // Blocking is correct here: async commands run off the main thread.
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(filename)
+        .add_filter(filter_name, extensions)
+        .blocking_save_file();
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let path = chosen
+        .into_path()
+        .map_err(|e| format!("The chosen location is not a file path: {e}"))?;
+    std::fs::write(&path, content)
+        .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::export_filter;
+
+    #[test]
+    fn only_formats_the_daemon_renders_have_a_filter() {
+        assert_eq!(export_filter("markdown"), Some(("Markdown", &["md"][..])));
+        assert_eq!(export_filter("json"), Some(("JSON", &["json"][..])));
+        assert_eq!(export_filter("pdf"), None);
+    }
+}
+
 /// This session's file checkpoints (files as they were before a tool wrote
 /// them), newest first. A daemon refusal comes back as `Err` with its message.
 #[tauri::command]

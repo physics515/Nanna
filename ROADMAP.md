@@ -5067,8 +5067,13 @@ asks permission or restricts her.)*:
       `nanna export <id> [-f md|json] [-o file-or-dir]`, stdout by default; the daemon's
       suggested filename is a bounded ASCII slug and only its last component is ever joined
       onto a directory. An unknown id is refused, not exported empty. `PRIVACY.md` updated.
-      - [ ] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
+      - [x] **GUI export button** — the verb is ready; needs a save dialog + an entry in the
             session menu, verified over WebDriver once `WebKitWebDriver` exists on the host.
+            *(2026-09-17)* Session menu → **Export Markdown / Export JSON**. The `export_session`
+            Tauri command has the daemon render the document, then opens the save dialog **from
+            Rust** and writes there — the destination never comes from the webview, so the command
+            is not a write-anywhere surface. Cancel → nothing written, no toast; success names the
+            path. 1 vitest + 1 Rust test; still not WebDriver-verified.
       - [x] **Memory export** — the same shape for the memory store (FSRS state included).
             *(2026-09-11 — shipped.)* `memory.export {scope, format}`, rendered by the daemon;
             `nanna export --memories [--scope global|<workspace>]`. Each memory carries

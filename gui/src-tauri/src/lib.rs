@@ -212,6 +212,7 @@ pub fn run() {
             commands::sessions::set_session_workspace,
             commands::sessions::set_session_model,
             commands::sessions::get_file_history,
+            commands::sessions::export_session,
             commands::sessions::restore_file_checkpoint,
             commands::sessions::set_session_tools,
             commands::settings::get_config,

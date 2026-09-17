@@ -437,6 +437,8 @@ daemon_proxies! {
     session_set_workspace(session_id: &str, workspace_id: Option<&str>);
     /// Set or clear the chat-model pin for a session
     session_set_model(session_id: &str, model: Option<&str>);
+    /// Render a session as a document
+    session_export(session_id: &str, format: &str);
     /// A session's file checkpoints, newest first
     session_file_history(session_id: &str, limit: Option<usize>);
     /// Restore one file checkpoint of a session

@@ -872,6 +872,17 @@ impl DaemonClient {
         })).await
     }
 
+    /// Render a session as a document (`markdown` or `json`) — `{format, filename, content}`.
+    pub async fn session_export(&self, session_id: &str, format: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "export",
+            "id": session_id,
+            "format": format
+        }))
+        .await
+    }
+
     /// A session's file checkpoints, newest first.
     pub async fn session_file_history(
         &self,
