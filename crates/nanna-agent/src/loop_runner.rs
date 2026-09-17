@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -3920,6 +3921,135 @@ fn detect_thinking_spiral(thinking: &str) -> bool {
     false
 }
 
+/// How one iteration of the agent loop ended early.
+enum RunExit {
+    /// Go straight on to the next iteration (the loop's `continue`).
+    Next,
+    /// End the run with the response built from its state.
+    Respond {
+        /// Whether the response is reported as truncated.
+        truncated: bool,
+    },
+    /// End the run as cancelled (`Agent::finish_cancelled`).
+    Cancelled,
+    /// End the run with this error.
+    Fail(AgentError),
+}
+
+/// The outcome of one phase of an agent-loop iteration: `Continue` carries
+/// the phase's result on, `Break` ends the iteration (see [`RunExit`]).
+type Pass<T = ()> = ControlFlow<RunExit, T>;
+
+/// The run-level values the agent loop keeps across iterations.
+struct RunLimits {
+    /// The model's info as resolved at run start.
+    model_info: nanna_llm::ModelInfo,
+    /// Reasoning budget added to the output reserve on Claude models.
+    thinking_reserve_tokens: usize,
+    /// The window the context budgets are currently derived from.
+    configured_window: usize,
+    /// Effective iteration cap: run option, else config, else unlimited.
+    max_iterations: Option<usize>,
+    /// When the run started (for the wall-clock cap).
+    run_started: std::time::Instant,
+}
+
+/// How an iteration's LLM call went, for the model statistics.
+struct LlmCallMeta {
+    /// Latency of the call that produced the result.
+    latency: std::time::Duration,
+    /// Whether the iteration was routed to a cheaper model.
+    routed: bool,
+    /// Whether the routed call escalated to the primary model.
+    escalated: bool,
+    /// The complexity routing classified, when routed.
+    complexity: Option<TaskComplexity>,
+}
+
+/// What the prose tool-call dialect pass salvaged from a zero-tool-call reply.
+#[derive(Default)]
+struct ProseSalvage {
+    /// Structured calls synthesized from the prose, as `(id, tool, input)`.
+    uses: Vec<(String, String, Value)>,
+    /// `(written name, resolved tool)` for every salvaged call.
+    executed: Vec<(String, String)>,
+    /// `(written name, guidance)` for calls that could not be salvaged.
+    unresolved: Vec<(String, String)>,
+    /// Tool-call fence tokens seen in the prose.
+    fence_tokens: usize,
+}
+
+/// Render a mission-mode continuation prod to the user exactly like a
+/// `mission_control` tool call.
+fn show_mission_prod(state: &RunState, options: &RunOptions, claim_unverified: bool, prod: &str) {
+    let call_id = format!("mission-continue-{}", state.mission_rounds);
+    if let Some(ref cb) = options.on_tool_start {
+        cb(
+            &call_id,
+            "mission_control",
+            &serde_json::json!({
+                "round": state.mission_rounds,
+                "stall_rounds": state.mission_stall_rounds,
+                "repeat_rounds": state.mission_repeat_rounds,
+                "reason": if claim_unverified {
+                    "MISSION COMPLETE claimed without verification"
+                } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
+                    "convergence loop detected — identical rounds"
+                } else {
+                    "model stopped without MISSION COMPLETE"
+                },
+            }),
+            None,
+        );
+    }
+    if let Some(ref cb) = options.on_tool_end {
+        cb(&call_id, "mission_control", prod, true, 0, None);
+    }
+}
+
+/// Fence the result-shaped objects in a zero-tool-call reply that have no
+/// provenance in `prior` — in the reply text and in every text block.
+fn fence_fabricated_results(
+    result: &mut LlmResult,
+    scan: &ProseDialectScan,
+    prior: &PriorMaterial,
+    iteration: usize,
+) {
+    let fabricated: Vec<(usize, usize)> = scan
+        .result_spans
+        .iter()
+        .filter(|(s, e)| !prior.contains(&result.text[*s..*e]))
+        .copied()
+        .collect();
+    if !fabricated.is_empty() {
+        warn!(
+            count = fabricated.len(),
+            iteration = iteration,
+            "🧯 Self-authored result object(s) in a zero-tool-call \
+             step — fencing before they enter history"
+        );
+        result.text =
+            fence_self_authored_results(&result.text, &fabricated);
+        for block in &mut result.content_blocks {
+            if let ContentBlock::Text { text } = block {
+                let block_scan = scan_prose_dialect(text);
+                let block_fabricated: Vec<(usize, usize)> = block_scan
+                    .result_spans
+                    .iter()
+                    .filter(|(s, e)| !prior.contains(&text[*s..*e]))
+                    .copied()
+                    .collect();
+                if !block_fabricated.is_empty() {
+                    *text = fence_self_authored_results(
+                        text,
+                        &block_fabricated,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The main agent
 pub struct Agent {
     config: AgentConfig,
@@ -4139,6 +4269,170 @@ impl Agent {
         message: &str,
         options: RunOptions,
     ) -> Result<AgentResponse, AgentError> {
+        let (mut state, mut limits) = self.prepare_run(message, &options).await;
+
+        // Agent loop
+        loop {
+            // Each iteration runs behind a `Send` trait object. The loop's
+            // phases nest one async fn inside another, and proving `Send` for
+            // a caller that spawns `run` (the supervisor's health checks)
+            // walks that whole nesting — deep enough, through the streaming
+            // LLM call, to exceed the compiler's recursion limit. Boxing
+            // proves it once, here, from a shallow start.
+            let iteration: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Pass> + Send + '_>,
+            > = Box::pin(self.run_iteration(&mut state, &options, &mut limits));
+            match iteration.await {
+                ControlFlow::Continue(()) | ControlFlow::Break(RunExit::Next) => {}
+                ControlFlow::Break(RunExit::Respond { truncated }) => {
+                    return Ok(state.into_response(truncated));
+                }
+                ControlFlow::Break(RunExit::Cancelled) => {
+                    return self.finish_cancelled(state, &options).await;
+                }
+                ControlFlow::Break(RunExit::Fail(error)) => return Err(error),
+            }
+        }
+    }
+
+    /// One iteration of the agent loop: one LLM call and what follows it.
+    /// `Break` ends the iteration early (see [`RunExit`]).
+    async fn run_iteration(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        limits: &mut RunLimits,
+    ) -> Pass {
+        self.begin_iteration(state, options, limits).await?;
+
+        let window_shrink_note = self.rebind_live_window(state, limits).await;
+        let tool_pressure_note = self
+            .check_context_floor(
+                state,
+                options,
+                limits.configured_window,
+                window_shrink_note.is_some(),
+            )
+            .await?;
+        self.run_compression_ladder().await;
+        self.deliver_ladder_notices(window_shrink_note, tool_pressure_note)
+            .await;
+
+        let (mut request, routed_model, complexity) =
+            self.build_iteration_request(state, options).await;
+
+        // If there's already streamed text from a previous iteration, emit a
+        // space separator so the next text block doesn't merge with the last one.
+        if state.iterations > 1
+            && !state.final_text.is_empty()
+            && !state.final_text.ends_with(' ')
+            && !state.final_text.ends_with('\n')
+            && let Some(ref on_text) = options.on_text {
+                on_text(" ");
+            }
+
+        let (result, llm_latency, escalated) = self
+            .call_with_escalation(
+                &mut request,
+                state,
+                options,
+                routed_model.is_some(),
+                complexity,
+            )
+            .await;
+        let result = self
+            .heal_unserved_tool_rejection(&mut request, result, state, options)
+            .await;
+        let result = self
+            .retry_after_context_overflow(&mut request, result, state, options)
+            .await;
+        let mut result = Self::settle_llm_result(state, result)?;
+        self.record_llm_call(
+            state,
+            options,
+            &request.model,
+            &result,
+            LlmCallMeta {
+                latency: llm_latency,
+                routed: routed_model.is_some(),
+                escalated,
+                complexity,
+            },
+        )
+        .await;
+        self.post_hoc_spiral_nudge(state, &result).await?;
+        Self::enforce_token_budget(state, options)?;
+
+        let salvage = self.salvage_prose_calls(state, &mut result).await;
+
+        // Store assistant response
+        self.store_assistant_response(&result.content_blocks).await;
+
+        // Tool result eviction: once the LLM has responded referencing tool results,
+        // replace old large tool results with compact stubs since the information
+        // has been synthesized into the assistant's response.
+        self.evict_referenced_tool_results(&result.content_blocks)
+            .await;
+
+        // Update final text
+        if !result.text.is_empty() {
+            state.final_text = result.text;
+        }
+        // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
+        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            // Content blocks may already be stored above — finish_cancelled
+            // de-dupes the cancel marker message.
+            return ControlFlow::Break(RunExit::Cancelled);
+        }
+
+        // If no tool calls, check for narration loop before exiting.
+        // A round whose structured calls ALL had malformed JSON
+        // (`tool_uses` empty but `error_tool_results` present) is NOT
+        // tool-free: it falls through to the tool path below so the
+        // synthesized error results get stored paired with the assistant
+        // turn's placeholder tool_use blocks. Exiting here dropped them —
+        // the model never learned its call was unparseable, and the
+        // stored turn kept tool_use blocks with no tool_result.
+        if result.tool_uses.is_empty() && result.error_tool_results.is_empty() {
+            return ControlFlow::Break(
+                self.finish_tool_free_round(state, options, &salvage, routed_model.as_deref())
+                    .await,
+            );
+        }
+
+        // Tools are off on the wrap-up iteration; a model that emits
+        // call-shaped output anyway (some providers echo tool JSON as
+        // content) gets its report synthesized rather than executed —
+        // the step is over.
+        if state.wrap_up.engaged {
+            warn!(
+                attempted_calls = result.tool_uses.len(),
+                "wrap-up iteration attempted tool calls — ending the step with a \
+                 synthesized report instead"
+            );
+            if state.final_text.trim().is_empty() {
+                state.final_text = step_activity_digest(&state.tool_records);
+            }
+            let truncated = state.wrap_up.truncated;
+            return ControlFlow::Break(RunExit::Respond { truncated });
+        }
+
+        self.run_tool_round(
+            state,
+            options,
+            &result.tool_uses,
+            result.error_tool_results,
+            routed_model.as_deref(),
+        )
+        .await?;
+        self.after_tool_round(state, options).await;
+        ControlFlow::Continue(())
+    }
+
+    /// Size the context for the model, seed the run state, and add the
+    /// user's message — everything the agent loop needs before its first
+    /// iteration.
+    async fn prepare_run(&self, message: &str, options: &RunOptions) -> (RunState, RunLimits) {
         // Resolve model limits from the provider before any context budgeting.
         // This also refreshes the shared disk cache used by synchronous callers.
         let model_cache = nanna_llm::ModelInfoCache::default_location();
@@ -4179,7 +4473,7 @@ impl Agent {
         // num_ctx latch), so a step starting AFTER a demotion budgets small
         // from its first token. The loop below re-reads the latch every
         // iteration and re-derives when it shrinks mid-run.
-        let mut configured_window = model_info.context_window;
+        let configured_window = model_info.context_window;
 
         // Mission mode: put the completion contract in the system prompt UP
         // FRONT — the model must know from turn one that it works until
@@ -4207,7 +4501,7 @@ impl Agent {
         state.task_anchor = resolve_task_anchor(options.task_anchor.as_deref(), message);
 
         // Add user message with optional budget awareness
-        self.add_user_message_with_budget(message, &options).await;
+        self.add_user_message_with_budget(message, options).await;
 
         // Pre-activate all tools for sub-agents so they don't waste a turn on discover_tools
         if options.tool_activation.all_tools_active {
@@ -4230,1460 +4524,84 @@ impl Agent {
                 "Pre-activated scoped tools for harness step"
             );
         }
+        let limits = RunLimits {
+            model_info,
+            thinking_reserve_tokens,
+            configured_window,
+            max_iterations,
+            run_started,
+        };
+        (state, limits)
+    }
 
-        // Agent loop
-        loop {
-            // Check cancellation
-            if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                return self.finish_cancelled(state, &options).await;
-            }
+    /// The iteration's opening checks: cancellation, the wall-clock and
+    /// iteration caps, budget visibility and wrap-up nudges.
+    async fn begin_iteration(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        limits: &RunLimits,
+    ) -> Pass {
+        // Check cancellation
+        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return ControlFlow::Break(RunExit::Cancelled);
+        }
 
-            // Bounded blast radius (P14): a per-run wall-clock cap set by the
-            // caller (never a default) ends the run cleanly instead of letting
-            // a stuck run burn a GPU for hours.
-            if let Some(cap) = options.max_wall_clock
-                && run_started.elapsed() >= cap {
-                    warn!(
-                        elapsed_secs = run_started.elapsed().as_secs(),
-                        cap_secs = cap.as_secs(),
-                        "Wall-clock budget exhausted, stopping agent"
-                    );
-                    state.final_text = format!(
-                        "{}\n\n[Wall-clock budget exhausted: {}s of {}s used]",
-                        state.final_text,
-                        run_started.elapsed().as_secs(),
-                        cap.as_secs()
-                    );
-                    return Ok(state.into_response(true));
-                }
-
-            // Budget visibility (P14): once past 80% of the token budget, tell
-            // the model — an agent that knows its budget plans around it.
-            if let Some(budget) = options.token_budget {
-                let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
-                if !state.steering.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
-                    state.steering.budget_warned = true;
-                    let note = budget_warning_message(
-                        cumulative,
-                        budget,
-                        state.task_anchor.as_deref(),
-                    );
-                    let mut ctx = self.context.write().await;
-                    ctx.messages.push(AnthropicMessage::user_text(&note));
-                }
-            }
-
-            state.iterations += 1;
-            if let Some(max) = max_iterations {
-                if state.iterations > max
-                    && !state.wrap_up.engaged
-                    && state.final_text.trim().is_empty()
-                    && !state.tool_records.is_empty()
-                {
-                    // Reserve ONE tools-off iteration past the cap instead of
-                    // returning silence: the run did real work and never got
-                    // to say so, and a silent step contributes nothing to
-                    // what the next step (or the user) knows. The engaged
-                    // flag makes this branch unreachable a second time.
-                    self.engage_wrap_up(
-                        &mut state,
-                        "the step's iteration budget is spent",
-                        true,
-                    )
-                    .await;
-                } else if state.iterations > max {
-                    // Extract memories before bailing — don't lose a long run's knowledge
-                    if options.analysis.auto_extract_memories
-                        && let Some(ref on_memory) = options.on_memory
-                            && let Ok(memories) = self.extract_memories().await {
-                                for memory in memories {
-                                    on_memory(memory).await;
-                                }
-                            }
-                    warn!(
-                        iterations = state.iterations,
-                        max = max,
-                        final_text_len = state.final_text.len(),
-                        "Agent hit max iterations limit, returning truncated response"
-                    );
-                    if state.final_text.trim().is_empty() {
-                        state.final_text = step_activity_digest(&state.tool_records);
-                    }
-                    return Ok(state.into_response(true));
-                }
-            }
-
-            // Progressive wrap-up nudges: escalating, config-driven, and LATE. The
-            // agent is meant to run long, so nudges only begin at
-            // `nudge_after_iterations` (default 500) and repeat every
-            // `nudge_interval_iterations` (default 100). They only STEER a possibly-stuck
-            // model; they never stop the loop — termination is `max_iterations`
-            // (default unlimited) or cancellation.
-            if let Some(level) = wrapup_nudge_due(
-                state.iterations,
-                self.config.nudge_after_iterations,
-                self.config.nudge_interval_iterations,
-                state.wrapup_nudge_count,
-            ) {
-                let msg =
-                    wrapup_nudge_message(level, state.iterations, state.task_anchor.as_deref());
-                state.wrapup_nudge_count += 1;
-                info!(
-                    iteration = state.iterations,
-                    nudge_count = state.wrapup_nudge_count,
-                    ?level,
-                    "⏰ Injecting wrap-up nudge"
-                );
-                let nudge = AnthropicMessage::user_text(&msg);
-                let mut ctx = self.context.write().await;
-                ctx.messages.push(nudge);
-            }
-
-            debug!(
-                iterations = state.iterations,
-                max = ?max_iterations,
-                "Agent iteration"
-            );
-
-            // Adaptive window rebind: a VRAM-pressure demotion (nanna-llm
-            // demote_context) rewrites the runner's effective num_ctx while
-            // this loop is mid-flight. Budgets derived from the old window
-            // would overflow every subsequent prompt — Ollama truncates
-            // model-side, SILENTLY, and the model loses its own task
-            // (observed 2026-08-02: a silent 16384→4096 demotion turned a
-            // 4-hour eval into 1/42). A smaller window means MORE
-            // compression, announced, with the run continuing: re-derive all
-            // budgets from the live window here, and the tiered compression
-            // ladder directly below shrinks history down to the new
-            // thresholds in this same iteration.
-            let live_window =
-                nanna_llm::effective_context_window(&self.config.model, configured_window);
-            let mut window_shrink_note: Option<String> = None;
-            if live_window != configured_window {
-                let live_info = nanna_llm::clamp_model_info_to_effective_window(
-                    &self.config.model,
-                    model_info.clone(),
-                );
-                let mut ctx = self.context.write().await;
-                // Same window-scaled reserve derivation as run start — the
-                // PR #156 re-derivation path recomputes it from the LIVE
-                // window, so a demotion shrinks the output reserve
-                // proportionally instead of letting a stale half-window
-                // claim starve the input side.
-                ctx.configure_for_model_with_output(
-                    &live_info,
-                    window_scaled_output_reserve(
-                        live_info.context_window,
-                        self.config.max_tokens as usize,
-                    ) + thinking_reserve_tokens,
-                );
+        // Bounded blast radius (P14): a per-run wall-clock cap set by the
+        // caller (never a default) ends the run cleanly instead of letting
+        // a stuck run burn a GPU for hours.
+        if let Some(cap) = options.max_wall_clock
+            && limits.run_started.elapsed() >= cap {
                 warn!(
-                    model = %self.config.model,
-                    old_window = configured_window,
-                    new_window = live_window,
-                    compression_threshold = ctx.compression_threshold,
-                    hard_limit = ctx.hard_limit,
-                    workspace_cap_chars = ctx.workspace_context_cap_chars(),
-                    "Effective context window changed mid-run — budgets re-derived; \
-                     compression ladder will shrink history to fit"
+                    elapsed_secs = limits.run_started.elapsed().as_secs(),
+                    cap_secs = cap.as_secs(),
+                    "Wall-clock budget exhausted, stopping agent"
                 );
-                window_shrink_note = Some(window_shrink_notice(
-                    configured_window,
-                    live_window,
+                state.final_text = format!(
+                    "{}\n\n[Wall-clock budget exhausted: {}s of {}s used]",
+                    state.final_text,
+                    limits.run_started.elapsed().as_secs(),
+                    cap.as_secs()
+                );
+                return ControlFlow::Break(RunExit::Respond { truncated: true });
+            }
+
+        // Budget visibility (P14): once past 80% of the token budget, tell
+        // the model — an agent that knows its budget plans around it.
+        if let Some(budget) = options.token_budget {
+            let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
+            if !state.steering.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
+                state.steering.budget_warned = true;
+                let note = budget_warning_message(
+                    cumulative,
+                    budget,
                     state.task_anchor.as_deref(),
-                ));
-                configured_window = live_window;
-            }
-
-            // Floor: below the irreducible prompt, adaptation is impossible.
-            // Compression shrinks history, never the system prompt, tool
-            // definitions, step frame, or output reserve — so when the window
-            // drops under their sum the ONLY honest move is a loud stop (the
-            // step/eval is resumable); anything else is a silently truncated
-            // prompt. Scoped to models the runner latch actually governs (a
-            // latch exists only once the Ollama sizing/demotion path has run;
-            // cloud models keep their provider-error path) and checked on the
-            // first iteration (a fresh step may start already-demoted) and
-            // again on every further shrink.
-            let mut tool_pressure_note: Option<String> = None;
-            if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
-                && (state.iterations == 1 || window_shrink_note.is_some())
-            {
-                let restrict = options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active;
-                let mut floor = self.context_floor(&state.active_tools, restrict).await;
-                if configured_window < floor.total() {
-                    // Before giving up, try the PRESSURE tier: the floor's
-                    // tool term counts every definition the run has
-                    // accumulated, but the smallest request this step could
-                    // send carries only the core baseline + the work-evidence
-                    // set (everything else stays one discover_tools call
-                    // away). Only a strict improvement engages — when the
-                    // reduced set measures no smaller (e.g. nothing beyond
-                    // the working set was active), the full floor stands.
-                    let pressure_active = pressure_tier_active_tools();
-                    let pressure_floor = self.context_floor(&pressure_active, restrict).await;
-                    if pressure_floor.total() < floor.total() {
-                        if configured_window >= pressure_floor.total() {
-                            let full_names =
-                                tool_names_for_request(&state.active_tools, restrict);
-                            let reduced_names =
-                                tool_names_for_request(&pressure_active, restrict);
-                            let mut dropped: Vec<String> =
-                                full_names.difference(&reduced_names).cloned().collect();
-                            dropped.sort();
-                            warn!(
-                                model = %self.config.model,
-                                effective_window = configured_window,
-                                full_floor = floor.total(),
-                                pressure_floor = pressure_floor.total(),
-                                full_tool_tokens = floor.tool_tokens,
-                                pressure_tool_tokens = pressure_floor.tool_tokens,
-                                dropped = %dropped.join(", "),
-                                "Window cannot fit the full tool catalog above \
-                                 the context floor — degrading to the pressure \
-                                 tier (core + work-evidence tools; the rest \
-                                 stay reachable via discover_tools)"
-                            );
-                            tool_pressure_note = Some(tool_pressure_notice(
-                                configured_window,
-                                &dropped,
-                                state.task_anchor.as_deref(),
-                            ));
-                            state.active_tools = pressure_active;
-                        }
-                        // Either way the honest minimum for the loud-failure
-                        // check below is the PRESSURE-tier floor — the
-                        // smallest request this step could possibly send.
-                        floor = pressure_floor;
-                    }
-                }
-                if configured_window < floor.total() {
-                    warn!(
-                        model = %self.config.model,
-                        effective_window = configured_window,
-                        floor = floor.total(),
-                        system_tokens = floor.system_tokens,
-                        tool_tokens = floor.tool_tokens,
-                        frame_tokens = floor.frame_tokens,
-                        output_reserve = floor.output_reserve,
-                        "Effective window below the minimum viable window — \
-                         stopping loudly (no compression can fit this step)"
-                    );
-                    return Err(AgentError::ContextBelowFloor {
-                        effective_window: configured_window,
-                        floor: floor.total(),
-                        system_tokens: floor.system_tokens,
-                        tool_tokens: floor.tool_tokens,
-                        frame_tokens: floor.frame_tokens,
-                        output_reserve: floor.output_reserve,
-                    });
-                }
-            }
-
-            // Tiered context compression before API call
-            {
-                let mut ctx = self.context.write().await;
-                let estimated = ctx.estimate_tokens();
-                let compression_threshold = ctx.compression_threshold;
-                let hard_limit = ctx.hard_limit;
-                // Measured headroom: growth since the previous ladder pass,
-                // max'd over the run ([`crate::context::ContextGrowthTracker`]).
-                // The Tier-1 trigger derives from it instead of a fixed
-                // 40%-of-threshold tuned for 200k windows — on a 16384-token
-                // window that constant fired 80× at 4423 tokens with ~3.7k
-                // tokens of real headroom still free.
-                let growth_since_last = ctx.growth.observe(estimated);
-
-                // Tier 1 (proactive): fire only when the run's own measured
-                // growth says the NEXT interval could cross the compression
-                // threshold. Prefer selective older-tool-result compression
-                // (LLMLingua via the summarization-model settings) before
-                // dropping messages wholesale. Keep at least 20 recent
-                // messages so the agent retains working context.
-                // Against the MESSAGE-side budget, the same quantity Tier 2
-                // now gates on. Both rungs used the raw threshold before, so
-                // their bands were disjoint by construction; leaving this one
-                // raw while Tier 2 deducts the preamble opens a band
-                // (`CT - preamble < estimated <= CT`) where BOTH fire in the
-                // same pass — dropping messages and then summarizing them —
-                // which destroys more history per pass than doing neither.
-                // That band is non-empty whenever a preamble exists, which is
-                // every chat carrying verified work.
-                if crate::context::proactive_compression_due(
-                    estimated,
-                    ctx.growth.max_observed_growth,
-                    ctx.message_compression_threshold(),
-                ) {
-                    info!(
-                        estimated_tokens = estimated,
-                        max_observed_growth = ctx.growth.max_observed_growth,
-                        growth_since_last = growth_since_last,
-                        compression_threshold = compression_threshold,
-                        tier = "proactive",
-                        "Tier 1: proactive compression triggered (measured headroom)"
-                    );
-
-                    let compressed_results =
-                        self.compress_older_context_tool_results(&mut ctx, 20).await;
-
-                    if compressed_results == 0 {
-                        let dropped = ctx.drop_oldest(20);
-                        if dropped > 0 {
-                            info!(
-                                dropped_messages = dropped,
-                                "Tier 1 compression complete (drop fallback)"
-                            );
-                            ctx.push_summarization_failure_notice(
-                                dropped,
-                                "proactive compression found no tool results \
-                                 to shrink, and measured growth says the next \
-                                 step could overflow the context window",
-                            );
-                        }
-                    } else {
-                        info!(
-                            compressed_results = compressed_results,
-                            estimated_tokens = ctx.estimate_tokens(),
-                            "Tier 1 compression complete (LLMLingua selective)"
-                        );
-                    }
-                }
-
-                // Tier 2 (standard): When exceeding compression_threshold, full summarization if available
-                if ctx.needs_compression() && !ctx.exceeds_hard_limit() {
-                    if self.config.summarization_priority.is_empty() {
-                        info!(
-                            estimated_tokens = estimated,
-                            compression_threshold = compression_threshold,
-                            tier = "standard",
-                            "Tier 2: no summarization models, dropping oldest"
-                        );
-                        let dropped = ctx.drop_oldest(16);
-                        ctx.push_summarization_failure_notice(
-                            dropped,
-                            "no summarization models are configured",
-                        );
-                    } else {
-                        let summarization_config = ContextSummarizationConfig {
-                            model_priority: self.config.summarization_priority.clone(),
-                            ollama_url: self.config.summarization_ollama_url.clone(),
-                            max_iterations: 20,
-                            openrouter_api_key: self.config.openrouter_api_key.clone(),
-                            openai_api_key: self.config.openai_api_key.clone(),
-                        };
-                        info!(
-                            estimated_tokens = estimated,
-                            compression_threshold = compression_threshold,
-                            tier = "standard",
-                            "Tier 2: standard summarization triggered"
-                        );
-                        // Summarizer failures are handled inside: it truncates
-                        // and announces the loss itself.
-                        let iterations = ctx
-                            .enforce_limits_with_summarization(
-                                &summarization_config,
-                                crate::context::SummarizationTarget::CompressionThreshold,
-                            )
-                            .await;
-                        if iterations > 0 {
-                            info!(
-                                iterations = iterations,
-                                new_tokens = ctx.estimate_tokens(),
-                                "Tier 2 summarization complete"
-                            );
-                        }
-                    }
-                }
-
-                // Tier 3 (hard cap): When exceeding hard_limit, aggressive truncation
-                if ctx.exceeds_hard_limit() {
-                    let estimated = ctx.estimate_tokens();
-
-                    if self.config.summarization_priority.is_empty() {
-                        warn!(
-                            estimated_tokens = estimated,
-                            hard_limit = hard_limit,
-                            tier = "hard_cap",
-                            "Tier 3: hard limit exceeded, truncating"
-                        );
-                        let dropped = ctx.truncate_to_limit();
-                        ctx.push_summarization_failure_notice(
-                            dropped,
-                            "no summarization models are configured and the \
-                             context exceeded the hard input limit",
-                        );
-                    } else {
-                        let summarization_config = ContextSummarizationConfig {
-                            model_priority: self.config.summarization_priority.clone(),
-                            ollama_url: self.config.summarization_ollama_url.clone(),
-                            max_iterations: 20,
-                            openrouter_api_key: self.config.openrouter_api_key.clone(),
-                            openai_api_key: self.config.openai_api_key.clone(),
-                        };
-                        warn!(
-                            estimated_tokens = estimated,
-                            hard_limit = hard_limit,
-                            tier = "hard_cap",
-                            "Tier 3: hard limit exceeded, aggressive summarization"
-                        );
-                        // Summarizer failures are handled inside: it truncates
-                        // and announces the loss itself.
-                        let iterations = ctx
-                            .enforce_limits_with_summarization(
-                                &summarization_config,
-                                crate::context::SummarizationTarget::HardLimit,
-                            )
-                            .await;
-                        if iterations > 0 {
-                            info!(
-                                iterations = iterations,
-                                new_tokens = ctx.estimate_tokens(),
-                                "Tier 3 summarization complete"
-                            );
-                        }
-                    }
-                }
-            }
-
-            // The shrink notice goes in AFTER the ladder ran so compression
-            // cannot drop its own announcement: the model must see WHAT
-            // happened and WHY, or the suddenly-shorter history reads as
-            // corruption (the restart-spiral failure class). Same for the
-            // tool-pressure notice — a tool set that silently thins between
-            // turns reads exactly like the deleted-definitions failure class
-            // (observed live: an unbounded workspace injection ate qwen's
-            // tool defs and the run spiraled).
-            if let Some(note) = window_shrink_note.take() {
+                );
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(AnthropicMessage::user_text(&note));
             }
-            if let Some(note) = tool_pressure_note.take() {
-                let mut ctx = self.context.write().await;
-                ctx.messages.push(AnthropicMessage::user_text(&note));
-            }
-            // Loss announcements composed inside the ladder (summarization
-            // failures, un-summarized drops) land AFTER it for the same
-            // reason as the notes above: compression must never drop its own
-            // announcement. Then re-baseline the growth tracker so the next
-            // ladder entry measures only NEW material — the model response
-            // and tool results of one interval — never compression's effect
-            // or these notices.
+        }
+
+        state.iterations += 1;
+        if let Some(max) = limits.max_iterations {
+            if state.iterations > max
+                && !state.wrap_up.engaged
+                && state.final_text.trim().is_empty()
+                && !state.tool_records.is_empty()
             {
-                let mut ctx = self.context.write().await;
-                let notices = ctx.take_pending_loss_notices();
-                for notice in notices {
-                    ctx.messages.push(AnthropicMessage::user_text(&notice));
-                }
-                let post_ladder = ctx.estimate_tokens();
-                ctx.growth.rebaseline(post_ladder);
-            }
-
-            // Model routing: classify complexity and pick cheapest capable model
-            let routed_model = self.route_model(&state, options.step_kind).await;
-
-            // Build and execute LLM request
-            let mut request = self
-                .build_request_with_thinking(
-                    options.thinking_mode,
-                    &state.active_tools,
-                    options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
+                // Reserve ONE tools-off iteration past the cap instead of
+                // returning silence: the run did real work and never got
+                // to say so, and a silent step contributes nothing to
+                // what the next step (or the user) knows. The engaged
+                // flag makes this branch unreachable a second time.
+                self.engage_wrap_up(
+                    state,
+                    "the step's iteration budget is spent",
+                    true,
                 )
                 .await;
-            // A planning step asks for one JSON answer and may not act:
-            // advertising tools invites the model to spend its single
-            // planning iteration on a tool call instead of the plan.
-            // Observed live 2026-08-08 (ornith, GUI mission): EVERY chat
-            // plan and continuation replan burned its one iteration on
-            // discover_tools, degraded to the fallback single task, and the
-            // turn died "dry" at 13/42 six minutes in. No tools sent means
-            // the only possible answer is the plan itself.
-            if matches!(options.step_kind, Some(crate::harness::StepKind::Plan)) {
-                request.tools = None;
-            }
-            // The reserved wrap-up iteration is text-only by construction:
-            // with no definitions served, the model cannot spend its final
-            // say on another tool call.
-            if state.wrap_up.engaged {
-                request.tools = None;
-            }
-            if let Some(ref routed) = routed_model {
-                // Strip provider prefix for the API request model field
-                // but keep the full spec for client routing
-                if let Some((_provider, model_name)) = routed.split_once('/') {
-                    request.model = model_name.to_string();
-                } else {
-                    request.model = routed.clone();
-                }
-                // Update cache_control based on new model
-                request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
-                // `thinking` and `temperature` were derived from the CONFIGURED
-                // model a moment ago; routing has just replaced it with a
-                // different one, and those two fields are contract-bound per
-                // model generation. Routing a legacy-configured agent to
-                // `claude-opus-5` would otherwise ship `budget_tokens` to a
-                // model that rejects it — a 400 on every routed step, which
-                // `should_escalate` then retries on the primary, so routing
-                // silently degrades into doubled latency and a false failure
-                // record against the routed model rather than an visible error.
-                let routed_contract = nanna_llm::anthropic_model_contract(&request.model);
-                let routed_mode = options.thinking_mode.unwrap_or(self.config.thinking_mode);
-                // Fetched, not read from cache. Nothing ever fetches info for a
-                // routing tier — every `get_model_info` call site passes the
-                // configured model — so a tier that has never been the active
-                // model is a guaranteed cache MISS, and a miss returns the
-                // unknown-model floor (32k window / 4k output). Sizing the
-                // ceiling from that would hand a routed step ~1k tokens of
-                // visible answer after reasoning, permanently, on every install.
-                let routed_cache = nanna_llm::ModelInfoCache::default_location();
-                let routed_info = self
-                    .llm
-                    .get_model_info(&request.model, routed_cache.as_ref())
-                    .await;
-                // The ceiling first, because the thinking shape is derived
-                // against it. It has to be rebuilt too: the original was sized
-                // from the configured model's window, output cap AND thinking
-                // contract, none of which transfer — a legacy-configured agent
-                // contributes no reasoning headroom, so routing to an adaptive
-                // model would hand it a ceiling with no room to think in.
-                request.max_tokens = request_output_budget(
-                    &request.model,
-                    &routed_info,
-                    window_scaled_output_reserve(
-                        routed_info.context_window,
-                        self.config.max_tokens as usize,
-                    ),
-                    routed_mode,
-                    self.llm.provider() == nanna_llm::Provider::Anthropic,
-                );
-                request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
-                    thinking_for_model(routed_contract, routed_mode, request.max_tokens)
-                } else {
-                    None
-                };
-                let routed_thinks = request
-                    .thinking
-                    .as_ref()
-                    .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
-                request.temperature = if nanna_llm::is_claude_model(&request.model)
-                    && (routed_contract.sampling_removed || routed_thinks)
-                {
-                    None
-                } else {
-                    Some(self.config.temperature)
-                };
-            }
-            let complexity = if routed_model.is_some() {
-                Some(self.classify_complexity(&state, options.step_kind).await)
-            } else {
-                None
-            };
-
-            // If there's already streamed text from a previous iteration, emit a
-            // space separator so the next text block doesn't merge with the last one.
-            if state.iterations > 1
-                && !state.final_text.is_empty()
-                && !state.final_text.ends_with(' ')
-                && !state.final_text.ends_with('\n')
-                && let Some(ref on_text) = options.on_text {
-                    on_text(" ");
-                }
-
-            // Call LLM with escalation: if a routed (cheap) model fails, retry with primary
-            let llm_start = std::time::Instant::now();
-            let mut result = self.call_llm(&request, &options, &mut state).await;
-            let mut llm_latency = llm_start.elapsed();
-            let mut escalated = false;
-
-            // Escalation: if routed model failed or returned malformed tool calls, retry with primary
-            if routed_model.is_some() {
-                let should_escalate = result.as_ref().map_or(true, |r| {
-                    // Check for malformed tool calls (empty name or unparseable JSON)
-                    r.tool_uses.iter().any(|(_, name, _)| name.is_empty())
-                });
-                if should_escalate {
-                    let escalation_reason = match &result {
-                        Err(e) => format!("error: {e}"),
-                        Ok(r) => {
-                            let bad_tools: Vec<_> = r
-                                .tool_uses
-                                .iter()
-                                .filter(|(_, name, _)| name.is_empty())
-                                .map(|(id, _, _)| id.as_str())
-                                .collect();
-                            format!("malformed tool calls: {bad_tools:?}")
-                        }
-                    };
-                    warn!(
-                        failed_model = %request.model,
-                        reason = %escalation_reason,
-                        "⬆️ Escalating: routed model failed, retrying with primary model"
-                    );
-                    // Record failure on the cheap model
-                    if let Some(ref tracker) = self.stats {
-                        tracker
-                            .record(crate::model_stats::RequestObservation {
-                                model: request.model.clone(),
-                                success: false,
-                                latency: llm_latency,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cache_read_tokens: 0,
-                                cache_creation_tokens: 0,
-                                cache_creation_1h_tokens: 0,
-                                tier: complexity,
-                                escalated: false,
-                            })
-                            .await;
-                    }
-                    // Rebuild request with primary model. Everything the
-                    // routing swap re-derived has to be re-derived back:
-                    // `max_tokens`, `thinking` and `temperature` were all
-                    // rebuilt against the ROUTED tier's window, output cap and
-                    // contract, none of which describe the primary. Restoring
-                    // only the name left the rescue turn running on the cheap
-                    // tier's ceiling — and if that tier's model info was a
-                    // cache miss it was the 4096 unknown floor, so the retry
-                    // that exists to save the turn truncated it instead.
-                    request.model = self.config.model.clone();
-                    request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
-                    let primary_contract =
-                        nanna_llm::anthropic_model_contract(&request.model);
-                    let primary_mode =
-                        options.thinking_mode.unwrap_or(self.config.thinking_mode);
-                    let primary_info = nanna_llm::model_info_from_cache_or_unknown(
-                        &request.model,
-                        "",
-                    );
-                    request.max_tokens = request_output_budget(
-                        &request.model,
-                        &primary_info,
-                        window_scaled_output_reserve(
-                            primary_info.context_window,
-                            self.config.max_tokens as usize,
-                        ),
-                        primary_mode,
-                        self.llm.provider() == nanna_llm::Provider::Anthropic,
-                    );
-                    request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic
-                    {
-                        thinking_for_model(primary_contract, primary_mode, request.max_tokens)
-                    } else {
-                        None
-                    };
-                    let primary_thinks = request
-                        .thinking
-                        .as_ref()
-                        .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
-                    request.temperature = if nanna_llm::is_claude_model(&request.model)
-                        && (primary_contract.sampling_removed || primary_thinks)
-                    {
-                        None
-                    } else {
-                        Some(self.config.temperature)
-                    };
-                    let escalation_start = std::time::Instant::now();
-                    result = self.call_llm(&request, &options, &mut state).await;
-                    llm_latency = escalation_start.elapsed();
-                    escalated = true;
-                }
-            }
-
-            // Heal a provider-side unserved-tool rejection: the model reached
-            // for a tool by name (it knows the canonical names from the system
-            // prompt) without discovering it first, and the provider validated
-            // that name against the request's `tools` array and failed the
-            // whole exchange — see [`provider_unknown_tool_name`]. The tool
-            // exists and the model asked for it, so the heal performs the same
-            // activation `discover_tools` would have, triggered by the
-            // provider's own signal, and re-sends. Bounded by construction,
-            // not by a cap: a retry happens only when the named tool NEWLY
-            // resolves to something this request was not already serving, and
-            // the registry is finite, so each pass strictly grows the served
-            // set and the chain cannot cycle.
-            while let Err(ref e) = result {
-                let msg = e.to_string();
-                let Some(wanted) = provider_unknown_tool_name(&msg) else {
-                    break;
-                };
-                let Some((canonical, _)) = self.tools.resolve_tool(wanted).await else {
-                    // Nothing registered under that name — not healable by
-                    // serving a definition; let the normal error path run.
-                    break;
-                };
-                // Serve it under both the name the model reached for and its
-                // canonical resolution (an unregistered alias serves nothing
-                // and costs nothing). Non-short-circuiting `|`: both inserts
-                // must run so a repeat of either name reads as already-served.
-                let newly_served = state.active_tools.insert(canonical.clone())
-                    | state.active_tools.insert(wanted.to_string());
-                if !newly_served {
-                    // Already serving it — same message, different fault.
-                    break;
-                }
-                warn!(
-                    tool = %wanted,
-                    canonical = %canonical,
-                    error = %msg,
-                    "Provider rejected a call to an unserved tool — activating \
-                     it and retrying the request"
-                );
-                request.tools = self
-                    .request_tool_defs(
-                        &state.active_tools,
-                        options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
-                    )
-                    .await;
-                result = self.call_llm(&request, &options, &mut state).await;
-            }
-
-            // Handle context_length_exceeded: emergency truncate and retry once
-            let result = match result {
-                Err(ref e) if Self::is_context_length_error(&e.to_string()) => {
-                    let err_msg = e.to_string();
-                    let est_tokens = self.context.read().await.estimate_request_tokens();
-                    warn!(
-                        error = err_msg,
-                        estimated_tokens = est_tokens,
-                        "Context length exceeded — emergency truncating and retrying"
-                    );
-                    {
-                        let mut ctx = self.context.write().await;
-                        // Aggressive: drop half the messages, then truncate to hard limit
-                        let keep = ctx.messages.len() / 2;
-                        if keep > 2 {
-                            ctx.drop_oldest(keep);
-                        }
-                        ctx.truncate_to_limit();
-                        let remaining = ctx.messages.len();
-                        let est_after = ctx.estimate_request_tokens();
-                        info!(
-                            remaining_messages = remaining,
-                            estimated_tokens = est_after,
-                            "Context emergency-truncated"
-                        );
-                        // Rebuild request with trimmed context
-                        request.messages = ctx.messages_for_request();
-                    }
-                    self.call_llm(&request, &options, &mut state).await
-                }
-                other => other,
-            };
-
-            // The reserved wrap-up iteration must not turn a report into an
-            // error: if its one LLM call fails, synthesize the report from
-            // the tool record and end the step the way it was going to end.
-            let mut result = match result {
-                Err(e) if state.wrap_up.engaged => {
-                    warn!(
-                        error = %e,
-                        "wrap-up iteration failed — synthesizing the step report"
-                    );
-                    if state.final_text.trim().is_empty() {
-                        state.final_text = step_activity_digest(&state.tool_records);
-                    }
-                    let truncated = state.wrap_up.truncated;
-                    return Ok(state.into_response(truncated));
-                }
-                other => other?,
-            };
-
-            // Record model statistics
-            let actual_model = request.model.clone();
-            let was_routed = routed_model.is_some() && !escalated;
-            let tier_label = if escalated {
-                "escalated".to_string()
-            } else {
-                complexity.map_or_else(|| "primary".to_string(), |c| format!("{c:?}").to_lowercase())
-            };
-
-            state
-                .model_stats
-                .push(crate::model_stats::RequestModelStats {
-                    model: actual_model.clone(),
-                    was_routed,
-                    tier: tier_label,
-                    latency_ms: millis_u64(llm_latency),
-                    throughput_tps: if llm_latency.as_millis() > 0 {
-                        f64::from(result.output_tokens) / llm_latency.as_secs_f64()
-                    } else {
-                        0.0
-                    },
-                    cache_read_tokens: result.cache_read_tokens,
-                    cache_creation_tokens: result.cache_creation_tokens,
-                    cache_creation_1h_tokens: result.cache_creation_1h_tokens,
-                    input_tokens: result.input_tokens,
-                    output_tokens: result.output_tokens,
-                    // The live latch, not `configured_window`: an escalated or
-                    // routed request may run a different model than the one
-                    // the loop budgets for.
-                    effective_context_window: nanna_llm::LlmClient::effective_num_ctx(
-                        &actual_model,
-                    )
-                    .map(|n| n as usize),
-                });
-
-            if let Some(ref tracker) = self.stats {
-                tracker
-                    .record(crate::model_stats::RequestObservation {
-                        model: actual_model,
-                        success: true,
-                        latency: llm_latency,
-                        input_tokens: result.input_tokens,
-                        output_tokens: result.output_tokens,
-                        cache_read_tokens: result.cache_read_tokens,
-                        cache_creation_tokens: result.cache_creation_tokens,
-                        cache_creation_1h_tokens: result.cache_creation_1h_tokens,
-                        tier: complexity,
-                        escalated,
-                    })
-                    .await;
-            }
-
-            state.input_tokens += result.input_tokens;
-            state.output_tokens += result.output_tokens;
-            if let Some(ref on_usage) = options.on_usage {
-                let window = { self.context.read().await.hard_limit } as u64;
-                on_usage(result.input_tokens, result.output_tokens, window);
-            }
-
-            // Post-hoc thinking spiral detection (catches sync/non-streaming path
-            // where we can't abort mid-stream)
-            if !state.nudges.thinking_spiral
-                && result.tool_uses.is_empty()
-                && result.text.is_empty()
-                && detect_thinking_spiral(&state.current_reasoning)
-            {
-                warn!(
-                    reasoning_len = state.current_reasoning.len(),
-                    reasoning_tokens = state.reasoning_tokens,
-                    "🌀 Post-hoc thinking spiral detected (sync path) — injecting action nudge"
-                );
-                state.nudges.thinking_spiral = true;
-                state.reasoning_content.clear();
-                state.current_reasoning.clear();
-
-                let nudge = AnthropicMessage::user_text(
-                    thinking_spiral_nudge_message(state.task_anchor.as_deref()),
-                );
-                {
-                    let mut ctx = self.context.write().await;
-                    ctx.messages.push(nudge);
-                }
-                continue;
-            }
-
-            // Token budget enforcement
-            if let Some(budget) = options.token_budget {
-                let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
-                let budget_pct = (cumulative * 100) / budget.max(1);
-                if cumulative >= budget {
-                    warn!(
-                        cumulative_tokens = cumulative,
-                        budget = budget,
-                        "Token budget exhausted, stopping agent"
-                    );
-                    state.final_text = format!(
-                        "{}\n\n[Token budget exhausted: used {} of {} tokens]",
-                        state.final_text, cumulative, budget
-                    );
-                    return Ok(state.into_response(true));
-                } else if budget_pct >= 80 {
-                    warn!(
-                        cumulative_tokens = cumulative,
-                        budget = budget,
-                        pct = budget_pct,
-                        "Token budget at {}%, approaching limit",
-                        budget_pct
-                    );
-                }
-            }
-
-            // ── P22 Tier 4: prose tool-call dialect ──
-            // A step with ZERO structured tool calls whose text contains
-            // call-shaped JSON or tool-call fence tokens is the narration
-            // failure in structural form. Analyzed BEFORE the response is
-            // stored so (a) self-authored result objects are fenced before
-            // they can enter history as the model's world, and (b) the calls
-            // the model MEANT are synthesized into the assistant turn as real
-            // tool_use blocks — history then demonstrates the correct dialect
-            // (and stays pair-complete once the salvage branch below stores
-            // their tool results). Skipped when the step attempted structured
-            // calls that merely failed to parse (`error_tool_results`): that
-            // is a different fault with its own feedback path.
-            let mut salvaged_uses: Vec<(String, String, Value)> = Vec::new();
-            let mut salvage_executed: Vec<(String, String)> = Vec::new();
-            let mut salvage_unresolved: Vec<(String, String)> = Vec::new();
-            let mut salvage_fence_tokens = 0usize;
-            if result.tool_uses.is_empty()
-                && result.error_tool_results.is_empty()
-                && !result.text.is_empty()
-            {
-                let scan = scan_prose_dialect(&result.text);
-                if !scan.is_empty() {
-                    salvage_fence_tokens = scan.fence_tokens;
-                    // Provenance corpus: text the model did NOT invent this
-                    // run — real tool outputs and user-authored messages. A
-                    // call or result object found verbatim there is quotation
-                    // (e.g. summarizing a config it just read), not intent or
-                    // fabrication, and is left entirely alone.
-                    let prior = {
-                        let ctx = self.context.read().await;
-                        let mut normalized: Vec<String> = state
-                            .tool_records
-                            .iter()
-                            .map(|r| normalize_ws(&r.output))
-                            .collect();
-                        for msg in &ctx.messages {
-                            if msg.role != "user" {
-                                continue;
-                            }
-                            for block in &msg.content {
-                                match block {
-                                    ContentBlock::Text { text } => {
-                                        normalized.push(normalize_ws(text));
-                                    }
-                                    ContentBlock::ToolResult { content, .. } => {
-                                        normalized.push(normalize_ws(content));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        drop(ctx);
-                        PriorMaterial { normalized }
-                    };
-
-                    // Fence self-authored results: a result-shaped object with
-                    // no provenance is the model writing its own world (the
-                    // lfm leg believed its invented directory listing for four
-                    // hours). Insertion-only annotation, applied before any
-                    // store so every copy in history carries it.
-                    let fabricated: Vec<(usize, usize)> = scan
-                        .result_spans
-                        .iter()
-                        .filter(|(s, e)| !prior.contains(&result.text[*s..*e]))
-                        .copied()
-                        .collect();
-                    if !fabricated.is_empty() {
-                        warn!(
-                            count = fabricated.len(),
-                            iteration = state.iterations,
-                            "🧯 Self-authored result object(s) in a zero-tool-call \
-                             step — fencing before they enter history"
-                        );
-                        result.text =
-                            fence_self_authored_results(&result.text, &fabricated);
-                        for block in &mut result.content_blocks {
-                            if let ContentBlock::Text { text } = block {
-                                let block_scan = scan_prose_dialect(text);
-                                let block_fabricated: Vec<(usize, usize)> = block_scan
-                                    .result_spans
-                                    .iter()
-                                    .filter(|(s, e)| !prior.contains(&text[*s..*e]))
-                                    .copied()
-                                    .collect();
-                                if !block_fabricated.is_empty() {
-                                    *text = fence_self_authored_results(
-                                        text,
-                                        &block_fabricated,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Salvage: resolve each distinct written call through the
-                    // registry — exact → case-insensitive → dialect synonym →
-                    // fuzzy, the same path a real call takes — and synthesize
-                    // the structured calls the model meant. Lossless by rule:
-                    // unusable arguments or an unresolvable name are surfaced
-                    // in the notice, never guessed at.
-                    let mut seen_calls: HashSet<String> = HashSet::new();
-                    let mut seen_unresolved: HashSet<String> = HashSet::new();
-                    for call in &scan.calls {
-                        if prior.contains(&call.span_raw) {
-                            continue;
-                        }
-                        let Some(params) = call.params.clone() else {
-                            if seen_unresolved.insert(call.written_name.to_lowercase()) {
-                                salvage_unresolved.push((
-                                    call.written_name.clone(),
-                                    "was recognized but its arguments could not be \
-                                     recovered — re-issue it as a real tool call with \
-                                     explicit arguments"
-                                        .to_string(),
-                                ));
-                            }
-                            continue;
-                        };
-                        // Byte-identical repeats within one step collapse to
-                        // one execution: the same call in the same instant
-                        // cannot yield different information (the lfm leg
-                        // wrote the same `list_files` 300 times).
-                        let key = format!(
-                            "{}\u{1}{}",
-                            call.written_name.to_lowercase(),
-                            params
-                        );
-                        if !seen_calls.insert(key) {
-                            continue;
-                        }
-                        match self.tools.resolve_tool(&call.written_name).await {
-                            Some((resolved, _)) => {
-                                let id = format!(
-                                    "salvage-{}-{}",
-                                    state.iterations,
-                                    salvaged_uses.len()
-                                );
-                                salvage_executed
-                                    .push((call.written_name.clone(), resolved.clone()));
-                                salvaged_uses.push((id, resolved, params));
-                            }
-                            None => {
-                                if seen_unresolved
-                                    .insert(call.written_name.to_lowercase())
-                                {
-                                    let hits = self
-                                        .tools
-                                        .search_tools(&call.written_name, 3)
-                                        .await;
-                                    let guidance = if hits.is_empty() {
-                                        "matches no real tool — call `discover_tools` \
-                                         to find the right one"
-                                            .to_string()
-                                    } else {
-                                        format!(
-                                            "matches no real tool — closest real \
-                                             tools: {}",
-                                            hits.iter()
-                                                .map(|h| h.name.as_str())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        )
-                                    };
-                                    salvage_unresolved
-                                        .push((call.written_name.clone(), guidance));
-                                }
-                            }
-                        }
-                    }
-                    if !salvaged_uses.is_empty() {
-                        info!(
-                            count = salvaged_uses.len(),
-                            iteration = state.iterations,
-                            "🛟 Prose tool call(s) salvaged — synthesizing the \
-                             structured calls the model meant"
-                        );
-                        for (id, name, input) in &salvaged_uses {
-                            result.content_blocks.push(ContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Store assistant response
-            self.store_assistant_response(&result.content_blocks).await;
-
-            // Tool result eviction: once the LLM has responded referencing tool results,
-            // replace old large tool results with compact stubs since the information
-            // has been synthesized into the assistant's response.
-            self.evict_referenced_tool_results(&result.content_blocks)
-                .await;
-
-            // Update final text
-            if !result.text.is_empty() {
-                state.final_text = result.text;
-            }
-            // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
-            if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-                // Content blocks may already be stored above — finish_cancelled
-                // de-dupes the cancel marker message.
-                return self.finish_cancelled(state, &options).await;
-            }
-
-            // If no tool calls, check for narration loop before exiting.
-            // A round whose structured calls ALL had malformed JSON
-            // (`tool_uses` empty but `error_tool_results` present) is NOT
-            // tool-free: it falls through to the tool path below so the
-            // synthesized error results get stored paired with the assistant
-            // turn's placeholder tool_use blocks. Exiting here dropped them —
-            // the model never learned its call was unparseable, and the
-            // stored turn kept tool_use blocks with no tool_result.
-            if result.tool_uses.is_empty() && result.error_tool_results.is_empty() {
-                // This round is over regardless of which path below it takes —
-                // normal exit, or one of the continuation `continue`s (mission
-                // stall, narration, repetition). Close its reasoning block here
-                // or the buffer carries into the next round and the spiral
-                // detector, which measures it as "this block", trips on the
-                // concatenated volume of several unrelated rounds.
-                state.finalize_reasoning_block(None);
-                // The wrap-up iteration's answer IS the step's report — no
-                // detector, prod, nudge, or salvage may spend iterations
-                // that no longer exist (tools were off; call-shaped prose in
-                // the report is quotation, not intent). Guarantee the report
-                // is never silence.
-                if state.wrap_up.engaged {
-                    if state.final_text.trim().is_empty() {
-                        state.final_text = step_activity_digest(&state.tool_records);
-                    }
-                    if options.analysis.track_uncertainty {
-                        state.confidence = Some(Self::analyze_confidence(&state.final_text));
-                    }
-                    if options.analysis.auto_extract_memories
-                        && let Some(ref on_memory) = options.on_memory
-                            && let Ok(memories) = self.extract_memories().await {
-                                for memory in memories {
-                                    on_memory(memory).await;
-                                }
-                            }
-                    let truncated = state.wrap_up.truncated;
-                    return Ok(state.into_response(truncated));
-                }
-
-                // P22 Tier 4 cross-turn honesty bookkeeping: a zero-call
-                // round whose text is byte-identical to the previous
-                // zero-call round did nothing between them. Tracked here —
-                // before any continuation branch — so every zero-call round
-                // counts; any real tool execution resets the streak (the
-                // reset lives on the tool path below). Consumed at the
-                // normal exit, where the reply says so plainly.
-                let reply_hash = result_content_hash(&state.final_text);
-                if !state.final_text.is_empty()
-                    && state.last_zero_call_reply_hash == Some(reply_hash)
-                {
-                    state.identical_zero_call_replies += 1;
-                } else {
-                    state.identical_zero_call_replies = 0;
-                    state.last_zero_call_reply_hash = Some(reply_hash);
-                }
-
-                // P22 Tier 4 salvage: the structured calls synthesized from
-                // the model's prose run through the NORMAL pipeline —
-                // breakers, ledger, stats, records, memory, UI chips — so a
-                // salvaged call is a real call in every way (identical spam
-                // hits the zero-info breaker exactly like structured spam
-                // would). The corrective notice then teaches the dialect.
-                if !salvaged_uses.is_empty() {
-                    let records_before = state.tool_records.len();
-                    let tool_results = self
-                        .execute_tools(
-                            &salvaged_uses,
-                            &mut state,
-                            &options,
-                            routed_model.as_deref(),
-                        )
-                        .await;
-                    self.store_tool_results(tool_results).await;
-                    let notice = prose_call_salvage_notice(
-                        state.task_anchor.as_deref(),
-                        &salvage_executed,
-                        &salvage_unresolved,
-                        salvage_fence_tokens,
-                    );
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(AnthropicMessage::user_text(notice));
-                    }
-                    // A salvage round that SUCCEEDED at something advanced
-                    // the run — same bookkeeping as the structured-call
-                    // path, then straight back to the model with the real
-                    // results. A round of nothing but breaker replays and
-                    // failures added no information, so it falls THROUGH to
-                    // the stall/repetition machinery below instead — salvage
-                    // must never become an unbounded grind lane that bypasses
-                    // the bounds the structured path answers to.
-                    let advanced = state.tool_records[records_before..]
-                        .iter()
-                        .any(|r| r.success);
-                    warn!(
-                        executed = salvage_executed.len(),
-                        unresolved = salvage_unresolved.len(),
-                        advanced,
-                        iteration = state.iterations,
-                        "🛟 Prose tool calls executed via salvage — dialect \
-                         notice injected"
-                    );
-                    if advanced {
-                        state.mission_stall_rounds = 0;
-                        state.mission_verified_since_claim = true;
-                        state.identical_zero_call_replies = 0;
-                        state.last_zero_call_reply_hash = None;
-                        continue;
-                    }
-                }
-
-                // Structural evidence with nothing executable (unresolvable
-                // names, unusable arguments, or orphan fence tokens): the
-                // corrective notice replaces the generic narration scold —
-                // same one-shot rung on the ladder (re-armed per mission
-                // round), naming the nearest real tools instead of scolding
-                // blind. Gated on the salvage branch NOT having run — a
-                // salvage round that fell through already injected this
-                // notice and must reach the stall machinery below.
-                if salvaged_uses.is_empty()
-                    && (!salvage_unresolved.is_empty() || salvage_fence_tokens > 0)
-                    && !state.nudges.narration
-                {
-                    state.nudges.narration = true;
-                    warn!(
-                        unresolved = salvage_unresolved.len(),
-                        fence_tokens = salvage_fence_tokens,
-                        iteration = state.iterations,
-                        "🔄 Prose tool calls with nothing salvageable — \
-                         corrective notice injected"
-                    );
-                    let notice = prose_call_salvage_notice(
-                        state.task_anchor.as_deref(),
-                        &salvage_executed,
-                        &salvage_unresolved,
-                        salvage_fence_tokens,
-                    );
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(AnthropicMessage::user_text(notice));
-                    }
-                    continue;
-                }
-
-                // Detect narration loop: model talked about using tools but never called them
-                let has_tool_history = !state.tool_records.is_empty();
-                if detect_narration_loop(&state.final_text, has_tool_history)
-                    && !state.nudges.narration
-                {
-                    warn!(
-                        text_len = state.final_text.len(),
-                        iteration = state.iterations,
-                        "🔄 Narration loop detected — injecting nudge and retrying"
-                    );
-                    state.nudges.narration = true;
-
-                    // The broken response is already in context (stored
-                    // unconditionally above) — inject only the user-role
-                    // nudge after it to break the pattern
-                    let nudge = AnthropicMessage::user_text(narration_nudge_message(
-                        state.task_anchor.as_deref(),
-                    ));
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(nudge);
-                    }
-
-                    // Continue the loop — the next iteration will re-call the LLM
-                    continue;
-                }
-
-                // Detect degenerate line repetition: the model re-emitting the
-                // same substantial line(s) — a known small-model generation loop
-                if detect_repetition(&state.final_text) && !state.nudges.repetition {
-                    warn!(
-                        text_len = state.final_text.len(),
-                        iteration = state.iterations,
-                        "🔁 Repetitive output detected — injecting nudge and retrying"
-                    );
-                    state.nudges.repetition = true;
-
-                    // The broken response is already in context (stored
-                    // unconditionally above); only the nudge is added here
-                    let nudge = AnthropicMessage::user_text(repetition_nudge_message(
-                        state.task_anchor.as_deref(),
-                    ));
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(nudge);
-                    }
-
-                    // Continue the loop — the next iteration will re-call the LLM
-                    continue;
-                }
-
-                // Thinking spiral: the stream handler aborted mid-reasoning and
-                // flagged it out-of-band (no marker text — see the abort site)
-                if !state.nudges.thinking_spiral && state.steering.thinking_spiral_detected {
-                    warn!(
-                        reasoning_tokens = state.reasoning_tokens,
-                        iteration = state.iterations,
-                        "🌀 Thinking spiral recovery — injecting action nudge and retrying"
-                    );
-                    state.nudges.thinking_spiral = true;
-                    state.steering.thinking_spiral_detected = false;
-
-                    // The aborted turn contributes nothing user-visible
-                    state.final_text.clear();
-                    // Clear accumulated reasoning so the model starts fresh
-                    state.reasoning_content.clear();
-                    state.current_reasoning.clear();
-
-                    // Inject a firm nudge that grounds the model on its available tools
-                    let nudge = AnthropicMessage::user_text(thinking_spiral_nudge_message(
-                        state.task_anchor.as_deref(),
-                    ));
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(nudge);
-                    }
-                    continue;
-                }
-
-                // Mission mode: the model stopped calling tools. Two cases,
-                // both auto-continued visibly (mission_control chips):
-                // an unverified MISSION COMPLETE claim gets a verification
-                // prod (a claim only stands after a round that ran tools);
-                // anything else gets a state-anchored continuation prod.
-                let mission_claim = options.mission_mode
-                    && mission_claims_complete(&state.final_text);
-                let claim_unverified = mission_claim
-                    && (state.mission_complete_claims == 0
-                        || !state.mission_verified_since_claim);
-                // Convergence-loop fingerprint: a continuation round whose
-                // tool digest is byte-identical to the previous round's did
-                // no new work, whatever its tool count. Track BEFORE the
-                // stall gate so the repeat bound can end the run.
-                if options.mission_mode && (claim_unverified || !mission_claim) {
-                    let digest_now = mission_tool_digest(&state.tool_records);
-                    if !digest_now.is_empty() && digest_now == state.mission_last_digest {
-                        state.mission_repeat_rounds += 1;
-                    } else {
-                        state.mission_repeat_rounds = 0;
-                        state.mission_last_digest = digest_now;
-                    }
-                }
-                if options.mission_mode
-                    && (claim_unverified || !mission_claim)
-                    && state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_MAX
-                {
-                    warn!(
-                        rounds = state.mission_rounds,
-                        repeats = state.mission_repeat_rounds,
-                        "🧭 Mission mode: {} identical rounds despite loop-break prods — ending run",
-                        state.mission_repeat_rounds
-                    );
-                    // Fall through to the normal exit below: the run ends
-                    // with done semantics and the partial work persists.
-                } else if options.mission_mode
-                    && (claim_unverified || !mission_claim)
-                    && state.mission_stall_rounds < MISSION_STALL_ROUNDS_MAX
-                {
-                    state.mission_rounds += 1;
-                    state.mission_stall_rounds += 1;
-                    if mission_claim {
-                        state.mission_complete_claims += 1;
-                        state.mission_verified_since_claim = false;
-                    }
-                    // Detectors re-arm each round: a narration relapse three
-                    // hours in must be caught like the first one.
-                    state.nudges.narration = false;
-                    state.nudges.repetition = false;
-                    state.nudges.thinking_spiral = false;
-
-                    // The model's partial answer is already in context (stored
-                    // unconditionally above), so it builds on its own progress
-                    // instead of restarting.
-                    let prod = if claim_unverified {
-                        mission_verify_message()
-                    } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
-                        // Identical rounds: the standard prod would send the
-                        // model straight back into the same action — break
-                        // the loop by naming it and teaching the contract.
-                        mission_convergence_message(
-                            state.mission_rounds,
-                            state.mission_repeat_rounds,
-                            &state.mission_last_digest,
-                        )
-                    } else {
-                        // Live disk anchor: the registry's session-aware
-                        // workdir is where the model is actually working
-                        // (seeded from the active workspace by the daemon).
-                        let listing = self
-                            .tools
-                            .default_workdir()
-                            .await
-                            .map_or_else(String::new, |dir| mission_dir_listing(&dir));
-                        mission_continue_message(
-                            state.mission_rounds,
-                            state.mission_stall_rounds,
-                            &mission_tool_digest(&state.tool_records),
-                            &listing,
-                        )
-                    };
-                    // The automation must be visible to the user: render the
-                    // prod exactly like a tool call.
-                    let call_id = format!("mission-continue-{}", state.mission_rounds);
-                    if let Some(ref cb) = options.on_tool_start {
-                        cb(
-                            &call_id,
-                            "mission_control",
-                            &serde_json::json!({
-                                "round": state.mission_rounds,
-                                "stall_rounds": state.mission_stall_rounds,
-                                "repeat_rounds": state.mission_repeat_rounds,
-                                "reason": if claim_unverified {
-                                    "MISSION COMPLETE claimed without verification"
-                                } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
-                                    "convergence loop detected — identical rounds"
-                                } else {
-                                    "model stopped without MISSION COMPLETE"
-                                },
-                            }),
-                            None,
-                        );
-                    }
-                    if let Some(ref cb) = options.on_tool_end {
-                        cb(&call_id, "mission_control", &prod, true, 0, None);
-                    }
-                    {
-                        let mut ctx = self.context.write().await;
-                        ctx.messages.push(AnthropicMessage::user_text(prod));
-                    }
-                    warn!(
-                        round = state.mission_rounds,
-                        stall_rounds = state.mission_stall_rounds,
-                        "🧭 Mission mode: auto-continuation injected"
-                    );
-                    continue;
-                }
-                if options.mission_mode && state.mission_stall_rounds >= MISSION_STALL_ROUNDS_MAX {
-                    warn!(
-                        rounds = state.mission_rounds,
-                        "🧭 Mission mode: {} consecutive tool-free rounds — ending run",
-                        state.mission_stall_rounds
-                    );
-                }
-
-                // P22 Tier 4 cross-turn honesty: consecutive rounds that
-                // ended byte-identical with zero structured tool calls did
-                // nothing between them — the reply must say so plainly
-                // instead of presenting the repetition as fresh work.
-                if state.identical_zero_call_replies >= 1 {
-                    let n = state.identical_zero_call_replies + 1;
-                    warn!(
-                        identical_rounds = n,
-                        "🪞 Run ended on identical zero-tool-call rounds — \
-                         appending the honesty note to the reply"
-                    );
-                    let _ = write!(
-                        state.final_text,
-                        "\n\n[{n} consecutive replies in this run were identical and \
-                         emitted zero tool calls — nothing new was done between them, \
-                         and no tool has verified the claims above.]"
-                    );
-                }
-
-                // Normal exit: no tool calls and not a narration loop
-                // Analyze uncertainty if enabled
-                if options.analysis.track_uncertainty {
-                    state.confidence = Some(Self::analyze_confidence(&state.final_text));
-                }
-
-                // Analyze emotional context if enabled
-                if options.analysis.track_emotions {
-                    state.emotional_context = self.analyze_emotions().await;
-                }
-
-                // Auto-extract memories if enabled
+            } else if state.iterations > max {
+                // Extract memories before bailing — don't lose a long run's knowledge
                 if options.analysis.auto_extract_memories
                     && let Some(ref on_memory) = options.on_memory
                         && let Ok(memories) = self.extract_memories().await {
@@ -5691,183 +4609,1696 @@ impl Agent {
                                 on_memory(memory).await;
                             }
                         }
-                return Ok(state.into_response(false));
-            }
-
-            // Tools are off on the wrap-up iteration; a model that emits
-            // call-shaped output anyway (some providers echo tool JSON as
-            // content) gets its report synthesized rather than executed —
-            // the step is over.
-            if state.wrap_up.engaged {
                 warn!(
-                    attempted_calls = result.tool_uses.len(),
-                    "wrap-up iteration attempted tool calls — ending the step with a \
-                     synthesized report instead"
+                    iterations = state.iterations,
+                    max = max,
+                    final_text_len = state.final_text.len(),
+                    "Agent hit max iterations limit, returning truncated response"
+                );
+                if state.final_text.trim().is_empty() {
+                    state.final_text = step_activity_digest(&state.tool_records);
+                }
+                return ControlFlow::Break(RunExit::Respond { truncated: true });
+            }
+        }
+
+        // Progressive wrap-up nudges: escalating, config-driven, and LATE. The
+        // agent is meant to run long, so nudges only begin at
+        // `nudge_after_iterations` (default 500) and repeat every
+        // `nudge_interval_iterations` (default 100). They only STEER a possibly-stuck
+        // model; they never stop the loop — termination is `max_iterations`
+        // (default unlimited) or cancellation.
+        if let Some(level) = wrapup_nudge_due(
+            state.iterations,
+            self.config.nudge_after_iterations,
+            self.config.nudge_interval_iterations,
+            state.wrapup_nudge_count,
+        ) {
+            let msg =
+                wrapup_nudge_message(level, state.iterations, state.task_anchor.as_deref());
+            state.wrapup_nudge_count += 1;
+            info!(
+                iteration = state.iterations,
+                nudge_count = state.wrapup_nudge_count,
+                ?level,
+                "⏰ Injecting wrap-up nudge"
+            );
+            let nudge = AnthropicMessage::user_text(&msg);
+            let mut ctx = self.context.write().await;
+            ctx.messages.push(nudge);
+        }
+
+        debug!(
+            iterations = state.iterations,
+            max = ?limits.max_iterations,
+            "Agent iteration"
+        );
+        ControlFlow::Continue(())
+    }
+
+    /// Re-derive every window budget when the live window moved since the
+    /// last iteration. Returns the notice announcing a change.
+    async fn rebind_live_window(&self, state: &RunState, limits: &mut RunLimits) -> Option<String> {
+        // Adaptive window rebind: a VRAM-pressure demotion (nanna-llm
+        // demote_context) rewrites the runner's effective num_ctx while
+        // this loop is mid-flight. Budgets derived from the old window
+        // would overflow every subsequent prompt — Ollama truncates
+        // model-side, SILENTLY, and the model loses its own task
+        // (observed 2026-08-02: a silent 16384→4096 demotion turned a
+        // 4-hour eval into 1/42). A smaller window means MORE
+        // compression, announced, with the run continuing: re-derive all
+        // budgets from the live window here, and the tiered compression
+        // ladder directly below shrinks history down to the new
+        // thresholds in this same iteration.
+        let live_window =
+            nanna_llm::effective_context_window(&self.config.model, limits.configured_window);
+        let mut window_shrink_note: Option<String> = None;
+        if live_window != limits.configured_window {
+            let live_info = nanna_llm::clamp_model_info_to_effective_window(
+                &self.config.model,
+                limits.model_info.clone(),
+            );
+            let mut ctx = self.context.write().await;
+            // Same window-scaled reserve derivation as run start — the
+            // PR #156 re-derivation path recomputes it from the LIVE
+            // window, so a demotion shrinks the output reserve
+            // proportionally instead of letting a stale half-window
+            // claim starve the input side.
+            ctx.configure_for_model_with_output(
+                &live_info,
+                window_scaled_output_reserve(
+                    live_info.context_window,
+                    self.config.max_tokens as usize,
+                ) + limits.thinking_reserve_tokens,
+            );
+            warn!(
+                model = %self.config.model,
+                old_window = limits.configured_window,
+                new_window = live_window,
+                compression_threshold = ctx.compression_threshold,
+                hard_limit = ctx.hard_limit,
+                workspace_cap_chars = ctx.workspace_context_cap_chars(),
+                "Effective context window changed mid-run — budgets re-derived; \
+                 compression ladder will shrink history to fit"
+            );
+            window_shrink_note = Some(window_shrink_notice(
+                limits.configured_window,
+                live_window,
+                state.task_anchor.as_deref(),
+            ));
+            limits.configured_window = live_window;
+        }
+        window_shrink_note
+    }
+
+    /// Stop loudly when the window cannot hold the irreducible prompt, first
+    /// degrading to the pressure tool tier when that alone would fit.
+    /// Returns the notice announcing a degradation.
+    async fn check_context_floor(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        configured_window: usize,
+        window_shrunk: bool,
+    ) -> Pass<Option<String>> {
+        // Floor: below the irreducible prompt, adaptation is impossible.
+        // Compression shrinks history, never the system prompt, tool
+        // definitions, step frame, or output reserve — so when the window
+        // drops under their sum the ONLY honest move is a loud stop (the
+        // step/eval is resumable); anything else is a silently truncated
+        // prompt. Scoped to models the runner latch actually governs (a
+        // latch exists only once the Ollama sizing/demotion path has run;
+        // cloud models keep their provider-error path) and checked on the
+        // first iteration (a fresh step may start already-demoted) and
+        // again on every further shrink.
+        let mut tool_pressure_note: Option<String> = None;
+        if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
+            && (state.iterations == 1 || window_shrunk)
+        {
+            let restrict = options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active;
+            let mut floor = self.context_floor(&state.active_tools, restrict).await;
+            if configured_window < floor.total() {
+                // Before giving up, try the PRESSURE tier: the floor's
+                // tool term counts every definition the run has
+                // accumulated, but the smallest request this step could
+                // send carries only the core baseline + the work-evidence
+                // set (everything else stays one discover_tools call
+                // away). Only a strict improvement engages — when the
+                // reduced set measures no smaller (e.g. nothing beyond
+                // the working set was active), the full floor stands.
+                let pressure_active = pressure_tier_active_tools();
+                let pressure_floor = self.context_floor(&pressure_active, restrict).await;
+                if pressure_floor.total() < floor.total() {
+                    if configured_window >= pressure_floor.total() {
+                        let full_names =
+                            tool_names_for_request(&state.active_tools, restrict);
+                        let reduced_names =
+                            tool_names_for_request(&pressure_active, restrict);
+                        let mut dropped: Vec<String> =
+                            full_names.difference(&reduced_names).cloned().collect();
+                        dropped.sort();
+                        warn!(
+                            model = %self.config.model,
+                            effective_window = configured_window,
+                            full_floor = floor.total(),
+                            pressure_floor = pressure_floor.total(),
+                            full_tool_tokens = floor.tool_tokens,
+                            pressure_tool_tokens = pressure_floor.tool_tokens,
+                            dropped = %dropped.join(", "),
+                            "Window cannot fit the full tool catalog above \
+                             the context floor — degrading to the pressure \
+                             tier (core + work-evidence tools; the rest \
+                             stay reachable via discover_tools)"
+                        );
+                        tool_pressure_note = Some(tool_pressure_notice(
+                            configured_window,
+                            &dropped,
+                            state.task_anchor.as_deref(),
+                        ));
+                        state.active_tools = pressure_active;
+                    }
+                    // Either way the honest minimum for the loud-failure
+                    // check below is the PRESSURE-tier floor — the
+                    // smallest request this step could possibly send.
+                    floor = pressure_floor;
+                }
+            }
+            if configured_window < floor.total() {
+                warn!(
+                    model = %self.config.model,
+                    effective_window = configured_window,
+                    floor = floor.total(),
+                    system_tokens = floor.system_tokens,
+                    tool_tokens = floor.tool_tokens,
+                    frame_tokens = floor.frame_tokens,
+                    output_reserve = floor.output_reserve,
+                    "Effective window below the minimum viable window — \
+                     stopping loudly (no compression can fit this step)"
+                );
+                return ControlFlow::Break(RunExit::Fail(AgentError::ContextBelowFloor {
+                    effective_window: configured_window,
+                    floor: floor.total(),
+                    system_tokens: floor.system_tokens,
+                    tool_tokens: floor.tool_tokens,
+                    frame_tokens: floor.frame_tokens,
+                    output_reserve: floor.output_reserve,
+                }));
+            }
+        }
+        ControlFlow::Continue(tool_pressure_note)
+    }
+
+    /// The tiered context-compression ladder, run under one context write
+    /// guard before the LLM call.
+    async fn run_compression_ladder(&self) {
+        // Tiered context compression before API call
+        let mut ctx = self.context.write().await;
+        let estimated = ctx.estimate_tokens();
+        let compression_threshold = ctx.compression_threshold;
+        let hard_limit = ctx.hard_limit;
+        // Measured headroom: growth since the previous ladder pass,
+        // max'd over the run ([`crate::context::ContextGrowthTracker`]).
+        // The Tier-1 trigger derives from it instead of a fixed
+        // 40%-of-threshold tuned for 200k windows — on a 16384-token
+        // window that constant fired 80× at 4423 tokens with ~3.7k
+        // tokens of real headroom still free.
+        let growth_since_last = ctx.growth.observe(estimated);
+
+        // Tier 1 (proactive): fire only when the run's own measured
+        // growth says the NEXT interval could cross the compression
+        // threshold. Prefer selective older-tool-result compression
+        // (LLMLingua via the summarization-model settings) before
+        // dropping messages wholesale. Keep at least 20 recent
+        // messages so the agent retains working context.
+        // Against the MESSAGE-side budget, the same quantity Tier 2
+        // now gates on. Both rungs used the raw threshold before, so
+        // their bands were disjoint by construction; leaving this one
+        // raw while Tier 2 deducts the preamble opens a band
+        // (`CT - preamble < estimated <= CT`) where BOTH fire in the
+        // same pass — dropping messages and then summarizing them —
+        // which destroys more history per pass than doing neither.
+        // That band is non-empty whenever a preamble exists, which is
+        // every chat carrying verified work.
+        if crate::context::proactive_compression_due(
+            estimated,
+            ctx.growth.max_observed_growth,
+            ctx.message_compression_threshold(),
+        ) {
+            self.ladder_proactive_tier(&mut ctx, estimated, growth_since_last, compression_threshold)
+                .await;
+        }
+
+        // Tier 2 (standard): When exceeding compression_threshold, full summarization if available
+        if ctx.needs_compression() && !ctx.exceeds_hard_limit() {
+            self.ladder_standard_tier(&mut ctx, estimated, compression_threshold).await;
+        }
+
+        // Tier 3 (hard cap): When exceeding hard_limit, aggressive truncation
+        if ctx.exceeds_hard_limit() {
+            self.ladder_hard_cap_tier(&mut ctx, hard_limit).await;
+        }
+    }
+
+    /// Tier 1 of the compression ladder (proactive).
+    async fn ladder_proactive_tier(
+        &self,
+        ctx: &mut AgentContext,
+        estimated: usize,
+        growth_since_last: usize,
+        compression_threshold: usize,
+    ) {
+        info!(
+            estimated_tokens = estimated,
+            max_observed_growth = ctx.growth.max_observed_growth,
+            growth_since_last = growth_since_last,
+            compression_threshold = compression_threshold,
+            tier = "proactive",
+            "Tier 1: proactive compression triggered (measured headroom)"
+        );
+
+        let compressed_results =
+            self.compress_older_context_tool_results(ctx, 20).await;
+
+        if compressed_results == 0 {
+            let dropped = ctx.drop_oldest(20);
+            if dropped > 0 {
+                info!(
+                    dropped_messages = dropped,
+                    "Tier 1 compression complete (drop fallback)"
+                );
+                ctx.push_summarization_failure_notice(
+                    dropped,
+                    "proactive compression found no tool results \
+                     to shrink, and measured growth says the next \
+                     step could overflow the context window",
+                );
+            }
+        } else {
+            info!(
+                compressed_results = compressed_results,
+                estimated_tokens = ctx.estimate_tokens(),
+                "Tier 1 compression complete (LLMLingua selective)"
+            );
+        }
+    }
+
+    /// Tier 2 of the compression ladder (standard).
+    async fn ladder_standard_tier(
+        &self,
+        ctx: &mut AgentContext,
+        estimated: usize,
+        compression_threshold: usize,
+    ) {
+        if self.config.summarization_priority.is_empty() {
+            info!(
+                estimated_tokens = estimated,
+                compression_threshold = compression_threshold,
+                tier = "standard",
+                "Tier 2: no summarization models, dropping oldest"
+            );
+            let dropped = ctx.drop_oldest(16);
+            ctx.push_summarization_failure_notice(
+                dropped,
+                "no summarization models are configured",
+            );
+        } else {
+            let summarization_config = ContextSummarizationConfig {
+                model_priority: self.config.summarization_priority.clone(),
+                ollama_url: self.config.summarization_ollama_url.clone(),
+                max_iterations: 20,
+                openrouter_api_key: self.config.openrouter_api_key.clone(),
+                openai_api_key: self.config.openai_api_key.clone(),
+            };
+            info!(
+                estimated_tokens = estimated,
+                compression_threshold = compression_threshold,
+                tier = "standard",
+                "Tier 2: standard summarization triggered"
+            );
+            // Summarizer failures are handled inside: it truncates
+            // and announces the loss itself.
+            let iterations = ctx
+                .enforce_limits_with_summarization(
+                    &summarization_config,
+                    crate::context::SummarizationTarget::CompressionThreshold,
+                )
+                .await;
+            if iterations > 0 {
+                info!(
+                    iterations = iterations,
+                    new_tokens = ctx.estimate_tokens(),
+                    "Tier 2 summarization complete"
+                );
+            }
+        }
+    }
+
+    /// Tier 3 of the compression ladder (hard cap).
+    async fn ladder_hard_cap_tier(&self, ctx: &mut AgentContext, hard_limit: usize) {
+        let estimated = ctx.estimate_tokens();
+
+        if self.config.summarization_priority.is_empty() {
+            warn!(
+                estimated_tokens = estimated,
+                hard_limit = hard_limit,
+                tier = "hard_cap",
+                "Tier 3: hard limit exceeded, truncating"
+            );
+            let dropped = ctx.truncate_to_limit();
+            ctx.push_summarization_failure_notice(
+                dropped,
+                "no summarization models are configured and the \
+                 context exceeded the hard input limit",
+            );
+        } else {
+            let summarization_config = ContextSummarizationConfig {
+                model_priority: self.config.summarization_priority.clone(),
+                ollama_url: self.config.summarization_ollama_url.clone(),
+                max_iterations: 20,
+                openrouter_api_key: self.config.openrouter_api_key.clone(),
+                openai_api_key: self.config.openai_api_key.clone(),
+            };
+            warn!(
+                estimated_tokens = estimated,
+                hard_limit = hard_limit,
+                tier = "hard_cap",
+                "Tier 3: hard limit exceeded, aggressive summarization"
+            );
+            // Summarizer failures are handled inside: it truncates
+            // and announces the loss itself.
+            let iterations = ctx
+                .enforce_limits_with_summarization(
+                    &summarization_config,
+                    crate::context::SummarizationTarget::HardLimit,
+                )
+                .await;
+            if iterations > 0 {
+                info!(
+                    iterations = iterations,
+                    new_tokens = ctx.estimate_tokens(),
+                    "Tier 3 summarization complete"
+                );
+            }
+        }
+    }
+
+    /// Deliver the window and tool-pressure notices and the ladder's loss
+    /// announcements, then re-baseline the growth tracker.
+    async fn deliver_ladder_notices(
+        &self,
+        mut window_shrink_note: Option<String>,
+        mut tool_pressure_note: Option<String>,
+    ) {
+        // The shrink notice goes in AFTER the ladder ran so compression
+        // cannot drop its own announcement: the model must see WHAT
+        // happened and WHY, or the suddenly-shorter history reads as
+        // corruption (the restart-spiral failure class). Same for the
+        // tool-pressure notice — a tool set that silently thins between
+        // turns reads exactly like the deleted-definitions failure class
+        // (observed live: an unbounded workspace injection ate qwen's
+        // tool defs and the run spiraled).
+        if let Some(note) = window_shrink_note.take() {
+            let mut ctx = self.context.write().await;
+            ctx.messages.push(AnthropicMessage::user_text(&note));
+        }
+        if let Some(note) = tool_pressure_note.take() {
+            let mut ctx = self.context.write().await;
+            ctx.messages.push(AnthropicMessage::user_text(&note));
+        }
+        // Loss announcements composed inside the ladder (summarization
+        // failures, un-summarized drops) land AFTER it for the same
+        // reason as the notes above: compression must never drop its own
+        // announcement. Then re-baseline the growth tracker so the next
+        // ladder entry measures only NEW material — the model response
+        // and tool results of one interval — never compression's effect
+        // or these notices.
+        {
+            let mut ctx = self.context.write().await;
+            let notices = ctx.take_pending_loss_notices();
+            for notice in notices {
+                ctx.messages.push(AnthropicMessage::user_text(&notice));
+            }
+            let post_ladder = ctx.estimate_tokens();
+            ctx.growth.rebaseline(post_ladder);
+        }
+    }
+
+    /// Route the iteration and build its LLM request. Returns the request,
+    /// the routed model (if any) and the complexity routing classified.
+    async fn build_iteration_request(
+        &self,
+        state: &RunState,
+        options: &RunOptions,
+    ) -> (AnthropicRequest, Option<String>, Option<TaskComplexity>) {
+        // Model routing: classify complexity and pick cheapest capable model
+        let routed_model = self.route_model(state, options.step_kind).await;
+
+        // Build and execute LLM request
+        let mut request = self
+            .build_request_with_thinking(
+                options.thinking_mode,
+                &state.active_tools,
+                options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
+            )
+            .await;
+        // A planning step asks for one JSON answer and may not act:
+        // advertising tools invites the model to spend its single
+        // planning iteration on a tool call instead of the plan.
+        // Observed live 2026-08-08 (ornith, GUI mission): EVERY chat
+        // plan and continuation replan burned its one iteration on
+        // discover_tools, degraded to the fallback single task, and the
+        // turn died "dry" at 13/42 six minutes in. No tools sent means
+        // the only possible answer is the plan itself.
+        if matches!(options.step_kind, Some(crate::harness::StepKind::Plan)) {
+            request.tools = None;
+        }
+        // The reserved wrap-up iteration is text-only by construction:
+        // with no definitions served, the model cannot spend its final
+        // say on another tool call.
+        if state.wrap_up.engaged {
+            request.tools = None;
+        }
+        if let Some(ref routed) = routed_model {
+            self.retarget_request_to_routed(&mut request, routed, options).await;
+        }
+        let complexity = if routed_model.is_some() {
+            Some(self.classify_complexity(state, options.step_kind).await)
+        } else {
+            None
+        };
+        (request, routed_model, complexity)
+    }
+
+    /// Point the request at the routed model, re-deriving the fields that
+    /// are bound to the model it now names.
+    async fn retarget_request_to_routed(
+        &self,
+        request: &mut AnthropicRequest,
+        routed: &str,
+        options: &RunOptions,
+    ) {
+        // Strip provider prefix for the API request model field
+        // but keep the full spec for client routing
+        if let Some((_provider, model_name)) = routed.split_once('/') {
+            request.model = model_name.to_string();
+        } else {
+            request.model = routed.to_string();
+        }
+        // Update cache_control based on new model
+        request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
+        // `thinking` and `temperature` were derived from the CONFIGURED
+        // model a moment ago; routing has just replaced it with a
+        // different one, and those two fields are contract-bound per
+        // model generation. Routing a legacy-configured agent to
+        // `claude-opus-5` would otherwise ship `budget_tokens` to a
+        // model that rejects it — a 400 on every routed step, which
+        // `should_escalate` then retries on the primary, so routing
+        // silently degrades into doubled latency and a false failure
+        // record against the routed model rather than an visible error.
+        let routed_contract = nanna_llm::anthropic_model_contract(&request.model);
+        let routed_mode = options.thinking_mode.unwrap_or(self.config.thinking_mode);
+        // Fetched, not read from cache. Nothing ever fetches info for a
+        // routing tier — every `get_model_info` call site passes the
+        // configured model — so a tier that has never been the active
+        // model is a guaranteed cache MISS, and a miss returns the
+        // unknown-model floor (32k window / 4k output). Sizing the
+        // ceiling from that would hand a routed step ~1k tokens of
+        // visible answer after reasoning, permanently, on every install.
+        let routed_cache = nanna_llm::ModelInfoCache::default_location();
+        let routed_info = self
+            .llm
+            .get_model_info(&request.model, routed_cache.as_ref())
+            .await;
+        // The ceiling first, because the thinking shape is derived
+        // against it. It has to be rebuilt too: the original was sized
+        // from the configured model's window, output cap AND thinking
+        // contract, none of which transfer — a legacy-configured agent
+        // contributes no reasoning headroom, so routing to an adaptive
+        // model would hand it a ceiling with no room to think in.
+        request.max_tokens = request_output_budget(
+            &request.model,
+            &routed_info,
+            window_scaled_output_reserve(
+                routed_info.context_window,
+                self.config.max_tokens as usize,
+            ),
+            routed_mode,
+            self.llm.provider() == nanna_llm::Provider::Anthropic,
+        );
+        request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
+            thinking_for_model(routed_contract, routed_mode, request.max_tokens)
+        } else {
+            None
+        };
+        let routed_thinks = request
+            .thinking
+            .as_ref()
+            .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
+        request.temperature = if nanna_llm::is_claude_model(&request.model)
+            && (routed_contract.sampling_removed || routed_thinks)
+        {
+            None
+        } else {
+            Some(self.config.temperature)
+        };
+    }
+
+    /// Call the LLM, retrying once on the primary model when a routed model
+    /// fails or returns malformed tool calls. Returns the result, the latency
+    /// of the call that produced it, and whether it escalated.
+    async fn call_with_escalation(
+        &self,
+        request: &mut AnthropicRequest,
+        state: &mut RunState,
+        options: &RunOptions,
+        routed: bool,
+        complexity: Option<TaskComplexity>,
+    ) -> (Result<LlmResult, AgentError>, std::time::Duration, bool) {
+        // Call LLM with escalation: if a routed (cheap) model fails, retry with primary
+        let llm_start = std::time::Instant::now();
+        let mut result = self.call_llm(request, options, state).await;
+        let mut llm_latency = llm_start.elapsed();
+        let mut escalated = false;
+
+        // Escalation: if routed model failed or returned malformed tool calls, retry with primary
+        if routed {
+            let should_escalate = result.as_ref().map_or(true, |r| {
+                // Check for malformed tool calls (empty name or unparseable JSON)
+                r.tool_uses.iter().any(|(_, name, _)| name.is_empty())
+            });
+            if should_escalate {
+                let escalation_reason = match &result {
+                    Err(e) => format!("error: {e}"),
+                    Ok(r) => {
+                        let bad_tools: Vec<_> = r
+                            .tool_uses
+                            .iter()
+                            .filter(|(_, name, _)| name.is_empty())
+                            .map(|(id, _, _)| id.as_str())
+                            .collect();
+                        format!("malformed tool calls: {bad_tools:?}")
+                    }
+                };
+                warn!(
+                    failed_model = %request.model,
+                    reason = %escalation_reason,
+                    "⬆️ Escalating: routed model failed, retrying with primary model"
+                );
+                // Record failure on the cheap model
+                if let Some(ref tracker) = self.stats {
+                    tracker
+                        .record(crate::model_stats::RequestObservation {
+                            model: request.model.clone(),
+                            success: false,
+                            latency: llm_latency,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cache_creation_1h_tokens: 0,
+                            tier: complexity,
+                            escalated: false,
+                        })
+                        .await;
+                }
+                self.retarget_request_to_primary(request, options);
+                let escalation_start = std::time::Instant::now();
+                result = self.call_llm(request, options, state).await;
+                llm_latency = escalation_start.elapsed();
+                escalated = true;
+            }
+        }
+        (result, llm_latency, escalated)
+    }
+
+    /// Point the request back at the primary model, re-deriving everything
+    /// the routing swap derived for the routed tier.
+    fn retarget_request_to_primary(&self, request: &mut AnthropicRequest, options: &RunOptions) {
+        // Rebuild request with primary model. Everything the
+        // routing swap re-derived has to be re-derived back:
+        // `max_tokens`, `thinking` and `temperature` were all
+        // rebuilt against the ROUTED tier's window, output cap and
+        // contract, none of which describe the primary. Restoring
+        // only the name left the rescue turn running on the cheap
+        // tier's ceiling — and if that tier's model info was a
+        // cache miss it was the 4096 unknown floor, so the retry
+        // that exists to save the turn truncated it instead.
+        request.model.clone_from(&self.config.model);
+        request.cache_control = prompt_cache_control(&request.model, self.config.prompt_cache_ttl);
+        let primary_contract =
+            nanna_llm::anthropic_model_contract(&request.model);
+        let primary_mode =
+            options.thinking_mode.unwrap_or(self.config.thinking_mode);
+        let primary_info = nanna_llm::model_info_from_cache_or_unknown(
+            &request.model,
+            "",
+        );
+        request.max_tokens = request_output_budget(
+            &request.model,
+            &primary_info,
+            window_scaled_output_reserve(
+                primary_info.context_window,
+                self.config.max_tokens as usize,
+            ),
+            primary_mode,
+            self.llm.provider() == nanna_llm::Provider::Anthropic,
+        );
+        request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic
+        {
+            thinking_for_model(primary_contract, primary_mode, request.max_tokens)
+        } else {
+            None
+        };
+        let primary_thinks = request
+            .thinking
+            .as_ref()
+            .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
+        request.temperature = if nanna_llm::is_claude_model(&request.model)
+            && (primary_contract.sampling_removed || primary_thinks)
+        {
+            None
+        } else {
+            Some(self.config.temperature)
+        };
+    }
+
+    /// Heal provider rejections of calls to tools the request did not serve
+    /// (see the comment inside). Returns the final result.
+    async fn heal_unserved_tool_rejection(
+        &self,
+        request: &mut AnthropicRequest,
+        mut result: Result<LlmResult, AgentError>,
+        state: &mut RunState,
+        options: &RunOptions,
+    ) -> Result<LlmResult, AgentError> {
+        // Heal a provider-side unserved-tool rejection: the model reached
+        // for a tool by name (it knows the canonical names from the system
+        // prompt) without discovering it first, and the provider validated
+        // that name against the request's `tools` array and failed the
+        // whole exchange — see [`provider_unknown_tool_name`]. The tool
+        // exists and the model asked for it, so the heal performs the same
+        // activation `discover_tools` would have, triggered by the
+        // provider's own signal, and re-sends. Bounded by construction,
+        // not by a cap: a retry happens only when the named tool NEWLY
+        // resolves to something this request was not already serving, and
+        // the registry is finite, so each pass strictly grows the served
+        // set and the chain cannot cycle.
+        while let Err(ref e) = result {
+            let msg = e.to_string();
+            let Some(wanted) = provider_unknown_tool_name(&msg) else {
+                break;
+            };
+            let Some((canonical, _)) = self.tools.resolve_tool(wanted).await else {
+                // Nothing registered under that name — not healable by
+                // serving a definition; let the normal error path run.
+                break;
+            };
+            // Serve it under both the name the model reached for and its
+            // canonical resolution (an unregistered alias serves nothing
+            // and costs nothing). Non-short-circuiting `|`: both inserts
+            // must run so a repeat of either name reads as already-served.
+            let newly_served = state.active_tools.insert(canonical.clone())
+                | state.active_tools.insert(wanted.to_string());
+            if !newly_served {
+                // Already serving it — same message, different fault.
+                break;
+            }
+            warn!(
+                tool = %wanted,
+                canonical = %canonical,
+                error = %msg,
+                "Provider rejected a call to an unserved tool — activating \
+                 it and retrying the request"
+            );
+            request.tools = self
+                .request_tool_defs(
+                    &state.active_tools,
+                    options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active,
+                )
+                .await;
+            result = self.call_llm(request, options, state).await;
+        }
+        result
+    }
+
+    /// On a context-length rejection, emergency-truncate the context and
+    /// retry once. Returns the final result.
+    async fn retry_after_context_overflow(
+        &self,
+        request: &mut AnthropicRequest,
+        result: Result<LlmResult, AgentError>,
+        state: &mut RunState,
+        options: &RunOptions,
+    ) -> Result<LlmResult, AgentError> {
+        // Handle context_length_exceeded: emergency truncate and retry once
+        match result {
+            Err(ref e) if Self::is_context_length_error(&e.to_string()) => {
+                let err_msg = e.to_string();
+                let est_tokens = self.context.read().await.estimate_request_tokens();
+                warn!(
+                    error = err_msg,
+                    estimated_tokens = est_tokens,
+                    "Context length exceeded — emergency truncating and retrying"
+                );
+                {
+                    let mut ctx = self.context.write().await;
+                    // Aggressive: drop half the messages, then truncate to hard limit
+                    let keep = ctx.messages.len() / 2;
+                    if keep > 2 {
+                        ctx.drop_oldest(keep);
+                    }
+                    ctx.truncate_to_limit();
+                    let remaining = ctx.messages.len();
+                    let est_after = ctx.estimate_request_tokens();
+                    info!(
+                        remaining_messages = remaining,
+                        estimated_tokens = est_after,
+                        "Context emergency-truncated"
+                    );
+                    // Rebuild request with trimmed context
+                    request.messages = ctx.messages_for_request();
+                }
+                self.call_llm(request, options, state).await
+            }
+            other => other,
+        }
+    }
+
+    /// The LLM call's outcome for the loop: its result, or the end of the
+    /// run — a synthesized report when the wrap-up call failed, the error
+    /// otherwise.
+    fn settle_llm_result(state: &mut RunState, result: Result<LlmResult, AgentError>) -> Pass<LlmResult> {
+        // The reserved wrap-up iteration must not turn a report into an
+        // error: if its one LLM call fails, synthesize the report from
+        // the tool record and end the step the way it was going to end.
+        match result {
+            Err(e) if state.wrap_up.engaged => {
+                warn!(
+                    error = %e,
+                    "wrap-up iteration failed — synthesizing the step report"
                 );
                 if state.final_text.trim().is_empty() {
                     state.final_text = step_activity_digest(&state.tool_records);
                 }
                 let truncated = state.wrap_up.truncated;
-                    return Ok(state.into_response(truncated));
+                ControlFlow::Break(RunExit::Respond { truncated })
             }
+            Err(e) => ControlFlow::Break(RunExit::Fail(e)),
+            Ok(result) => ControlFlow::Continue(result),
+        }
+    }
 
-            // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
-            if result.tool_uses.is_empty() {
-                // Only the all-calls-malformed round reaches here without
-                // tool_uses (the genuinely tool-free round exited or continued
-                // above). Close its reasoning block, but leave the mission
-                // stall counter alone — an unparseable call is not verified
-                // work.
-                state.finalize_reasoning_block(None);
-            } else {
-                let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
-                state.finalize_reasoning_block(first_tool);
-                // Real tool activity resets the mission stall counter — the
-                // bound is on grinding, never on productive work. It also
-                // marks a pending completion claim as verified-in-progress,
-                // and restarts the identical-zero-call-reply honesty streak
-                // (work happened, so the next identical reply is not "still
-                // nothing").
-                state.mission_stall_rounds = 0;
-                state.mission_verified_since_claim = true;
-                state.identical_zero_call_replies = 0;
-                state.last_zero_call_reply_hash = None;
-            }
+    /// Record the call in the run's and the tracker's model statistics and
+    /// in the run's token totals.
+    async fn record_llm_call(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        model: &str,
+        result: &LlmResult,
+        meta: LlmCallMeta,
+    ) {
+        let LlmCallMeta {
+            latency: llm_latency,
+            routed,
+            escalated,
+            complexity,
+        } = meta;
+        // Record model statistics
+        let actual_model = model.to_string();
+        let was_routed = routed && !escalated;
+        let tier_label = if escalated {
+            "escalated".to_string()
+        } else {
+            complexity.map_or_else(|| "primary".to_string(), |c| format!("{c:?}").to_lowercase())
+        };
 
-            // Execute tools and continue loop
-            let records_before = state.tool_records.len();
-            let mut tool_results = self
-                .execute_tools(
-                    &result.tool_uses,
-                    &mut state,
-                    &options,
-                    routed_model.as_deref(),
-                )
-                .await;
-            // Merge in any error results from malformed tool call JSON.
-            // These tell the model its call was unparseable so it can retry.
-            if !result.error_tool_results.is_empty() {
-                tool_results.extend(result.error_tool_results);
-            }
-            self.store_tool_results(tool_results).await;
-
-            // Bounded blast radius (P14): per-run tool-call cap set by the
-            // caller. Checked after results are stored so the transcript is
-            // coherent for salvage.
-            if let Some(cap) = options.max_tool_calls
-                && state.tool_records.len() >= cap {
-                    warn!(
-                        tool_calls = state.tool_records.len(),
-                        cap = cap,
-                        "Tool-call budget exhausted, stopping agent"
-                    );
-                    state.final_text = format!(
-                        "{}\n\n[Tool-call budget exhausted: {} of {} calls used]",
-                        state.final_text,
-                        state.tool_records.len(),
-                        cap
-                    );
-                    return Ok(state.into_response(true));
-                }
-
-            // Progress exhaustion (P22) — the step-level rung of the same
-            // ladder, harness steps only: fold this iteration's yield into
-            // the information ledger; STEP_EXHAUSTION_AFTER consecutive
-            // tool-calling iterations that taught the run NOTHING end the
-            // step through the reserved wrap-up instead of spinning until an
-            // arbitrary count cuts it mid-flight. Mission mode is excluded —
-            // its continuation machinery owns those bounds.
-            if options.step_kind.is_some() && !options.mission_mode {
-                // `final_text` is this iteration's text when the model spoke
-                // (assigned above) and a previous iteration's — hence already
-                // in the ledger, correctly non-novel — when it did not.
-                let novel = {
-                    let (seen, records, text) = (
-                        &mut state.seen_information,
-                        &state.tool_records[records_before..],
-                        state.final_text.clone(),
-                    );
-                    iteration_produced_information(seen, records, &text)
-                };
-                if novel {
-                    state.no_information_iterations = 0;
+        state
+            .model_stats
+            .push(crate::model_stats::RequestModelStats {
+                model: actual_model.clone(),
+                was_routed,
+                tier: tier_label,
+                latency_ms: millis_u64(llm_latency),
+                throughput_tps: if llm_latency.as_millis() > 0 {
+                    f64::from(result.output_tokens) / llm_latency.as_secs_f64()
                 } else {
-                    state.no_information_iterations += 1;
-                    if state.no_information_iterations >= STEP_EXHAUSTION_AFTER {
-                        let reason = format!(
-                            "the last {} iterations produced no new information",
-                            state.no_information_iterations
-                        );
-                        self.engage_wrap_up(&mut state, &reason, false).await;
-                        // Straight to the wrap-up call — the steering rungs
-                        // below spend iterations that no longer exist.
-                        continue;
-                    }
-                }
-            }
+                    0.0
+                },
+                cache_read_tokens: result.cache_read_tokens,
+                cache_creation_tokens: result.cache_creation_tokens,
+                cache_creation_1h_tokens: result.cache_creation_1h_tokens,
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
+                // The live latch, not `configured_window`: an escalated or
+                // routed request may run a different model than the one
+                // the loop budgets for.
+                effective_context_window: nanna_llm::LlmClient::effective_num_ctx(
+                    &actual_model,
+                )
+                .map(|n| n as usize),
+            });
 
-            // Direct completion-claim rung: work is done, tools keep coming,
-            // the claim never does — teach the claim protocol directly.
-            // Evaluated BEFORE the loop-nudge detector below on purpose: on
-            // the iteration the loop nudge first fires this still sees
-            // `steering.tool_loop_nudged == false`, so the model always gets one full
-            // post-loop-nudge attempt before this rung engages — the same
-            // 2 + 1 derivation as the sibling breakers.
-            self.maybe_inject_claim_nudge(&mut state, &options).await;
+        if let Some(ref tracker) = self.stats {
+            tracker
+                .record(crate::model_stats::RequestObservation {
+                    model: actual_model,
+                    success: true,
+                    latency: llm_latency,
+                    input_tokens: result.input_tokens,
+                    output_tokens: result.output_tokens,
+                    cache_read_tokens: result.cache_read_tokens,
+                    cache_creation_tokens: result.cache_creation_tokens,
+                    cache_creation_1h_tokens: result.cache_creation_1h_tokens,
+                    tier: complexity,
+                    escalated,
+                })
+                .await;
+        }
 
-            // Tool-call loop detector (P14): same tool + same args + same
-            // result twice in a row means the model is grinding, not
-            // progressing. Small models loop; this is cheap to detect and
-            // expensive to ignore. This soft nudge is the FIRST rung of the
-            // repetition ladder; when the nudge changes nothing, the sibling
-            // breakers in `execute_tools` engage one rung above it and
-            // short-circuit further identical calls without executing them:
-            // the repeat-failure breaker (REPEAT_FAILURE_BREAKER_AFTER) for
-            // calls that keep failing identically, the zero-information
-            // breaker (ZERO_INFO_BREAKER_AFTER) for calls that keep
-            // succeeding with byte-identical results.
-            if !state.steering.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
-                state.steering.tool_loop_nudged = true;
-                warn!(
-                    iteration = state.iterations,
-                    last_tool = state.tool_records.last().map_or("", |r| r.name.as_str()),
-                    "🔂 Tool-call loop detected — injecting nudge"
-                );
-                let nudge = AnthropicMessage::user_text(tool_loop_nudge_message(
-                    state.task_anchor.as_deref(),
-                ));
+        state.input_tokens += result.input_tokens;
+        state.output_tokens += result.output_tokens;
+        if let Some(ref on_usage) = options.on_usage {
+            let window = { self.context.read().await.hard_limit } as u64;
+            on_usage(result.input_tokens, result.output_tokens, window);
+        }
+    }
+
+    /// Nudge a post-hoc thinking spiral on the synchronous path.
+    async fn post_hoc_spiral_nudge(&self, state: &mut RunState, result: &LlmResult) -> Pass {
+        // Post-hoc thinking spiral detection (catches sync/non-streaming path
+        // where we can't abort mid-stream)
+        if !state.nudges.thinking_spiral
+            && result.tool_uses.is_empty()
+            && result.text.is_empty()
+            && detect_thinking_spiral(&state.current_reasoning)
+        {
+            warn!(
+                reasoning_len = state.current_reasoning.len(),
+                reasoning_tokens = state.reasoning_tokens,
+                "🌀 Post-hoc thinking spiral detected (sync path) — injecting action nudge"
+            );
+            state.nudges.thinking_spiral = true;
+            state.reasoning_content.clear();
+            state.current_reasoning.clear();
+
+            let nudge = AnthropicMessage::user_text(
+                thinking_spiral_nudge_message(state.task_anchor.as_deref()),
+            );
+            {
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(nudge);
             }
+            return ControlFlow::Break(RunExit::Next);
+        }
+        ControlFlow::Continue(())
+    }
 
-            // Progressive context distillation: rolling summary every N iterations
-            if self.config.distillation_interval > 0
-                && state.iterations > 0
-                && state.iterations.is_multiple_of(self.config.distillation_interval)
-            {
-                self.run_progressive_distillation().await;
+    /// End the run once the token budget is spent; warn as it nears.
+    fn enforce_token_budget(state: &mut RunState, options: &RunOptions) -> Pass {
+        // Token budget enforcement
+        if let Some(budget) = options.token_budget {
+            let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
+            let budget_pct = (cumulative * 100) / budget.max(1);
+            if cumulative >= budget {
+                warn!(
+                    cumulative_tokens = cumulative,
+                    budget = budget,
+                    "Token budget exhausted, stopping agent"
+                );
+                state.final_text = format!(
+                    "{}\n\n[Token budget exhausted: used {} of {} tokens]",
+                    state.final_text, cumulative, budget
+                );
+                return ControlFlow::Break(RunExit::Respond { truncated: true });
+            } else if budget_pct >= 80 {
+                warn!(
+                    cumulative_tokens = cumulative,
+                    budget = budget,
+                    pct = budget_pct,
+                    "Token budget at {}%, approaching limit",
+                    budget_pct
+                );
             }
+        }
+        ControlFlow::Continue(())
+    }
 
-            // Semantic deduplication: evict superseded tool results
-            self.deduplicate_tool_results().await;
+    /// The P22 Tier 4 prose tool-call dialect pass over a zero-tool-call
+    /// reply (see the comment inside). Returns what was salvaged.
+    async fn salvage_prose_calls(&self, state: &RunState, result: &mut LlmResult) -> ProseSalvage {
+        // ── P22 Tier 4: prose tool-call dialect ──
+        // A step with ZERO structured tool calls whose text contains
+        // call-shaped JSON or tool-call fence tokens is the narration
+        // failure in structural form. Analyzed BEFORE the response is
+        // stored so (a) self-authored result objects are fenced before
+        // they can enter history as the model's world, and (b) the calls
+        // the model MEANT are synthesized into the assistant turn as real
+        // tool_use blocks — history then demonstrates the correct dialect
+        // (and stays pair-complete once the salvage branch below stores
+        // their tool results). Skipped when the step attempted structured
+        // calls that merely failed to parse (`error_tool_results`): that
+        // is a different fault with its own feedback path.
+        let mut salvage = ProseSalvage::default();
+        if result.tool_uses.is_empty()
+            && result.error_tool_results.is_empty()
+            && !result.text.is_empty()
+        {
+            let scan = scan_prose_dialect(&result.text);
+            if !scan.is_empty() {
+                salvage.fence_tokens = scan.fence_tokens;
+                // Provenance corpus: text the model did NOT invent this
+                // run — real tool outputs and user-authored messages. A
+                // call or result object found verbatim there is quotation
+                // (e.g. summarizing a config it just read), not intent or
+                // fabrication, and is left entirely alone.
+                let prior = self.prior_material(state).await;
 
-            // Checkpoint: persist conversation state for crash recovery
-            if let Some(ref cb) = options.on_checkpoint {
-                let ctx = self.context.read().await;
-                cb(&ctx.messages, state.iterations);
+                // Fence self-authored results: a result-shaped object with
+                // no provenance is the model writing its own world (the
+                // lfm leg believed its invented directory listing for four
+                // hours). Insertion-only annotation, applied before any
+                // store so every copy in history carries it.
+                fence_fabricated_results(result, &scan, &prior, state.iterations);
+
+                // Salvage: resolve each distinct written call through the
+                // registry — exact → case-insensitive → dialect synonym →
+                // fuzzy, the same path a real call takes — and synthesize
+                // the structured calls the model meant. Lossless by rule:
+                // unusable arguments or an unresolvable name are surfaced
+                // in the notice, never guessed at.
+                self.resolve_prose_calls(&scan, &prior, state.iterations, &mut salvage)
+                    .await;
+                if !salvage.uses.is_empty() {
+                    info!(
+                        count = salvage.uses.len(),
+                        iteration = state.iterations,
+                        "🛟 Prose tool call(s) salvaged — synthesizing the \
+                         structured calls the model meant"
+                    );
+                    for (id, name, input) in &salvage.uses {
+                        result.content_blocks.push(ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                    }
+                }
             }
+        }
+        salvage
+    }
 
-            // Periodic memory extraction every 10 iterations
-            if options.analysis.auto_extract_memories && state.iterations > 0 && state.iterations.is_multiple_of(10)
-                && let Some(ref on_memory) = options.on_memory {
-                    info!(iteration = state.iterations, "Periodic memory extraction");
-                    if let Ok(memories) = self.extract_memories().await {
+    /// Text this run did NOT invent: real tool outputs and user-authored
+    /// messages, normalized.
+    async fn prior_material(&self, state: &RunState) -> PriorMaterial {
+        let ctx = self.context.read().await;
+        let mut normalized: Vec<String> = state
+            .tool_records
+            .iter()
+            .map(|r| normalize_ws(&r.output))
+            .collect();
+        for msg in &ctx.messages {
+            if msg.role != "user" {
+                continue;
+            }
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        normalized.push(normalize_ws(text));
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        normalized.push(normalize_ws(content));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop(ctx);
+        PriorMaterial { normalized }
+    }
+
+    /// Resolve each distinct prose call through the registry into `salvage`.
+    async fn resolve_prose_calls(
+        &self,
+        scan: &ProseDialectScan,
+        prior: &PriorMaterial,
+        iteration: usize,
+        salvage: &mut ProseSalvage,
+    ) {
+        let mut seen_calls: HashSet<String> = HashSet::new();
+        let mut seen_unresolved: HashSet<String> = HashSet::new();
+        for call in &scan.calls {
+            if prior.contains(&call.span_raw) {
+                continue;
+            }
+            let Some(params) = call.params.clone() else {
+                if seen_unresolved.insert(call.written_name.to_lowercase()) {
+                    salvage.unresolved.push((
+                        call.written_name.clone(),
+                        "was recognized but its arguments could not be \
+                         recovered — re-issue it as a real tool call with \
+                         explicit arguments"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            };
+            // Byte-identical repeats within one step collapse to
+            // one execution: the same call in the same instant
+            // cannot yield different information (the lfm leg
+            // wrote the same `list_files` 300 times).
+            let key = format!(
+                "{}\u{1}{}",
+                call.written_name.to_lowercase(),
+                params
+            );
+            if !seen_calls.insert(key) {
+                continue;
+            }
+            match self.tools.resolve_tool(&call.written_name).await {
+                Some((resolved, _)) => {
+                    let id = format!(
+                        "salvage-{}-{}",
+                        iteration,
+                        salvage.uses.len()
+                    );
+                    salvage.executed
+                        .push((call.written_name.clone(), resolved.clone()));
+                    salvage.uses.push((id, resolved, params));
+                }
+                None => {
+                    if seen_unresolved
+                        .insert(call.written_name.to_lowercase())
+                    {
+                        let hits = self
+                            .tools
+                            .search_tools(&call.written_name, 3)
+                            .await;
+                        let guidance = if hits.is_empty() {
+                            "matches no real tool — call `discover_tools` \
+                             to find the right one"
+                                .to_string()
+                        } else {
+                            format!(
+                                "matches no real tool — closest real \
+                                 tools: {}",
+                                hits.iter()
+                                    .map(|h| h.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
+                        salvage.unresolved
+                            .push((call.written_name.clone(), guidance));
+                    }
+                }
+            }
+        }
+    }
+
+    /// End a round that made no structured tool call: report on the wrap-up
+    /// iteration, run what the prose salvage recovered, steer a degenerate
+    /// reply, continue a mission — or finish the run normally.
+    async fn finish_tool_free_round(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        salvage: &ProseSalvage,
+        routed_model: Option<&str>,
+    ) -> RunExit {
+        // This round is over regardless of which path below it takes —
+        // normal exit, or one of the continuation `continue`s (mission
+        // stall, narration, repetition). Close its reasoning block here
+        // or the buffer carries into the next round and the spiral
+        // detector, which measures it as "this block", trips on the
+        // concatenated volume of several unrelated rounds.
+        state.finalize_reasoning_block(None);
+        // The wrap-up iteration's answer IS the step's report — no
+        // detector, prod, nudge, or salvage may spend iterations
+        // that no longer exist (tools were off; call-shaped prose in
+        // the report is quotation, not intent). Guarantee the report
+        // is never silence.
+        if state.wrap_up.engaged {
+            if state.final_text.trim().is_empty() {
+                state.final_text = step_activity_digest(&state.tool_records);
+            }
+            if options.analysis.track_uncertainty {
+                state.confidence = Some(Self::analyze_confidence(&state.final_text));
+            }
+            if options.analysis.auto_extract_memories
+                && let Some(ref on_memory) = options.on_memory
+                    && let Ok(memories) = self.extract_memories().await {
                         for memory in memories {
                             on_memory(memory).await;
                         }
                     }
-                }
+            let truncated = state.wrap_up.truncated;
+            return RunExit::Respond { truncated };
         }
+
+        // P22 Tier 4 cross-turn honesty bookkeeping: a zero-call
+        // round whose text is byte-identical to the previous
+        // zero-call round did nothing between them. Tracked here —
+        // before any continuation branch — so every zero-call round
+        // counts; any real tool execution resets the streak (the
+        // reset lives on the tool path below). Consumed at the
+        // normal exit, where the reply says so plainly.
+        let reply_hash = result_content_hash(&state.final_text);
+        if !state.final_text.is_empty()
+            && state.last_zero_call_reply_hash == Some(reply_hash)
+        {
+            state.identical_zero_call_replies += 1;
+        } else {
+            state.identical_zero_call_replies = 0;
+            state.last_zero_call_reply_hash = Some(reply_hash);
+        }
+
+        if let ControlFlow::Break(exit) = self
+            .run_prose_salvage(state, options, salvage, routed_model)
+            .await
+        {
+            return exit;
+        }
+        if let ControlFlow::Break(exit) = self.steer_tool_free_round(state, salvage).await {
+            return exit;
+        }
+        if let ControlFlow::Break(exit) = self.continue_mission(state, options).await {
+            return exit;
+        }
+
+        // P22 Tier 4 cross-turn honesty: consecutive rounds that
+        // ended byte-identical with zero structured tool calls did
+        // nothing between them — the reply must say so plainly
+        // instead of presenting the repetition as fresh work.
+        if state.identical_zero_call_replies >= 1 {
+            let n = state.identical_zero_call_replies + 1;
+            warn!(
+                identical_rounds = n,
+                "🪞 Run ended on identical zero-tool-call rounds — \
+                 appending the honesty note to the reply"
+            );
+            let _ = write!(
+                state.final_text,
+                "\n\n[{n} consecutive replies in this run were identical and \
+                 emitted zero tool calls — nothing new was done between them, \
+                 and no tool has verified the claims above.]"
+            );
+        }
+
+        // Normal exit: no tool calls and not a narration loop
+        // Analyze uncertainty if enabled
+        if options.analysis.track_uncertainty {
+            state.confidence = Some(Self::analyze_confidence(&state.final_text));
+        }
+
+        // Analyze emotional context if enabled
+        if options.analysis.track_emotions {
+            state.emotional_context = self.analyze_emotions().await;
+        }
+
+        // Auto-extract memories if enabled
+        if options.analysis.auto_extract_memories
+            && let Some(ref on_memory) = options.on_memory
+                && let Ok(memories) = self.extract_memories().await {
+                    for memory in memories {
+                        on_memory(memory).await;
+                    }
+                }
+        RunExit::Respond { truncated: false }
+    }
+
+    /// Execute the calls salvaged from the model's prose (see the comment
+    /// inside); a round that advanced goes straight back to the model.
+    async fn run_prose_salvage(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        salvage: &ProseSalvage,
+        routed_model: Option<&str>,
+    ) -> Pass {
+        let salvaged_uses = &salvage.uses;
+        let salvage_executed = &salvage.executed;
+        let salvage_unresolved = &salvage.unresolved;
+        let salvage_fence_tokens = salvage.fence_tokens;
+        // P22 Tier 4 salvage: the structured calls synthesized from
+        // the model's prose run through the NORMAL pipeline —
+        // breakers, ledger, stats, records, memory, UI chips — so a
+        // salvaged call is a real call in every way (identical spam
+        // hits the zero-info breaker exactly like structured spam
+        // would). The corrective notice then teaches the dialect.
+        if !salvaged_uses.is_empty() {
+            let records_before = state.tool_records.len();
+            let tool_results = self
+                .execute_tools(
+                    salvaged_uses,
+                    state,
+                    options,
+                    routed_model,
+                )
+                .await;
+            self.store_tool_results(tool_results).await;
+            let notice = prose_call_salvage_notice(
+                state.task_anchor.as_deref(),
+                salvage_executed,
+                salvage_unresolved,
+                salvage_fence_tokens,
+            );
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(AnthropicMessage::user_text(notice));
+            }
+            // A salvage round that SUCCEEDED at something advanced
+            // the run — same bookkeeping as the structured-call
+            // path, then straight back to the model with the real
+            // results. A round of nothing but breaker replays and
+            // failures added no information, so it falls THROUGH to
+            // the stall/repetition machinery below instead — salvage
+            // must never become an unbounded grind lane that bypasses
+            // the bounds the structured path answers to.
+            let advanced = state.tool_records[records_before..]
+                .iter()
+                .any(|r| r.success);
+            warn!(
+                executed = salvage_executed.len(),
+                unresolved = salvage_unresolved.len(),
+                advanced,
+                iteration = state.iterations,
+                "🛟 Prose tool calls executed via salvage — dialect \
+                 notice injected"
+            );
+            if advanced {
+                state.mission_stall_rounds = 0;
+                state.mission_verified_since_claim = true;
+                state.identical_zero_call_replies = 0;
+                state.last_zero_call_reply_hash = None;
+                return ControlFlow::Break(RunExit::Next);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The one-shot steering rungs for a degenerate tool-free reply: the
+    /// unsalvageable-prose notice, and the narration, repetition and
+    /// thinking-spiral nudges.
+    async fn steer_tool_free_round(&self, state: &mut RunState, salvage: &ProseSalvage) -> Pass {
+        let salvaged_uses = &salvage.uses;
+        let salvage_executed = &salvage.executed;
+        let salvage_unresolved = &salvage.unresolved;
+        let salvage_fence_tokens = salvage.fence_tokens;
+        // Structural evidence with nothing executable (unresolvable
+        // names, unusable arguments, or orphan fence tokens): the
+        // corrective notice replaces the generic narration scold —
+        // same one-shot rung on the ladder (re-armed per mission
+        // round), naming the nearest real tools instead of scolding
+        // blind. Gated on the salvage branch NOT having run — a
+        // salvage round that fell through already injected this
+        // notice and must reach the stall machinery below.
+        if salvaged_uses.is_empty()
+            && (!salvage_unresolved.is_empty() || salvage_fence_tokens > 0)
+            && !state.nudges.narration
+        {
+            state.nudges.narration = true;
+            warn!(
+                unresolved = salvage_unresolved.len(),
+                fence_tokens = salvage_fence_tokens,
+                iteration = state.iterations,
+                "🔄 Prose tool calls with nothing salvageable — \
+                 corrective notice injected"
+            );
+            let notice = prose_call_salvage_notice(
+                state.task_anchor.as_deref(),
+                salvage_executed,
+                salvage_unresolved,
+                salvage_fence_tokens,
+            );
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(AnthropicMessage::user_text(notice));
+            }
+            return ControlFlow::Break(RunExit::Next);
+        }
+
+        // Detect narration loop: model talked about using tools but never called them
+        let has_tool_history = !state.tool_records.is_empty();
+        if detect_narration_loop(&state.final_text, has_tool_history)
+            && !state.nudges.narration
+        {
+            warn!(
+                text_len = state.final_text.len(),
+                iteration = state.iterations,
+                "🔄 Narration loop detected — injecting nudge and retrying"
+            );
+            state.nudges.narration = true;
+
+            // The broken response is already in context (stored
+            // unconditionally above) — inject only the user-role
+            // nudge after it to break the pattern
+            let nudge = AnthropicMessage::user_text(narration_nudge_message(
+                state.task_anchor.as_deref(),
+            ));
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(nudge);
+            }
+
+            // Continue the loop — the next iteration will re-call the LLM
+            return ControlFlow::Break(RunExit::Next);
+        }
+
+        // Detect degenerate line repetition: the model re-emitting the
+        // same substantial line(s) — a known small-model generation loop
+        if detect_repetition(&state.final_text) && !state.nudges.repetition {
+            warn!(
+                text_len = state.final_text.len(),
+                iteration = state.iterations,
+                "🔁 Repetitive output detected — injecting nudge and retrying"
+            );
+            state.nudges.repetition = true;
+
+            // The broken response is already in context (stored
+            // unconditionally above); only the nudge is added here
+            let nudge = AnthropicMessage::user_text(repetition_nudge_message(
+                state.task_anchor.as_deref(),
+            ));
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(nudge);
+            }
+
+            // Continue the loop — the next iteration will re-call the LLM
+            return ControlFlow::Break(RunExit::Next);
+        }
+
+        // Thinking spiral: the stream handler aborted mid-reasoning and
+        // flagged it out-of-band (no marker text — see the abort site)
+        if !state.nudges.thinking_spiral && state.steering.thinking_spiral_detected {
+            warn!(
+                reasoning_tokens = state.reasoning_tokens,
+                iteration = state.iterations,
+                "🌀 Thinking spiral recovery — injecting action nudge and retrying"
+            );
+            state.nudges.thinking_spiral = true;
+            state.steering.thinking_spiral_detected = false;
+
+            // The aborted turn contributes nothing user-visible
+            state.final_text.clear();
+            // Clear accumulated reasoning so the model starts fresh
+            state.reasoning_content.clear();
+            state.current_reasoning.clear();
+
+            // Inject a firm nudge that grounds the model on its available tools
+            let nudge = AnthropicMessage::user_text(thinking_spiral_nudge_message(
+                state.task_anchor.as_deref(),
+            ));
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(nudge);
+            }
+            return ControlFlow::Break(RunExit::Next);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Mission mode's auto-continuation of a tool-free round (see the
+    /// comment inside); falls through when the mission is over.
+    async fn continue_mission(&self, state: &mut RunState, options: &RunOptions) -> Pass {
+        // Mission mode: the model stopped calling tools. Two cases,
+        // both auto-continued visibly (mission_control chips):
+        // an unverified MISSION COMPLETE claim gets a verification
+        // prod (a claim only stands after a round that ran tools);
+        // anything else gets a state-anchored continuation prod.
+        let mission_claim = options.mission_mode
+            && mission_claims_complete(&state.final_text);
+        let claim_unverified = mission_claim
+            && (state.mission_complete_claims == 0
+                || !state.mission_verified_since_claim);
+        // Convergence-loop fingerprint: a continuation round whose
+        // tool digest is byte-identical to the previous round's did
+        // no new work, whatever its tool count. Track BEFORE the
+        // stall gate so the repeat bound can end the run.
+        if options.mission_mode && (claim_unverified || !mission_claim) {
+            let digest_now = mission_tool_digest(&state.tool_records);
+            if !digest_now.is_empty() && digest_now == state.mission_last_digest {
+                state.mission_repeat_rounds += 1;
+            } else {
+                state.mission_repeat_rounds = 0;
+                state.mission_last_digest = digest_now;
+            }
+        }
+        if options.mission_mode
+            && (claim_unverified || !mission_claim)
+            && state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_MAX
+        {
+            warn!(
+                rounds = state.mission_rounds,
+                repeats = state.mission_repeat_rounds,
+                "🧭 Mission mode: {} identical rounds despite loop-break prods — ending run",
+                state.mission_repeat_rounds
+            );
+            // Fall through to the normal exit below: the run ends
+            // with done semantics and the partial work persists.
+        } else if options.mission_mode
+            && (claim_unverified || !mission_claim)
+            && state.mission_stall_rounds < MISSION_STALL_ROUNDS_MAX
+        {
+            state.mission_rounds += 1;
+            state.mission_stall_rounds += 1;
+            if mission_claim {
+                state.mission_complete_claims += 1;
+                state.mission_verified_since_claim = false;
+            }
+            // Detectors re-arm each round: a narration relapse three
+            // hours in must be caught like the first one.
+            state.nudges.narration = false;
+            state.nudges.repetition = false;
+            state.nudges.thinking_spiral = false;
+
+            // The model's partial answer is already in context (stored
+            // unconditionally above), so it builds on its own progress
+            // instead of restarting.
+            let prod = if claim_unverified {
+                mission_verify_message()
+            } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
+                // Identical rounds: the standard prod would send the
+                // model straight back into the same action — break
+                // the loop by naming it and teaching the contract.
+                mission_convergence_message(
+                    state.mission_rounds,
+                    state.mission_repeat_rounds,
+                    &state.mission_last_digest,
+                )
+            } else {
+                // Live disk anchor: the registry's session-aware
+                // workdir is where the model is actually working
+                // (seeded from the active workspace by the daemon).
+                let listing = self
+                    .tools
+                    .default_workdir()
+                    .await
+                    .map_or_else(String::new, |dir| mission_dir_listing(&dir));
+                mission_continue_message(
+                    state.mission_rounds,
+                    state.mission_stall_rounds,
+                    &mission_tool_digest(&state.tool_records),
+                    &listing,
+                )
+            };
+            // The automation must be visible to the user: render the
+            // prod exactly like a tool call.
+            show_mission_prod(state, options, claim_unverified, &prod);
+            {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(AnthropicMessage::user_text(prod));
+            }
+            warn!(
+                round = state.mission_rounds,
+                stall_rounds = state.mission_stall_rounds,
+                "🧭 Mission mode: auto-continuation injected"
+            );
+            return ControlFlow::Break(RunExit::Next);
+        }
+        if options.mission_mode && state.mission_stall_rounds >= MISSION_STALL_ROUNDS_MAX {
+            warn!(
+                rounds = state.mission_rounds,
+                "🧭 Mission mode: {} consecutive tool-free rounds — ending run",
+                state.mission_stall_rounds
+            );
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Execute the round's tool calls and store their results, then apply
+    /// the tool-call cap and the progress-exhaustion rung.
+    async fn run_tool_round(
+        &self,
+        state: &mut RunState,
+        options: &RunOptions,
+        tool_uses: &[(String, String, Value)],
+        error_tool_results: Vec<ContentBlock>,
+        routed_model: Option<&str>,
+    ) -> Pass {
+        // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
+        if tool_uses.is_empty() {
+            // Only the all-calls-malformed round reaches here without
+            // tool_uses (the genuinely tool-free round exited or continued
+            // above). Close its reasoning block, but leave the mission
+            // stall counter alone — an unparseable call is not verified
+            // work.
+            state.finalize_reasoning_block(None);
+        } else {
+            let first_tool = tool_uses.first().map(|(_, name, _)| name.clone());
+            state.finalize_reasoning_block(first_tool);
+            // Real tool activity resets the mission stall counter — the
+            // bound is on grinding, never on productive work. It also
+            // marks a pending completion claim as verified-in-progress,
+            // and restarts the identical-zero-call-reply honesty streak
+            // (work happened, so the next identical reply is not "still
+            // nothing").
+            state.mission_stall_rounds = 0;
+            state.mission_verified_since_claim = true;
+            state.identical_zero_call_replies = 0;
+            state.last_zero_call_reply_hash = None;
+        }
+
+        // Execute tools and continue loop
+        let records_before = state.tool_records.len();
+        let mut tool_results = self
+            .execute_tools(
+                tool_uses,
+                state,
+                options,
+                routed_model,
+            )
+            .await;
+        // Merge in any error results from malformed tool call JSON.
+        // These tell the model its call was unparseable so it can retry.
+        if !error_tool_results.is_empty() {
+            tool_results.extend(error_tool_results);
+        }
+        self.store_tool_results(tool_results).await;
+
+        // Bounded blast radius (P14): per-run tool-call cap set by the
+        // caller. Checked after results are stored so the transcript is
+        // coherent for salvage.
+        if let Some(cap) = options.max_tool_calls
+            && state.tool_records.len() >= cap {
+                warn!(
+                    tool_calls = state.tool_records.len(),
+                    cap = cap,
+                    "Tool-call budget exhausted, stopping agent"
+                );
+                state.final_text = format!(
+                    "{}\n\n[Tool-call budget exhausted: {} of {} calls used]",
+                    state.final_text,
+                    state.tool_records.len(),
+                    cap
+                );
+                return ControlFlow::Break(RunExit::Respond { truncated: true });
+            }
+
+        // Progress exhaustion (P22) — the step-level rung of the same
+        // ladder, harness steps only: fold this iteration's yield into
+        // the information ledger; STEP_EXHAUSTION_AFTER consecutive
+        // tool-calling iterations that taught the run NOTHING end the
+        // step through the reserved wrap-up instead of spinning until an
+        // arbitrary count cuts it mid-flight. Mission mode is excluded —
+        // its continuation machinery owns those bounds.
+        if options.step_kind.is_some() && !options.mission_mode {
+            // `final_text` is this iteration's text when the model spoke
+            // (assigned above) and a previous iteration's — hence already
+            // in the ledger, correctly non-novel — when it did not.
+            let novel = {
+                let (seen, records, text) = (
+                    &mut state.seen_information,
+                    &state.tool_records[records_before..],
+                    state.final_text.clone(),
+                );
+                iteration_produced_information(seen, records, &text)
+            };
+            if novel {
+                state.no_information_iterations = 0;
+            } else {
+                state.no_information_iterations += 1;
+                if state.no_information_iterations >= STEP_EXHAUSTION_AFTER {
+                    let reason = format!(
+                        "the last {} iterations produced no new information",
+                        state.no_information_iterations
+                    );
+                    self.engage_wrap_up(state, &reason, false).await;
+                    // Straight to the wrap-up call — the steering rungs
+                    // below spend iterations that no longer exist.
+                    return ControlFlow::Break(RunExit::Next);
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// After a tool round: the claim and tool-loop nudges, distillation,
+    /// deduplication, the checkpoint and periodic memory extraction.
+    async fn after_tool_round(&self, state: &mut RunState, options: &RunOptions) {
+        // Direct completion-claim rung: work is done, tools keep coming,
+        // the claim never does — teach the claim protocol directly.
+        // Evaluated BEFORE the loop-nudge detector below on purpose: on
+        // the iteration the loop nudge first fires this still sees
+        // `steering.tool_loop_nudged == false`, so the model always gets one full
+        // post-loop-nudge attempt before this rung engages — the same
+        // 2 + 1 derivation as the sibling breakers.
+        self.maybe_inject_claim_nudge(state, options).await;
+
+        // Tool-call loop detector (P14): same tool + same args + same
+        // result twice in a row means the model is grinding, not
+        // progressing. Small models loop; this is cheap to detect and
+        // expensive to ignore. This soft nudge is the FIRST rung of the
+        // repetition ladder; when the nudge changes nothing, the sibling
+        // breakers in `execute_tools` engage one rung above it and
+        // short-circuit further identical calls without executing them:
+        // the repeat-failure breaker (REPEAT_FAILURE_BREAKER_AFTER) for
+        // calls that keep failing identically, the zero-information
+        // breaker (ZERO_INFO_BREAKER_AFTER) for calls that keep
+        // succeeding with byte-identical results.
+        if !state.steering.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
+            state.steering.tool_loop_nudged = true;
+            warn!(
+                iteration = state.iterations,
+                last_tool = state.tool_records.last().map_or("", |r| r.name.as_str()),
+                "🔂 Tool-call loop detected — injecting nudge"
+            );
+            let nudge = AnthropicMessage::user_text(tool_loop_nudge_message(
+                state.task_anchor.as_deref(),
+            ));
+            let mut ctx = self.context.write().await;
+            ctx.messages.push(nudge);
+        }
+
+        // Progressive context distillation: rolling summary every N iterations
+        if self.config.distillation_interval > 0
+            && state.iterations > 0
+            && state.iterations.is_multiple_of(self.config.distillation_interval)
+        {
+            self.run_progressive_distillation().await;
+        }
+
+        // Semantic deduplication: evict superseded tool results
+        self.deduplicate_tool_results().await;
+
+        // Checkpoint: persist conversation state for crash recovery
+        if let Some(ref cb) = options.on_checkpoint {
+            let ctx = self.context.read().await;
+            cb(&ctx.messages, state.iterations);
+        }
+
+        // Periodic memory extraction every 10 iterations
+        if options.analysis.auto_extract_memories && state.iterations > 0 && state.iterations.is_multiple_of(10)
+            && let Some(ref on_memory) = options.on_memory {
+                info!(iteration = state.iterations, "Periodic memory extraction");
+                if let Ok(memories) = self.extract_memories().await {
+                    for memory in memories {
+                        on_memory(memory).await;
+                    }
+                }
+            }
     }
 
     /// Direct completion-claim rung — the rung above the tool-loop nudge on
