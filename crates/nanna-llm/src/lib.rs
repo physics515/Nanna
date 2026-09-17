@@ -1416,34 +1416,79 @@ impl ThinkingConfig {
 /// ignoring the field.
 ///
 /// Derived from the published per-model table; the two axes that bite are the
-/// `thinking` shape and whether sampling parameters still exist.
+/// `thinking` shape and whether sampling parameters still exist, so those are
+/// the two fields. Callers that want one fact at a time read it through the
+/// accessors below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Four independent capability facts about one model, not a state machine:
-// every combination below is a real published contract, and they are read
-// individually at different points in the request build.
-#[allow(clippy::struct_excessive_bools)]
 pub struct AnthropicModelContract {
-    /// Takes `{"type":"adaptive"}`; `budget_tokens` is rejected.
-    pub adaptive_thinking: bool,
-    /// `thinking.display` defaults to `"omitted"`, so reasoning text only
-    /// arrives if `"summarized"` is asked for explicitly. On the 4.6 family
-    /// the default is already `"summarized"`.
-    pub display_defaults_omitted: bool,
+    /// Which `thinking` shape the model accepts, and how it behaves.
+    pub thinking: AnthropicThinkingContract,
     /// `temperature`, `top_p`, and `top_k` were removed; sending one is a 400.
     pub sampling_removed: bool,
-    /// Thinking cannot be turned off — `{"type":"disabled"}` is rejected, so
-    /// the only legal request is one with no `thinking` field.
-    pub thinking_always_on: bool,
+}
+
+/// The `thinking` axis of an [`AnthropicModelContract`].
+///
+/// The display default and the always-on rule are properties of adaptive
+/// thinking — no budgeted model has either — so they live inside that variant
+/// rather than beside it as flags that would be meaningless on a legacy model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicThinkingContract {
+    /// Pre-4.6: takes `{"type":"enabled","budget_tokens":N}`, not adaptive.
+    Budgeted,
+    /// Takes `{"type":"adaptive"}`; `budget_tokens` is rejected.
+    Adaptive {
+        /// What `thinking.display` means when the request leaves it off.
+        /// `Omitted` on the current generation, so reasoning text only arrives
+        /// if `"summarized"` is asked for explicitly; on the 4.6 family the
+        /// default is already `Summarized`.
+        default_display: ThinkingDisplay,
+        /// Thinking cannot be turned off — `{"type":"disabled"}` is rejected,
+        /// so the only legal request is one with no `thinking` field.
+        always_on: bool,
+    },
 }
 
 impl AnthropicModelContract {
     /// The pre-4.6 contract: fixed thinking budgets, sampling parameters live.
     const LEGACY: Self = Self {
-        adaptive_thinking: false,
-        display_defaults_omitted: false,
+        thinking: AnthropicThinkingContract::Budgeted,
         sampling_removed: false,
-        thinking_always_on: false,
     };
+
+    /// The current-generation contract: adaptive only, reasoning hidden unless
+    /// asked for, sampling removed, an explicit disable still accepted.
+    const CURRENT: Self = Self {
+        thinking: AnthropicThinkingContract::Adaptive {
+            default_display: ThinkingDisplay::Omitted,
+            always_on: false,
+        },
+        sampling_removed: true,
+    };
+
+    /// Takes `{"type":"adaptive"}`; `budget_tokens` is rejected.
+    #[must_use]
+    pub const fn adaptive_thinking(self) -> bool {
+        matches!(self.thinking, AnthropicThinkingContract::Adaptive { .. })
+    }
+
+    /// `thinking.display` defaults to `"omitted"`, so reasoning text only
+    /// arrives if `"summarized"` is asked for explicitly. False on the 4.6
+    /// family, whose default is already `"summarized"`, and on budgeted models.
+    #[must_use]
+    pub const fn display_defaults_omitted(self) -> bool {
+        matches!(
+            self.thinking,
+            AnthropicThinkingContract::Adaptive { default_display: ThinkingDisplay::Omitted, .. }
+        )
+    }
+
+    /// Thinking cannot be turned off — `{"type":"disabled"}` is rejected, so
+    /// the only legal request is one with no `thinking` field.
+    #[must_use]
+    pub const fn thinking_always_on(self) -> bool {
+        matches!(self.thinking, AnthropicThinkingContract::Adaptive { always_on: true, .. })
+    }
 }
 
 /// Classify a Claude model into its request contract.
@@ -1486,10 +1531,11 @@ pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
     // Thinking is always on and cannot be disabled.
     if name.contains("fable-5") || name.contains("mythos") {
         return AnthropicModelContract {
-            adaptive_thinking: true,
-            display_defaults_omitted: true,
+            thinking: AnthropicThinkingContract::Adaptive {
+                default_display: ThinkingDisplay::Omitted,
+                always_on: true,
+            },
             sampling_removed: true,
-            thinking_always_on: true,
         };
     }
 
@@ -1499,22 +1545,18 @@ pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
         || name.contains("opus-4-8")
         || name.contains("opus-4-7")
     {
-        return AnthropicModelContract {
-            adaptive_thinking: true,
-            display_defaults_omitted: true,
-            sampling_removed: true,
-            thinking_always_on: false,
-        };
+        return AnthropicModelContract::CURRENT;
     }
 
     // The 4.6 family: adaptive, but sampling still works and reasoning
     // summaries are already the default.
     if name.contains("opus-4-6") || name.contains("sonnet-4-6") {
         return AnthropicModelContract {
-            adaptive_thinking: true,
-            display_defaults_omitted: false,
+            thinking: AnthropicThinkingContract::Adaptive {
+                default_display: ThinkingDisplay::Summarized,
+                always_on: false,
+            },
             sampling_removed: false,
-            thinking_always_on: false,
         };
     }
 
@@ -1537,12 +1579,7 @@ pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
     }
 
     // Unknown: assume current generation. See the doc comment.
-    AnthropicModelContract {
-        adaptive_thinking: true,
-        display_defaults_omitted: true,
-        sampling_removed: true,
-        thinking_always_on: false,
-    }
+    AnthropicModelContract::CURRENT
 }
 
 /// Whether `model` names a Claude model, as opposed to an Ollama tag, an
@@ -1618,12 +1655,12 @@ pub fn conform_to_anthropic_contract(
         // Omission used to mean "no thinking" everywhere; on adaptive models it
         // now means adaptive. Make that original intent explicit where the
         // model accepts an explicit off.
-        None if contract.adaptive_thinking && !contract.thinking_always_on => {
+        None if contract.adaptive_thinking() && !contract.thinking_always_on() => {
             Fix::Set(ThinkingConfig::Disabled)
         }
         // A fixed budget on a model that removed `budget_tokens`.
-        Some(ThinkingConfig::Enabled { .. }) if contract.adaptive_thinking => {
-            Fix::Set(if contract.display_defaults_omitted {
+        Some(ThinkingConfig::Enabled { .. }) if contract.adaptive_thinking() => {
+            Fix::Set(if contract.display_defaults_omitted() {
                 ThinkingConfig::adaptive_summarized()
             } else {
                 ThinkingConfig::adaptive()
@@ -1634,7 +1671,7 @@ pub fn conform_to_anthropic_contract(
         // cannot synthesize an honest `budget_tokens`; dropping the field is
         // the valid degradation, since omission means no thinking on these
         // models. Reaching this means a caller skipped its own derivation.
-        Some(ThinkingConfig::Adaptive { .. }) if !contract.adaptive_thinking => {
+        Some(ThinkingConfig::Adaptive { .. }) if !contract.adaptive_thinking() => {
             tracing::debug!(
                 model = %request.model,
                 "adaptive thinking requested on a pre-4.6 model; sending no thinking field"
@@ -1642,7 +1679,7 @@ pub fn conform_to_anthropic_contract(
             Fix::Clear
         }
         // An explicit off on a model that rejects one.
-        Some(ThinkingConfig::Disabled) if contract.thinking_always_on => Fix::Clear,
+        Some(ThinkingConfig::Disabled) if contract.thinking_always_on() => Fix::Clear,
         _ => Fix::Leave,
     };
 
@@ -7384,13 +7421,13 @@ mod anthropic_model_contract_tests {
             "claude-sonnet-5",
         ] {
             let c = anthropic_model_contract(model);
-            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(c.adaptive_thinking(), "{model} takes adaptive thinking");
             assert!(c.sampling_removed, "{model} rejects temperature");
             assert!(
-                c.display_defaults_omitted,
+                c.display_defaults_omitted(),
                 "{model} hides reasoning text unless display is asked for"
             );
-            assert!(!c.thinking_always_on, "{model} accepts an explicit disable");
+            assert!(!c.thinking_always_on(), "{model} accepts an explicit disable");
         }
     }
 
@@ -7398,8 +7435,8 @@ mod anthropic_model_contract_tests {
     fn fable_and_mythos_cannot_be_told_not_to_think() {
         for model in ["claude-fable-5", "claude-mythos-5"] {
             let c = anthropic_model_contract(model);
-            assert!(c.thinking_always_on, "{model} rejects an explicit disable");
-            assert!(c.adaptive_thinking);
+            assert!(c.thinking_always_on(), "{model} rejects an explicit disable");
+            assert!(c.adaptive_thinking());
             assert!(c.sampling_removed);
         }
     }
@@ -7410,8 +7447,8 @@ mod anthropic_model_contract_tests {
     #[test]
     fn mythos_preview_is_a_migration_source_not_a_mythos_five() {
         let c = anthropic_model_contract("claude-mythos-preview");
-        assert!(!c.adaptive_thinking, "it still takes budget_tokens");
-        assert!(!c.thinking_always_on, "nothing documents a rejected disable");
+        assert!(!c.adaptive_thinking(), "it still takes budget_tokens");
+        assert!(!c.thinking_always_on(), "nothing documents a rejected disable");
         assert!(!c.sampling_removed, "it still takes temperature");
     }
 
@@ -7419,10 +7456,10 @@ mod anthropic_model_contract_tests {
     fn the_four_six_family_is_adaptive_but_kept_sampling() {
         for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
             let c = anthropic_model_contract(model);
-            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(c.adaptive_thinking(), "{model} takes adaptive thinking");
             assert!(!c.sampling_removed, "{model} kept temperature");
             assert!(
-                !c.display_defaults_omitted,
+                !c.display_defaults_omitted(),
                 "{model} already defaults to summarized reasoning"
             );
         }
@@ -7442,7 +7479,7 @@ mod anthropic_model_contract_tests {
             "claude-3-opus-20240229",
         ] {
             let c = anthropic_model_contract(model);
-            assert!(!c.adaptive_thinking, "{model} still takes budget_tokens");
+            assert!(!c.adaptive_thinking(), "{model} still takes budget_tokens");
             assert!(!c.sampling_removed, "{model} still takes temperature");
         }
     }
@@ -7454,19 +7491,19 @@ mod anthropic_model_contract_tests {
     /// `temperature` from one that wanted it.
     #[test]
     fn adjacent_generations_do_not_collide() {
-        assert!(anthropic_model_contract("claude-sonnet-5").adaptive_thinking);
-        assert!(!anthropic_model_contract("claude-sonnet-4-5").adaptive_thinking);
-        assert!(anthropic_model_contract("claude-opus-5").adaptive_thinking);
-        assert!(!anthropic_model_contract("claude-opus-4-5").adaptive_thinking);
+        assert!(anthropic_model_contract("claude-sonnet-5").adaptive_thinking());
+        assert!(!anthropic_model_contract("claude-sonnet-4-5").adaptive_thinking());
+        assert!(anthropic_model_contract("claude-opus-5").adaptive_thinking());
+        assert!(!anthropic_model_contract("claude-opus-4-5").adaptive_thinking());
     }
 
     #[test]
     fn provider_prefixes_and_dotted_aliases_still_classify() {
         // Bedrock prefixes the first-party id; some configs write `4.6`.
         assert!(anthropic_model_contract("anthropic.claude-opus-5").sampling_removed);
-        assert!(anthropic_model_contract("anthropic/claude-opus-4-6").adaptive_thinking);
+        assert!(anthropic_model_contract("anthropic/claude-opus-4-6").adaptive_thinking());
         assert!(!anthropic_model_contract("claude-opus-4.6").sampling_removed);
-        assert!(anthropic_model_contract("CLAUDE-OPUS-5").adaptive_thinking);
+        assert!(anthropic_model_contract("CLAUDE-OPUS-5").adaptive_thinking());
     }
 
     /// An unrecognized name is assumed to be newer than this table, not older:
@@ -7476,9 +7513,47 @@ mod anthropic_model_contract_tests {
     #[test]
     fn unknown_models_get_the_current_contract() {
         let c = anthropic_model_contract("claude-something-unreleased");
-        assert!(c.adaptive_thinking);
+        assert!(c.adaptive_thinking());
         assert!(c.sampling_removed);
-        assert!(c.display_defaults_omitted);
+        assert!(c.display_defaults_omitted());
+    }
+
+    /// Every row of the table, with all four facts pinned at once. The tests
+    /// above each check the facts their family is known for; this one holds the
+    /// complete answer per row, so a change to how the contract is represented
+    /// cannot move a fact nobody happened to assert.
+    #[test]
+    fn every_row_keeps_all_four_facts() {
+        // (model, adaptive_thinking, display_defaults_omitted, sampling_removed, thinking_always_on)
+        let rows = [
+            ("claude-fable-5", true, true, true, true),
+            ("claude-mythos-5", true, true, true, true),
+            ("claude-opus-5", true, true, true, false),
+            ("claude-sonnet-5", true, true, true, false),
+            ("claude-opus-4-8", true, true, true, false),
+            ("claude-opus-4-7", true, true, true, false),
+            ("claude-something-unreleased", true, true, true, false),
+            ("claude-opus-4-6", true, false, false, false),
+            ("claude-sonnet-4-6", true, false, false, false),
+            ("claude-mythos-preview", false, false, false, false),
+            ("claude-opus-4-5", false, false, false, false),
+            ("claude-sonnet-4-20250514", false, false, false, false),
+            ("claude-haiku-4-5-20251001", false, false, false, false),
+            ("claude-3-opus-20240229", false, false, false, false),
+        ];
+        for (model, adaptive, omitted, sampling_removed, always_on) in rows {
+            let c = anthropic_model_contract(model);
+            assert_eq!(
+                (
+                    c.adaptive_thinking(),
+                    c.display_defaults_omitted(),
+                    c.sampling_removed,
+                    c.thinking_always_on(),
+                ),
+                (adaptive, omitted, sampling_removed, always_on),
+                "{model}"
+            );
+        }
     }
 
     fn probe_request(model: &str) -> AnthropicRequest {

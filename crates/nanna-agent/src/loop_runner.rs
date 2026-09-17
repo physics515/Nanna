@@ -312,7 +312,7 @@ fn request_output_budget(
 ) -> u32 {
     let headroom = if is_anthropic
         && mode.is_enabled()
-        && nanna_llm::anthropic_model_contract(model).adaptive_thinking
+        && nanna_llm::anthropic_model_contract(model).adaptive_thinking()
     {
         mode.budget_tokens().unwrap_or(0) as usize
     } else {
@@ -357,14 +357,14 @@ fn thinking_for_model(
         // on Opus 5 and Sonnet 5 — so muting has to be explicit where the
         // model accepts an explicit off, and degrades to omission where it
         // does not (Fable/Mythos reject `disabled` outright).
-        return if contract.adaptive_thinking && !contract.thinking_always_on {
+        return if contract.adaptive_thinking() && !contract.thinking_always_on() {
             Some(nanna_llm::ThinkingConfig::Disabled)
         } else {
             None
         };
     }
 
-    if contract.adaptive_thinking {
+    if contract.adaptive_thinking() {
         // An adaptive model has no budget knob, so the only protection against
         // it spending the whole ceiling on reasoning is refusing to think at
         // all when the ceiling cannot hold both. The floor is the same pair the
@@ -379,10 +379,10 @@ fn thinking_for_model(
                 viable,
                 "output ceiling too small to hold reasoning and an answer; disabling thinking"
             );
-            return (!contract.thinking_always_on)
+            return (!contract.thinking_always_on())
                 .then_some(nanna_llm::ThinkingConfig::Disabled);
         }
-        return Some(if contract.display_defaults_omitted {
+        return Some(if contract.display_defaults_omitted() {
             nanna_llm::ThinkingConfig::adaptive_summarized()
         } else {
             nanna_llm::ThinkingConfig::adaptive()
