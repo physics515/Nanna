@@ -1440,21 +1440,51 @@ pub fn canonicalize_acceptance(
 /// 50 valid task-adds bounced on this, each answered with a rephrased
 /// duplicate batch). Only exact non-negative integers coerce; a fractional
 /// or negative value is left alone for [`validate_acceptance`] to reject —
-/// the leniency is lossless by construction. The f64→u64 cast is exact for
-/// every value that passes the guards: integral, non-negative, and below
-/// 2^53 (far beyond any plausible timeout).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// the leniency is lossless by construction: [`exact_u64_below_2_pow_53`]
+/// admits only integral, non-negative values below 2^53 (far beyond any
+/// plausible timeout), and every one of those converts exactly.
 fn normalize_integral_timeout(value: &mut serde_json::Value) {
-    const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0; // 2^53
     if let Some(obj) = value.as_object_mut()
         && let Some(timeout) = obj.get_mut("timeout_secs")
         && !timeout.is_u64()
         && let Some(f) = timeout.as_f64()
-        && f.fract() == 0.0
-        && (0.0..MAX_EXACT_F64_INT).contains(&f)
+        && let Some(whole) = exact_u64_below_2_pow_53(f)
     {
-        *timeout = serde_json::Value::from(f as u64);
+        *timeout = serde_json::Value::from(whole);
     }
+}
+
+/// The integer `f` denotes when it is integral, non-negative, and below 2^53;
+/// `None` for anything else (a fraction, a negative, NaN, an infinity, or an
+/// integer too large for every neighbour to be exact). `-0.0` denotes 0.
+///
+/// Read off the IEEE-754 bits instead of cast: no `TryFrom<f64>` exists for
+/// any integer type. A finite `f64` is `significand * 2^(exponent - 52)` with
+/// the significand's top bit at position 52, so a value in `[1, 2^53)` has an
+/// unbiased exponent in `0..=52`, is integral exactly when the
+/// `52 - exponent` bits below its binary point are zero, and then denotes the
+/// significand shifted right by that many bits — no step rounds. This admits
+/// exactly the values `f.fract() == 0.0 && (0.0..2^53).contains(&f)` admits,
+/// and returns the same integer `f as u64` would.
+fn exact_u64_below_2_pow_53(f: f64) -> Option<u64> {
+    const FRACTION_BITS: u64 = 52;
+    const EXPONENT_BIAS: u64 = 1023;
+    if f == 0.0 {
+        return Some(0); // +0.0 and -0.0 alike
+    }
+    if f.is_sign_negative() {
+        return None;
+    }
+    let bits = f.to_bits();
+    // The sign bit is clear, so the biased exponent is everything above the
+    // fraction. Below the bias is a fraction of one (or a subnormal); above
+    // bias + 52 is 2^53 or more, an infinity, or NaN.
+    let exponent = (bits >> FRACTION_BITS)
+        .checked_sub(EXPONENT_BIAS)
+        .filter(|&exponent| exponent <= FRACTION_BITS)?;
+    let significand = (bits & ((1 << FRACTION_BITS) - 1)) | (1 << FRACTION_BITS);
+    let fraction_shift = FRACTION_BITS - exponent;
+    (significand & ((1 << fraction_shift) - 1) == 0).then_some(significand >> fraction_shift)
 }
 
 /// Decode an acceptance object that arrived as a string: strict JSON first,
@@ -2996,6 +3026,51 @@ mod tests {
             repo.create(neg).await,
             Err(StorageError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn exact_u64_admits_only_exact_non_negative_integers_below_2_pow_53() {
+        // Admitted: every whole number below 2^53, including both zeros and
+        // the neighbours of the powers of two where the exponent changes.
+        for (f, whole) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (1.0, 1),
+            (60.0, 60),
+            (1_023.0, 1_023),
+            (1_024.0, 1_024),
+            (4_503_599_627_370_495.0, 4_503_599_627_370_495),
+            (4_503_599_627_370_496.0, 4_503_599_627_370_496),
+            (4_503_599_627_370_497.0, 4_503_599_627_370_497),
+            (9_007_199_254_740_991.0, 9_007_199_254_740_991),
+        ] {
+            assert_eq!(exact_u64_below_2_pow_53(f), Some(whole), "{f:?}");
+        }
+        for n in [2, 3, 255, 65_535, 1 << 31, u32::MAX] {
+            assert_eq!(exact_u64_below_2_pow_53(f64::from(n)), Some(u64::from(n)), "{n}");
+        }
+
+        // Refused: fractions, negatives, non-finite values, and 2^53 upward.
+        for f in [
+            0.5,
+            1.5,
+            60.5,
+            4_503_599_627_370_495.5,
+            5e-324,
+            f64::MIN_POSITIVE,
+            -1.0,
+            -60.0,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+            9_007_199_254_740_994.0,
+            1e300,
+            f64::MAX,
+        ] {
+            assert_eq!(exact_u64_below_2_pow_53(f), None, "{f:?}");
+        }
     }
 
     #[tokio::test]
