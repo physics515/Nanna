@@ -703,7 +703,7 @@ impl ProviderCredentials {
     /// to the OS keyring and finally the Claude CLI's own credentials.
     ///
     /// Per provider, first source wins:
-    /// - Anthropic: see [`resolve_anthropic`] — OAuth env/durable-store/config
+    /// - Anthropic: see `resolve_anthropic` — OAuth env/durable-store/config
     ///   chain (refreshing stale tokens) → config API key → keyring API key →
     ///   durable OAuth fallback. An enabled OAuth flag with a missing token
     ///   falls through — the boot chain used to dead-end there, registering no

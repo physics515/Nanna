@@ -197,7 +197,7 @@ pub enum ThinkingMode {
     ///
     /// Derived from the request contract, not taste. The shipped output
     /// budget is `max_tokens: 8192`, and the sent budget must leave the
-    /// visible answer at least [`MIN_OUTPUT_RESERVE_TOKENS`] (1112) of room
+    /// visible answer at least `MIN_OUTPUT_RESERVE_TOKENS` (1112) of room
     /// — so the largest step that fits is the largest `budget < 8192 - 1112
     /// = 7080`. `High` (8192) and `Maximum` (16384) both exceed the whole
     /// output budget and would be clamped on every single request, i.e. the
@@ -208,7 +208,7 @@ pub enum ThinkingMode {
     /// models the model chooses its own depth, and this figure survives as the
     /// reasoning room reserved in the context budget and added to the request
     /// ceiling (`max_tokens` covers thinking and the answer together — see
-    /// [`request_output_budget`]). See also [`thinking_for_model`].
+    /// `request_output_budget`). See also `thinking_for_model`.
     #[default]
     Medium,
     /// High thinking budget (8192 tokens).
@@ -696,7 +696,7 @@ pub struct ToolActivation {
     /// **This never gates capability.** `discover_tools` is sent on every
     /// request regardless of this flag, so the model can always pull in any
     /// tool in the registry the moment it needs one. A scope is a starting
-    /// set, not a cage — see [`DISCOVERY_TOOL_NAME`].
+    /// set, not a cage — see `DISCOVERY_TOOL_NAME`.
     ///
     /// Ignored when the scope is empty (nothing to start from) or
     /// `all_tools_active` is set.
@@ -740,7 +740,7 @@ pub struct RunOptions {
     /// Checkpoint callback: fired after each iteration with current conversation state.
     /// Enables crash recovery by persisting intermediate state.
     pub on_checkpoint: Option<CheckpointCallback>,
-    /// Per-request usage callback — see [`UsageCallback`]. Lets the caller
+    /// Per-request usage callback — see `UsageCallback`. Lets the caller
     /// keep run-scoped token totals that survive attempt restarts.
     pub on_usage: Option<UsageCallback>,
     /// If true, this is a sub-agent run. Nudge thresholds are lowered
@@ -767,7 +767,7 @@ pub struct RunOptions {
     /// declaring the completion contract (`MISSION COMPLETE` on its own
     /// line), the loop auto-continues it — surfacing each prod in the UI as
     /// a `mission_control` tool call — until it completes or stalls for
-    /// [`MISSION_STALL_ROUNDS_MAX`] consecutive tool-free rounds. Lets a
+    /// `MISSION_STALL_ROUNDS_MAX` consecutive tool-free rounds. Lets a
     /// single user prompt drive hours of continuous work.
     pub mission_mode: bool,
     /// The live work item's title (a harness step's `StepRequest::item_title`)
@@ -895,7 +895,7 @@ pub struct ToolCallRecord {
     pub success: bool,
     pub duration_ms: u64,
     /// The bytes landed but the file no longer parses. Separate from `success`
-    /// on purpose — see [`structure_broken`].
+    /// on purpose — see `structure_broken`.
     pub structure_broken: bool,
 }
 
@@ -1212,12 +1212,12 @@ pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
 const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
 /// Byte bound on the task-anchor rendered at the head of every injected
-/// steering text ([`anchor_header`]).
+/// steering text (`anchor_header`).
 ///
 /// Derivation: the anchor is a one-line LABEL whose only job is to keep the
 /// model oriented on its task while a meta-instruction interrupts it — it
 /// must never dominate the notice it introduces. The largest bounded notice
-/// payload is [`BREAKER_REPLAY_MAX_BYTES`] (2000); a tenth of that keeps the
+/// payload is `BREAKER_REPLAY_MAX_BYTES` (2000); a tenth of that keeps the
 /// header a label rather than a second payload, while comfortably fitting
 /// every real item title the task store produces (planner titles are short
 /// noun phrases; the endurance evals' longest observed title is well under
@@ -1350,7 +1350,7 @@ struct RepeatCallState {
 /// fresh `RunState` and therefore a fresh, EMPTY breaker ledger. The turn ran
 /// 22 steps, and in every step after the first the model made exactly 2-3
 /// identical `explore {}` calls and then the step ended — always one short of
-/// [`ZERO_INFO_BREAKER_AFTER`]. 99 `explore` calls, 79 of them the
+/// `ZERO_INFO_BREAKER_AFTER`. 99 `explore` calls, 79 of them the
 /// byte-identical `{}` shape returning byte-identical output, and the breaker
 /// engaged 3 times in the whole turn: the threshold was never reachable
 /// because the counter was reset 22 times. Replaying that trace against one
@@ -1365,7 +1365,7 @@ struct RepeatCallState {
 /// are bounded by the turn's own token and wall-clock budgets — so the ledger
 /// cannot outgrow the turn that feeds it, and needs no separate cap. What
 /// needed bounding is per-entry size, since the replay excerpt is up to
-/// [`BREAKER_REPLAY_MAX_BYTES`]: it is retained only once a shape has
+/// `BREAKER_REPLAY_MAX_BYTES`: it is retained only once a shape has
 /// actually repeated, which is by construction the small set the breaker can
 /// ever render a notice for. Measured over this store's whole history
 /// (2026-07..08, including the 4-hour endurance evals), the largest single
@@ -3208,7 +3208,7 @@ pub fn wrapup_nudge_due(
 ///
 /// Task-anchored (the injected-notice reset bug — observed live 2026-08-02,
 /// gemma4:12b treating an injected `[SYSTEM: …]` nudge as a conversation
-/// reset and greeting instead of working): opens with the [`anchor_header`]
+/// reset and greeting instead of working): opens with the `anchor_header`
 /// work context, states the steer in one imperative sentence, and closes
 /// with [`STEERING_CONTINUATION`].
 #[must_use]
@@ -3252,7 +3252,7 @@ pub const CLAIM_NUDGES_MAX: usize = 2;
 /// before the one escalation repeat is injected.
 ///
 /// Derivation (the loop-nudge cadence, not a magic number): the loop-nudge
-/// rung directly below this one ([`detect_tool_call_loop`]) needs two
+/// rung directly below this one (`detect_tool_call_loop`) needs two
 /// consecutive identical records — two churn iterations — to conclude a
 /// steer is being ignored. The claim instruction is held to the same
 /// evidence standard: two full post-instruction iterations that still call
@@ -3364,7 +3364,7 @@ pub fn claim_nudge_failure_message(
 /// ladder (the sibling breakers in `execute_tools` sit one rung above it).
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
-/// [`anchor_header`] work context, states the steer in one imperative
+/// `anchor_header` work context, states the steer in one imperative
 /// sentence, and closes with [`STEERING_CONTINUATION`].
 #[must_use]
 pub fn tool_loop_nudge_message(task_anchor: Option<&str>) -> String {
@@ -3381,7 +3381,7 @@ pub fn tool_loop_nudge_message(task_anchor: Option<&str>) -> String {
 /// in prose without emitting any — nothing it narrated actually happened.
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
-/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// `anchor_header` work context and closes with [`STEERING_CONTINUATION`].
 #[must_use]
 pub fn narration_nudge_message(task_anchor: Option<&str>) -> String {
     format!(
@@ -3396,7 +3396,7 @@ pub fn narration_nudge_message(task_anchor: Option<&str>) -> String {
 /// same substantial line(s) — a known small-model generation loop.
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
-/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// `anchor_header` work context and closes with [`STEERING_CONTINUATION`].
 #[must_use]
 pub fn repetition_nudge_message(task_anchor: Option<&str>) -> String {
     format!(
@@ -3412,7 +3412,7 @@ pub fn repetition_nudge_message(task_anchor: Option<&str>) -> String {
 /// circles (analysis paralysis) without producing text or tool calls.
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
-/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// `anchor_header` work context and closes with [`STEERING_CONTINUATION`].
 #[must_use]
 pub fn thinking_spiral_nudge_message(task_anchor: Option<&str>) -> String {
     format!(
@@ -3427,7 +3427,7 @@ pub fn thinking_spiral_nudge_message(task_anchor: Option<&str>) -> String {
 /// Render the 80%-token-budget status note.
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
-/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// `anchor_header` work context and closes with [`STEERING_CONTINUATION`].
 #[must_use]
 pub fn budget_warning_message(cumulative: u64, budget: u64, task_anchor: Option<&str>) -> String {
     format!(
@@ -3529,7 +3529,7 @@ fn estimate_tool_definition_tokens(defs: &[nanna_tools::ToolDefinition]) -> usiz
 }
 
 /// The smallest `num_ctx` a harness step shaped like THIS run can still
-/// viably execute in — the PRESSURE-tier [`ContextFloor`] solved for the
+/// viably execute in — the PRESSURE-tier `ContextFloor` solved for the
 /// window it is measured against.
 ///
 /// Two of the floor's terms scale WITH the window (the workspace-context cap
@@ -9702,7 +9702,7 @@ fn is_write_tool(name: &str) -> bool {
 /// did something.
 ///
 /// Derived from the existing write classification rather than an
-/// independent list: [`is_write_tool`] names every file-writing tool (the
+/// independent list: `is_write_tool` names every file-writing tool (the
 /// same set the skill-side write-guard/ratchet protects), extended by the
 /// in-place editor and the shell — the two other tools the ratchet guards
 /// (the exec skill refuses clobbering redirects to ratchet-protected files
@@ -9721,7 +9721,7 @@ fn is_write_tool(name: &str) -> bool {
 /// worth waiting on, and nothing is claimed on its behalf.
 ///
 /// The completion-claim rung in this file is the ASYMMETRIC case and no
-/// longer uses this predicate: see [`claim_evidence_armed`]. Its cheap
+/// longer uses this predicate: see `claim_evidence_armed`. Its cheap
 /// mistake runs the other way — a read-only success there invites a
 /// completion claim over work that never happened — so it demands a verdict
 /// (a successful write/edit, or an exec that flipped a definite non-zero exit

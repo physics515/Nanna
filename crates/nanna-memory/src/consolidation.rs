@@ -628,7 +628,7 @@ pub fn is_verbatim_pinned<S: std::hash::BuildHasher>(
 /// whose composite score exceeds the threshold and group them.
 ///
 /// A cluster is always **scope-homogeneous**: only memories sharing the seed's
-/// `workspace_id` can join it (see [`same_scope`]), so a dream cycle can never
+/// `workspace_id` can join it (see `same_scope`), so a dream cycle can never
 /// merge across a workspace boundary or fold a global and a workspace memory
 /// into one entry.
 ///

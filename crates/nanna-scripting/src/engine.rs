@@ -297,7 +297,7 @@ impl ScriptEngine {
     /// the call's raw `timeout` input, parsed here by the same rule the engine
     /// applies to itself, so a supervisor cannot disagree with the engine about
     /// what was asked for. The answer is the deadline this engine will really
-    /// enforce plus one more [`ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`]: every layer
+    /// enforce plus one more `ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`: every layer
     /// sits one handoff above the layer it supervises, which is what makes the
     /// inner, better-informed message win by construction instead of by luck.
     /// Only ever longer than `base_ms`, never shorter.

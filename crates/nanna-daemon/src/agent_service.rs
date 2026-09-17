@@ -291,7 +291,7 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
 ///
 /// Nothing else moves. `summarization_priority`, `summarization_ollama_url`,
 /// `sub_agent_model`, the provider keys and the whole iteration/nudge policy
-/// stay as [`agent_config_from`] produced them, because the pin names the CHAT
+/// stay as `agent_config_from` produced them, because the pin names the CHAT
 /// model only. Embedding settings are not reachable from here at all — they
 /// live in `[embedding]` and nothing on the chat-turn path reads them.
 ///
@@ -671,7 +671,7 @@ pub struct RunStateSnapshot {
     pub accumulated_thinking: String,
     pub active_tool_calls: Vec<ActiveToolCallInfo>,
     pub completed_tool_calls: Vec<CompletedToolCallInfo>,
-    /// The run's chronological journal — see [`ActiveChat::timeline`].
+    /// The run's chronological journal — see `ActiveChat::timeline`.
     pub timeline: Vec<TimelineItem>,
     /// Live token totals so far this run (input, output) — benchmark data
     /// visible before the run completes.

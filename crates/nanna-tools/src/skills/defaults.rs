@@ -137,7 +137,7 @@ const FILESYSTEM_WILDCARD: &str = "*";
 /// Pure and cheap, so the always-on guard in [`ensure_permissions`] and the test
 /// that pins this decision assert the identical property. A scope is home-bounded
 /// when it is non-empty (an empty list would break every undeclared tool rather
-/// than confine it) and names no [`FILESYSTEM_WILDCARD`].
+/// than confine it) and names no `FILESYSTEM_WILDCARD`.
 #[must_use]
 pub fn default_permissions_are_home_bounded() -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(DEFAULT_PERMISSIONS_JSON) else {

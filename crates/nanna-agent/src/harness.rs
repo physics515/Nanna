@@ -126,7 +126,7 @@ pub struct AcceptanceVerdict {
     /// against, so it says nothing about the work. It is emphatically NOT a
     /// hang: no hang finding is minted, the re-stake cap is not armed, and the
     /// next run of the check (against the re-baselined evidence) decides
-    /// normally. See [`EvidenceGuard`].
+    /// normally. See `EvidenceGuard`.
     #[serde(default)]
     pub evidence_changed: bool,
     /// First [`ACCEPTANCE_OUTPUT_EXCERPT_CHARS`] of what the check's command

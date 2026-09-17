@@ -46,7 +46,7 @@ const BEATS_PER_SILENCE_WINDOW: u64 = 4;
 ///   default budget for a step's acceptance check, the other harness-owned
 ///   operation that legitimately holds the turn quiet.
 ///
-/// The beat is the tighter of the two divided by [`BEATS_PER_SILENCE_WINDOW`]
+/// The beat is the tighter of the two divided by `BEATS_PER_SILENCE_WINDOW`
 /// (30s today). Anything longer risks a whole legal silence window passing
 /// between beats, so "beats stopped" could mean "lawful quiet stretch" —
 /// exactly the ambiguity the beat exists to remove. If either budget changes,
@@ -267,7 +267,7 @@ pub struct ToolMarkSnapshot {
 pub struct StopSnapshot {
     pub reason: String,
     /// The TURN's exit cause when the caller had one (see
-    /// [`StopMark::exit_cause`]) — absent rather than guessed.
+    /// `StopMark::exit_cause`) — absent rather than guessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_cause: Option<String>,
     pub at: String,

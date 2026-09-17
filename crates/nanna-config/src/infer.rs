@@ -22,7 +22,7 @@
 //!    `backend::vram_by_adapter_name()` returns an empty vec on Linux and
 //!    macOS, marking Vulkan memory heaps a follow-up. So
 //!    [`InferPrecision::Auto`] cannot resolve to f16 here, and
-//!    [`resolve_precision`] says so out loud instead of silently handing back
+//!    [`resolve_precision`](crate::infer::resolve_precision) says so out loud instead of silently handing back
 //!    f32 and leaving someone to wonder why the fast path never engages.
 
 use std::path::PathBuf;

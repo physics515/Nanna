@@ -470,7 +470,7 @@ impl DreamingService {
 
     /// Record feedback for a memory (will be applied during dreaming).
     ///
-    /// Tallied into a fixed-size per-memory [`FeedbackTally`] — every signal
+    /// Tallied into a fixed-size per-memory `FeedbackTally` — every signal
     /// counts toward the aggregate the dream cycle applies, and the accumulator
     /// cannot grow with flood volume.
     pub async fn record_feedback(&self, memory_id: &str, feedback: MemoryFeedback) {

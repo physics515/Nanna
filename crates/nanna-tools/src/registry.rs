@@ -700,7 +700,7 @@ impl ToolRegistry {
 
     /// Execute a tool call, recording exactly one audit record for it.
     ///
-    /// The audit lives here rather than inside [`Self::execute_call`] so that it
+    /// The audit lives here rather than inside `Self::execute_call` so that it
     /// cannot be bypassed by an early return: every exit — not-found, policy
     /// refusal, success, failure — flows back through this one point. That is
     /// the whole property an audit trail rests on, so it is enforced by the

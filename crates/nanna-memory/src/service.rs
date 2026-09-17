@@ -801,7 +801,7 @@ impl MemoryService {
     /// What is traded, stated plainly: **the neighbour-dedup search is skipped**
     /// (there is no query vector to search with), so a burst of near-identical
     /// tool results lands as its own rows instead of folding into one. That is
-    /// the same trade [`Self::store_unembedded`] already makes and for the same
+    /// the same trade `Self::store_unembedded` already makes and for the same
     /// reason — squeezing the store is dreaming's job, done later with the whole
     /// corpus in view — and run-length collapse upstream has already removed the
     /// case that made it expensive.

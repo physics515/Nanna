@@ -1516,7 +1516,7 @@ pub struct AgentStepRunner {
     pub chat_sink: Option<ChatSink>,
     /// GPU-memory faults observed in THIS harness run, across all its steps.
     ///
-    /// Drives the blip-tolerant demotion ladder ([`gpu_fault_action`]): the
+    /// Drives the blip-tolerant demotion ladder (`gpu_fault_action`): the
     /// FIRST fault of a run gets a runner reset alone (reload at the same
     /// size), the SECOND and every later one demote the context as well.
     /// Runners serving the same run (the chat harness's planner and step
@@ -3455,7 +3455,7 @@ fn title_tokens(title: &str) -> Vec<String> {
 /// Normalized away (none of it can name different work):
 /// - surrounding whitespace and internal punctuation/separator runs,
 /// - ASCII case,
-/// - trailing-`s` plurals ([`fold_plural`]) — "merge the PRs" and "merge the
+/// - trailing-`s` plurals (`fold_plural`) — "merge the PRs" and "merge the
 ///   PR" are one job.
 ///
 /// Everything else is load-bearing and compared verbatim, IN ORDER. Two titles
@@ -4058,7 +4058,7 @@ pub(crate) fn ollama_local_base() -> String {
 /// aborted with `done:false`; model unloads do not clear it — verified live).
 /// Callers gate it: bouncing a shared local service is an operator decision.
 /// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
-/// most once per [`OLLAMA_RESTART_COOLDOWN_SECS`] process-wide.
+/// most once per `OLLAMA_RESTART_COOLDOWN_SECS` process-wide.
 ///
 /// REGRESSION (2026-08-09): the kill must take the whole runner tree, not
 /// just the server. This function originally ran `taskkill /F /IM

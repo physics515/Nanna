@@ -259,7 +259,7 @@ impl Client {
     /// that carry no session (config, memory, workspace, channel, connection)
     /// keep arriving — narrowing is about sessions, not about going quiet.
     ///
-    /// This is connection-wide, so every [`SessionEvents`] stream held over the
+    /// This is connection-wide, so every `SessionEvents` stream held over the
     /// same connection is affected: a stream for a session that was never named
     /// will simply stop yielding. [`Self::widen_to_all_sessions`] undoes it.
     ///

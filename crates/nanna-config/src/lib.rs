@@ -901,7 +901,7 @@ impl Config {
     /// `[general] data_dir` when the user set one, otherwise the platform
     /// default. A blank or whitespace-only value counts as unset — a text input
     /// that submits `""` must not redirect the whole store to a path of `""`,
-    /// which is the same policy [`Self::config_path_override`] applies.
+    /// which is the same policy `Self::config_path_override` applies.
     ///
     /// This is the single place the override is honoured, so every consumer
     /// that already funnels through the daemon's `data_dir` picks it up at

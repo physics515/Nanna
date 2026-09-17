@@ -24,7 +24,7 @@
 //!    the closest vocab term's stem stands in for it — catching typos like
 //!    `wirte file`.
 //! 4. **Score** — BM25 (k1 = 1.2, b = 0.75) over per-tool documents built from
-//!    name + description, with name tokens weighted 3x (see [`NAME_WEIGHT`]).
+//!    name + description, with name tokens weighted 3x (see `NAME_WEIGHT`).
 //!    Ties break by name, so ranking is fully deterministic.
 
 use rust_stemmers::{Algorithm, Stemmer};

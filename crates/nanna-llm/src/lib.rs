@@ -172,7 +172,7 @@ pub enum LlmError {
         retry_after: Option<u64>,
     },
     /// A local runner stuck emitting one token forever, caught by
-    /// [`RepeatWatch`].
+    /// `RepeatWatch`.
     ///
     /// Structured rather than folded into [`LlmError::Api`] because the retry
     /// ladder has to tell "this is the same wedge I just hit" from "one
@@ -1074,7 +1074,7 @@ impl Provider {
     /// derived from the provider's PUBLISHED request-per-minute quota — never
     /// a tuning knob. This is only the PRIOR: the moment a response arrives,
     /// its `x-ratelimit-*` headers supersede it (see
-    /// [`PaceState::required_wait`]) because headers reflect the actual
+    /// `PaceState::required_wait`) because headers reflect the actual
     /// account's tier, which docs cannot. `None` means "do not pace", and
     /// every `None` is a decision:
     ///

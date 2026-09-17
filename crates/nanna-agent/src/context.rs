@@ -381,7 +381,7 @@ pub struct AgentContext {
     /// execution.
     #[serde(default)]
     pub verified_outcomes: Vec<VerifiedOutcome>,
-    /// Live growth measurement feeding [`proactive_compression_due`].
+    /// Live growth measurement feeding `proactive_compression_due`.
     #[serde(default)]
     pub growth: ContextGrowthTracker,
     /// In-context loss announcements, composed where the loss happens (deep
@@ -734,7 +734,7 @@ impl AgentContext {
     }
 
     /// Queue an in-context loss announcement (see
-    /// [`summarization_failure_notice`]). No-op when nothing was dropped —
+    /// `summarization_failure_notice`). No-op when nothing was dropped —
     /// an announcement of zero loss would be noise. Drained by the agent
     /// loop AFTER its compression ladder so the announcement cannot itself
     /// be compressed away in the same pass.
@@ -870,7 +870,7 @@ impl AgentContext {
     /// their framing, and the assistant acknowledgement that keeps
     /// user/assistant alternation.
     ///
-    /// Measured from the text [`Self::context_preamble`] actually produces
+    /// Measured from the text `Self::context_preamble` actually produces
     /// rather than re-derived from the parts, so the number cannot drift away
     /// from what gets sent when the framing changes. Compression's levers
     /// touch only the message list, so this is the part of the request the
@@ -1459,7 +1459,7 @@ impl AgentContext {
     /// Estimate token count of the MESSAGE side of a request: the system
     /// prompt plus the message list. This is the quantity compression can
     /// actually change, which is why it is the quantity every tier gates on
-    /// (against a preamble-deducted threshold — see [`Self::message_budget`]).
+    /// (against a preamble-deducted threshold — see `Self::message_budget`).
     ///
     /// Leans conservative on purpose: over-estimating triggers earlier
     /// compression, which is much better than hitting a 400
@@ -1497,7 +1497,7 @@ impl AgentContext {
     ///
     /// Same inequality as request-tokens-versus-hard-limit, expressed so it
     /// is ordered against [`Self::needs_compression`] by construction — see
-    /// [`Self::message_budget`].
+    /// `Self::message_budget`.
     #[must_use]
     pub fn exceeds_hard_limit(&self) -> bool {
         self.estimate_tokens() > self.message_hard_limit()

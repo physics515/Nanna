@@ -22,7 +22,7 @@
 //!    reads on Windows are synchronous reads on the blocking pool, it pinned
 //!    a blocking thread and hung runtime teardown for the sleeper's whole
 //!    lifetime (25+ minutes).
-//! 3. [`adopt_kill_on_close_job`] — the process-wide backstop: the daemon
+//! 3. `adopt_kill_on_close_job` — the process-wide backstop: the daemon
 //!    assigns *itself* to a kill-on-close job at startup, so no child ever
 //!    outlives an unclean daemon death (`taskkill /F`, crash, panic).
 //!

@@ -451,7 +451,7 @@ pub mod tools_bridge {
     ///
     /// # Errors
     ///
-    /// Returns [`McpError`] if a tool definition cannot be converted.
+    /// Returns [`McpError`](crate::McpError) if a tool definition cannot be converted.
     pub async fn register_tools_from_registry(
         server: &McpServer,
         registry: Arc<ToolRegistry>,

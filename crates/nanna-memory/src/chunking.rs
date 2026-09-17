@@ -95,7 +95,7 @@ pub struct Chunk {
 ///
 /// Breaks prefer, in order: a paragraph end, a line end, a sentence end, any
 /// whitespace, and finally the window edge itself. A break is only taken in the
-/// back half of the window (see [`BREAK_SEARCH_FRACTION`]). Delimiters stay
+/// back half of the window (see `BREAK_SEARCH_FRACTION`). Delimiters stay
 /// with the chunk that precedes them — nothing is trimmed, because trimming is
 /// how a splitter silently loses text.
 #[must_use]

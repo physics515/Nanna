@@ -14,7 +14,7 @@
 //! written there would not be discovered by `discover_skills` at all.
 //!
 //! **Containment.** The only user-supplied path component is the tool name, and
-//! [`validate_tool_name`] restricts it to `^[a-z][a-z0-9_]{0,63}$` — no `/`, no
+//! `validate_tool_name` restricts it to `^[a-z][a-z0-9_]{0,63}$` — no `/`, no
 //! `.`, no `..`, so traversal is impossible by construction rather than by
 //! filtering. The symlink check on top covers the remaining case: a directory
 //! somebody else planted that points out of the tools dir.
