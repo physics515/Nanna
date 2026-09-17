@@ -69,14 +69,14 @@ impl Storage {
         info!("Opening database: {}", config.path);
         let db = Builder::new_local(&config.path).build().await?;
         let conn = db.connect()?;
-        // The connection holds its own reference to the database: every
-        // statement after this function returns already runs without `db`.
-        drop(db);
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
 
         storage.migrate().await?;
+        // Released once migrations have run; from here on the connection's
+        // own reference keeps the database open.
+        drop(db);
         Ok(storage)
     }
 
@@ -88,13 +88,13 @@ impl Storage {
     pub async fn in_memory() -> Result<Self, StorageError> {
         let db = Builder::new_local(":memory:").build().await?;
         let conn = db.connect()?;
-        // The connection holds its own reference to the database: every
-        // statement after this function returns already runs without `db`.
-        drop(db);
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
         storage.migrate().await?;
+        // Released once migrations have run; from here on the connection's
+        // own reference keeps the database open.
+        drop(db);
         Ok(storage)
     }
 

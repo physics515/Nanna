@@ -377,8 +377,8 @@ fn decode_memory_row(
 ///
 /// Every `f32` this crate stores goes in as `f64::from(f32)`, which is exact,
 /// so for those rows this narrowing is exact too. `as` is the only f64 to f32
-/// conversion the language has (there is no `TryFrom`); anything else rounds
-/// to the nearest `f32`, exactly as the per-field casts this replaces did.
+/// conversion the language has (there is no `TryFrom`); any other value rounds
+/// to the nearest `f32`, and one beyond the `f32` range becomes infinite.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "no lossless f64 -> f32 conversion exists; columns are written from f32 via f64::from, so the round-trip is exact"
