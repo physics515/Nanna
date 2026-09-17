@@ -180,11 +180,10 @@ impl Tool for OcrTool {
             ));
         }
 
-        let prompt = if let Some(lang) = language {
-            format!("{OCR_PROMPT}\n\nLanguage hint: {lang}")
-        } else {
-            OCR_PROMPT.to_string()
-        };
+        let prompt = language.map_or_else(
+            || OCR_PROMPT.to_string(),
+            |lang| format!("{OCR_PROMPT}\n\nLanguage hint: {lang}"),
+        );
 
         for (model_name, vision_fn) in &self.vision_models {
             match vision_fn(image_data.clone(), prompt.clone(), actual_media_type.clone()).await {
@@ -193,11 +192,9 @@ impl Tool for OcrTool {
                 }
                 Ok(_) => {
                     warn!("OCR model '{}' returned empty text — trying next", model_name);
-                    continue;
                 }
                 Err(e) => {
                     warn!("OCR model '{}' failed: {} — trying next", model_name, e);
-                    continue;
                 }
             }
         }
@@ -251,7 +248,7 @@ async fn download_if_missing(url: &str, dest: &Path) -> Result<(), String> {
 
     tokio::fs::write(dest, &bytes)
         .await
-        .map_err(|e| format!("Failed to write model to {dest:?}: {e}"))?;
+        .map_err(|e| format!("Failed to write model to {}: {e}", dest.display()))?;
 
     info!("OCR model saved to {:?} ({} bytes)", dest, bytes.len());
     Ok(())

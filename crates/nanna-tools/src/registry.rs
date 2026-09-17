@@ -272,8 +272,7 @@ impl ToolRegistry {
     pub async fn register<T: Tool + 'static>(&self, tool: T) {
         let definition = tool.definition();
         let name = definition.name.clone();
-        let mut tools = self.tools.write().await;
-        tools.insert(name.clone(), Arc::new(tool));
+        self.tools.write().await.insert(name.clone(), Arc::new(tool));
         info!("Registered tool: {}", name);
     }
 
@@ -281,8 +280,7 @@ impl ToolRegistry {
     pub async fn register_boxed(&self, tool: Arc<dyn Tool>) {
         let definition = tool.definition();
         let name = definition.name.clone();
-        let mut tools = self.tools.write().await;
-        tools.insert(name.clone(), tool);
+        self.tools.write().await.insert(name.clone(), tool);
         info!("Registered tool: {}", name);
     }
 
@@ -302,8 +300,10 @@ impl ToolRegistry {
             aliases.insert(alias.to_string());
             drop(aliases);
             // Store reverse mapping: alias → canonical target
-            let mut targets = self.alias_targets.write().await;
-            targets.insert(alias.to_string(), target.to_string());
+            self.alias_targets
+                .write()
+                .await
+                .insert(alias.to_string(), target.to_string());
             info!("Registered tool alias: {} -> {}", alias, target);
         } else {
             warn!(
@@ -464,6 +464,7 @@ impl ToolRegistry {
                 _ => {}
             }
         }
+        drop(tools);
 
         if let Some((key, score, tool)) = best {
             let gap = score - second_best_score;
@@ -515,7 +516,7 @@ impl ToolRegistry {
             })
             .map(|(name, t)| {
                 let mut def = t.definition();
-                def.name = name.clone(); // Override name to match registered key
+                def.name.clone_from(name); // Override name to match registered key
                 def
             })
             .collect()
@@ -540,18 +541,20 @@ impl ToolRegistry {
     /// Sorted by name so a caller rendering a list gets a stable order rather
     /// than `HashMap` iteration order, which reshuffles between calls.
     pub async fn inventory(&self) -> Vec<ToolInventoryEntry> {
-        let tools = self.tools.read().await;
-        let aliases = self.aliases.read().await;
-        let policy = self.policy.read().await;
-        let mut entries: Vec<ToolInventoryEntry> = tools
-            .iter()
-            .filter(|(name, _)| !aliases.contains(name.as_str()))
-            .map(|(name, tool)| ToolInventoryEntry {
-                enabled: policy.permits(name.as_str()),
-                description: tool.definition().description,
-                name: name.clone(),
-            })
-            .collect();
+        let mut entries: Vec<ToolInventoryEntry> = {
+            let tools = self.tools.read().await;
+            let aliases = self.aliases.read().await;
+            let policy = self.policy.read().await;
+            tools
+                .iter()
+                .filter(|(name, _)| !aliases.contains(name.as_str()))
+                .map(|(name, tool)| ToolInventoryEntry {
+                    enabled: policy.permits(name.as_str()),
+                    description: tool.definition().description,
+                    name: name.clone(),
+                })
+                .collect()
+        };
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         debug_assert!(
@@ -605,7 +608,7 @@ impl ToolRegistry {
             })
             .map(|(name, t)| {
                 let mut def = t.definition();
-                def.name = name.clone();
+                def.name.clone_from(name);
                 def
             })
             .collect()
@@ -1051,9 +1054,11 @@ const DIALECT_SYNONYMS: &[(&str, &str)] = &[
     ("subagent", "sub_agent"),
 ];
 
-/// Look up the canonical target for a dialect synonym (`name` must already be
-/// lowercased). Public so the agent loop's prose-call salvage can explain a
-/// mapping ("`list_files` → `list_dir`") in its corrective notice.
+/// Look up the canonical target for a dialect synonym.
+///
+/// `name` must already be lowercased. Public so the agent loop's prose-call
+/// salvage can explain a mapping ("`list_files` → `list_dir`") in its
+/// corrective notice.
 #[must_use]
 pub fn dialect_synonym(name: &str) -> Option<&'static str> {
     DIALECT_SYNONYMS
@@ -1087,7 +1092,7 @@ fn normalized_similarity(a: &str, b: &str) -> f64 {
     if max_len == 0 {
         return 1.0;
     }
-    1.0 - (levenshtein(a, b) as f64 / max_len as f64)
+    1.0 - (crate::usize_to_f64(levenshtein(a, b)) / crate::usize_to_f64(max_len))
 }
 
 /// Find the largest byte index <= `max_bytes` that is a valid char boundary.
@@ -1586,8 +1591,7 @@ mod tests {
         let call = ToolCall {
             id: "test-1".to_string(),
             name: "echo".to_string(),
-            parameters: [("text".to_string(), Value::String("hello".to_string()))]
-                .into_iter()
+            parameters: std::iter::once(("text".to_string(), Value::String("hello".to_string())))
                 .collect(),
         };
 
@@ -1605,8 +1609,7 @@ mod tests {
         let call = ToolCall {
             id: "test-2".to_string(),
             name: "Echo".to_string(),
-            parameters: [("text".to_string(), Value::String("hi".to_string()))]
-                .into_iter()
+            parameters: std::iter::once(("text".to_string(), Value::String("hi".to_string())))
                 .collect(),
         };
 
@@ -1622,11 +1625,11 @@ mod tests {
         reg.register_alias("e", "echo").await;
 
         // Request both the alias and canonical — alias should be skipped
-        let names: HashSet<String> = ["echo", "e"].iter().map(|s| s.to_string()).collect();
+        let names: HashSet<String> = ["echo", "e"].iter().map(ToString::to_string).collect();
         let defs = reg.definitions_for_names(&names).await;
         let def_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 
-        assert_eq!(defs.len(), 1, "Should have 1 def, got: {:?}", def_names);
+        assert_eq!(defs.len(), 1, "Should have 1 def, got: {def_names:?}");
         assert_eq!(defs[0].name, "echo");
     }
 
@@ -1637,7 +1640,7 @@ mod tests {
         reg.register_alias("e", "echo").await;
 
         // Request ONLY the alias (not canonical) — alias should be included
-        let names: HashSet<String> = ["e"].iter().map(|s| s.to_string()).collect();
+        let names: HashSet<String> = std::iter::once("e").map(ToString::to_string).collect();
         let defs = reg.definitions_for_names(&names).await;
 
         assert_eq!(defs.len(), 1);
@@ -2238,8 +2241,7 @@ mod tests {
             .execute(ToolCall {
                 id: "slow-1".to_string(),
                 name: "slow".to_string(),
-                parameters: [("timeout".to_string(), Value::from(3))]
-                    .into_iter()
+                parameters: std::iter::once(("timeout".to_string(), Value::from(3)))
                     .collect(),
             })
             .await;
@@ -2259,9 +2261,8 @@ mod tests {
     #[cfg(feature = "scripting")]
     #[test]
     fn backstop_outlives_every_inner_deadline() {
-        let requested: HashMap<String, Value> = [("timeout".to_string(), Value::from(600))]
-            .into_iter()
-            .collect();
+        let requested: HashMap<String, Value> =
+            std::iter::once(("timeout".to_string(), Value::from(600))).collect();
         assert!(
             backstop_timeout(180, &requested) > std::time::Duration::from_secs(600),
             "a 600s command deadline must not be cut short by a 180s ceiling"

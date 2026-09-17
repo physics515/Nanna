@@ -25,6 +25,7 @@ impl ReadFileTool {
         }
     }
 
+    #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<String>) -> Self {
         self.base_dir = Some(dir.into());
         self
@@ -92,7 +93,8 @@ impl Tool for ReadFileTool {
             ToolError::ExecutionFailed(format!("Failed to read file metadata: {e}"))
         })?;
 
-        if metadata.len() as usize > self.max_size {
+        // Compared as `u64` so no file length can wrap below the limit.
+        if metadata.len() > self.max_size as u64 {
             return Err(ToolError::ExecutionFailed(format!(
                 "File too large: {} bytes (max: {} bytes)",
                 metadata.len(),
@@ -108,12 +110,12 @@ impl Tool for ReadFileTool {
         let offset = params
             .get("offset")
             .and_then(serde_json::Value::as_u64)
-            .map_or(0, |v| v.saturating_sub(1) as usize);
+            .map_or(0, |v| crate::u64_to_usize(v.saturating_sub(1)));
 
         let limit = params
             .get("limit")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize);
+            .map(crate::u64_to_usize);
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -148,6 +150,7 @@ impl WriteFileTool {
         Self { base_dir: None }
     }
 
+    #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<String>) -> Self {
         self.base_dir = Some(dir.into());
         self
@@ -238,6 +241,7 @@ impl ListDirTool {
         Self { base_dir: None }
     }
 
+    #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<String>) -> Self {
         self.base_dir = Some(dir.into());
         self
@@ -291,7 +295,7 @@ impl Tool for ListDirTool {
             for entry in walkdir::WalkDir::new(path).max_depth(10) {
                 match entry {
                     Ok(e) => {
-                        let entry_path = e.path().strip_prefix(path).unwrap_or(e.path());
+                        let entry_path = e.path().strip_prefix(path).unwrap_or_else(|_| e.path());
                         let file_type = if e.file_type().is_dir() {
                             "dir"
                         } else if e.file_type().is_symlink() {

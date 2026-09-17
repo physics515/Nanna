@@ -33,6 +33,7 @@ impl ExecTool {
         }
     }
 
+    #[must_use]
     pub fn with_workdir(mut self, workdir: impl Into<String>) -> Self {
         self.workdir = Some(workdir.into());
         self

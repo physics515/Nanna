@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -104,7 +105,8 @@ impl Tool for CodeOutlineTool {
                 path,
                 line_count,
                 outline_lines,
-                (1.0 - outline_lines as f64 / line_count.max(1) as f64) * 100.0,
+                (1.0 - crate::usize_to_f64(outline_lines) / crate::usize_to_f64(line_count.max(1)))
+                    * 100.0,
                 outline
             )))
         }
@@ -273,15 +275,19 @@ impl Tool for CodeSearchTool {
             .get("file_pattern")
             .and_then(Value::as_str);
 
-        let context_lines = params
-            .get("context_lines")
-            .and_then(Value::as_u64)
-            .unwrap_or(2) as usize;
+        let context_lines = crate::u64_to_usize(
+            params
+                .get("context_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(2),
+        );
 
-        let max_results = params
-            .get("max_results")
-            .and_then(Value::as_u64)
-            .unwrap_or(50) as usize;
+        let max_results = crate::u64_to_usize(
+            params
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .unwrap_or(50),
+        );
 
         let re = Regex::new(pattern_str)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid regex: {e}")))?;
@@ -320,9 +326,8 @@ impl Tool for CodeSearchTool {
                     continue;
                 }
 
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue, // Skip unreadable files
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue; // Skip unreadable files
             };
 
             // Skip likely minified/bundled files (any line > 500 chars)
@@ -344,9 +349,9 @@ impl Tool for CodeSearchTool {
                     let end = (i + context_lines + 1).min(lines.len());
 
                     let mut match_block = format!("{}:{}\n", path.display(), i + 1);
-                    for j in start..end {
+                    for (j, context_line) in lines.iter().enumerate().take(end).skip(start) {
                         let marker = if j == i { ">" } else { " " };
-                        match_block.push_str(&format!("{} {:>4} | {}\n", marker, j + 1, lines[j]));
+                        let _ = writeln!(match_block, "{} {:>4} | {}", marker, j + 1, context_line);
                     }
                     structured_matches.push(serde_json::json!({
                         "file": path.display().to_string(),
@@ -426,10 +431,12 @@ impl Tool for ProjectStructureTool {
             .and_then(Value::as_str)
             .unwrap_or(".");
 
-        let max_depth = params
-            .get("max_depth")
-            .and_then(Value::as_u64)
-            .unwrap_or(3) as usize;
+        let max_depth = crate::u64_to_usize(
+            params
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(3),
+        );
 
         let root_path = Path::new(root);
         if !root_path.exists() {
@@ -516,9 +523,9 @@ fn format_size(bytes: u64) -> String {
     const MB: u64 = 1024 * 1024;
 
     if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
+        format!("{:.1}MB", crate::u64_to_f64(bytes) / crate::u64_to_f64(MB))
     } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
+        format!("{:.1}KB", crate::u64_to_f64(bytes) / crate::u64_to_f64(KB))
     } else {
         format!("{bytes}B")
     }

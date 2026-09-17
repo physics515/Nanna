@@ -20,6 +20,7 @@ use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -240,13 +241,14 @@ impl ReadPdfTool {
             return Ok(());
         }
         let Some(ref ocr_fn) = self.ocr_fn else {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "
 
 *Note: {} page(s) had no extractable text. Configure an OCR \
                  pipeline to recover text from image-only pages.*",
                 empty_pages.len()
-            ));
+            );
             return Ok(());
         };
 
@@ -275,23 +277,25 @@ impl ReadPdfTool {
                 .to_string();
             match ocr_fn(encoded, prompt, media_type).await {
                 Ok(text) if !text.trim().is_empty() => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (OCR)
 {text}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (OCR failed)
 Error: {e}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
             }
         }
@@ -335,22 +339,24 @@ Error: {e}
             let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
             match vision_fn(encoded, prompt.to_string(), media_type).await {
                 Ok(description) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {}
 {description}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
                 Err(e) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (analysis failed)
 Error: {e}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
             }
         }
@@ -419,7 +425,7 @@ impl Tool for ReadPdfTool {
             None => params
                 .get("max_pages")
                 .and_then(serde_json::Value::as_u64)
-                .map_or(PageSelection::All, |n| PageSelection::First(n as usize)),
+                .map_or(PageSelection::All, |n| PageSelection::First(crate::u64_to_usize(n))),
         };
 
         let image_prompt = params
@@ -519,22 +525,24 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
     debug_assert!(pages_read <= page_count, "cannot read more than exists");
 
     let mut text = String::new();
-    text.push_str(&format!(
+    let _ = write!(
+        text,
         "*{page_count} pages total, reading {pages_read}*\n\n"
-    ));
+    );
 
     // A selection that matched nothing must say so. An empty body plus a
     // "0 pages read" header is otherwise indistinguishable from a document
     // whose pages were all blank.
     if pages_read == 0 && page_count > 0 {
-        text.push_str(&format!(
-            "*[No pages matched the requested selection; the document has {page_count} pages]*\n"
-        ));
+        let _ = writeln!(
+            text,
+            "*[No pages matched the requested selection; the document has {page_count} pages]*"
+        );
     }
 
     let mut empty_pages: Vec<u32> = Vec::new();
     for page_num in &selected {
-        text.push_str(&format!("--- Page {page_num} ---\n"));
+        let _ = writeln!(text, "--- Page {page_num} ---");
 
         match doc.extract_text(&[*page_num]) {
             Ok(page_text) => {
@@ -548,7 +556,7 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
                 }
             }
             Err(e) => {
-                text.push_str(&format!("*[Failed to extract: {e}]*\n"));
+                let _ = writeln!(text, "*[Failed to extract: {e}]*");
                 empty_pages.push(*page_num);
             }
         }
@@ -558,10 +566,11 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
     // Announce the cut in counts rather than as "N more pages": the latter
     // reads as the tail, which is wrong for a range that skipped the front.
     if pages_read < page_count {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "\n*... {} of {page_count} pages not shown (selection read {pages_read})*",
             page_count - pages_read
-        ));
+        );
     }
 
     Ok(PdfExtract {
@@ -612,8 +621,6 @@ pub async fn ocr_empty_pages(
     empty_page_count: usize,
     ocr_fn: Option<&OcrFn>,
 ) -> Result<PdfOcrOutcome, ToolError> {
-    use std::fmt::Write as _;
-
     if empty_page_count == 0 {
         return Ok(PdfOcrOutcome::NotNeeded);
     }

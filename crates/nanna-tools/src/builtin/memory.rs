@@ -106,8 +106,7 @@ struct StoredMemory {
 impl MemoryStorage for InMemoryStorage {
     async fn store(&self, content: &str, tags: &[String]) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut memories = self.memories.write().await;
-        memories.push(StoredMemory {
+        self.memories.write().await.push(StoredMemory {
             id: id.clone(),
             content: content.to_string(),
             _tags: tags.to_vec(),
@@ -132,12 +131,13 @@ impl MemoryStorage for InMemoryStorage {
 
     async fn delete(&self, id: &str) -> Result<bool, String> {
         let mut memories = self.memories.write().await;
-        if let Some(pos) = memories.iter().position(|m| m.id == id) {
+        // Find and remove under one guard, so the position is still valid.
+        let position = memories.iter().position(|m| m.id == id);
+        if let Some(pos) = position {
             memories.remove(pos);
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        drop(memories);
+        Ok(position.is_some())
     }
 
     async fn list(&self, limit: usize) -> Result<Vec<MemoryResult>, String> {
@@ -263,10 +263,12 @@ impl Tool for RecallTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("query is required".to_string()))?;
 
-        let limit = params
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(5) as usize;
+        let limit = crate::u64_to_usize(
+            params
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(5),
+        );
 
         let results = match self.storage.search(query, limit).await {
             Ok(results) => results,

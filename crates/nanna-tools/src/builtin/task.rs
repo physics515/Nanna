@@ -52,7 +52,7 @@ impl Tool for TaskTool {
 
         let max_iterations = params.get("max_iterations")
             .and_then(Value::as_u64)
-            .map(|v| v as usize);
+            .map(crate::u64_to_usize);
 
         match self.spawner.spawn(prompt, description, max_iterations).await {
             Ok(result) => {

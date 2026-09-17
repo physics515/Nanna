@@ -39,27 +39,22 @@ impl BrowserManager {
 
     /// Get or create a page for the given URL.
     async fn get_page(&self, url: &str) -> Result<Arc<dyn BrowserPage>, BrowserError> {
-        // Check if we have a cached page at the same URL
-        let cached = self.current_page.read().await;
-        if cached.is_some() {
-            // If same URL, reuse
-            // Note: page.url() might not work well, so we always navigate
-            drop(cached);
-        } else {
-            drop(cached);
-        }
-
-        // Navigate to URL
+        // A cached page is never reused, even at the same URL: `page.url()`
+        // might not work well, so we always navigate.
         let page = self.browser.navigate(url).await?;
         
         // Cache it
-        let mut guard = self.current_page.write().await;
-        *guard = Some(page.clone());
+        *self.current_page.write().await = Some(page.clone());
         
         Ok(page)
     }
 
     /// Take a screenshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's message if navigating to `url` or capturing the
+    /// screenshot fails.
     pub async fn screenshot(
         &self,
         url: &str,
@@ -83,7 +78,11 @@ impl BrowserManager {
         let options = ScreenshotOptions {
             full_page,
             format,
-            quality: params.get("quality").and_then(serde_json::Value::as_u64).map(|q| q as u8),
+            // The low byte, exactly what the `as u8` this replaced kept.
+            quality: params
+                .get("quality")
+                .and_then(serde_json::Value::as_u64)
+                .map(|q| q.to_le_bytes()[0]),
             selector: params.get("selector").and_then(|v| v.as_str()).map(String::from),
         };
 
@@ -91,6 +90,12 @@ impl BrowserManager {
     }
 
     /// Extract content from a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if `attribute` is given
+    /// without a `selector`, or if reading the attribute, evaluating the
+    /// selector script, or reading the page's HTML or text fails.
     pub async fn extract(
         &self,
         url: &str,
@@ -145,6 +150,13 @@ impl BrowserManager {
     }
 
     /// Perform an action on a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if `action` is missing
+    /// or unknown, if a parameter the action needs (`selector`, `text`, `key`,
+    /// or the `value` URL for `navigate`) is missing, or if the page operation
+    /// itself fails.
     pub async fn action(
         &self,
         url: &str,
@@ -250,6 +262,11 @@ impl BrowserManager {
     }
 
     /// Evaluate JavaScript on a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if neither `expression`
+    /// nor `script` is given, or if evaluating the script fails.
     pub async fn evaluate(
         &self,
         url: &str,
@@ -270,6 +287,10 @@ impl BrowserManager {
     }
 
     /// Close the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's [`BrowserError`] if closing the browser fails.
     pub async fn close(&self) -> Result<(), BrowserError> {
         self.browser.close().await
     }
@@ -323,7 +344,7 @@ mod tests {
     #[test]
     fn test_browser_manager_creation() {
         // Just test that the types are correct - actual browser tests need integration
-        let config = BrowserConfig::default();
+        let _config = BrowserConfig::default();
         // Would need actual browser installed to test:
         // let manager = BrowserManager::from_config(config);
     }

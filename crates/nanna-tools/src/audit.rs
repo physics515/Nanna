@@ -770,7 +770,7 @@ mod tests {
     fn a_missing_trail_reads_as_an_empty_page_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let page = read_recent(&dir.path().join("never-written.jsonl"), 10);
-        assert!(page.records.is_empty());
+        assert_eq!(page.records, Vec::<ToolAuditRecord>::new());
         assert_eq!(page.generations_read, 0);
         assert_eq!(page.scanned, 0);
         assert!(

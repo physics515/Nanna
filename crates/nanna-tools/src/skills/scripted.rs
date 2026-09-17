@@ -27,6 +27,16 @@ pub struct ScriptedToolWrapper {
 
 impl ScriptedToolWrapper {
     /// Create from a tool.js or tool.ts file
+    ///
+    /// A `permissions.json` beside the file is applied when it can be read and
+    /// parsed, with `~` and relative paths resolved; otherwise the tool keeps
+    /// the default permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::ExecutionFailed`] if the script file cannot be read,
+    /// or [`ToolError::InvalidParams`] if it has no `export default` manifest
+    /// with a name and description.
     pub async fn from_file(path: &Path) -> Result<Self, ToolError> {
         let mut tool = ScriptedTool::from_file(path).map_err(|e| {
             ToolError::ExecutionFailed(format!("Failed to load script: {e}"))
@@ -35,8 +45,10 @@ impl ScriptedToolWrapper {
         // Check for permissions.json alongside the tool file
         if let Some(parent) = path.parent() {
             let perms_path = parent.join("permissions.json");
+            // Read without blocking: skills load on the daemon's runtime, at
+            // boot and again whenever an authored tool is (re)registered.
             if perms_path.exists()
-                && let Ok(perms_str) = std::fs::read_to_string(&perms_path)
+                && let Ok(perms_str) = tokio::fs::read_to_string(&perms_path).await
                     && let Ok(mut perms) = serde_json::from_str::<ToolPermissions>(&perms_str) {
                         // Expand ~ to home directory and resolve relative paths
                         let home = directories::UserDirs::new().map_or_else(|| PathBuf::from("."), |d| d.home_dir().to_path_buf());
@@ -76,7 +88,7 @@ impl ScriptedToolWrapper {
         // entry point is `tool.ts`, so its logs named nearly every tool `tool`.
         // The manifest carries the name the model and the user actually call,
         // and this is the first point where both are known, so bind it here.
-        tool.name = manifest.name.clone();
+        tool.name.clone_from(&manifest.name);
 
         info!(name = %manifest.name, path = ?path, "Loaded scripted tool");
 
@@ -90,6 +102,11 @@ impl ScriptedToolWrapper {
     }
 
     /// Create from source code directly
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidParams`] if `source` has no `export default`
+    /// manifest with a name and description.
     pub fn from_source(name: impl Into<String>, source: impl Into<String>) -> Result<Self, ToolError> {
         let mut tool = ScriptedTool::new(name, source);
 
@@ -101,7 +118,7 @@ impl ScriptedToolWrapper {
 
         // Same reason as `from_file`: the caller's label is for the caller, the
         // manifest name is what everything downstream calls this tool.
-        tool.name = manifest.name.clone();
+        tool.name.clone_from(&manifest.name);
 
         Ok(Self {
             tool,
@@ -127,17 +144,102 @@ impl ScriptedToolWrapper {
         self.services = Some(services);
         self
     }
+
+    /// Ranked tool search for `Nanna.searchTools(query)`, backed by the same
+    /// weak registry handle as `Nanna.listTools()`.
+    ///
+    /// The closure is called synchronously from the script engine's blocking
+    /// thread, so it runs the async registry read on a throwaway
+    /// current-thread runtime (same pattern the bridge fns use). A dead
+    /// registry — or any internal failure — yields an empty array so the skill
+    /// can fall back to its own matching; it never throws into the script.
+    fn tool_search_fn(&self) -> Option<nanna_scripting::ToolSearchFn> {
+        self.registry.as_ref().map(|weak| {
+            let weak = weak.clone();
+            let f: nanna_scripting::ToolSearchFn = Arc::new(move |query: &str, limit: usize| {
+                let Some(registry) = weak.upgrade() else {
+                    return Value::Array(Vec::new());
+                };
+                let query = query.to_string();
+                let hits = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .map(|rt| rt.block_on(registry.search_tools(&query, limit)))
+                        .unwrap_or_default()
+                })
+                .join()
+                .unwrap_or_default();
+                Value::Array(
+                    hits.into_iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "name": h.name,
+                                "description": h.description,
+                                "score": h.score,
+                            })
+                        })
+                        .collect(),
+                )
+            });
+            f
+        })
+    }
+}
+
+/// Turn the value a script returned into a [`ToolResult`].
+///
+/// A structured result — `{ content: "...", success: bool, data: {...} }` —
+/// keeps its explicit `success` and `data`. Anything else is plain content, and
+/// content starting with `Error:` marks a failure, returned (not thrown) so the
+/// model reads it as a tool result.
+fn tool_result_from_script_value(value: &Value) -> ToolResult {
+    // Check for structured result: { content: "...", success: bool, data: {...} }
+    if let Value::Object(obj) = value
+        && let Some(content_val) = obj.get("content") {
+            let content = match content_val {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+            };
+            // Respect explicit success field if present
+            let is_success = obj.get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| !content.starts_with("Error:"));
+            let mut tool_result = if is_success {
+                ToolResult::success(content)
+            } else {
+                ToolResult::error(content)
+            };
+            if let Some(data) = obj.get("data") {
+                tool_result = tool_result.with_data(data.clone());
+            }
+            return tool_result;
+        }
+
+    // Fallback: plain string/null/other
+    let content = match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+
+    // Detect error strings from tools that return plain strings
+    if content.starts_with("Error:") {
+        ToolResult::error(content)
+    } else {
+        ToolResult::success(content)
+    }
 }
 
 #[async_trait]
 impl Tool for ScriptedToolWrapper {
     fn definition(&self) -> ToolDefinition {
         // Parse parameters from manifest if available
-        let parameters = if let Some(ref schema) = self.manifest.parameters {
-            parse_params_from_schema(schema)
-        } else {
-            vec![]
-        };
+        let parameters = self
+            .manifest
+            .parameters
+            .as_ref()
+            .map_or_else(Vec::new, parse_params_from_schema);
         
         ToolDefinition {
             name: self.manifest.name.clone(),
@@ -199,42 +301,7 @@ impl Tool for ScriptedToolWrapper {
             None
         };
 
-        // Ranked tool search for `Nanna.searchTools(query)`, backed by the
-        // same weak registry handle as `Nanna.listTools()`. The closure is
-        // called synchronously from the script engine's blocking thread, so it
-        // runs the async registry read on a throwaway current-thread runtime
-        // (same pattern the bridge fns use). A dead registry — or any internal
-        // failure — yields an empty array so the skill can fall back to its
-        // own matching; it never throws into the script.
-        let tool_search: Option<nanna_scripting::ToolSearchFn> = self.registry.as_ref().map(|weak| {
-            let weak = weak.clone();
-            let f: nanna_scripting::ToolSearchFn = Arc::new(move |query: &str, limit: usize| {
-                let Some(registry) = weak.upgrade() else {
-                    return Value::Array(Vec::new());
-                };
-                let query = query.to_string();
-                let hits = std::thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .build()
-                        .map(|rt| rt.block_on(registry.search_tools(&query, limit)))
-                        .unwrap_or_default()
-                })
-                .join()
-                .unwrap_or_default();
-                Value::Array(
-                    hits.into_iter()
-                        .map(|h| {
-                            serde_json::json!({
-                                "name": h.name,
-                                "description": h.description,
-                                "score": h.score,
-                            })
-                        })
-                        .collect(),
-                )
-            });
-            f
-        });
+        let tool_search = self.tool_search_fn();
 
         let input = Value::Object(params.into_iter().collect());
 
@@ -250,42 +317,7 @@ impl Tool for ScriptedToolWrapper {
             "Script executed"
         );
 
-        // Check for structured result: { content: "...", success: bool, data: {...} }
-        if let Value::Object(ref obj) = result.value
-            && let Some(content_val) = obj.get("content") {
-                let content = match content_val {
-                    Value::String(s) => s.clone(),
-                    Value::Null => String::new(),
-                    other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-                };
-                // Respect explicit success field if present
-                let is_success = obj.get("success")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or_else(|| !content.starts_with("Error:"));
-                let mut tool_result = if is_success {
-                    ToolResult::success(content)
-                } else {
-                    ToolResult::error(content)
-                };
-                if let Some(data) = obj.get("data") {
-                    tool_result = tool_result.with_data(data.clone());
-                }
-                return Ok(tool_result);
-            }
-
-        // Fallback: plain string/null/other
-        let content = match result.value {
-            Value::String(ref s) => s.clone(),
-            Value::Null => String::new(),
-            ref other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-        };
-
-        // Detect error strings from tools that return plain strings
-        if content.starts_with("Error:") {
-            Ok(ToolResult::error(content))
-        } else {
-            Ok(ToolResult::success(content))
-        }
+        Ok(tool_result_from_script_value(&result.value))
     }
 
     fn output_target(&self) -> OutputTarget {
@@ -324,8 +356,8 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
             .unwrap_or_default();
         
         for (name, prop) in properties {
+            // `string`, and anything absent or unrecognised, reads as a string.
             let param_type = match prop.get("type").and_then(|t| t.as_str()) {
-                Some("string") => ParameterType::String,
                 Some("integer") => ParameterType::Integer,
                 Some("number") => ParameterType::Number,
                 Some("boolean") => ParameterType::Boolean,
