@@ -678,8 +678,37 @@ fn turn_signal(event: &Event) -> Option<TurnSignal<'_>> {
 }
 
 /// Whether to send "typing…" now, given when it was last sent. Pure.
-fn typing_due(last_sent: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn typing_due(last_sent: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
     last_sent.is_none_or(|last| now.saturating_duration_since(last) >= TYPING_REFRESH)
+}
+
+/// A routed session whose turn is running, as the typing keepalive sees it.
+struct Typing {
+    route: ReplyChannel,
+    last_sent: tokio::time::Instant,
+    last_event: tokio::time::Instant,
+}
+
+/// How long a turn may go without any event before the keepalive stops
+/// showing "typing…" for it. Pure.
+///
+/// A live turn emits a liveness beat every [`crate::liveness::beat_interval_secs`]
+/// even when it is otherwise silent (a long tool call), so two missed beats
+/// mean the turn is gone without a `message_end` — a crash — and the chat must
+/// not show "typing…" forever.
+fn typing_abandon_after() -> std::time::Duration {
+    std::time::Duration::from_secs(crate::liveness::beat_interval_secs().saturating_mul(2))
+}
+
+/// Send one "typing…" for `route`; failures are logged, never retried.
+async fn send_typing_to(router: &RwLock<MessageRouter>, session_id: &str, route: &ReplyChannel) {
+    let router = router.read().await;
+    if let Some(channel) = router.get(&route.provider) {
+        let target = ChannelId::new(&route.provider, &route.id);
+        if let Err(e) = channel.send_typing(&target).await {
+            debug!("typing indicator for {session_id} not sent: {e}");
+        }
+    }
 }
 
 /// Forward replies for channel-routed sessions back through `router`.
@@ -691,9 +720,10 @@ fn typing_due(last_sent: Option<std::time::Instant>, now: std::time::Instant) ->
 ///
 /// While a routed session's turn runs, the chat also shows "typing…": a
 /// Telegram user used to see nothing at all between sending a message and a
-/// reply minutes later. Driven by the turn's own events, so there is no timer
-/// to leak; the throttle map holds only sessions mid-turn (entries leave on
-/// `message_end`) and is bounded by the channel session count.
+/// reply minutes later. A turn's first event starts it; a tick every
+/// [`TYPING_REFRESH`] keeps it up through silent stretches (a long tool call);
+/// `message_end`, or no event for [`typing_abandon_after`], ends it. The map
+/// holds only sessions mid-turn and is bounded by the channel session count.
 pub fn spawn_reply_forwarder(
     sessions: Arc<SessionManager>,
     mut events: broadcast::Receiver<Event>,
@@ -701,10 +731,28 @@ pub fn spawn_reply_forwarder(
     counters: Arc<crate::channel_counters::ChannelCounters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut typing: std::collections::HashMap<String, std::time::Instant> =
+        let mut typing: std::collections::HashMap<String, Typing> =
             std::collections::HashMap::new();
+        let mut tick = tokio::time::interval(TYPING_REFRESH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let event = match events.recv().await {
+            let received = tokio::select! {
+                received = events.recv() => received,
+                _ = tick.tick() => {
+                    let now = tokio::time::Instant::now();
+                    typing.retain(|_, state| {
+                        now.saturating_duration_since(state.last_event) < typing_abandon_after()
+                    });
+                    for (session_id, state) in &mut typing {
+                        if typing_due(Some(state.last_sent), now) {
+                            state.last_sent = now;
+                            send_typing_to(&router, session_id, &state.route).await;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let event = match received {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
@@ -717,18 +765,19 @@ pub fn spawn_reply_forwarder(
             };
             match turn_signal(&event) {
                 Some(TurnSignal::Working(session_id)) => {
-                    let now = std::time::Instant::now();
-                    if typing_due(typing.get(session_id).copied(), now) {
-                        if let Some(route) = sessions.reply_channel(session_id).await {
-                            typing.insert(session_id.to_string(), now);
-                            let router = router.read().await;
-                            if let Some(channel) = router.get(&route.provider) {
-                                let target = ChannelId::new(&route.provider, &route.id);
-                                if let Err(e) = channel.send_typing(&target).await {
-                                    debug!("typing indicator for {session_id} not sent: {e}");
-                                }
-                            }
-                        }
+                    let now = tokio::time::Instant::now();
+                    if let Some(state) = typing.get_mut(session_id) {
+                        state.last_event = now;
+                    } else if let Some(route) = sessions.reply_channel(session_id).await {
+                        send_typing_to(&router, session_id, &route).await;
+                        typing.insert(
+                            session_id.to_string(),
+                            Typing {
+                                route,
+                                last_sent: now,
+                                last_event: now,
+                            },
+                        );
                     }
                 }
                 Some(TurnSignal::Finished(session_id)) => {
@@ -1213,7 +1262,7 @@ mod tests {
 
     #[test]
     fn typing_is_throttled_and_follows_the_turn() {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         assert!(typing_due(None, start));
         assert!(!typing_due(Some(start), start + Duration::from_secs(3)));
         assert!(typing_due(Some(start), start + TYPING_REFRESH));
@@ -1293,6 +1342,56 @@ mod tests {
             ],
             "one typing for a burst of deltas, none for the GUI session"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_stays_up_through_a_silent_tool_call_and_stops_for_a_dead_turn() {
+        let sessions = Arc::new(SessionManager::new());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "chat-7".into(),
+        };
+        sessions
+            .ensure_channel_session(SESSION, "test · ada", &route)
+            .await;
+        let (events_tx, events_rx) = broadcast::channel(16);
+        let (router, sent) = recording_router();
+        let counters = Arc::new(crate::channel_counters::ChannelCounters::default());
+        let forwarder = spawn_reply_forwarder(sessions.clone(), events_rx, router, counters);
+        let typings = |sent: &Sent| {
+            sent.lock()
+                .expect("sent")
+                .iter()
+                .filter(|(_, text)| text == "<typing>")
+                .count()
+        };
+
+        events_tx
+            .send(Event::MessageStart {
+                session_id: SESSION.into(),
+                message_id: "m".into(),
+            })
+            .expect("a receiver");
+        // A tool call with no events for 10 s: the tick keeps "typing…" up.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let during = typings(&sent);
+        assert!(
+            (3..=4).contains(&during),
+            "start + a refresh every 4 s over 10 s of silence, got {during}"
+        );
+
+        // No event at all for well past two beats: the turn is gone.
+        tokio::time::sleep(typing_abandon_after() + Duration::from_secs(10)).await;
+        let settled = typings(&sent);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            typings(&sent),
+            settled,
+            "a turn with no events stops showing typing"
+        );
+
+        drop(events_tx);
+        forwarder.await.expect("forwarder exits");
     }
 
     #[tokio::test]

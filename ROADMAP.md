@@ -4823,8 +4823,11 @@ asks permission or restricts her.)*:
       (start, deltas, tools, liveness beats) at most every 4 s per session — Telegram's action lasts
       5 s, Discord's 10 s — and stops at `message_end`; no timers, the throttle map holds only
       sessions mid-turn. Test: one typing for a burst of deltas, none for a GUI session
-      (mutation-checked: unthrottled it fails). No live bot. Gap: a silent stretch longer than 5 s
-      with no event (a long tool call; beats are 30 s) lets Telegram's indicator lapse.
+      (mutation-checked: unthrottled it fails). No live bot. Same day, the gap it left — a silent
+      tool call longer than 5 s let Telegram's indicator lapse, since beats are 30 s — closed: a
+      4 s tick refreshes every mid-turn session, and a session with no event for two beat intervals
+      (60 s; a live turn always beats) is dropped, so a crashed turn cannot show "typing…" forever.
+      Paused-time test over 10 s of silence and a dead turn; both halves mutation-checked.
       - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
             now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
             calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview
