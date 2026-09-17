@@ -833,7 +833,8 @@ impl MemoryRepository {
     pub async fn retain_queue_models(&self, keep: &[String]) -> Result<usize, StorageError> {
         assert!(
             !keep.is_empty(),
-            "refusing to clear the whole queue — an empty keep-list means no provider resolved,              which is a configuration problem, not a cleanup request"
+            "refusing to clear the whole queue — an empty keep-list means no provider resolved, \
+             which is a configuration problem, not a cleanup request"
         );
         let placeholders: Vec<String> = (1..=keep.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
