@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence, PendingChunk};
-use nanna_storage::{MemoryRepository, NewMemory, NewMemoryChunk};
+use nanna_storage::{MemoryFsrsUpdate, MemoryRepository, NewMemory, NewMemoryChunk};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -212,13 +212,15 @@ impl MemoryPersistence for TursoMemoryPersistence {
                 }
                 let _ = self.repo.update_fsrs(
                     &entry.id,
-                    entry.fsrs.stability,
-                    entry.fsrs.difficulty,
-                    entry.fsrs.last_access,
-                    i64::from(entry.fsrs.access_count),
-                    entry.fsrs.importance,
-                    entry.fsrs.storage_strength,
-                    i64::from(entry.fsrs.generation),
+                    &MemoryFsrsUpdate {
+                        stability: entry.fsrs.stability,
+                        difficulty: entry.fsrs.difficulty,
+                        last_access: entry.fsrs.last_access,
+                        access_count: i64::from(entry.fsrs.access_count),
+                        importance: entry.fsrs.importance,
+                        storage_strength: entry.fsrs.storage_strength,
+                        generation: i64::from(entry.fsrs.generation),
+                    },
                 ).await;
                 Ok(())
             }
@@ -430,13 +432,15 @@ impl MemoryPersistence for TursoMemoryPersistence {
         self.repo
             .update_fsrs(
                 id,
-                fsrs.stability,
-                fsrs.difficulty,
-                fsrs.last_access,
-                i64::from(fsrs.access_count),
-                fsrs.importance,
-                fsrs.storage_strength,
-                i64::from(fsrs.generation),
+                &MemoryFsrsUpdate {
+                    stability: fsrs.stability,
+                    difficulty: fsrs.difficulty,
+                    last_access: fsrs.last_access,
+                    access_count: i64::from(fsrs.access_count),
+                    importance: fsrs.importance,
+                    storage_strength: fsrs.storage_strength,
+                    generation: i64::from(fsrs.generation),
+                },
             )
             .await
             .map(|_| ())

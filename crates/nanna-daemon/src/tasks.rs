@@ -1697,15 +1697,15 @@ impl ChatSink {
             tokio::spawn(async move {
                 if let Some(storage) = storage {
                     if let Err(e) = storage
-                        .log_tool_call(
-                            &observation.tool_name,
-                            observation.success,
-                            observation.short_circuited,
-                            observation.duration_ms,
-                            observation.output_size,
-                            observation.error.as_deref(),
-                            Some(&session_id),
-                        )
+                        .log_tool_call(&nanna_storage::NewToolCall {
+                            tool_name: &observation.tool_name,
+                            success: observation.success,
+                            short_circuited: observation.short_circuited,
+                            duration_ms: observation.duration_ms,
+                            output_size: observation.output_size,
+                            error_message: observation.error.as_deref(),
+                            session_id: Some(&session_id),
+                        })
                         .await
                     {
                         tracing::warn!("Failed to log tool call to DB: {e}");
