@@ -9,7 +9,6 @@ description = "Child-process lifetime containment: tree kills and kill-on-close 
 # takes &tokio::process::Child; both callers (exec tool, acceptance runner)
 # are tokio-native.
 tokio.workspace = true
-tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Win32_System_JobObjects + Win32_Security: kill-on-close Job Objects (the
@@ -17,6 +16,8 @@ tracing.workspace = true
 # Win32_Security even though we always pass null).
 # Win32_System_Threading: GetCurrentProcess for daemon self-adoption.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
+# Job Object failures are logged; the Windows code path is the only caller.
+tracing.workspace = true
 
 # Process-group kill for tree-kill timeouts: kill(-pgid, SIGKILL) reaps the
 # shell AND its descendants, which kill_on_drop alone cannot.
