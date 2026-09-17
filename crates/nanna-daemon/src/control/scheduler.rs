@@ -61,14 +61,30 @@ impl ControlPlane {
                     json!({ "error": "not_found", "id": id })
                 }
             }
-            SchedulerAction::Add { schedule, task, name } => {
+            SchedulerAction::Add {
+                schedule,
+                task,
+                name,
+                session_id,
+            } => {
+                // A result posted into a conversation that does not exist would
+                // be dropped on every run; refuse it now instead.
+                if let Some(ref id) = session_id
+                    && !self.sessions.exists(id).await
+                {
+                    return json!({
+                        "error": "session_not_found",
+                        "message": format!("Session {id} not found; the job was not added"),
+                    });
+                }
                 // Try to parse as cron expression
                 match Scheduler::cron_task(
                     name.as_deref().unwrap_or("unnamed"),
                     &schedule,
                     &task,
                 ) {
-                    Ok(scheduled_task) => {
+                    Ok(mut scheduled_task) => {
+                        scheduled_task.target_session = session_id;
                         let id = scheduled_task.id.clone();
                         let scheduler = scheduler.read().await;
                         scheduler.add_task(scheduled_task).await;

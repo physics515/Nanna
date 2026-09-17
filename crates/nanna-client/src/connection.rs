@@ -626,6 +626,7 @@ impl SchedulerApi<'_> {
                 schedule: schedule.to_string(),
                 task: task.to_string(),
                 name: name.map(String::from),
+                session_id: None,
             }))
             .await
     }

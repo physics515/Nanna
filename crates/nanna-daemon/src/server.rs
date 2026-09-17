@@ -462,6 +462,20 @@ async fn assemble_handle_content(
 /// pairing in one function is the point: the offsets were once proven against
 /// the assembled text and then used to index a single chunk of it, which is
 /// both out of bounds and off-boundary.
+/// What a scheduled job posts into its conversation after a run. Pure.
+///
+/// Nothing for a heartbeat that found nothing to do (the `HEARTBEAT_OK`
+/// sentinel is run mechanics, not news) or for an empty result — a chat app
+/// would otherwise get a blank message on every quiet run.
+fn scheduled_output_message(task_name: &str, content: &str, heartbeat_ok: bool) -> Option<String> {
+    let content = content.trim();
+    if heartbeat_ok || content.is_empty() {
+        return None;
+    }
+    debug_assert!(!task_name.is_empty(), "every scheduled task is named");
+    Some(format!("**Scheduled: {task_name}**\n\n{content}"))
+}
+
 /// The dreaming orchestrator, reached late — it is built after script services.
 pub type DreamingSlot = Arc<std::sync::OnceLock<Arc<nanna_memory::DreamingService>>>;
 
@@ -2909,10 +2923,19 @@ impl DaemonServer {
                                             result.content.chars().take(200).collect::<String>()
                                         );
                                     }
-                                    if task.target_channel.is_some() {
+                                    if let Some(message) = scheduled_output_message(
+                                        &task.name,
+                                        &result.content,
+                                        heartbeat_ok,
+                                    ) && let Some(ref target) = task.target_session
+                                        && sessions
+                                            .post_assistant_message(&events, target, message)
+                                            .await
+                                            .is_none()
+                                    {
                                         warn!(
-                                            "Task '{}' targets a channel; channel routing from the \
-                                             daemon scheduler is not implemented yet",
+                                            "Task '{}' posts to session {target}, which no longer \
+                                             exists; its result is in the run history only",
                                             task.name
                                         );
                                     }
@@ -5093,6 +5116,19 @@ mod tests {
         service: &Arc<nanna_memory::MemoryService>,
     ) -> nanna_memory::MemoryListEntry {
         service.list_all().await.into_iter().next().expect("seeded")
+    }
+
+    #[test]
+    fn a_scheduled_result_is_posted_only_when_it_says_something() {
+        assert_eq!(
+            scheduled_output_message("inbox", "  3 new messages\n", false).as_deref(),
+            Some("**Scheduled: inbox**\n\n3 new messages")
+        );
+        assert_eq!(
+            scheduled_output_message("heartbeat", "HEARTBEAT_OK", true),
+            None
+        );
+        assert_eq!(scheduled_output_message("inbox", "   ", false), None);
     }
 
     #[test]

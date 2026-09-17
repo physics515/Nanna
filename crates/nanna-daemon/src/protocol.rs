@@ -537,6 +537,11 @@ pub enum SchedulerAction {
         schedule: String,
         task: String,
         name: Option<String>,
+        /// A conversation the job's result is posted into after each run —
+        /// and so, for a channel conversation, sent to that chat. Absent: the
+        /// result goes to the job's run history only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// Update a job
     Update {

@@ -1313,6 +1313,38 @@ impl SessionManager {
         }
     }
 
+    /// Append an assistant message outside any streamed turn and announce it
+    /// with `session_message_added`, so an open client shows it and the channel
+    /// reply forwarder delivers it to a channel-owned conversation.
+    ///
+    /// The one path for daemon-originated messages — a reminder coming due, a
+    /// clarifying question, a scheduled job's result — so none of them can be
+    /// persisted without being announced, or the reverse. `None` when the
+    /// session does not exist; nothing is sent then.
+    pub async fn post_assistant_message(
+        &self,
+        events: &tokio::sync::broadcast::Sender<crate::protocol::Event>,
+        session_id: &str,
+        content: String,
+    ) -> Option<String> {
+        debug_assert!(
+            !content.trim().is_empty(),
+            "a posted message says something"
+        );
+        let message_id = self
+            .add_message(session_id, MessageRole::Assistant, content.clone())
+            .await?;
+        // No receiver is not a failure: the message is persisted and read back
+        // from history by the next client that opens the session.
+        let _ = events.send(crate::protocol::Event::SessionMessageAdded {
+            session_id: session_id.to_string(),
+            message_id: message_id.clone(),
+            role: "assistant".to_string(),
+            content,
+        });
+        Some(message_id)
+    }
+
     /// Add a message with tool calls, reasoning, run timeline, and usage totals to a session (with write-through to DB)
     pub async fn add_full_message(
         &self,

@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 
 use crate::control::chat_harness::ChatRunRegistry;
 use crate::protocol::Event;
-use crate::session::{MessageRole, SessionManager};
+use crate::session::SessionManager;
 
 /// Default wait for an answer.
 pub const ASK_USER_WAIT_SECS_DEFAULT: u64 = 600;
@@ -117,13 +117,8 @@ pub fn build_ask_user_services(deps: AskUserDeps) -> HashMap<String, ServiceFn> 
 
 async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
     let request = parse_request(params)?;
-    let message_id = deps
-        .sessions
-        .add_message(
-            &request.session_id,
-            MessageRole::Assistant,
-            request.question.clone(),
-        )
+    deps.sessions
+        .post_assistant_message(&deps.events, &request.session_id, request.question.clone())
         .await
         .ok_or_else(|| {
             format!(
@@ -131,13 +126,6 @@ async fn ask(deps: &AskUserDeps, params: &Value) -> Result<Value, String> {
                 request.session_id
             )
         })?;
-    // No receiver is fine: the question is persisted and shows on next load.
-    let _ = deps.events.send(Event::SessionMessageAdded {
-        session_id: request.session_id.clone(),
-        message_id,
-        role: "assistant".to_string(),
-        content: request.question.clone(),
-    });
 
     if !deps.chat_runs.is_active(&request.session_id).await {
         return Ok(json!({

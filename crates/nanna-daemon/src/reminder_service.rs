@@ -39,7 +39,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
 use crate::protocol::Event;
-use crate::session::{MessageRole, SessionManager};
+use crate::session::SessionManager;
 
 /// Scheduler task name every reminder carries.
 ///
@@ -333,8 +333,8 @@ pub async fn deliver_reminder(
         _ => None,
     };
     let content = reminder_text(&task.payload, fire_at, now, tick);
-    let message_id = sessions
-        .add_message(session_id, MessageRole::Assistant, content.clone())
+    sessions
+        .post_assistant_message(event_tx, session_id, content.clone())
         .await
         .ok_or_else(|| {
             format!(
@@ -342,14 +342,6 @@ pub async fn deliver_reminder(
                 task.id
             )
         })?;
-    // No receiver is not a failure: the message is persisted and a client that
-    // opens the session later reads it from history.
-    let _ = event_tx.send(Event::SessionMessageAdded {
-        session_id: session_id.to_string(),
-        message_id,
-        role: "assistant".to_string(),
-        content: content.clone(),
-    });
     info!("Reminder {} delivered into session {session_id}", task.id);
     Ok(content)
 }
@@ -498,7 +490,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_refuses_every_job_that_is_not_a_reminder() {
-        let scheduler = Arc::new(RwLock::new(Scheduler::new(nanna_core::SchedulerConfig::default())));
+        let scheduler = Arc::new(RwLock::new(Scheduler::new(
+            nanna_core::SchedulerConfig::default(),
+        )));
         let dreaming = nanna_core::consolidation_task(None);
         let dreaming_id = dreaming.id.clone();
         let pending = reminder("stretch", at(60));
@@ -536,7 +530,9 @@ mod tests {
 
     #[tokio::test]
     async fn add_checks_the_session_the_switch_and_the_bound() {
-        let scheduler = Arc::new(RwLock::new(Scheduler::new(nanna_core::SchedulerConfig::default())));
+        let scheduler = Arc::new(RwLock::new(Scheduler::new(
+            nanna_core::SchedulerConfig::default(),
+        )));
         let sessions = SessionManager::new();
         let session = sessions.create(None).await;
 
@@ -598,7 +594,7 @@ mod tests {
         let stored = sessions.get(&session.id).await.unwrap();
         let last = stored.messages.last().unwrap();
         assert_eq!(last.content, delivered);
-        assert_eq!(last.role, MessageRole::Assistant);
+        assert_eq!(last.role, crate::session::MessageRole::Assistant);
 
         match events.try_recv().unwrap() {
             Event::SessionMessageAdded {

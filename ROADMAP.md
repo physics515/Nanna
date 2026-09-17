@@ -4748,9 +4748,19 @@ asks permission or restricts her.)*:
 - [ ] **File/log monitors** — no watcher anywhere wakes the agent; best latency today is the heartbeat.
       Watcher → agent-prompt (reusing scheduler/executor plumbing): a download landing, a build log erroring,
       a folder changing are the daemon's native senses.
-- [ ] **Detached sub-agents with channel notifications** — the chat task tool blocks the parent turn, and
+- [~] **Detached sub-agents with channel notifications** — the chat task tool blocks the parent turn, and
       scheduled-task channel routing is a warn-"not implemented" (server.rs:1242). "Do X" from Telegram then
       walk away requires fire-and-forget spawn + completion that reaches the channel, not just GUI clients.
+      *(2026-09-17) The scheduled-task half is done.* `scheduler.add` takes an optional `session_id`
+      (refused if the conversation does not exist) stored as the job's `target_session`, and after
+      each run the executor posts the result into that conversation through the one
+      daemon-originated-message path (`SessionManager::post_assistant_message`, now shared by
+      reminders, `ask_user` and scheduled jobs): persisted, announced, and forwarded to the chat
+      app when it is a channel conversation. A quiet heartbeat (`HEARTBEAT_OK`) or an empty result
+      posts nothing. The "channel routing is not implemented" warning is gone. 2 tests (pure
+      message rule; add refuses a missing session and stores a real one). The prompt run itself
+      needs a model, so the post-run delivery was not exercised live. Remaining: fire-and-forget
+      sub-agent spawn whose completion posts the same way.
 - [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
       Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
       ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
