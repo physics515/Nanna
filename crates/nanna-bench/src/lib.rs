@@ -193,13 +193,24 @@ pub fn fixture_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 		.map(|_| {
 			(0..dim)
 				.map(|_| {
-					#[allow(clippy::cast_precision_loss)]
-					let unit = (next() >> 40) as f32 / f32::from(1_u16 << 8) / 96.0;
+					let unit = top_24_bits_as_f32(next()) / f32::from(1_u16 << 8) / 96.0;
 					unit.mul_add(2.0, -1.0)
 				})
 				.collect()
 		})
 		.collect()
+}
+
+/// The top 24 bits of a draw (`draw >> 40`) as the `f32` that denotes them.
+///
+/// Every integer below 2^24 is exactly representable in an `f32`, but no
+/// `From` conversion takes a 24-bit integer there. Split into its high 16 and
+/// low 8 bits, both halves have lossless `From` conversions, and recombining
+/// them lands on an integer below 2^24 again, so no step rounds: the result is
+/// bit-identical to the plain cast.
+fn top_24_bits_as_f32(draw: u64) -> f32 {
+	let [high, middle, low, ..] = draw.to_be_bytes();
+	f32::from(u16::from_be_bytes([high, middle])).mul_add(256.0, f32::from(low))
 }
 
 #[cfg(test)]
@@ -222,5 +233,15 @@ mod tests {
 		assert_eq!(a, b);
 		assert_eq!(a.len(), 4);
 		assert_eq!(a[0].len(), 8);
+	}
+
+	#[test]
+	fn top_24_bits_convert_exactly() {
+		// `f64::from(u32)` is lossless, so it is an exact reference for the
+		// 24-bit value the draw's top bits denote.
+		for draw in [0, 1 << 40, (1 << 40) - 1, u64::MAX, 0xFFFF_FF00_0000_0000, 0x9E37_79B9_7F4A_7C15] {
+			let expected = u32::try_from(draw >> 40).expect("a 24-bit value fits u32");
+			assert_eq!(f64::from(top_24_bits_as_f32(draw)).to_bits(), f64::from(expected).to_bits(), "draw {draw:#x}");
+		}
 	}
 }

@@ -4,7 +4,7 @@
 
 use crate::{Tool, ToolDefinition, ToolError, ToolResult, ToolRegistry, ParameterType, ToolParameter, OutputTarget};
 use async_trait::async_trait;
-use nanna_scripting::{ScriptEngine, ScriptedTool, ToolManifest, ToolPermissions, extract_manifest, ServiceFn};
+use nanna_scripting::{BridgeCapabilities, ScriptEngine, ScriptedTool, ToolManifest, ToolPermissions, extract_manifest, ServiceFn};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -305,7 +305,15 @@ impl Tool for ScriptedToolWrapper {
 
         let input = Value::Object(params.into_iter().collect());
 
-        let result = self.engine.execute_full(&self.tool, input, tool_defs, self.services.clone(), default_workdir, session_id, tool_search).await.map_err(|e| {
+        let capabilities = BridgeCapabilities {
+            tool_definitions: tool_defs,
+            services: self.services.clone(),
+            default_workdir,
+            session_id,
+            tool_search,
+        };
+
+        let result = self.engine.execute_full(&self.tool, input, capabilities).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
 

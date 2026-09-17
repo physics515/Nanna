@@ -51,7 +51,7 @@ mod deno_impl;
 #[cfg(feature = "python")]
 pub mod python;
 
-pub use engine::{ScriptEngine, EngineKind, ExecutionResult};
+pub use engine::{ScriptEngine, EngineKind, ExecutionResult, BridgeCapabilities};
 pub use tool::{ScriptedTool, ToolManifest, ToolPermissions, OutputTarget, extract_manifest};
 pub use bridge::{NannaBridge, ServiceFn, ToolSearchFn, DEFAULT_TOOL_SEARCH_LIMIT};
 

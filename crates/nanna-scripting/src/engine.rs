@@ -38,6 +38,25 @@ pub struct ExecutionResult {
     pub primary_error: Option<String>,
 }
 
+/// The optional capabilities a script's `Nanna` bridge is built with.
+///
+/// A field left `None` leaves that capability off, so
+/// `BridgeCapabilities::default()` is a bridge with none of them.
+#[derive(Default)]
+pub struct BridgeCapabilities {
+    /// JSON array of tool definitions for `Nanna.listTools()`.
+    pub tool_definitions: Option<Value>,
+    /// Service functions callable via `Nanna.service()`.
+    pub services: Option<HashMap<String, ServiceFn>>,
+    /// Default working directory for exec commands, overriding the home
+    /// directory fallback.
+    pub default_workdir: Option<std::path::PathBuf>,
+    /// Session ID for session-scoped operations.
+    pub session_id: Option<String>,
+    /// Ranked tool search behind `Nanna.searchTools()`.
+    pub tool_search: Option<ToolSearchFn>,
+}
+
 /// Unified script engine with automatic fallback
 pub struct ScriptEngine {
     /// Preferred engine order
@@ -118,7 +137,14 @@ impl ScriptEngine {
         default_workdir: Option<std::path::PathBuf>,
         session_id: Option<String>,
     ) -> Result<ExecutionResult> {
-        self.execute_full(tool, input, tool_definitions, services, default_workdir, session_id, None).await
+        let capabilities = BridgeCapabilities {
+            tool_definitions,
+            services,
+            default_workdir,
+            session_id,
+            tool_search: None,
+        };
+        self.execute_full(tool, input, capabilities).await
     }
 
     /// Execute a scripted tool with every optional bridge capability,
@@ -133,17 +159,19 @@ impl ScriptEngine {
     /// the tool's deadline, or [`ScriptError::EngineNotAvailable`] when the
     /// chosen engine is not compiled in. When the fallback engine fails too,
     /// returns [`ScriptError::Execution`] naming both failures.
-    #[allow(clippy::too_many_arguments)]
     pub async fn execute_full(
         &self,
         tool: &ScriptedTool,
         input: Value,
-        tool_definitions: Option<Value>,
-        services: Option<HashMap<String, ServiceFn>>,
-        default_workdir: Option<std::path::PathBuf>,
-        session_id: Option<String>,
-        tool_search: Option<ToolSearchFn>,
+        capabilities: BridgeCapabilities,
     ) -> Result<ExecutionResult> {
+        let BridgeCapabilities {
+            tool_definitions,
+            services,
+            default_workdir,
+            session_id,
+            tool_search,
+        } = capabilities;
         let mut bridge = NannaBridge::new(tool.permissions.clone());
         if let Some(defs) = tool_definitions {
             bridge = bridge.with_tool_definitions(defs);
