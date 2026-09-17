@@ -315,7 +315,7 @@ impl MessageQueue {
         let id = queue.next_id;
         queue.next_id += 1;
 
-        let queued = QueuedMessage {
+        let entry = QueuedMessage {
             message,
             priority,
             queued_at: Instant::now(),
@@ -334,7 +334,7 @@ impl MessageQueue {
             }
         }
 
-        queue.messages.push(queued);
+        queue.messages.push(entry);
         queue.stats.queued = queue.messages.len();
 
         let _ = self.event_tx.send(QueueEvent::Queued { 
@@ -343,6 +343,9 @@ impl MessageQueue {
         }).await;
 
         debug!("Enqueued message {} for {} (priority: {:?})", id, provider, priority);
+        // Held across the event send: concurrent enqueues emit their `Queued`
+        // events in the same order they assigned message ids.
+        drop(queues);
         id
     }
 
@@ -357,49 +360,7 @@ impl MessageQueue {
 
         loop {
             // Get next message to send
-            let msg = {
-                let mut queues = self.queues.write().await;
-                let Some(queue) = queues.get_mut(provider) else {
-                    break;
-                };
-
-                // Check rate limit
-                if !queue.rate_limiter.can_send() {
-                    let wait = queue.rate_limiter.time_until_available();
-                    if wait > Duration::ZERO {
-                        queue.stats.cooldown_remaining_ms = Some(wait.as_millis() as u64);
-                        break;
-                    }
-                }
-                queue.stats.cooldown_remaining_ms = None;
-
-                // Get highest priority message that's ready
-                let now = Instant::now();
-                let ready_idx = queue.messages.iter().position(|m| {
-                    m.retry_after.is_none_or(|t| now >= t)
-                });
-
-                if ready_idx.is_some() {
-                    // Pop the top message (highest priority that's ready)
-                    let mut temp = Vec::new();
-                    let mut found = None;
-                    while let Some(m) = queue.messages.pop() {
-                        if found.is_none() && m.retry_after.is_none_or(|t| now >= t) {
-                            found = Some(m);
-                        } else {
-                            temp.push(m);
-                        }
-                    }
-                    for m in temp {
-                        queue.messages.push(m);
-                    }
-                    found
-                } else {
-                    None
-                }
-            };
-
-            let Some(mut msg) = msg else {
+            let Some(mut msg) = self.take_ready_message(provider).await else {
                 break;
             };
 
@@ -433,6 +394,9 @@ impl MessageQueue {
                         message_id: msg.id,
                         result_id,
                     }).await;
+                    // Held across the event send so the `Sent` event is ordered
+                    // with the stats change it reports.
+                    drop(queues);
                 }
                 Err(ChannelError::RateLimited) => {
                     // Apply cooldown and requeue
@@ -492,6 +456,9 @@ impl MessageQueue {
                         }).await;
 
                         error!("Message {} failed after {} attempts: {}", msg.id, msg.attempts, e);
+                        // Held across the event send so the `Failed` event is
+                        // ordered with the stats change it reports.
+                        drop(queues);
                     }
                 }
             }
@@ -512,13 +479,62 @@ impl MessageQueue {
         results
     }
 
+    /// Pop the highest-priority message whose retry time has come, or `None`
+    /// when the provider has no queue, is rate limited, or has nothing ready.
+    async fn take_ready_message(&self, provider: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(provider)?;
+
+        // Check rate limit
+        if !queue.rate_limiter.can_send() {
+            let wait = queue.rate_limiter.time_until_available();
+            if wait > Duration::ZERO {
+                // A cooldown beyond u64::MAX milliseconds (~584 million years)
+                // cannot be scheduled, so saturating never differs in practice.
+                queue.stats.cooldown_remaining_ms =
+                    Some(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
+                return None;
+            }
+        }
+        queue.stats.cooldown_remaining_ms = None;
+
+        // Get highest priority message that's ready
+        let now = Instant::now();
+        let ready_idx = queue.messages.iter().position(|m| {
+            m.retry_after.is_none_or(|t| now >= t)
+        });
+
+        let found = if ready_idx.is_some() {
+            // Pop the top message (highest priority that's ready)
+            let mut temp = Vec::new();
+            let mut found = None;
+            while let Some(m) = queue.messages.pop() {
+                if found.is_none() && m.retry_after.is_none_or(|t| now >= t) {
+                    found = Some(m);
+                } else {
+                    temp.push(m);
+                }
+            }
+            for m in temp {
+                queue.messages.push(m);
+            }
+            found
+        } else {
+            None
+        };
+        drop(queues);
+        found
+    }
+
     /// Calculate exponential backoff delay
     fn calculate_backoff(&self, attempts: u32) -> Duration {
         let base = self.config.initial_retry_delay.as_secs_f64();
         let max = self.config.max_retry_delay.as_secs_f64();
         
-        // Exponential backoff with jitter
-        let delay = (base * 2.0_f64.powi(attempts as i32 - 1)).min(max);
+        // Exponential backoff with jitter. `attempts` counts real send attempts,
+        // so it never approaches `i32::MAX`; saturating is unreachable.
+        let exponent = i32::try_from(attempts).unwrap_or(i32::MAX) - 1;
+        let delay = (base * 2.0_f64.powi(exponent)).min(max);
         let jitter = delay * 0.1 * rand::random::<f64>();
         
         Duration::from_secs_f64(delay + jitter)

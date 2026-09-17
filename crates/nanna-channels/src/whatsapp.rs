@@ -111,6 +111,13 @@ impl WhatsAppChannel {
     // ========================================================================
 
     /// Send a text message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_text(
         &self,
         to: &str,
@@ -148,6 +155,13 @@ impl WhatsAppChannel {
     }
 
     /// Send an image message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_image(
         &self,
         to: &str,
@@ -187,6 +201,13 @@ impl WhatsAppChannel {
     }
 
     /// Send a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_document(
         &self,
         to: &str,
@@ -227,6 +248,13 @@ impl WhatsAppChannel {
     }
 
     /// Send a reaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_reaction(
         &self,
         to: &str,
@@ -264,6 +292,13 @@ impl WhatsAppChannel {
     }
 
     /// Remove a reaction (send empty emoji).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn remove_reaction(
         &self,
         to: &str,
@@ -273,6 +308,13 @@ impl WhatsAppChannel {
     }
 
     /// Send a location.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_location(
         &self,
         to: &str,
@@ -314,6 +356,13 @@ impl WhatsAppChannel {
     }
 
     /// Send a template message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not a valid message response.
     pub async fn send_template(
         &self,
         to: &str,
@@ -355,15 +404,22 @@ impl WhatsAppChannel {
     }
 
     /// Mark a message as read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not valid JSON.
     pub async fn mark_read(&self, message_id: &str) -> Result<(), ChannelError> {
-        debug!(message_id, "Marking WhatsApp message as read");
-
         #[derive(Serialize)]
         struct MarkReadRequest {
             messaging_product: &'static str,
             status: &'static str,
             message_id: String,
         }
+
+        debug!(message_id, "Marking WhatsApp message as read");
 
         let body = MarkReadRequest {
             messaging_product: "whatsapp",
@@ -387,11 +443,23 @@ impl WhatsAppChannel {
     // ========================================================================
 
     /// Upload media and get media ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Send`] if `mime_type` is not a valid MIME type,
+    /// the upload request cannot be sent, or the response body is not JSON
+    /// carrying a media `id` (an API error response lands here too, since its
+    /// status is not checked).
     pub async fn upload_media(
         &self,
         data: &[u8],
         mime_type: &str,
     ) -> Result<String, ChannelError> {
+        #[derive(Deserialize)]
+        struct MediaResponse {
+            id: String,
+        }
+
         let url = format!("{WHATSAPP_API_BASE}/{}/media", self.phone_number_id);
 
         let form = reqwest::multipart::Form::new()
@@ -411,11 +479,6 @@ impl WhatsAppChannel {
             .await
             .map_err(|e| ChannelError::Send(e.to_string()))?;
 
-        #[derive(Deserialize)]
-        struct MediaResponse {
-            id: String,
-        }
-
         let result: MediaResponse = response
             .json()
             .await
@@ -425,6 +488,13 @@ impl WhatsAppChannel {
     }
 
     /// Get media URL from media ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if the Cloud API answers HTTP 429 or
+    /// error code 80007, and [`ChannelError::Send`] if the request cannot be
+    /// sent, the API answers any other non-success status, or the response body
+    /// is not JSON carrying the media `url`.
     pub async fn get_media_url(&self, media_id: &str) -> Result<String, ChannelError> {
         #[derive(Deserialize)]
         struct MediaUrlResponse {

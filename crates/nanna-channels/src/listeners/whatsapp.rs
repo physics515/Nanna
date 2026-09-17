@@ -142,7 +142,7 @@ impl WhatsAppWebListener {
         }
 
         // Parse sender info
-        let sender_id = msg.from.clone().or(msg.sender.clone())?;
+        let sender_id = msg.from.clone().or_else(|| msg.sender.clone())?;
         let sender_name = msg.sender_name.or(msg.push_name);
         
         // Check if it's a group message

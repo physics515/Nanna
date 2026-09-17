@@ -88,6 +88,14 @@ impl TelegramChannel {
     }
 
     /// Send a text message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_text(
         &self,
         chat_id: i64,
@@ -117,6 +125,14 @@ impl TelegramChannel {
     }
 
     /// Send a photo.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_photo(
         &self,
         chat_id: i64,
@@ -150,6 +166,14 @@ impl TelegramChannel {
     }
 
     /// Send a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_document(
         &self,
         chat_id: i64,
@@ -183,6 +207,14 @@ impl TelegramChannel {
     }
 
     /// Send a location.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_location(
         &self,
         chat_id: i64,
@@ -212,6 +244,14 @@ impl TelegramChannel {
     }
 
     /// Send a poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_poll(
         &self,
         chat_id: i64,
@@ -240,6 +280,14 @@ impl TelegramChannel {
     }
 
     /// Edit a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn edit_message(
         &self,
         chat_id: i64,
@@ -268,6 +316,14 @@ impl TelegramChannel {
     }
 
     /// Delete a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct DeleteMessageParams {
@@ -286,6 +342,14 @@ impl TelegramChannel {
     }
 
     /// Set a reaction on a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn set_reaction(
         &self,
         chat_id: i64,
@@ -321,6 +385,14 @@ impl TelegramChannel {
     }
 
     /// Remove reaction from a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn remove_reaction(&self, chat_id: i64, message_id: i64) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct SetReactionParams {
@@ -341,6 +413,14 @@ impl TelegramChannel {
     }
 
     /// Pin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn pin_message(&self, chat_id: i64, message_id: i64) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct PinParams {
@@ -361,6 +441,14 @@ impl TelegramChannel {
     }
 
     /// Unpin a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn unpin_message(&self, chat_id: i64, message_id: i64) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct UnpinParams {
@@ -373,6 +461,14 @@ impl TelegramChannel {
     }
 
     /// Send typing indicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn send_typing(&self, chat_id: i64) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct ChatActionParams {
@@ -391,11 +487,27 @@ impl TelegramChannel {
     }
 
     /// Get bot info.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn get_me(&self) -> Result<TelegramUser, ChannelError> {
         self.request("getMe", serde_json::json!({})).await
     }
 
     /// Set webhook URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn set_webhook(&self, url: &str, secret_token: Option<&str>) -> Result<bool, ChannelError> {
         #[derive(Serialize)]
         struct SetWebhookParams<'a> {
@@ -412,6 +524,14 @@ impl TelegramChannel {
     }
 
     /// Delete webhook (switch to polling mode).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::RateLimited`] if Telegram rejects the call with
+    /// HTTP 429, and [`ChannelError::Send`] if the request cannot be sent, the
+    /// response body is not a Telegram API envelope with the expected result, or
+    /// Telegram rejects the call for any other reason (its `description` is
+    /// carried in the error).
     pub async fn delete_webhook(&self) -> Result<bool, ChannelError> {
         self.request("deleteWebhook", serde_json::json!({})).await
     }
@@ -585,9 +705,8 @@ impl Channel for TelegramChannel {
             .parse()
             .map_err(|_| ChannelError::Send("Invalid message ID".to_string()))?;
 
-        let text = match content {
-            MessageContent::Text { text } => text,
-            _ => return Err(ChannelError::Send("Can only edit text messages".to_string())),
+        let MessageContent::Text { text } = content else {
+            return Err(ChannelError::Send("Can only edit text messages".to_string()));
         };
 
         self.edit_message(chat_id, msg_id, &text).await?;

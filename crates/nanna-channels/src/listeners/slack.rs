@@ -8,6 +8,7 @@ use super::{Listener, ListenerError, ListenerHandle};
 use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
@@ -137,7 +138,7 @@ impl SlackListener {
     }
 
     /// Convert Slack event to `IncomingMessage`
-    fn convert_event(&self, event: &Value, self_id: &Option<String>) -> Option<IncomingMessage> {
+    fn convert_event(&self, event: &Value, self_id: Option<&str>) -> Option<IncomingMessage> {
         let event_type = event.get("type")?.as_str()?;
 
         // Only handle messages
@@ -152,7 +153,7 @@ impl SlackListener {
 
         // Skip messages from self
         let user_id = event.get("user")?.as_str()?;
-        if self_id.as_deref() == Some(user_id) {
+        if self_id == Some(user_id) {
             return None;
         }
 
@@ -299,57 +300,8 @@ impl SlackListener {
                             }
                         };
 
-                        // Handle different envelope types
-                        match payload.envelope_type.as_str() {
-                            "hello" => {
-                                debug!("Slack Socket Mode hello received");
-                            }
-                            "disconnect" => {
-                                info!("Slack requested disconnect");
-                                break 'connection;
-                            }
-                            "events_api" => {
-                                // Acknowledge the event immediately
-                                if let Some(envelope_id) = &payload.envelope_id {
-                                    let ack = json!({ "envelope_id": envelope_id });
-                                    if write.send(WsMessage::Text(ack.to_string().into())).await.is_err() {
-                                        warn!("Failed to send event acknowledgment");
-                                        break 'connection;
-                                    }
-                                }
-
-                                // Process the event
-                                if let Some(event_payload) = &payload.payload
-                                    && let Some(event) = event_payload.get("event") {
-                                        let self_id = self.self_id.read().await.clone();
-                                        if let Some(message) = self.convert_event(event, &self_id) {
-                                            debug!("Slack message: {:?}", message.id);
-                                            if sender.send(message).await.is_err() {
-                                                error!("Failed to send message to router");
-                                                break 'connection;
-                                            }
-                                        }
-                                    }
-                            }
-                            "interactive" => {
-                                // Acknowledge interactive payloads
-                                if let Some(envelope_id) = &payload.envelope_id {
-                                    let ack = json!({ "envelope_id": envelope_id });
-                                    let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
-                                }
-                                debug!("Slack interactive event received");
-                            }
-                            "slash_commands" => {
-                                // Acknowledge slash commands
-                                if let Some(envelope_id) = &payload.envelope_id {
-                                    let ack = json!({ "envelope_id": envelope_id });
-                                    let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
-                                }
-                                debug!("Slack slash command received");
-                            }
-                            _ => {
-                                debug!("Unknown Slack envelope type: {}", payload.envelope_type);
-                            }
+                        if self.handle_envelope(&payload, &mut write, &sender).await == EnvelopeFlow::Reconnect {
+                            break 'connection;
                         }
                     }
                 }
@@ -361,6 +313,81 @@ impl SlackListener {
 
         info!("Slack Socket Mode listener stopped");
     }
+
+    /// Act on one decoded Socket Mode envelope: acknowledge it and forward any
+    /// user message to the router.
+    async fn handle_envelope(
+        &self,
+        payload: &SocketModePayload,
+        write: &mut SocketSink,
+        sender: &mpsc::Sender<IncomingMessage>,
+    ) -> EnvelopeFlow {
+        // Handle different envelope types
+        match payload.envelope_type.as_str() {
+            "hello" => {
+                debug!("Slack Socket Mode hello received");
+            }
+            "disconnect" => {
+                info!("Slack requested disconnect");
+                return EnvelopeFlow::Reconnect;
+            }
+            "events_api" => {
+                // Acknowledge the event immediately
+                if let Some(envelope_id) = &payload.envelope_id {
+                    let ack = json!({ "envelope_id": envelope_id });
+                    if write.send(WsMessage::Text(ack.to_string().into())).await.is_err() {
+                        warn!("Failed to send event acknowledgment");
+                        return EnvelopeFlow::Reconnect;
+                    }
+                }
+
+                // Process the event
+                if let Some(event_payload) = &payload.payload
+                    && let Some(event) = event_payload.get("event") {
+                        let self_id = self.self_id.read().await.clone();
+                        if let Some(message) = self.convert_event(event, self_id.as_deref()) {
+                            debug!("Slack message: {:?}", message.id);
+                            if sender.send(message).await.is_err() {
+                                error!("Failed to send message to router");
+                                return EnvelopeFlow::Reconnect;
+                            }
+                        }
+                    }
+            }
+            "interactive" => {
+                // Acknowledge interactive payloads
+                if let Some(envelope_id) = &payload.envelope_id {
+                    let ack = json!({ "envelope_id": envelope_id });
+                    let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
+                }
+                debug!("Slack interactive event received");
+            }
+            "slash_commands" => {
+                // Acknowledge slash commands
+                if let Some(envelope_id) = &payload.envelope_id {
+                    let ack = json!({ "envelope_id": envelope_id });
+                    let _ = write.send(WsMessage::Text(ack.to_string().into())).await;
+                }
+                debug!("Slack slash command received");
+            }
+            _ => {
+                debug!("Unknown Slack envelope type: {}", payload.envelope_type);
+            }
+        }
+        EnvelopeFlow::Continue
+    }
+}
+
+/// Write half of the Socket Mode WebSocket.
+type SocketSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+
+/// What the connection loop does after handling one Socket Mode envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeFlow {
+    /// Keep reading this connection.
+    Continue,
+    /// Leave this connection; the outer loop backs off and reconnects.
+    Reconnect,
 }
 
 #[async_trait]

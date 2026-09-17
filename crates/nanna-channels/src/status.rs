@@ -197,6 +197,7 @@ impl StatusManager {
         } else if !enabled {
             status.state = ConnectionState::Disconnected;
         }
+        drop(statuses);
     }
 
     /// Update channel state
@@ -226,22 +227,22 @@ impl StatusManager {
                     status.health.last_healthy = Some(chrono::Utc::now().timestamp_millis());
                     status.health.consecutive_failures = 0;
                 }
-                ConnectionState::RateLimited => {
-                    // Don't count as failure, just degraded
-                }
                 ConnectionState::AuthFailed | ConnectionState::Unavailable => {
                     status.health.last_failure = Some(chrono::Utc::now().timestamp_millis());
                     status.health.consecutive_failures += 1;
                 }
+                // RateLimited lands here too: don't count it as a failure, just degraded
                 _ => {}
             }
 
-            StatusEvent {
+            let event = StatusEvent {
                 provider: provider.to_string(),
                 status: status.clone(),
                 previous_state,
                 timestamp: chrono::Utc::now().timestamp_millis(),
-            }
+            };
+            drop(statuses);
+            event
         };
 
         // Broadcast event (ignore send errors if no subscribers)
@@ -278,6 +279,7 @@ impl StatusManager {
             status.state = ConnectionState::Degraded;
             status.last_state_change = chrono::Utc::now().timestamp_millis();
         }
+        drop(statuses);
     }
 
     /// Update response time average
@@ -292,7 +294,10 @@ impl StatusManager {
             samples.remove(0);
         }
 
-        let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+        // `samples` was just trimmed to at most MAX_SAMPLES (100) entries, so the
+        // count always fits a u32, which converts to f64 exactly.
+        let sample_count = f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX));
+        let avg = samples.iter().sum::<f64>() / sample_count;
 
         // Update in status
         drop(response_times);
@@ -320,12 +325,14 @@ impl StatusManager {
             status.health.rate_limit_remaining_ms = Some(cooldown_ms);
             status.last_state_change = chrono::Utc::now().timestamp_millis();
 
-            StatusEvent {
+            let event = StatusEvent {
                 provider: provider.to_string(),
                 status: status.clone(),
                 previous_state,
                 timestamp: chrono::Utc::now().timestamp_millis(),
-            }
+            };
+            drop(statuses);
+            event
         };
 
         let _ = self.event_tx.send(event);
@@ -339,7 +346,7 @@ impl StatusManager {
                 return;
             };
 
-            if status.state == ConnectionState::RateLimited {
+            let event = if status.state == ConnectionState::RateLimited {
                 status.state = ConnectionState::Connected;
                 status.health.rate_limit_remaining_ms = None;
                 status.last_state_change = chrono::Utc::now().timestamp_millis();
@@ -352,7 +359,9 @@ impl StatusManager {
                 })
             } else {
                 None
-            }
+            };
+            drop(statuses);
+            event
         };
 
         if let Some(event) = event {
@@ -418,6 +427,7 @@ impl StatusManager {
                 summary.healthy += 1;
             }
         }
+        drop(statuses);
         
         summary
     }

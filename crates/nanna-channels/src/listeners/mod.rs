@@ -127,6 +127,16 @@ impl ListenerManager {
     }
 
     /// Add and start a listener
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error the listener's [`Listener::start`] returns, in which
+    /// case the listener is not added. The Signal listener fails with
+    /// [`ListenerError::Connection`] when its REST API is unreachable or answers a
+    /// non-success status; the `WhatsApp` Web listener fails with
+    /// [`ListenerError::Connection`] or [`ListenerError::Api`] when its bridge's
+    /// status check fails, and with [`ListenerError::Auth`] when the bridge is
+    /// neither connected nor authenticated.
     pub async fn add<L: Listener + 'static>(
         &mut self,
         listener: Arc<L>,
