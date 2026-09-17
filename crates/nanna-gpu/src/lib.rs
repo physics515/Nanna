@@ -310,15 +310,16 @@ impl CosineSimilaritySearch {
     ///
     /// # Errors
     ///
-    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read.
+    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read, and
+    /// `GpuError::InsufficientMemory` if the query length or the vector count
+    /// does not fit the shader's `u32` parameters.
     pub async fn search(
         &self,
         ctx: &GpuContext,
         query: &[f32],
         vectors: &[f32],
     ) -> Result<Vec<f32>, GpuError> {
-        let query_len = query.len() as u32;
-        let num_vectors = (vectors.len() / query.len()) as u32;
+        let (query_len, num_vectors) = shader_counts(query.len(), vectors.len())?;
 
         if num_vectors == 0 {
             return Ok(vec![]);
@@ -434,6 +435,21 @@ impl CosineSimilaritySearch {
         staging_buffer.unmap();
 
         Ok(results)
+    }
+}
+
+/// The query length and vector count as the `u32`s the shader indexes with.
+///
+/// A count past `u32::MAX` would need a storage binding of more than 16 GiB,
+/// which no adapter's `max_storage_buffer_binding_size` allows, so refusing it
+/// replaces a silent truncation that could never reach a valid dispatch anyway.
+fn shader_counts(query_len: usize, vectors_len: usize) -> Result<(u32, u32), GpuError> {
+    let num_vectors = vectors_len / query_len;
+    match (u32::try_from(query_len), u32::try_from(num_vectors)) {
+        (Ok(query_len), Ok(num_vectors)) => Ok((query_len, num_vectors)),
+        _ => Err(GpuError::InsufficientMemory(format!(
+            "search input exceeds the shader's u32 indexing: query length {query_len}, {num_vectors} vectors"
+        ))),
     }
 }
 
