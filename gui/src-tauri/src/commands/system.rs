@@ -194,6 +194,31 @@ pub async fn get_model_stats(
     }))
 }
 
+/// Estimated spend per day over the last `days` days (`system.cost_rollup`).
+#[tauri::command]
+pub async fn get_cost_rollup(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    days: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let result = state_guard
+        .backend
+        .daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "cost_rollup",
+            "days": days,
+            "by": "day"
+        }))
+        .await?;
+    if result.get("error").is_some() {
+        return Err(result["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string());
+    }
+    Ok(result)
+}
+
 /// Get per-tool performance statistics
 ///
 /// # Errors

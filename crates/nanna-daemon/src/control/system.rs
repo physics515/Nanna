@@ -3,13 +3,127 @@
 use super::{json, info, ControlPlane, SystemAction, Value};
 
 impl ControlPlane {
+    /// Gather everything `GET /metrics` reports, in one pass.
+    pub async fn metrics_snapshot(&self) -> crate::metrics::MetricsSnapshot {
+        let memory_entries = match self.memory {
+            Some(ref memory) => Some(memory.count().await),
+            None => None,
+        };
+        let reminders_pending = match self.scheduler {
+            Some(ref scheduler) => {
+                let tasks = scheduler.read().await.list_tasks().await;
+                let pending = tasks.iter().filter(|task| {
+                    task.name == crate::reminder_service::REMINDER_TASK_NAME && task.enabled
+                });
+                Some(pending.count())
+            }
+            None => None,
+        };
+        let mcp_servers = match self.mcp_status {
+            Some(ref status) => status.read().await.clone(),
+            None => Vec::new(),
+        };
+        crate::metrics::MetricsSnapshot {
+            uptime_secs: self.uptime_secs(),
+            sessions: self.sessions.count().await,
+            chat_runs_active: self.chat_runs.active_count().await,
+            memory_entries,
+            reminders_pending,
+            tools: self.tool_stats.summaries().await,
+            models: self.model_stats.summaries().await,
+            mcp_servers,
+            channels: self.channel_counters.snapshot(),
+        }
+    }
+
     // =========================================================================
     // System Handlers
     // =========================================================================
     
     pub(super) async fn handle_system(&self, _client_id: &str, action: SystemAction) -> Value {
         match action {
-            SystemAction::Status => self.system_status().await,
+            SystemAction::Status => {
+                let memory_stats = if let Some(ref memory) = self.memory {
+                    let stats = memory.stats().await;
+                    Some(json!({
+                        "total": stats.total,
+                        "active": stats.active,
+                    }))
+                } else {
+                    None
+                };
+                
+                let tool_count = if let Some(ref tools) = self.tools {
+                    Some(tools.definitions().await.len())
+                } else {
+                    None
+                };
+                
+                let workspace_count = self.workspaces.read().await.len();
+                let scheduler_available = self.scheduler.is_some();
+
+                // The router's live provider set. This is what actually routes
+                // a chat request — the GUI model picker gates on this instead
+                // of its own login state, so the two can't split-brain about
+                // which providers exist.
+                let llm_providers: Vec<&'static str> = self
+                    .router
+                    .as_ref()
+                    .map(|r| {
+                        r.available_providers_sorted()
+                            .into_iter()
+                            .map(crate::llm_router::ProviderId::name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Durable-store health: a corrupt row skipped on load leaves the
+                // store degraded — surface it rather than a silent empty store.
+                let (memory_degraded, memory_corrupt_rows) = if let Some(ref m) = self.memory {
+                    let h = m.store_health().await;
+                    (h.degraded, h.corrupt_rows)
+                } else {
+                    (false, 0)
+                };
+
+                // Startup quarantine + rebuild (page-level corruption): keep it
+                // on /status for the daemon's lifetime — clients that connect
+                // after boot never saw the MemoryStoreRebuilt event.
+                let (memory_rebuilt, memory_recovered_rows, memory_expected_rows) = self
+                    .memory_recovery
+                    .as_ref()
+                    .map_or((false, 0, None), |r| {
+                        (true, r.memories_recovered, r.memories_expected)
+                    });
+
+                json!({
+                    "status": "running",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "uptime_secs": self.uptime_secs(),
+                    "sessions": self.sessions.count().await,
+                    "workspaces": workspace_count,
+                    "agent_available": self.agent.is_some(),
+                    "memory_available": self.memory.is_some(),
+                    "memory_degraded": memory_degraded,
+                    "memory_corrupt_rows": memory_corrupt_rows,
+                    "memory_rebuilt": memory_rebuilt,
+                    "memory_recovered_rows": memory_recovered_rows,
+                    "memory_expected_rows": memory_expected_rows,
+                    "memory_stats": memory_stats,
+                    "tools_available": self.tools.is_some(),
+                    "tool_count": tool_count,
+                    "scheduler_available": scheduler_available,
+                    "llm_providers": llm_providers,
+                    // Each configured MCP server: starting / started (with its
+                    // tool count) / failed or not_started (with the reason).
+                    // A failed server's tools are simply absent otherwise.
+                    "mcp_servers": match self.mcp_status {
+                        Some(ref status) => json!(*status.read().await),
+                        None => json!([]),
+                    },
+                    "config_path": self.config_path,
+                })
+            }
             SystemAction::Restart => {
                 info!("Restart requested");
                 json!({ "status": "restarting" })
@@ -80,6 +194,23 @@ impl ControlPlane {
                     }
                 } else {
                     json!({ "buckets": [], "error": "Storage not available" })
+                }
+            }
+            SystemAction::CostRollup { days, by } => {
+                let Some(ref storage) = self.storage else {
+                    return json!({ "error": "storage_unavailable", "message": "Cost rollups need the request log in storage" });
+                };
+                let period = match by.as_deref() {
+                    None | Some("day") => nanna_storage::UsagePeriod::Day,
+                    Some("month") => nanna_storage::UsagePeriod::Month,
+                    Some("session") => nanna_storage::UsagePeriod::Session,
+                    Some(other) => {
+                        return json!({ "error": "invalid_period", "message": format!("`by` must be \"day\", \"month\" or \"session\" (got {other:?})") });
+                    }
+                };
+                match storage.model_usage_by(days.unwrap_or(30), period).await {
+                    Ok(usage) => json!(crate::cost_rollup::price_buckets(usage)),
+                    Err(e) => json!({ "error": "rollup_failed", "message": e.to_string() }),
                 }
             }
             SystemAction::ToolStatsDaily { tool_name, days } => {

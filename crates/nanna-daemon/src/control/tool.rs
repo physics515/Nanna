@@ -34,7 +34,11 @@ impl ControlPlane {
             }
             ToolAction::Enable { name } => self.set_tool_enabled(&name, true).await,
             ToolAction::Disable { name } => self.set_tool_enabled(&name, false).await,
-            ToolAction::Execute { name, input } => {
+            ToolAction::Execute {
+                name,
+                input,
+                session_id,
+            } => {
                 use nanna_tools::ToolCall;
                 
                 let params: std::collections::HashMap<String, Value> = match input {
@@ -48,12 +52,22 @@ impl ControlPlane {
                     parameters: params,
                 };
                 
-                let result = tools.execute(call).await;
+                let result = match session_id {
+                    Some(session_id) => {
+                        nanna_tools::ToolRegistry::with_run_session(session_id, tools.execute(call))
+                            .await
+                    }
+                    None => tools.execute(call).await,
+                };
                 
                 json!({
                     "name": name,
                     "success": result.result.success,
                     "output": result.result.content,
+                    // A failed tool's explanation lives here, not in `output`;
+                    // without it a direct call that failed answered only
+                    // `success: false` with an empty string.
+                    "error": result.result.error,
                 })
             }
             ToolAction::Create { name, description, code, needs_shell } => self.tool_create(name, description, code, needs_shell).await,

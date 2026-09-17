@@ -150,6 +150,21 @@ impl ControlPlane {
         }
     }
 
+    /// Cancel the turn in `session_id` on behalf of a channel command, through
+    /// the same arm the IPC `chat.cancel` verb uses.
+    pub(crate) async fn handle_chat_cancel_for_channel(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Value {
+        self.handle_chat(
+            "channel:command",
+            ChatAction::Cancel {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Assemble everything a turn needs beyond the delivery ack: system
     /// prompt (persona + recall + conversation), planner conversation,
     /// resolved workspace. Runs INSIDE the spawned turn, after the ack is on

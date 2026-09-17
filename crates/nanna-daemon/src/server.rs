@@ -36,15 +36,15 @@ use std::path::PathBuf;
 /// due scheduled work — never reading instruction files off disk.
 const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. Review your current state, and if nothing needs attention, reply HEARTBEAT_OK.";
 
-/// Concrete implementation of `AgentSpawner` that lives in the daemon. Runs
-/// each sub-agent as a managed chat on the daemon `ControlPlane`.
+/// Concrete implementation of AgentSpawner that lives in the daemon. Runs
+/// each sub-agent as a managed chat on the daemon ControlPlane.
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
     /// Read at spawn, never at construction: a sub-agent must run on the
     /// model and summarization list the user has NOW, not the ones the daemon
     /// booted with.
     agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
-    /// Filled once the daemon `ControlPlane` is live. Sub-agents are ordinary
+    /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
     /// chats on that plane — same `run_chat_turn` path as a user turn.
     control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
 }
@@ -74,17 +74,11 @@ impl AgentSpawner for AgentSpawnerImpl {
         // provider is missing is skipped; a candidate whose run fails hands
         // the prompt to the next (a fresh agent — sub-agent runs are
         // idempotent by contract, the parent only consumes the final text).
-        // Blank names are dropped the same way the chat walk drops them: a
-        // blank candidate would reach the provider that claims unprefixed
-        // names and send a request naming no model.
         let candidates = if sub_agent_models.is_empty() {
-            crate::agent_service::named_models(std::slice::from_ref(&base_config.model))
+            vec![base_config.model.clone()]
         } else {
-            crate::agent_service::named_models(&sub_agent_models)
+            sub_agent_models.clone()
         };
-        if candidates.is_empty() {
-            return Err(crate::agent_service::NO_MODEL_CONFIGURED.to_string());
-        }
 
         let control = self.control.read().await.clone();
         let Some(control) = control else {
@@ -185,7 +179,7 @@ async fn last_assistant_text(sessions: &SessionManager, session_id: &str) -> Str
         .unwrap_or_default()
 }
 
-/// Concrete implementation of `ParentChannel` that lives in the daemon.
+/// Concrete implementation of ParentChannel that lives in the daemon.
 /// Allows sub-agents to ask their parent questions.
 ///
 /// Instead of blocking on mailbox polling, this makes a lightweight LLM call
@@ -215,7 +209,8 @@ impl ParentChannel for ParentChannelImpl {
             .await
             .ok_or_else(|| {
                 format!(
-                    "Sub-session '{sub_session_id}' not found — ask_parent is only available to sub-agents"
+                    "Sub-session '{}' not found — ask_parent is only available to sub-agents",
+                    sub_session_id
                 )
             })?;
 
@@ -250,7 +245,7 @@ impl ParentChannel for ParentChannelImpl {
             .sessions
             .get(&parent_id)
             .await
-            .ok_or_else(|| format!("Parent session '{parent_id}' not found"))?;
+            .ok_or_else(|| format!("Parent session '{}' not found", parent_id))?;
 
         let recent_messages: Vec<String> = parent_session
             .messages
@@ -291,7 +286,7 @@ impl ParentChannel for ParentChannelImpl {
         let llm_client = self
             .router
             .client_for_model(model)
-            .ok_or_else(|| format!("No provider for model '{model}'"))?;
+            .ok_or_else(|| format!("No provider for model '{}'", model))?;
 
         let stripped_model = crate::llm_router::LlmRouter::strip_model_prefix(model);
         let request = nanna_llm::CompletionRequest {
@@ -309,7 +304,7 @@ impl ParentChannel for ParentChannelImpl {
         let answer = llm_client
             .complete(&request)
             .await
-            .map_err(|e| format!("LLM call failed: {e}"))?;
+            .map_err(|e| format!("LLM call failed: {}", e))?;
 
         tracing::info!(
             sub_session = sub_session_id,
@@ -467,6 +462,72 @@ async fn assemble_handle_content(
 /// pairing in one function is the point: the offsets were once proven against
 /// the assembled text and then used to index a single chunk of it, which is
 /// both out of bounds and off-boundary.
+/// What a scheduled job posts into its conversation after a run. Pure.
+///
+/// Nothing for a heartbeat that found nothing to do (the `HEARTBEAT_OK`
+/// sentinel is run mechanics, not news) or for an empty result — a chat app
+/// would otherwise get a blank message on every quiet run.
+fn scheduled_output_message(task_name: &str, content: &str, heartbeat_ok: bool) -> Option<String> {
+    let content = content.trim();
+    if heartbeat_ok || content.is_empty() {
+        return None;
+    }
+    debug_assert!(!task_name.is_empty(), "every scheduled task is named");
+    Some(format!("**Scheduled: {task_name}**\n\n{content}"))
+}
+
+/// The dreaming orchestrator, reached late — it is built after script services.
+pub type DreamingSlot = Arc<std::sync::OnceLock<Arc<nanna_memory::DreamingService>>>;
+
+/// Which memories a `memory.get` read demonstrably used, and how. Pure.
+///
+/// This is the first producer of `UsedSuccessfully`, which the FSRS feedback
+/// loop priced and tallied but nothing ever sent. The attribution is the one
+/// that is a fact about specific memories rather than a guess: a model resolved
+/// a stored handle and got the stored text back, so those rows carried the work
+/// forward. Only the FIRST page counts — paging through one result is one use,
+/// and counting each page would reward long outputs for being long. A forwarded
+/// handle credits the memory that absorbed the original, because that is what
+/// answered.
+fn recall_feedback(
+    offset: usize,
+    served_ids: &[String],
+) -> Vec<(String, nanna_memory::MemoryFeedback)> {
+    if offset > 0 {
+        return Vec::new();
+    }
+    debug_assert!(
+        !served_ids.is_empty(),
+        "a resolved read served at least one row"
+    );
+    served_ids
+        .iter()
+        .map(|id| (id.clone(), nanna_memory::MemoryFeedback::UsedSuccessfully))
+        .collect()
+}
+
+/// The ids of the rows a handle's content was assembled from.
+async fn served_row_ids(
+    memory: &Arc<MemoryService>,
+    entry: &nanna_memory::MemoryListEntry,
+) -> Vec<String> {
+    let Some(source_id) = entry.metadata.get("source_id") else {
+        return vec![entry.id.clone()];
+    };
+    let ids: Vec<String> = memory
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        vec![entry.id.clone()]
+    } else {
+        ids
+    }
+}
+
 fn handle_page_range(content: &str, offset: usize, limit: usize) -> (usize, usize) {
     let total = content.len();
     let start = offset.min(total);
@@ -583,14 +644,15 @@ fn req_text(params: &serde_json::Value, key: &str) -> Result<String, String> {
 /// that is not text errors instead of falling through to a default — a
 /// silently defaulted `new` on `memory.replace` would delete the match.
 fn opt_text(params: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
-    params.get(key).filter(|v| !v.is_null()).map_or(Ok(None), |value| {
-        as_text_lenient(value).map(Some).ok_or_else(|| {
+    match params.get(key).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(value) => as_text_lenient(value).map(Some).ok_or_else(|| {
             format!(
                 "{key} must be text (got {}).",
                 crate::tasks::describe_value(value)
             )
-        })
-    })
+        }),
+    }
 }
 
 /// Read an optional count param (`limit`, `offset`).
@@ -606,9 +668,6 @@ fn opt_count(params: &serde_json::Value, key: &str) -> Result<Option<usize>, Str
         .map(Some)
         .map_err(|_| format!("{key} must be zero or a positive whole number (got {n})."))
 }
-
-/// A slot the finished service map is published into once it is built.
-type ServiceMapSlot = Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>;
 
 /// Everything [`build_script_services`] needs, named.
 ///
@@ -641,7 +700,7 @@ struct ScriptServiceDeps {
     tool_authoring: Option<(
         PathBuf,
         std::sync::Weak<nanna_tools::ToolRegistry>,
-        ServiceMapSlot,
+        Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
     )>,
     /// Router plus the configured vision-model priority list. `None`, an empty
     /// list, or a list the router cannot serve all leave `vision.analyze`
@@ -651,7 +710,7 @@ struct ScriptServiceDeps {
     /// The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
     /// image-only pages unread and the response says so.
     pdf_ocr: Option<nanna_tools::PdfOcrFn>,
-    /// `OpenAI` key plus the data dir generated speech is written under. `None` or
+    /// OpenAI key plus the data dir generated speech is written under. `None` or
     /// no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
     /// The data dir page screenshots are written under. `None`, or no
@@ -660,6 +719,16 @@ struct ScriptServiceDeps {
     /// The data dir desktop captures are written under. `None`, or no capture
     /// tool / display session, leaves `screenshot.capture` unregistered.
     screenshot_data_dir: Option<PathBuf>,
+    /// The late-bound scheduler and the sessions reminders are delivered
+    /// into. `None` leaves `schedule.*` unregistered, which withholds the three
+    /// reminder skills.
+    reminders: Option<(crate::reminder_service::SchedulerSlot, Arc<SessionManager>)>,
+    /// Sessions, the event bus and the run registry `session.ask_user` posts
+    /// through and waits on. `None` withholds the `ask_user` skill.
+    ask_user: Option<crate::ask_user_service::AskUserDeps>,
+    /// Where `memory.get` records that a stored memory was used. `None`, or a
+    /// slot never filled, records nothing.
+    feedback: Option<DreamingSlot>,
 }
 
 
@@ -678,8 +747,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         audio,
         browser_data_dir,
         screenshot_data_dir,
+        reminders,
+        ask_user,
+        feedback,
     } = deps;
     let memory = &memory;
+    use serde_json::{Value, json};
 
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
@@ -695,16 +768,331 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 
     // Memory services
     if let Some(mem) = memory {
-        insert_memory_store_services(&mut services, mem, &workspace_id);
-        insert_memory_search_service(&mut services, mem, &workspace_id);
-        insert_memory_read_services(&mut services, mem);
-        // memory.append / memory.replace — the write half of the file-like
-        // surface. Without them a memory can only be created or forgotten, so a
-        // record that has become WRONG (an action narrated as a fact, e.g.
-        // "creating minidb.sh at D:\…" nine hours after that file stopped
-        // existing) can only be duplicated or destroyed, never corrected. Append
-        // gives a running record per subject instead of N disconnected islands.
-        insert_memory_edit_services(&mut services, mem);
+        let mem_store = mem.clone();
+        let ws_store = workspace_id.clone();
+        services.insert(
+            "memory.store".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_store.clone();
+                let ws = ws_store.clone();
+                Box::pin(async move {
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tags: HashMap<String, String> = params
+                        .get("tags")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let importance = params
+                        .get("importance")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
+                    let workspace = ws.read().await.clone();
+                    match mem
+                        .remember_scoped(&content, tags, importance, workspace)
+                        .await
+                    {
+                        Ok((id, _)) => Ok(json!({"id": id})),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            }),
+        );
+
+        let mem_search = mem.clone();
+        let ws_search = workspace_id.clone();
+        services.insert(
+            "memory.search".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_search.clone();
+                let ws = ws_search.clone();
+                Box::pin(async move {
+                    let query = params
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                    // Per-result page budget. Storage is unbounded now, so a
+                    // recall that returned whole memories would put an
+                    // arbitrarily large payload into a fixed context window —
+                    // `limit` times over. The default is one embedding chunk's
+                    // worth of text: the same unit the memory was indexed in,
+                    // so a page corresponds to something the retrieval actually
+                    // reasoned about rather than to a round number of bytes.
+                    let page_chars = params
+                        .get("page_chars")
+                        .and_then(|v| v.as_u64())
+                        .map_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS, |v| v as usize);
+                    let offset = params
+                        .get("offset")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let workspace = ws.read().await;
+                    match mem.recall_scoped(&query, workspace.as_deref()).await {
+                        Ok(results) => {
+                            let items: Vec<Value> = results
+                                .into_iter()
+                                .take(limit)
+                                .map(|r| {
+                                    let (content, start, total) = r.excerpt(offset, page_chars);
+                                    let returned = content.chars().count();
+                                    json!({
+                                        "id": r.id,
+                                        "content": content,
+                                        "score": r.score,
+                                        // Always present, never inferred from
+                                        // whether `content` "looks" cut off. A
+                                        // page that does not announce itself is
+                                        // indistinguishable from a whole
+                                        // memory, and a reader that believes it
+                                        // has the whole thing stops looking.
+                                        "offset": start,
+                                        "returned": returned,
+                                        "total": total,
+                                        "truncated": start + returned < total,
+                                        "best_chunk": r.best_chunk,
+                                    })
+                                })
+                                .collect();
+                            Ok(Value::Array(items))
+                        }
+                        Err(e) => {
+                            // If embedding is not configured, return empty results
+                            // instead of an error so the agent can continue gracefully
+                            let msg = e.to_string();
+                            if msg.contains("embedding") || msg.contains("No embedding function") {
+                                tracing::debug!("Memory search skipped: {}", msg);
+                                Ok(Value::Array(vec![]))
+                            } else {
+                                Err(msg)
+                            }
+                        }
+                    }
+                })
+            }),
+        );
+
+        // Alias: some tool scripts may call memory.embed instead of memory.store
+        let mem_embed = mem.clone();
+        let ws_embed = workspace_id.clone();
+        services.insert(
+            "memory.embed".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_embed.clone();
+                let ws = ws_embed.clone();
+                Box::pin(async move {
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tags: HashMap<String, String> = params
+                        .get("tags")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let importance = params
+                        .get("importance")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    // Provenance is what decides whether a dream cycle may
+                    // paraphrase this memory, so it is written at the one place
+                    // every `remember` call passes through — both this service
+                    // and its `memory.embed` alias.
+                    let tags = tags_with_provenance(tags, &params);
+                    let workspace = ws.read().await.clone();
+                    match mem
+                        .remember_scoped(&content, tags, importance, workspace)
+                        .await
+                    {
+                        Ok((id, _)) => Ok(json!({"id": id})),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            }),
+        );
+
+        let mem_delete = mem.clone();
+        services.insert(
+            "memory.delete".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_delete.clone();
+                Box::pin(async move {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    match mem.forget(&id).await {
+                        Ok(()) => Ok(json!({"deleted": true})),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            }),
+        );
+
+        let mem_list = mem.clone();
+        services.insert(
+            "memory.list".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_list.clone();
+                Box::pin(async move {
+                    let limit = opt_count(&params, "limit")?.unwrap_or(20);
+                    let all = mem.list_all().await;
+                    let items: Vec<Value> = all
+                        .into_iter()
+                        .take(limit)
+                        .map(|e| json!({"id": e.id, "content": e.content, "weight": e.weight}))
+                        .collect();
+                    Ok(Value::Array(items))
+                })
+            }),
+        );
+    }
+
+    // memory.get — read ONE memory by id, with a byte range.
+    //
+    // The store had only "search by similarity" and "list everything", which
+    // is why a tool result kept in memory could not be pointed at from
+    // context: a stub naming an id had no way to dereference it. This is the
+    // first piece of a file-like surface (read a range, later append/replace)
+    // so "the full result lives in memory, a stub lives in context" actually
+    // has a retrieval path.
+    if let Some(mem) = memory {
+        let mem_get = mem.clone();
+        let feedback_for_get = feedback;
+        services.insert(
+            "memory.get".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_get.clone();
+                let feedback = feedback_for_get.clone();
+                Box::pin(async move {
+                    let id = req_text(&params, "id")?;
+                    let offset = opt_count(&params, "offset")?.unwrap_or(0);
+                    // Default cap keeps a huge tool result from re-flooding
+                    // the context the stub existed to protect.
+                    let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
+
+                    let entry = resolve_memory_handle(&mem, &id).await?;
+                    let content = assemble_handle_content(&mem, &entry).await;
+                    if let Some(dreaming) = feedback.as_ref().and_then(|slot| slot.get()) {
+                        let served = served_row_ids(&mem, &entry).await;
+                        for (memory_id, signal) in recall_feedback(offset, &served) {
+                            dreaming.record_feedback(&memory_id, signal).await;
+                        }
+                    }
+
+                    let total = content.len();
+                    // Never split a UTF-8 char, and index the same text the
+                    // range was measured against: every field below reports on
+                    // the assembled content, so that is what the page cuts.
+                    let (s, e) = handle_page_range(&content, offset, limit);
+
+                    // If the handle forwarded, SAY SO. Silently returning a
+                    // consolidated narration where raw output was asked for
+                    // is how a model concludes its data was corrupted; the
+                    // note explains that dreaming folded the original in and
+                    // that nothing was lost, only generalised.
+                    let forwarded = entry.id != id
+                        && entry.metadata.get("source_id").is_none_or(|s| s != &id);
+                    let mut out = json!({
+                        "id": entry.id,
+                        "content": &content[s..e],
+                        "offset": s,
+                        "returned": e - s,
+                        "total": total,
+                        "truncated": e < total,
+                    });
+                    if forwarded {
+                        out["forwarded_from"] = json!(id);
+                        out["note"] = json!(format!(
+                            "'{id}' was consolidated during dreaming; this is the memory that \
+                             absorbed it ({}). The original text was generalised into this one, \
+                             not deleted.",
+                            entry.id
+                        ));
+                    }
+                    Ok(out)
+                })
+            }),
+        );
+    }
+
+    // memory.append / memory.replace — the write half of the file-like
+    // surface. Without them a memory can only be created or forgotten, so a
+    // record that has become WRONG (an action narrated as a fact, e.g.
+    // "creating minidb.sh at D:\…" nine hours after that file stopped
+    // existing) can only be duplicated or destroyed, never corrected. Append
+    // gives a running record per subject instead of N disconnected islands.
+    if let Some(mem) = memory {
+        let mem_append = mem.clone();
+        services.insert(
+            "memory.append".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_append.clone();
+                Box::pin(async move {
+                    let handle = req_text(&params, "id")?;
+                    let addition = req_text(&params, "content")?;
+                    let entry = resolve_memory_handle(&mem, &handle).await?;
+                    let combined = format!("{}\n{addition}", entry.content);
+                    mem.update_content(&entry.id, &combined)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "id": entry.id, "total": combined.len() }))
+                })
+            }),
+        );
+
+        let mem_replace = mem.clone();
+        services.insert(
+            "memory.replace".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_replace.clone();
+                Box::pin(async move {
+                    let handle = req_text(&params, "id")?;
+                    let old = req_text(&params, "old")?;
+                    let new = opt_text(&params, "new")?.unwrap_or_default();
+                    let entry = resolve_memory_handle(&mem, &handle).await?;
+                    let hits = entry.content.matches(&old).count();
+                    if hits == 0 {
+                        // Same contract as edit_file: refuse rather than
+                        // guess, and say what is actually there.
+                        let preview: String = entry.content.chars().take(160).collect();
+                        return Err(format!(
+                            "'{old}' does not appear in memory {}. Nothing was changed. It \
+                             begins: {preview}",
+                            entry.id
+                        ));
+                    }
+                    let updated = entry.content.replace(&old, &new);
+                    mem.update_content(&entry.id, &updated)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({
+                        "id": entry.id,
+                        "replaced": hits,
+                        "total": updated.len(),
+                    }))
+                })
+            }),
+        );
     }
 
     // memory.summarize — concatenate texts and summarize them with the
@@ -712,20 +1100,167 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
     // half: dreaming already does this on a schedule, and this lets the model
     // ask for it deliberately when it notices related fragments piling up.
     if let Some((router, summarizer_config)) = summarizer {
-        insert_memory_summarize_service(&mut services, router, summarizer_config);
+        services.insert(
+            "memory.summarize".to_string(),
+            Arc::new(move |params: Value| {
+                let router = router.clone();
+                let summarizer_config = Arc::clone(&summarizer_config);
+                Box::pin(async move {
+                    let texts: Vec<String> = params
+                        .get("texts")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if texts.is_empty() {
+                        return Err("texts must be a non-empty array".to_string());
+                    }
+                    let joined = texts.join("
+
+---
+
+");
+                    // Resolved per call: whichever summarization list the
+                    // user has set right now is the one that answers.
+                    let models = {
+                        let live = summarizer_config.read().await;
+                        crate::dream_summarizer::summarization_models(
+                            &live.summarization_priority,
+                            std::slice::from_ref(&live.model),
+                        )
+                    };
+                    let summarize =
+                        crate::dream_summarizer::summarize_with_failover(router, models);
+                    let summary = summarize(joined).await?;
+                    Ok(json!({ "summary": summary }))
+                })
+            }),
+        );
     }
 
     // Agent spawner service
     if let Some(spawner) = spawner {
-        insert_agent_spawn_service(&mut services, spawner);
+        services.insert(
+            "agent.spawn".to_string(),
+            Arc::new(move |params: Value| {
+                let spawner = spawner.clone();
+                Box::pin(async move {
+                    let prompt = params
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = params
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("sub-task")
+                        .to_string();
+                    let max_iterations = params
+                        .get("max_iterations")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize);
+                    match spawner.spawn(&prompt, &description, max_iterations).await {
+                        Ok(result) => Ok(json!({
+                            "text": result.text,
+                            "iterations": result.iterations,
+                            "tool_calls": result.tool_calls,
+                            "model": result.model,
+                        })),
+                        Err(e) => Err(e),
+                    }
+                })
+            }),
+        );
     }
 
     // Embedded Python interpreter (no system Python required)
-    insert_python_service(&mut services);
+    {
+        use nanna_scripting::python::PythonEngine;
+        let python_engine = Arc::new(PythonEngine::new());
+        services.insert(
+            "python.exec".to_string(),
+            Arc::new(move |params: Value| {
+                let engine = python_engine.clone();
+                Box::pin(async move {
+                    let code = params
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let timeout = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let workdir = params
+                        .get("workdir")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
+                    match engine.execute(&code, workdir.as_deref(), timeout).await {
+                        Ok(result) => Ok(json!({
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "success": result.success,
+                            "error": result.error,
+                            "duration_ms": result.duration_ms,
+                        })),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            }),
+        );
+    }
 
     // Session history service — returns recent messages from the current session.
     // The SharedSessionHistory is populated before each agent run.
-    insert_session_history_service(&mut services, session_history);
+    {
+        let history = session_history;
+        services.insert(
+            "session.history".to_string(),
+            Arc::new(move |params: Value| {
+                let history = history.clone();
+                Box::pin(async move {
+                    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                    let history = history.read().await;
+                    let start = if history.len() > limit {
+                        history.len() - limit
+                    } else {
+                        0
+                    };
+                    let messages: Vec<Value> = history[start..]
+                        .iter()
+                        .map(|msg| {
+                            json!({
+                                "role": format!("{:?}", msg.role).to_lowercase(),
+                                "content": msg.content,
+                                "timestamp": msg.timestamp.to_rfc3339(),
+                            })
+                        })
+                        .collect();
+                    Ok(json!(messages))
+                })
+            }),
+        );
+    }
+
+    // File history. The bridge snapshots before every script write once a
+    // store is installed; these let the `file_history` skill list and restore.
+    services.extend(crate::file_history_service::build_file_history_services(
+        nanna_scripting::file_history::installed(),
+    ));
+
+    // Clarifying questions, answered by the user's next message to a live turn.
+    if let Some(deps) = ask_user {
+        services.extend(crate::ask_user_service::build_ask_user_services(deps));
+    }
+
+    // Reminders. `remind` / `list_reminders` / `cancel_reminder` declare
+    // these; the scheduler is built after this map, so it arrives by slot.
+    if let Some((scheduler, sessions)) = reminders {
+        services.extend(crate::reminder_service::build_reminder_services(
+            scheduler, sessions,
+        ));
+    }
 
     // Desktop capture. The `screenshot` skill declares this; the Rust tool
     // behind it was a stub, so this is the implementation, not a registration.
@@ -781,529 +1316,6 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
     // indistinguishable from a scanned document that genuinely has no text. So
     // the response reports the outcome as one of four named cases rather than
     // returning an empty string for all of them.
-    insert_pdf_read_service(&mut services, pdf_ocr);
-
-    services
-}
-
-/// `memory.store` and its `memory.embed` alias: remember a text with tags and
-/// an importance, scoped to the active workspace.
-fn insert_memory_store_services(
-    services: &mut HashMap<String, ServiceFn>,
-    mem: &Arc<MemoryService>,
-    workspace_id: &Arc<tokio::sync::RwLock<Option<String>>>,
-) {
-    use serde_json::{Value, json};
-
-    let mem_store = mem.clone();
-    let ws_store = workspace_id.clone();
-    services.insert(
-        "memory.store".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_store.clone();
-            let ws = ws_store.clone();
-            Box::pin(async move {
-                let content = params
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tags: HashMap<String, String> = params
-                    .get("tags")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let importance = crate::numeric::f32_from_f64(
-                    params
-                        .get("importance")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(1.0),
-                );
-                // Provenance is what decides whether a dream cycle may
-                // paraphrase this memory, so it is written at the one place
-                // every `remember` call passes through — both this service
-                // and its `memory.embed` alias.
-                let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
-                match mem
-                    .remember_scoped(&content, tags, importance, workspace)
-                    .await
-                {
-                    Ok((id, _)) => Ok(json!({"id": id})),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-        }),
-    );
-
-    // Alias: some tool scripts may call memory.embed instead of memory.store
-    let mem_embed = mem.clone();
-    let ws_embed = workspace_id.clone();
-    services.insert(
-        "memory.embed".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_embed.clone();
-            let ws = ws_embed.clone();
-            Box::pin(async move {
-                let content = params
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tags: HashMap<String, String> = params
-                    .get("tags")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let importance = crate::numeric::f32_from_f64(
-                    params
-                        .get("importance")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(1.0),
-                );
-                // Provenance is what decides whether a dream cycle may
-                // paraphrase this memory, so it is written at the one place
-                // every `remember` call passes through — both this service
-                // and its `memory.embed` alias.
-                let tags = tags_with_provenance(tags, &params);
-                let workspace = ws.read().await.clone();
-                match mem
-                    .remember_scoped(&content, tags, importance, workspace)
-                    .await
-                {
-                    Ok((id, _)) => Ok(json!({"id": id})),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-        }),
-    );
-}
-
-/// `memory.search`: scoped recall, paged per result.
-fn insert_memory_search_service(
-    services: &mut HashMap<String, ServiceFn>,
-    mem: &Arc<MemoryService>,
-    workspace_id: &Arc<tokio::sync::RwLock<Option<String>>>,
-) {
-    use serde_json::{Value, json};
-
-    let mem_search = mem.clone();
-    let ws_search = workspace_id.clone();
-    services.insert(
-        "memory.search".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_search.clone();
-            let ws = ws_search.clone();
-            Box::pin(async move {
-                let query = params
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let limit = crate::numeric::usize_saturating(
-                    params.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(10),
-                );
-                // Per-result page budget. Storage is unbounded now, so a
-                // recall that returned whole memories would put an
-                // arbitrarily large payload into a fixed context window —
-                // `limit` times over. The default is one embedding chunk's
-                // worth of text: the same unit the memory was indexed in,
-                // so a page corresponds to something the retrieval actually
-                // reasoned about rather than to a round number of bytes.
-                let page_chars = params
-                    .get("page_chars")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS, crate::numeric::usize_saturating);
-                let offset = crate::numeric::usize_saturating(
-                    params
-                        .get("offset")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                );
-                let workspace = ws.read().await;
-                match mem.recall_scoped(&query, workspace.as_deref()).await {
-                    Ok(results) => {
-                        let items: Vec<Value> = results
-                            .into_iter()
-                            .take(limit)
-                            .map(|r| {
-                                let (content, start, total) = r.excerpt(offset, page_chars);
-                                let returned = content.chars().count();
-                                json!({
-                                    "id": r.id,
-                                    "content": content,
-                                    "score": r.score,
-                                    // Always present, never inferred from
-                                    // whether `content` "looks" cut off. A
-                                    // page that does not announce itself is
-                                    // indistinguishable from a whole
-                                    // memory, and a reader that believes it
-                                    // has the whole thing stops looking.
-                                    "offset": start,
-                                    "returned": returned,
-                                    "total": total,
-                                    "truncated": start + returned < total,
-                                    "best_chunk": r.best_chunk,
-                                })
-                            })
-                            .collect();
-                        Ok(Value::Array(items))
-                    }
-                    Err(e) => {
-                        // If embedding is not configured, return empty results
-                        // instead of an error so the agent can continue gracefully
-                        let msg = e.to_string();
-                        if msg.contains("embedding") || msg.contains("No embedding function") {
-                            tracing::debug!("Memory search skipped: {}", msg);
-                            Ok(Value::Array(vec![]))
-                        } else {
-                            Err(msg)
-                        }
-                    }
-                }
-            })
-        }),
-    );
-}
-
-/// `memory.delete`, `memory.list` and `memory.get`.
-fn insert_memory_read_services(services: &mut HashMap<String, ServiceFn>, mem: &Arc<MemoryService>) {
-    use serde_json::{Value, json};
-
-    let mem_delete = mem.clone();
-    services.insert(
-        "memory.delete".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_delete.clone();
-            Box::pin(async move {
-                let id = params
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                match mem.forget(&id).await {
-                    Ok(()) => Ok(json!({"deleted": true})),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-        }),
-    );
-
-    let mem_list = mem.clone();
-    services.insert(
-        "memory.list".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_list.clone();
-            Box::pin(async move {
-                let limit = opt_count(&params, "limit")?.unwrap_or(20);
-                let all = mem.list_all().await;
-                let items: Vec<Value> = all
-                    .into_iter()
-                    .take(limit)
-                    .map(|e| json!({"id": e.id, "content": e.content, "weight": e.weight}))
-                    .collect();
-                Ok(Value::Array(items))
-            })
-        }),
-    );
-
-    // memory.get — read ONE memory by id, with a byte range.
-    //
-    // The store had only "search by similarity" and "list everything", which
-    // is why a tool result kept in memory could not be pointed at from
-    // context: a stub naming an id had no way to dereference it. This is the
-    // first piece of a file-like surface (read a range, later append/replace)
-    // so "the full result lives in memory, a stub lives in context" actually
-    // has a retrieval path.
-    let mem_get = mem.clone();
-    services.insert(
-        "memory.get".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_get.clone();
-            Box::pin(async move {
-                let id = req_text(&params, "id")?;
-                let offset = opt_count(&params, "offset")?.unwrap_or(0);
-                // Default cap keeps a huge tool result from re-flooding
-                // the context the stub existed to protect.
-                let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
-
-                let entry = resolve_memory_handle(&mem, &id).await?;
-                let content = assemble_handle_content(&mem, &entry).await;
-
-                let total = content.len();
-                // Never split a UTF-8 char, and index the same text the
-                // range was measured against: every field below reports on
-                // the assembled content, so that is what the page cuts.
-                let (s, e) = handle_page_range(&content, offset, limit);
-
-                // If the handle forwarded, SAY SO. Silently returning a
-                // consolidated narration where raw output was asked for
-                // is how a model concludes its data was corrupted; the
-                // note explains that dreaming folded the original in and
-                // that nothing was lost, only generalised.
-                let forwarded = entry.id != id
-                    && entry.metadata.get("source_id").is_none_or(|s| s != &id);
-                let mut out = json!({
-                    "id": entry.id,
-                    "content": &content[s..e],
-                    "offset": s,
-                    "returned": e - s,
-                    "total": total,
-                    "truncated": e < total,
-                });
-                if forwarded {
-                    out["forwarded_from"] = json!(id);
-                    out["note"] = json!(format!(
-                        "'{id}' was consolidated during dreaming; this is the memory that \
-                         absorbed it ({}). The original text was generalised into this one, \
-                         not deleted.",
-                        entry.id
-                    ));
-                }
-                Ok(out)
-            })
-        }),
-    );
-}
-
-/// `memory.append` and `memory.replace` — see the call site for why they exist.
-fn insert_memory_edit_services(services: &mut HashMap<String, ServiceFn>, mem: &Arc<MemoryService>) {
-    use serde_json::{Value, json};
-
-    let mem_append = mem.clone();
-    services.insert(
-        "memory.append".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_append.clone();
-            Box::pin(async move {
-                let handle = req_text(&params, "id")?;
-                let addition = req_text(&params, "content")?;
-                let entry = resolve_memory_handle(&mem, &handle).await?;
-                let combined = format!("{}\n{addition}", entry.content);
-                mem.update_content(&entry.id, &combined)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({ "id": entry.id, "total": combined.len() }))
-            })
-        }),
-    );
-
-    let mem_replace = mem.clone();
-    services.insert(
-        "memory.replace".to_string(),
-        Arc::new(move |params: Value| {
-            let mem = mem_replace.clone();
-            Box::pin(async move {
-                let handle = req_text(&params, "id")?;
-                let old = req_text(&params, "old")?;
-                let new = opt_text(&params, "new")?.unwrap_or_default();
-                let entry = resolve_memory_handle(&mem, &handle).await?;
-                let hits = entry.content.matches(&old).count();
-                if hits == 0 {
-                    // Same contract as edit_file: refuse rather than
-                    // guess, and say what is actually there.
-                    let preview: String = entry.content.chars().take(160).collect();
-                    return Err(format!(
-                        "'{old}' does not appear in memory {}. Nothing was changed. It \
-                         begins: {preview}",
-                        entry.id
-                    ));
-                }
-                let updated = entry.content.replace(&old, &new);
-                mem.update_content(&entry.id, &updated)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({
-                    "id": entry.id,
-                    "replaced": hits,
-                    "total": updated.len(),
-                }))
-            })
-        }),
-    );
-}
-
-/// `memory.summarize` over the live summarization model chain.
-fn insert_memory_summarize_service(
-    services: &mut HashMap<String, ServiceFn>,
-    router: Arc<crate::llm_router::LlmRouter>,
-    summarizer_config: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
-) {
-    use serde_json::{Value, json};
-
-    services.insert(
-        "memory.summarize".to_string(),
-        Arc::new(move |params: Value| {
-            let router = router.clone();
-            let summarizer_config = Arc::clone(&summarizer_config);
-            Box::pin(async move {
-                let texts: Vec<String> = params
-                    .get("texts")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if texts.is_empty() {
-                    return Err("texts must be a non-empty array".to_string());
-                }
-                let joined = texts.join("
-
----
-
-");
-                // Resolved per call: whichever summarization list the
-                // user has set right now is the one that answers.
-                let models = {
-                    let live = summarizer_config.read().await;
-                    crate::dream_summarizer::summarization_models(
-                        &live.summarization_priority,
-                        std::slice::from_ref(&live.model),
-                    )
-                };
-                let summarize =
-                    crate::dream_summarizer::summarize_with_failover(router, models);
-                let summary = summarize(joined).await?;
-                Ok(json!({ "summary": summary }))
-            })
-        }),
-    );
-}
-
-/// `agent.spawn`: run a sub-agent to completion.
-fn insert_agent_spawn_service(
-    services: &mut HashMap<String, ServiceFn>,
-    spawner: Arc<dyn AgentSpawner + Send + Sync>,
-) {
-    use serde_json::{Value, json};
-
-    services.insert(
-        "agent.spawn".to_string(),
-        Arc::new(move |params: Value| {
-            let spawner = spawner.clone();
-            Box::pin(async move {
-                let prompt = params
-                    .get("prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = params
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("sub-task")
-                    .to_string();
-                let max_iterations = params
-                    .get("max_iterations")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(crate::numeric::usize_saturating);
-                match spawner.spawn(&prompt, &description, max_iterations).await {
-                    Ok(result) => Ok(json!({
-                        "text": result.text,
-                        "iterations": result.iterations,
-                        "tool_calls": result.tool_calls,
-                        "model": result.model,
-                    })),
-                    Err(e) => Err(e),
-                }
-            })
-        }),
-    );
-}
-
-/// `python.exec` on the embedded interpreter (no system Python required).
-fn insert_python_service(services: &mut HashMap<String, ServiceFn>) {
-    use serde_json::{Value, json};
-    use nanna_scripting::python::PythonEngine;
-    let python_engine = Arc::new(PythonEngine::new());
-    services.insert(
-        "python.exec".to_string(),
-        Arc::new(move |params: Value| {
-            let engine = python_engine.clone();
-            Box::pin(async move {
-                let code = params
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let timeout = params.get("timeout").and_then(serde_json::Value::as_u64).unwrap_or(30);
-                let workdir = params
-                    .get("workdir")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                match engine.execute(&code, workdir.as_deref(), timeout).await {
-                    Ok(result) => Ok(json!({
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                        "success": result.success,
-                        "error": result.error,
-                        "duration_ms": result.duration_ms,
-                    })),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-        }),
-    );
-}
-
-/// `session.history`: recent messages from the current session. The
-/// `SharedSessionHistory` is populated before each agent run.
-fn insert_session_history_service(
-    services: &mut HashMap<String, ServiceFn>,
-    session_history: SharedSessionHistory,
-) {
-    use serde_json::{Value, json};
-
-    let history = session_history;
-    services.insert(
-        "session.history".to_string(),
-        Arc::new(move |params: Value| {
-            let history = history.clone();
-            Box::pin(async move {
-                let limit = crate::numeric::usize_saturating(
-                    params.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(20),
-                );
-                let history = history.read().await;
-                let start = if history.len() > limit {
-                    history.len() - limit
-                } else {
-                    0
-                };
-                let messages: Vec<Value> = history[start..]
-                    .iter()
-                    .map(|msg| {
-                        json!({
-                            "role": format!("{:?}", msg.role).to_lowercase(),
-                            "content": msg.content,
-                            "timestamp": msg.timestamp.to_rfc3339(),
-                        })
-                    })
-                    .collect();
-                drop(history);
-                Ok(json!(messages))
-            })
-        }),
-    );
-}
-
-/// `pdf.read`, with the vision-model OCR fallback when one is bound — see the
-/// call site for the outcome cases it reports.
-fn insert_pdf_read_service(
-    services: &mut HashMap<String, ServiceFn>,
-    pdf_ocr: Option<nanna_tools::PdfOcrFn>,
-) {
-    use serde_json::{Value, json};
-
     let pdf_ocr_fn = pdf_ocr;
     services.insert(
         "pdf.read".to_string(),
@@ -1402,6 +1414,8 @@ fn insert_pdf_read_service(
             })
         }),
     );
+
+    services
 }
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -1423,10 +1437,14 @@ pub struct DaemonConfig {
     pub agent: AgentServiceConfig,
     /// Enable memory service (requires embedding provider)
     pub enable_memory: bool,
-    /// Which auxiliary servers and guards run beside the IPC server.
-    pub servers: ServerSwitches,
+    /// Enable HTTP health server
+    pub enable_health_server: bool,
     /// Health server port (default: 5148)
     pub health_port: u16,
+    /// Enable PID file (prevents multiple instances)
+    pub enable_pid_file: bool,
+    /// Enable webhook server for inbound messages
+    pub enable_webhook_server: bool,
     /// Webhook server port (default: 3000)
     pub webhook_port: u16,
     /// Webhook configuration
@@ -1450,9 +1468,12 @@ pub struct DaemonConfig {
     /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
     /// tool actually stop executing (previously the list was parsed but ignored).
     pub tool_denylist: Vec<String>,
-    /// The per-call tool audit trail (mirrors `[tools] audit_log` /
-    /// `audit_log_values`).
-    pub tool_audit: ToolAuditSwitches,
+    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
+    /// Mirrors `[tools] audit_log`.
+    pub tool_audit_log: bool,
+    /// Include a bounded preview of tool arguments in that trail.
+    /// Mirrors `[tools] audit_log_values`.
+    pub tool_audit_log_values: bool,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -1464,43 +1485,16 @@ pub struct DaemonConfig {
     pub memory_min_remaining_memories: usize,
     /// Seconds of idle (no chat activity) before the scheduled dream cycle may
     /// run (mirrors `[memory] dream_idle_threshold_secs`). Gated via the shared
-    /// [`ActivityClock`](nanna_memory::ActivityClock) + `nanna_memory::dream_trigger`.
+    /// [`ActivityClock`] + `nanna_memory::dream_trigger`.
     pub dream_idle_threshold_secs: u64,
     /// Live memory count that forces a dream cycle regardless of idle time
     /// (mirrors `[memory] dream_memory_pressure_count`; `0` disables).
     pub dream_memory_pressure_count: usize,
-    /// The daemon's scheduler switches (mirrors `[scheduler]`).
-    pub scheduler: SchedulerSwitches,
-}
-
-/// Which auxiliary servers and guards the daemon runs beside IPC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerSwitches {
-    /// Enable HTTP health server
-    pub health: bool,
-    /// Enable PID file (prevents multiple instances)
-    pub pid_file: bool,
-    /// Enable webhook server for inbound messages
-    pub webhook: bool,
-}
-
-/// The per-call tool audit trail's switches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolAuditSwitches {
-    /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
-    /// Mirrors `[tools] audit_log`.
-    pub log: bool,
-    /// Include a bounded preview of tool arguments in that trail.
-    /// Mirrors `[tools] audit_log_values`.
-    pub log_values: bool,
-}
-
-/// The daemon scheduler's switches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchedulerSwitches {
+    /// MCP servers to start at boot (`[mcp]`).
+    pub mcp: nanna_config::McpConfig,
     /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
     /// `false` loads cron jobs but fires nothing.
-    pub enabled: bool,
+    pub scheduler_enabled: bool,
     /// Whether the periodic heartbeat runs (mirrors
     /// `[scheduler] heartbeat_enabled`). The heartbeat drives a full agent turn
     /// against the chat model, so on a single-slot local backend it competes
@@ -1522,9 +1516,9 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
-    /// `OpenAI` API key
+    /// OpenAI API key
     pub openai_api_key: Option<String>,
-    /// `OpenRouter` API key
+    /// OpenRouter API key
     pub openrouter_api_key: Option<String>,
     /// GitHub token (for GitHub Models)
     pub github_token: Option<String>,
@@ -1540,16 +1534,16 @@ pub struct LlmConfig {
 ///
 /// The store is where the GUI puts keys the user types in, so a key that is
 /// only ever read from the environment is a key the user cannot set. Anthropic
-/// and `OpenAI` already got their store fallback further down this file; the
-/// others never did, and `OpenRouter`'s absence was load-bearing — the dream
-/// summarizer is configured to `OpenRouter` models by default, so every
+/// and OpenAI already got their store fallback further down this file; the
+/// others never did, and OpenRouter's absence was load-bearing — the dream
+/// summarizer is configured to OpenRouter models by default, so every
 /// consolidation failed with `Missing API key for provider: OpenRouter` while
 /// the key sat in the store the whole time. Dreaming had never once run.
 fn credential(env_var: &str, store_key: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(env_var)
-        && !value.trim().is_empty()
-    {
-        return Some(value);
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
     }
     SecureStore::new()
         .get(store_key)
@@ -1606,13 +1600,12 @@ impl DaemonConfig {
     /// Where the per-call tool audit trail is written.
     ///
     /// One definition, because two consumers need it and they are built in
-    /// different places: `init_services` hands it to the [`JsonlAuditSink`](nanna_tools::JsonlAuditSink), and
+    /// different places: `init_services` hands it to the [`JsonlAuditSink`], and
     /// the control plane needs it to serve the trail back to a client. Deriving
     /// it twice is how the reader ends up looking somewhere the writer never
     /// wrote — and note this hangs off `data_dir`, which `--data-dir` moves, so
     /// re-deriving from `Config::default_data_dir()` would read an empty trail
     /// on every isolated run.
-    #[must_use]
     pub fn tool_audit_path(&self) -> PathBuf {
         self.data_dir.join("logs").join("tool-audit.jsonl")
     }
@@ -1620,7 +1613,9 @@ impl DaemonConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        let data_dir = nanna_config::project_dirs().map_or_else(|| PathBuf::from("./data"), |d| d.data_dir().to_path_buf());
+        let data_dir = nanna_config::project_dirs()
+            .map(|d| d.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("./data"));
 
         Self {
             ipc: IpcServerConfig::default(),
@@ -1630,12 +1625,10 @@ impl Default for DaemonConfig {
             llm: LlmConfig::default(),
             agent: AgentServiceConfig::default(),
             enable_memory: true, // Enabled by default (requires embedding provider)
-            servers: ServerSwitches {
-                health: true,
-                pid_file: true,
-                webhook: false, // Disabled by default (needs configuration)
-            },
+            enable_health_server: true,
             health_port: DEFAULT_HEALTH_PORT,
+            enable_pid_file: true,
+            enable_webhook_server: false, // Disabled by default (needs configuration)
             webhook_port: DEFAULT_WEBHOOK_PORT,
             webhook: WebhookConfig::default(),
             use_script_tools: true,
@@ -1643,10 +1636,8 @@ impl Default for DaemonConfig {
             vision_model_priority: Vec::new(),
             tool_allowlist: None,
             tool_denylist: Vec::new(),
-            tool_audit: ToolAuditSwitches {
-                log: true,
-                log_values: false,
-            },
+            tool_audit_log: true,
+            tool_audit_log_values: false,
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -1654,12 +1645,11 @@ impl Default for DaemonConfig {
             // Mirror DreamingConfig::default() (== nanna-config defaults).
             dream_idle_threshold_secs: 300,
             dream_memory_pressure_count: 5000,
+            mcp: nanna_config::McpConfig::default(),
             // Mirror nanna_config::SchedulerConfig::default().
-            scheduler: SchedulerSwitches {
-                enabled: true,
-                heartbeat_enabled: true,
-                heartbeat_interval_secs: 1800,
-            },
+            scheduler_enabled: true,
+            heartbeat_enabled: true,
+            heartbeat_interval_secs: 1800,
         }
     }
 }
@@ -2093,442 +2083,6 @@ fn flatten_scheduled_join(
     })
 }
 
-/// A scheduled task's `(success, output, error)`, as `TaskResult` reports it.
-type TaskOutcome = (bool, Option<String>, Option<String>);
-
-/// Everything the daemon scheduler's executor needs to run a task: shared
-/// handles, cloned once per task invocation.
-#[derive(Clone)]
-struct ScheduledTaskContext {
-    agent: Arc<AgentService>,
-    dreaming: Option<Arc<nanna_memory::DreamingService>>,
-    router: Arc<LlmRouter>,
-    storage: Option<Arc<nanna_storage::Storage>>,
-    activity: Arc<nanna_memory::ActivityClock>,
-    chat_runs: Arc<crate::control::chat_harness::ChatRunRegistry>,
-    /// In-flight latch: the scheduler tick re-fired consolidation every 30s
-    /// while the previous one was still folding (observed 2026-08-10: a fresh
-    /// "Consolidation starting" per tick, none finishing) — one dream at a
-    /// time.
-    dream_in_flight: Arc<std::sync::atomic::AtomicBool>,
-    /// At most one yielded scheduled run waiting to resume. Not a quota — a
-    /// dedup: reality already serializes scheduled runs (a live one makes
-    /// every other tick skip), so a second waiter could only arise from an
-    /// exotic interleaving, and dropping it costs one schedule period, which
-    /// the log names.
-    scheduled_resume_parked: Arc<std::sync::atomic::AtomicBool>,
-    /// The user's memory-compression settings for the scheduled dream cycle.
-    consolidation_max_ratio: f32,
-    consolidation_min_remaining: usize,
-    /// Idle threshold is captured for the skip log only — the gate *decision*
-    /// lives in the `DreamingService` (built with both thresholds), so there is
-    /// no second copy of the policy here.
-    dream_idle_threshold_secs: u64,
-}
-
-impl ScheduledTaskContext {
-    /// Run one scheduled task and report how it went.
-    async fn run(self, task: nanna_core::ScheduledTask) -> nanna_core::TaskResult {
-        let start = std::time::Instant::now();
-        let started_at = chrono::Utc::now();
-        let (success, output, error) = match task.name.as_str() {
-            "memory_consolidation" => self.run_memory_consolidation().await,
-            "task_recurrence_sweep" => self.run_recurrence_sweep().await,
-            _ if task.payload.is_empty() => {
-                debug!("Skipping task with empty payload: {}", task.name);
-                (true, Some("Skipped (empty payload)".to_string()), None)
-            }
-            _ => self.run_scheduled_prompt(&task).await,
-        };
-        nanna_core::TaskResult {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            success,
-            output,
-            error,
-            duration_ms: crate::numeric::millis_u64(start.elapsed()),
-            started_at,
-            finished_at: chrono::Utc::now(),
-        }
-    }
-
-    /// The scheduled dream cycle, gated on a live mission and the in-flight
-    /// latch.
-    async fn run_memory_consolidation(&self) -> TaskOutcome {
-        let Some(ref dreaming) = self.dreaming else {
-            return (
-                true,
-                Some("Skipped (memory service unavailable)".to_string()),
-                None,
-            );
-        };
-        if self.chat_runs.any_active().await {
-            // A live harness run is the opposite of
-            // idle, however old the last user message
-            // is: dreaming rewrites the very scoped
-            // memories the run is using, and doing so
-            // mid-step deadlocked a live mission
-            // (2026-08-10, 316 tool-result memories
-            // folded under a running step).
-            (true, Some("Skipped (mission live)".to_string()), None)
-        } else if self
-            .dream_in_flight
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            (
-                true,
-                Some("Skipped (dream already in flight)".to_string()),
-                None,
-            )
-        } else {
-            let outcome = self.dream_once(dreaming).await;
-            self.dream_in_flight
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            outcome
-        }
-    }
-
-    /// One dream cycle, holding the in-flight latch the caller took.
-    async fn dream_once(&self, dreaming: &nanna_memory::DreamingService) -> TaskOutcome {
-        // Read the summarization list LIVE, once per
-        // cycle: whatever the user last set is what
-        // this dream summarizes on. Falls back to the
-        // chat model exactly as the boot path did.
-        let live_cfg = self.agent.agent_config().await;
-        let summarization_models =
-            crate::dream_summarizer::summarization_models(
-                &live_cfg.summarization_priority,
-                std::slice::from_ref(&live_cfg.model),
-            );
-        // The idle gate AND the full dream cycle (feedback
-        // flush -> FSRS testing-effect flush -> consolidate)
-        // both live in the one `DreamingService`. The daemon
-        // supplies only what it owns: its lock-free activity
-        // clock and a consolidation budget sized to *its*
-        // summarizer model. Dreaming competes with the live
-        // agent for that model and rewrites the store, so it
-        // still only runs during a lull (or under pressure).
-        let idle = self.activity.idle();
-        // Size the budget to the SMALLEST window across
-        // the failover list: one prompt is built and
-        // then offered to each candidate in turn, so a
-        // budget fitted to the first model would
-        // overflow a smaller fallback.
-        let window_tokens =
-            crate::dream_summarizer::summarizer_context_window_tokens(
-                &self.router,
-                &summarization_models,
-            )
-            .await;
-        let consolidation_config = scheduled_consolidation_config(
-            self.consolidation_max_ratio,
-            self.consolidation_min_remaining,
-            window_tokens,
-        );
-        // The any_active skip above gates the dream's
-        // START; this gates its MIDDLE (P22 Tier 4): a
-        // chat turn arriving mid-dream pauses the NEXT
-        // cluster's summarization until the turn
-        // releases, instead of contending with it for
-        // the model. Cluster boundaries are the natural
-        // yield points — a fold already in flight
-        // completes (the CAS guards own staleness),
-        // only new provider work waits. Dreaming is
-        // idle-time work by definition, so it pauses
-        // for a live turn whatever provider it
-        // summarizes on.
-        let inner_summarize =
-            crate::dream_summarizer::summarize_with_failover(
-                self.router.clone(),
-                summarization_models.clone(),
-            );
-        let summarize_gate = self.chat_runs.clone();
-        let summarize = move |prompt: String| {
-            let pending = inner_summarize(prompt);
-            let gate = summarize_gate.clone();
-            async move {
-                gate.wait_idle().await;
-                pending.await
-            }
-        };
-        match dreaming
-            .dream_if_triggered(idle, &consolidation_config, summarize)
-            .await
-        {
-            Ok(None) => {
-                let memory_count = dreaming.memory().count().await;
-                let dream_idle_threshold_secs = self.dream_idle_threshold_secs;
-                debug!(
-                    "Skipping scheduled consolidation: system active \
-                     (idle {idle:?} < {dream_idle_threshold_secs}s, \
-                     {memory_count} memories)"
-                );
-                (
-                    true,
-                    Some(format!(
-                        "Skipped (active; idle {}s, {memory_count} memories)",
-                        idle.as_secs()
-                    )),
-                    None,
-                )
-            }
-            Ok(Some((trigger, stats))) => {
-                info!(
-                    "Scheduled dream ({trigger:?}): {} processed, \
-                     {} merged, {} deduped, {} promoted, {} demoted",
-                    stats.consolidation.memories_processed,
-                    stats.consolidation.memories_merged,
-                    stats.consolidation.memories_deduped,
-                    stats.auto_promoted,
-                    stats.auto_demoted,
-                );
-                (
-                    true,
-                    Some(format!(
-                        "Processed {} memories",
-                        stats.consolidation.memories_processed
-                    )),
-                    None,
-                )
-            }
-            Err(e) => {
-                error!("Scheduled consolidation failed: {e}");
-                (false, None, Some(e.to_string()))
-            }
-        }
-    }
-
-    /// Reopen recurring tasks whose next occurrence has arrived.
-    async fn run_recurrence_sweep(&self) -> TaskOutcome {
-        if let Some(ref storage) = self.storage {
-            let reopened = crate::tasks::sweep_recurrences(storage).await;
-            if reopened > 0 {
-                info!("Recurrence sweep reopened {reopened} tasks");
-            }
-            (
-                true,
-                Some(format!("Reopened {reopened} recurring tasks")),
-                None,
-            )
-        } else {
-            (true, Some("Skipped (no storage)".to_string()), None)
-        }
-    }
-
-    /// Heartbeat and cron jobs run as full agent prompts (tools, memory, model
-    /// fallback) in a task-scoped session that is not persisted to the session
-    /// store.
-    async fn run_scheduled_prompt(&self, task: &nanna_core::ScheduledTask) -> TaskOutcome {
-        let session_id = format!("scheduled-{}", task.id);
-        // Idle gate: never start an autonomous prompt on top
-        // of a live run. A local model server serves one
-        // generation at a time, so a heartbeat firing into a
-        // streaming chat gets the slot time-shared and the
-        // chat's generation CANCELLED — surfacing as a bogus
-        // "provider incident" the harness then heals against
-        // (observed live 2026-07-26). Skipping loses nothing:
-        // a heartbeat exists to work during a lull, and the
-        // next tick picks up whatever was due.
-        if self.agent.any_run_active().await {
-            debug!(
-                "Skipping scheduled task '{}': a run is already in flight",
-                task.name
-            );
-            return (true, Some("Skipped (a run is in flight)".to_string()), None);
-        }
-        // Nothing to run the prompt with: a daemon with no model configured
-        // would only fail every tick (and used to send a request naming no
-        // model at all).
-        if !self.agent.has_configured_model().await {
-            debug!("Skipping scheduled task '{}': no model is configured", task.name);
-            return (true, Some("Skipped (no model configured)".to_string()), None);
-        }
-        // An autonomous agent run (heartbeat / cron / task
-        // prompt) is the daemon actively using the model, so
-        // it counts as activity too — defer the dream cycle
-        // while it runs. Heartbeats are infrequent (30 min)
-        // vs the 5-min idle threshold, and memory pressure
-        // still overrides, so dreaming is not starved.
-        self.activity.record();
-        // Session scoping (the `with_run_session` binding
-        // that fixed 35 failed `todo` calls) now lives
-        // inside `run_scheduled_prompt_yielding`, carried
-        // by the run's own spawned future — a chat that
-        // starts during this run cannot see the scheduled
-        // session, nor vice versa.
-        let outcome = run_scheduled_prompt_yielding(
-            &self.agent,
-            &self.chat_runs,
-            &session_id,
-            &task.payload,
-        )
-        .await;
-        match outcome {
-            Some(Ok(result)) => {
-                let heartbeat_ok = task.name == "heartbeat"
-                    && result.content.trim().contains("HEARTBEAT_OK");
-                if heartbeat_ok {
-                    debug!("Heartbeat: OK (nothing to do)");
-                } else {
-                    info!(
-                        "Scheduled task '{}' completed: {}",
-                        task.name,
-                        result.content.chars().take(200).collect::<String>()
-                    );
-                }
-                if task.target_channel.is_some() {
-                    warn!(
-                        "Task '{}' targets a channel; channel routing from the \
-                         daemon scheduler is not implemented yet",
-                        task.name
-                    );
-                }
-                (true, Some(result.content), None)
-            }
-            Some(Err(e)) => {
-                error!("Scheduled task '{}' failed: {}", task.name, e.message);
-                (false, None, Some(e.message))
-            }
-            None => self.park_yielded_run(session_id, task),
-        }
-    }
-
-    /// The run yielded the local provider to a live chat turn (P22 Tier 4).
-    ///
-    /// Resume on release: ONE detached waiter re-runs the prompt when the
-    /// registry goes idle — promptly, not at the next tick — and if a fresh
-    /// user turn preempts the resumed run too, it parks again. That loop is
-    /// bounded by user activity itself, not by a counter: every extra lap
-    /// requires a new turn to have claimed the provider. The executor returns
-    /// NOW because the heartbeat arm of the scheduler loop awaits it inline —
-    /// parking here would stall every other scheduled task for as long as the
-    /// chat runs.
-    fn park_yielded_run(&self, session_id: String, task: &nanna_core::ScheduledTask) -> TaskOutcome {
-        if self
-            .scheduled_resume_parked
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            tokio::spawn(self.clone().resume_yielded_run(
-                session_id,
-                task.payload.clone(),
-                task.name.clone(),
-            ));
-            (
-                true,
-                Some(
-                    "Yielded to a live chat turn; resuming on release"
-                        .to_string(),
-                ),
-                None,
-            )
-        } else {
-            (
-                true,
-                Some(
-                    "Yielded to a live chat turn; a resume is \
-                     already parked, the next tick covers this one"
-                        .to_string(),
-                ),
-                None,
-            )
-        }
-    }
-
-    /// The parked waiter: re-run a yielded scheduled prompt once no chat turn
-    /// holds the provider, then release the park.
-    async fn resume_yielded_run(self, resume_session: String, resume_payload: String, resume_name: String) {
-        loop {
-            self.chat_runs.wait_idle().await;
-            // The release tail unregisters
-            // the finished chat BEFORE
-            // releasing the registry, so an
-            // active run here is a NEW
-            // claimant — the slot is taken
-            // and the schedule covers the
-            // rest.
-            if self.agent.any_run_active().await {
-                debug!(
-                    task = %resume_name,
-                    "Yielded run superseded — the slot is \
-                     taken; the next tick owns the work"
-                );
-                break;
-            }
-            self.activity.record();
-            match run_scheduled_prompt_yielding(
-                &self.agent,
-                &self.chat_runs,
-                &resume_session,
-                &resume_payload,
-            )
-            .await
-            {
-                Some(Ok(result)) => {
-                    let heartbeat_ok = resume_name
-                        == "heartbeat"
-                        && result
-                            .content
-                            .trim()
-                            .contains("HEARTBEAT_OK");
-                    if heartbeat_ok {
-                        debug!(
-                            "Heartbeat (resumed): OK \
-                             (nothing to do)"
-                        );
-                    } else {
-                        info!(
-                            "Scheduled task '{}' completed \
-                             after yielding: {}",
-                            resume_name,
-                            result
-                                .content
-                                .chars()
-                                .take(200)
-                                .collect::<String>()
-                        );
-                    }
-                    break;
-                }
-                Some(Err(e)) => {
-                    error!(
-                        "Scheduled task '{}' failed after \
-                         yielding: {}",
-                        resume_name, e.message
-                    );
-                    break;
-                }
-                None => {
-                    // Preempted again — user
-                    // turns keep priority.
-                }
-            }
-        }
-        self.scheduled_resume_parked
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// What [`DaemonServer::init_services`] builds, named.
-struct DaemonServices {
-    tools: Arc<ToolRegistry>,
-    memory: Option<Arc<MemoryService>>,
-    agent: Arc<AgentService>,
-    router: Arc<LlmRouter>,
-    tools_dir: Option<PathBuf>,
-    /// The workspace id the script services scope memory to.
-    workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
-    /// Turn-start closed-task baselines.
-    turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    /// The shared model-stats tracker.
-    model_stats: nanna_agent::ModelStatsTracker,
-}
-
 /// The main daemon server
 pub struct DaemonServer {
     config: DaemonConfig,
@@ -2536,9 +2090,18 @@ pub struct DaemonServer {
     memory_path: Option<PathBuf>,
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
+    _control: Arc<ControlPlane>,
     /// Late-bound handle to the control plane for consumers created
-    /// before it exists (filled in `run()`, read by the agent service).
+    /// before it exists (filled in run(), read by the agent service).
     control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
+    /// The scheduler, for the `schedule.*` services built before it exists.
+    /// Filled once in run(), right after the scheduler is constructed.
+    scheduler_slot: crate::reminder_service::SchedulerSlot,
+    /// Per-server MCP state: written by the boot task, read by `system.status`.
+    mcp_status: crate::mcp_startup::McpStatus,
+    /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
+    /// in `run()`, right after it is built.
+    dreaming_slot: DreamingSlot,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -2563,13 +2126,6 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    /// The address the IPC listener bound, `None` until `run` binds it. See
-    /// [`IpcServer::bound_addr`]: with port 0 this reports the chosen port.
-    #[must_use]
-    pub fn ipc_bound_addr(&self) -> tokio::sync::watch::Receiver<Option<std::net::SocketAddr>> {
-        self.ipc.bound_addr()
-    }
-
     /// Resolve one `provider/model` spec to a live embedding client.
     ///
     /// `None` means the provider's credential is absent — the entry is skipped
@@ -2598,18 +2154,16 @@ impl DaemonServer {
                     .openai_api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                key.map_or_else(
-                    || {
+                match key {
+                    Some(key) => Some((
+                        info,
+                        Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
+                    )),
+                    None => {
                         warn!("Embedding provider '{spec}' skipped: no OpenAI API key");
                         None
-                    },
-                    |key| {
-                        Some((
-                            info,
-                            Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
-                        ))
-                    },
-                )
+                    }
+                }
             }
             "openrouter" => {
                 let key = self
@@ -2618,22 +2172,20 @@ impl DaemonServer {
                     .openrouter_api_key
                     .clone()
                     .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
-                key.map_or_else(
-                    || {
+                match key {
+                    Some(key) => Some((
+                        info,
+                        Arc::new(
+                            nanna_llm::EmbeddingClient::openai(&key)
+                                .with_model(&model)
+                                .with_base_url("https://openrouter.ai/api"),
+                        ),
+                    )),
+                    None => {
                         warn!("Embedding provider '{spec}' skipped: no OpenRouter API key");
                         None
-                    },
-                    |key| {
-                        Some((
-                            info,
-                            Arc::new(
-                                nanna_llm::EmbeddingClient::openai(&key)
-                                    .with_model(&model)
-                                    .with_base_url("https://openrouter.ai/api"),
-                            ),
-                        ))
-                    },
-                )
+                    }
+                }
             }
             "ollama" => Some((
                 info,
@@ -2672,7 +2224,6 @@ impl DaemonServer {
     }
 
     /// Create a new daemon server
-    #[must_use]
     pub fn new(
         config: DaemonConfig,
         embedding: EmbeddingConfig,
@@ -2680,12 +2231,13 @@ impl DaemonServer {
         brave_api_key: Option<String>,
     ) -> Self {
         let sessions = Arc::new(SessionManager::new());
+        let control = Arc::new(ControlPlane::new(sessions.clone()));
         let ipc = Arc::new(IpcServer::new(config.ipc.clone()));
         let persistence = Arc::new(PersistenceManager::new(&config.data_dir));
         let (shutdown_tx, _) = broadcast::channel(1);
 
         // Create PID file if enabled
-        let pid_file = if config.servers.pid_file {
+        let pid_file = if config.enable_pid_file {
             Some(PidFile::new(&config.data_dir))
         } else {
             None
@@ -2699,7 +2251,11 @@ impl DaemonServer {
             memory_path,
             _brave_api_key: brave_api_key,
             sessions,
+            _control: control,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
+            scheduler_slot: Arc::new(std::sync::OnceLock::new()),
+            mcp_status: crate::mcp_startup::McpStatus::default(),
+            dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
             shutdown_tx,
@@ -2713,7 +2269,6 @@ impl DaemonServer {
     }
 
     /// Recovery report from a startup quarantine + rebuild, if one happened.
-    #[must_use]
     pub fn memory_recovery(&self) -> Option<Arc<nanna_storage::RecoveryReport>> {
         self.memory_recovery.clone()
     }
@@ -2722,12 +2277,13 @@ impl DaemonServer {
     pub fn set_storage(&mut self, storage: Arc<nanna_storage::Storage>) {
         // Replace the SessionManager with one that has storage
         let new_sessions = Arc::new(SessionManager::with_storage(storage.clone()));
-        self.sessions = new_sessions;
+        self.sessions = new_sessions.clone();
+        // Update control plane reference
+        self._control = Arc::new(ControlPlane::new(self.sessions.clone()));
         self.storage = Some(storage);
     }
 
     /// Get the shutdown sender (for signaling shutdown)
-    #[must_use]
     pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
         self.shutdown_tx.clone()
     }
@@ -2736,30 +2292,141 @@ impl DaemonServer {
     /// `run()` (the signal / ctrl-c handlers in `main`). Clones share the
     /// armed flag, so recording stays a no-op until `run()` has claimed the
     /// file by writing its startup marker.
-    #[must_use]
     pub fn exit_reason_handle(&self) -> crate::exit_reason::ExitReasonFile {
         self.exit_reason.clone()
     }
 
     /// Get the IPC server address
-    #[must_use]
     pub fn ipc_address(&self) -> String {
         self.ipc.address()
     }
 
+    /// The address the IPC listener bound, `None` until `run` binds it. See
+    /// [`IpcServer::bound_addr`]: with port 0 this reports the chosen port.
+    #[must_use]
+    pub fn ipc_bound_addr(&self) -> tokio::sync::watch::Receiver<Option<std::net::SocketAddr>> {
+        self.ipc.bound_addr()
+    }
+
     /// Run the daemon server
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the data directory cannot be created, another
-    /// daemon instance already holds the PID file, no LLM provider is
-    /// configured, or the IPC request receiver was already taken. Failures of
-    /// optional subsystems (health, channels, webhooks) are logged instead.
     pub async fn run(&mut self) -> Result<(), crate::DaemonError> {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
 
-        self.boot().await?;
+        // Route every panic through tracing BEFORE doing anything that can
+        // spawn a task. The default hook prints to stderr, which a headless
+        // daemon has nowhere useful to send — so a panicked task died with
+        // ZERO log lines and the wedge it left (2026-08-10: a chat turn's
+        // task panicked and its session went silent for 50+ minutes) was
+        // undiagnosable from the log alone. Chains to the previous hook so
+        // stderr output, where it exists, is preserved.
+        let previous_hook = std::panic::take_hook();
+        let panic_exit_reason = self.exit_reason.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            // File first, log second: with panic=abort (the release profile)
+            // this hook is the last code that runs, and the non-blocking log
+            // writer may never flush — the reason file is the record that
+            // survives. In debug a task panic doesn't kill the process; a
+            // later clean shutdown overwrites this record, so last-writer-
+            // wins keeps the file truthful either way.
+            panic_exit_reason.record_exit("panic", Some(&format!("{payload} at {location}")));
+            tracing::error!(%location, "PANIC: {payload}");
+            previous_hook(info);
+        }));
+
+        // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
+        // every exec/acceptance process inherits membership, so the OS reaps
+        // the whole tree when this process dies for any reason — clean stop,
+        // `taskkill /F`, or a crash. Closes the leak where daemon restarts
+        // orphaned in-flight `powershell.exe`/`bash.exe` children (89 counted
+        // on 2026-08-01). Survivable on failure: log and run uncontained.
+        #[cfg(windows)]
+        if crate::job::adopt_kill_on_close_job() {
+            info!("Job Object adopted — child processes cannot outlive the daemon");
+        } else {
+            warn!("Job Object adoption failed — exec children may outlive an unclean daemon exit");
+        }
+
+        // Ensure data directory exists
+        std::fs::create_dir_all(&self.config.data_dir)?;
+
+        // Acquire PID file to prevent multiple instances
+        if let Some(ref pid_file) = self.pid_file {
+            match pid_file.acquire() {
+                Ok(()) => {
+                    info!("PID file acquired at {:?}", pid_file.path());
+                }
+                Err(crate::health::PidFileError::AlreadyRunning(pid)) => {
+                    error!("Another daemon instance is already running (PID: {})", pid);
+                    return Err(crate::DaemonError::AlreadyRunning);
+                }
+                Err(e) => {
+                    warn!("Failed to acquire PID file: {}. Continuing anyway.", e);
+                }
+            }
+        }
+
+        // Terminal reason file: report how the PREVIOUS daemon died, then
+        // claim the file for this process. Runs after the PID acquire so a
+        // duplicate instance that loses the race can never touch the live
+        // daemon's record. A previous record still saying `running` is the
+        // unclean-exit verdict — the process died through a path no hook
+        // could see, which is exactly the 2026-08-10 log-just-ends death.
+        {
+            let previous = self.exit_reason.read_previous();
+            if previous.is_unclean() {
+                warn!("Previous exit was UNCLEAN: {}", previous.describe());
+            } else {
+                info!("Previous exit: {}", previous.describe());
+            }
+            self.exit_reason.mark_running();
+            info!(
+                "Exit reason file armed at {:?} — every exit path now records why it fired",
+                self.exit_reason.path()
+            );
+        }
+
+        // Load sessions from Turso database
+        {
+            let loaded = self.sessions.load_from_db().await;
+            info!("Loaded {} sessions from database", loaded);
+        }
+
+        // If no sessions loaded from DB, check for legacy sessions.json migration
+        if self.sessions.count().await == 0 {
+            if let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await {
+                if !sessions.is_empty() {
+                    info!(
+                        "Migrating {} sessions from legacy sessions.json to database",
+                        sessions.len()
+                    );
+                    for session in sessions {
+                        self.sessions.restore(session).await;
+                    }
+                    if let Some(id) = default_id {
+                        self.sessions.set_default(&id).await;
+                    }
+                    // Mark as migrated
+                    self.persistence.mark_sessions_migrated().await;
+                }
+            }
+        }
+
+        // Create default session if none exist
+        if self.sessions.count().await == 0 {
+            let default_session = self.sessions.create(Some("Main".to_string())).await;
+            info!("Created default session: {}", default_session.id);
+        }
 
         // ONE run registry, created before the services so the embedding
         // drain, the dream gate, the scheduler and the control plane all hold
@@ -2770,10 +2437,111 @@ impl DaemonServer {
         let degradations = Arc::new(nanna_agent::DegradationLedger::new());
 
         // Initialize services
-        let services = self.init_services(&chat_runs, &degradations).await?;
+        let (
+            tools,
+            memory,
+            agent,
+            router,
+            tools_dir,
+            workspace_id_for_services,
+            turn_baselines,
+            model_stats,
+        ) = self.init_services(&chat_runs, &degradations).await?;
 
         // Recover any orphaned checkpoints from the database.
-        self.recover_checkpoints(&services.agent).await;
+        if let Some(ref storage) = self.storage {
+            match storage.list_checkpoints().await {
+                Ok(checkpoint_ids) => {
+                    for session_id in checkpoint_ids {
+                        // Load checkpoint data from DB and parse it. The
+                        // checkpoint is deleted only after a SUCCESSFUL
+                        // recovery (or when it holds nothing recoverable) —
+                        // deleting before/regardless of the parse made any
+                        // recovery failure a permanent data loss.
+                        let mut recovered = false;
+                        if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
+                            if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
+                                let reasoning = partial.reasoning.clone();
+                                self.sessions
+                                    .add_full_message(
+                                        &session_id,
+                                        crate::session::MessageRole::Assistant,
+                                        &partial.content,
+                                        crate::session::MessageDetails {
+                                            tool_calls: partial.tool_calls,
+                                            reasoning,
+                                            timeline: partial.timeline,
+                                            usage: partial.usage,
+                                        },
+                                    )
+                                    .await;
+                                info!("Recovered crashed run for session {}", session_id);
+                                recovered = true;
+                            } else if serde_json::from_str::<serde_json::Value>(&data).is_ok() {
+                                // Parsed fine but held nothing recoverable —
+                                // an empty checkpoint is safe to clean up.
+                                recovered = true;
+                            } else {
+                                warn!(
+                                    "Checkpoint for session {} did not parse — keeping it for manual inspection",
+                                    session_id
+                                );
+                            }
+                        }
+                        if recovered {
+                            if let Err(e) = storage.delete_checkpoint(&session_id).await {
+                                warn!(
+                                    "Failed to delete checkpoint for session {}: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list checkpoints: {}", e),
+            }
+
+            // Also migrate any legacy checkpoint JSON files
+            let checkpoint_dir = self.config.data_dir.join("checkpoints");
+            if checkpoint_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&checkpoint_dir) {
+                    for entry in entries.flatten() {
+                        let filename = entry.file_name();
+                        let name = filename.to_string_lossy();
+                        if name.starts_with("checkpoint-") && name.ends_with(".json") {
+                            let session_id = name
+                                .strip_prefix("checkpoint-")
+                                .and_then(|s| s.strip_suffix(".json"))
+                                .unwrap_or("");
+                            if !session_id.is_empty() {
+                                if let Some(partial) = agent.recover_checkpoint(session_id) {
+                                    let reasoning = partial.reasoning.clone();
+                                    self.sessions
+                                        .add_full_message(
+                                            session_id,
+                                            crate::session::MessageRole::Assistant,
+                                            &partial.content,
+                                            crate::session::MessageDetails {
+                                                tool_calls: partial.tool_calls,
+                                                reasoning,
+                                                timeline: partial.timeline,
+                                                usage: partial.usage,
+                                            },
+                                        )
+                                        .await;
+                                    info!(
+                                        "Recovered crashed run from legacy checkpoint for session {}",
+                                        session_id
+                                    );
+                                }
+                                // Remove the legacy file
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Shared activity clock: stamped by the control plane on every chat
         // request, read by the scheduled dream cycle to gate on idleness. Made
@@ -2781,7 +2549,41 @@ impl DaemonServer {
         // control plane (built later); cloning the Arc shares the same clock.
         let activity_clock = Arc::new(nanna_memory::ActivityClock::new());
 
-        let dreaming = self.build_dreaming(services.memory.as_ref(), &activity_clock);
+        // The single dreaming orchestrator (P13 unification). Built once here and
+        // shared by BOTH consolidation paths — the scheduled cycle below and the
+        // IPC `MemoryAction::Consolidate` handler — so they run the same
+        // multi-phase body over the same live store and accumulate pending
+        // feedback in one place. It reads the very `activity_clock` the control
+        // plane stamps, so its idle gate cannot drift from the daemon's own
+        // notion of "in use".
+        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.as_ref().map(|memory| {
+            let dreaming_config = nanna_memory::DreamingConfig {
+                idle_threshold_secs: self.config.dream_idle_threshold_secs,
+                memory_pressure_count: self.config.dream_memory_pressure_count,
+                ..nanna_memory::DreamingConfig::default()
+            };
+            Arc::new(
+                nanna_memory::DreamingService::with_shared_memory(
+                    dreaming_config,
+                    Arc::clone(memory),
+                )
+                .with_activity_clock(Arc::clone(&activity_clock)),
+            )
+        });
+
+        if let Some(ref dreaming) = dreaming
+            && self.dreaming_slot.set(Arc::clone(dreaming)).is_err()
+        {
+            warn!("dreaming slot was already filled; memory use feedback keeps the first service");
+        }
+
+        // Dreaming must observe the very store the agent writes to, never a
+        // private copy — that identity is the whole point of the shared seam.
+        debug_assert_eq!(
+            dreaming.is_some(),
+            memory.is_some(),
+            "dreaming service must exist exactly when the memory store does"
+        );
 
         // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
         // is the cron runner (the GUI scheduler only runs in embedded mode).
@@ -2792,32 +2594,647 @@ impl DaemonServer {
         // 30s while the previous one was still folding (observed 2026-08-10:
         // a fresh "Consolidation starting" per tick, none finishing) — one
         // dream at a time.
-        let scheduler = self
-            .start_scheduler(ScheduledTaskContext {
-                agent: services.agent.clone(),
-                dreaming: dreaming.clone(),
-                router: services.router.clone(),
-                storage: self.storage.clone(),
-                activity: activity_clock.clone(),
-                chat_runs: chat_runs.clone(),
-                dream_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                scheduled_resume_parked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                consolidation_max_ratio: self.config.memory_max_compression_ratio,
-                consolidation_min_remaining: self.config.memory_min_remaining_memories,
-                dream_idle_threshold_secs: self.config.dream_idle_threshold_secs,
-            })
-            .await;
+        let dream_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scheduler = {
+            // These three come from `[scheduler]` in the user's config, not from
+            // literals: the GUI's Scheduler tab writes them there and a config
+            // reload re-applies them to this very loop (see the control plane's
+            // config handler), so the toggles work without a daemon restart.
+            let scheduler_config = nanna_core::SchedulerConfig {
+                enabled: self.config.scheduler_enabled,
+                heartbeat_interval: std::time::Duration::from_secs(
+                    nanna_core::clamp_heartbeat_secs(self.config.heartbeat_interval_secs),
+                ),
+                heartbeat_enabled: self.config.heartbeat_enabled,
+                heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
+                max_concurrent: 4,
+                check_interval: std::time::Duration::from_secs(30),
+                default_timezone: "UTC".to_string(),
+            };
+            let mut scheduler = nanna_core::Scheduler::new(scheduler_config);
+            if let Some(ref storage) = self.storage {
+                scheduler = scheduler.with_storage(storage.clone());
+                match scheduler.load_jobs().await {
+                    Ok(count) => info!("Loaded {count} cron jobs from storage"),
+                    Err(e) => warn!("Failed to load cron jobs: {e}"),
+                }
+            } else {
+                info!("Scheduler running without persistence (no storage backend)");
+            }
 
-        let memory = services.memory.clone();
-        let (control, channel_status_manager) = self
-            .assemble_control_plane(
-                services,
-                scheduler,
-                (&chat_runs, &degradations),
-                &activity_clock,
-                dreaming.as_ref(),
-            )
-            .await;
+            let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
+            if deduped > 0 {
+                info!("Removed {deduped} duplicate consolidation tasks");
+            }
+            if !scheduler.has_task_named("memory_consolidation").await {
+                scheduler
+                    .add_task(nanna_core::consolidation_task(Some(
+                        std::time::Duration::from_secs(3600),
+                    )))
+                    .await;
+                info!("Scheduled memory consolidation task (every 1 hour)");
+            }
+
+            // Task recurrence sweep (P15): the scheduler is the one recurrence
+            // engine — recurring todo items are reopened here, not by a second
+            // clock inside the task store.
+            if self.storage.is_some() {
+                let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
+                if deduped > 0 {
+                    info!("Removed {deduped} duplicate recurrence sweep tasks");
+                }
+                if !scheduler.has_task_named("task_recurrence_sweep").await {
+                    scheduler
+                        .add_task(nanna_core::recurring_task(
+                            "task_recurrence_sweep",
+                            std::time::Duration::from_secs(300),
+                            "Reopen recurring tasks whose next occurrence has arrived.",
+                        ))
+                        .await;
+                    info!("Scheduled task recurrence sweep (every 5 minutes)");
+                }
+            }
+
+            let chat_runs_for_tasks = chat_runs.clone();
+            let dream_in_flight_for_tasks = dream_in_flight.clone();
+            // At most one yielded scheduled run waiting to resume. Not a
+            // quota — a dedup: reality already serializes scheduled runs (a
+            // live one makes every other tick skip), so a second waiter could
+            // only arise from an exotic interleaving, and dropping it costs
+            // one schedule period, which the log names.
+            let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let agent_for_tasks = agent.clone();
+            let sessions_for_tasks = self.sessions.clone();
+            let events_for_tasks = self.ipc.event_sender();
+            let reminder_tick = scheduler.check_interval();
+            let dreaming_for_tasks = dreaming.clone();
+            let router_for_tasks = router.clone();
+            let storage_for_tasks = self.storage.clone();
+            // Capture the user's memory-compression settings for the scheduled
+            // dream cycle (Copy scalars, moved into the executor closure).
+            let consolidation_max_ratio = self.config.memory_max_compression_ratio;
+            let consolidation_min_remaining = self.config.memory_min_remaining_memories;
+            // Idle threshold is captured for the skip log only — the gate
+            // *decision* now lives in the DreamingService (built above with
+            // both thresholds), so there is no second copy of the policy here.
+            let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
+            let activity_for_tasks = activity_clock.clone();
+            // NOT captured here. The list is read from the live agent config at
+            // the top of each cycle instead: a boot clone survives every
+            // `config.set`, so a user who repointed summarization kept dreaming
+            // on the model they had at startup — the whole class the P23
+            // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
+            // summarizations in the benchmark series ran on the wrong model).
+            // A dream cycle runs minutes-to-hours apart, so one lock read per
+            // cycle costs nothing measurable.
+            let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
+                let agent = agent_for_tasks.clone();
+                let dreaming = dreaming_for_tasks.clone();
+                let router = router_for_tasks.clone();
+                let storage = storage_for_tasks.clone();
+                let activity = activity_for_tasks.clone();
+                let chat_runs = chat_runs_for_tasks.clone();
+                let dream_in_flight = dream_in_flight_for_tasks.clone();
+                let scheduled_resume_parked = scheduled_resume_parked.clone();
+                let sessions = sessions_for_tasks.clone();
+                let events = events_for_tasks.clone();
+                Box::pin(async move {
+                    let start = std::time::Instant::now();
+                    let started_at = chrono::Utc::now();
+                    let (success, output, error) = match task.name.as_str() {
+                        "memory_consolidation" => {
+                            if let Some(ref dreaming) = dreaming {
+                                if chat_runs.any_active().await {
+                                    // A live harness run is the opposite of
+                                    // idle, however old the last user message
+                                    // is: dreaming rewrites the very scoped
+                                    // memories the run is using, and doing so
+                                    // mid-step deadlocked a live mission
+                                    // (2026-08-10, 316 tool-result memories
+                                    // folded under a running step).
+                                    (true, Some("Skipped (mission live)".to_string()), None)
+                                } else if dream_in_flight
+                                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    (
+                                        true,
+                                        Some("Skipped (dream already in flight)".to_string()),
+                                        None,
+                                    )
+                                } else {
+                                // Read the summarization list LIVE, once per
+                                // cycle: whatever the user last set is what
+                                // this dream summarizes on. Falls back to the
+                                // chat model exactly as the boot path did.
+                                let live_cfg = agent.agent_config().await;
+                                let summarization_models =
+                                    crate::dream_summarizer::summarization_models(
+                                        &live_cfg.summarization_priority,
+                                        std::slice::from_ref(&live_cfg.model),
+                                    );
+                                let outcome = {
+                                // The idle gate AND the full dream cycle (feedback
+                                // flush -> FSRS testing-effect flush -> consolidate)
+                                // both live in the one `DreamingService`. The daemon
+                                // supplies only what it owns: its lock-free activity
+                                // clock and a consolidation budget sized to *its*
+                                // summarizer model. Dreaming competes with the live
+                                // agent for that model and rewrites the store, so it
+                                // still only runs during a lull (or under pressure).
+                                let idle = activity.idle();
+                                // Size the budget to the SMALLEST window across
+                                // the failover list: one prompt is built and
+                                // then offered to each candidate in turn, so a
+                                // budget fitted to the first model would
+                                // overflow a smaller fallback.
+                                let window_tokens =
+                                    crate::dream_summarizer::summarizer_context_window_tokens(
+                                        &router,
+                                        &summarization_models,
+                                    )
+                                    .await;
+                                let consolidation_config = scheduled_consolidation_config(
+                                    consolidation_max_ratio,
+                                    consolidation_min_remaining,
+                                    window_tokens,
+                                );
+                                // The any_active skip above gates the dream's
+                                // START; this gates its MIDDLE (P22 Tier 4): a
+                                // chat turn arriving mid-dream pauses the NEXT
+                                // cluster's summarization until the turn
+                                // releases, instead of contending with it for
+                                // the model. Cluster boundaries are the natural
+                                // yield points — a fold already in flight
+                                // completes (the CAS guards own staleness),
+                                // only new provider work waits. Dreaming is
+                                // idle-time work by definition, so it pauses
+                                // for a live turn whatever provider it
+                                // summarizes on.
+                                let inner_summarize =
+                                    crate::dream_summarizer::summarize_with_failover(
+                                        router.clone(),
+                                        summarization_models.clone(),
+                                    );
+                                let summarize_gate = chat_runs.clone();
+                                let summarize = move |prompt: String| {
+                                    let pending = inner_summarize(prompt);
+                                    let gate = summarize_gate.clone();
+                                    async move {
+                                        gate.wait_idle().await;
+                                        pending.await
+                                    }
+                                };
+                                match dreaming
+                                    .dream_if_triggered(idle, &consolidation_config, summarize)
+                                    .await
+                                {
+                                    Ok(None) => {
+                                        let memory_count = dreaming.memory().count().await;
+                                        debug!(
+                                            "Skipping scheduled consolidation: system active \
+                                             (idle {idle:?} < {dream_idle_threshold_secs}s, \
+                                             {memory_count} memories)"
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Skipped (active; idle {}s, {memory_count} memories)",
+                                                idle.as_secs()
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Ok(Some((trigger, stats))) => {
+                                        info!(
+                                            "Scheduled dream ({trigger:?}): {} processed, \
+                                             {} merged, {} deduped, {} promoted, {} demoted",
+                                            stats.consolidation.memories_processed,
+                                            stats.consolidation.memories_merged,
+                                            stats.consolidation.memories_deduped,
+                                            stats.auto_promoted,
+                                            stats.auto_demoted,
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Processed {} memories",
+                                                stats.consolidation.memories_processed
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("Scheduled consolidation failed: {e}");
+                                        (false, None, Some(e.to_string()))
+                                    }
+                                }
+                                };
+                                dream_in_flight
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                outcome
+                                }
+                            } else {
+                                (
+                                    true,
+                                    Some("Skipped (memory service unavailable)".to_string()),
+                                    None,
+                                )
+                            }
+                        }
+                        "task_recurrence_sweep" => {
+                            if let Some(ref storage) = storage {
+                                let reopened = crate::tasks::sweep_recurrences(storage).await;
+                                if reopened > 0 {
+                                    info!("Recurrence sweep reopened {reopened} tasks");
+                                }
+                                (
+                                    true,
+                                    Some(format!("Reopened {reopened} recurring tasks")),
+                                    None,
+                                )
+                            } else {
+                                (true, Some("Skipped (no storage)".to_string()), None)
+                            }
+                        }
+                        crate::reminder_service::REMINDER_TASK_NAME => {
+                            // Delivered as a message, never run as a prompt:
+                            // a reminder needs no model, and must not wait for
+                            // one (see `reminder_service`).
+                            match crate::reminder_service::deliver_reminder(
+                                &sessions,
+                                &events,
+                                &task,
+                                chrono::Utc::now(),
+                                reminder_tick,
+                            )
+                            .await
+                            {
+                                Ok(content) => (true, Some(content), None),
+                                Err(e) => {
+                                    warn!("{e}");
+                                    (false, None, Some(e))
+                                }
+                            }
+                        }
+                        _ if task.payload.is_empty() => {
+                            debug!("Skipping task with empty payload: {}", task.name);
+                            (true, Some("Skipped (empty payload)".to_string()), None)
+                        }
+                        _ => {
+                            // Heartbeat and cron jobs run as full agent prompts
+                            // (tools, memory, model fallback) in a task-scoped
+                            // session that is not persisted to the session store.
+                            let session_id = format!("scheduled-{}", task.id);
+                            // Idle gate: never start an autonomous prompt on top
+                            // of a live run. A local model server serves one
+                            // generation at a time, so a heartbeat firing into a
+                            // streaming chat gets the slot time-shared and the
+                            // chat's generation CANCELLED — surfacing as a bogus
+                            // "provider incident" the harness then heals against
+                            // (observed live 2026-07-26). Skipping loses nothing:
+                            // a heartbeat exists to work during a lull, and the
+                            // next tick picks up whatever was due.
+                            if agent.any_run_active().await {
+                                debug!(
+                                    "Skipping scheduled task '{}': a run is already in flight",
+                                    task.name
+                                );
+                                (true, Some("Skipped (a run is in flight)".to_string()), None)
+                            } else if !agent.has_configured_model().await {
+                                // Nothing to run the prompt with: a daemon with
+                                // no model configured would only fail every tick
+                                // (and used to send a request naming no model).
+                                debug!(
+                                    "Skipping scheduled task '{}': no model is configured",
+                                    task.name
+                                );
+                                (true, Some("Skipped (no model configured)".to_string()), None)
+                            } else {
+                            // An autonomous agent run (heartbeat / cron / task
+                            // prompt) is the daemon actively using the model, so
+                            // it counts as activity too — defer the dream cycle
+                            // while it runs. Heartbeats are infrequent (30 min)
+                            // vs the 5-min idle threshold, and memory pressure
+                            // still overrides, so dreaming is not starved.
+                            activity.record();
+                            // Session scoping (the `with_run_session` binding
+                            // that fixed 35 failed `todo` calls) now lives
+                            // inside `run_scheduled_prompt_yielding`, carried
+                            // by the run's own spawned future — a chat that
+                            // starts during this run cannot see the scheduled
+                            // session, nor vice versa.
+                            let outcome = run_scheduled_prompt_yielding(
+                                &agent,
+                                &chat_runs,
+                                &session_id,
+                                &task.payload,
+                            )
+                            .await;
+                            match outcome {
+                                Some(Ok(result)) => {
+                                    let heartbeat_ok = task.name == "heartbeat"
+                                        && result.content.trim().contains("HEARTBEAT_OK");
+                                    if heartbeat_ok {
+                                        debug!("Heartbeat: OK (nothing to do)");
+                                    } else {
+                                        info!(
+                                            "Scheduled task '{}' completed: {}",
+                                            task.name,
+                                            result.content.chars().take(200).collect::<String>()
+                                        );
+                                    }
+                                    if let Some(message) = scheduled_output_message(
+                                        &task.name,
+                                        &result.content,
+                                        heartbeat_ok,
+                                    ) && let Some(ref target) = task.target_session
+                                        && sessions
+                                            .post_assistant_message(&events, target, message)
+                                            .await
+                                            .is_none()
+                                    {
+                                        warn!(
+                                            "Task '{}' posts to session {target}, which no longer \
+                                             exists; its result is in the run history only",
+                                            task.name
+                                        );
+                                    }
+                                    (true, Some(result.content), None)
+                                }
+                                Some(Err(e)) => {
+                                    error!("Scheduled task '{}' failed: {}", task.name, e.message);
+                                    (false, None, Some(e.message))
+                                }
+                                None => {
+                                    // The run yielded the local provider to a
+                                    // live chat turn (P22 Tier 4). Resume on
+                                    // release: ONE detached waiter re-runs the
+                                    // prompt when the registry goes idle —
+                                    // promptly, not at the next tick — and if
+                                    // a fresh user turn preempts the resumed
+                                    // run too, it parks again. That loop is
+                                    // bounded by user activity itself, not by
+                                    // a counter: every extra lap requires a
+                                    // new turn to have claimed the provider.
+                                    // The executor returns NOW because the
+                                    // heartbeat arm of the scheduler loop
+                                    // awaits it inline — parking here would
+                                    // stall every other scheduled task for as
+                                    // long as the chat runs.
+                                    if scheduled_resume_parked
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        let resume_agent = agent.clone();
+                                        let resume_runs = chat_runs.clone();
+                                        let resume_activity = activity.clone();
+                                        let resume_parked = scheduled_resume_parked.clone();
+                                        let resume_session = session_id.clone();
+                                        let resume_payload = task.payload.clone();
+                                        let resume_name = task.name.clone();
+                                        tokio::spawn(async move {
+                                            loop {
+                                                resume_runs.wait_idle().await;
+                                                // The release tail unregisters
+                                                // the finished chat BEFORE
+                                                // releasing the registry, so an
+                                                // active run here is a NEW
+                                                // claimant — the slot is taken
+                                                // and the schedule covers the
+                                                // rest.
+                                                if resume_agent.any_run_active().await {
+                                                    debug!(
+                                                        task = %resume_name,
+                                                        "Yielded run superseded — the slot is \
+                                                         taken; the next tick owns the work"
+                                                    );
+                                                    break;
+                                                }
+                                                resume_activity.record();
+                                                match run_scheduled_prompt_yielding(
+                                                    &resume_agent,
+                                                    &resume_runs,
+                                                    &resume_session,
+                                                    &resume_payload,
+                                                )
+                                                .await
+                                                {
+                                                    Some(Ok(result)) => {
+                                                        let heartbeat_ok = resume_name
+                                                            == "heartbeat"
+                                                            && result
+                                                                .content
+                                                                .trim()
+                                                                .contains("HEARTBEAT_OK");
+                                                        if heartbeat_ok {
+                                                            debug!(
+                                                                "Heartbeat (resumed): OK \
+                                                                 (nothing to do)"
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                "Scheduled task '{}' completed \
+                                                                 after yielding: {}",
+                                                                resume_name,
+                                                                result
+                                                                    .content
+                                                                    .chars()
+                                                                    .take(200)
+                                                                    .collect::<String>()
+                                                            );
+                                                        }
+                                                        break;
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        error!(
+                                                            "Scheduled task '{}' failed after \
+                                                             yielding: {}",
+                                                            resume_name, e.message
+                                                        );
+                                                        break;
+                                                    }
+                                                    None => {
+                                                        // Preempted again — user
+                                                        // turns keep priority.
+                                                    }
+                                                }
+                                            }
+                                            resume_parked
+                                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                                        });
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; resuming on release"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    } else {
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; a resume is \
+                                                 already parked, the next tick covers this one"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    }
+                                }
+                            }
+                            }
+                        }
+                    };
+                    nanna_core::TaskResult {
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        success,
+                        output,
+                        error,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        started_at,
+                        finished_at: chrono::Utc::now(),
+                    }
+                })
+            });
+            scheduler = scheduler.with_executor(executor);
+            scheduler.start();
+            info!("Daemon scheduler started (heartbeat + cron runner)");
+            let scheduler = Arc::new(tokio::sync::RwLock::new(scheduler));
+            // `run` executes once per server, so the slot is empty here; a
+            // second fill would leave the reminder services on the first
+            // scheduler, which is the one still running.
+            if self.scheduler_slot.set(Arc::clone(&scheduler)).is_err() {
+                warn!("scheduler slot was already filled; reminders keep the first scheduler");
+            }
+            scheduler
+        };
+
+        // Create control plane with all services (including router for consolidation)
+        let mut control = ControlPlane::with_all_services(
+            self.sessions.clone(),
+            agent,
+            memory.clone(),
+            Some(tools),
+            Some(router),
+        )
+        .with_tools_dir(tools_dir)
+        .with_audit_log_path(
+            self.config
+                .tool_audit_log
+                .then(|| self.config.tool_audit_path()),
+        )
+        .with_event_tx(self.ipc.event_sender())
+        .with_session_filters(self.ipc.session_filters())
+        .with_workspace_id(workspace_id_for_services)
+        .with_turn_baselines(turn_baselines)
+        .with_scheduler(scheduler)
+        .with_mcp_status(Arc::clone(&self.mcp_status))
+        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
+        .with_memory_recovery(self.memory_recovery.clone())
+        .with_chat_runs(chat_runs.clone())
+        .with_degradations(degradations.clone())
+        .with_shutdown(self.shutdown_tx.clone());
+        if let Some(ref buf) = self.log_buffer {
+            control = control.with_log_buffer(buf.clone());
+        }
+        // Make the tracker the agent + sub-agents record into (from
+        // init_services) the canonical one the control plane owns. Must happen
+        // BEFORE with_storage, which loads persisted stats via
+        // import_from_storage — those now land in the shared tracker too.
+        control.model_stats = model_stats;
+        // Load persisted model stats from storage
+        if let Some(ref storage) = self.storage {
+            control = control.with_storage(storage.clone()).await;
+        }
+
+        // Load persisted workspaces from database
+        if let Some(ref storage) = self.storage {
+            match storage.workspaces().list().await {
+                Ok(records) if !records.is_empty() => {
+                    let mut registry = control.workspaces().write().await;
+                    let mut active_id = None;
+                    for record in &records {
+                        let path = PathBuf::from(&record.path);
+                        if path.exists() {
+                            let mut ws = nanna_core::Workspace::new(&path);
+                            ws.id = record.id.clone();
+                            if let Err(e) = ws.load_context().await {
+                                warn!(
+                                    "Failed to load workspace context for {}: {}",
+                                    record.path, e
+                                );
+                            }
+                            registry.register(ws);
+                            if record.active {
+                                active_id = Some(record.id.clone());
+                            }
+                        } else {
+                            warn!("Persisted workspace path no longer exists: {}", record.path);
+                        }
+                    }
+                    if let Some(id) = active_id {
+                        registry.set_active(&id);
+                        // Seed the tool working directory from the persisted active
+                        // workspace so tools resolve against it from boot — not just
+                        // after an interactive SetActive or the first workspace-scoped
+                        // chat. Without this, a fresh daemon with a persisted active
+                        // workspace left `default_workdir` at None until the user
+                        // re-selected it, so tools fell back to the home dir instead of
+                        // running "in the workspace you're in".
+                        let active_path = registry.get(&id).map(|ws| ws.path.clone());
+                        drop(registry);
+                        if let (Some(tools), Some(path)) = (control.tools(), active_path) {
+                            tools.set_default_workdir(Some(path.clone())).await;
+                            info!(
+                                "Seeded tool working directory from active workspace: {:?}",
+                                path
+                            );
+                        }
+                    } else {
+                        drop(registry);
+                    }
+                    info!("Restored {} workspaces from database", records.len());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to load workspaces from database: {}", e);
+                }
+            }
+        }
+
+        // Wire model stats tracker into the router for health-aware routing.
+        // The control plane owns the canonical tracker; the router reads it.
+        if let Some(ref router) = control.router() {
+            router.set_stats(control.model_stats.clone()).await;
+            info!("Stats-informed routing enabled on LLM router");
+        }
+
+        // Shared channel status manager — attached before the Arc wrap so
+        // ChannelAction::Status and ChannelManager listeners see the same state.
+        let channel_status_manager = Arc::new(nanna_channels::StatusManager::new());
+        control.set_status_manager(Arc::clone(&channel_status_manager));
+
+        // Share the activity clock so chat requests stamp the same clock the
+        // scheduled dream cycle reads for its idle gate.
+        control.set_activity_clock(Arc::clone(&activity_clock));
+
+        // Share the ONE dreaming orchestrator, so an IPC-triggered consolidation
+        // runs the same multi-phase cycle the scheduler does (P13 unification).
+        if let Some(ref dreaming) = dreaming {
+            control.set_dreaming(Arc::clone(dreaming));
+        }
+
+        let control = Arc::new(control);
+        // Hand edits of config.toml apply without a restart.
+        control.spawn_config_watcher(self.shutdown_tx.subscribe());
+        *self.control_slot.write().await = Some(control.clone());
 
         // Take the request receiver from IPC server
         let mut request_rx =
@@ -2827,7 +3244,32 @@ impl DaemonServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        let ipc_handle = self.spawn_ipc_server();
+        // Spawn IPC server
+        let ipc_server = self.ipc.clone();
+        let ipc_shutdown = self.shutdown_tx.clone();
+        let ipc_exit_reason = self.exit_reason.clone();
+        let ipc_handle = tokio::spawn(async move {
+            if let Err(e) = ipc_server.run().await {
+                // An IPC-less daemon is unreachable (no control plane) but
+                // would keep running heartbeats and burning the LLM budget —
+                // observed live when a second instance lost the port race.
+                // Take the daemon down instead of zombie-ing.
+                error!(
+                    "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
+                    e
+                );
+                // Record the cause before either exit route. If the clean
+                // drain completes it overwrites this with `clean_shutdown`;
+                // if the hard exit below fires, this record is the terminal
+                // one — and process::exit skips every Drop, so nothing else
+                // would have written it.
+                ipc_exit_reason.record_exit("ipc_server_error", Some(&e.to_string()));
+                if ipc_shutdown.send(()).is_err() {
+                    // No shutdown listener yet — exit hard rather than linger.
+                    std::process::exit(1);
+                }
+            }
+        });
 
         // Announce a startup quarantine + rebuild to subscribed clients. Boot
         // usually precedes any subscriber, so /status (health server + control
@@ -2842,26 +3284,283 @@ impl DaemonServer {
         }
 
         // Spawn health HTTP server if enabled
-        let _health_state = if self.config.servers.health {
-            Some(self.spawn_health_server(memory.as_ref()).await)
+        let _health_state = if self.config.enable_health_server {
+            // Seed durable-memory-store health (load already ran in init_services),
+            // so a corrupt/degraded store shows on /status, not just a boot log.
+            //
+            // A store that never opened is degraded too, and more severely than
+            // one with corrupt rows: there is no durable store at all, so the
+            // per-store health probe cannot report on it. Fold that in here or
+            // the most complete failure is the one /status calls healthy.
+            let (mem_degraded, mem_corrupt) = if let Some(ref m) = memory {
+                let h = m.store_health().await;
+                (h.degraded || self.storage_error.is_some(), h.corrupt_rows)
+            } else {
+                (self.storage_error.is_some(), 0)
+            };
+            if let Some(ref err) = self.storage_error {
+                error!(
+                    error = %err,
+                    "reporting degraded health: memory has no durable store this session"
+                );
+            }
+            let mut state = HealthState::new(
+                memory.is_some(),
+                true, // agent is available
+            )
+            .with_memory_health(mem_degraded, mem_corrupt);
+            if let Some(ref report) = self.memory_recovery {
+                state = state
+                    .with_memory_rebuild(report.memories_recovered, report.memories_expected);
+            }
+            let control_for_metrics = Arc::clone(&control);
+            state = state.with_metrics(Arc::new(move || {
+                let control = Arc::clone(&control_for_metrics);
+                Box::pin(async move {
+                    crate::metrics::render_metrics(&control.metrics_snapshot().await)
+                })
+            }));
+            let health_state = Arc::new(state);
+
+            // Update session count
+            let sessions_for_health = self.sessions.clone();
+            let health_state_clone = health_state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let count = sessions_for_health.count().await;
+                    health_state_clone.set_session_count(count).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+
+            // Serve the SAME state the session-count loop above updates
+            // (via `from_shared`), so `/status` reflects live counts instead of
+            // a throwaway copy stuck at zero. The server logs its own
+            // "listening" line from `run()` once the bind succeeds, so we don't
+            // pre-log here (that duplicate line falsely implied a bind before
+            // one had happened).
+            let health_server = HealthServer::from_shared(
+                health_state.clone(),
+                &self.config.ipc.host,
+                self.config.health_port,
+            );
+            health_server.spawn();
+
+            Some(health_state)
         } else {
             None
         };
 
         // Start ChannelManager if any channels are configured.
         // This handles listener-based inbound (polling) and routes responses back out.
-        let channel_manager = self.start_channel_manager(&control, &channel_status_manager).await;
+        let channel_manager = if let Some(ref channels_config) = self.config.channels {
+            // Build a daemon-local ChannelsConfig from the nanna_config::ChannelsConfig.
+            // We re-map from nanna_config types to the daemon-local types.
+            let daemon_channels = build_daemon_channels_config(channels_config);
+
+            let mut manager = ChannelManager::with_status_manager(
+                Arc::clone(&control),
+                Arc::clone(&channel_status_manager),
+            );
+            manager.configure(&daemon_channels).await;
+
+            // Also register outbound channels for webhook-sourced providers that have
+            // bot tokens in the channel config (Telegram, Discord, Slack).
+            // The listener-based configure() already does this; this is a no-op guard.
+
+            match manager.start().await {
+                Ok(()) => {
+                    info!("Channel manager started");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    error!("Failed to start channel manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Spawn webhook HTTP server if enabled
-        if self.config.servers.webhook {
-            self.spawn_webhook_server(&control, channel_manager.as_ref()).await;
+        if self.config.enable_webhook_server {
+            let mut webhook_config = self.config.webhook.clone();
+            webhook_config.host = self.config.ipc.host.clone();
+            webhook_config.port = self.config.webhook_port;
+
+            // Keep a copy of the config for outbound channel registration below
+            let webhook_config_copy = webhook_config.clone();
+
+            let (webhook_server, mut webhook_rx) = WebhookServer::new(webhook_config);
+
+            // Spawn the webhook server
+            tokio::spawn(async move {
+                if let Err(e) = webhook_server.run().await {
+                    error!("Webhook server error: {}", e);
+                }
+            });
+
+            // Build a shared router for the webhook event processor.
+            // If a ChannelManager is running, share its router so outbound channels
+            // (bot tokens) are already registered.  Otherwise create a standalone
+            // router that may only cover providers registered via webhook config.
+            let webhook_router = if let Some(ref mgr) = channel_manager {
+                mgr.router()
+            } else {
+                // No channel manager — create a standalone router.
+                // Outbound channels can be registered here from webhook config if
+                // bot tokens are provided.
+                let standalone_router =
+                    Arc::new(tokio::sync::RwLock::new(ChannelMessageRouter::new()));
+
+                // Register outbound channels from webhook config credentials
+                {
+                    let mut router = standalone_router.write().await;
+                    if let Some(ref token) = webhook_config_copy.telegram_token {
+                        router.register("telegram", Box::new(TelegramChannel::new(token)));
+                        info!("Registered Telegram outbound channel from webhook config");
+                    }
+                    if webhook_config_copy.discord_public_key.is_some() {
+                        // discord_public_key is for verification; bot token for sending
+                        // is not separately stored in WebhookConfig currently.
+                        // Log a warning — users should configure channels.discord instead.
+                        debug!(
+                            "Discord public key found in webhook config; for outbound replies configure channels.discord with a bot_token"
+                        );
+                    }
+                }
+
+                // This router has no channel manager's forwarder behind it, so
+                // replies to webhook conversations need one of their own.
+                if let Some(events) = control.subscribe_events() {
+                    crate::channels::spawn_reply_forwarder(
+                        Arc::clone(&control.sessions),
+                        events,
+                        Arc::clone(&standalone_router),
+                        Arc::clone(&control.channel_counters),
+                    );
+                } else {
+                    warn!("No event bus attached; webhook conversations will get no replies");
+                }
+
+                standalone_router
+            };
+
+            // Spawn webhook event processor — routes events through the same pipeline
+            // as channel listener messages.
+            let control_for_webhooks = Arc::clone(&control);
+            tokio::spawn(async move {
+                while let Some(event) = webhook_rx.recv().await {
+                    debug!("Webhook event from {}: {:?}", event.source, event.message);
+
+                    if let Some(ref msg) = event.message {
+                        // Convert WebhookMessage → IncomingMessage
+                        let incoming = IncomingMessage {
+                            id: msg
+                                .message_id
+                                .clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            channel: ChannelId::new(&event.source, &msg.chat_id),
+                            sender: ChannelSender {
+                                id: msg.sender_id.clone(),
+                                name: msg.sender_name.clone(),
+                                username: None,
+                            },
+                            content: MessageContent::Text {
+                                text: msg.content.clone(),
+                            },
+                            timestamp: event.timestamp,
+                            reply_to: None,
+                        };
+
+                        // Process through the same pipeline as channel listeners
+                        let router_guard = webhook_router.read().await;
+                        ChannelManager::process_message(
+                            incoming,
+                            &control_for_webhooks,
+                            &router_guard,
+                        )
+                        .await;
+                    }
+                }
+            });
+
+            info!(
+                "Webhook server listening on http://{}:{}",
+                self.config.ipc.host, self.config.webhook_port
+            );
         }
 
         // Sessions are now persisted via Turso write-through on every mutation.
         // No more periodic JSON auto-save — each create/message/delete/rename writes to DB immediately.
 
-        let stats_save_handle = self.spawn_stats_autosave(&control);
-        self.spawn_sub_agent_checkin();
+        // Spawn model + tool stats auto-save task (every 5 minutes)
+        let stats_control = control.clone();
+        let mut stats_shutdown = self.shutdown_tx.subscribe();
+        let stats_save_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        stats_control.save_model_stats().await;
+                        stats_control.save_tool_stats().await;
+                    }
+                    _ = stats_shutdown.recv() => {
+                        // Final save on shutdown
+                        stats_control.save_model_stats().await;
+                        stats_control.save_tool_stats().await;
+                        info!("Model + tool stats final save completed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn sub-agent check-in task: periodically check running sub-agents
+        // and drain parent mailboxes so questions don't go stale.
+        // When a sub-agent uses ask_parent, the ParentChannelImpl handles it directly
+        // via an LLM call. This task handles any orphaned mailbox messages and provides
+        // visibility into long-running sub-agents.
+        {
+            let sessions = self.sessions.clone();
+            let ipc_events = self.ipc.event_sender();
+            let mut checkin_shutdown = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                // Check every 30 seconds
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let running = sessions.list_sub_sessions(None).await;
+                            let running: Vec<_> = running.into_iter()
+                                .filter(|s| matches!(s.state, crate::session::SubSessionState::Running | crate::session::SubSessionState::Spawning))
+                                .collect();
+
+                            if running.is_empty() {
+                                continue;
+                            }
+
+                            // Check each parent's mailbox for pending questions
+                            for sub in &running {
+                                if let Some(ref parent_id) = sub.parent_id {
+                                    let messages = sessions.drain_mailbox(parent_id).await;
+                                    for msg in messages {
+                                        // Re-emit as events for any listening clients (GUI)
+                                        let _ = ipc_events.send(crate::protocol::Event::SubSessionQuestion {
+                                            session_id: sub.session_id.clone(),
+                                            parent_id: Some(parent_id.clone()),
+                                            label: sub.label.clone(),
+                                            question: msg.content,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ = checkin_shutdown.recv() => break,
+                    }
+                }
+            });
+        }
 
         // The configured address: with port 0 the real port is only known once
         // the IPC task binds, and its own "listening" line reports that.
@@ -2928,817 +3627,6 @@ impl DaemonServer {
         Ok(())
     }
 
-    /// Everything before the services exist: the panic hook, the Windows job
-    /// object, the data directory, the PID file, the exit reason file, and the
-    /// session store.
-    async fn boot(&self) -> Result<(), crate::DaemonError> {
-        // Route every panic through tracing BEFORE doing anything that can
-        // spawn a task. The default hook prints to stderr, which a headless
-        // daemon has nowhere useful to send — so a panicked task died with
-        // ZERO log lines and the wedge it left (2026-08-10: a chat turn's
-        // task panicked and its session went silent for 50+ minutes) was
-        // undiagnosable from the log alone. Chains to the previous hook so
-        // stderr output, where it exists, is preserved.
-        self.install_panic_hook();
-
-        // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
-        // every exec/acceptance process inherits membership, so the OS reaps
-        // the whole tree when this process dies for any reason — clean stop,
-        // `taskkill /F`, or a crash. Closes the leak where daemon restarts
-        // orphaned in-flight `powershell.exe`/`bash.exe` children (89 counted
-        // on 2026-08-01). Survivable on failure: log and run uncontained.
-        #[cfg(windows)]
-        if crate::job::adopt_kill_on_close_job() {
-            info!("Job Object adopted — child processes cannot outlive the daemon");
-        } else {
-            warn!("Job Object adoption failed — exec children may outlive an unclean daemon exit");
-        }
-
-        // Ensure data directory exists
-        std::fs::create_dir_all(&self.config.data_dir)?;
-
-        self.acquire_pid_file()?;
-
-        // Terminal reason file: report how the PREVIOUS daemon died, then
-        // claim the file for this process. Runs after the PID acquire so a
-        // duplicate instance that loses the race can never touch the live
-        // daemon's record. A previous record still saying `running` is the
-        // unclean-exit verdict — the process died through a path no hook
-        // could see, which is exactly the 2026-08-10 log-just-ends death.
-        self.arm_exit_reason();
-
-        self.restore_sessions().await;
-        Ok(())
-    }
-
-    /// Route panics through tracing and the exit reason file, chaining to the
-    /// previous hook.
-    fn install_panic_hook(&self) {
-        let previous_hook = std::panic::take_hook();
-        let panic_exit_reason = self.exit_reason.clone();
-        std::panic::set_hook(Box::new(move |info| {
-            let payload = info
-                .payload()
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            let location = info
-                .location().map_or_else(|| "<unknown location>".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
-            // File first, log second: with panic=abort (the release profile)
-            // this hook is the last code that runs, and the non-blocking log
-            // writer may never flush — the reason file is the record that
-            // survives. In debug a task panic doesn't kill the process; a
-            // later clean shutdown overwrites this record, so last-writer-
-            // wins keeps the file truthful either way.
-            panic_exit_reason.record_exit("panic", Some(&format!("{payload} at {location}")));
-            tracing::error!(%location, "PANIC: {payload}");
-            previous_hook(info);
-        }));
-    }
-
-    /// Acquire the PID file, refusing to start beside a live instance.
-    fn acquire_pid_file(&self) -> Result<(), crate::DaemonError> {
-        if let Some(ref pid_file) = self.pid_file {
-            match pid_file.acquire() {
-                Ok(()) => {
-                    info!("PID file acquired at {:?}", pid_file.path());
-                }
-                Err(crate::health::PidFileError::AlreadyRunning(pid)) => {
-                    error!("Another daemon instance is already running (PID: {})", pid);
-                    return Err(crate::DaemonError::AlreadyRunning);
-                }
-                Err(e) => {
-                    warn!("Failed to acquire PID file: {}. Continuing anyway.", e);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Report how the previous daemon exited, then claim the reason file.
-    fn arm_exit_reason(&self) {
-        let previous = self.exit_reason.read_previous();
-        if previous.is_unclean() {
-            warn!("Previous exit was UNCLEAN: {}", previous.describe());
-        } else {
-            info!("Previous exit: {}", previous.describe());
-        }
-        self.exit_reason.mark_running();
-        info!(
-            "Exit reason file armed at {:?} — every exit path now records why it fired",
-            self.exit_reason.path()
-        );
-    }
-
-    /// Load persisted sessions, migrating legacy `sessions.json` when the
-    /// database is empty, and make sure a default session exists.
-    async fn restore_sessions(&self) {
-        // Load sessions from Turso database
-        {
-            let loaded = self.sessions.load_from_db().await;
-            info!("Loaded {} sessions from database", loaded);
-        }
-
-        // If no sessions loaded from DB, check for legacy sessions.json migration
-        if self.sessions.count().await == 0
-            && let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await
-            && !sessions.is_empty()
-        {
-            info!(
-                "Migrating {} sessions from legacy sessions.json to database",
-                sessions.len()
-            );
-            for session in sessions {
-                self.sessions.restore(session).await;
-            }
-            if let Some(id) = default_id {
-                self.sessions.set_default(&id).await;
-            }
-            // Mark as migrated
-            self.persistence.mark_sessions_migrated().await;
-        }
-
-        // Create default session if none exist
-        if self.sessions.count().await == 0 {
-            let default_session = self.sessions.create(Some("Main".to_string())).await;
-            info!("Created default session: {}", default_session.id);
-        }
-    }
-
-    /// Recover crashed runs from database checkpoints and legacy checkpoint
-    /// files into their sessions.
-    async fn recover_checkpoints(&self, agent: &AgentService) {
-        if let Some(ref storage) = self.storage {
-            match storage.list_checkpoints().await {
-                Ok(checkpoint_ids) => {
-                    for session_id in checkpoint_ids {
-                        // Load checkpoint data from DB and parse it. The
-                        // checkpoint is deleted only after a SUCCESSFUL
-                        // recovery (or when it holds nothing recoverable) —
-                        // deleting before/regardless of the parse made any
-                        // recovery failure a permanent data loss.
-                        let mut recovered = false;
-                        if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
-                            if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
-                                let reasoning = partial.reasoning.clone();
-                                self.sessions
-                                    .add_full_message(
-                                        &session_id,
-                                        crate::session::MessageRole::Assistant,
-                                        &partial.content,
-                                        crate::session::MessageDetails {
-                                            tool_calls: partial.tool_calls,
-                                            reasoning,
-                                            timeline: partial.timeline,
-                                            usage: partial.usage,
-                                        },
-                                    )
-                                    .await;
-                                info!("Recovered crashed run for session {}", session_id);
-                                recovered = true;
-                            } else if serde_json::from_str::<serde_json::Value>(&data).is_ok() {
-                                // Parsed fine but held nothing recoverable —
-                                // an empty checkpoint is safe to clean up.
-                                recovered = true;
-                            } else {
-                                warn!(
-                                    "Checkpoint for session {} did not parse — keeping it for manual inspection",
-                                    session_id
-                                );
-                            }
-                        }
-                        if recovered
-                            && let Err(e) = storage.delete_checkpoint(&session_id).await
-                        {
-                            warn!(
-                                "Failed to delete checkpoint for session {}: {}",
-                                session_id, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => warn!("Failed to list checkpoints: {}", e),
-            }
-
-            self.recover_legacy_checkpoints(agent).await;
-        }
-    }
-
-    /// Recover crashed runs from legacy `checkpoint-*.json` files, removing
-    /// each file it reads.
-    async fn recover_legacy_checkpoints(&self, agent: &AgentService) {
-        // Also migrate any legacy checkpoint JSON files
-        let checkpoint_dir = self.config.data_dir.join("checkpoints");
-        if checkpoint_dir.exists()
-            && let Ok(entries) = std::fs::read_dir(&checkpoint_dir)
-        {
-            for entry in entries.flatten() {
-                let filename = entry.file_name();
-                let name = filename.to_string_lossy();
-                if name.starts_with("checkpoint-") && name.ends_with(".json") {
-                    let session_id = name
-                        .strip_prefix("checkpoint-")
-                        .and_then(|s| s.strip_suffix(".json"))
-                        .unwrap_or("");
-                    if !session_id.is_empty() {
-                        if let Some(partial) = agent.recover_checkpoint(session_id) {
-                            let reasoning = partial.reasoning.clone();
-                            self.sessions
-                                .add_full_message(
-                                    session_id,
-                                    crate::session::MessageRole::Assistant,
-                                    &partial.content,
-                                    crate::session::MessageDetails {
-                                        tool_calls: partial.tool_calls,
-                                        reasoning,
-                                        timeline: partial.timeline,
-                                        usage: partial.usage,
-                                    },
-                                )
-                                .await;
-                            info!(
-                                "Recovered crashed run from legacy checkpoint for session {}",
-                                session_id
-                            );
-                        }
-                        // Remove the legacy file
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Build the single dreaming orchestrator over the live memory store.
-    fn build_dreaming(
-        &self,
-        memory: Option<&Arc<MemoryService>>,
-        activity_clock: &Arc<nanna_memory::ActivityClock>,
-    ) -> Option<Arc<nanna_memory::DreamingService>> {
-        // The single dreaming orchestrator (P13 unification). Built once here and
-        // shared by BOTH consolidation paths — the scheduled cycle below and the
-        // IPC `MemoryAction::Consolidate` handler — so they run the same
-        // multi-phase body over the same live store and accumulate pending
-        // feedback in one place. It reads the very `activity_clock` the control
-        // plane stamps, so its idle gate cannot drift from the daemon's own
-        // notion of "in use".
-        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.map(|memory| {
-            let dreaming_config = nanna_memory::DreamingConfig {
-                idle_threshold_secs: self.config.dream_idle_threshold_secs,
-                memory_pressure_count: self.config.dream_memory_pressure_count,
-                ..nanna_memory::DreamingConfig::default()
-            };
-            Arc::new(
-                nanna_memory::DreamingService::with_shared_memory(
-                    dreaming_config,
-                    Arc::clone(memory),
-                )
-                .with_activity_clock(Arc::clone(activity_clock)),
-            )
-        });
-
-        // Dreaming must observe the very store the agent writes to, never a
-        // private copy — that identity is the whole point of the shared seam.
-        debug_assert_eq!(
-            dreaming.is_some(),
-            memory.is_some(),
-            "dreaming service must exist exactly when the memory store does"
-        );
-        dreaming
-    }
-
-    /// Build the daemon's scheduler, load persisted jobs, ensure the built-in
-    /// consolidation and recurrence tasks exist, and start it with an executor
-    /// over `tasks`.
-    async fn start_scheduler(
-        &self,
-        tasks: ScheduledTaskContext,
-    ) -> Arc<tokio::sync::RwLock<nanna_core::Scheduler>> {
-        // These three come from `[scheduler]` in the user's config, not from
-        // literals: the GUI's Scheduler tab writes them there and a config
-        // reload re-applies them to this very loop (see the control plane's
-        // config handler), so the toggles work without a daemon restart.
-        let scheduler_config = nanna_core::SchedulerConfig {
-            enabled: self.config.scheduler.enabled,
-            heartbeat_interval: std::time::Duration::from_secs(
-                nanna_core::clamp_heartbeat_secs(self.config.scheduler.heartbeat_interval_secs),
-            ),
-            heartbeat_enabled: self.config.scheduler.heartbeat_enabled,
-            heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
-            max_concurrent: 4,
-            check_interval: std::time::Duration::from_secs(30),
-            default_timezone: "UTC".to_string(),
-        };
-        let mut scheduler = nanna_core::Scheduler::new(scheduler_config);
-        if let Some(ref storage) = self.storage {
-            scheduler = scheduler.with_storage(storage.clone());
-            match scheduler.load_jobs().await {
-                Ok(count) => info!("Loaded {count} cron jobs from storage"),
-                Err(e) => warn!("Failed to load cron jobs: {e}"),
-            }
-        } else {
-            info!("Scheduler running without persistence (no storage backend)");
-        }
-
-        let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
-        if deduped > 0 {
-            info!("Removed {deduped} duplicate consolidation tasks");
-        }
-        if !scheduler.has_task_named("memory_consolidation").await {
-            scheduler
-                .add_task(nanna_core::consolidation_task(Some(
-                    std::time::Duration::from_secs(3600),
-                )))
-                .await;
-            info!("Scheduled memory consolidation task (every 1 hour)");
-        }
-
-        // Task recurrence sweep (P15): the scheduler is the one recurrence
-        // engine — recurring todo items are reopened here, not by a second
-        // clock inside the task store.
-        if self.storage.is_some() {
-            let deduped = scheduler.deduplicate_by_name("task_recurrence_sweep").await;
-            if deduped > 0 {
-                info!("Removed {deduped} duplicate recurrence sweep tasks");
-            }
-            if !scheduler.has_task_named("task_recurrence_sweep").await {
-                scheduler
-                    .add_task(nanna_core::recurring_task(
-                        "task_recurrence_sweep",
-                        std::time::Duration::from_secs(300),
-                        "Reopen recurring tasks whose next occurrence has arrived.",
-                    ))
-                    .await;
-                info!("Scheduled task recurrence sweep (every 5 minutes)");
-            }
-        }
-
-        // NOT captured here. The list is read from the live agent config at
-        // the top of each cycle instead: a boot clone survives every
-        // `config.set`, so a user who repointed summarization kept dreaming
-        // on the model they had at startup — the whole class the P23
-        // summarizer-pin fix closed on the chat path (2026-08-15: 171/171
-        // summarizations in the benchmark series ran on the wrong model).
-        // A dream cycle runs minutes-to-hours apart, so one lock read per
-        // cycle costs nothing measurable.
-        let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
-            let tasks = tasks.clone();
-            Box::pin(tasks.run(task))
-        });
-        scheduler = scheduler.with_executor(executor);
-        scheduler.start();
-        info!("Daemon scheduler started (heartbeat + cron runner)");
-        Arc::new(tokio::sync::RwLock::new(scheduler))
-    }
-
-    /// Build the control plane over the initialized services and share it:
-    /// the live workspaces, stats-informed routing, the channel status
-    /// manager, the activity clock and the dreaming orchestrator. Returns the
-    /// control plane and the status manager channel listeners report into.
-    async fn assemble_control_plane(
-        &self,
-        services: DaemonServices,
-        scheduler: Arc<tokio::sync::RwLock<nanna_core::Scheduler>>,
-        (chat_runs, degradations): (
-            &Arc<crate::control::chat_harness::ChatRunRegistry>,
-            &Arc<nanna_agent::DegradationLedger>,
-        ),
-        activity_clock: &Arc<nanna_memory::ActivityClock>,
-        dreaming: Option<&Arc<nanna_memory::DreamingService>>,
-    ) -> (Arc<ControlPlane>, Arc<nanna_channels::StatusManager>) {
-        let DaemonServices {
-            tools,
-            memory,
-            agent,
-            router,
-            tools_dir,
-            workspace_id: workspace_id_for_services,
-            turn_baselines,
-            model_stats,
-        } = services;
-        // Create control plane with all services (including router for consolidation)
-        let mut control = ControlPlane::with_all_services(
-            self.sessions.clone(),
-            agent,
-            memory.clone(),
-            Some(tools),
-            Some(router),
-        )
-        .with_tools_dir(tools_dir)
-        .with_audit_log_path(
-            self.config
-                .tool_audit
-                .log
-                .then(|| self.config.tool_audit_path()),
-        )
-        .with_event_tx(self.ipc.event_sender())
-        .with_session_filters(self.ipc.session_filters())
-        .with_workspace_id(workspace_id_for_services)
-        .with_turn_baselines(turn_baselines)
-        .with_scheduler(scheduler)
-        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
-        .with_memory_recovery(self.memory_recovery.clone())
-        .with_chat_runs(chat_runs.clone())
-        .with_degradations(degradations.clone())
-        .with_shutdown(self.shutdown_tx.clone());
-        if let Some(ref buf) = self.log_buffer {
-            control = control.with_log_buffer(buf.clone());
-        }
-        // Make the tracker the agent + sub-agents record into (from
-        // init_services) the canonical one the control plane owns. Must happen
-        // BEFORE with_storage, which loads persisted stats via
-        // import_from_storage — those now land in the shared tracker too.
-        control.model_stats = model_stats;
-        // Load persisted model stats from storage
-        if let Some(ref storage) = self.storage {
-            control = control.with_storage(storage.clone()).await;
-        }
-
-        self.restore_workspaces(&control).await;
-
-        // Wire model stats tracker into the router for health-aware routing.
-        // The control plane owns the canonical tracker; the router reads it.
-        if let Some(router) = control.router() {
-            router.set_stats(control.model_stats.clone()).await;
-            info!("Stats-informed routing enabled on LLM router");
-        }
-
-        // Shared channel status manager — attached before the Arc wrap so
-        // ChannelAction::Status and ChannelManager listeners see the same state.
-        let channel_status_manager = Arc::new(nanna_channels::StatusManager::new());
-        control.set_status_manager(Arc::clone(&channel_status_manager));
-
-        // Share the activity clock so chat requests stamp the same clock the
-        // scheduled dream cycle reads for its idle gate.
-        control.set_activity_clock(Arc::clone(activity_clock));
-
-        // Share the ONE dreaming orchestrator, so an IPC-triggered consolidation
-        // runs the same multi-phase cycle the scheduler does (P13 unification).
-        if let Some(dreaming) = dreaming {
-            control.set_dreaming(Arc::clone(dreaming));
-        }
-
-        let control = Arc::new(control);
-        *self.control_slot.write().await = Some(control.clone());
-        (control, channel_status_manager)
-    }
-
-    /// Re-register the persisted workspaces and seed the tool working
-    /// directory from the active one.
-    async fn restore_workspaces(&self, control: &ControlPlane) {
-        if let Some(ref storage) = self.storage {
-            match storage.workspaces().list().await {
-                Ok(records) if !records.is_empty() => {
-                    let mut registry = control.workspaces().write().await;
-                    let mut active_id = None;
-                    for record in &records {
-                        let path = PathBuf::from(&record.path);
-                        if path.exists() {
-                            let mut ws = nanna_core::Workspace::new(&path);
-                            ws.id = record.id.clone();
-                            if let Err(e) = ws.load_context().await {
-                                warn!(
-                                    "Failed to load workspace context for {}: {}",
-                                    record.path, e
-                                );
-                            }
-                            registry.register(ws);
-                            if record.active {
-                                active_id = Some(record.id.clone());
-                            }
-                        } else {
-                            warn!("Persisted workspace path no longer exists: {}", record.path);
-                        }
-                    }
-                    if let Some(id) = active_id {
-                        registry.set_active(&id);
-                        // Seed the tool working directory from the persisted active
-                        // workspace so tools resolve against it from boot — not just
-                        // after an interactive SetActive or the first workspace-scoped
-                        // chat. Without this, a fresh daemon with a persisted active
-                        // workspace left `default_workdir` at None until the user
-                        // re-selected it, so tools fell back to the home dir instead of
-                        // running "in the workspace you're in".
-                        let active_path = registry.get(&id).map(|ws| ws.path.clone());
-                        drop(registry);
-                        if let (Some(tools), Some(path)) = (control.tools(), active_path) {
-                            tools.set_default_workdir(Some(path.clone())).await;
-                            info!(
-                                "Seeded tool working directory from active workspace: {:?}",
-                                path
-                            );
-                        }
-                    } else {
-                        drop(registry);
-                    }
-                    info!("Restored {} workspaces from database", records.len());
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to load workspaces from database: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Spawn the IPC server; an IPC-less daemon takes itself down.
-    fn spawn_ipc_server(&self) -> tokio::task::JoinHandle<()> {
-        let ipc_server = self.ipc.clone();
-        let ipc_shutdown = self.shutdown_tx.clone();
-        let ipc_exit_reason = self.exit_reason.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ipc_server.run().await {
-                // An IPC-less daemon is unreachable (no control plane) but
-                // would keep running heartbeats and burning the LLM budget —
-                // observed live when a second instance lost the port race.
-                // Take the daemon down instead of zombie-ing.
-                error!(
-                    "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
-                    e
-                );
-                // Record the cause before either exit route. If the clean
-                // drain completes it overwrites this with `clean_shutdown`;
-                // if the hard exit below fires, this record is the terminal
-                // one — and process::exit skips every Drop, so nothing else
-                // would have written it.
-                ipc_exit_reason.record_exit("ipc_server_error", Some(&e.to_string()));
-                if ipc_shutdown.send(()).is_err() {
-                    // No shutdown listener yet — exit hard rather than linger.
-                    std::process::exit(1);
-                }
-            }
-        })
-    }
-
-    /// Spawn the health HTTP server over state seeded with the memory store's
-    /// health, plus the task that keeps its session count live.
-    async fn spawn_health_server(&self, memory: Option<&Arc<MemoryService>>) -> Arc<HealthState> {
-        // Seed durable-memory-store health (load already ran in init_services),
-        // so a corrupt/degraded store shows on /status, not just a boot log.
-        //
-        // A store that never opened is degraded too, and more severely than
-        // one with corrupt rows: there is no durable store at all, so the
-        // per-store health probe cannot report on it. Fold that in here or
-        // the most complete failure is the one /status calls healthy.
-        let (mem_degraded, mem_corrupt) = if let Some(m) = memory {
-            let h = m.store_health().await;
-            (h.degraded || self.storage_error.is_some(), h.corrupt_rows)
-        } else {
-            (self.storage_error.is_some(), 0)
-        };
-        if let Some(ref err) = self.storage_error {
-            error!(
-                error = %err,
-                "reporting degraded health: memory has no durable store this session"
-            );
-        }
-        let mut state = HealthState::new(
-            memory.is_some(),
-            true, // agent is available
-        )
-        .with_memory_health(mem_degraded, mem_corrupt);
-        if let Some(ref report) = self.memory_recovery {
-            state = state
-                .with_memory_rebuild(report.memories_recovered, report.memories_expected);
-        }
-        let health_state = Arc::new(state);
-
-        // Update session count
-        let sessions_for_health = self.sessions.clone();
-        let health_state_clone = health_state.clone();
-        tokio::spawn(async move {
-            loop {
-                let count = sessions_for_health.count().await;
-                health_state_clone.set_session_count(count).await;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
-
-        // Serve the SAME state the session-count loop above updates
-        // (via `from_shared`), so `/status` reflects live counts instead of
-        // a throwaway copy stuck at zero. The server logs its own
-        // "listening" line from `run()` once the bind succeeds, so we don't
-        // pre-log here (that duplicate line falsely implied a bind before
-        // one had happened).
-        let health_server = HealthServer::from_shared(
-            health_state.clone(),
-            &self.config.ipc.host,
-            self.config.health_port,
-        );
-        // Detached: the server runs for the daemon's lifetime.
-        drop(health_server.spawn());
-        health_state
-    }
-
-    /// Start the channel manager when channels are configured.
-    async fn start_channel_manager(
-        &self,
-        control: &Arc<ControlPlane>,
-        channel_status_manager: &Arc<nanna_channels::StatusManager>,
-    ) -> Option<Arc<ChannelManager>> {
-        if let Some(ref channels_config) = self.config.channels {
-            // Build a daemon-local ChannelsConfig from the nanna_config::ChannelsConfig.
-            // We re-map from nanna_config types to the daemon-local types.
-            let daemon_channels = build_daemon_channels_config(channels_config);
-
-            let mut manager = ChannelManager::with_status_manager(
-                Arc::clone(control),
-                Arc::clone(channel_status_manager),
-            );
-            manager.configure(&daemon_channels).await;
-
-            // Also register outbound channels for webhook-sourced providers that have
-            // bot tokens in the channel config (Telegram, Discord, Slack).
-            // The listener-based configure() already does this; this is a no-op guard.
-
-            match manager.start().await {
-                Ok(()) => {
-                    info!("Channel manager started");
-                    Some(Arc::new(manager))
-                }
-                Err(e) => {
-                    error!("Failed to start channel manager: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Spawn the webhook HTTP server and the processor that routes its events
-    /// through the channel message pipeline.
-    async fn spawn_webhook_server(
-        &self,
-        control: &Arc<ControlPlane>,
-        channel_manager: Option<&Arc<ChannelManager>>,
-    ) {
-        let mut webhook_config = self.config.webhook.clone();
-        webhook_config.host = self.config.ipc.host.clone();
-        webhook_config.port = self.config.webhook_port;
-
-        // Keep a copy of the config for outbound channel registration below
-        let webhook_config_copy = webhook_config.clone();
-
-        let (webhook_server, mut webhook_rx) = WebhookServer::new(webhook_config);
-
-        // Spawn the webhook server
-        tokio::spawn(async move {
-            if let Err(e) = webhook_server.run().await {
-                error!("Webhook server error: {}", e);
-            }
-        });
-
-        // Build a shared router for the webhook event processor.
-        // If a ChannelManager is running, share its router so outbound channels
-        // (bot tokens) are already registered.  Otherwise create a standalone
-        // router that may only cover providers registered via webhook config.
-        let webhook_router = if let Some(mgr) = channel_manager {
-            mgr.router()
-        } else {
-            // No channel manager — create a standalone router.
-            // Outbound channels can be registered here from webhook config if
-            // bot tokens are provided.
-            let standalone_router =
-                Arc::new(tokio::sync::RwLock::new(ChannelMessageRouter::new()));
-
-            // Register outbound channels from webhook config credentials
-            {
-                let mut router = standalone_router.write().await;
-                if let Some(ref token) = webhook_config_copy.telegram_token {
-                    router.register("telegram", Box::new(TelegramChannel::new(token)));
-                    info!("Registered Telegram outbound channel from webhook config");
-                }
-                drop(router);
-                if webhook_config_copy.discord_public_key.is_some() {
-                    // discord_public_key is for verification; bot token for sending
-                    // is not separately stored in WebhookConfig currently.
-                    // Log a warning — users should configure channels.discord instead.
-                    debug!(
-                        "Discord public key found in webhook config; for outbound replies configure channels.discord with a bot_token"
-                    );
-                }
-            }
-
-            standalone_router
-        };
-
-        // Spawn webhook event processor — routes events through the same pipeline
-        // as channel listener messages.
-        let control_for_webhooks = Arc::clone(control);
-        tokio::spawn(async move {
-            while let Some(event) = webhook_rx.recv().await {
-                debug!("Webhook event from {}: {:?}", event.source, event.message);
-
-                if let Some(ref msg) = event.message {
-                    // Convert WebhookMessage → IncomingMessage
-                    let incoming = IncomingMessage {
-                        id: msg
-                            .message_id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        channel: ChannelId::new(&event.source, &msg.chat_id),
-                        sender: ChannelSender {
-                            id: msg.sender_id.clone(),
-                            name: msg.sender_name.clone(),
-                            username: None,
-                        },
-                        content: MessageContent::Text {
-                            text: msg.content.clone(),
-                        },
-                        timestamp: event.timestamp,
-                        reply_to: None,
-                    };
-
-                    // Process through the same pipeline as channel listeners
-                    ChannelManager::process_message(
-                        incoming,
-                        &control_for_webhooks,
-                        &*webhook_router.read().await,
-                    )
-                    .await;
-                }
-            }
-        });
-
-        info!(
-            "Webhook server listening on http://{}:{}",
-            self.config.ipc.host, self.config.webhook_port
-        );
-    }
-
-    /// Spawn the model + tool stats auto-save task (every 5 minutes, and once
-    /// more on shutdown).
-    fn spawn_stats_autosave(&self, control: &Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
-        let stats_control = Arc::clone(control);
-        let mut stats_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        stats_control.save_model_stats().await;
-                        stats_control.save_tool_stats().await;
-                    }
-                    _ = stats_shutdown.recv() => {
-                        // Final save on shutdown
-                        stats_control.save_model_stats().await;
-                        stats_control.save_tool_stats().await;
-                        info!("Model + tool stats final save completed");
-                        break;
-                    }
-                }
-            }
-        })
-    }
-
-    // Spawn sub-agent check-in task: periodically check running sub-agents
-    // and drain parent mailboxes so questions don't go stale.
-    // When a sub-agent uses ask_parent, the ParentChannelImpl handles it directly
-    // via an LLM call. This task handles any orphaned mailbox messages and provides
-    // visibility into long-running sub-agents.
-    fn spawn_sub_agent_checkin(&self) {
-        let sessions = self.sessions.clone();
-        let ipc_events = self.ipc.event_sender();
-        let mut checkin_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            // Check every 30 seconds
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let running = sessions.list_sub_sessions(None).await;
-                        let running: Vec<_> = running.into_iter()
-                            .filter(|s| matches!(s.state, crate::session::SubSessionState::Running | crate::session::SubSessionState::Spawning))
-                            .collect();
-
-                        if running.is_empty() {
-                            continue;
-                        }
-
-                        // Check each parent's mailbox for pending questions
-                        for sub in &running {
-                            if let Some(ref parent_id) = sub.parent_id {
-                                let messages = sessions.drain_mailbox(parent_id).await;
-                                for msg in messages {
-                                    // Re-emit as events for any listening clients (GUI)
-                                    let _ = ipc_events.send(crate::protocol::Event::SubSessionQuestion {
-                                        session_id: sub.session_id.clone(),
-                                        parent_id: Some(parent_id.clone()),
-                                        label: sub.label.clone(),
-                                        question: msg.content,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    _ = checkin_shutdown.recv() => break,
-                }
-            }
-        });
-    }
-
     /// Initialize all services
     ///
     /// `chat_runs` is THE liveness source for background-vs-user contention
@@ -3749,7 +3637,19 @@ impl DaemonServer {
         &self,
         chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
         degradations: &Arc<nanna_agent::DegradationLedger>,
-    ) -> Result<DaemonServices, crate::DaemonError> {
+    ) -> Result<
+        (
+            Arc<ToolRegistry>,
+            Option<Arc<MemoryService>>,
+            Arc<AgentService>,
+            Arc<LlmRouter>,
+            Option<PathBuf>,                          // tools_dir
+            Arc<tokio::sync::RwLock<Option<String>>>, // workspace_id for script services
+            Arc<crate::tasks::TurnBaselines>,         // turn-start closed-task baselines
+            nanna_agent::ModelStatsTracker,           // shared model-stats tracker
+        ),
+        crate::DaemonError,
+    > {
         // Create LLM router with all available providers. The same resolution
         // + construction runs again on every control-plane config mutation
         // (see `control::config`), so a provider the user authenticates after
@@ -3776,96 +3676,8 @@ impl DaemonServer {
         // Create empty tool registry — all tools loaded from disk
         let tools = Arc::new(ToolRegistry::new());
 
-        let tools_dir = self.resolve_tools_dir();
-
-        // Initialize memory service with embeddings if enabled
-        let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
-            Some(self.init_memory(chat_runs, degradations).await)
-        } else {
-            info!("Memory service disabled in config");
-            None
-        };
-
-        // ONE config for every long-lived collaborator below. The sub-agent
-        // spawner and the script summarizer are constructed BEFORE the agent
-        // service, so the service adopts this same lock (`with_shared_config`)
-        // and a later `config.set` reaches all three at once — the boot-clone
-        // staleness that ran a whole benchmark series on the wrong summarizer
-        // (2026-08-15).
-        let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
-
-        // Shared session history for the recall_messages tool service
-        let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-
-        // One shared model-stats tracker for the whole daemon: the main agent
-        // (AgentService) and every sub-agent (managed chats on the control
-        // plane) record into it, and the control plane makes it canonical
-        // (persists it + feeds the router). Cloning shares state
-        // (Arc<RwLock<_>> inside).
-        let model_stats = nanna_agent::ModelStatsTracker::new();
-
-        // Build script services and load all tools from disk
-        let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =
-            Arc::new(tokio::sync::RwLock::new(None));
-        // ONE registry, shared by the chat harness (which registers a turn's
-        // baseline) and the `tasks.*` services (whose `tasks.add` reads it).
-        // Two registries would compile and silently guard nothing.
-        let turn_baselines = Arc::new(crate::tasks::TurnBaselines::new());
-        self.load_skills(
-            &tools,
-            &router,
-            tools_dir.as_ref(),
-            ServiceHandles {
-                memory: memory.clone(),
-                session_history: session_history.clone(),
-                workspace_id: workspace_id_for_services.clone(),
-                turn_baselines: turn_baselines.clone(),
-                agent_config: Arc::clone(&shared_agent_config),
-            },
-        )
-        .await;
-
-        self.register_builtin_tools(&tools, &router, tools_dir.as_ref()).await;
-
-        // Create agent service with multi-provider router
-        let event_tx = self.ipc.event_sender();
-        let mut agent_service = AgentService::with_data_dir(
-            self.config.agent.clone(),
-            router.clone(),
-            tools.clone(),
-            memory.clone(),
-            event_tx,
-            Some(self.config.data_dir.clone()),
-        )
-        .with_session_history(session_history)
-        .with_stats(model_stats.clone())
-        .with_degradations(degradations.clone())
-        // Adopt the lock the spawner and the script summarizer already hold,
-        // so `config.set` moves all three at once instead of only this one.
-        .with_shared_config(Arc::clone(&shared_agent_config));
-        if let Some(ref storage) = self.storage {
-            agent_service = agent_service.with_storage(storage.clone());
-        }
-        let agent = Arc::new(agent_service);
-
-        info!("Agent service initialized");
-
-        Ok(DaemonServices {
-            tools,
-            memory,
-            agent,
-            router,
-            tools_dir,
-            workspace_id: workspace_id_for_services,
-            turn_baselines,
-            model_stats,
-        })
-    }
-
-    /// Resolve tools directory (env var > config > dev fallback > `{data_dir}/tools/`),
-    /// bootstrapping the default skills into it. `None` when script tools are off.
-    fn resolve_tools_dir(&self) -> Option<PathBuf> {
-        if self.config.use_script_tools {
+        // Resolve tools directory (env var > config > dev fallback > {data_dir}/tools/)
+        let tools_dir = if self.config.use_script_tools {
             let config_dir = self.config.tools_dir.as_deref();
             let resolved = nanna_tools::skills::defaults::resolve_tools_dir(config_dir)
                 .unwrap_or_else(|| self.config.data_dir.join("tools"));
@@ -3897,471 +3709,701 @@ impl DaemonServer {
             Some(resolved)
         } else {
             None
-        }
-    }
-
-    /// The memory service: backed by the configured embedding providers when
-    /// any resolves, and vectorless (writes still persist, queued for backfill)
-    /// when none does.
-    async fn init_memory(
-        &self,
-        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
-        degradations: &Arc<nanna_agent::DegradationLedger>,
-    ) -> Arc<MemoryService> {
-        // Resolve the ordered provider list the user actually configured.
-        //
-        // `embedding_priority` is authoritative and is walked in order:
-        // the first entry whose credential resolves becomes primary, the
-        // rest become fallbacks in the same order. Failover happens ONLY on
-        // error, exactly like `model_priority` for chat, so one model
-        // embeds at a time.
-        //
-        // What this replaces: a single configured provider plus THREE
-        // hardcoded fallbacks appended by credential sniffing —
-        // `text-embedding-3-small` (1536) for OpenAI and
-        // `openai/text-embedding-3-small` (1536) for OpenRouter. Those were
-        // injected whether or not the user wanted them, which is how a paid
-        // 1536-dim embedder ended up live on an install whose config asked
-        // for a free one first and a 768-dim local model second.
-        let specs: Vec<String> = if self.embedding.priority.is_empty() {
-            let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
-            info!("No embedding_priority configured; using the single pair '{legacy}'");
-            vec![legacy]
-        } else {
-            self.embedding.priority.clone()
         };
 
-        let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
-            .iter()
-            .filter_map(|spec| self.embedding_provider_for(spec))
-            .collect();
-
-        // Queue rows for models no longer in the list can never drain and
-        // would pollute queue health forever. Pruned only when something
-        // resolved — an empty resolution means a missing key, and wiping
-        // the queue over a missing key would turn a config hiccup into
-        // lost work tracking.
-        if !resolved.is_empty()
-            && let Some(ref storage) = self.storage
-        {
-            let keep: Vec<String> = resolved.iter().map(|(info, _)| info.to_string()).collect();
-            match storage.memories().retain_queue_models(&keep).await {
-                Ok(0) => {}
-                Ok(n) => info!("Dropped {n} queued embeddings for models no longer configured"),
-                Err(e) => warn!("Could not prune the embedding queue: {e}"),
-            }
-        }
-
-        let primary_client = resolved.first().cloned();
-        let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
-
-        if primary_client.is_none() && !specs.is_empty() {
-            warn!(
-                "No embedding provider in embedding_priority could be resolved ({} entries tried) — \
-                 memory will be written without vectors and queued for backfill",
-                specs.len()
-            );
-        }
-
-        if let Some((primary_info, primary)) = primary_client {
-            self.init_embedded_memory(primary_info, primary, fallbacks, chat_runs, degradations)
-                .await
-        } else {
-            self.init_unembedded_memory(degradations).await
-        }
-    }
-
-    /// The memory service over an embedding router, with the background
-    /// workers that keep its binding honest and its backlog draining.
-    async fn init_embedded_memory(
-        &self,
-        primary_info: EmbeddingProviderInfo,
-        primary: Arc<nanna_llm::EmbeddingClient>,
-        fallbacks: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)>,
-        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
-        degradations: &Arc<nanna_agent::DegradationLedger>,
-    ) -> Arc<MemoryService> {
-        // Build the embedding router with fallback providers
-        let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
-
-        // Fallbacks are the REST OF THE USER'S LIST, in their
-        // order — not a credential sweep. The list is the whole
-        // policy: what to try, and in what sequence.
-        for (info, client) in fallbacks {
-            info!("Embedding fallback: {info}");
-            embed_router = embed_router.with_fallback(info, client);
-        }
-
-        info!(
-            "Embedding router: {} providers configured",
-            embed_router.provider_count()
-        );
-        let embed_router = Arc::new(embed_router);
-
-        // Create embedding function that routes through the EmbeddingRouter.
-        let router_for_fn = embed_router.clone();
-        // Placeholder for memory service — set after construction via lazy init
-        let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
-            Arc::new(tokio::sync::OnceCell::new());
-        let mem_cell_for_fn = memory_for_reembed.clone();
-        // One drain at a time, process-wide — see `drain_backfill`.
-        let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
-        let drain_serial_for_fn = drain_serial.clone();
-        let chat_runs_for_fn = chat_runs.clone();
-        let ledger_for_fn = degradations.clone();
-
-        let embed_fn = embedding_fn(
-            router_for_fn,
-            mem_cell_for_fn,
-            drain_serial_for_fn,
-            chat_runs_for_fn,
-            ledger_for_fn,
-        );
-
-        let dimension = self.embedding_dimension(&embed_router).await;
-        let config = nanna_memory::MemoryServiceConfig {
-            dimension,
-            ..Default::default()
-        };
-
-        // Wire up Turso persistence if storage is available.
-        // The persistence adapter is constructed here and attached to the
-        // MemoryService so all writes are automatically mirrored to Turso.
-        let memory_service = if let Some(ref storage) = self.storage {
-            let repo = storage.memories();
-            let db = Arc::new(TursoMemoryPersistence::new(repo));
-            nanna_memory::MemoryService::new(config)
-                .with_embed_fn(embed_fn)
-                .with_persistence(db)
-        } else {
-            warn!(
-                "No storage backend available — memory will NOT be persisted to Turso"
-            );
-            nanna_memory::MemoryService::new(config).with_embed_fn(embed_fn)
-        };
-
-        self.migrate_or_load_memories(&memory_service).await;
-
-        info!("Memory service initialized with Turso persistence and embedding router");
-        let memory_arc = Arc::new(memory_service);
-
-        // Probe the actual embedding dimension from the model IN THE
-        // BACKGROUND. The probe's first embed call can take ~a minute
-        // when the local embedding model is cold (Ollama loads it on
-        // demand), and it used to block startup past the GUI's
-        // daemon-ready timeout — forcing an embedded fallback while an
-        // orphaned daemon kept running. `probe_and_align_dimension`
-        // takes `&self` on the Arc'd service specifically so it can run
-        // at runtime; a mismatched dimension is corrected (and entries
-        // re-embedded) as soon as the probe completes.
-        spawn_embedding_workers(&memory_arc, &embed_router, &primary_info, dimension, chat_runs, &drain_serial)
-            .await;
-
-        // Wire the memory service into the embed_fn's OnceCell
-        // so provider-switch re-embedding can find it
-        let _ = memory_for_reembed.set(memory_arc.clone());
-
-        // One long-lived worker for the vectors a live turn parks.
-        // It sleeps on the queue's notify and costs nothing until a
-        // tool result is ingested; see `drain_queued_vectors` for
-        // why it is a separate drain and what bounds it.
-        let memory_for_queue = memory_arc.clone();
-        let drain_serial_for_queue = drain_serial.clone();
-        tokio::spawn(async move {
-            drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
-        });
-
-        memory_arc
-    }
-
-    /// Seed the embedding dimension by probing the router, falling back to
-    /// the default dimension when no provider answers.
-    async fn embedding_dimension(&self, embed_router: &EmbeddingRouter) -> usize {
-        // Seed the embedding dimension by probing the router.
-        //
-        // A probe failure must NOT stop the daemon: Nanna is
-        // offline-capable by default, so an unreachable or unkeyed
-        // embedding provider degrades memory — it does not refuse
-        // to boot. The seed only has to be a valid positive
-        // dimension: real vectors always come from the provider,
-        // and the background `probe_and_align_dimension` below
-        // corrects the store (re-embedding any mismatched entries)
-        // as soon as a provider answers. Probing here is purely an
-        // optimization — when it succeeds the store is right
-        // immediately and nothing is ever re-embedded.
-        let seed_dimension = nanna_memory::MemoryServiceConfig::default().dimension;
-        let dimension = match Self::probe_embedding_dimension(embed_router).await {
-            Ok(dim) => {
-                info!(
-                    "Memory service using probed dimension {} for model {}",
-                    dim, self.embedding.model
-                );
-                dim
-            }
-            Err(e) => {
-                warn!(
-                    "Could not probe the embedding dimension ({e}). Starting anyway with a \
-                     provisional dimension of {seed_dimension}; memory will re-align \
-                     automatically once an embedding provider is reachable. To enable \
-                     embeddings, run a local Ollama with `ollama pull {}` or set an \
-                     OpenAI/OpenRouter key.",
-                    self.embedding.model
-                );
-                seed_dimension
-            }
-        };
-        assert!(dimension > 0, "embedding dimension must be positive");
-        dimension
-    }
-
-    /// One-time migration from `memories.json` when Turso is empty; otherwise
-    /// load the store from Turso into the in-memory cache.
-    async fn migrate_or_load_memories(&self, memory_service: &MemoryService) {
-        // One-time migration: if memories.json exists and Turso is empty,
-        // load from JSON into in-memory cache then save each entry to Turso.
-        let json_path = self.memory_path.as_ref();
-        let should_migrate = if let (Some(path), Some(storage)) =
-            (json_path, &self.storage)
-        {
-            if path.exists() {
-                match storage.memories().count().await {
-                    Ok(0) => true,
-                    Ok(n) => {
-                        info!(
-                            "Turso already has {} memories — skipping JSON migration",
-                            n
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        warn!("Could not check Turso memory count: {}", e);
-                        false
-                    }
-                }
+        // Initialize memory service with embeddings if enabled
+        let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
+            // Resolve the ordered provider list the user actually configured.
+            //
+            // `embedding_priority` is authoritative and is walked in order:
+            // the first entry whose credential resolves becomes primary, the
+            // rest become fallbacks in the same order. Failover happens ONLY on
+            // error, exactly like `model_priority` for chat, so one model
+            // embeds at a time.
+            //
+            // What this replaces: a single configured provider plus THREE
+            // hardcoded fallbacks appended by credential sniffing —
+            // `text-embedding-3-small` (1536) for OpenAI and
+            // `openai/text-embedding-3-small` (1536) for OpenRouter. Those were
+            // injected whether or not the user wanted them, which is how a paid
+            // 1536-dim embedder ended up live on an install whose config asked
+            // for a free one first and a 768-dim local model second.
+            let specs: Vec<String> = if self.embedding.priority.is_empty() {
+                let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
+                info!("No embedding_priority configured; using the single pair '{legacy}'");
+                vec![legacy]
             } else {
-                false
-            }
-        } else {
-            false
-        };
+                self.embedding.priority.clone()
+            };
 
-        if should_migrate {
-            let path = json_path.unwrap();
-            info!(
-                "Migrating memories from {:?} to Turso (one-time migration)",
-                path
-            );
-            match memory_service.load(path).await {
-                Ok(()) => {
-                    let count = memory_service.count().await;
-                    info!("Loaded {} memories from JSON, flushing to Turso...", count);
-                    // Flush all entries to Turso
-                    match memory_service.flush_to_db().await {
-                        Ok(n) => info!("Flushed {} memories to Turso", n),
-                        Err(e) => warn!("Failed to flush memories to Turso: {}", e),
-                    }
-                    // Rename the JSON file so we don't re-migrate next time
-                    let migrated_path = path.with_extension("json.migrated");
-                    if let Err(e) = tokio::fs::rename(path, &migrated_path).await {
-                        warn!("Could not rename migrated JSON file: {}", e);
-                    } else {
-                        info!(
-                            "Renamed {:?} → {:?} (migration complete)",
-                            path, migrated_path
-                        );
-                    }
+            let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
+                .iter()
+                .filter_map(|spec| self.embedding_provider_for(spec))
+                .collect();
+
+            // Queue rows for models no longer in the list can never drain and
+            // would pollute queue health forever. Pruned only when something
+            // resolved — an empty resolution means a missing key, and wiping
+            // the queue over a missing key would turn a config hiccup into
+            // lost work tracking.
+            if !resolved.is_empty()
+                && let Some(ref storage) = self.storage
+            {
+                let keep: Vec<String> = resolved.iter().map(|(info, _)| info.to_string()).collect();
+                match storage.memories().retain_queue_models(&keep).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("Dropped {n} queued embeddings for models no longer configured"),
+                    Err(e) => warn!("Could not prune the embedding queue: {e}"),
                 }
-                Err(e) => {
-                    warn!(
-                        "JSON migration failed: {}. Will attempt to load from Turso.",
-                        e
+            }
+
+            let primary_client = resolved.first().cloned();
+            let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
+
+            if primary_client.is_none() && !specs.is_empty() {
+                warn!(
+                    "No embedding provider in embedding_priority could be resolved ({} entries tried) — \
+                     memory will be written without vectors and queued for backfill",
+                    specs.len()
+                );
+            }
+
+            match primary_client {
+                Some((primary_info, primary)) => {
+                    // Build the embedding router with fallback providers
+                    let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
+
+                    // Fallbacks are the REST OF THE USER'S LIST, in their
+                    // order — not a credential sweep. The list is the whole
+                    // policy: what to try, and in what sequence.
+                    for (info, client) in fallbacks {
+                        info!("Embedding fallback: {info}");
+                        embed_router = embed_router.with_fallback(info, client);
+                    }
+
+                    info!(
+                        "Embedding router: {} providers configured",
+                        embed_router.provider_count()
                     );
+                    let embed_router = Arc::new(embed_router);
+
+                    // Create embedding function that routes through the EmbeddingRouter.
+                    let router_for_fn = embed_router.clone();
+                    // Placeholder for memory service — set after construction via lazy init
+                    let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
+                        Arc::new(tokio::sync::OnceCell::new());
+                    let mem_cell_for_fn = memory_for_reembed.clone();
+                    // One drain at a time, process-wide — see `drain_backfill`.
+                    let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
+                    let drain_serial_for_fn = drain_serial.clone();
+                    let chat_runs_for_fn = chat_runs.clone();
+                    let ledger_for_fn = degradations.clone();
+
+                    let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
+                        let router = router_for_fn.clone();
+                        let text = text.to_string();
+                        let mem_cell = mem_cell_for_fn.clone();
+                        let drain_serial = drain_serial_for_fn.clone();
+                        let chat_runs = chat_runs_for_fn.clone();
+                        let ledger = ledger_for_fn.clone();
+                        Box::pin(async move {
+                            let attempted = router.embed_one(&text).await;
+
+                            // Capability transitions reach the model once, in
+                            // its next tool result (P22 Tier 4). The seam is
+                            // HERE — the one place every embed outcome passes —
+                            // because "no provider answered" is the moment
+                            // memory writes start landing vectorless, and the
+                            // first success afterwards is the moment they stop.
+                            // The ledger dedups by state, so the steady flow of
+                            // successes (and repeated failures) records nothing.
+                            match &attempted {
+                                Err(reason) => ledger.set(
+                                    "memory-embeddings",
+                                    "degraded",
+                                    format!(
+                                        "[capability notice — memory embeddings DEGRADED: no \
+                                         embedding provider is answering ({reason}). Memory and \
+                                         tool-result writes still SUCCEED and are stored in full — \
+                                         the Turso store remains the source of truth — but new \
+                                         entries are queued for embedding backfill, so semantic \
+                                         recall may miss them until a provider recovers. This \
+                                         notice will not repeat unless the state changes.]"
+                                    ),
+                                ),
+                                Ok(_) => ledger.set(
+                                    "memory-embeddings",
+                                    "healthy",
+                                    "[capability notice — memory embeddings RESTORED: an \
+                                     embedding provider is answering again; queued entries are \
+                                     backfilling and new writes are searchable normally.]",
+                                ),
+                            }
+
+                            let (embedding, switched_to) = attempted?;
+
+                            // Provider switched — realign the store BEFORE this
+                            // write is allowed to land, so it validates against
+                            // the new binding rather than the dead provider's.
+                            //
+                            // The router reports the switch to exactly ONE
+                            // caller (the one whose call flipped the live
+                            // active index), so this is stampede-safe without
+                            // any generation bookkeeping here. And the vector
+                            // in hand came from `switched_to` itself, so
+                            // `(model, embedding.len())` is a consistent pair
+                            // by construction — reading the active provider
+                            // back from the router here could race a second
+                            // switch and rebind the store to a torn
+                            // (new model, old width) state. That torn state is
+                            // the 2026-08-02 incident: model rebound, width
+                            // latch stale, every write failing
+                            // "expected 2048, got 768" for minutes.
+                            if let Some(provider) = switched_to
+                                && let Some(mem) = mem_cell.get()
+                            {
+                                let model = provider.to_string();
+                                // The new provider's input window, memoized by
+                                // the router — one `/api/show` per provider per
+                                // process, and it travels WITH the model and
+                                // width for the same reason those two do. A
+                                // chunk sized for the old window is not
+                                // rejected by the new embedder, it is silently
+                                // truncated.
+                                let window = router.context_window_for(&provider).await;
+                                tracing::info!(
+                                    "Embedding provider changed — rebinding the store to \
+                                     '{}' ({} dims)",
+                                    model,
+                                    embedding.len()
+                                );
+
+                                // Rebinding is a hash lookup per entry: no
+                                // network, no re-embed, and a switch BACK to a
+                                // model used earlier is free because its bucket
+                                // was retained.
+                                let (_, missing) =
+                                    mem.rebind_embeddings(&model, embedding.len(), window).await;
+
+                                // Whatever this model has never embedded gets
+                                // filled in lazily, in bounded passes, while
+                                // the run continues. It must not be done
+                                // inline: the store can hold thousands of
+                                // entries and the provider we just failed over
+                                // to may be the rate-limited one.
+                                //
+                                // Unconditional for the same reason as the
+                                // startup bind: `missing` counts ROW vectors,
+                                // and the chunk queue is independent of it. A
+                                // flap back to a model whose row buckets were
+                                // all retained reports zero missing while its
+                                // chunk vectors are still stamped with the
+                                // other provider, and a drain interrupted
+                                // partway leaves exactly that state.
+                                let _ = missing;
+                                let mem = mem.clone();
+                                let chat_runs = chat_runs.clone();
+                                let drain_serial = drain_serial.clone();
+                                tokio::spawn(async move {
+                                    drain_backfill(&mem, &model, &chat_runs, &drain_serial)
+                                        .await;
+                                });
+                            }
+
+                            Ok(embedding)
+                        })
+                    });
+
+                    // Seed the embedding dimension by probing the router.
+                    //
+                    // A probe failure must NOT stop the daemon: Nanna is
+                    // offline-capable by default, so an unreachable or unkeyed
+                    // embedding provider degrades memory — it does not refuse
+                    // to boot. The seed only has to be a valid positive
+                    // dimension: real vectors always come from the provider,
+                    // and the background `probe_and_align_dimension` below
+                    // corrects the store (re-embedding any mismatched entries)
+                    // as soon as a provider answers. Probing here is purely an
+                    // optimization — when it succeeds the store is right
+                    // immediately and nothing is ever re-embedded.
+                    let seed_dimension = nanna_memory::MemoryServiceConfig::default().dimension;
+                    let dimension = match Self::probe_embedding_dimension(&embed_router).await {
+                        Ok(dim) => {
+                            info!(
+                                "Memory service using probed dimension {} for model {}",
+                                dim, self.embedding.model
+                            );
+                            dim
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not probe the embedding dimension ({e}). Starting anyway with a \
+                                 provisional dimension of {seed_dimension}; memory will re-align \
+                                 automatically once an embedding provider is reachable. To enable \
+                                 embeddings, run a local Ollama with `ollama pull {}` or set an \
+                                 OpenAI/OpenRouter key.",
+                                self.embedding.model
+                            );
+                            seed_dimension
+                        }
+                    };
+                    assert!(dimension > 0, "embedding dimension must be positive");
+                    let config = nanna_memory::MemoryServiceConfig {
+                        dimension,
+                        ..Default::default()
+                    };
+
+                    // Wire up Turso persistence if storage is available.
+                    // The persistence adapter is constructed here and attached to the
+                    // MemoryService so all writes are automatically mirrored to Turso.
+                    let memory_service = if let Some(ref storage) = self.storage {
+                        let repo = storage.memories();
+                        let db = Arc::new(TursoMemoryPersistence::new(repo));
+                        nanna_memory::MemoryService::new(config)
+                            .with_embed_fn(embed_fn)
+                            .with_persistence(db)
+                    } else {
+                        warn!(
+                            "No storage backend available — memory will NOT be persisted to Turso"
+                        );
+                        nanna_memory::MemoryService::new(config).with_embed_fn(embed_fn)
+                    };
+
+                    // One-time migration: if memories.json exists and Turso is empty,
+                    // load from JSON into in-memory cache then save each entry to Turso.
+                    let json_path = self.memory_path.as_ref();
+                    let should_migrate = if let (Some(path), Some(storage)) =
+                        (json_path, &self.storage)
+                    {
+                        if path.exists() {
+                            match storage.memories().count().await {
+                                Ok(0) => true,
+                                Ok(n) => {
+                                    info!(
+                                        "Turso already has {} memories — skipping JSON migration",
+                                        n
+                                    );
+                                    false
+                                }
+                                Err(e) => {
+                                    warn!("Could not check Turso memory count: {}", e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if should_migrate {
+                        let path = json_path.unwrap();
+                        info!(
+                            "Migrating memories from {:?} to Turso (one-time migration)",
+                            path
+                        );
+                        match memory_service.load(path).await {
+                            Ok(()) => {
+                                let count = memory_service.count().await;
+                                info!("Loaded {} memories from JSON, flushing to Turso...", count);
+                                // Flush all entries to Turso
+                                match memory_service.flush_to_db().await {
+                                    Ok(n) => info!("Flushed {} memories to Turso", n),
+                                    Err(e) => warn!("Failed to flush memories to Turso: {}", e),
+                                }
+                                // Rename the JSON file so we don't re-migrate next time
+                                let migrated_path = path.with_extension("json.migrated");
+                                if let Err(e) = tokio::fs::rename(path, &migrated_path).await {
+                                    warn!("Could not rename migrated JSON file: {}", e);
+                                } else {
+                                    info!(
+                                        "Renamed {:?} → {:?} (migration complete)",
+                                        path, migrated_path
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "JSON migration failed: {}. Will attempt to load from Turso.",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // Load from Turso into the in-memory cache (normal startup path).
+                    // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
+                    if !should_migrate {
+                        match memory_service.load_from_db().await {
+                            Ok(count) => {
+                                info!("Loaded {} memories from Turso", count);
+                            }
+                            Err(nanna_memory::MemoryError::Persistence(ref e))
+                                if e.contains("No persistence backend") =>
+                            {
+                                // No storage configured — silently skip
+                            }
+                            Err(e) => {
+                                warn!("Failed to load memories from Turso: {}", e);
+                            }
+                        }
+                    }
+
+                    info!("Memory service initialized with Turso persistence and embedding router");
+                    let memory_arc = Arc::new(memory_service);
+
+                    // Probe the actual embedding dimension from the model IN THE
+                    // BACKGROUND. The probe's first embed call can take ~a minute
+                    // when the local embedding model is cold (Ollama loads it on
+                    // demand), and it used to block startup past the GUI's
+                    // daemon-ready timeout — forcing an embedded fallback while an
+                    // orphaned daemon kept running. `probe_and_align_dimension`
+                    // takes `&self` on the Arc'd service specifically so it can run
+                    // at runtime; a mismatched dimension is corrected (and entries
+                    // re-embedded) as soon as the probe completes.
+                    {
+                        let memory_for_probe = memory_arc.clone();
+                        // Name the model the router actually bound — not the
+                        // legacy `embedding.model` config field, which the
+                        // priority list overrides. A log that names the wrong
+                        // model sends whoever reads it to debug a provider that
+                        // is not even running.
+                        let model_name = primary_info.to_string();
+                        // Bind the store to the model that is about to write to
+                        // it, BEFORE any probe or write. Without this the first
+                        // entries of a session get bucketed under `None` — they
+                        // would be re-embedded on the next switch instead of
+                        // being reusable, which is the whole point of buckets.
+                        let bind_provider = embed_router.active_provider().await;
+                        let bind_model = bind_provider.to_string();
+                        let memory_for_bind = memory_arc.clone();
+                        let router_for_bind = embed_router.clone();
+                        let chat_runs_for_bind = chat_runs.clone();
+                        let drain_serial_for_bind = drain_serial.clone();
+                        tokio::spawn(async move {
+                            // The probed (or seeded) dimension and the model's
+                            // input window travel WITH the model — the binding
+                            // is one triple, never three independently-updated
+                            // latches. Resolved inside the spawn because it
+                            // costs a request, and startup must not block on it.
+                            let window =
+                                router_for_bind.context_window_for(&bind_provider).await;
+                            let (_, _missing) = memory_for_bind
+                                .rebind_embeddings(&bind_model, dimension, window)
+                                .await;
+                            // Unconditional, NOT gated on missing row vectors.
+                            // The two queues are independent: after the chunk
+                            // migration every existing memory has a row vector
+                            // and no chunks at all, so `missing == 0` while the
+                            // entire store is unchunked. Gating on the row
+                            // count would leave it that way forever. Both
+                            // drains no-op immediately when their queue is
+                            // empty, so the unconditional call costs one query
+                            // each on a store that is already complete.
+                            drain_backfill(
+                                &memory_for_bind,
+                                &bind_model,
+                                &chat_runs_for_bind,
+                                &drain_serial_for_bind,
+                            )
+                            .await;
+                        });
+                        // One supervisor for the daemon's life: it turns the
+                        // end of every turn into a drain opportunity, which is
+                        // what closes the "parked until the next binding event"
+                        // gap `store_unembedded` documents -- the backlog
+                        // `drain_queued_vectors` is budgeted not to sweep.
+                        // Spawned beside the startup bind because that is where
+                        // the binding, the run registry and the drain mutex are
+                        // all in scope.
+                        let memory_for_supervisor = memory_arc.clone();
+                        let chat_runs_for_supervisor = chat_runs.clone();
+                        let drain_serial_for_supervisor = drain_serial.clone();
+                        tokio::spawn(supervise_idle_backfill(
+                            memory_for_supervisor,
+                            chat_runs_for_supervisor,
+                            drain_serial_for_supervisor,
+                        ));
+                        let chat_runs_for_probe = chat_runs.clone();
+                        let drain_serial_for_probe = drain_serial.clone();
+                        tokio::spawn(async move {
+                            match memory_for_probe.probe_and_align_dimension().await {
+                                Ok(actual_dim) => {
+                                    if actual_dim == dimension {
+                                        debug!(
+                                            "Embedding dimension confirmed: {actual_dim} for model {model_name}"
+                                        );
+                                    } else {
+                                        info!(
+                                            "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
+                                        );
+                                        // Writes that landed under the stale
+                                        // width were queued for backfill, not
+                                        // failed — drain them now that the
+                                        // binding is honest.
+                                        if let Some(model) =
+                                            memory_for_probe.active_embedding_model().await
+                                        {
+                                            drain_backfill(
+                                                &memory_for_probe,
+                                                &model,
+                                                &chat_runs_for_probe,
+                                                &drain_serial_for_probe,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Could not probe embedding dimension (model may be loading): {e}. \
+                                         Using static dimension {dimension}."
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    // Wire the memory service into the embed_fn's OnceCell
+                    // so provider-switch re-embedding can find it
+                    let _ = memory_for_reembed.set(memory_arc.clone());
+
+                    // One long-lived worker for the vectors a live turn parks.
+                    // It sleeps on the queue's notify and costs nothing until a
+                    // tool result is ingested; see `drain_queued_vectors` for
+                    // why it is a separate drain and what bounds it.
+                    let memory_for_queue = memory_arc.clone();
+                    let drain_serial_for_queue = drain_serial.clone();
+                    tokio::spawn(async move {
+                        drain_queued_vectors(&memory_for_queue, &drain_serial_for_queue).await;
+                    });
+
+                    Some(memory_arc)
+                }
+                None => {
+                    // No provider resolved — but memory does NOT switch off.
+                    // The service runs with persistence and no embedder:
+                    // writes land in Turso with no vector, exactly the
+                    // queued-for-backfill state the loader and the drain
+                    // already handle, and they become searchable the moment a
+                    // provider is configured and the daemon restarts. The old
+                    // arm returned `None` here, which contradicted the warn
+                    // above it promising vectorless writes — and quietly
+                    // discarded every memory of a session that merely had a
+                    // missing API key.
+                    warn!(
+                        "No embedding provider available — memory runs WITHOUT vectors: writes \
+                         persist and queue for backfill, recall is unavailable until an \
+                         embedding provider is configured"
+                    );
+                    // The model finds out the same way the operator does —
+                    // once, in its first tool result, not on every write.
+                    degradations.set(
+                        "memory-embeddings",
+                        "degraded",
+                        "[capability notice — memory embeddings are OFF: no embedding provider \
+                         is configured. Memory and tool-result writes still SUCCEED and persist \
+                         in full — the Turso store is the source of truth — but they carry no \
+                         vectors, so semantic recall is unavailable until a provider is \
+                         configured. This notice will not repeat unless the state changes.]",
+                    );
+                    let config = nanna_memory::MemoryServiceConfig::default();
+                    let memory_service = if let Some(ref storage) = self.storage {
+                        let repo = storage.memories();
+                        let db = Arc::new(TursoMemoryPersistence::new(repo));
+                        nanna_memory::MemoryService::new(config).with_persistence(db)
+                    } else {
+                        // No storage either: in-RAM only, still better than
+                        // dropping writes on the floor for the session.
+                        nanna_memory::MemoryService::new(config)
+                    };
+                    match memory_service.load_from_db().await {
+                        Ok(count) => info!("Loaded {count} memories from Turso (no embedder yet)"),
+                        Err(nanna_memory::MemoryError::Persistence(ref e))
+                            if e.contains("No persistence backend") => {}
+                        Err(e) => warn!("Failed to load memories from Turso: {e}"),
+                    }
+                    Some(Arc::new(memory_service))
                 }
             }
-        }
-
-        // Load from Turso into the in-memory cache (normal startup path).
-        // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
-        if !should_migrate {
-            match memory_service.load_from_db().await {
-                Ok(count) => {
-                    info!("Loaded {} memories from Turso", count);
-                }
-                Err(nanna_memory::MemoryError::Persistence(ref e))
-                    if e.contains("No persistence backend") =>
-                {
-                    // No storage configured — silently skip
-                }
-                Err(e) => {
-                    warn!("Failed to load memories from Turso: {}", e);
-                }
-            }
-        }
-    }
-
-    /// The memory service with no embedder: persisted, vectorless, and
-    /// announced as degraded.
-    async fn init_unembedded_memory(&self, degradations: &nanna_agent::DegradationLedger) -> Arc<MemoryService> {
-        // No provider resolved — but memory does NOT switch off.
-        // The service runs with persistence and no embedder:
-        // writes land in Turso with no vector, exactly the
-        // queued-for-backfill state the loader and the drain
-        // already handle, and they become searchable the moment a
-        // provider is configured and the daemon restarts. The old
-        // arm returned `None` here, which contradicted the warn
-        // above it promising vectorless writes — and quietly
-        // discarded every memory of a session that merely had a
-        // missing API key.
-        warn!(
-            "No embedding provider available — memory runs WITHOUT vectors: writes \
-             persist and queue for backfill, recall is unavailable until an \
-             embedding provider is configured"
-        );
-        // The model finds out the same way the operator does —
-        // once, in its first tool result, not on every write.
-        degradations.set(
-            "memory-embeddings",
-            "degraded",
-            "[capability notice — memory embeddings are OFF: no embedding provider \
-             is configured. Memory and tool-result writes still SUCCEED and persist \
-             in full — the Turso store is the source of truth — but they carry no \
-             vectors, so semantic recall is unavailable until a provider is \
-             configured. This notice will not repeat unless the state changes.]",
-        );
-        let config = nanna_memory::MemoryServiceConfig::default();
-        let memory_service = if let Some(ref storage) = self.storage {
-            let repo = storage.memories();
-            let db = Arc::new(TursoMemoryPersistence::new(repo));
-            nanna_memory::MemoryService::new(config).with_persistence(db)
         } else {
-            // No storage either: in-RAM only, still better than
-            // dropping writes on the floor for the session.
-            nanna_memory::MemoryService::new(config)
-        };
-        match memory_service.load_from_db().await {
-            Ok(count) => info!("Loaded {count} memories from Turso (no embedder yet)"),
-            Err(nanna_memory::MemoryError::Persistence(ref e))
-                if e.contains("No persistence backend") => {}
-            Err(e) => warn!("Failed to load memories from Turso: {e}"),
-        }
-        Arc::new(memory_service)
-    }
-
-    /// Build the script services and load every skill from the tools
-    /// directory and the authored-tools directory.
-    async fn load_skills(
-        &self,
-        tools: &Arc<ToolRegistry>,
-        router: &Arc<LlmRouter>,
-        tools_dir: Option<&PathBuf>,
-        handles: ServiceHandles,
-    ) {
-        let ServiceHandles {
-            memory,
-            session_history,
-            workspace_id: workspace_id_for_services,
-            turn_baselines,
-            agent_config: shared_agent_config,
-        } = handles;
-        let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> = if router
-            .available_providers()
-            .is_empty() {
+            info!("Memory service disabled in config");
             None
-        } else {
-            Some(Arc::new(AgentSpawnerImpl {
-                router: router.clone(),
-                // The live config, not a snapshot of it — see
-                // `AgentSpawnerImpl::agent_config_src`.
-                agent_config_src: Arc::clone(&shared_agent_config),
-                control: self.control_slot.clone(),
-            }))
         };
 
-        // `[memory] ocr_model_priority` already means "vision-capable
-        // models, tried in order" — an existing documented setting, so
-        // `vision.analyze` reads it rather than inventing a second one.
-        let vision_models = self.config.vision_model_priority.clone();
+        // ONE config for every long-lived collaborator below. The sub-agent
+        // spawner and the script summarizer are constructed BEFORE the agent
+        // service, so the service adopts this same lock (`with_shared_config`)
+        // and a later `config.set` reaches all three at once — the boot-clone
+        // staleness that ran a whole benchmark series on the wrong summarizer
+        // (2026-08-15).
+        let shared_agent_config = Arc::new(tokio::sync::RwLock::new(self.config.agent.clone()));
 
-        // The authoring services load a tool they just wrote with the same
-        // services every bundled skill gets. That map is the one being
-        // built, so it reaches them through a slot filled immediately
-        // below — a runtime-authored tool must not be the only one in the
-        // daemon that cannot call a service.
-        let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
-            Arc::new(std::sync::OnceLock::new());
-        // Author into the data dir, never into wherever skills happen to be
-        // *loaded* from. In a debug build `resolve_tools_dir` returns the
-        // source tree, so `tools.create` would have written a new skill
-        // directory into the checkout — untracked files appearing in the
-        // repo because an agent made a tool. Loading from source is
-        // deliberate and stays; writing to it is not.
-        let authoring_dir = self.config.data_dir.join("tools");
-        let tool_authoring = Some((
-            authoring_dir.clone(),
-            Arc::downgrade(tools),
-            Arc::clone(&authoring_slot),
-        ));
+        // Shared session history for the recall_messages tool service
+        let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
-        let services = build_script_services(ScriptServiceDeps {
-            memory: memory.clone(),
-            spawner: spawner_arc,
-            session_history: session_history.clone(),
-            workspace_id: workspace_id_for_services.clone(),
-            storage: self.storage.clone(),
-            turn_baselines: turn_baselines.clone(),
-            summarizer: Some((router.clone(), Arc::clone(&shared_agent_config))),
-            tool_authoring,
-            vision: Some((router.clone(), vision_models.clone())),
-            pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(router, &vision_models),
-            audio: Some((
-                self.config.llm.openai_api_key.clone(),
-                self.config.data_dir.clone(),
-            )),
-            browser_data_dir: Some(self.config.data_dir.clone()),
-            screenshot_data_dir: Some(self.config.data_dir.clone()),
-        });
-        // Fill the slot before any skill can be executed. `set` returning
-        // an error would mean the map was filled twice, which cannot
-        // happen here and would leave the authoring services reading a
-        // stale map if it did.
-        if authoring_slot.set(services.clone()).is_err() {
-            warn!(
-                "tool-authoring service map was already filled; authored tools may not reach services"
-            );
+        // One shared model-stats tracker for the whole daemon: the main agent
+        // (AgentService) and every sub-agent (managed chats on the control
+        // plane) record into it, and the control plane makes it canonical
+        // (persists it + feeds the router). Cloning shares state
+        // (Arc<RwLock<_>> inside).
+        let model_stats = nanna_agent::ModelStatsTracker::new();
+        // Keep the per-request history too: lifetime totals cannot be split
+        // back into days, and `system.cost_rollup` prices days. The table
+        // existed with no writer until this sink.
+        if let Some(ref storage) = self.storage {
+            let storage = Arc::clone(storage);
+            model_stats.set_request_sink(Arc::new(move |obs: &nanna_agent::RequestObservation| {
+                let storage = Arc::clone(&storage);
+                let obs = obs.clone();
+                // Read here, on the run's task: the task-local does not cross
+                // the spawn below.
+                let session_id = ToolRegistry::run_session_id();
+                tokio::spawn(async move {
+                    let latency_ms = u64::try_from(obs.latency.as_millis()).unwrap_or(u64::MAX);
+                    let tier = obs.tier.map(|t| format!("{t:?}").to_lowercase());
+                    if let Err(e) = storage
+                        .log_model_request(&nanna_storage::NewModelRequest {
+                            model: &obs.model,
+                            success: obs.success,
+                            latency_ms,
+                            input_tokens: obs.input_tokens,
+                            output_tokens: obs.output_tokens,
+                            cache_read_tokens: obs.cache_read_tokens,
+                            cache_creation_tokens: obs.cache_creation_tokens,
+                            cache_creation_1h_tokens: obs
+                                .cache_creation_1h_tokens
+                                .min(obs.cache_creation_tokens),
+                            tier: tier.as_deref(),
+                            escalated: obs.escalated,
+                            session_id: session_id.as_deref(),
+                        })
+                        .await
+                    {
+                        warn!("Failed to log model request: {e}");
+                    }
+                });
+            }));
         }
 
-        if let Some(dir) = tools_dir
-            && dir.is_dir()
+        // Build script services and load all tools from disk
+        let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        // ONE registry, shared by the chat harness (which registers a turn's
+        // baseline) and the `tasks.*` services (whose `tasks.add` reads it).
+        // Two registries would compile and silently guard nothing.
+        let turn_baselines = Arc::new(crate::tasks::TurnBaselines::new());
         {
-            let loaded = tools.load_skills_with_services(dir, &services).await;
-            info!("Loaded {} tools from {:?}", loaded, dir);
-        }
+            let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> = if !router
+                .available_providers()
+                .is_empty()
+            {
+                Some(Arc::new(AgentSpawnerImpl {
+                    router: router.clone(),
+                    // The live config, not a snapshot of it — see
+                    // `AgentSpawnerImpl::agent_config_src`.
+                    agent_config_src: Arc::clone(&shared_agent_config),
+                    control: self.control_slot.clone(),
+                }))
+            } else {
+                None
+            };
 
-        // Tools authored at runtime live in the data dir. In a release
-        // build that is the same directory as above and this is skipped; in
-        // a debug build it is the other half of the tool surface, and
-        // without it an authored tool would be callable for one session and
-        // gone after a restart.
-        if authoring_dir.is_dir()
-            && tools_dir != Some(&authoring_dir)
-        {
-            let loaded = tools
-                .load_skills_with_services(&authoring_dir, &services)
-                .await;
-            if loaded > 0 {
-                info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
+            // `[memory] ocr_model_priority` already means "vision-capable
+            // models, tried in order" — an existing documented setting, so
+            // `vision.analyze` reads it rather than inventing a second one.
+            let vision_models = self.config.vision_model_priority.clone();
+
+            // The authoring services load a tool they just wrote with the same
+            // services every bundled skill gets. That map is the one being
+            // built, so it reaches them through a slot filled immediately
+            // below — a runtime-authored tool must not be the only one in the
+            // daemon that cannot call a service.
+            let authoring_slot: Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>> =
+                Arc::new(std::sync::OnceLock::new());
+            // Author into the data dir, never into wherever skills happen to be
+            // *loaded* from. In a debug build `resolve_tools_dir` returns the
+            // source tree, so `tools.create` would have written a new skill
+            // directory into the checkout — untracked files appearing in the
+            // repo because an agent made a tool. Loading from source is
+            // deliberate and stays; writing to it is not.
+            let authoring_dir = self.config.data_dir.join("tools");
+            let tool_authoring = Some((
+                authoring_dir.clone(),
+                Arc::downgrade(&tools),
+                Arc::clone(&authoring_slot),
+            ));
+
+            // Before any skill runs: the bridge snapshots into this store on
+            // every script write from here on.
+            let file_history_root = self.config.data_dir.join("file-history");
+            if nanna_scripting::file_history::install(file_history_root.clone()) {
+                info!(
+                    "File history (pre-write snapshots) at {}",
+                    file_history_root.display()
+                );
+            }
+
+            let services = build_script_services(ScriptServiceDeps {
+                memory: memory.clone(),
+                spawner: spawner_arc,
+                session_history: session_history.clone(),
+                workspace_id: workspace_id_for_services.clone(),
+                storage: self.storage.clone(),
+                turn_baselines: turn_baselines.clone(),
+                summarizer: Some((router.clone(), Arc::clone(&shared_agent_config))),
+                tool_authoring,
+                vision: Some((router.clone(), vision_models.clone())),
+                pdf_ocr: crate::vision_service::bind_pdf_ocr_fn(&router, &vision_models),
+                audio: Some((
+                    self.config.llm.openai_api_key.clone(),
+                    self.config.data_dir.clone(),
+                )),
+                browser_data_dir: Some(self.config.data_dir.clone()),
+                screenshot_data_dir: Some(self.config.data_dir.clone()),
+                reminders: Some((Arc::clone(&self.scheduler_slot), Arc::clone(&self.sessions))),
+                feedback: Some(Arc::clone(&self.dreaming_slot)),
+                ask_user: Some(crate::ask_user_service::AskUserDeps {
+                    sessions: Arc::clone(&self.sessions),
+                    events: self.ipc.event_sender(),
+                    chat_runs: Arc::clone(chat_runs),
+                }),
+            });
+            // Fill the slot before any skill can be executed. `set` returning
+            // an error would mean the map was filled twice, which cannot
+            // happen here and would leave the authoring services reading a
+            // stale map if it did.
+            if authoring_slot.set(services.clone()).is_err() {
+                warn!(
+                    "tool-authoring service map was already filled; authored tools may not reach services"
+                );
+            }
+
+            if let Some(ref dir) = tools_dir {
+                if dir.is_dir() {
+                    let loaded = tools.load_skills_with_services(dir, &services).await;
+                    info!("Loaded {} tools from {:?}", loaded, dir);
+                }
+            }
+
+            // Tools authored at runtime live in the data dir. In a release
+            // build that is the same directory as above and this is skipped; in
+            // a debug build it is the other half of the tool surface, and
+            // without it an authored tool would be callable for one session and
+            // gone after a restart.
+            if authoring_dir.is_dir()
+                && tools_dir.as_ref() != Some(&authoring_dir)
+            {
+                let loaded = tools
+                    .load_skills_with_services(&authoring_dir, &services)
+                    .await;
+                if loaded > 0 {
+                    info!("Loaded {} authored tools from {:?}", loaded, authoring_dir);
+                }
             }
         }
-    }
 
-    /// Register the tool aliases, `discover_tools` and `ask_parent`, then
-    /// apply the allow/deny policy and the audit trail.
-    async fn register_builtin_tools(
-        &self,
-        tools: &Arc<ToolRegistry>,
-        router: &Arc<LlmRouter>,
-        tools_dir: Option<&PathBuf>,
-    ) {
         // Register common aliases for Claude Code compatibility (after tools are loaded)
         tools.register_alias("read", "read_file").await;
         tools.register_alias("Read", "read_file").await;
@@ -4384,15 +4426,26 @@ impl DaemonServer {
             info!("Tool registry: {} tools (including aliases)", tool_count);
         }
 
+        // MCP servers register their tools as each handshake completes; the
+        // count above is the tool surface before them.
+        crate::mcp_startup::spawn_mcp_servers(
+            &self.config.mcp,
+            Arc::clone(&tools),
+            Arc::clone(&self.mcp_status),
+            self.shutdown_tx.subscribe(),
+            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
+        )
+        .await;
+
         // Register discover_tools (JS/TS skill with registry access)
-        if let Some(dir) = tools_dir {
+        if let Some(ref dir) = tools_dir {
             if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
                 let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source(
                     "discover_tools",
                     &source,
                 )
                 .expect("discover_tools skill must parse")
-                .with_registry(Arc::downgrade(tools));
+                .with_registry(Arc::downgrade(&tools));
                 tools.register(wrapper).await;
                 info!("Registered discover_tools skill from {:?}", dir);
             } else {
@@ -4435,311 +4488,54 @@ impl DaemonServer {
         // (chat harness, task tool, scheduled runs and the MCP bridge all call
         // the registry directly), and an audit that saw only one of them would
         // be worse than none — it would read as a complete account.
-        if self.config.tool_audit.log {
+        if self.config.tool_audit_log {
             let path = self.config.tool_audit_path();
             let sink = nanna_tools::JsonlAuditSink::new(
                 path.clone(),
                 nanna_tools::ToolAuditConfig {
-                    include_values: self.config.tool_audit.log_values,
+                    include_values: self.config.tool_audit_log_values,
                     ..Default::default()
                 },
             );
             tools.set_audit_sink(Some(Arc::new(sink))).await;
-            info!(path = %path.display(), values = self.config.tool_audit.log_values,
+            info!(path = %path.display(), values = self.config.tool_audit_log_values,
                   "Tool audit trail enabled");
         }
-    }
-}
 
-/// The shared handles every script service is built over.
-struct ServiceHandles {
-    memory: Option<Arc<MemoryService>>,
-    session_history: SharedSessionHistory,
-    workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
-    turn_baselines: Arc<crate::tasks::TurnBaselines>,
-    /// The live agent config the spawner and summarizer read.
-    agent_config: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
-}
-
-/// The memory store's embedding function: route through the embedding
-/// router, record capability transitions, and rebind the store when the
-/// router switches provider.
-fn embedding_fn(
-    router_for_fn: Arc<EmbeddingRouter>,
-    mem_cell_for_fn: Arc<tokio::sync::OnceCell<Arc<MemoryService>>>,
-    drain_serial_for_fn: Arc<tokio::sync::Mutex<()>>,
-    chat_runs_for_fn: Arc<crate::control::chat_harness::ChatRunRegistry>,
-    ledger_for_fn: Arc<nanna_agent::DegradationLedger>,
-) -> nanna_memory::EmbedFn {
-    Arc::new(move |text: &str| {
-        let router = router_for_fn.clone();
-        let text = text.to_string();
-        let mem_cell = mem_cell_for_fn.clone();
-        let drain_serial = drain_serial_for_fn.clone();
-        let chat_runs = chat_runs_for_fn.clone();
-        let ledger = ledger_for_fn.clone();
-        Box::pin(async move {
-            let attempted = router.embed_one(&text).await;
-
-            // Capability transitions reach the model once, in
-            // its next tool result (P22 Tier 4). The seam is
-            // HERE — the one place every embed outcome passes —
-            // because "no provider answered" is the moment
-            // memory writes start landing vectorless, and the
-            // first success afterwards is the moment they stop.
-            // The ledger dedups by state, so the steady flow of
-            // successes (and repeated failures) records nothing.
-            record_embedding_capability(&ledger, attempted.as_ref().map(|_| ()));
-
-            let (embedding, switched_to) = attempted?;
-
-            // Provider switched — realign the store BEFORE this
-            // write is allowed to land, so it validates against
-            // the new binding rather than the dead provider's.
-            //
-            // The router reports the switch to exactly ONE
-            // caller (the one whose call flipped the live
-            // active index), so this is stampede-safe without
-            // any generation bookkeeping here. And the vector
-            // in hand came from `switched_to` itself, so
-            // `(model, embedding.len())` is a consistent pair
-            // by construction — reading the active provider
-            // back from the router here could race a second
-            // switch and rebind the store to a torn
-            // (new model, old width) state. That torn state is
-            // the 2026-08-02 incident: model rebound, width
-            // latch stale, every write failing
-            // "expected 2048, got 768" for minutes.
-            if let Some(provider) = switched_to
-                && let Some(mem) = mem_cell.get()
-            {
-                rebind_after_provider_switch(
-                    mem,
-                    &router,
-                    provider,
-                    embedding.len(),
-                    &chat_runs,
-                    &drain_serial,
-                )
-                .await;
-            }
-
-            Ok(embedding)
-        })
-    })
-}
-
-/// Record whether an embedding provider answered, in the capability ledger.
-/// The ledger dedups by state, so only transitions reach the model.
-fn record_embedding_capability(ledger: &nanna_agent::DegradationLedger, attempted: Result<(), &String>) {
-    match attempted {
-        Err(reason) => ledger.set(
-            "memory-embeddings",
-            "degraded",
-            format!(
-                "[capability notice — memory embeddings DEGRADED: no \
-                 embedding provider is answering ({reason}). Memory and \
-                 tool-result writes still SUCCEED and are stored in full — \
-                 the Turso store remains the source of truth — but new \
-                 entries are queued for embedding backfill, so semantic \
-                 recall may miss them until a provider recovers. This \
-                 notice will not repeat unless the state changes.]"
-            ),
-        ),
-        Ok(()) => ledger.set(
-            "memory-embeddings",
-            "healthy",
-            "[capability notice — memory embeddings RESTORED: an \
-             embedding provider is answering again; queued entries are \
-             backfilling and new writes are searchable normally.]",
-        ),
-    }
-}
-
-/// Realign the store to the provider the router just switched to, then drain
-/// whatever that provider has never embedded, in the background.
-async fn rebind_after_provider_switch(
-    mem: &Arc<MemoryService>,
-    router: &EmbeddingRouter,
-    provider: EmbeddingProviderInfo,
-    dims: usize,
-    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
-    drain_serial: &Arc<tokio::sync::Mutex<()>>,
-) {
-    let model = provider.to_string();
-    // The new provider's input window, memoized by
-    // the router — one `/api/show` per provider per
-    // process, and it travels WITH the model and
-    // width for the same reason those two do. A
-    // chunk sized for the old window is not
-    // rejected by the new embedder, it is silently
-    // truncated.
-    let window = router.context_window_for(&provider).await;
-    tracing::info!(
-        "Embedding provider changed — rebinding the store to \
-         '{}' ({} dims)",
-        model,
-        dims
-    );
-
-    // Rebinding is a hash lookup per entry: no
-    // network, no re-embed, and a switch BACK to a
-    // model used earlier is free because its bucket
-    // was retained.
-    let (_, missing) =
-        mem.rebind_embeddings(&model, dims, window).await;
-
-    // Whatever this model has never embedded gets
-    // filled in lazily, in bounded passes, while
-    // the run continues. It must not be done
-    // inline: the store can hold thousands of
-    // entries and the provider we just failed over
-    // to may be the rate-limited one.
-    //
-    // Unconditional for the same reason as the
-    // startup bind: `missing` counts ROW vectors,
-    // and the chunk queue is independent of it. A
-    // flap back to a model whose row buckets were
-    // all retained reports zero missing while its
-    // chunk vectors are still stamped with the
-    // other provider, and a drain interrupted
-    // partway leaves exactly that state.
-    let _ = missing;
-    let mem = mem.clone();
-    let chat_runs = chat_runs.clone();
-    let drain_serial = drain_serial.clone();
-    tokio::spawn(async move {
-        drain_backfill(&mem, &model, &chat_runs, &drain_serial)
-            .await;
-    });
-}
-
-/// The long-lived embedding workers: bind the store to the active provider
-/// and drain its backlog, supervise idle backfill, and probe the real
-/// dimension.
-async fn spawn_embedding_workers(
-    memory_arc: &Arc<MemoryService>,
-    embed_router: &Arc<EmbeddingRouter>,
-    primary_info: &EmbeddingProviderInfo,
-    dimension: usize,
-    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
-    drain_serial: &Arc<tokio::sync::Mutex<()>>,
-) {
-    // Name the model the router actually bound — not the
-    // legacy `embedding.model` config field, which the
-    // priority list overrides. A log that names the wrong
-    // model sends whoever reads it to debug a provider that
-    // is not even running.
-    let model_name = primary_info.to_string();
-    // Bind the store to the model that is about to write to
-    // it, BEFORE any probe or write. Without this the first
-    // entries of a session get bucketed under `None` — they
-    // would be re-embedded on the next switch instead of
-    // being reusable, which is the whole point of buckets.
-    let bind_provider = embed_router.active_provider().await;
-    let bind_model = bind_provider.to_string();
-    let memory_for_bind = memory_arc.clone();
-    let router_for_bind = embed_router.clone();
-    let chat_runs_for_bind = chat_runs.clone();
-    let drain_serial_for_bind = drain_serial.clone();
-    tokio::spawn(async move {
-        // The probed (or seeded) dimension and the model's
-        // input window travel WITH the model — the binding
-        // is one triple, never three independently-updated
-        // latches. Resolved inside the spawn because it
-        // costs a request, and startup must not block on it.
-        let window =
-            router_for_bind.context_window_for(&bind_provider).await;
-        let (_, _missing) = memory_for_bind
-            .rebind_embeddings(&bind_model, dimension, window)
-            .await;
-        // Unconditional, NOT gated on missing row vectors.
-        // The two queues are independent: after the chunk
-        // migration every existing memory has a row vector
-        // and no chunks at all, so `missing == 0` while the
-        // entire store is unchunked. Gating on the row
-        // count would leave it that way forever. Both
-        // drains no-op immediately when their queue is
-        // empty, so the unconditional call costs one query
-        // each on a store that is already complete.
-        drain_backfill(
-            &memory_for_bind,
-            &bind_model,
-            &chat_runs_for_bind,
-            &drain_serial_for_bind,
+        // Create agent service with multi-provider router
+        let event_tx = self.ipc.event_sender();
+        let mut agent_service = AgentService::with_data_dir(
+            self.config.agent.clone(),
+            router.clone(),
+            tools.clone(),
+            memory.clone(),
+            event_tx,
+            Some(self.config.data_dir.clone()),
         )
-        .await;
-    });
-    // One supervisor for the daemon's life: it turns the
-    // end of every turn into a drain opportunity, which is
-    // what closes the "parked until the next binding event"
-    // gap `store_unembedded` documents -- the backlog
-    // `drain_queued_vectors` is budgeted not to sweep.
-    // Spawned beside the startup bind because that is where
-    // the binding, the run registry and the drain mutex are
-    // all in scope.
-    let memory_for_supervisor = memory_arc.clone();
-    let chat_runs_for_supervisor = chat_runs.clone();
-    let drain_serial_for_supervisor = drain_serial.clone();
-    tokio::spawn(supervise_idle_backfill(
-        memory_for_supervisor,
-        chat_runs_for_supervisor,
-        drain_serial_for_supervisor,
-    ));
-    spawn_dimension_probe(
-        memory_arc.clone(),
-        model_name,
-        dimension,
-        chat_runs.clone(),
-        drain_serial.clone(),
-    );
-}
-
-/// Probe the real embedding dimension in the background and drain writes
-/// queued under a stale width once it is corrected.
-fn spawn_dimension_probe(
-    memory_for_probe: Arc<MemoryService>,
-    model_name: String,
-    dimension: usize,
-    chat_runs_for_probe: Arc<crate::control::chat_harness::ChatRunRegistry>,
-    drain_serial_for_probe: Arc<tokio::sync::Mutex<()>>,
-) {
-    tokio::spawn(async move {
-        match memory_for_probe.probe_and_align_dimension().await {
-            Ok(actual_dim) => {
-                if actual_dim == dimension {
-                    debug!(
-                        "Embedding dimension confirmed: {actual_dim} for model {model_name}"
-                    );
-                } else {
-                    info!(
-                        "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
-                    );
-                    // Writes that landed under the stale
-                    // width were queued for backfill, not
-                    // failed — drain them now that the
-                    // binding is honest.
-                    if let Some(model) =
-                        memory_for_probe.active_embedding_model().await
-                    {
-                        drain_backfill(
-                            &memory_for_probe,
-                            &model,
-                            &chat_runs_for_probe,
-                            &drain_serial_for_probe,
-                        )
-                        .await;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Could not probe embedding dimension (model may be loading): {e}. \
-                     Using static dimension {dimension}."
-                );
-            }
+        .with_session_history(session_history)
+        .with_stats(model_stats.clone())
+        .with_degradations(degradations.clone())
+        // Adopt the lock the spawner and the script summarizer already hold,
+        // so `config.set` moves all three at once instead of only this one.
+        .with_shared_config(Arc::clone(&shared_agent_config));
+        if let Some(ref storage) = self.storage {
+            agent_service = agent_service.with_storage(storage.clone());
         }
-    });
+        let agent = Arc::new(agent_service);
+
+        info!("Agent service initialized");
+
+        Ok((
+            tools,
+            memory,
+            agent,
+            router,
+            tools_dir,
+            workspace_id_for_services,
+            turn_baselines,
+            model_stats,
+        ))
+    }
 }
 
 /// Build a [`ToolPolicy`] from the `[tools] enabled`/`disabled` config lists.
@@ -4759,7 +4555,7 @@ fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPol
     ToolPolicy::from_config_lists(enabled, disabled)
 }
 
-// Embedding configuration for the daemon
+/// Embedding configuration for the daemon
 
 /// Split an `embedding_priority` entry into `(provider, model)`.
 ///
@@ -4827,7 +4623,7 @@ impl Default for EmbeddingConfig {
     }
 }
 
-/// Builder for `DaemonServer`
+/// Builder for DaemonServer
 pub struct DaemonBuilder {
     config: DaemonConfig,
     embedding: EmbeddingConfig,
@@ -4858,17 +4654,16 @@ fn apply_channel_webhook_secrets(
         webhook.slack_signing_secret = Some(slack.signing_secret.clone());
     }
     if let Some(ref whatsapp) = channels.whatsapp {
-        webhook.whatsapp_verify_token.clone_from(&whatsapp.verify_token);
-        webhook.whatsapp_app_secret.clone_from(&whatsapp.app_secret);
+        webhook.whatsapp_verify_token = whatsapp.verify_token.clone();
+        webhook.whatsapp_app_secret = whatsapp.app_secret.clone();
     }
     if let Some(ref telegram) = channels.telegram {
         webhook.telegram_token = Some(telegram.bot_token.clone());
-        webhook.telegram_secret.clone_from(&telegram.webhook_secret);
+        webhook.telegram_secret = telegram.webhook_secret.clone();
     }
 }
 
 impl DaemonBuilder {
-    #[must_use]
     pub fn new() -> Self {
         Self {
             config: DaemonConfig::default(),
@@ -4880,12 +4675,6 @@ impl DaemonBuilder {
     }
 
     /// Create builder from Nanna config file
-    ///
-    /// # Errors
-    ///
-    /// None today: a config that fails to load is logged and replaced by the
-    /// defaults with environment overrides, and an unresolvable data directory
-    /// keeps the default one.
     pub fn from_nanna_config() -> Result<Self, crate::DaemonError> {
         use nanna_config::Config;
 
@@ -4910,10 +4699,10 @@ impl DaemonBuilder {
         builder.config.llm = LlmConfig::from_nanna(&config);
 
         // Set embedding configuration from Nanna memory config
-        builder.embedding.provider.clone_from(&config.memory.embedding_provider);
-        builder.embedding.model.clone_from(&config.memory.embedding_model);
-        builder.embedding.ollama_host.clone_from(&config.memory.ollama_host);
-        builder.embedding.priority.clone_from(&config.memory.embedding_priority);
+        builder.embedding.provider = config.memory.embedding_provider.clone();
+        builder.embedding.model = config.memory.embedding_model.clone();
+        builder.embedding.ollama_host = config.memory.ollama_host.clone();
+        builder.embedding.priority = config.memory.embedding_priority.clone();
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
@@ -4924,17 +4713,16 @@ impl DaemonBuilder {
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
         // `ocr_model_priority` already means "vision-capable models, in order";
         // `vision.analyze` reads it rather than adding a second list.
-        builder.config.vision_model_priority.clone_from(&config.memory.ocr_model_priority);
+        builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
+        builder.config.mcp = config.mcp.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is
         // unconditional — which is how it kept stealing the local model's one
         // slot mid-chat.
-        builder.config.scheduler = SchedulerSwitches {
-            enabled: config.scheduler.enabled,
-            heartbeat_enabled: config.scheduler.heartbeat_enabled,
-            heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
-        };
+        builder.config.scheduler_enabled = config.scheduler.enabled;
+        builder.config.heartbeat_enabled = config.scheduler.heartbeat_enabled;
+        builder.config.heartbeat_interval_secs = config.scheduler.heartbeat_interval_secs;
 
         // Wire webhook signature-verification secrets from the user's channel
         // config. Without this the inbound webhook server always ran with the
@@ -4966,7 +4754,7 @@ impl DaemonBuilder {
                 } else {
                     info!("Using Nanna data directory: {:?}", data_dir);
                 }
-                builder.config.data_dir.clone_from(&data_dir);
+                builder.config.data_dir = data_dir.clone();
                 builder.memory_path = Some(data_dir.join("memories.json"));
             }
             Err(e) => {
@@ -4974,25 +4762,70 @@ impl DaemonBuilder {
             }
         }
 
-        builder.apply_agent_settings(&config);
+        // Set agent configuration from loaded config
+        // Use user-configured model priority list for fallback
+        builder.config.agent.model_priority = config.llm.model_priority.clone();
+        info!("Model priority list: {:?}", config.llm.model_priority);
+
+        if let Some(model) = config.llm.model_priority.first() {
+            builder.config.agent.model = model.to_string();
+        } else {
+            builder.config.agent.model = config.llm.model.clone();
+        }
+
+        // Set summarization configuration
+        builder.config.agent.summarization_priority = config.llm.summarization_priority.clone();
+        builder.config.agent.summarization_ollama_url = config.llm.ollama_url.clone();
+
+        // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
+        builder.config.agent.openrouter_api_key = config.llm.openrouter_api_key.clone();
+        builder.config.agent.openai_api_key = config.llm.openai_api_key.clone();
+
+        // Thinking mode is NOT read from config: it is always on (owner
+        // directive 2026-08-04). `AgentServiceConfig::default` already carries
+        // `ThinkingMode::default()`, and the `agent.thinking_enabled` flag that
+        // used to gate it here is gone.
+
+        // Agent-loop iteration policy: unbounded by default (long-horizon worker),
+        // with late escalating soft nudges. All three are user-configurable.
+        builder.config.agent.max_iterations = config.agent.max_iterations;
+        builder.config.agent.nudge_after_iterations = config.agent.nudge_after_iterations;
+        builder.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
+
+        // Set model routing configuration
+        builder.config.agent.model_routing = config.llm.model_routing.clone();
+        builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
+        builder.config.agent.sub_agent_model = config.llm.sub_agent_model.clone();
+        // Resolved here (list > legacy single > main chat list) so every
+        // consumer sees one authoritative, never-empty chain.
+        builder.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
+        builder.config.agent.prompt_cache_ttl =
+            crate::agent_service::cache_ttl_from(config.llm.prompt_cache_ttl);
+        if !config.llm.model_routing.is_empty() {
+            info!("Model routing enabled: {:?}", config.llm.model_routing);
+        }
+        if !config.llm.sub_agent_models.is_empty() || config.llm.sub_agent_model.is_some() {
+            info!(
+                "Sub-agent models: {:?}",
+                builder.config.agent.sub_agent_models
+            );
+        }
 
         // Set Brave API key for web search
-        builder.brave_api_key.clone_from(&config.tools.brave_api_key);
+        builder.brave_api_key = config.tools.brave_api_key.clone();
 
         // Set script tools flag and tools directory
         builder.config.use_script_tools = config.tools.use_script_tools;
-        builder.config.tools_dir.clone_from(&config.tools.tools_dir);
+        builder.config.tools_dir = config.tools.tools_dir.clone();
 
         // Tool allow/deny policy — `[tools] enabled` is the allowlist ("*" = all),
         // `[tools] disabled` is the denylist. This is the wiring that makes a
         // disabled tool actually stop executing (the lists were previously
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
-        builder.config.tool_denylist.clone_from(&config.tools.disabled);
-        builder.config.tool_audit = ToolAuditSwitches {
-            log: config.tools.audit_log,
-            log_values: config.tools.audit_log_values,
-        };
+        builder.config.tool_denylist = config.tools.disabled.clone();
+        builder.config.tool_audit_log = config.tools.audit_log;
+        builder.config.tool_audit_log_values = config.tools.audit_log_values;
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -5005,195 +4838,120 @@ impl DaemonBuilder {
             info!("Channel configuration loaded");
         }
 
-        builder.log_loaded_config();
-
-        Ok(builder)
-    }
-
-    /// Take the agent's model, summarization, routing and iteration settings
-    /// from the loaded config.
-    fn apply_agent_settings(&mut self, config: &nanna_config::Config) {
-        // Set agent configuration from loaded config
-        // Use user-configured model priority list for fallback
-        self.config.agent.model_priority.clone_from(&config.llm.model_priority);
-        info!("Model priority list: {:?}", config.llm.model_priority);
-
-        if let Some(model) = config.llm.model_priority.first() {
-            self.config.agent.model.clone_from(model);
-        } else {
-            self.config.agent.model.clone_from(&config.llm.model);
-        }
-
-        // Set summarization configuration
-        self.config.agent.summarization_priority.clone_from(&config.llm.summarization_priority);
-        self.config.agent.summarization_ollama_url.clone_from(&config.llm.ollama_url);
-
-        // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
-        self.config.agent.openrouter_api_key.clone_from(&config.llm.openrouter_api_key);
-        self.config.agent.openai_api_key.clone_from(&config.llm.openai_api_key);
-
-        // Thinking mode is NOT read from config: it is always on (owner
-        // directive 2026-08-04). `AgentServiceConfig::default` already carries
-        // `ThinkingMode::default()`, and the `agent.thinking_enabled` flag that
-        // used to gate it here is gone.
-
-        // Agent-loop iteration policy: unbounded by default (long-horizon worker),
-        // with late escalating soft nudges. All three are user-configurable.
-        self.config.agent.max_iterations = config.agent.max_iterations;
-        self.config.agent.nudge_after_iterations = config.agent.nudge_after_iterations;
-        self.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
-
-        // Set model routing configuration
-        self.config.agent.model_routing.clone_from(&config.llm.model_routing);
-        self.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
-        self.config.agent.sub_agent_model.clone_from(&config.llm.sub_agent_model);
-        // Resolved here (list > legacy single > main chat list) so every
-        // consumer sees one authoritative, never-empty chain.
-        self.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
-        self.config.agent.prompt_cache_ttl =
-            crate::agent_service::cache_ttl_from(config.llm.prompt_cache_ttl);
-        if !config.llm.model_routing.is_empty() {
-            info!("Model routing enabled: {:?}", config.llm.model_routing);
-        }
-        if !config.llm.sub_agent_models.is_empty() || config.llm.sub_agent_model.is_some() {
-            info!(
-                "Sub-agent models: {:?}",
-                self.config.agent.sub_agent_models
-            );
-        }
-    }
-
-    /// Say which model, embedder and providers the loaded config selected.
-    fn log_loaded_config(&self) {
         // Log configured providers
         let mut providers = Vec::new();
-        if self.config.llm.anthropic_api_key.is_some()
-            || self.config.llm.anthropic_oauth_token.is_some()
+        if builder.config.llm.anthropic_api_key.is_some()
+            || builder.config.llm.anthropic_oauth_token.is_some()
         {
             providers.push("anthropic");
         }
-        if self.config.llm.openai_api_key.is_some() {
+        if builder.config.llm.openai_api_key.is_some() {
             providers.push("openai");
         }
-        if self.config.llm.openrouter_api_key.is_some() {
+        if builder.config.llm.openrouter_api_key.is_some() {
             providers.push("openrouter");
         }
-        if self.config.llm.github_token.is_some() {
+        if builder.config.llm.github_token.is_some() {
             providers.push("github");
         }
         providers.push("ollama"); // Always available
 
         info!(
             "Daemon config loaded: model={}, embedding={}:{}, providers=[{}], brave_key={}",
-            self.config.agent.model,
-            self.embedding.provider,
-            self.embedding.model,
+            builder.config.agent.model,
+            builder.embedding.provider,
+            builder.embedding.model,
             providers.join(", "),
-            if self.brave_api_key.is_some() {
+            if builder.brave_api_key.is_some() {
                 "set"
             } else {
                 "none"
             }
         );
+
+        Ok(builder)
     }
 
-    #[must_use]
-    pub const fn with_port(mut self, port: u16) -> Self {
+    pub fn with_port(mut self, port: u16) -> Self {
         self.config.ipc.port = port;
         self
     }
 
-    #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.config.ipc.host = host.into();
         self
     }
 
-    #[must_use]
     pub fn with_data_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.data_dir = path.into();
         self
     }
 
-    #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.config.log_level = level.into();
         self
     }
 
-    #[must_use]
-    pub const fn with_auto_save_interval(mut self, secs: u64) -> Self {
+    pub fn with_auto_save_interval(mut self, secs: u64) -> Self {
         self.config.auto_save_interval_secs = secs;
         self
     }
 
-    #[must_use]
     pub fn with_llm_provider(mut self, provider: impl Into<String>) -> Self {
         self.config.llm.provider = provider.into();
         self
     }
 
-    #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.config.llm.api_key = Some(key.into());
         self
     }
 
-    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.config.agent.model = model.into();
         self
     }
 
-    #[must_use]
-    pub const fn with_memory(mut self, enable: bool) -> Self {
+    pub fn with_memory(mut self, enable: bool) -> Self {
         self.config.enable_memory = enable;
         self
     }
 
-    #[must_use]
-    pub const fn with_health_server(mut self, enable: bool) -> Self {
-        self.config.servers.health = enable;
+    pub fn with_health_server(mut self, enable: bool) -> Self {
+        self.config.enable_health_server = enable;
         self
     }
 
-    #[must_use]
-    pub const fn with_health_port(mut self, port: u16) -> Self {
+    pub fn with_health_port(mut self, port: u16) -> Self {
         self.config.health_port = port;
         self
     }
 
-    #[must_use]
-    pub const fn with_pid_file(mut self, enable: bool) -> Self {
-        self.config.servers.pid_file = enable;
+    pub fn with_pid_file(mut self, enable: bool) -> Self {
+        self.config.enable_pid_file = enable;
         self
     }
 
-    #[must_use]
-    pub const fn with_webhook_server(mut self, enable: bool) -> Self {
-        self.config.servers.webhook = enable;
+    pub fn with_webhook_server(mut self, enable: bool) -> Self {
+        self.config.enable_webhook_server = enable;
         self
     }
 
-    #[must_use]
-    pub const fn with_webhook_port(mut self, port: u16) -> Self {
+    pub fn with_webhook_port(mut self, port: u16) -> Self {
         self.config.webhook_port = port;
         self
     }
 
-    #[must_use]
     pub fn with_webhook_config(mut self, config: WebhookConfig) -> Self {
         self.config.webhook = config;
         self
     }
 
-    #[must_use]
-    pub const fn with_script_tools(mut self, enable: bool) -> Self {
+    pub fn with_script_tools(mut self, enable: bool) -> Self {
         self.config.use_script_tools = enable;
         self
     }
 
-    #[must_use]
     pub fn with_log_buffer(mut self, buffer: crate::log_buffer::LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
         self
@@ -5419,6 +5177,75 @@ mod tests {
         service.list_all().await.into_iter().next().expect("seeded")
     }
 
+    #[test]
+    fn a_scheduled_result_is_posted_only_when_it_says_something() {
+        assert_eq!(
+            scheduled_output_message("inbox", "  3 new messages\n", false).as_deref(),
+            Some("**Scheduled: inbox**\n\n3 new messages")
+        );
+        assert_eq!(
+            scheduled_output_message("heartbeat", "HEARTBEAT_OK", true),
+            None
+        );
+        assert_eq!(scheduled_output_message("inbox", "   ", false), None);
+    }
+
+    #[test]
+    fn only_the_first_page_of_a_recall_counts_as_a_use() {
+        let served = vec!["chunk-1".to_string(), "chunk-2".to_string()];
+        let signals = recall_feedback(0, &served);
+        assert_eq!(signals.len(), 2);
+        assert!(
+            signals
+                .iter()
+                .all(|(_, f)| *f == nanna_memory::MemoryFeedback::UsedSuccessfully)
+        );
+        assert!(
+            recall_feedback(4000, &served).is_empty(),
+            "a later page is the same use"
+        );
+    }
+
+    /// End to end through the real service map: resolving a stub's handle
+    /// credits every chunk row that served it, once.
+    #[tokio::test]
+    async fn resolving_a_stored_result_credits_the_rows_that_served_it() {
+        let store = seeded_chunk_store(3, 3).await;
+        let dreaming = Arc::new(nanna_memory::DreamingService::with_shared_memory(
+            nanna_memory::DreamingConfig::default(),
+            Arc::clone(&store),
+        ));
+        let slot: DreamingSlot = Arc::new(std::sync::OnceLock::new());
+        assert!(slot.set(Arc::clone(&dreaming)).is_ok());
+        let services = build_script_services(ScriptServiceDeps {
+            memory: Some(Arc::clone(&store)),
+            feedback: Some(slot),
+            ..ScriptServiceDeps::default()
+        });
+
+        let first = services["memory.get"](serde_json::json!({ "id": "abc123", "limit": 7 }))
+            .await
+            .expect("resolved");
+        assert_eq!(first["content"], "part 1\n");
+        let next = services["memory.get"](serde_json::json!({ "id": "abc123", "offset": 7 }))
+            .await
+            .expect("next page");
+        assert_eq!(next["offset"], 7);
+
+        for chunk in ["chunk-1", "chunk-2", "chunk-3"] {
+            assert_eq!(
+                dreaming.pending_feedback_boost(chunk).await,
+                Some(0.5),
+                "{chunk}: one UsedSuccessfully, not one per page"
+            );
+        }
+        assert!(
+            services["memory.get"](serde_json::json!({ "id": "no-such-handle" }))
+                .await
+                .is_err()
+        );
+    }
+
     /// The whole result is present: the reassembly is exactly the chunks, in
     /// order, and says nothing extra. An announcement on a complete read would
     /// be noise, and worse, would teach the model to ignore the real one.
@@ -5524,7 +5351,7 @@ mod tests {
     /// `embedding_provider`. A default entry here therefore overrides the
     /// provider the user actually selected, silently.
     ///
-    /// It was `["openai/text-embedding-3-small"]`. With no `OpenAI` key that
+    /// It was `["openai/text-embedding-3-small"]`. With no OpenAI key that
     /// resolved zero providers and switched the whole memory subsystem off, and
     /// the Settings dropdown writes provider/model without touching this list,
     /// so the state was one click away for anyone who chose Ollama.
@@ -5540,7 +5367,7 @@ mod tests {
     }
 
     /// REGRESSION: a scheduled run must see its own session — every one of the
-    /// 35 logged "session scope requires `session_id`" `todo` failures came from
+    /// 35 logged "session scope requires session_id" `todo` failures came from
     /// a `scheduled-heartbeat-*` run that had a session id all along, it just
     /// never reached the registry `Nanna.sessionId()` reads.
     ///
@@ -5969,10 +5796,10 @@ mod tests {
         // config file documents — the daemon's fallback cannot drift from it.
         let daemon = DaemonConfig::default();
         let scheduler = nanna_config::SchedulerConfig::default();
-        assert_eq!(daemon.scheduler.enabled, scheduler.enabled);
-        assert_eq!(daemon.scheduler.heartbeat_enabled, scheduler.heartbeat_enabled);
+        assert_eq!(daemon.scheduler_enabled, scheduler.enabled);
+        assert_eq!(daemon.heartbeat_enabled, scheduler.heartbeat_enabled);
         assert_eq!(
-            daemon.scheduler.heartbeat_interval_secs,
+            daemon.heartbeat_interval_secs,
             scheduler.heartbeat_interval_secs
         );
     }
@@ -5988,17 +5815,17 @@ mod tests {
             heartbeat_enabled: false,
             heartbeat_interval_secs: 600,
         };
-        builder.config.scheduler.enabled = user.enabled;
-        builder.config.scheduler.heartbeat_enabled = user.heartbeat_enabled;
-        builder.config.scheduler.heartbeat_interval_secs = user.heartbeat_interval_secs;
+        builder.config.scheduler_enabled = user.enabled;
+        builder.config.heartbeat_enabled = user.heartbeat_enabled;
+        builder.config.heartbeat_interval_secs = user.heartbeat_interval_secs;
 
         // Mirrors the construction in `init_services`.
         let core = nanna_core::SchedulerConfig {
-            enabled: builder.config.scheduler.enabled,
+            enabled: builder.config.scheduler_enabled,
             heartbeat_interval: std::time::Duration::from_secs(nanna_core::clamp_heartbeat_secs(
-                builder.config.scheduler.heartbeat_interval_secs,
+                builder.config.heartbeat_interval_secs,
             )),
-            heartbeat_enabled: builder.config.scheduler.heartbeat_enabled,
+            heartbeat_enabled: builder.config.heartbeat_enabled,
             ..nanna_core::SchedulerConfig::default()
         };
 

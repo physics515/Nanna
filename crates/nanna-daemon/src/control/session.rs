@@ -228,6 +228,7 @@ impl ControlPlane {
                 event,
                 Event::SessionCreated { .. }
                     | Event::SessionDeleted { .. }
+                    | Event::SessionCleared { .. }
                     | Event::SessionRenamed { .. }
             ),
             "only session lifecycle events go through here"
@@ -235,6 +236,16 @@ impl ControlPlane {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(event);
         }
+    }
+
+    /// Remove every message of a session and tell connected clients. The one
+    /// clear path for IPC `session.clear` and a chat app's `/new`.
+    pub(crate) async fn clear_session(&self, id: &str) -> bool {
+        let cleared = self.sessions.clear(id).await;
+        if cleared {
+            self.notify_session_event(Event::SessionCleared { id: id.to_string() });
+        }
+        cleared
     }
 
     pub(super) async fn handle_session(&self, client_id: &str, action: SessionAction) -> Value {
@@ -266,7 +277,7 @@ impl ControlPlane {
             SessionAction::Delete { id } => self.session_delete(id).await,
             SessionAction::DeleteAll => self.delete_all_sessions().await,
             SessionAction::Clear { id } => {
-                if self.sessions.clear(&id).await {
+                if self.clear_session(&id).await {
                     json!({ "status": "cleared", "id": id })
                 } else {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
@@ -298,7 +309,39 @@ impl ControlPlane {
                     json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
                 }
             }
-            SessionAction::Fork { id, name } => self.fork_session(id, name).await,
+            SessionAction::FileHistory { id, path, limit } => {
+                let Some(history) = nanna_scripting::file_history::installed() else {
+                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+                };
+                let params = json!({ "session_id": id, "path": path, "limit": limit });
+                match crate::file_history_service::list(history, &params).await {
+                    Ok(listed) => listed,
+                    Err(message) => json!({ "error": "file_history_failed", "message": message }),
+                }
+            }
+            SessionAction::RestoreFile { id, checkpoint } => {
+                let Some(history) = nanna_scripting::file_history::installed() else {
+                    return json!({ "error": "file_history_unavailable", "message": "File history is not enabled on this daemon" });
+                };
+                let params = json!({ "session_id": id, "checkpoint": checkpoint });
+                match crate::file_history_service::restore(history, &params).await {
+                    Ok(restored) => json!({ "ok": true, "restored": restored }),
+                    Err(message) => json!({ "error": "restore_failed", "message": message }),
+                }
+            }
+            SessionAction::Fork { id, name } => {
+                if let Some(original) = self.sessions.get(&id).await {
+                    let mut forked = self.sessions.create(
+                        name.or_else(|| original.name.as_ref().map(|n| format!("{} (copy)", n)))
+                    ).await;
+                    // Copy messages
+                    forked.messages = original.messages.clone();
+                    self.sessions.update(forked.clone()).await;
+                    json!({ "session": forked })
+                } else {
+                    json!({ "error": "not_found", "message": format!("Session {} not found", id) })
+                }
+            }
 
             // --- Sub-Agent Sessions (#72) ---
 

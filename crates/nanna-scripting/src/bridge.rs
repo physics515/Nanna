@@ -1155,6 +1155,17 @@ impl NannaBridge {
             )));
         }
 
+        // Snapshot what this write is about to replace, so it can be undone.
+        // Never blocks the write: losing the undo beats losing the work.
+        if let Some(history) = crate::file_history::installed()
+            && !crate::file_history::is_tool_housekeeping(&path)
+            && let Err(e) = history
+                .record_before_write(self.session_id.as_deref(), &path)
+                .await
+        {
+            tracing::warn!(path = %path.display(), error = %e, "pre-write snapshot failed; writing without an undo");
+        }
+
         // Create parent directories if needed
         if let Some(parent) = path.parent()
             && !parent.exists() {

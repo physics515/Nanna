@@ -17,6 +17,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("013_embedding_buckets", MIGRATION_013),
     ("014_memory_events", MIGRATION_014),
     ("015_model_stats_cache_ttl", MIGRATION_015),
+    ("016_request_log_cache_ttl", MIGRATION_016),
 ];
 
 const MIGRATION_001: &str = r"
@@ -556,6 +557,12 @@ const MIGRATION_015: &str = r"
 -- cannot be priced once [llm] prompt_cache_ttl can be 1h. A subset of
 -- total_cache_creation_tokens, never added to it.
 ALTER TABLE model_stats ADD COLUMN total_cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;
+";
+
+const MIGRATION_016: &str = r"
+-- The same 1-hour cache-write share, per request, so a day's spend can be
+-- priced from the request log exactly as the lifetime totals are.
+ALTER TABLE model_request_log ADD COLUMN cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Lexer state while splitting a migration.

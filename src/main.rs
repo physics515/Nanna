@@ -196,6 +196,22 @@ enum McpAction {
         #[arg(long)]
         tools_dir: Option<std::path::PathBuf>,
     },
+
+    /// Store or remove a secret an MCP server gets as an environment variable
+    /// (listed by name in its `secret_env`). Values go to the OS keyring,
+    /// never to config.toml, and are read from a prompt or stdin — not argv.
+    Secret {
+        #[command(subcommand)]
+        action: McpSecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpSecretAction {
+    /// Store a value: `nanna mcp secret set github GITHUB_PERSONAL_ACCESS_TOKEN`
+    Set { server: String, var: String },
+    /// Remove a stored value
+    Delete { server: String, var: String },
 }
 
 #[derive(Subcommand)]
@@ -304,6 +320,17 @@ fn init_logging(log_level: Level, logs_to_stderr: bool) {
     }
 }
 
+/// `nanna mcp …`.
+async fn run_mcp(config: &Config, action: McpAction) -> anyhow::Result<()> {
+    match action {
+        McpAction::Serve { tools_dir } => commands::mcp::serve(config, tools_dir).await,
+        McpAction::Secret { action } => match action {
+            McpSecretAction::Set { server, var } => commands::mcp::secret_set(config, &server, &var),
+            McpSecretAction::Delete { server, var } => commands::mcp::secret_delete(&server, &var),
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -375,11 +402,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Commands::Mcp { action }) => {
-            match action {
-                McpAction::Serve { tools_dir } => {
-                    commands::mcp::serve(&config, tools_dir).await?;
-                }
-            }
+            run_mcp(&config, action).await?;
             return Ok(());
         }
         Some(Commands::Server { host, port }) => {

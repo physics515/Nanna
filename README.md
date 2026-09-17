@@ -80,8 +80,8 @@ A fully local run needs none.
 | **Signal Channel** | ✅ Stable | Signal CLI bridge |
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
-| **Tool System (44 tools, 41 wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
-| **MCP Client** | ✅ Stable | MCP server |
+| **Tool System (47 tools, all wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
+| **MCP Client** | ✅ Stable (stdio servers) | A server listed under `[mcp]` |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
 ---
@@ -95,7 +95,7 @@ A fully local run needs none.
   with drift protection: what you *stated* is kept in your words and never paraphrased away, and a
   summary is never re-summarized ([measured](bench/BASELINE.md#summarization-drift-content-fidelity-not-recall))
 - **LLM routing** — Local-first with optional cloud escalation; native prompt caching (50–80% savings)
-- **44 filesystem tools, 41 of them wired** — file, shell, web, code-search, memory, task and
+- **47 filesystem tools, all of them wired** — file, shell, web, code-search, memory, task and
   curiosity tools work with no setup. A tool whose daemon-side service is missing is **withheld from
   the model rather than offered and left to fail**, and the daemon says at boot which ones and why —
   so the count you get is the count that works. Four groups need something present to register:
@@ -104,23 +104,32 @@ A fully local run needs none.
   wants an OpenAI key; **browsing** (`browser_action`, `browser_evaluate`, `browser_extract`,
   `browser_screenshot`) wants Chromium or Chrome installed; and **`screenshot`** wants a desktop
   capture tool (`grim`, `spectacle`, `maim`, `scrot`, `import`, or macOS `screencapture`) and a
-  display session. The three reminder tools (`remind`, `list_reminders`, `cancel_reminder`) are not
-  wired yet. Also includes `find_files` for locating a file by glob when you know its name but not
+  display session. **Reminders** (`remind`, `list_reminders`, `cancel_reminder`) need nothing: a
+  due reminder is posted into the conversation that set it and shows up live in an open chat; it
+  survives a restart, and one that came due while Nanna was not running is delivered at the next
+  boot and says how late it is. Also includes `find_files` for locating a file by glob when you know its name but not
   its path.
 - **Nanna can write its own tools** — `create_tool` authors a new JS/TS tool into the data directory
   and registers it live, callable in the same conversation with no restart; `edit_tool` changes one,
   refusing an edit that matches zero or several places rather than guessing, and re-registering on
   success; `list_user_tools` shows what has been authored.
+- **Asks when it is unsure** — `ask_user` posts a clarifying question into the conversation (the app, or the chat app you wrote from) and waits up to half an hour for your reply, which the running turn picks up and continues with; no reply, and it carries on with its best judgement and says what it assumed.
+- **Your file rules stay yours** — a rule you declared ("don't touch tests/") blocks `write_file`/`edit_file`; when it really stands in the way, `lift_invariant` asks you, quoting your own words, and lifts it only on a clear yes.
 - **Reads what it is shown** — `read_pdf` falls back to model OCR for image-only pages when a vision
   model is configured, and reports which of four things happened (no OCR configured, OCR ran, the
   document has no images to read, or no page was missing text) instead of returning an empty string
   for all of them. Screenshots and generated speech are written to files and their paths returned,
   not summarised as a byte count and discarded.
-- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
+- **Five channels** — Telegram, Discord, Slack, Signal, WhatsApp. Each chat gets its own conversation, answers (and reminders set from the chat) come back to it, `/model <name>` pins that conversation to a model (`/model default` undoes it), and `/status`, `/stop` and `/new` (start the chat over) work from the chat app. Inbound webhooks **fail closed**: every route verifies its provider signature or shared secret before the payload reaches the agent, and a channel with no credential configured refuses to serve (503) rather than accepting anonymous requests. Discord and Slack captures also expire on a 5-minute replay window. `nanna init` mints the Telegram secret and prints the `setWebhook` call.
 - **Tool audit trail** — one JSON line per tool call (including refused and not-found ones), recorded at the registry chokepoint so every caller is covered; argument values stay out by default
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
+- **Undo for file writes** — before `write_file`, `edit_file` or `file_buffer` changes a file, its previous content is saved outside your project (in Nanna's data directory, per conversation), and the `file_history` tool lists those checkpoints and puts a file back — including removing one a write created. A restore is itself undoable. Bounded: the 100 most recent checkpoints per conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall; changes made through `exec` are not tracked.
 - **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
 - **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
+- **MCP servers** — list stdio MCP servers under `[mcp]` and the daemon starts them at boot, in the
+  background so a slow first `npx` download never delays startup; their tools appear to the model as
+  `mcp__<server>__<tool>`. A server that fails to start is logged by name and the rest still start, and
+  the servers are shut down with the daemon. HTTP/SSE servers are not started from config yet.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -292,7 +301,24 @@ model = "qwen3.5:9b"
 
 [server]
 port = 3000               # `nanna server` port; the PORT env var or --port override it
+
+[[mcp.servers]]           # repeat per server; tools show up as mcp__files__<tool>
+name = "files"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
+# enabled = false         # keep the entry without starting it
+# secret_env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]  # values from the keyring, see below
 ```
+
+Edits to `config.toml` apply to a running daemon within a couple of seconds (models and
+providers, scheduler switches); channel, MCP and webhook settings are read at startup. A file
+that does not parse is logged and the running configuration is kept.
+
+MCP servers inherit the daemon's environment. There is deliberately no `env` table in
+`config.toml`: a token a server needs is named in `secret_env` and stored with
+`nanna mcp secret set <server> <VAR>` (prompted, or read from stdin — never a command-line
+argument). The value lives in the OS keyring and only that server's process receives it; a server
+whose secret is missing is not started, and `system.status` / the Tools page say which command sets it.
 
 **Environment Variables:**
 
@@ -306,7 +332,7 @@ port = 3000               # `nanna server` port; the PORT env var or --port over
 | `DISCORD_BOT_TOKEN` | Discord channel |
 | `NANNA_CONFIG_PATH` | Load config from this file instead of the default location above |
 
-**Ports:** Health HTTP `5148` · WebSocket IPC `5149`
+**Ports:** Health HTTP `5148` (`/health`, `/status`, and Prometheus `/metrics`) · WebSocket IPC `5149`
 
 `NANNA_CONFIG_PATH` is useful for running a second instance, or for trying a
 configuration without touching the one you use day to day — pair it with the

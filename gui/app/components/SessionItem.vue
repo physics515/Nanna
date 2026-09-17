@@ -42,6 +42,8 @@
         class="absolute right-0 top-full z-50 w-36 overflow-hidden border border-solid border-nui-muted/40 bg-nui-bg p-1"
       >
         <button @click="startRename" class="ctx-item block w-full px-2.5 py-1.5 text-left text-xs text-nui-fg transition-colors hover:bg-white/5">Rename</button>
+        <button @click="exportAs('markdown')" class="ctx-item ctx-export block w-full px-2.5 py-1.5 text-left text-xs text-nui-fg transition-colors hover:bg-white/5">Export Markdown</button>
+        <button @click="exportAs('json')" class="ctx-item ctx-export block w-full px-2.5 py-1.5 text-left text-xs text-nui-fg transition-colors hover:bg-white/5">Export JSON</button>
         <button @click="confirmDelete" class="ctx-item ctx-danger block w-full px-2.5 py-1.5 text-left text-xs text-nui-pink transition-colors hover:bg-nui-pink/10">Delete</button>
       </div>
     </Transition>
@@ -77,6 +79,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { modelDisplayName } from '~/lib/modelSpecs'
 import { knownChatModel } from '~/composables/useSessionState'
 import { useConfirm } from '~/composables/useConfirm'
+import { useToast } from '~/composables/useToast'
 const { confirm } = useConfirm()
 
 interface SessionInfo {
@@ -138,6 +141,19 @@ async function saveRename() {
     emit('renamed', { ...props.session, name: newName.value.trim() })
     isRenaming.value = false
   } catch (e) { console.error('Failed to rename:', e) }
+}
+
+const toast = useToast()
+
+/** Save this chat as a document; the daemon renders it, Rust asks where. */
+async function exportAs(format: 'markdown' | 'json') {
+  showMenu.value = false
+  try {
+    const saved = await invoke<string | null>('export_session', { sessionId: props.session.id, format })
+    if (saved) toast.success('Chat exported', saved)
+  } catch (e) {
+    toast.error('Could not export the chat', String(e))
+  }
 }
 
 async function confirmDelete() {

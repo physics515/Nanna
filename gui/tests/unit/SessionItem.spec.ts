@@ -7,6 +7,8 @@ const invoke = vi.fn()
 const confirm = vi.fn()
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(...args) }))
 vi.mock('~/composables/useConfirm', () => ({ useConfirm: () => ({ confirm }) }))
+const toastSuccess = vi.fn()
+vi.mock('~/composables/useToast', () => ({ useToast: () => ({ success: toastSuccess, error: vi.fn(), info: vi.fn(), warning: vi.fn(), show: vi.fn() }) }))
 vi.mock('~/composables/useSplatter', () => ({ useSplatter: () => ({ splatterBg: '', onEnter: vi.fn(), onLeave: vi.fn() }) }))
 
 const session = { id: 'session-1', name: 'Moon notes', created_at: '2026-01-01T00:00:00Z', updated_at: new Date().toISOString(), message_count: 4, workspace_id: null, workspace_name: null }
@@ -36,9 +38,20 @@ describe('SessionItem', () => {
     expect(invoke).not.toHaveBeenCalled()
   })
 
+  it('exports this chat in the chosen format and says where it went', async () => {
+    invoke.mockResolvedValue('/home/me/moon-notes.md')
+    const wrapper = mountItem(); await openMenu(wrapper); await wrapper.findAll('.ctx-export')[0].trigger('click')
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('export_session', { sessionId: 'session-1', format: 'markdown' }))
+    await vi.waitFor(() => expect(toastSuccess).toHaveBeenCalledWith('Chat exported', '/home/me/moon-notes.md'))
+    toastSuccess.mockReset(); invoke.mockResolvedValue(null)
+    await openMenu(wrapper); await wrapper.findAll('.ctx-export')[1].trigger('click')
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('export_session', { sessionId: 'session-1', format: 'json' }))
+    expect(toastSuccess).not.toHaveBeenCalled()
+  })
+
   it('deletes only after confirmation', async () => {
     confirm.mockResolvedValue(true); invoke.mockResolvedValue(undefined)
-    const wrapper = mountItem(); await openMenu(wrapper); await wrapper.findAll('.ctx-item')[1].trigger('click')
+    const wrapper = mountItem(); await openMenu(wrapper); await wrapper.get('.ctx-danger').trigger('click')
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('delete_session', { sessionId: 'session-1' }))
     expect(wrapper.emitted('deleted')?.[0]).toEqual(['session-1'])
   })

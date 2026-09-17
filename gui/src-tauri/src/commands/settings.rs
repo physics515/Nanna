@@ -129,38 +129,6 @@ pub async fn set_model(state: State<'_, Arc<RwLock<AppState>>>, model: String) -
     Ok(())
 }
 
-/// Set API key
-///
-/// # Errors
-///
-/// Never returns `Err`: a failed `config.toml` save is logged, and the daemon
-/// reload is best-effort.
-#[tauri::command]
-pub async fn set_api_key(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    api_key: String,
-) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-
-    // The daemon owns the live LLM client; persist the key to config (which the
-    // daemon reads) and ask it to reload.
-    state_guard.config.llm.api_key = Some(api_key.clone());
-
-    // SAFETY: single-threaded application context
-    unsafe {
-        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
-    }
-
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save config: {e}");
-    }
-    let _ = state_guard.backend.config_reload().await;
-    drop(state_guard);
-
-    info!("API key updated");
-    Ok(())
-}
-
 /// Extended settings for the settings page
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedSettings {
@@ -313,7 +281,8 @@ pub async fn get_extended_settings(
             claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
                 .unwrap_or_else(|_| "http://localhost:3456".to_string()),
         },
-        brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
+        brave_key_set: state_guard.config.tools.brave_api_key.is_some()
+            || std::env::var("BRAVE_API_KEY").is_ok(),
 
         // Anthropic OAuth status
         anthropic_oauth: AnthropicOauthStatus {
@@ -444,28 +413,18 @@ pub async fn set_provider_api_key(
     let mut state_guard = state.write().await;
 
     // The daemon owns the live LLM clients and tool registry; persist the key to
-    // config (+ env for this process) and let the daemon reload.
+    // the secure store and let the daemon reload. This process reads keys from
+    // `state_guard.config` (refilled from the store below), not from its own
+    // environment: `set_var` from a command running on the multi-threaded
+    // runtime races every concurrent `getenv`, and an env copy was gone after a
+    // restart anyway — `get_openai_models` read only env, so a stored OpenAI key
+    // stopped listing models once the GUI restarted.
     match provider.as_str() {
-        "anthropic" => {
-            state_guard.config.llm.api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
-        }
-        "openai" => {
-            state_guard.config.llm.openai_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
-        }
-        "brave" => {
-            state_guard.config.tools.brave_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("BRAVE_API_KEY", &api_key); }
-        }
-        "openrouter" => {
-            state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
-        }
-        "github" => {
-            state_guard.config.llm.github_token = Some(api_key.clone());
-            unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
-        }
+        "anthropic" => state_guard.config.llm.api_key = Some(api_key.clone()),
+        "openai" => state_guard.config.llm.openai_api_key = Some(api_key.clone()),
+        "brave" => state_guard.config.tools.brave_api_key = Some(api_key.clone()),
+        "openrouter" => state_guard.config.llm.openrouter_api_key = Some(api_key.clone()),
+        "github" => state_guard.config.llm.github_token = Some(api_key.clone()),
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
             unsafe {
@@ -831,6 +790,23 @@ pub async fn get_daemon_providers(
         .ok_or_else(|| "daemon did not report llm_providers".to_string())
 }
 
+/// Each configured MCP server's state, from the daemon's `system.status`.
+///
+/// Empty — not an error — when the daemon predates the field or has no MCP
+/// servers configured: the Tools page then simply shows no MCP section.
+#[tauri::command]
+pub async fn get_mcp_servers(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let state_guard = state.read().await;
+    let status = state_guard.backend.system_status().await?;
+    Ok(status
+        .get("mcp_servers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 /// Refresh the OAuth token if expired or expiring soon
 ///
 /// # Errors
@@ -1033,10 +1009,9 @@ pub async fn set_ollama_host(
         }
     }
     let _ = state_guard.backend.config_reload().await;
-    drop(state_guard);
-
-    // Also set env var for current session
-    unsafe { std::env::set_var("OLLAMA_HOST", &host); }
+    // No `OLLAMA_HOST` copy in this process's environment: nothing in the GUI
+    // reads it (the daemon is a separate process and reads the config file),
+    // and `set_var` here raced concurrent `getenv` on the multi-threaded runtime.
 
     Ok(format!("Ollama host saved: {host}"))
 }
@@ -1282,7 +1257,32 @@ pub async fn get_anthropic_models(
 /// and `Failed to parse OpenAI response: …` when the body is not the expected
 /// model list.
 #[tauri::command]
-pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
+pub async fn get_openai_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    // Config first: it holds the keyring copy, which survives a restart.
+    let api_key = state.read().await.config.llm.openai_api_key.clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .ok_or("No OpenAI API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenAI models: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {}: {}", status, body));
+    }
+
     #[derive(Deserialize)]
     struct OpenAIModelsResponse {
         data: Vec<OpenAIModel>,
