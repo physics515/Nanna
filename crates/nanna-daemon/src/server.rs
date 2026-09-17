@@ -1397,6 +1397,8 @@ pub struct DaemonConfig {
     /// Live memory count that forces a dream cycle regardless of idle time
     /// (mirrors `[memory] dream_memory_pressure_count`; `0` disables).
     pub dream_memory_pressure_count: usize,
+    /// MCP servers to start at boot (`[mcp]`).
+    pub mcp: nanna_config::McpConfig,
     /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
     /// `false` loads cron jobs but fires nothing.
     pub scheduler_enabled: bool,
@@ -1550,6 +1552,7 @@ impl Default for DaemonConfig {
             // Mirror DreamingConfig::default() (== nanna-config defaults).
             dream_idle_threshold_secs: 300,
             dream_memory_pressure_count: 5000,
+            mcp: nanna_config::McpConfig::default(),
             // Mirror nanna_config::SchedulerConfig::default().
             scheduler_enabled: true,
             heartbeat_enabled: true,
@@ -4223,6 +4226,14 @@ impl DaemonServer {
             info!("Tool registry: {} tools (including aliases)", tool_count);
         }
 
+        // MCP servers register their tools as each handshake completes; the
+        // count above is the tool surface before them.
+        crate::mcp_startup::spawn_mcp_servers(
+            &self.config.mcp,
+            Arc::clone(&tools),
+            self.shutdown_tx.subscribe(),
+        );
+
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
             if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
@@ -4500,6 +4511,7 @@ impl DaemonBuilder {
         // `ocr_model_priority` already means "vision-capable models, in order";
         // `vision.analyze` reads it rather than adding a second list.
         builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
+        builder.config.mcp = config.mcp.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
         // this the GUI's Scheduler tab is dead UI and the heartbeat is

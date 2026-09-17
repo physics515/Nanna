@@ -4511,11 +4511,35 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       real daemon (`tool="grim" executable="/usr/bin/grim"`, and the boot left the screenshot
       directory empty) and the pixel path was not exercised. A capture is one command; someone's
       screen is not test fixture.
-- [ ] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
+- [~] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
       constructed nowhere and nanna-config has no `[mcp]` section. Add config + daemon boot registration +
       bearer/OAuth headers on HttpTransport (currently none) + Streamable HTTP (pinned to 2024-11-05 legacy
       SSE). Unlocks the whole connector ecosystem (calendar, email, home automation) — highest-leverage
       integration path for a personal daemon.
+      *(2026-09-17) The stdio half landed, and it found a bug that would have broken every turn.*
+      `[[mcp.servers]] {name, command, args, enabled}` in `nanna-config` (bounded at 16 servers —
+      each is a child process, ~50–100 MB for the common Node ones; blank/duplicate/over-limit
+      entries are named in the log, not started). The daemon starts them **in the background** after
+      the skill registry is built (`mcp_startup.rs`), so a first-run `npx -y` download cannot hold
+      readiness hostage, and shuts them down on the shutdown broadcast. **The latent bug:** MCP tools
+      registered as `server:tool`, and both Anthropic and OpenAI validate tool names against
+      `^[a-zA-Z0-9_-]{1,64}$` — a `:` rejects the WHOLE request, so the first MCP tool anyone
+      configured would have failed every turn. Now `mcp__{server}__{tool}`, sanitized, and hashed
+      past 64 characters so two long names sharing a prefix stay distinct. No `env` table on purpose:
+      secrets left `config.toml` in P1, and a server inherits the daemon's environment.
+      Verified on the real debug daemon with a stdio fixture server (Python, scratch config): tool
+      listed as `mcp__fixture__shout`, `tool.execute` returned `HELLO FROM NANNA`, a nonexistent
+      command and a duplicate name each logged and skipped while the good server started, and on
+      SIGTERM the daemon exited `clean_shutdown` with the fixture child reaped. Not verified: a
+      model actually choosing the tool (no model on this host), and a real `npx` server.
+      - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
+            speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
+            keyring (not `config.toml`), then Streamable HTTP.
+      - [ ] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
+            need a token, so a GitHub/Calendar server does not require exporting the token into the
+            daemon's own environment (where every `exec` child also inherits it).
+      - [ ] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
+            server as started / failed-with-reason; today that lives only in the boot log.
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.

@@ -81,7 +81,7 @@ A fully local run needs none.
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
 | **Tool System (44 tools, 41 wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
-| **MCP Client** | ✅ Stable | MCP server |
+| **MCP Client** | ✅ Stable (stdio servers) | A server listed under `[mcp]` |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
 ---
@@ -123,6 +123,10 @@ A fully local run needs none.
 - **Repo-aware context** — when the workspace is a git repository, each turn sees a bounded snapshot of the branch, uncommitted paths, and recent commits, so the agent knows what work is already in flight before it edits
 - **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
 - **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
+- **MCP servers** — list stdio MCP servers under `[mcp]` and the daemon starts them at boot, in the
+  background so a slow first `npx` download never delays startup; their tools appear to the model as
+  `mcp__<server>__<tool>`. A server that fails to start is logged by name and the rest still start, and
+  the servers are shut down with the daemon. HTTP/SSE servers are not started from config yet.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -294,7 +298,16 @@ model = "qwen3.5:9b"
 
 [server]
 port = 3000               # `nanna server` port; the PORT env var or --port override it
+
+[[mcp.servers]]           # repeat per server; tools show up as mcp__files__<tool>
+name = "files"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
+# enabled = false         # keep the entry without starting it
 ```
+
+MCP servers inherit the daemon's environment; there is deliberately no `env` table in
+`config.toml`, so a token a server needs is supplied by starting the daemon with it set.
 
 **Environment Variables:**
 

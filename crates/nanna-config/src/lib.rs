@@ -12,6 +12,9 @@ pub use infer::{
     PrecisionReason, ResolvedPrecision,
 };
 pub mod bind;
+/// MCP servers started at boot (`[mcp]`).
+pub mod mcp;
+pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry};
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -91,6 +94,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     /// Local (on-device) inference settings — the Mummu runner.
     pub infer: InferConfig,
+    /// MCP servers the daemon starts at boot.
+    pub mcp: McpConfig,
 }
 
 
