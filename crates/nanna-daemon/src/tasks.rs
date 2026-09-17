@@ -379,10 +379,10 @@ fn opt_string(params: &Value, key: &str) -> Option<String> {
 /// canonical object, identical to what the planner admits and what `create`
 /// stores.
 fn canonical_acceptance(params: &Value) -> Result<Option<Value>, String> {
-    match params.get("acceptance").filter(|v| !v.is_null()) {
-        Some(raw) => AcceptanceCheck::canonicalize(raw).map(Some),
-        None => Ok(None),
-    }
+    params
+        .get("acceptance")
+        .filter(|v| !v.is_null())
+        .map_or(Ok(None), |raw| AcceptanceCheck::canonicalize(raw).map(Some))
 }
 
 // ---------------------------------------------------------------------------
@@ -688,10 +688,10 @@ pub fn build_task_services(
                     let note = decomposition_note(depth, open_siblings, parent_id);
 
                     let task = storage.tasks().create(new).await.map_err(err_str)?;
-                    match note {
-                        Some(note) => Ok(json!({ "task": task_to_json(&task), "note": note })),
-                        None => Ok(json!({ "task": task_to_json(&task) })),
-                    }
+                    Ok(note.map_or_else(
+                        || json!({ "task": task_to_json(&task) }),
+                        |note| json!({ "task": task_to_json(&task), "note": note }),
+                    ))
                 })
             }),
         );
@@ -773,9 +773,7 @@ pub fn build_task_services(
                     let actor = opt_string(&params, "actor");
                     let task = storage.tasks().get(id).await.map_err(err_str)?;
 
-                    let mut verified = false;
-                    let mut verdict_detail = Value::Null;
-                    if let Some(acceptance) = &task.acceptance {
+                    let (verified, verdict_detail) = if let Some(acceptance) = &task.acceptance {
                         let check = AcceptanceCheck::from_json(acceptance)?;
                         let workdir = opt_string(&params, "workdir")
                             .map_or_else(|| PathBuf::from("."), PathBuf::from);
@@ -803,9 +801,10 @@ pub fn build_task_services(
                                 ),
                             }));
                         }
-                        verified = true;
-                        verdict_detail = json!(verdict.detail);
-                    }
+                        (true, json!(verdict.detail))
+                    } else {
+                        (false, Value::Null)
+                    };
 
                     let outcome = storage
                         .tasks()
@@ -1052,7 +1051,6 @@ pub fn build_task_services(
     // tasks.counts {scope?, session_id?}
     {
         let storage = storage.clone();
-        let workspace_id = workspace_id;
         services.insert(
             "tasks.counts".to_string(),
             Arc::new(move |params: Value| {
@@ -1489,8 +1487,10 @@ pub struct AgentStepRunner {
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
-/// contract (`MessageDelta` / `ToolStart` / `ToolEnd`), so a long-horizon run
-/// renders in the transcript with no protocol change on the GUI side.
+/// contract (`MessageDelta` / `ToolStart` / `ToolEnd`).
+///
+/// A long-horizon run therefore renders in the transcript with no protocol
+/// change on the GUI side.
 ///
 /// When `run` is set (chat-backed runs), every callback ALSO fills the
 /// registered [`crate::agent_service::ExternalRunHandle`] buffers, which is
@@ -1695,8 +1695,8 @@ impl ChatSink {
             let session_id = self.session_id.clone();
             // Recording is async and this callback is sync — hand it off.
             tokio::spawn(async move {
-                if let Some(storage) = storage {
-                    if let Err(e) = storage
+                if let Some(storage) = storage
+                    && let Err(e) = storage
                         .log_tool_call(
                             &observation.tool_name,
                             observation.success,
@@ -1707,9 +1707,8 @@ impl ChatSink {
                             Some(&session_id),
                         )
                         .await
-                    {
-                        tracing::warn!("Failed to log tool call to DB: {e}");
-                    }
+                {
+                    tracing::warn!("Failed to log tool call to DB: {e}");
                 }
                 stats.record(observation).await;
             });
@@ -1731,6 +1730,39 @@ impl ChatSink {
     /// `ActiveChat`, and `ExternalRunHandle` — this path's only handle on that
     /// state — does not expose them; when it does, they belong here beside the
     /// event.
+    /// Wire a harness step's text, thinking, tool and usage streams into this
+    /// sink.
+    ///
+    /// The live context gauge rides along: the step path never set
+    /// `on_usage`, so the ONLY emitter of `ContextUsage` sat in the retired
+    /// in-service chat path: every client's meter read 0 of 0 for the whole
+    /// run while the daemon recomputed the real figures on every request (59
+    /// of 59 captured run-state snapshots, 56 of them mid-run).
+    fn attach_stream_callbacks(&self, options: &mut nanna_agent::RunOptions) {
+        let text_sink = self.clone();
+        let think_sink = self.clone();
+        let start_sink = self.clone();
+        let end_sink = self.clone();
+        options.on_text = Some(Box::new(move |chunk: &str| text_sink.delta(chunk)));
+        options.on_thinking = Some(Box::new(move |chunk: &str| think_sink.thinking(chunk)));
+        options.on_tool_start = Some(Box::new(
+            move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
+                start_sink.tool_start(call_id, name, input, model);
+            },
+        ));
+        options.on_tool_end = Some(Box::new(
+            move |call_id: &str,
+                  name: &str,
+                  output: &str,
+                  success: bool,
+                  duration_ms: u64,
+                  data: Option<&Value>| {
+                end_sink.tool_end(call_id, name, output, success, duration_ms, data);
+            },
+        ));
+        options.on_usage = Some(self.usage_callback());
+    }
+
     fn usage_callback(&self) -> Box<dyn Fn(u32, u32, u64) + Send + Sync> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
@@ -2324,10 +2356,10 @@ fn wedge_reset_due(
     }
     // Same token, same abort point: the retry re-entered the same wedge, so
     // the free first retry is not buying evidence — it already arrived.
-    if let (Some(cur), Some(prev)) = (current, previous) {
-        if cur.is_repeat_of(prev) {
-            return Some(WedgeReset::Confirmed);
-        }
+    if let (Some(cur), Some(prev)) = (current, previous)
+        && cur.is_repeat_of(prev)
+    {
+        return Some(WedgeReset::Confirmed);
     }
     // Otherwise the original rule: reset once the fault has repeated at all.
     // This still covers "empty completion", which has no fingerprint to
@@ -2485,110 +2517,12 @@ impl StepRunner for AgentStepRunner {
         let mut cur_wedge: Option<WedgeFingerprint> = None;
         let mut prev_wedge: Option<WedgeFingerprint> = None;
         for attempt in 0..=STEP_LLM_RETRIES {
-            if attempt > 0 {
-                // Stop pressed while the failed attempt ran: don't sleep out
-                // a backoff and burn a whole fresh step after the user asked
-                // to abort.
-                if request
-                    .cancel
-                    .as_ref()
-                    .is_some_and(CancelToken::is_cancelled)
-                {
-                    return Err(last_err);
-                }
-                tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
-                let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
-                let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
-                // A Stop arriving mid-backoff aborts the sleep too — the
-                // user is not waiting on a retry they just cancelled.
-                if let Some(token) = request.cancel.as_ref() {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => return Err(last_err),
-                        () = sleep => {}
-                    }
-                } else {
-                    sleep.await;
-                }
-                // A WEDGED runner does not recover by being asked again: its
-                // state has to be cleared. Retrying one three times against
-                // the same wedge is how a run dies — observed 2026-07-27,
-                // 17 repetition aborts collapsing into back-to-back
-                // attempt=1,2,3 failures until the run ended.
-                //
-                // Two ways in. The fingerprint says this abort IS the last
-                // one (same stuck token, same abort point), which is already
-                // the evidence a retry would have bought — so act now.
-                // Failing that, the original ladder: reset from the SECOND
-                // retry, by which point the fault has repeated once, leaving
-                // the first retry free for a genuinely transient drop.
-                if let Some(reason) =
-                    wedge_reset_due(attempt, &last_err, cur_wedge.as_ref(), prev_wedge.as_ref())
-                {
-                    tracing::warn!(
-                        attempt,
-                        ?reason,
-                        "wedged runner — resetting it before the next attempt"
-                    );
-                    self.reset_ollama_runner().await;
-                }
-                // Out of VRAM: reset on EVERY fault (reloading at the same
-                // size is the blip fix), demote only once the fault REPEATS
-                // within the run (shrinking is the repeat fix) — see
-                // `gpu_fault_action` for why the first fault gets tolerance
-                // the old code denied it. The demotion is clamped to the
-                // run's measured minimum viable window, so a fault can never
-                // be "healed" into a size the floor check refuses.
-                if gpu_memory_error(&last_err) {
-                    let fault = self
-                        .gpu_fault_count
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
-                    match gpu_fault_action(fault) {
-                        GpuFaultAction::ResetOnly => {
-                            tracing::warn!(
-                                gpu_faults = fault,
-                                "first GPU memory fault of this run — resetting \
-                                 the runner at the SAME size; a single fault at \
-                                 a sane starting pin is a load blip until a \
-                                 second fault proves otherwise"
-                            );
-                        }
-                        GpuFaultAction::ResetAndDemote => {
-                            // The clamp: the smallest window THIS run's steps
-                            // stay viable in (pressure-tier floor solved for
-                            // the window).
-                            let floor = nanna_agent::min_viable_num_ctx(
-                                &self.tools,
-                                &self.system_prompt,
-                                self.workspace_context.as_deref(),
-                                self.workspace_root.as_deref(),
-                                &request.prompt,
-                                self.agent_config.max_tokens as usize,
-                            )
-                            .await;
-                            // demote_context announces old → new and
-                            // clamped-or-not; `None` means the latch already
-                            // sits at the floor — the retry then reloads at
-                            // the same size and, if the fault persists, the
-                            // existing loud below-floor/fault failure
-                            // surfaces (resumable) instead of a manufactured
-                            // unusable window.
-                            let demoted = nanna_llm::LlmClient::demote_context(
-                                &self.agent_config.model,
-                                Some(floor),
-                            );
-                            tracing::warn!(
-                                gpu_faults = fault,
-                                min_viable_ctx = floor,
-                                demoted_to = ?demoted,
-                                "repeat GPU memory fault — demotion ladder engaged"
-                            );
-                        }
-                    }
-                    // The reset rides along on every fault, demoted or not.
-                    self.reset_ollama_runner().await;
-                }
+            if attempt > 0
+                && !self
+                    .prepare_retry(&request, attempt, &last_err, cur_wedge.as_ref(), prev_wedge.as_ref())
+                    .await
+            {
+                return Err(last_err);
             }
             // A fresh context per attempt: the re-anchor makes retries free —
             // there is no partial transcript worth salvaging. After a
@@ -2694,6 +2628,127 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Get ready for retry `attempt` of a step: honour a Stop, back off, and
+    /// clear a wedged or out-of-memory runner. Returns `false` when the user
+    /// cancelled, in which case the step ends with the last error.
+    async fn prepare_retry(
+        &self,
+        request: &StepRequest,
+        attempt: usize,
+        last_err: &str,
+        cur_wedge: Option<&WedgeFingerprint>,
+        prev_wedge: Option<&WedgeFingerprint>,
+    ) -> bool {
+        // Stop pressed while the failed attempt ran: don't sleep out
+        // a backoff and burn a whole fresh step after the user asked
+        // to abort.
+        if request
+            .cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            return false;
+        }
+        tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
+        let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
+        // A Stop arriving mid-backoff aborts the sleep too — the
+        // user is not waiting on a retry they just cancelled.
+        if let Some(token) = request.cancel.as_ref() {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return false,
+                () = sleep => {}
+            }
+        } else {
+            sleep.await;
+        }
+        // A WEDGED runner does not recover by being asked again: its
+        // state has to be cleared. Retrying one three times against
+        // the same wedge is how a run dies — observed 2026-07-27,
+        // 17 repetition aborts collapsing into back-to-back
+        // attempt=1,2,3 failures until the run ended.
+        //
+        // Two ways in. The fingerprint says this abort IS the last
+        // one (same stuck token, same abort point), which is already
+        // the evidence a retry would have bought — so act now.
+        // Failing that, the original ladder: reset from the SECOND
+        // retry, by which point the fault has repeated once, leaving
+        // the first retry free for a genuinely transient drop.
+        if let Some(reason) = wedge_reset_due(attempt, last_err, cur_wedge, prev_wedge) {
+            tracing::warn!(
+                attempt,
+                ?reason,
+                "wedged runner — resetting it before the next attempt"
+            );
+            self.reset_ollama_runner().await;
+        }
+        // Out of VRAM: reset on EVERY fault (reloading at the same
+        // size is the blip fix), demote only once the fault REPEATS
+        // within the run (shrinking is the repeat fix) — see
+        // `gpu_fault_action` for why the first fault gets tolerance
+        // the old code denied it. The demotion is clamped to the
+        // run's measured minimum viable window, so a fault can never
+        // be "healed" into a size the floor check refuses.
+        if gpu_memory_error(last_err) {
+            self.handle_gpu_fault(request).await;
+        }
+        true
+    }
+
+    /// One GPU memory fault: reset the runner, and demote the context window
+    /// once the fault repeats within the run.
+    async fn handle_gpu_fault(&self, request: &StepRequest) {
+        let fault = self
+            .gpu_fault_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        match gpu_fault_action(fault) {
+            GpuFaultAction::ResetOnly => {
+                tracing::warn!(
+                    gpu_faults = fault,
+                    "first GPU memory fault of this run — resetting \
+                     the runner at the SAME size; a single fault at \
+                     a sane starting pin is a load blip until a \
+                     second fault proves otherwise"
+                );
+            }
+            GpuFaultAction::ResetAndDemote => {
+                // The clamp: the smallest window THIS run's steps
+                // stay viable in (pressure-tier floor solved for
+                // the window).
+                let floor = nanna_agent::min_viable_num_ctx(
+                    &self.tools,
+                    &self.system_prompt,
+                    self.workspace_context.as_deref(),
+                    self.workspace_root.as_deref(),
+                    &request.prompt,
+                    self.agent_config.max_tokens as usize,
+                )
+                .await;
+                // demote_context announces old → new and
+                // clamped-or-not; `None` means the latch already
+                // sits at the floor — the retry then reloads at
+                // the same size and, if the fault persists, the
+                // existing loud below-floor/fault failure
+                // surfaces (resumable) instead of a manufactured
+                // unusable window.
+                let demoted = nanna_llm::LlmClient::demote_context(
+                    &self.agent_config.model,
+                    Some(floor),
+                );
+                tracing::warn!(
+                    gpu_faults = fault,
+                    min_viable_ctx = floor,
+                    demoted_to = ?demoted,
+                    "repeat GPU memory fault — demotion ladder engaged"
+                );
+            }
+        }
+        // The reset rides along on every fault, demoted or not.
+        self.reset_ollama_runner().await;
+    }
+
     /// The re-anchor's concrete half: the side-effecting calls the
     /// INTERRUPTED ATTEMPT made, read from the P22 Tier 4 liveness ledger and
     /// bounded by a share of this model's live input budget.
@@ -2996,46 +3051,7 @@ impl AgentStepRunner {
         };
         let restrict_to_active = true;
 
-        // Show the work as it happens: the step's text, thinking, and tool
-        // activity stream through the same events a plain chat turn uses,
-        // and fill the registered run buffers for recovery/persistence.
-        let (on_text, on_thinking, on_tool_start, on_tool_end, on_usage) = match &self.chat_sink {
-            None => (None, None, None, None, None),
-            Some(sink) => {
-                let text_sink = sink.clone();
-                let think_sink = sink.clone();
-                let start_sink = sink.clone();
-                let end_sink = sink.clone();
-                (
-                    Some(Box::new(move |chunk: &str| text_sink.delta(chunk))
-                        as Box<dyn Fn(&str) + Send + Sync>),
-                    Some(Box::new(move |chunk: &str| think_sink.thinking(chunk))
-                        as Box<dyn Fn(&str) + Send + Sync>),
-                    Some(Box::new(
-                        move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
-                            start_sink.tool_start(call_id, name, input, model);
-                        },
-                    )
-                        as Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>),
-                    Some(Box::new(
-                        move |call_id: &str,
-                              name: &str,
-                              output: &str,
-                              success: bool,
-                              duration_ms: u64,
-                              data: Option<&Value>| {
-                            end_sink.tool_end(call_id, name, output, success, duration_ms, data);
-                        },
-                    )
-                        as Box<
-                            dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync,
-                        >),
-                    Some(sink.usage_callback()),
-                )
-            }
-        };
-
-        let options = RunOptions {
+        let mut options = RunOptions {
             max_iterations: request.max_iterations,
             token_budget: request.token_budget,
             max_wall_clock: request.max_wall_clock,
@@ -3063,16 +3079,6 @@ impl AgentStepRunner {
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
             is_sub_agent: true,
-            on_text,
-            on_thinking,
-            on_tool_start,
-            on_tool_end,
-            // The live context gauge. This path never set `on_usage`, so the
-            // ONLY emitter of `ContextUsage` sat in the retired in-service
-            // chat path: every client's meter read 0 of 0 for the whole run
-            // while the daemon recomputed the real figures on every request
-            // (59 of 59 captured run-state snapshots, 56 of them mid-run).
-            on_usage,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
             // Capability transitions (provider benched, writes queued) reach
@@ -3080,6 +3086,12 @@ impl AgentStepRunner {
             degradations: self.degradations.clone(),
             ..Default::default()
         };
+        // Show the work as it happens: the step's text, thinking, and tool
+        // activity stream through the same events a plain chat turn uses,
+        // and fill the registered run buffers for recovery/persistence.
+        if let Some(sink) = &self.chat_sink {
+            sink.attach_stream_callbacks(&mut options);
+        }
 
         let result = agent
             .run(&request.prompt, options)
@@ -3127,10 +3139,10 @@ impl AgentStepRunner {
         // acceptance references triggers an immediate re-check of that item.
         let mut touched_paths: Vec<String> = Vec::new();
         for record in &result.tool_calls {
-            if let Some(path) = touched_path_of(&record.name, &record.input) {
-                if !touched_paths.contains(&path) {
-                    touched_paths.push(path);
-                }
+            if let Some(path) = touched_path_of(&record.name, &record.input)
+                && !touched_paths.contains(&path)
+            {
+                touched_paths.push(path);
             }
         }
 
@@ -3281,6 +3293,12 @@ impl AgentPlanner {
 /// the user speaking mid-run outranks anything already planned - and (b)
 /// must not be outranked by an item the harness already marked `in_progress`
 /// - see `SessionInterjector::yield_current_item`.
+///
+/// # Errors
+///
+/// Returns an error when the scope's existing tasks cannot be listed, or when
+/// not one planned task could be created (an empty plan included). Individual
+/// rejected tasks are logged and skipped while at least one lands.
 pub async fn seed_plan(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3296,8 +3314,9 @@ pub async fn seed_plan(
         .list(scope, scope_id, false)
         .await
         .map_err(|e| e.to_string())?;
-    let base_sort =
-        existing.iter().map(|t| t.sort_order).min().unwrap_or(0) - plan.tasks.len() as i64 - 1;
+    let base_sort = existing.iter().map(|t| t.sort_order).min().unwrap_or(0)
+        - crate::numeric::i64_saturating(plan.tasks.len())
+        - 1;
 
     let mut ids = Vec::with_capacity(plan.tasks.len());
     for (index, task) in plan.tasks.iter().enumerate() {
@@ -3318,7 +3337,7 @@ pub async fn seed_plan(
             depends_on: Vec::new(),
             acceptance: task.acceptance.clone(),
             assignee: None,
-            sort_order: base_sort + index as i64,
+            sort_order: base_sort + crate::numeric::i64_saturating(index),
         };
         match repo.create(new).await {
             Ok(created) => ids.push(created.id),
@@ -3427,6 +3446,10 @@ pub fn same_title(a: &str, b: &str) -> bool {
 /// "work this turn already did". An id snapshot rather than a timestamp bound
 /// because a cancelled task carries no completion stamp and the store's
 /// datetime strings would need parsing — set difference is exact.
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed.
 pub async fn closed_task_ids(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3455,11 +3478,15 @@ pub async fn closed_task_ids(
 /// Returns whole tasks rather than titles so the one caller that must NAME
 /// what it refused (`tasks.add`, whose notice cites the settled task's id and
 /// verdict) does not need a second query with a second chance to drift.
-pub async fn tasks_closed_since(
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed.
+pub async fn tasks_closed_since<S: std::hash::BuildHasher + Sync>(
     storage: &Arc<Storage>,
     scope: &str,
     scope_id: Option<&str>,
-    baseline: &HashSet<i64>,
+    baseline: &HashSet<i64, S>,
 ) -> Result<Vec<Task>, String> {
     Ok(storage
         .tasks()
@@ -3593,12 +3620,18 @@ pub fn closed_this_turn_notice(title: &str, status: &str) -> String {
 /// BEFORE the turn never filter — a user may legitimately re-ask yesterday's
 /// question — and genuinely new titles (decomposed subtasks, next features)
 /// seed exactly as before.
-pub async fn seed_continuation(
+///
+/// # Errors
+///
+/// Returns an error when the scope's tasks cannot be listed, or — once at
+/// least one proposed task survives the filter — when [`seed_plan`] fails.
+/// A plan whose every task was already closed this turn is `Ok` and empty.
+pub async fn seed_continuation<S: std::hash::BuildHasher + Sync>(
     storage: &Arc<Storage>,
     scope: &str,
     scope_id: Option<&str>,
     plan: &Plan,
-    closed_before_turn: &HashSet<i64>,
+    closed_before_turn: &HashSet<i64, S>,
 ) -> Result<Vec<i64>, String> {
     let closed_this_turn = tasks_closed_since(storage, scope, scope_id, closed_before_turn).await?;
     let fresh: Vec<_> = plan
@@ -3652,6 +3685,12 @@ pub async fn seed_continuation(
 /// carrying over a hundred each.
 ///
 /// Returns how many items were demoted.
+///
+/// # Errors
+///
+/// Returns the store's error, as text, when the scope's tasks cannot be listed
+/// or an item cannot be updated; items demoted before the failure stay
+/// demoted.
 pub async fn demote_in_progress(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3686,8 +3725,8 @@ pub async fn demote_in_progress(
 
 /// Messages held for one session before admission.
 ///
-/// Bound justification: these are messages a human typed while watching a run
-/// - an unbounded queue here is a memory leak fed by a stuck run. 64 is far
+/// Bound justification: these are messages a human typed while watching a run —
+/// an unbounded queue here is a memory leak fed by a stuck run. 64 is far
 /// past any realistic burst of human typing between two step boundaries, and
 /// overflow drops the OLDEST so the most recent intent always survives.
 pub const PENDING_MESSAGES_MAX: usize = 64;
@@ -5996,7 +6035,7 @@ mod tests {
 
     /// REGRESSION (P19 live drive, 2026-07-24): tool calls vanished when the
     /// user navigated away mid-run, because the harness streamed events only —
-    /// `get_run_state` recovery reads the ActiveChat buffers, and nothing was
+    /// `get_run_state` recovery reads the `ActiveChat` buffers, and nothing was
     /// filling them. Every sink callback must land in the shared run handle,
     /// not just on the event bus.
     #[tokio::test]
@@ -6026,6 +6065,7 @@ mod tests {
             assert_eq!(done[0].name, "exec");
             assert_eq!(done[0].output, "file.txt");
             assert!(done[0].success);
+            drop(done);
         }
 
         // And the journal persisted with the final message: text merged per
@@ -6320,6 +6360,10 @@ impl TaskRunManager {
     }
 
     /// Spawn a background run. Errors if one is already active for the scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a run is already active for the source's scope.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         self: &Arc<Self>,
@@ -6337,6 +6381,12 @@ impl TaskRunManager {
     /// [`Self::start`], plus the hook that lets user messages join this run
     /// at a step boundary instead of queueing behind it. Chat-backed runs
     /// always pass one; background runs do not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a run is already active for the source's scope, or
+    /// when the run registered here is gone again before its cancel token can
+    /// be read back.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_interjector(
         self: &Arc<Self>,
@@ -6472,8 +6522,13 @@ impl TaskRunManager {
     pub async fn status(&self, scope: &str, scope_id: Option<&str>) -> RunStatus {
         let key = Self::scope_key(scope, scope_id);
         let runs = self.runs.read().await;
-        let reports = self.reports.read().await;
-        let (last_report, resumes) = reports
+        // `runs` is held first and throughout: a finishing run removes itself
+        // from `runs` before recording its report, so while this guard is held
+        // the report for this key cannot change and needs no guard of its own.
+        let (last_report, resumes) = self
+            .reports
+            .read()
+            .await
             .get(&key)
             .map_or((None, 0), |(report, resumes)| (Some(report.clone()), *resumes));
         runs.get(&key).map_or_else(
@@ -6633,7 +6688,7 @@ mod session_scope_tests {
             .with_services(services)
     }
 
-    /// The shape a run WITH a bound session emits: scope and session_id both
+    /// The shape a run WITH a bound session emits: scope and `session_id` both
     /// present, straight from `Nanna.sessionId()`. It lands in that session.
     #[tokio::test]
     async fn the_todo_tools_bound_session_params_land_in_that_session() {
@@ -6665,7 +6720,7 @@ mod session_scope_tests {
     /// The shape a SESSION-LESS run emits on `next`/`list`: `session_id` is
     /// present but null, because `Nanna.sessionId()` returned null and `base`
     /// is not compacted. It must fail with a message that names every way out
-    /// — restating "requires session_id" is precisely what the model could not
+    /// — restating "requires `session_id`" is precisely what the model could not
     /// act on across 35 logged failures.
     #[tokio::test]
     async fn a_null_session_id_is_told_how_to_supply_a_scope() {
@@ -7097,7 +7152,7 @@ mod retry_note_tests {
         let one = carried_side_effect_note(&marks(1), carried_side_effect_budget_bytes(27_904), true);
         assert!(one.contains("1 side-effecting tool call before"), "{one}");
 
-        assert!(carried_side_effect_note(&[], 2_000, true).is_empty());
+        assert_eq!(carried_side_effect_note(&[], 2_000, true), "");
 
         // A run with no memory service never stored those outputs, so the
         // note must not send the model looking for them — it keeps the half
