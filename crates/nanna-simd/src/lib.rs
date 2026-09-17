@@ -528,9 +528,9 @@ mod tests {
 
     #[test]
     fn test_dot_product() {
-        let a: Vec<f32> = (1..=20).map(|x| x as f32).collect();
-        let b: Vec<f32> = (1..=20).map(|x| x as f32).collect();
-        let expected: f32 = (1..=20).map(|x: i32| (x * x) as f32).sum();
+        let a: Vec<f32> = (1..=20_u8).map(f32::from).collect();
+        let b: Vec<f32> = (1..=20_u8).map(f32::from).collect();
+        let expected: f32 = (1..=20_u16).map(|x| f32::from(x * x)).sum();
         let result = dot_product_f32(&a, &b);
         assert!(
             (result - expected).abs() < 1e-3,
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity_identical() {
-        let a: Vec<f32> = (1..=32).map(|x| x as f32).collect();
+        let a: Vec<f32> = (1..=32_u8).map(f32::from).collect();
         let b = a.clone();
         let result = cosine_similarity_f32(&a, &b);
         assert!(
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_normalize() {
-        let mut v: Vec<f32> = (1..=20).map(|x| x as f32).collect();
+        let mut v: Vec<f32> = (1..=20_u8).map(f32::from).collect();
         normalize_f32(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
@@ -584,11 +584,11 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let mut a: Vec<f32> = (1..=20).map(|x| x as f32).collect();
-        let b: Vec<f32> = (1..=20).map(|x| x as f32).collect();
+        let mut a: Vec<f32> = (1..=20_u8).map(f32::from).collect();
+        let b: Vec<f32> = (1..=20_u8).map(f32::from).collect();
         add_f32(&mut a, &b);
-        for (i, &val) in a.iter().enumerate() {
-            let expected = ((i + 1) * 2) as f32;
+        for (i, (&val, n)) in a.iter().zip(1_u8..).enumerate() {
+            let expected = f32::from(n * 2);
             assert!(
                 (val - expected).abs() < 1e-5,
                 "a[{i}] = {val}, expected {expected}"
@@ -598,10 +598,10 @@ mod tests {
 
     #[test]
     fn test_scale() {
-        let mut v: Vec<f32> = (1..=20).map(|x| x as f32).collect();
+        let mut v: Vec<f32> = (1..=20_u8).map(f32::from).collect();
         scale_f32(&mut v, 3.0);
-        for (i, &val) in v.iter().enumerate() {
-            let expected = ((i + 1) * 3) as f32;
+        for (i, (&val, n)) in v.iter().zip(1_u8..).enumerate() {
+            let expected = f32::from(n * 3);
             assert!(
                 (val - expected).abs() < 1e-5,
                 "v[{i}] = {val}, expected {expected}"
