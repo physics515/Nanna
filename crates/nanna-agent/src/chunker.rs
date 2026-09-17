@@ -25,9 +25,9 @@ pub struct Chunk {
 
 impl Chunk {
     /// Create a new chunk from content.
-    pub fn new(content: String, _offset: usize) -> Self {
-        let hash = Self::hash_content(&content);
-        let token_count = Self::estimate_tokens(&content);
+    pub fn new(content: &str, _offset: usize) -> Self {
+        let hash = Self::hash_content(content);
+        let token_count = Self::estimate_tokens(content);
         let byte_len = content.len();
         Self {
             hash,
@@ -67,7 +67,7 @@ impl Chunk {
 
             if current.len() + sentence_with_term.len() > TARGET_CHUNK_SIZE
                 && !current.is_empty() {
-                    chunks.push(Self::new(current.clone(), offset));
+                    chunks.push(Self::new(&current, offset));
                     offset += current.len();
                     current.clear();
                 }
@@ -76,7 +76,7 @@ impl Chunk {
         }
 
         if !current.is_empty() {
-            chunks.push(Self::new(current, offset));
+            chunks.push(Self::new(&current, offset));
         }
 
         chunks
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_chunk_creation() {
-        let chunk = Chunk::new("Hello world".to_string(), 0);
+        let chunk = Chunk::new("Hello world", 0);
         assert!(chunk.hash > 0);
         assert!(chunk.token_count > 0);
         assert_eq!(chunk.byte_len, 11);
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn test_deduplication() {
         let content = "Test content here.";
-        let chunk = Chunk::new(content.to_string(), 0);
+        let chunk = Chunk::new(content, 0);
         let mut known = HashSet::new();
         known.insert(chunk.hash);
 

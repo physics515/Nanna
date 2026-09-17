@@ -15,6 +15,7 @@ pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
 mod multi;
+mod numeric;
 pub mod planner;
 pub mod prompts;
 pub mod tool_stats;

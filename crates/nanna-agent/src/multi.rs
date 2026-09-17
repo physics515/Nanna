@@ -10,6 +10,12 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::numeric::{millis_u64, u64_to_f32};
+
+/// A finished background task as reported on the completion channel: the
+/// task id and the agent run's outcome.
+type TaskCompletion = (String, Result<AgentResponse, AgentError>);
+
 /// Message sent between agents or from spawner to agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessage {
@@ -64,8 +70,8 @@ pub struct AgentCoordinator {
     /// Tool registry (shared)
     tools: Arc<ToolRegistry>,
     /// Task completion notifier
-    task_tx: mpsc::Sender<(String, Result<AgentResponse, AgentError>)>,
-    task_rx: RwLock<Option<mpsc::Receiver<(String, Result<AgentResponse, AgentError>)>>>,
+    task_tx: mpsc::Sender<TaskCompletion>,
+    task_rx: RwLock<Option<mpsc::Receiver<TaskCompletion>>>,
 }
 
 impl AgentCoordinator {
@@ -100,15 +106,24 @@ impl AgentCoordinator {
     /// Spawn a background task.
     ///
     /// Returns the task ID immediately. The task runs asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying an "Agent not found" message) when
+    /// no agent is registered under `agent_id`; no task is created then. The
+    /// run's own failure is reported later through [`Self::poll_completions`].
     pub async fn spawn_task(
         &self,
         agent_id: &str,
         name: impl Into<String>,
         prompt: impl Into<String>,
     ) -> Result<String, AgentError> {
-        let agents = self.agents.read().await;
-        let entry = agents
+        let (config, system_prompt) = self
+            .agents
+            .read()
+            .await
             .get(agent_id)
+            .map(|entry| (entry.config.clone(), entry.system_prompt.clone()))
             .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {agent_id}"))))?;
 
         let task_id = Uuid::new_v4().to_string();
@@ -130,8 +145,6 @@ impl AgentCoordinator {
         self.tasks.write().await.insert(task_id.clone(), task);
 
         // Clone what we need for the spawned task
-        let config = entry.config.clone();
-        let system_prompt = entry.system_prompt.clone();
         let llm = self.llm.clone();
         let tools = self.tools.clone();
         let task_tx = self.task_tx.clone();
@@ -181,6 +194,12 @@ impl AgentCoordinator {
     }
 
     /// Send a message to an agent's mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying an "Agent not found" message) when
+    /// `to` has no mailbox, i.e. no agent was registered under that id; the
+    /// message is dropped then.
     pub async fn send_message(&self, from: &str, to: &str, content: impl Into<String>) -> Result<String, AgentError> {
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
@@ -192,13 +211,13 @@ impl AgentCoordinator {
 
         let msg_id = msg.id.clone();
 
-        let mut mailboxes = self.mailboxes.write().await;
-        if let Some(mailbox) = mailboxes.get_mut(to) {
-            mailbox.push(msg);
-            Ok(msg_id)
-        } else {
-            Err(AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {to}"))))
-        }
+        self.mailboxes.write().await.get_mut(to).map_or_else(
+            || Err(AgentError::Llm(nanna_llm::LlmError::MissingApiKey(format!("Agent not found: {to}")))),
+            |mailbox| {
+                mailbox.push(msg);
+                Ok(msg_id)
+            },
+        )
     }
 
     /// Check mailbox for an agent.
@@ -213,9 +232,8 @@ impl AgentCoordinator {
     /// Poll for completed tasks (non-blocking).
     pub async fn poll_completions(&self) -> Vec<(String, BackgroundTask)> {
         let mut rx_guard = self.task_rx.write().await;
-        let rx = match rx_guard.as_mut() {
-            Some(r) => r,
-            None => return Vec::new(),
+        let Some(rx) = rx_guard.as_mut() else {
+            return Vec::new();
         };
 
         let mut completed = Vec::new();
@@ -236,6 +254,7 @@ impl AgentCoordinator {
                 completed.push((task_id, task.clone()));
             }
         }
+        drop(rx_guard);
 
         completed
     }
@@ -302,7 +321,7 @@ impl CriticalPathMetrics {
                 if let Some(result) = results.iter().find(|r| &r.task_id == task_id)
                     && result.duration_ms > max_duration {
                         max_duration = result.duration_ms;
-                        max_task_id = task_id.clone();
+                        max_task_id.clone_from(task_id);
                     }
             }
             
@@ -314,7 +333,7 @@ impl CriticalPathMetrics {
         
         let critical_path_ms: u64 = level_max_durations.iter().sum();
         let parallelism_ratio = if wall_clock_ms > 0 {
-            sequential_ms as f32 / wall_clock_ms as f32
+            u64_to_f32(sequential_ms) / u64_to_f32(wall_clock_ms)
         } else {
             1.0
         };
@@ -399,6 +418,13 @@ impl AgentCoordinator {
     ///
     /// # Returns
     /// Aggregated results from all tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying an "Agent not found" message) when
+    /// no agent is registered under `agent_id`. Failed, timed-out or panicked
+    /// tasks and a failed aggregation call do not fail the swarm: they are
+    /// counted in, or left out of, the returned [`SwarmResult`].
     pub async fn spawn_swarm(
         &self,
         agent_id: &str,
@@ -441,51 +467,16 @@ impl AgentCoordinator {
                 let task_id = Uuid::new_v4().to_string();
                 let thinking_mode = swarm_thinking_mode;
                 
-                let handle = tokio::spawn(async move {
-                    let task_start = std::time::Instant::now();
-                    
-                    let context = AgentContext::new(&task_id).with_system_prompt(system);
-                    let agent = Agent::new(agent_cfg, llm, tools).with_context(context);
-                    
-                    // Run with timeout, passing thinking mode from swarm config
-                    let run_options = RunOptions {
-                        thinking_mode: Some(thinking_mode),
-                        ..RunOptions::default()
-                    };
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout),
-                        agent.run(&prompt, run_options)
-                    ).await;
-                    
-                    let duration_ms = task_start.elapsed().as_millis() as u64;
-                    
-                    match result {
-                        Ok(Ok(response)) => SwarmTaskResult {
-                            task_id,
-                            prompt,
-                            success: true,
-                            result: Some(response.text),
-                            error: None,
-                            duration_ms,
-                        },
-                        Ok(Err(e)) => SwarmTaskResult {
-                            task_id,
-                            prompt,
-                            success: false,
-                            result: None,
-                            error: Some(e.to_string()),
-                            duration_ms,
-                        },
-                        Err(_) => SwarmTaskResult {
-                            task_id,
-                            prompt,
-                            success: false,
-                            result: None,
-                            error: Some("Task timed out".to_string()),
-                            duration_ms,
-                        },
-                    }
-                });
+                let handle = tokio::spawn(run_swarm_task(SwarmTask {
+                    llm,
+                    tools,
+                    agent_config: agent_cfg,
+                    system_prompt: system,
+                    prompt,
+                    timeout_secs: timeout,
+                    task_id,
+                    thinking_mode,
+                }));
                 
                 handles.push(handle);
             }
@@ -538,7 +529,7 @@ impl AgentCoordinator {
             None
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = millis_u64(start.elapsed());
 
         // For simple swarm (no dependency levels), create single-level metrics
         let critical_path = if config.calculate_critical_path {
@@ -561,6 +552,14 @@ impl AgentCoordinator {
     }
 
     /// Quick helper to run parallel research queries and aggregate results.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` (carrying an "Agent not found" message) when
+    /// no agent is registered under `agent_id`, and `AgentError::Llm`
+    /// (carrying "No results to aggregate") when there is no aggregated
+    /// answer — every query failed or timed out, or the aggregation call
+    /// itself failed.
     pub async fn parallel_research(
         &self,
         agent_id: &str,
@@ -586,6 +585,76 @@ impl AgentCoordinator {
                 "No results to aggregate".to_string()
             ))
         })
+    }
+}
+
+/// Everything one swarm task needs, moved into its spawned future.
+struct SwarmTask {
+    llm: Arc<LlmClient>,
+    tools: Arc<ToolRegistry>,
+    agent_config: AgentConfig,
+    system_prompt: String,
+    prompt: String,
+    timeout_secs: u64,
+    task_id: String,
+    thinking_mode: ThinkingMode,
+}
+
+/// Run one swarm task to completion or timeout, reporting the outcome (never
+/// an error) with its wall-clock duration.
+async fn run_swarm_task(task: SwarmTask) -> SwarmTaskResult {
+    let SwarmTask {
+        llm,
+        tools,
+        agent_config,
+        system_prompt,
+        prompt,
+        timeout_secs,
+        task_id,
+        thinking_mode,
+    } = task;
+    let task_start = std::time::Instant::now();
+
+    let context = AgentContext::new(&task_id).with_system_prompt(system_prompt);
+    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+
+    // Run with timeout, passing thinking mode from swarm config
+    let run_options = RunOptions {
+        thinking_mode: Some(thinking_mode),
+        ..RunOptions::default()
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        agent.run(&prompt, run_options)
+    ).await;
+
+    let duration_ms = millis_u64(task_start.elapsed());
+
+    match result {
+        Ok(Ok(response)) => SwarmTaskResult {
+            task_id,
+            prompt,
+            success: true,
+            result: Some(response.text),
+            error: None,
+            duration_ms,
+        },
+        Ok(Err(e)) => SwarmTaskResult {
+            task_id,
+            prompt,
+            success: false,
+            result: None,
+            error: Some(e.to_string()),
+            duration_ms,
+        },
+        Err(_) => SwarmTaskResult {
+            task_id,
+            prompt,
+            success: false,
+            result: None,
+            error: Some("Task timed out".to_string()),
+            duration_ms,
+        },
     }
 }
 
@@ -687,6 +756,13 @@ impl SwarmCoordinator {
     }
 
     /// Decompose a complex task into subtasks using LLM.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` when the decomposition request to
+    /// `decomposition_model` fails, or (as `LlmError::Stream`) when its reply
+    /// cannot be healed into JSON. A reply that is JSON but has no usable
+    /// `subtasks` array is not an error: it yields no subtasks.
     pub async fn decompose_task(&self, task: &str) -> Result<DecomposedTask, AgentError> {
         let decomposition_prompt = format!(
             r#"You are a task decomposition specialist. Break down the following task into smaller, independent subtasks that can be executed in parallel where possible.
@@ -749,6 +825,16 @@ Output ONLY valid JSON, no markdown or explanation."#
     }
 
     /// Execute a complex task by decomposing it and running subtasks in parallel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`Self::decompose_task`] when decomposition
+    /// fails. When it yields no subtasks the task runs as a one-prompt swarm on
+    /// the coordinator's `general` agent, which fails with `AgentError::Llm`
+    /// ("Agent not found") if no such agent is registered. The per-level
+    /// swarms cannot fail that way: each level's domain agent is registered
+    /// just before its swarm starts, and the coordinator never unregisters
+    /// agents.
     pub async fn execute_task(&self, task: &str, config: SwarmConfig) -> Result<SwarmResult, AgentError> {
         let start = std::time::Instant::now();
         let swarm_id = Uuid::new_v4().to_string();
@@ -770,7 +856,7 @@ Output ONLY valid JSON, no markdown or explanation."#
         }
 
         // Step 2: Group subtasks by dependency level
-        let execution_levels = self.build_execution_levels(&decomposed.subtasks);
+        let execution_levels = Self::build_execution_levels(&decomposed.subtasks);
 
         // Step 3: Execute each level in parallel
         let mut all_results = Vec::new();
@@ -785,20 +871,7 @@ Output ONLY valid JSON, no markdown or explanation."#
                 .collect();
 
             // Build prompts with context from completed dependencies
-            let prompts: Vec<String> = subtasks.iter().map(|subtask| {
-                let mut prompt = subtask.description.clone();
-                
-                // Add context from dependencies
-                for dep_id in &subtask.dependencies {
-                    if let Some(dep_result) = context.get(dep_id) {
-                        prompt = format!(
-                            "{prompt}\n\n--- Context from previous task ({dep_id}) ---\n{dep_result}"
-                        );
-                    }
-                }
-                
-                prompt
-            }).collect();
+            let prompts = level_prompts(&subtasks, &context);
 
             // Determine which agent to use (use first subtask's domain)
             let domain = subtasks.first().map_or("general", |s| s.domain.as_str());
@@ -839,22 +912,7 @@ Output ONLY valid JSON, no markdown or explanation."#
                 .collect::<Vec<_>>()
                 .join("\n\n");
 
-            let agg_prompt = format!(
-                r"You completed a complex task by breaking it into subtasks. Here are the results:
-
-ORIGINAL TASK: {}
-
-EXECUTION PLAN: {}
-
-SUBTASK RESULTS:
-{}
-
-Synthesize these results into a coherent final response that addresses the original task.
-Be comprehensive but concise. Highlight key findings and conclusions.",
-                decomposed.original_task,
-                decomposed.execution_plan,
-                results_text
-            );
+            let agg_prompt = final_aggregation_prompt(&decomposed, &results_text);
 
             match self.coordinator.llm.complete(
                 &nanna_llm::CompletionRequest::default()
@@ -871,7 +929,7 @@ Be comprehensive but concise. Highlight key findings and conclusions.",
             None
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = millis_u64(start.elapsed());
 
         // Calculate critical path metrics using actual execution levels
         let critical_path = if config.calculate_critical_path {
@@ -898,7 +956,7 @@ Be comprehensive but concise. Highlight key findings and conclusions.",
     }
 
     /// Build execution levels based on dependencies (topological sort).
-    fn build_execution_levels(&self, subtasks: &[Subtask]) -> Vec<Vec<String>> {
+    fn build_execution_levels(subtasks: &[Subtask]) -> Vec<Vec<String>> {
         let mut levels: Vec<Vec<String>> = Vec::new();
         let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut remaining: Vec<&Subtask> = subtasks.iter().collect();
@@ -939,11 +997,9 @@ Be comprehensive but concise. Highlight key findings and conclusions.",
 
     /// Ensure a domain agent is registered with the coordinator.
     async fn ensure_agent_registered(&self, domain: &str) {
-        let agents = self.coordinator.agents.read().await;
-        if agents.contains_key(domain) {
+        if self.coordinator.agents.read().await.contains_key(domain) {
             return;
         }
-        drop(agents);
 
         let domain_agents = self.domain_agents.read().await;
         let domain_config = domain_agents.get(domain).cloned().unwrap_or_default();
@@ -955,6 +1011,45 @@ Be comprehensive but concise. Highlight key findings and conclusions.",
             &domain_config.system_prompt,
         ).await;
     }
+}
+
+/// One level's prompts: each subtask's description, followed by the result of
+/// every dependency that has one.
+fn level_prompts(subtasks: &[&Subtask], context: &HashMap<String, String>) -> Vec<String> {
+    subtasks.iter().map(|subtask| {
+        let mut prompt = subtask.description.clone();
+        
+        // Add context from dependencies
+        for dep_id in &subtask.dependencies {
+            if let Some(dep_result) = context.get(dep_id) {
+                prompt = format!(
+                    "{prompt}\n\n--- Context from previous task ({dep_id}) ---\n{dep_result}"
+                );
+            }
+        }
+        
+        prompt
+    }).collect()
+}
+
+/// The prompt that synthesizes every subtask result into one final answer.
+fn final_aggregation_prompt(decomposed: &DecomposedTask, results_text: &str) -> String {
+    format!(
+        r"You completed a complex task by breaking it into subtasks. Here are the results:
+
+ORIGINAL TASK: {}
+
+EXECUTION PLAN: {}
+
+SUBTASK RESULTS:
+{}
+
+Synthesize these results into a coherent final response that addresses the original task.
+Be comprehensive but concise. Highlight key findings and conclusions.",
+        decomposed.original_task,
+        decomposed.execution_plan,
+        results_text
+    )
 }
 
 #[cfg(test)]
@@ -971,8 +1066,7 @@ mod tests {
             .register_agent("test-agent", AgentConfig::default(), "Test system prompt")
             .await;
 
-        let agents = coordinator.agents.read().await;
-        assert!(agents.contains_key("test-agent"));
+        assert!(coordinator.agents.read().await.contains_key("test-agent"));
     }
 
     #[test]
@@ -983,12 +1077,7 @@ mod tests {
             Subtask { id: "c".to_string(), description: "C".to_string(), domain: "general".to_string(), dependencies: vec![], priority: 1 },
         ];
 
-        let llm = std::sync::Arc::new(LlmClient::anthropic("test"));
-        let tools = std::sync::Arc::new(ToolRegistry::new());
-        let coordinator = std::sync::Arc::new(AgentCoordinator::new(llm, tools));
-        let swarm = SwarmCoordinator::new(coordinator, "test");
-
-        let levels = swarm.build_execution_levels(&subtasks);
+        let levels = SwarmCoordinator::build_execution_levels(&subtasks);
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].len(), 3);
     }
@@ -1001,12 +1090,7 @@ mod tests {
             Subtask { id: "c".to_string(), description: "C".to_string(), domain: "general".to_string(), dependencies: vec!["b".to_string()], priority: 1 },
         ];
 
-        let llm = std::sync::Arc::new(LlmClient::anthropic("test"));
-        let tools = std::sync::Arc::new(ToolRegistry::new());
-        let coordinator = std::sync::Arc::new(AgentCoordinator::new(llm, tools));
-        let swarm = SwarmCoordinator::new(coordinator, "test");
-
-        let levels = swarm.build_execution_levels(&subtasks);
+        let levels = SwarmCoordinator::build_execution_levels(&subtasks);
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[0], vec!["a"]);
         assert_eq!(levels[1], vec!["b"]);

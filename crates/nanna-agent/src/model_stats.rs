@@ -16,6 +16,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use nanna_storage::StoredModelStats;
 
+use crate::numeric::{millis_u64, u64_to_f64, usize_to_f64};
+
 /// Global model statistics tracker. Thread-safe, designed for concurrent access.
 #[derive(Debug, Clone)]
 pub struct ModelStatsTracker {
@@ -181,7 +183,7 @@ impl ModelStatsTracker {
         let stats = inner.models.entry(obs.model.clone()).or_insert_with(|| ModelStats::new(&obs.model));
 
         stats.total_requests += 1;
-        let latency_ms = obs.latency.as_millis() as u64;
+        let latency_ms = millis_u64(obs.latency);
 
         if obs.success {
             stats.successful_requests += 1;
@@ -239,6 +241,7 @@ impl ModelStatsTracker {
         if obs.escalated {
             stats.escalations += 1;
         }
+        drop(inner);
 
         debug!(model = %obs.model, success = obs.success, latency_ms = latency_ms, input = obs.input_tokens, output = obs.output_tokens, cache_read = obs.cache_read_tokens, "📊 Model stats recorded");
     }
@@ -382,7 +385,7 @@ impl ModelStats {
 
     fn summary(&self) -> ModelStatsSummary {
         let success_rate = if self.total_requests > 0 {
-            self.successful_requests as f64 / self.total_requests as f64
+            u64_to_f64(self.successful_requests) / u64_to_f64(self.total_requests)
         } else {
             1.0
         };
@@ -398,12 +401,12 @@ impl ModelStats {
         let avg_throughput_tps = if self.throughput_tps.is_empty() {
             0.0
         } else {
-            self.throughput_tps.iter().sum::<f64>() / self.throughput_tps.len() as f64
+            self.throughput_tps.iter().sum::<f64>() / usize_to_f64(self.throughput_tps.len())
         };
 
         let total_cacheable = self.total_input_tokens + self.total_cache_read_tokens;
         let cache_hit_rate = if total_cacheable > 0 {
-            self.total_cache_read_tokens as f64 / total_cacheable as f64
+            u64_to_f64(self.total_cache_read_tokens) / u64_to_f64(total_cacheable)
         } else {
             0.0
         };
@@ -439,10 +442,11 @@ fn percentile(sorted_data: &[u64], pct: usize) -> u64 {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    millis_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 // =============================================================================
