@@ -36,15 +36,15 @@ use std::path::PathBuf;
 /// due scheduled work — never reading instruction files off disk.
 const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. Review your current state, and if nothing needs attention, reply HEARTBEAT_OK.";
 
-/// Concrete implementation of AgentSpawner that lives in the daemon. Runs
-/// each sub-agent as a managed chat on the daemon ControlPlane.
+/// Concrete implementation of [`AgentSpawner`] that lives in the daemon. Runs
+/// each sub-agent as a managed chat on the daemon [`ControlPlane`].
 struct AgentSpawnerImpl {
     router: Arc<crate::llm_router::LlmRouter>,
     /// Read at spawn, never at construction: a sub-agent must run on the
     /// model and summarization list the user has NOW, not the ones the daemon
     /// booted with.
     agent_config_src: Arc<tokio::sync::RwLock<crate::agent_service::AgentServiceConfig>>,
-    /// Filled once the daemon ControlPlane is live. Sub-agents are ordinary
+    /// Filled once the daemon [`ControlPlane`] is live. Sub-agents are ordinary
     /// chats on that plane — same `run_chat_turn` path as a user turn.
     control: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
 }
@@ -179,7 +179,7 @@ async fn last_assistant_text(sessions: &SessionManager, session_id: &str) -> Str
         .unwrap_or_default()
 }
 
-/// Concrete implementation of ParentChannel that lives in the daemon.
+/// Concrete implementation of [`ParentChannel`] that lives in the daemon.
 /// Allows sub-agents to ask their parent questions.
 ///
 /// Instead of blocking on mailbox polling, this makes a lightweight LLM call
@@ -209,8 +209,8 @@ impl ParentChannel for ParentChannelImpl {
             .await
             .ok_or_else(|| {
                 format!(
-                    "Sub-session '{}' not found — ask_parent is only available to sub-agents",
-                    sub_session_id
+                    "Sub-session '{sub_session_id}' not found — ask_parent is only available to \
+                     sub-agents"
                 )
             })?;
 
@@ -245,7 +245,7 @@ impl ParentChannel for ParentChannelImpl {
             .sessions
             .get(&parent_id)
             .await
-            .ok_or_else(|| format!("Parent session '{}' not found", parent_id))?;
+            .ok_or_else(|| format!("Parent session '{parent_id}' not found"))?;
 
         let recent_messages: Vec<String> = parent_session
             .messages
@@ -286,7 +286,7 @@ impl ParentChannel for ParentChannelImpl {
         let llm_client = self
             .router
             .client_for_model(model)
-            .ok_or_else(|| format!("No provider for model '{}'", model))?;
+            .ok_or_else(|| format!("No provider for model '{model}'"))?;
 
         let stripped_model = crate::llm_router::LlmRouter::strip_model_prefix(model);
         let request = nanna_llm::CompletionRequest {
@@ -304,7 +304,7 @@ impl ParentChannel for ParentChannelImpl {
         let answer = llm_client
             .complete(&request)
             .await
-            .map_err(|e| format!("LLM call failed: {}", e))?;
+            .map_err(|e| format!("LLM call failed: {e}"))?;
 
         tracing::info!(
             sub_session = sub_session_id,
@@ -644,15 +644,17 @@ fn req_text(params: &serde_json::Value, key: &str) -> Result<String, String> {
 /// that is not text errors instead of falling through to a default — a
 /// silently defaulted `new` on `memory.replace` would delete the match.
 fn opt_text(params: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
-    match params.get(key).filter(|v| !v.is_null()) {
-        None => Ok(None),
-        Some(value) => as_text_lenient(value).map(Some).ok_or_else(|| {
-            format!(
-                "{key} must be text (got {}).",
-                crate::tasks::describe_value(value)
-            )
-        }),
-    }
+    params
+        .get(key)
+        .filter(|v| !v.is_null())
+        .map_or(Ok(None), |value| {
+            as_text_lenient(value).map(Some).ok_or_else(|| {
+                format!(
+                    "{key} must be text (got {}).",
+                    crate::tasks::describe_value(value)
+                )
+            })
+        })
 }
 
 /// Read an optional count param (`limit`, `offset`).
@@ -668,6 +670,19 @@ fn opt_count(params: &serde_json::Value, key: &str) -> Result<Option<usize>, Str
         .map(Some)
         .map_err(|_| format!("{key} must be zero or a positive whole number (got {n})."))
 }
+
+/// The tools directory the authoring services write into, the live registry
+/// they register into, and the slot they read the finished service map back
+/// out of.
+///
+/// Named because the tuple is past `clippy::type_complexity`'s limit written
+/// inline, and a reader of [`ScriptServiceDeps::tool_authoring`] should not have
+/// to parse three nested generics to learn it is those three things.
+type ToolAuthoringDeps = (
+    PathBuf,
+    std::sync::Weak<nanna_tools::ToolRegistry>,
+    Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
+);
 
 /// Everything [`build_script_services`] needs, named.
 ///
@@ -697,11 +712,7 @@ struct ScriptServiceDeps {
     /// plus the slot they read the finished service map back out of. `None`
     /// leaves `tools.{create,update,list}` unregistered, which withholds the
     /// three authoring skills rather than half-wiring them.
-    tool_authoring: Option<(
-        PathBuf,
-        std::sync::Weak<nanna_tools::ToolRegistry>,
-        Arc<std::sync::OnceLock<HashMap<String, ServiceFn>>>,
-    )>,
+    tool_authoring: Option<ToolAuthoringDeps>,
     /// Router plus the configured vision-model priority list. `None`, an empty
     /// list, or a list the router cannot serve all leave `vision.analyze`
     /// unregistered, which withholds the three vision skills rather than
@@ -710,7 +721,7 @@ struct ScriptServiceDeps {
     /// The same vision model, bound for `pdf.read`'s OCR fallback. `None` leaves
     /// image-only pages unread and the response says so.
     pdf_ocr: Option<nanna_tools::PdfOcrFn>,
-    /// OpenAI key plus the data dir generated speech is written under. `None` or
+    /// `OpenAI` key plus the data dir generated speech is written under. `None` or
     /// no key leaves `audio.tts` / `audio.transcribe` unregistered.
     audio: Option<(Option<String>, PathBuf)>,
     /// The data dir page screenshots are written under. `None`, or no
@@ -733,6 +744,8 @@ struct ScriptServiceDeps {
 
 
 fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> {
+    use serde_json::{Value, json};
+
     let ScriptServiceDeps {
         memory,
         spawner,
@@ -752,7 +765,6 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
         feedback,
     } = deps;
     let memory = &memory;
-    use serde_json::{Value, json};
 
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
@@ -790,10 +802,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let importance = params
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0) as f32;
+                    let importance = crate::numeric::f32_from_f64(
+                        params
+                            .get("importance")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(1.0),
+                    );
                     // Provenance is what decides whether a dream cycle may
                     // paraphrase this memory, so it is written at the one place
                     // every `remember` call passes through — both this service
@@ -824,7 +838,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                    let limit = crate::numeric::usize_saturating(
+                        params
+                            .get("limit")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(10),
+                    );
                     // Per-result page budget. Storage is unbounded now, so a
                     // recall that returned whole memories would put an
                     // arbitrarily large payload into a fixed context window —
@@ -834,12 +853,17 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                     // reasoned about rather than to a round number of bytes.
                     let page_chars = params
                         .get("page_chars")
-                        .and_then(|v| v.as_u64())
-                        .map_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS, |v| v as usize);
-                    let offset = params
-                        .get("offset")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or(
+                            nanna_memory::MEMORY_CHUNK_TARGET_CHARS,
+                            crate::numeric::usize_saturating,
+                        );
+                    let offset = crate::numeric::usize_saturating(
+                        params
+                            .get("offset")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    );
                     let workspace = ws.read().await;
                     match mem.recall_scoped(&query, workspace.as_deref()).await {
                         Ok(results) => {
@@ -887,7 +911,8 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
 
         // Alias: some tool scripts may call memory.embed instead of memory.store
         let mem_embed = mem.clone();
-        let ws_embed = workspace_id.clone();
+        // Last reader of `workspace_id` in this function, so it moves.
+        let ws_embed = workspace_id;
         services.insert(
             "memory.embed".to_string(),
             Arc::new(move |params: Value| {
@@ -908,10 +933,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let importance = params
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0) as f32;
+                    let importance = crate::numeric::f32_from_f64(
+                        params
+                            .get("importance")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(1.0),
+                    );
                     // Provenance is what decides whether a dream cycle may
                     // paraphrase this memory, so it is written at the one place
                     // every `remember` call passes through — both this service
@@ -1160,8 +1187,8 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                         .to_string();
                     let max_iterations = params
                         .get("max_iterations")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize);
+                        .and_then(serde_json::Value::as_u64)
+                        .map(crate::numeric::usize_saturating);
                     match spawner.spawn(&prompt, &description, max_iterations).await {
                         Ok(result) => Ok(json!({
                             "text": result.text,
@@ -1190,7 +1217,10 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let timeout = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let timeout = params
+                        .get("timeout")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(30);
                     let workdir = params
                         .get("workdir")
                         .and_then(|v| v.as_str())
@@ -1220,7 +1250,12 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
             Arc::new(move |params: Value| {
                 let history = history.clone();
                 Box::pin(async move {
-                    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                    let limit = crate::numeric::usize_saturating(
+                        params
+                            .get("limit")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(20),
+                    );
                     let history = history.read().await;
                     let start = if history.len() > limit {
                         history.len() - limit
@@ -1237,6 +1272,9 @@ fn build_script_services(deps: ScriptServiceDeps) -> HashMap<String, ServiceFn> 
                             })
                         })
                         .collect();
+                    // The snapshot is taken; nothing below reads the history, so
+                    // the read guard is released before the JSON is built.
+                    drop(history);
                     Ok(json!(messages))
                 })
             }),
@@ -1584,9 +1622,9 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
-    /// OpenAI API key
+    /// `OpenAI` API key
     pub openai_api_key: Option<String>,
-    /// OpenRouter API key
+    /// `OpenRouter` API key
     pub openrouter_api_key: Option<String>,
     /// GitHub token (for GitHub Models)
     pub github_token: Option<String>,
@@ -1602,16 +1640,16 @@ pub struct LlmConfig {
 ///
 /// The store is where the GUI puts keys the user types in, so a key that is
 /// only ever read from the environment is a key the user cannot set. Anthropic
-/// and OpenAI already got their store fallback further down this file; the
-/// others never did, and OpenRouter's absence was load-bearing — the dream
-/// summarizer is configured to OpenRouter models by default, so every
+/// and `OpenAI` already got their store fallback further down this file; the
+/// others never did, and `OpenRouter`'s absence was load-bearing — the dream
+/// summarizer is configured to `OpenRouter` models by default, so every
 /// consolidation failed with `Missing API key for provider: OpenRouter` while
 /// the key sat in the store the whole time. Dreaming had never once run.
 fn credential(env_var: &str, store_key: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(env_var) {
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
+    if let Ok(value) = std::env::var(env_var)
+        && !value.trim().is_empty()
+    {
+        return Some(value);
     }
     SecureStore::new()
         .get(store_key)
@@ -1674,6 +1712,7 @@ impl DaemonConfig {
     /// wrote — and note this hangs off `data_dir`, which `--data-dir` moves, so
     /// re-deriving from `Config::default_data_dir()` would read an empty trail
     /// on every isolated run.
+    #[must_use]
     pub fn tool_audit_path(&self) -> PathBuf {
         self.data_dir.join("logs").join("tool-audit.jsonl")
     }
@@ -1682,8 +1721,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         let data_dir = nanna_config::project_dirs()
-            .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("./data"));
+            .map_or_else(|| PathBuf::from("./data"), |d| d.data_dir().to_path_buf());
 
         Self {
             ipc: IpcServerConfig::default(),
@@ -2154,12 +2192,11 @@ pub struct DaemonServer {
     memory_path: Option<PathBuf>,
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
-    _control: Arc<ControlPlane>,
     /// Late-bound handle to the control plane for consumers created
-    /// before it exists (filled in run(), read by the agent service).
+    /// before it exists (filled in `run()`, read by the agent service).
     control_slot: Arc<tokio::sync::RwLock<Option<Arc<ControlPlane>>>>,
     /// The scheduler, for the `schedule.*` services built before it exists.
-    /// Filled once in run(), right after the scheduler is constructed.
+    /// Filled once in `run()`, right after the scheduler is constructed.
     scheduler_slot: crate::reminder_service::SchedulerSlot,
     /// Per-server MCP state: written by the boot task, read by `system.status`.
     mcp_status: crate::mcp_startup::McpStatus,
@@ -2218,16 +2255,14 @@ impl DaemonServer {
                     .openai_api_key
                     .clone()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-                match key {
-                    Some(key) => Some((
-                        info,
-                        Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
-                    )),
-                    None => {
-                        warn!("Embedding provider '{spec}' skipped: no OpenAI API key");
-                        None
-                    }
-                }
+                let Some(key) = key else {
+                    warn!("Embedding provider '{spec}' skipped: no OpenAI API key");
+                    return None;
+                };
+                Some((
+                    info,
+                    Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
+                ))
             }
             "openrouter" => {
                 let key = self
@@ -2236,20 +2271,18 @@ impl DaemonServer {
                     .openrouter_api_key
                     .clone()
                     .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
-                match key {
-                    Some(key) => Some((
-                        info,
-                        Arc::new(
-                            nanna_llm::EmbeddingClient::openai(&key)
-                                .with_model(&model)
-                                .with_base_url("https://openrouter.ai/api"),
-                        ),
-                    )),
-                    None => {
-                        warn!("Embedding provider '{spec}' skipped: no OpenRouter API key");
-                        None
-                    }
-                }
+                let Some(key) = key else {
+                    warn!("Embedding provider '{spec}' skipped: no OpenRouter API key");
+                    return None;
+                };
+                Some((
+                    info,
+                    Arc::new(
+                        nanna_llm::EmbeddingClient::openai(&key)
+                            .with_model(&model)
+                            .with_base_url("https://openrouter.ai/api"),
+                    ),
+                ))
             }
             "ollama" => Some((
                 info,
@@ -2288,6 +2321,7 @@ impl DaemonServer {
     }
 
     /// Create a new daemon server
+    #[must_use]
     pub fn new(
         config: DaemonConfig,
         embedding: EmbeddingConfig,
@@ -2295,7 +2329,6 @@ impl DaemonServer {
         brave_api_key: Option<String>,
     ) -> Self {
         let sessions = Arc::new(SessionManager::new());
-        let control = Arc::new(ControlPlane::new(sessions.clone()));
         let ipc = Arc::new(IpcServer::new(config.ipc.clone()));
         let persistence = Arc::new(PersistenceManager::new(&config.data_dir));
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -2315,7 +2348,6 @@ impl DaemonServer {
             memory_path,
             _brave_api_key: brave_api_key,
             sessions,
-            _control: control,
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             mcp_status: crate::mcp_startup::McpStatus::default(),
@@ -2333,6 +2365,7 @@ impl DaemonServer {
     }
 
     /// Recovery report from a startup quarantine + rebuild, if one happened.
+    #[must_use]
     pub fn memory_recovery(&self) -> Option<Arc<nanna_storage::RecoveryReport>> {
         self.memory_recovery.clone()
     }
@@ -2340,14 +2373,12 @@ impl DaemonServer {
     /// Set the storage backend for model stats persistence and session persistence.
     pub fn set_storage(&mut self, storage: Arc<nanna_storage::Storage>) {
         // Replace the SessionManager with one that has storage
-        let new_sessions = Arc::new(SessionManager::with_storage(storage.clone()));
-        self.sessions = new_sessions.clone();
-        // Update control plane reference
-        self._control = Arc::new(ControlPlane::new(self.sessions.clone()));
+        self.sessions = Arc::new(SessionManager::with_storage(storage.clone()));
         self.storage = Some(storage);
     }
 
     /// Get the shutdown sender (for signaling shutdown)
+    #[must_use]
     pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
         self.shutdown_tx.clone()
     }
@@ -2356,11 +2387,13 @@ impl DaemonServer {
     /// `run()` (the signal / ctrl-c handlers in `main`). Clones share the
     /// armed flag, so recording stays a no-op until `run()` has claimed the
     /// file by writing its startup marker.
+    #[must_use]
     pub fn exit_reason_handle(&self) -> crate::exit_reason::ExitReasonFile {
         self.exit_reason.clone()
     }
 
     /// Get the IPC server address
+    #[must_use]
     pub fn ipc_address(&self) -> String {
         self.ipc.address()
     }
@@ -2373,6 +2406,14 @@ impl DaemonServer {
     }
 
     /// Run the daemon server
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DaemonError::AlreadyRunning`] when another daemon holds the PID
+    /// file, [`crate::DaemonError::Io`] when the data directory cannot be
+    /// created, [`crate::DaemonError::Ipc`] when the IPC request receiver has
+    /// already been taken, and whatever `init_services` returns when no LLM
+    /// provider is configured.
     pub async fn run(&mut self) -> Result<(), crate::DaemonError> {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
@@ -2393,10 +2434,10 @@ impl DaemonServer {
                 .map(|s| (*s).to_string())
                 .or_else(|| info.payload().downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            let location = info
-                .location()
-                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-                .unwrap_or_else(|| "<unknown location>".to_string());
+            let location = info.location().map_or_else(
+                || "<unknown location>".to_string(),
+                |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+            );
             // File first, log second: with panic=abort (the release profile)
             // this hook is the last code that runs, and the non-blocking log
             // writer may never flush — the reason file is the record that
@@ -2467,23 +2508,22 @@ impl DaemonServer {
         }
 
         // If no sessions loaded from DB, check for legacy sessions.json migration
-        if self.sessions.count().await == 0 {
-            if let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await {
-                if !sessions.is_empty() {
-                    info!(
-                        "Migrating {} sessions from legacy sessions.json to database",
-                        sessions.len()
-                    );
-                    for session in sessions {
-                        self.sessions.restore(session).await;
-                    }
-                    if let Some(id) = default_id {
-                        self.sessions.set_default(&id).await;
-                    }
-                    // Mark as migrated
-                    self.persistence.mark_sessions_migrated().await;
-                }
+        if self.sessions.count().await == 0
+            && let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await
+            && !sessions.is_empty()
+        {
+            info!(
+                "Migrating {} sessions from legacy sessions.json to database",
+                sessions.len()
+            );
+            for session in sessions {
+                self.sessions.restore(session).await;
             }
+            if let Some(id) = default_id {
+                self.sessions.set_default(&id).await;
+            }
+            // Mark as migrated
+            self.persistence.mark_sessions_migrated().await;
         }
 
         // Create default session if none exist
@@ -2552,13 +2592,13 @@ impl DaemonServer {
                                 );
                             }
                         }
-                        if recovered {
-                            if let Err(e) = storage.delete_checkpoint(&session_id).await {
-                                warn!(
-                                    "Failed to delete checkpoint for session {}: {}",
-                                    session_id, e
-                                );
-                            }
+                        if recovered
+                            && let Err(e) = storage.delete_checkpoint(&session_id).await
+                        {
+                            warn!(
+                                "Failed to delete checkpoint for session {}: {}",
+                                session_id, e
+                            );
                         }
                     }
                 }
@@ -2567,40 +2607,40 @@ impl DaemonServer {
 
             // Also migrate any legacy checkpoint JSON files
             let checkpoint_dir = self.config.data_dir.join("checkpoints");
-            if checkpoint_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&checkpoint_dir) {
-                    for entry in entries.flatten() {
-                        let filename = entry.file_name();
-                        let name = filename.to_string_lossy();
-                        if name.starts_with("checkpoint-") && name.ends_with(".json") {
-                            let session_id = name
-                                .strip_prefix("checkpoint-")
-                                .and_then(|s| s.strip_suffix(".json"))
-                                .unwrap_or("");
-                            if !session_id.is_empty() {
-                                if let Some(partial) = agent.recover_checkpoint(session_id) {
-                                    let reasoning = partial.reasoning.clone();
-                                    self.sessions
-                                        .add_full_message(
-                                            session_id,
-                                            crate::session::MessageRole::Assistant,
-                                            &partial.content,
-                                            crate::session::MessageDetails {
-                                                tool_calls: partial.tool_calls,
-                                                reasoning,
-                                                timeline: partial.timeline,
-                                                usage: partial.usage,
-                                            },
-                                        )
-                                        .await;
-                                    info!(
-                                        "Recovered crashed run from legacy checkpoint for session {}",
-                                        session_id
-                                    );
-                                }
-                                // Remove the legacy file
-                                let _ = std::fs::remove_file(entry.path());
+            if checkpoint_dir.exists()
+                && let Ok(entries) = std::fs::read_dir(&checkpoint_dir)
+            {
+                for entry in entries.flatten() {
+                    let filename = entry.file_name();
+                    let name = filename.to_string_lossy();
+                    if name.starts_with("checkpoint-") && name.ends_with(".json") {
+                        let session_id = name
+                            .strip_prefix("checkpoint-")
+                            .and_then(|s| s.strip_suffix(".json"))
+                            .unwrap_or("");
+                        if !session_id.is_empty() {
+                            if let Some(partial) = agent.recover_checkpoint(session_id) {
+                                let reasoning = partial.reasoning.clone();
+                                self.sessions
+                                    .add_full_message(
+                                        session_id,
+                                        crate::session::MessageRole::Assistant,
+                                        &partial.content,
+                                        crate::session::MessageDetails {
+                                            tool_calls: partial.tool_calls,
+                                            reasoning,
+                                            timeline: partial.timeline,
+                                            usage: partial.usage,
+                                        },
+                                    )
+                                    .await;
+                                info!(
+                                    "Recovered crashed run from legacy checkpoint for session {}",
+                                    session_id
+                                );
                             }
+                            // Remove the legacy file
+                            let _ = std::fs::remove_file(entry.path());
                         }
                     }
                 }
@@ -3161,7 +3201,7 @@ impl DaemonServer {
                         success,
                         output,
                         error,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: crate::numeric::millis_u64(start.elapsed()),
                         started_at,
                         finished_at: chrono::Utc::now(),
                     }
@@ -3276,7 +3316,7 @@ impl DaemonServer {
 
         // Wire model stats tracker into the router for health-aware routing.
         // The control plane owns the canonical tracker; the router reads it.
-        if let Some(ref router) = control.router() {
+        if let Some(router) = control.router() {
             router.set_stats(control.model_stats.clone()).await;
             info!("Stats-informed routing enabled on LLM router");
         }
@@ -3409,7 +3449,10 @@ impl DaemonServer {
                 &self.config.ipc.host,
                 self.config.health_port,
             );
-            health_server.spawn();
+            // Detached on purpose: the health server runs for the daemon's whole
+            // life and has no shutdown hook, so dropping the join handle — what
+            // this code always did — is the intent, not an oversight.
+            drop(health_server.spawn());
 
             Some(health_state)
         } else {
@@ -3485,6 +3528,10 @@ impl DaemonServer {
                         router.register("telegram", Box::new(TelegramChannel::new(token)));
                         info!("Registered Telegram outbound channel from webhook config");
                     }
+                    // Registration is complete; the Discord note below reads only
+                    // the webhook config, so the write lock is released here
+                    // rather than held across it.
+                    drop(router);
                     if webhook_config_copy.discord_public_key.is_some() {
                         // discord_public_key is for verification; bot token for sending
                         // is not separately stored in WebhookConfig currently.
@@ -4360,20 +4407,18 @@ impl DaemonServer {
         // Two registries would compile and silently guard nothing.
         let turn_baselines = Arc::new(crate::tasks::TurnBaselines::new());
         {
-            let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> = if !router
-                .available_providers()
-                .is_empty()
-            {
-                Some(Arc::new(AgentSpawnerImpl {
-                    router: router.clone(),
-                    // The live config, not a snapshot of it — see
-                    // `AgentSpawnerImpl::agent_config_src`.
-                    agent_config_src: Arc::clone(&shared_agent_config),
-                    control: self.control_slot.clone(),
-                }))
-            } else {
-                None
-            };
+            let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
+                if router.available_providers().is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(AgentSpawnerImpl {
+                        router: router.clone(),
+                        // The live config, not a snapshot of it — see
+                        // `AgentSpawnerImpl::agent_config_src`.
+                        agent_config_src: Arc::clone(&shared_agent_config),
+                        control: self.control_slot.clone(),
+                    }))
+                };
 
             // `[memory] ocr_model_priority` already means "vision-capable
             // models, tried in order" — an existing documented setting, so
@@ -4445,11 +4490,11 @@ impl DaemonServer {
                 );
             }
 
-            if let Some(ref dir) = tools_dir {
-                if dir.is_dir() {
-                    let loaded = tools.load_skills_with_services(dir, &services).await;
-                    info!("Loaded {} tools from {:?}", loaded, dir);
-                }
+            if let Some(ref dir) = tools_dir
+                && dir.is_dir()
+            {
+                let loaded = tools.load_skills_with_services(dir, &services).await;
+                info!("Loaded {} tools from {:?}", loaded, dir);
             }
 
             // Tools authored at runtime live in the data dir. In a release
@@ -4620,8 +4665,6 @@ fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPol
     ToolPolicy::from_config_lists(enabled, disabled)
 }
 
-/// Embedding configuration for the daemon
-
 /// Split an `embedding_priority` entry into `(provider, model)`.
 ///
 /// Splits on the FIRST slash only: model names routinely contain slashes of
@@ -4688,7 +4731,7 @@ impl Default for EmbeddingConfig {
     }
 }
 
-/// Builder for DaemonServer
+/// Builder for [`DaemonServer`]
 pub struct DaemonBuilder {
     config: DaemonConfig,
     embedding: EmbeddingConfig,
@@ -4719,16 +4762,19 @@ fn apply_channel_webhook_secrets(
         webhook.slack_signing_secret = Some(slack.signing_secret.clone());
     }
     if let Some(ref whatsapp) = channels.whatsapp {
-        webhook.whatsapp_verify_token = whatsapp.verify_token.clone();
-        webhook.whatsapp_app_secret = whatsapp.app_secret.clone();
+        webhook
+            .whatsapp_verify_token
+            .clone_from(&whatsapp.verify_token);
+        webhook.whatsapp_app_secret.clone_from(&whatsapp.app_secret);
     }
     if let Some(ref telegram) = channels.telegram {
         webhook.telegram_token = Some(telegram.bot_token.clone());
-        webhook.telegram_secret = telegram.webhook_secret.clone();
+        webhook.telegram_secret.clone_from(&telegram.webhook_secret);
     }
 }
 
 impl DaemonBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             config: DaemonConfig::default(),
@@ -4740,6 +4786,15 @@ impl DaemonBuilder {
     }
 
     /// Create builder from Nanna config file
+    ///
+    /// # Errors
+    ///
+    /// Never, today: a config file that fails to load falls back to
+    /// [`nanna_config::Config::default`] with env overrides, and every field
+    /// below is infallible. The `Result` is kept because this is the daemon's
+    /// one construction seam and a future required setting (a credential that
+    /// cannot be defaulted, say) must be able to refuse to boot here rather
+    /// than panic.
     pub fn from_nanna_config() -> Result<Self, crate::DaemonError> {
         use nanna_config::Config;
 
@@ -4764,10 +4819,22 @@ impl DaemonBuilder {
         builder.config.llm = LlmConfig::from_nanna(&config);
 
         // Set embedding configuration from Nanna memory config
-        builder.embedding.provider = config.memory.embedding_provider.clone();
-        builder.embedding.model = config.memory.embedding_model.clone();
-        builder.embedding.ollama_host = config.memory.ollama_host.clone();
-        builder.embedding.priority = config.memory.embedding_priority.clone();
+        builder
+            .embedding
+            .provider
+            .clone_from(&config.memory.embedding_provider);
+        builder
+            .embedding
+            .model
+            .clone_from(&config.memory.embedding_model);
+        builder
+            .embedding
+            .ollama_host
+            .clone_from(&config.memory.ollama_host);
+        builder
+            .embedding
+            .priority
+            .clone_from(&config.memory.embedding_priority);
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
@@ -4778,7 +4845,10 @@ impl DaemonBuilder {
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
         // `ocr_model_priority` already means "vision-capable models, in order";
         // `vision.analyze` reads it rather than adding a second list.
-        builder.config.vision_model_priority = config.memory.ocr_model_priority.clone();
+        builder
+            .config
+            .vision_model_priority
+            .clone_from(&config.memory.ocr_model_priority);
         builder.config.mcp = config.mcp.clone();
 
         // Scheduler switches. The daemon owns the scheduler (P16), so without
@@ -4819,7 +4889,7 @@ impl DaemonBuilder {
                 } else {
                     info!("Using Nanna data directory: {:?}", data_dir);
                 }
-                builder.config.data_dir = data_dir.clone();
+                builder.config.data_dir.clone_from(&data_dir);
                 builder.memory_path = Some(data_dir.join("memories.json"));
             }
             Err(e) => {
@@ -4829,22 +4899,42 @@ impl DaemonBuilder {
 
         // Set agent configuration from loaded config
         // Use user-configured model priority list for fallback
-        builder.config.agent.model_priority = config.llm.model_priority.clone();
+        builder
+            .config
+            .agent
+            .model_priority
+            .clone_from(&config.llm.model_priority);
         info!("Model priority list: {:?}", config.llm.model_priority);
 
         if let Some(model) = config.llm.model_priority.first() {
-            builder.config.agent.model = model.to_string();
+            builder.config.agent.model.clone_from(model);
         } else {
-            builder.config.agent.model = config.llm.model.clone();
+            builder.config.agent.model.clone_from(&config.llm.model);
         }
 
         // Set summarization configuration
-        builder.config.agent.summarization_priority = config.llm.summarization_priority.clone();
-        builder.config.agent.summarization_ollama_url = config.llm.ollama_url.clone();
+        builder
+            .config
+            .agent
+            .summarization_priority
+            .clone_from(&config.llm.summarization_priority);
+        builder
+            .config
+            .agent
+            .summarization_ollama_url
+            .clone_from(&config.llm.ollama_url);
 
         // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
-        builder.config.agent.openrouter_api_key = config.llm.openrouter_api_key.clone();
-        builder.config.agent.openai_api_key = config.llm.openai_api_key.clone();
+        builder
+            .config
+            .agent
+            .openrouter_api_key
+            .clone_from(&config.llm.openrouter_api_key);
+        builder
+            .config
+            .agent
+            .openai_api_key
+            .clone_from(&config.llm.openai_api_key);
 
         // Thinking mode is NOT read from config: it is always on (owner
         // directive 2026-08-04). `AgentServiceConfig::default` already carries
@@ -4858,9 +4948,17 @@ impl DaemonBuilder {
         builder.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
 
         // Set model routing configuration
-        builder.config.agent.model_routing = config.llm.model_routing.clone();
+        builder
+            .config
+            .agent
+            .model_routing
+            .clone_from(&config.llm.model_routing);
         builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
-        builder.config.agent.sub_agent_model = config.llm.sub_agent_model.clone();
+        builder
+            .config
+            .agent
+            .sub_agent_model
+            .clone_from(&config.llm.sub_agent_model);
         // Resolved here (list > legacy single > main chat list) so every
         // consumer sees one authoritative, never-empty chain.
         builder.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
@@ -4877,18 +4975,21 @@ impl DaemonBuilder {
         }
 
         // Set Brave API key for web search
-        builder.brave_api_key = config.tools.brave_api_key.clone();
+        builder.brave_api_key.clone_from(&config.tools.brave_api_key);
 
         // Set script tools flag and tools directory
         builder.config.use_script_tools = config.tools.use_script_tools;
-        builder.config.tools_dir = config.tools.tools_dir.clone();
+        builder.config.tools_dir.clone_from(&config.tools.tools_dir);
 
         // Tool allow/deny policy — `[tools] enabled` is the allowlist ("*" = all),
         // `[tools] disabled` is the denylist. This is the wiring that makes a
         // disabled tool actually stop executing (the lists were previously
         // parsed into config but never enforced).
         builder.config.tool_allowlist = Some(config.tools.enabled.clone());
-        builder.config.tool_denylist = config.tools.disabled.clone();
+        builder
+            .config
+            .tool_denylist
+            .clone_from(&config.tools.disabled);
         builder.config.tool_audit.log = config.tools.audit_log;
         builder.config.tool_audit.log_values = config.tools.audit_log_values;
 
@@ -4937,86 +5038,103 @@ impl DaemonBuilder {
         Ok(builder)
     }
 
-    pub fn with_port(mut self, port: u16) -> Self {
+    #[must_use]
+    pub const fn with_port(mut self, port: u16) -> Self {
         self.config.ipc.port = port;
         self
     }
 
+    #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.config.ipc.host = host.into();
         self
     }
 
+    #[must_use]
     pub fn with_data_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.data_dir = path.into();
         self
     }
 
+    #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.config.log_level = level.into();
         self
     }
 
-    pub fn with_auto_save_interval(mut self, secs: u64) -> Self {
+    #[must_use]
+    pub const fn with_auto_save_interval(mut self, secs: u64) -> Self {
         self.config.auto_save_interval_secs = secs;
         self
     }
 
+    #[must_use]
     pub fn with_llm_provider(mut self, provider: impl Into<String>) -> Self {
         self.config.llm.provider = provider.into();
         self
     }
 
+    #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.config.llm.api_key = Some(key.into());
         self
     }
 
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.config.agent.model = model.into();
         self
     }
 
-    pub fn with_memory(mut self, enable: bool) -> Self {
+    #[must_use]
+    pub const fn with_memory(mut self, enable: bool) -> Self {
         self.config.enable_memory = enable;
         self
     }
 
-    pub fn with_health_server(mut self, enable: bool) -> Self {
+    #[must_use]
+    pub const fn with_health_server(mut self, enable: bool) -> Self {
         self.config.servers.health_server = enable;
         self
     }
 
-    pub fn with_health_port(mut self, port: u16) -> Self {
+    #[must_use]
+    pub const fn with_health_port(mut self, port: u16) -> Self {
         self.config.health_port = port;
         self
     }
 
-    pub fn with_pid_file(mut self, enable: bool) -> Self {
+    #[must_use]
+    pub const fn with_pid_file(mut self, enable: bool) -> Self {
         self.config.servers.pid_file = enable;
         self
     }
 
-    pub fn with_webhook_server(mut self, enable: bool) -> Self {
+    #[must_use]
+    pub const fn with_webhook_server(mut self, enable: bool) -> Self {
         self.config.servers.webhook_server = enable;
         self
     }
 
-    pub fn with_webhook_port(mut self, port: u16) -> Self {
+    #[must_use]
+    pub const fn with_webhook_port(mut self, port: u16) -> Self {
         self.config.webhook_port = port;
         self
     }
 
+    #[must_use]
     pub fn with_webhook_config(mut self, config: WebhookConfig) -> Self {
         self.config.webhook = config;
         self
     }
 
-    pub fn with_script_tools(mut self, enable: bool) -> Self {
+    #[must_use]
+    pub const fn with_script_tools(mut self, enable: bool) -> Self {
         self.config.use_script_tools = enable;
         self
     }
 
+    #[must_use]
     pub fn with_log_buffer(mut self, buffer: crate::log_buffer::LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
         self
@@ -5416,7 +5534,7 @@ mod tests {
     /// `embedding_provider`. A default entry here therefore overrides the
     /// provider the user actually selected, silently.
     ///
-    /// It was `["openai/text-embedding-3-small"]`. With no OpenAI key that
+    /// It was `["openai/text-embedding-3-small"]`. With no `OpenAI` key that
     /// resolved zero providers and switched the whole memory subsystem off, and
     /// the Settings dropdown writes provider/model without touching this list,
     /// so the state was one click away for anyone who chose Ollama.
@@ -5432,7 +5550,7 @@ mod tests {
     }
 
     /// REGRESSION: a scheduled run must see its own session — every one of the
-    /// 35 logged "session scope requires session_id" `todo` failures came from
+    /// 35 logged "session scope requires `session_id`" `todo` failures came from
     /// a `scheduled-heartbeat-*` run that had a session id all along, it just
     /// never reached the registry `Nanna.sessionId()` reads.
     ///
