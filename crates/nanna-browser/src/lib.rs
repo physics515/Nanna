@@ -262,10 +262,12 @@ pub trait Browser: Send + Sync {
 ///
 /// Returns `BrowserError::UnsupportedBrowser` if the requested backend is not compiled in.
 pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, BrowserError> {
-    // Playwright supports all browsers
+    // Playwright supports all browsers. This block is the whole body whenever
+    // the feature is on — the two below are cfg'd out by `not(playwright)` and
+    // `not(any(..))` — so it is the tail expression and needs no `return`.
     #[cfg(feature = "playwright")]
     {
-        return Ok(Arc::new(playwright::PlaywrightBrowser::new(config)));
+        Ok(Arc::new(playwright::PlaywrightBrowser::new(config)))
     }
 
     // CDP only supports Chromium

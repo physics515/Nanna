@@ -255,9 +255,11 @@ mod tests {
     /// ASCII, so box-drawing output and every non-Latin script read as binary.
     #[test]
     fn box_drawing_and_non_latin_text_are_not_binary() {
-        // `format!`, not `String + &String`: with every feature enabled the
-        // graph pulls in smartstring, whose `Add` impl for String makes that
-        // expression ambiguous and the crate stop compiling.
+        // `format!`, not `String + &String`: under `--all-features` the graph
+        // picks up smartstring (via deno_ast -> swc_ecma_lexer), whose
+        // `impl Add<SmartString<_>> for String` makes the `+` ambiguous, so
+        // the `&String -> &str` deref coercion is no longer attempted and the
+        // line stops compiling.
         let tree = format!("[exec → tree — ok] {}", "├── src\n│   └── main.rs\n".repeat(20));
         assert!(!is_low_signal_memory(&tree));
         assert!(!is_low_signal_memory(
