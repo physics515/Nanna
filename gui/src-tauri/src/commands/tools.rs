@@ -217,21 +217,7 @@ pub async fn list_tools(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ToolInfo>, String> {
     let result = backend_handle(&state).await.tool_list().await?;
-    let tools = result
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| {
-                    Some(ToolInfo {
-                        name: t.get("name")?.as_str()?.to_string(),
-                        description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        enabled: t.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
-                        is_user_tool: t.get("is_user_tool").and_then(serde_json::Value::as_bool).unwrap_or(false),
-                    })
-                })
-                .collect()
-        })
+    let tools = crate::commands::settings::tool_infos(&result)
         .ok_or("Failed to fetch tools from daemon")?;
     Ok(tools)
 }

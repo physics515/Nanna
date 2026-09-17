@@ -640,7 +640,7 @@ async fn probe_signal(
     }
 }
 
-/// WhatsApp: the Cloud API phone-number endpoint for a `cloud_api` setup. A
+/// `WhatsApp`: the Cloud API phone-number endpoint for a `cloud_api` setup. A
 /// web-bridge setup cannot be probed without its QR login, so it only reports
 /// being configured.
 async fn probe_whatsapp(
