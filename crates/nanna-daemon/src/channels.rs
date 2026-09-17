@@ -280,6 +280,15 @@ impl ChannelManager {
             .ensure_channel_session(&session_id, &name, &route)
             .await;
 
+        // A chat app has no settings screen: the few things a GUI user
+        // changes with a click, a channel user says as a command. Handled
+        // here, never sent to the model.
+        if let Some(command) = parse_channel_command(&text) {
+            let reply = run_channel_command(command, control, &session_id).await;
+            send_reply(router, &msg, reply).await;
+            return;
+        }
+
         let action = ChatAction::Send {
             session_id: session_id.clone(),
             content: text,
@@ -294,17 +303,7 @@ impl ChannelManager {
             return;
         };
         warn!("Channel turn for {session_id} was refused: {refusal}");
-        let outgoing = OutgoingMessage {
-            channel: msg.channel.clone(),
-            content: MessageContent::Text { text: refusal },
-            reply_to: Some(msg.id.clone()),
-        };
-        if let Err(e) = router.send(outgoing).await {
-            error!(
-                "Failed to send response to {}:{}: {}",
-                msg.channel.provider, msg.channel.id, e
-            );
-        }
+        send_reply(router, &msg, refusal).await;
     }
 
     /// Stop all listeners
@@ -335,6 +334,126 @@ impl ChannelManager {
             })
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Answer `msg` in the channel it came from.
+async fn send_reply(router: &MessageRouter, msg: &IncomingMessage, text: String) {
+    debug_assert!(!text.trim().is_empty(), "a reply says something");
+    let outgoing = OutgoingMessage {
+        channel: msg.channel.clone(),
+        content: MessageContent::Text { text },
+        reply_to: Some(msg.id.clone()),
+    };
+    if let Err(e) = router.send(outgoing).await {
+        error!(
+            "Failed to send response to {}:{}: {}",
+            msg.channel.provider, msg.channel.id, e
+        );
+    }
+}
+
+/// A command a channel user typed instead of a message for the model.
+#[derive(Debug, PartialEq, Eq)]
+enum ChannelCommand<'a> {
+    /// `/model` — say which model this conversation uses.
+    ShowModel,
+    /// `/model <spec>` — pin this conversation to a model.
+    SetModel(&'a str),
+    /// `/model default` — follow the daemon's default again.
+    ClearModel,
+    /// `/model a b` — more than one word; nothing is changed.
+    ModelUsage,
+}
+
+/// Parse a channel command. Pure. `None` means an ordinary message.
+///
+/// Matches the command word exactly — `/models` or `/modeling` are messages —
+/// and accepts Telegram's group form `/model@SomeBot`.
+fn parse_channel_command(text: &str) -> Option<ChannelCommand<'_>> {
+    let text = text.trim();
+    let (head, rest) = text
+        .split_once(char::is_whitespace)
+        .map_or((text, ""), |(head, rest)| (head, rest.trim()));
+    let command = head.split_once('@').map_or(head, |(command, _bot)| command);
+    if command != "/model" {
+        return None;
+    }
+    let mut words = rest.split_whitespace();
+    let command = match (words.next(), words.next()) {
+        (None, _) => ChannelCommand::ShowModel,
+        (Some(_), Some(_)) => ChannelCommand::ModelUsage,
+        (Some(word), None) if ["default", "reset", "clear"].contains(&word) => {
+            ChannelCommand::ClearModel
+        }
+        (Some(spec), None) => ChannelCommand::SetModel(spec),
+    };
+    Some(command)
+}
+
+/// Carry out a channel command against the session; returns the reply.
+async fn run_channel_command(
+    command: ChannelCommand<'_>,
+    control: &ControlPlane,
+    session_id: &str,
+) -> String {
+    let sessions = &control.sessions;
+    match command {
+        ChannelCommand::ShowModel => {
+            // A rare command; cloning the session to read one key is fine.
+            let Some(session) = sessions.get(session_id).await else {
+                return "This conversation could not be found, so nothing was read.".to_string();
+            };
+            session.chat_model().map_or_else(
+                || {
+                    "This conversation follows Nanna's default model. Send `/model <name>` to pin one."
+                        .to_string()
+                },
+                |spec| {
+                    format!("This conversation is pinned to `{spec}`. Send `/model default` to undo.")
+                },
+            )
+        }
+        ChannelCommand::SetModel(spec) => {
+            if !sessions
+                .set_chat_model(session_id, Some(spec.to_string()))
+                .await
+            {
+                return "This conversation could not be found, so no model was pinned.".to_string();
+            }
+            let servable = control
+                .router()
+                .is_some_and(|router| router.can_handle(spec));
+            model_pinned_reply(spec, servable)
+        }
+        ChannelCommand::ClearModel => {
+            if sessions.set_chat_model(session_id, None).await {
+                "This conversation follows Nanna's default model again.".to_string()
+            } else {
+                "This conversation could not be found, so nothing was changed.".to_string()
+            }
+        }
+        ChannelCommand::ModelUsage => {
+            "Nothing was changed: a model name is one word, e.g. `/model ollama/qwen3.5:9b`. \
+             `/model` alone shows the current one; `/model default` undoes a pin."
+                .to_string()
+        }
+    }
+}
+
+/// The reply to a model pin. Pure.
+///
+/// The pin is kept either way — a provider may come up before the next turn,
+/// and the turn is where "can this run" is decided (see `SessionAction::SetModel`).
+/// What differs is whether the reply may say it will run.
+fn model_pinned_reply(spec: &str, servable: bool) -> String {
+    if servable {
+        format!("This conversation now uses `{spec}`.")
+    } else {
+        format!(
+            "This conversation is now pinned to `{spec}`, but no provider Nanna has configured can \
+             serve it right now, so your next message will fail until one can. Send `/model default` to undo."
+        )
     }
 }
 
@@ -602,6 +721,108 @@ mod tests {
             delta: "d".into(),
         };
         assert_eq!(reply_text(&delta), None);
+    }
+
+    #[test]
+    fn model_commands_parse_exactly() {
+        use ChannelCommand::*;
+        assert_eq!(parse_channel_command("/model"), Some(ShowModel));
+        assert_eq!(parse_channel_command("  /model  "), Some(ShowModel));
+        assert_eq!(parse_channel_command("/model@NannaBot"), Some(ShowModel));
+        assert_eq!(
+            parse_channel_command("/model ollama/qwen3.5:9b"),
+            Some(SetModel("ollama/qwen3.5:9b"))
+        );
+        assert_eq!(
+            parse_channel_command("/model@NannaBot claude-opus-5"),
+            Some(SetModel("claude-opus-5"))
+        );
+        assert_eq!(parse_channel_command("/model default"), Some(ClearModel));
+        assert_eq!(parse_channel_command("/model reset"), Some(ClearModel));
+        assert_eq!(
+            parse_channel_command("/model the big one"),
+            Some(ModelUsage)
+        );
+        for message in [
+            "/models",
+            "/modeling",
+            "model x",
+            "what /model do you use?",
+            "",
+            "hi",
+        ] {
+            assert_eq!(parse_channel_command(message), None, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn a_pin_only_promises_to_run_when_a_provider_can_serve_it() {
+        assert_eq!(
+            model_pinned_reply("claude-opus-5", true),
+            "This conversation now uses `claude-opus-5`."
+        );
+        let unservable = model_pinned_reply("claude-opus-5", false);
+        assert!(
+            unservable.contains("no provider Nanna has configured can serve it"),
+            "{unservable}"
+        );
+        assert!(!unservable.contains("now uses"), "{unservable}");
+    }
+
+    #[tokio::test]
+    async fn a_model_command_pins_and_clears_without_reaching_the_model() {
+        let sessions = Arc::new(SessionManager::new());
+        let control = Arc::new(ControlPlane::new(sessions.clone()));
+        let (router, sent) = recording_router();
+        let router = router.read().await;
+
+        ChannelManager::process_message(incoming("/model ollama/qwen3.5:9b"), &control, &router)
+            .await;
+        let session = sessions.get(SESSION).await.expect("session");
+        assert_eq!(session.chat_model(), Some("ollama/qwen3.5:9b"));
+        assert!(
+            session.messages.is_empty(),
+            "a command is not a conversation turn"
+        );
+
+        ChannelManager::process_message(incoming("/model"), &control, &router).await;
+        ChannelManager::process_message(incoming("/model default"), &control, &router).await;
+        assert_eq!(
+            sessions.get(SESSION).await.expect("session").chat_model(),
+            None
+        );
+        ChannelManager::process_message(incoming("/model a b"), &control, &router).await;
+
+        let replies: Vec<String> = sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(replies.len(), 4, "{replies:?}");
+        // No router on this control plane: the pin is kept and the reply says
+        // it cannot run yet, rather than claiming it will. (The recording
+        // channel is plain text, so the router has stripped the Markdown.)
+        assert!(
+            replies[0].contains("pinned to ollama/qwen3.5:9b, but no provider"),
+            "{}",
+            replies[0]
+        );
+        assert!(
+            replies[1].contains("is pinned to ollama/qwen3.5:9b"),
+            "{}",
+            replies[1]
+        );
+        assert!(
+            replies[2].contains("follows Nanna's default model again"),
+            "{}",
+            replies[2]
+        );
+        assert!(
+            replies[3].starts_with("Nothing was changed"),
+            "{}",
+            replies[3]
+        );
     }
 
     #[test]

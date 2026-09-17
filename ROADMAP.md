@@ -4816,9 +4816,18 @@ asks permission or restricts her.)*:
             `apply_chat_model_override` moves exactly the chat model on the per-turn config clone
             — never the shared service config, so sub-agents, summarization and other sessions
             are untouched (pinned by `a_chat_model_pick_moves_exactly_two_fields`).
-      - [ ] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
+      - [x] **For chat-first channels:** `nanna-channels` has no model command, so a Telegram
             user still cannot say "use the big model for this conversation" — a `/model <name>`
             channel command over the same `session.set_model` verb would close it.
+            *(2026-09-17)* Done in `ChannelManager::process_message`, ahead of the turn: `/model`
+            shows the pin, `/model <spec>` pins, `/model default|reset|clear` unpins, and anything
+            with more than one word changes nothing and says how to use it. Exact command word
+            (`/models` is a message) and Telegram's `/model@Bot` group form. Same store as the GUI
+            picker (`set_chat_model`); the pin is kept even when no provider can serve it — the
+            turn remains the place that decides — but the reply then says so instead of claiming it
+            will run. A command is never sent to the model and never becomes a session message.
+            4 tests (parser, reply wording both ways, pin → show → clear → usage end to end through
+            a recording channel). Needed the channel-reply fix from the same run to be reachable at all.
 - [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
       restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
       (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
