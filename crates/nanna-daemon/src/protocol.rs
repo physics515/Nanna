@@ -126,8 +126,17 @@ pub enum TaskAction {
         recurrence: Option<String>,
         #[serde(default)]
         depends_on: Option<Vec<i64>>,
+        /// Boxed because it is the whole reason this variant dwarfs the rest.
+        /// A `serde_json::Value` is 32 bytes with `serde_json`'s default
+        /// `BTreeMap`-backed map and ~72 with the `IndexMap` that
+        /// `preserve_order` swaps in — and something in the dependency graph
+        /// turns `preserve_order` on under `--all-features`. Inline, that made
+        /// `Create`, and through it `Action` (the type every IPC request is),
+        /// 368 bytes, so a `task.get {id}` cost as much to move as the largest
+        /// `task.create`. `Box` is transparent to serde: the wire JSON is
+        /// byte-for-byte what it was, including `null` for `None`.
         #[serde(default)]
-        acceptance: Option<serde_json::Value>,
+        acceptance: Option<Box<serde_json::Value>>,
         #[serde(default)]
         project: Option<String>,
         #[serde(default)]
@@ -1147,6 +1156,75 @@ mod tests {
                     Action::Session(SessionAction::SetModel { model: None, .. })
                 ),
                 "no model on the wire is the clear, not a parse error"
+            );
+        }
+    }
+
+    /// `TaskAction::Create::acceptance` is a `Box` purely to keep `Action`
+    /// small, and that is only allowed because `Box` is transparent to serde.
+    /// Pinned in both directions: a client's `task.create` still parses, and
+    /// the acceptance goes back out as itself rather than wrapped in anything.
+    /// If the box ever leaked into the wire it would show up here and nowhere
+    /// else — every client hand-writes this envelope.
+    ///
+    /// The re-serialized envelope is not byte-identical to the request, but
+    /// that predates the box and has nothing to do with it: no field carries
+    /// `skip_serializing_if`, so all thirteen omitted `Option`s come back as
+    /// explicit `null`. Round-tripping that output is what the assertion
+    /// checks, because `null` and absent are the same thing on the way in.
+    #[test]
+    fn a_boxed_acceptance_is_the_same_json_in_both_directions() {
+        let check = serde_json::json!({ "kind": "command", "command": "cargo test", "cwd": "." });
+        let raw = serde_json::json!({
+            "type": "task",
+            "action": "create",
+            "title": "build minidb",
+            "acceptance": check,
+        });
+
+        let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+        match &action {
+            Action::Task(TaskAction::Create { title, acceptance, .. }) => {
+                assert_eq!(title, "build minidb");
+                assert_eq!(
+                    acceptance.as_deref(),
+                    Some(&check),
+                    "the acceptance arrives whole through the box"
+                );
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+
+        let out = serde_json::to_value(&action).expect("create must serialize");
+        assert_eq!(out["acceptance"], check, "the box must not show up on the wire");
+        let again = serde_json::from_value::<Action>(out).expect("our own output must parse");
+        match again {
+            Action::Task(TaskAction::Create { acceptance, .. }) => {
+                assert_eq!(acceptance.as_deref(), Some(&check));
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+    }
+
+    /// The other half: no acceptance at all. `null` and an absent key both
+    /// mean "no check", and neither may round-trip into `Some(Value::Null)` —
+    /// which `task_create` would then hand to the harness parser as a shape to
+    /// reject, turning a plain task into a `bad_acceptance` error.
+    #[test]
+    fn a_null_or_absent_acceptance_is_no_acceptance() {
+        for raw in [
+            serde_json::json!({
+                "type": "task", "action": "create", "title": "t", "acceptance": null,
+            }),
+            serde_json::json!({ "type": "task", "action": "create", "title": "t" }),
+        ] {
+            let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+            assert!(
+                matches!(
+                    action,
+                    Action::Task(TaskAction::Create { acceptance: None, .. })
+                ),
+                "no acceptance on the wire is no check, not an empty one"
             );
         }
     }

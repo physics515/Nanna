@@ -530,7 +530,10 @@ struct CreateTask {
     due_at: Option<String>,
     recurrence: Option<String>,
     depends_on: Option<Vec<i64>>,
-    acceptance: Option<Value>,
+    /// Boxed to match `TaskAction::Create`, whose field it is moved from; see
+    /// the note there. Unboxed again by `task_create` before it reaches
+    /// `NewTask`, which stores the canonicalized value inline.
+    acceptance: Option<Box<Value>>,
     project: Option<String>,
     assignee: Option<String>,
 }
