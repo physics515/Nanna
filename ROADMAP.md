@@ -4612,6 +4612,27 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             on the new (5/5 reruns). The flag is still write-only — nothing reads it — and the
             transport is the deprecated 2024-11-05 HTTP+SSE one, so this item remains a rewrite, not
             a config wiring job.
+            *(research 2026-09-17 — what the rewrite targets)* **Streamable HTTP as of `2026-07-28`**
+            is much simpler than the 2025 shape: one MCP endpoint, **every** JSON-RPC message its own
+            `POST` with `Accept: application/json, text/event-stream`; each request answered by a
+            JSON object **or** an SSE stream scoped to that request (progress/log notifications, then
+            the response); **no sessions** (`Mcp-Session-Id` gone), **no GET stream**, no
+            `Last-Event-ID` resumption; cancellation = closing that request's stream (no
+            `notifications/cancelled`). Required headers mirror the body: `MCP-Protocol-Version`
+            (must equal `_meta["io.modelcontextprotocol/protocolVersion"]`), `Mcp-Method`, and
+            `Mcp-Name` for `tools/call`/`resources/read`/`prompts/get` (Base64 sentinel
+            `=?base64?…?=` for non-header-safe values); mismatches are `400` + `-32020`
+            `HeaderMismatch`. **Clients MUST mirror `x-mcp-header`-annotated tool parameters into
+            `Mcp-Param-{Name}` headers and MUST drop tools whose annotations are invalid** — a
+            requirement nanna-mcp's schema guard should enforce at `tools/list`. Server-to-client
+            asks arrive as `InputRequiredResult` (retry with `inputResponses`), and change
+            notifications only via a `subscriptions/listen` stream. Era detection: send a modern
+            request; on `400`/`404`/`405` inspect the body — a recognized modern JSON-RPC error means
+            modern (retry with the advertised versions), otherwise fall back to `initialize`
+            (2025-era Streamable HTTP) or, failing a POST, `GET` for the legacy `endpoint` event.
+            Consequence for this item: build the modern POST client first and keep the SSE transport
+            only as the last fallback — or drop it, since it is deprecated and eligible for removal.
+            Source: [Streamable HTTP, 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
       - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
