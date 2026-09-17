@@ -4538,8 +4538,17 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       - [ ] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
-      - [ ] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
+      - [~] **Surface MCP state** — `nanna doctor` and the GUI Tools page should show each configured
             server as started / failed-with-reason; today that lives only in the boot log.
+            *(2026-09-17)* `nanna doctor` half done: an offline `mcp.servers` check judges the
+            config the way the daemon will start it — FAIL when a command is not on `PATH` (or an
+            absolute `command` is not an executable file), naming the server and noting the daemon's
+            PATH can differ from the shell's; WARN for entries the daemon will skip (blank,
+            duplicate, over the limit); OK listing what will start. Nothing is spawned. Verified on
+            the real CLI against the smoke config: `[FAIL] mcp.servers 'broken' runs
+            /nonexistent/mcp-server, which is not an executable file; also not started: … 'fixture'
+            is used twice`. Still open: live per-server state (started / handshake failed) over IPC
+            and on the GUI Tools page.
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.

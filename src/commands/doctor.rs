@@ -118,6 +118,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
     checks.push(check_ollama_servers(config));
+    checks.push(check_mcp_servers(config, command_resolves));
 
     debug_assert!(
         checks
@@ -208,6 +209,94 @@ fn check_server_exposure() -> Check {
             nanna_config::LOOPBACK_HOST
         ),
     )
+}
+
+/// The `[mcp]` servers the daemon will try to start, judged the way it will:
+/// entries it skips are named, and a command that is not on `PATH` is a
+/// failure — the daemon would log a spawn error at boot and the server's tools
+/// would silently never appear.
+///
+/// `resolves` answers "can this command be spawned" so the verdict logic is
+/// testable without a real `PATH`. Offline: nothing is spawned or contacted.
+fn check_mcp_servers(config: &Config, resolves: impl Fn(&str) -> bool) -> Check {
+    const NAME: &str = "mcp.servers";
+    if config.mcp.servers.is_empty() {
+        return Check::ok(NAME, "no MCP servers configured");
+    }
+    let (start, skipped) = config.mcp.startable();
+    let missing: Vec<String> = start
+        .iter()
+        .filter(|entry| !resolves(entry.command.trim()))
+        .map(|entry| {
+            let command = entry.command.trim();
+            let why = if command.contains('/') || command.contains(std::path::MAIN_SEPARATOR) {
+                "which is not an executable file"
+            } else {
+                "which is not on PATH"
+            };
+            format!("'{}' runs `{command}`, {why}", entry.name.trim())
+        })
+        .collect();
+    debug_assert!(missing.len() <= start.len());
+    if !missing.is_empty() {
+        let mut detail = missing.join("; ");
+        if !skipped.is_empty() {
+            detail = format!("{detail}; also not started: {}", skipped.join("; "));
+        }
+        return Check::fail(
+            NAME,
+            detail,
+            "install the command, or give its absolute path as `command` in `[[mcp.servers]]` \
+             (the daemon's PATH can differ from this shell's when the GUI starts it), or set \
+             `enabled = false`",
+        );
+    }
+    if !skipped.is_empty() {
+        return Check::warn(
+            NAME,
+            format!(
+                "{} will start; not started: {}",
+                start.len(),
+                skipped.join("; ")
+            ),
+            "fix or remove the named `[[mcp.servers]]` entries",
+        );
+    }
+    let names: Vec<&str> = start.iter().map(|entry| entry.name.trim()).collect();
+    Check::ok(
+        NAME,
+        format!(
+            "{} will start at daemon boot: {}",
+            start.len(),
+            names.join(", ")
+        ),
+    )
+}
+
+/// Whether `command` names something spawnable: an existing file when it
+/// contains a path separator, otherwise a file in some `PATH` directory.
+fn command_resolves(command: &str) -> bool {
+    let is_spawnable = |path: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+                || ["exe", "cmd", "bat"]
+                    .iter()
+                    .any(|ext| path.with_extension(ext).is_file())
+        }
+    };
+    if command.contains('/') || command.contains(std::path::MAIN_SEPARATOR) {
+        return is_spawnable(Path::new(command));
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| is_spawnable(&dir.join(command)))
+    })
 }
 
 /// A configured tools directory that does not exist means every script tool is
@@ -876,6 +965,76 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    fn with_mcp(servers: &[(&str, &str)]) -> Config {
+        let mut config = cfg();
+        config.mcp.servers = servers
+            .iter()
+            .map(|(name, command)| nanna_config::McpServerEntry {
+                name: (*name).to_string(),
+                command: (*command).to_string(),
+                args: Vec::new(),
+                enabled: true,
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn mcp_servers_are_judged_the_way_the_daemon_will_start_them() {
+        let installed = |command: &str| command == "npx";
+
+        let none = check_mcp_servers(&cfg(), installed);
+        assert_eq!(none.severity, Severity::Ok);
+
+        let fine = check_mcp_servers(&with_mcp(&[("files", "npx")]), installed);
+        assert_eq!(fine.severity, Severity::Ok, "{fine:?}");
+        assert!(
+            fine.detail.contains("1 will start at daemon boot: files"),
+            "{fine:?}"
+        );
+
+        let missing = check_mcp_servers(&with_mcp(&[("files", "npx"), ("git", "uvx")]), installed);
+        assert_eq!(missing.severity, Severity::Fail, "{missing:?}");
+        assert!(
+            missing
+                .detail
+                .contains("'git' runs `uvx`, which is not on PATH"),
+            "{missing:?}"
+        );
+        assert!(!missing.detail.contains("'files'"), "{missing:?}");
+
+        let both = check_mcp_servers(
+            &with_mcp(&[("files", "npx"), ("git", "/opt/uvx"), ("files", "npx")]),
+            installed,
+        );
+        assert_eq!(both.severity, Severity::Fail, "{both:?}");
+        assert!(
+            both.detail
+                .contains("`/opt/uvx`, which is not an executable file"),
+            "{both:?}"
+        );
+        assert!(
+            both.detail
+                .contains("also not started: MCP server name 'files' is used twice"),
+            "{both:?}"
+        );
+
+        let duplicate =
+            check_mcp_servers(&with_mcp(&[("files", "npx"), ("files", "npx")]), installed);
+        assert_eq!(duplicate.severity, Severity::Warn, "{duplicate:?}");
+        assert!(duplicate.detail.contains("is used twice"), "{duplicate:?}");
+    }
+
+    #[test]
+    fn command_resolution_reads_path_and_absolute_paths() {
+        #[cfg(unix)]
+        assert!(command_resolves("sh"), "sh is on every unix PATH");
+        assert!(!command_resolves("definitely-not-a-command-nanna-7f3"));
+        assert!(!command_resolves("/nonexistent/mcp-server"));
+        #[cfg(unix)]
+        assert!(command_resolves("/bin/sh"));
     }
 
     /// Build a credential `hours` from expiry (negative = already expired).
