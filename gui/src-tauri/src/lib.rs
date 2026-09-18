@@ -39,13 +39,13 @@ use tracing::{error, info, warn};
 /// Fill the workspace-registry cache from the daemon.
 ///
 /// The daemon owns workspace persistence; this cache backs local reads and the
-/// workspace-file editing commands. This runs after the state is managed (see
-/// `run`), so the window may already be using the cache. The fill therefore
-/// only adds entries the cache does not have, the way `list_workspaces` does.
-/// It leaves the active workspace alone. That is the window's own choice, and
-/// the layout sets it on mount with `set_active_workspace` or
-/// `clear_active_workspace`. Adopting the daemon's choice here could overwrite
-/// what the window already picked.
+/// workspace-file editing commands. This runs once, on the client's first
+/// connection (see `run`), so the window may already be using the cache. The
+/// fill therefore only adds entries the cache does not have, the way
+/// `list_workspaces` does. It leaves the active workspace alone. That is the
+/// window's own choice, and the layout sets it on mount with
+/// `set_active_workspace` or `clear_active_workspace`. Adopting the daemon's
+/// choice here could overwrite what the window already picked.
 ///
 /// Best-effort: an unreachable daemon leaves the cache as it is, and
 /// `list_workspaces` reads through once the daemon attaches.
@@ -333,6 +333,8 @@ macro_rules! command_handler {
             commands::system::get_backend_status,
             commands::system::get_daemon_version,
             commands::system::init_backend,
+            commands::system::restart_daemon,
+            commands::system::get_boot_log,
             commands::sessions::get_session_run_state,
             // Cancellation & Logs
             commands::sessions::cancel_session,
@@ -431,6 +433,20 @@ pub fn run() {
                 handle.manage(Arc::new(RwLock::new(state)));
                 info!("App state initialized successfully");
 
+                // Fill the workspace cache on the first connection, whichever
+                // path makes it. Hydrating only when `init` connected missed
+                // every later attach: the retry loop's after a slow or failed
+                // first boot, and a restart's.
+                let mut attached = backend.subscribe_attached();
+                let hydrating = Arc::clone(&backend);
+                tauri::async_runtime::spawn(async move {
+                    // Errs only once the client is gone, and then there is
+                    // nothing to hydrate from.
+                    if attached.wait_for(|count| *count > 0).await.is_ok() {
+                        hydrate_workspaces(&hydrating, &workspaces).await;
+                    }
+                });
+
                 // Start and connect to the daemon sidecar. A failed connect is a
                 // user-visible state (the frontend shows a "start the daemon"
                 // affordance) while the client keeps retrying; there is no
@@ -438,7 +454,6 @@ pub fn run() {
                 match backend.init(&handle).await {
                     BackendMode::Daemon => {
                         info!("Backend connected to daemon");
-                        hydrate_workspaces(&backend, &workspaces).await;
                     }
                     BackendMode::Disconnected => {
                         error!("Backend could not reach the daemon — the app shows a disconnected state and keeps retrying until one answers");

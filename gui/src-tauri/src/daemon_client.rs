@@ -512,8 +512,11 @@ impl DaemonClient {
     /// start a new loop. It cannot do that while this one still looks like it
     /// is running.
     fn start_retry_loop(shared: ConnectionShared) {
+        // Subscribed before the task first runs: a `disconnect` that comes
+        // before then (a restart right after a failed connect) must still
+        // end the loop now, not one `retry_interval` later.
+        let mut shutdown_rx = shared.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let mut shutdown_rx = shared.shutdown_tx.subscribe();
             let mut attempt: u64 = 0;
 
             let interval = shared.config.retry_interval;
@@ -2026,6 +2029,30 @@ mod tests {
         // An explicit connect works again, and it attaches.
         client.connect().await.expect("the daemon is up");
         assert!(client.is_connected().await);
+    }
+
+    /// A restart disconnects right after a connect that failed, before the
+    /// new retry loop's task has run. The loop used to subscribe to the
+    /// shutdown only once it ran, missed it, and lived on for a whole retry
+    /// interval.
+    #[tokio::test]
+    async fn a_disconnect_before_the_retry_loop_runs_still_ends_it() {
+        let port = free_port().await;
+        let client = DaemonClient::new(DaemonClientConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            connect_timeout: Duration::from_secs(2),
+            ..DaemonClientConfig::default()
+        });
+        assert!(client.connect().await.is_err());
+        client.disconnect();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.is_retrying() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the loop ends at once, not after RETRY_INTERVAL");
     }
 
     /// `init` can run more than once. A second `connect` on a live client must

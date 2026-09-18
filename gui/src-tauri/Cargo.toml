@@ -70,8 +70,9 @@ nanna-tools = { path = "../../crates/nanna-tools", features = ["scripting"] }
 [target.'cfg(windows)'.dependencies]
 # Shared taskkill /T walk for tree-killing the daemon sidecar the GUI manages
 # (daemon_manager.rs). Windows-only on purpose: the Unix path there is a
-# deliberate no-op, because tauri-plugin-shell owns the sidecar spawn and the
-# process_group(0) contract behind nanna-proc's group kill does not hold.
+# deliberate no-op, because the sidecar is not spawned as a process-group
+# leader and the process_group(0) contract behind nanna-proc's group kill does
+# not hold.
 nanna-proc = { path = "../../crates/nanna-proc" }
 
 [features]
@@ -91,3 +92,6 @@ e2e-webdriver = ["dep:tauri-plugin-webdriver"]
 
 [dev-dependencies]
 tempfile = "3"
+# `tauri::test`: a mock app, so unit tests can run the sidecar lifecycle
+# (daemon_manager.rs) against a stand-in process through the real shell plugin.
+tauri = { workspace = true, features = ["test"] }
