@@ -123,27 +123,29 @@ keys, so an `ollama/` entry goes to the Ollama server set above, with its token.
 cannot be reached, or its answer is empty or unusable, the next one is tried; for condensing a
 tool result, an answer that does not rate every sentence counts as unusable. The conversation is
 cut to fit only when no model in the list answers, or when the list is empty, as the hint in
-Settings says. Picking out memories falls back to the chat model instead. That used to happen only
-when the list was empty; now it also happens when every listed model fails, so with a local
-summarizer down, memories are picked out by your chat model, which may cost more. It still holds a
-reply up no longer than its one call used to. Condensing one large tool result, and the pass that
-condenses older ones, each stop after that same time in all (two minutes), so a server that takes
-a request and never answers holds the reply up once, not once for every model or every result.
-A summary on your Ollama server waits for a chat reply being generated there to finish, rather than
-cutting it off. Before this, summaries used their own `[llm].ollama_url`, which pointed at this
-computer unless you changed it, and sent no token, so with chat on a remote server they were
-refused. Several of them also tried only the first model in the list. In the app, a new server,
-token or key reaches summaries at once, even in a chat that is already running (`nanna chat` in a
-terminal reads them when it starts); a change to the list applies from the next message, and a
-background task keeps the list it started with. `[llm].ollama_url` is no longer read; an old config
-that has it still loads, and setting it through the daemon is refused with a note saying what
-replaced it. If yours pointed at a different server from the one in Settings → Models, the log says
-so when the config loads: set that server in Settings if your summarization models are on it.
-`nanna doctor` now checks one Ollama server, for chat, embedding and summary models together, and
-expects a model there exactly when chat, the embedders or the summarizers would send it there. An
-entry typed without a provider now goes where chat would send it: `qwen3` and `meta-llama/llama-3`
-to Anthropic, `gpt-oss:20b` to OpenAI. `nanna doctor` warns about each and shows how to write it
-(`ollama/qwen3`).
+Settings says. Picking out memories falls back to the chat model instead, now also when every
+listed model fails, so with a local summarizer down, memories are picked out by your chat model,
+which may cost more.
+
+Before this, summaries used their own `[llm].ollama_url`, which pointed at this computer unless you
+changed it, and sent no token, so with chat on a remote server they were refused. Several of them
+also tried only the first model in the list. In the app, a new server, token or key reaches
+summaries at once, even in a chat that is already running (`nanna chat` in a terminal reads them
+when it starts); a change to the list applies from the next message, and a background task keeps
+the list it started with. Picking out memories still holds a reply up no longer than its one call
+used to. Condensing one large tool result, and the pass that condenses older ones, each stop after
+that same time in all (two minutes), so a server that takes a request and never answers holds the
+reply up once, not once for every model or every result. A summary on your Ollama server waits for
+a chat reply being generated there to finish, rather than cutting it off.
+
+`[llm].ollama_url` is no longer read. An old config that has it still loads, and setting it through
+the daemon is refused with a note saying what replaced it. If yours pointed at a different server
+from the one in Settings → Models, the log says so when the config loads: set that server in
+Settings if your summarization models are on it. `nanna doctor` now checks one Ollama server, for
+chat, embedding and summary models together, and expects a model there exactly when chat, the
+embedders or the summarizers would send it there. An entry typed without a provider now goes where
+chat would send it: `qwen3` and `meta-llama/llama-3` to Anthropic, `gpt-oss:20b` to OpenAI. `nanna
+doctor` warns about each and shows how to write it (`ollama/qwen3`).
 
 **Memory consolidation skipped `anthropic/` and `openai/` summarization models.** Settings writes
 these entries as `anthropic/<model>` and `openai/<model>`. Both were sent to Anthropic with the
@@ -236,7 +238,7 @@ release workflow, not by a run of the real app.
 
 ## Numbers
 
-- **2,394 Rust tests pass, 0 fail**; clippy reports no warnings, with and without every feature.
+- **2,436 Rust tests pass, 0 fail**; clippy reports no warnings, with and without every feature.
   The live interop suite passes **11/11** against the real SDKs.
 - **390 GUI unit tests pass.** In the browser suite **37 of 38** pass. The one failure, sending a
   chat and pressing Stop, also fails on the previous release and is tracked separately.
