@@ -3,7 +3,8 @@
 # `crates/nanna-mcp/tests/dual_era_live.rs` drives the official TypeScript SDK
 # (`@modelcontextprotocol/server` 2.0, `server-everything`, pinned by the
 # fixture's package-lock) over stdio, Streamable HTTP (modern and 2025-era) and
-# the deprecated HTTP+SSE transport — including multi-round-trip elicitation,
+# the deprecated HTTP+SSE transport, plus a server on the official Rust SDK
+# (`tests/fixtures/rmcp-server`, built by the test) — including multi-round-trip elicitation,
 # `x-mcp-header` mirroring and list-change delivery. Those tests are `#[ignore]`
 # locally because they need Node and an `npm ci`; without this job nothing
 # would ever run them, and the protocol moves (2026-07-28 removed the

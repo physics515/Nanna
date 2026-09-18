@@ -4897,7 +4897,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             the fixture's committed lockfile, `cargo test -p nanna-mcp --test dual_era_live --locked
             -- --ignored`. The exact command passes locally (10/10); `npm ci` from the lockfile alone
             reproduces the fixture. Runner time not yet measured — its first run sets the bound.
-      - [ ] *(research 2026-09-18)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
+      - [ ] *(research 2026-09-18; (a) done the same night)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
             2026-07-28** — stateless serving by default, a `ClientLifecycleMode::Discover` that
             skips `initialized`, and version negotiation on connect. Two uses: (a) a second,
             independent implementation for `dual_era_live.rs` — today every modern fixture is the
@@ -4907,6 +4907,14 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             transports, but decide by diffing what each covers (MRTR, subscriptions, tasks,
             x-mcp-header) rather than by LOC. Sources: [crates.io/rmcp](https://crates.io/crates/rmcp),
             [modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk).
+            *(2026-09-18, same night)* **(a) is done.** `tests/fixtures/rmcp-server` is a standalone
+            crate (its own `[workspace]` and lockfile, `rmcp` pinned `=3.4.0`, never shipped) with
+            `add` and an MRTR `greet` that elicits a name. `dual_era_live.rs` builds it into
+            `CARGO_TARGET_TMPDIR` and drives it: `server/discover` → 2026-07-28, `tools/list`, a
+            call, and the full `input_required` → `ask_user`-style answer → retry round. It passed
+            first time — so nothing we share with the TypeScript SDK misreads the spec where rmcp
+            reads it differently, at least on these paths. Live suite 11/11; runs in `mcp-interop`.
+            (b), whether nanna-mcp should sit on `rmcp`, stays open.
       - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.

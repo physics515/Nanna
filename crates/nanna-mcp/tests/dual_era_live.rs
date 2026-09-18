@@ -1,7 +1,8 @@
 //! The dual-era client against the REAL reference SDK servers, not a fixture
 //! written from our own reading of the spec.
 //!
-//! Ignored by default (needs `node` and the pinned packages). To run:
+//! Ignored by default (needs `node` and the pinned packages; the `rmcp` test
+//! builds its own fixture crate). To run:
 //!
 //! ```sh
 //! (cd crates/nanna-mcp/tests/fixtures/sdk-servers && npm install)
@@ -162,6 +163,78 @@ async fn a_real_servers_elicitation_is_put_to_the_user_and_answered() {
     }
     client.close().await.expect("close");
     bare.close().await.expect("close");
+}
+
+// ---------------------------------------------------------------------------
+// A second implementation: the official Rust SDK
+// ---------------------------------------------------------------------------
+
+/// Build `tests/fixtures/rmcp-server` (the official Rust SDK, `rmcp`) and
+/// return its binary. Every other modern peer here is the TypeScript SDK, so
+/// a misreading of the spec shared by it and nanna-mcp would pass unseen; a
+/// second implementation is what catches that. Built into this test's own
+/// scratch target, never the one the outer `cargo test` holds.
+fn rmcp_fixture() -> String {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rmcp-server");
+    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("rmcp-fixture");
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--quiet", "--locked", "--manifest-path"])
+        .arg(manifest.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &target)
+        .status()
+        .expect("cargo");
+    assert!(status.success(), "building the rmcp fixture failed");
+    let binary = target
+        .join("debug")
+        .join(format!("rmcp-fixture{}", std::env::consts::EXE_SUFFIX));
+    binary.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+#[ignore = "builds tests/fixtures/rmcp-server (fetches its crates on first run)"]
+async fn the_official_rust_sdk_server_connects_runs_a_tool_and_elicits() {
+    let binary = rmcp_fixture();
+    let user = std::sync::Arc::new(ScriptedUser(std::sync::Mutex::new(Vec::new()), "Ada"));
+    let transport = nanna_mcp::StdioTransport::spawn(&binary, &[]).expect("spawn");
+    let client = McpClient::new(transport).with_elicitor(user.clone());
+    client.initialize().await.expect("rmcp server must connect");
+    assert_eq!(
+        client.era().await,
+        ProtocolEra::Modern {
+            version: "2026-07-28".into()
+        }
+    );
+    let mut tools: Vec<_> = client
+        .list_tools()
+        .await
+        .expect("tools/list")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    tools.sort();
+    assert_eq!(tools, ["add", "greet"]);
+
+    let sum = client
+        .call_tool("add", Some(serde_json::json!({ "a": 40, "b": 2 })))
+        .await
+        .expect("add");
+    assert_eq!(
+        serde_json::to_value(&sum).expect("json")["content"][0]["text"],
+        "42"
+    );
+
+    let greeting = client
+        .call_tool("greet", Some(serde_json::json!({ "greeting": "Hello" })))
+        .await
+        .expect("greet, after the elicitation is answered");
+    assert_eq!(
+        serde_json::to_value(&greeting).expect("json")["content"][0]["text"],
+        "Hello, Ada!"
+    );
+    let asked = user.0.lock().expect("lock").clone();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].contains("What is your name?"), "{}", asked[0]);
+    client.close().await.expect("close");
 }
 
 // ---------------------------------------------------------------------------
