@@ -41,6 +41,40 @@ pub struct DaemonManagerConfig {
     pub startup_timeout: Duration,
 }
 
+/// The daemon port `NANNA_DAEMON_PORT` asks for, if it names a usable one.
+///
+/// For isolated runs (automated GUI verification above all): a GUI on the
+/// default port attaches to whatever daemon already listens there — on a
+/// developer's machine, their own, with their real data. Pure.
+#[must_use]
+pub fn port_override(value: Option<&str>) -> Option<u16> {
+    value?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port >= 1024)
+}
+
+#[cfg(test)]
+mod port_override_tests {
+    use super::port_override;
+
+    #[test]
+    fn only_a_usable_port_overrides_the_default() {
+        assert_eq!(port_override(Some("51997")), Some(51997));
+        assert_eq!(port_override(Some(" 6000 ")), Some(6000));
+        assert_eq!(port_override(None), None);
+        assert_eq!(port_override(Some("")), None);
+        assert_eq!(
+            port_override(Some("80")),
+            None,
+            "privileged ports are not a daemon's"
+        );
+        assert_eq!(port_override(Some("70000")), None);
+        assert_eq!(port_override(Some("fifty")), None);
+    }
+}
+
 impl Default for DaemonManagerConfig {
     fn default() -> Self {
         Self {

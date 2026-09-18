@@ -357,6 +357,22 @@ macro_rules! command_handler {
     };
 }
 
+/// With the `e2e-webdriver` feature, embed the `WebDriver` server that lets
+/// automation drive this app (see the feature's note in Cargo.toml).
+#[cfg(feature = "e2e-webdriver")]
+fn with_e2e_webdriver<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    tracing::warn!(
+        "e2e-webdriver build: a WebDriver server listens on 127.0.0.1:4445 — never ship this build"
+    );
+    builder.plugin(tauri_plugin_webdriver::init())
+}
+
+/// Without the `e2e-webdriver` feature: the builder, untouched.
+#[cfg(not(feature = "e2e-webdriver"))]
+const fn with_e2e_webdriver<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder
+}
+
 /// Build and run the Tauri application until it exits.
 ///
 /// # Panics
@@ -384,7 +400,7 @@ pub fn run() {
         .with(LogBufferLayer::new(log_buffer.clone()))
         .init();
 
-    tauri::Builder::default()
+    with_e2e_webdriver(tauri::Builder::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())

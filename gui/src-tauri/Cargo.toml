@@ -21,6 +21,8 @@ tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Only with the `e2e-webdriver` feature (see [features]).
+tauri-plugin-webdriver = { version = "0.2.3", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -80,6 +82,12 @@ custom-protocol = ["tauri/custom-protocol"]
 # `debug_assertions`, so `tauri dev` is unaffected — build with `--features devtools` to get the
 # inspector in a release build deliberately.
 devtools = ["tauri/devtools"]
+# NOT in `default`, and never enabled by `release.yml`: embeds a W3C WebDriver server in the app
+# (127.0.0.1:4445, reached through the `tauri-webdriver` intermediary on :4444) so the app can be
+# driven end to end on Linux, where no `WebKitWebDriver` matching WebKitGTK 4.1 exists. A shipped
+# build with it would carry a remote-control port — build with `--features e2e-webdriver` only for
+# automated verification (CI, the nightly routine).
+e2e-webdriver = ["dep:tauri-plugin-webdriver"]
 
 [dev-dependencies]
 tempfile = "3"

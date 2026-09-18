@@ -57,7 +57,16 @@ impl Backend {
     /// Create a new backend.
     #[must_use]
     pub fn new() -> Self {
-        let manager_config = DaemonManagerConfig::default();
+        let mut manager_config = DaemonManagerConfig::default();
+        if let Some(port) =
+            crate::daemon_manager::port_override(std::env::var("NANNA_DAEMON_PORT").ok().as_deref())
+        {
+            tracing::warn!(
+                "NANNA_DAEMON_PORT: the daemon sidecar runs on port {port}, not {}",
+                manager_config.port
+            );
+            manager_config.port = port;
+        }
         let client_config = DaemonClientConfig {
             url: format!("ws://{}:{}", manager_config.host, manager_config.port),
             ..Default::default()

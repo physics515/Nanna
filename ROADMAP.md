@@ -7238,7 +7238,7 @@ keep the phases readable; promote individual items into a phase when they become
             or WebdriverIO's `@wdio/tauri-service`, whose docs list other Linux providers).
             Until one lands **the Linux WebDriver harness stays UNVALIDATED** and no run may claim
             GUI verification passed.
-      - [ ] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
+      - [x] *(research 2026-09-17 — option (c) above has matured into the cheapest route)*
             **`tauri-plugin-webdriver` 0.2.3 + `tauri-webdriver` 0.2.0 (both 2026-09-01, MIT; the
             plugin has ~119k downloads)** embed a W3C WebDriver server *inside the Tauri app*, so on
             Linux they drive WebKitGTK without any `WebKitWebDriver` binary — which removes the
@@ -7250,6 +7250,39 @@ keep the phases readable; promote individual items into a phase when they become
             `tauri-webdriver` instead of `tauri-driver`. Source:
             [Choochmeque/tauri-webdriver](https://github.com/Choochmeque/tauri-webdriver),
             crates.io `tauri-plugin-webdriver` / `tauri-webdriver`.
+            *(2026-09-18) **Done — the first GUI verification on this Linux host.** Feature
+            `e2e-webdriver` on `nanna-gui` (off by default, never enabled by `release.yml`, and a
+            `WARN` at startup whenever it is on) adds `tauri-plugin-webdriver`; `cargo install
+            tauri-webdriver` provides the intermediary — no `WebKitWebDriver`, no `sudo`. A GUI
+            started with defaults attaches to whatever daemon holds :5149 (on this machine, the
+            operator's own, with their data), so the GUI now honours **`NANNA_DAEMON_PORT`**
+            (≥1024) for its sidecar, alongside the existing `NANNA_DEV_DATA_DIR`. Working recipe,
+            all state in scratch: `env -u XDG_CONFIG_HOME -u XDG_DATA_HOME HOME=<s>/home
+            NANNA_CONFIG_PATH=<s>/cfg.toml NANNA_DEV_DATA_DIR=<s>/data NANNA_DAEMON_PORT=51990
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent GDK_BACKEND=x11 tauri-webdriver --port 4444`,
+            then W3C `POST /session` with `{"tauri:options":{"application":"<target>/debug/nanna-gui"}}`.
+            **`GDK_BACKEND=x11` is required here**: on native Wayland the app dies at once with
+            `Gdk Error 71 (Protocol error) dispatching to Wayland display` (NVIDIA; the operator's
+            own GUI runs with the same variable). Driven: `document.title = "Nanna"`,
+            `tauri://localhost/`, `#__nuxt` mounted, `__TAURI_INTERNALS__.invoke("get_mcp_servers")`
+            returned the isolated sidecar's `[{link:"2026-07-28 over stdio",name:"modern",…}]`, and
+            the Tools page — reached through the app's own router — rendered `MCP SERVERS · modern
+            2 tools · 2026-07-28 over stdio` with `mcp__modern__*` in the tool list; screenshots
+            taken over WebDriver. Build: `pnpm generate`, the daemon copied to
+            `gui/src-tauri/binaries/nanna-daemon-x86_64-unknown-linux-gnu`, `cargo build -p
+            nanna-gui --features e2e-webdriver` (54 s warm).
+      - [ ] **Point the shared harness at `tauri-webdriver`** (`~/.claude/scheduled-tasks/_shared/
+            tauri-webdriver.sh`, outside this repo and shared with other routines — not edited
+            unattended): its `ensure` should check `tauri-webdriver` instead of `tauri-driver` +
+            `WebKitWebDriver` on Linux, its `start` should set `GDK_BACKEND=x11` and the isolating
+            variables above, and the app must be built with `--features e2e-webdriver`.
+      - [ ] *(found 2026-09-18, driving the GUI)* **A GUI that is killed leaves its daemon sidecar
+            running on Linux.** Ending the WebDriver session terminated `nanna-gui`, and its sidecar
+            (`nanna-daemon --port 51990 …`) stayed up, holding its port and store lock, until
+            stopped by hand. `kill_sidecar_tree` is a deliberate no-op on Unix and the graceful stop
+            path never runs when the GUI itself is killed. Shape: have the sidecar watch its parent
+            (Linux `prctl(PR_SET_PDEATHSIG)` at spawn, or the daemon exiting when stdin — the pipe
+            the shell plugin holds — reaches EOF) so an abrupt GUI death still ends it.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
