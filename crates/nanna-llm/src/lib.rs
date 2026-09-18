@@ -2575,9 +2575,17 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // Trimmed of whitespace and trailing slashes because every call appends
         // `/api/...` itself: a pasted `https://host/ollama/` would otherwise
         // address `//api/chat`, which a path-routing proxy answers with 404.
-        url.trim()
-            .trim_end_matches('/')
-            .replacen("://localhost", "://127.0.0.1", 1)
+        let trimmed = url.trim().trim_end_matches('/');
+        // The parsed host, not a prefix of the text: `localhost.example.com`
+        // is another machine, and rewriting it would connect somewhere other
+        // than the address the bearer token was bound to.
+        let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+            return trimmed.to_string();
+        };
+        if parsed.host_str() != Some("localhost") || parsed.set_host(Some("127.0.0.1")).is_err() {
+            return trimmed.to_string();
+        }
+        parsed.as_str().trim_end_matches('/').to_string()
     }
 
     /// Create a new Anthropic client with API key
@@ -8300,6 +8308,25 @@ mod input_overflow_tests {
         // …and remote hosts pass through untouched.
         let client = EmbeddingClient::ollama("http://gpu-box:11434");
         assert_eq!(client.base_url, "http://gpu-box:11434");
+    }
+
+    #[test]
+    fn only_the_host_localhost_is_pinned() {
+        // A host that merely starts with "localhost" is another machine: the
+        // client must connect to the name the address gives (and the bearer
+        // token was bound to), not to `127.0.0.1.example.com`.
+        for url in [
+            "http://localhost.example.com:11434",
+            "http://localhostfoo:11434/ollama",
+        ] {
+            assert_eq!(EmbeddingClient::ollama(url).base_url, url);
+            assert_eq!(LlmClient::ollama(url).base_url, url);
+        }
+        // The name itself still is, however it is written.
+        assert_eq!(
+            LlmClient::ollama("http://LOCALHOST:11434/ollama/").base_url,
+            "http://127.0.0.1:11434/ollama"
+        );
     }
 
     #[test]
