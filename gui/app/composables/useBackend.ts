@@ -66,13 +66,17 @@ function releasePolling() {
 export function useBackend() {
   /**
    * Initialize the backend — attach to the daemon control plane (P16: daemon-only).
+   *
+   * Runs again whenever it is called while disconnected. That is what the
+   * Retry button relies on: `init_backend` restarts a sidecar that exited. It
+   * used to return early once the first init had finished, so Retry did
+   * nothing at all.
    */
   async function init(): Promise<'daemon' | 'disconnected'> {
-    if (initialized.value || initializing.value) {
-      const mode = status.value?.mode
-      if (mode === 'daemon' && status.value?.connected) return 'daemon'
-      return 'disconnected'
-    }
+    const connected = status.value?.mode === 'daemon' && status.value?.connected === true
+    // One init at a time; the second caller gets the answer as it stands.
+    if (initializing.value) return connected ? 'daemon' : 'disconnected'
+    if (initialized.value && connected) return 'daemon'
 
     initializing.value = true
 
@@ -102,7 +106,12 @@ export function useBackend() {
     }
   }
 
-  const label = computed(() => describeBackend(status.value, initializing.value && !initialized.value))
+  // "Checking…" only until the first status arrives. The first init can last
+  // as long as the daemon's boot, and the polled status is the one thing
+  // that can say "Still starting · 2m 05s" in the meantime.
+  const label = computed(() =>
+    describeBackend(status.value, initializing.value && !initialized.value && status.value === null),
+  )
 
   /** True when attached to a live daemon. */
   const isDaemon = computed(() => status.value?.mode === 'daemon' && status.value?.connected === true)
