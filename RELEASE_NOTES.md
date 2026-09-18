@@ -58,6 +58,16 @@ answers at that address (which usually means the path is missing). A token saved
 reaches chat and embeddings at once. A new address reaches chat at once; embeddings keep the address
 and model they started with until Nanna restarts, and the log says so.
 
+**Nanna says what it is doing while it starts.** Until the daemon answers, the window shows a
+start-up screen instead of an app that cannot do anything yet: "Starting the daemon…", then "Still
+starting · 1m 05s" with why a start can take that long. If the daemon stops while starting, the
+screen says so in the daemon's own words (for example "Error: IPC port 127.0.0.1:5149 unavailable:
+Address already in use") with its exit code, and a Restart button. There is always a way out:
+**Open Nanna anyway** (or Esc; settings and logs work without the daemon, and Nanna keeps trying to
+start it), **Show log** (the daemon's own start-up output, live), **Quit**, and **Update** when an
+update is waiting, the way out of a daemon from another version. The screen appears only at launch;
+losing the daemon later still shows in the status bar, as before.
+
 ## What's Fixed
 
 **Nanna could fail to start at all.** If the embedding model was busy — the free OpenRouter model
@@ -69,6 +79,36 @@ is now asked once, without waiting; a busy model means starting on a provisional
 corrects itself as soon as the model answers. Checked against the real server with an embedding
 endpoint that refuses everything: the previous release still had its door closed after 30 seconds,
 this one opened in a quarter of a second.
+
+**A slow start no longer becomes "never starts".** The app stopped a daemon that had not finished
+starting after 90 seconds, and when its first attempt to connect failed it never tried again. So a
+daemon that needed two minutes, or one started by hand afterwards, was never used. While the
+daemon's process is alive the app now waits for it, with no deadline, and it keeps trying to
+connect until one answers.
+
+**Restart works on a start that hangs, and on a daemon that died while starting.** Nothing could
+stop a daemon that was alive but never finished starting, short of quitting the app, and a daemon
+that exited before its first connection was never started again. Restart now stops the stuck
+process and starts a fresh one. Checked on this machine with a stand-in daemon that never opens its
+port: after 34 s, Restart replaced its process and the count started over.
+
+**A daemon that crashed while an MCP server it started was still running looked alive.** The app
+counted the daemon as gone only once every process holding its output had closed it, and an MCP
+server outlives the daemon that started it. The daemon's own exit decides now.
+
+**Quitting stops a daemon that has stopped answering.** When the daemon did not answer the request
+to shut down, the app sent the kill after it had already begun exiting, so the kill could be lost
+and the daemon left running.
+
+**The onboarding "Ready check" said the backend was ready when it was not.** It read a field the
+status never had, so any answer passed, even with the daemon down or still starting, and the
+version it named was the app's own. It now reads whether the daemon is connected, names the
+daemon's version, and says what state the daemon is in when it is not ready.
+
+**A stuck local Ollama could freeze part of the daemon.** Sizing a chat request's context window
+asks the local Ollama for its models and waited with no time limit, on a thread the daemon needs
+for other work. It now gives up after 3 seconds and waits on a thread of its own. Found as a test
+that hung one run in four; it passed 20 of 20 after the fix.
 
 **The Ollama setup step now checks.** Onboarding used to assume a local Ollama was running. It now
 asks, and tells apart "Ollama isn't running" from "it's running but this model isn't pulled",
@@ -155,7 +195,11 @@ release workflow, not by a run of the real app.
 
 ## Numbers
 
-- **2,224 Rust tests pass, 0 fail**; clippy reports no warnings. The live interop suite passes
-  **11/11** against the real SDKs.
+- **2,394 Rust tests pass, 0 fail**; clippy reports no warnings, with and without every feature.
+  The live interop suite passes **11/11** against the real SDKs.
+- **390 GUI unit tests pass.** In the browser suite **37 of 38** pass. The one failure, sending a
+  chat and pressing Stop, also fails on the previous release and is tracked separately.
+- The start-up screen was driven in the real app on Linux: a 45-second start, a start that fails,
+  a start that hangs (then Restart), and the real daemon.
 - Ways to reach an MCP server: **1 → 5**. Before, only stdio with the old handshake. Now stdio in
   both protocol eras, Streamable HTTP in both eras, and the 2024 HTTP+SSE transport.
