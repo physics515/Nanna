@@ -859,9 +859,11 @@ impl Channel for TelegramChannel {
             .id
             .parse()
             .map_err(|_| ChannelError::Send("Invalid chat ID".to_string()))?;
-        if chat_id <= 0 || text.trim().is_empty() {
+        if chat_id <= 0 {
             return Ok(());
         }
+        // Empty text is deliberate: Telegram shows its animated "Thinking…"
+        // placeholder for it, which is what a turn shows before its words.
         self.send_message_draft(chat_id, draft_id, text).await?;
         Ok(())
     }

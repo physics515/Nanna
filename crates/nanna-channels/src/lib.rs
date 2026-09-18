@@ -289,7 +289,8 @@ pub trait Channel: Send + Sync {
     /// Show `text` as the in-progress draft of the reply in `channel`.
     /// Repeated calls with one `draft_id` update it in place; the real
     /// message, sent with [`Channel::send`] when the turn ends, replaces it.
-    /// The default does nothing (see [`Channel::supports_drafts`]).
+    /// Empty `text` shows the provider's "thinking" placeholder. The default
+    /// does nothing (see [`Channel::supports_drafts`]).
     async fn send_draft(
         &self,
         _channel: &ChannelId,

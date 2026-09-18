@@ -726,6 +726,9 @@ struct Draft {
     /// Text arrived since the last send.
     dirty: bool,
     last_sent: Option<tokio::time::Instant>,
+    /// What shows is the empty-text "Thinking…" placeholder: the first words
+    /// replace it at once instead of waiting out the throttle.
+    placeholder: bool,
 }
 
 impl Draft {
@@ -754,7 +757,7 @@ impl Draft {
     fn due(&self, now: tokio::time::Instant) -> bool {
         self.last_sent.map_or(self.dirty, |last| {
             let since = now.saturating_duration_since(last);
-            (self.dirty && since >= DRAFT_REFRESH) || since >= DRAFT_KEEPALIVE
+            (self.dirty && (self.placeholder || since >= DRAFT_REFRESH)) || since >= DRAFT_KEEPALIVE
         })
     }
 }
@@ -783,10 +786,14 @@ fn flush_draft(
     let Some(draft) = state.draft.as_mut().filter(|draft| draft.due(now)) else {
         return false;
     };
-    if draft.text.trim().is_empty() {
-        return false;
-    }
-    send_draft_to(router, &state.route, draft.id, draft.text.clone());
+    // Whitespace-only text shows as the placeholder, like no text at all.
+    let shown = if draft.text.trim().is_empty() {
+        String::new()
+    } else {
+        draft.text.clone()
+    };
+    draft.placeholder = shown.is_empty();
+    send_draft_to(router, &state.route, draft.id, shown);
     draft.dirty = false;
     draft.last_sent = Some(now);
     true
@@ -863,23 +870,30 @@ async fn track_turn(
             if let Some(state) = typing.get_mut(session_id) {
                 state.last_event = now;
             } else if let Some(route) = sessions.reply_channel(session_id).await {
-                send_typing_to(router, session_id, &route);
                 let target = ChannelId::new(&route.provider, &route.id);
                 let drafts = router
                     .read()
                     .await
                     .get(&route.provider)
                     .is_some_and(|channel| channel.supports_drafts(&target));
+                // A chat that shows drafts gets the provider's "Thinking…"
+                // placeholder (an empty draft) at once, which the streamed
+                // answer then replaces in place; anything else, "typing…".
                 let draft = drafts.then(|| {
                     let id = *next_draft_id;
                     *next_draft_id = next_draft_id.checked_add(1).unwrap_or(1);
+                    send_draft_to(router, &route, id, String::new());
                     Draft {
                         id,
                         text: String::new(),
                         dirty: false,
-                        last_sent: None,
+                        last_sent: Some(now),
+                        placeholder: true,
                     }
                 });
+                if draft.is_none() {
+                    send_typing_to(router, session_id, &route);
+                }
                 typing.insert(
                     session_id.to_string(),
                     Typing {
@@ -1638,8 +1652,12 @@ mod tests {
         let drafts: Vec<&String> = log.iter().filter(|t| t.starts_with("<draft")).collect();
         assert_eq!(
             drafts.first().map(|d| d.as_str()),
-            Some("<draft 1> Hel"),
-            "the first words go at once: {log:?}"
+            Some("<draft 1> "),
+            "the turn opens with the empty-text placeholder: {log:?}"
+        );
+        assert!(
+            drafts.iter().any(|d| d.as_str() == "<draft 1> Hel"),
+            "the first words replace it at once: {log:?}"
         );
         assert!(
             drafts.iter().any(|d| d.as_str() == "<draft 1> Hello"),
@@ -1655,8 +1673,8 @@ mod tests {
         );
         assert_eq!(
             log.iter().filter(|t| t.as_str() == "<typing>").count(),
-            1,
-            "typing only before the first words: {log:?}"
+            0,
+            "a chat that shows drafts never gets typing…: {log:?}"
         );
         assert_eq!(
             log.last().map(String::as_str),
@@ -1680,6 +1698,7 @@ mod tests {
             text: String::new(),
             dirty: false,
             last_sent: None,
+            placeholder: false,
         };
         draft.append(&"é".repeat(DRAFT_BUFFER_CHARS_MAX));
         draft.append("END");
@@ -1694,6 +1713,16 @@ mod tests {
             !draft.due(now + DRAFT_REFRESH),
             "nothing new, not yet stale"
         );
+        // Words arriving while the placeholder shows go at once.
+        draft.placeholder = true;
+        draft.dirty = true;
+        assert!(
+            draft.due(now),
+            "the first words replace the placeholder unthrottled"
+        );
+        draft.placeholder = false;
+        assert!(!draft.due(now), "after that, the throttle applies");
+        draft.dirty = false;
         assert!(
             draft.due(now + DRAFT_KEEPALIVE),
             "kept alive before the ~30 s expiry"

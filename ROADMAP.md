@@ -5181,7 +5181,13 @@ asks permission or restricts her.)*:
             id is the user's id, so the synthesized sender lands on the running session and the
             existing stop path does the rest. Allowed-chats and non-private stops are ignored. Also
             learned: `sendMessageDraft` with empty text shows a "Thinking…" placeholder — a candidate
-            to replace "typing…" in private chats. Still open: the live round-trip. Follow-up the same day: a clear —
+            to replace "typing…" in private chats. Still open: the live round-trip.
+            *(same night)* Taken: a chat that shows drafts now gets that placeholder at the start of
+            a turn instead of "typing…" (and never "typing…" at all), kept alive through silent
+            stretches by the draft keepalive, and the first words replace it at once rather than
+            waiting out the 1.5 s throttle. Paused-clock forwarder test pins the sequence
+            (placeholder → first words → throttled rest → keepalive → the real message, no typing).
+            Unverified against a real bot, like the rest of the draft work. Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
