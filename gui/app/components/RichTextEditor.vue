@@ -102,6 +102,14 @@ function buildExtensions() {
 // ── Editor init ──
 const initialising = ref(true)
 
+// Bumped synchronously by every transaction. @tiptap/vue-3 stores each new
+// editor state at once but tells Vue about it only two animation frames later,
+// so anything derived from `editor.value.state` stays cached — and stale —
+// until those frames run (and forever where they never run, as in the
+// tauri-webdriver window on Linux). Reading this makes a derivation re-read the
+// live document on the next access instead. See `isEmpty` below.
+const docVersion = ref(0)
+
 const editor = useEditor({
   content: markdownToHtml(props.modelValue),
   editable: props.editable,
@@ -147,6 +155,7 @@ const editor = useEditor({
       return false
     },
   },
+  onTransaction: () => { docVersion.value++ },
   onUpdate: ({ editor: ed }) => {
     if (initialising.value) return
     emit('update:modelValue', getMarkdownContent(ed))
@@ -181,7 +190,12 @@ onBeforeUnmount(() => {
 })
 
 // ── Public API ──
-const isEmpty = computed(() => editor.value?.isEmpty ?? true)
+// Live: text typed and sent in the same frame must not read as empty (the Send
+// gate in ChatInput dropped Ctrl+Enter pressed right after typing).
+const isEmpty = computed(() => {
+  void docVersion.value
+  return editor.value?.isEmpty ?? true
+})
 
 function focus() {
   editor.value?.commands.focus()

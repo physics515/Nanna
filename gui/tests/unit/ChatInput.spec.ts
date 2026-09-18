@@ -1,6 +1,8 @@
-import { mount } from '@vue/test-utils'
-import { defineComponent } from 'vue'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import type { Editor } from '@tiptap/vue-3'
+import { defineComponent, nextTick } from 'vue'
 import ChatInput from '~/components/ChatInput.vue'
+import RichTextEditor from '~/components/RichTextEditor.vue'
 
 vi.mock('~/composables/useSplatter', () => ({ useSplatter: () => ({ splatterBg: '', onEnter: vi.fn(), onLeave: vi.fn() }) }))
 vi.mock('~/composables/useGroundGlass', () => ({ useGroundGlass: () => ({ glassStyle: {} }) }))
@@ -43,5 +45,78 @@ describe('ChatInput', () => {
   it('forwards editor updates to v-model', async () => {
     const wrapper = mountInput(); await wrapper.get('[data-test="editor"]').setValue('new value')
     expect(wrapper.emitted('update:modelValue')?.[0]).toEqual(['new value'])
+  })
+})
+
+/**
+ * The Send gate against the REAL Tiptap editor. @tiptap/vue-3 keeps editor
+ * state in a debounced ref: the new state is stored synchronously, but Vue is
+ * only told about it two animation frames later. Anything cached over it (a
+ * `computed(() => editor.isEmpty)`) keeps answering "empty" until those frames
+ * run — so Ctrl+Enter pressed right after typing was silently dropped (the
+ * intermittent critical-path e2e failure), and where frames never run (the
+ * tauri-webdriver window on Linux) Send never enabled at all. Frames are
+ * stubbed to never fire here so the tests can only pass if the gate reads the
+ * editor's live document.
+ */
+describe('ChatInput with the real editor', () => {
+  let realRequestAnimationFrame: typeof requestAnimationFrame
+  beforeEach(() => {
+    realRequestAnimationFrame = globalThis.requestAnimationFrame
+    globalThis.requestAnimationFrame = () => 0
+  })
+  afterEach(() => { globalThis.requestAnimationFrame = realRequestAnimationFrame })
+
+  const mountWithEditor = async () => {
+    const wrapper = mount(ChatInput, {
+      props: { modelValue: '' },
+      attachTo: document.body,
+      global: {
+        components: { RichTextEditor },
+        stubs: { FloatingToolbar: true, NuiIcon: true, NuiKbd: true, MarkdownContent: true },
+      },
+    })
+    await flushPromises()
+    const editor = wrapper.findComponent(RichTextEditor).vm.editor as Editor
+    expect(editor).toBeTruthy()
+    return { wrapper, editor }
+  }
+  // What ProseMirror dispatches for typed characters.
+  const type = (editor: Editor, text: string) => editor.view.dispatch(editor.view.state.tr.insertText(text))
+  const pressCtrlEnter = (editor: Editor) => editor.view.dom.dispatchEvent(
+    new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }),
+  )
+  const sendButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.attributes('title') === 'Send')!
+
+  it('submits on Ctrl+Enter pressed immediately after typing', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    type(editor, 'Hello from e2e')
+    pressCtrlEnter(editor)
+    expect(wrapper.emitted('submit')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('enables Send as soon as text is typed and disables it once cleared', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    expect(sendButton(wrapper).attributes('disabled')).toBeDefined()
+
+    type(editor, 'Hello')
+    await nextTick()
+    expect(sendButton(wrapper).attributes('disabled')).toBeUndefined()
+    await sendButton(wrapper).trigger('click')
+    expect(wrapper.emitted('submit')).toHaveLength(1)
+
+    // submit() clears the editor, which must re-disable Send.
+    await nextTick()
+    expect(editor.isEmpty).toBe(true)
+    expect(sendButton(wrapper).attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('does not submit an empty editor on Ctrl+Enter', async () => {
+    const { wrapper, editor } = await mountWithEditor()
+    pressCtrlEnter(editor)
+    expect(wrapper.emitted('submit')).toBeUndefined()
+    wrapper.unmount()
   })
 })
