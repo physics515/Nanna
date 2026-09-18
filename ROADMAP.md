@@ -4756,6 +4756,35 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             (2025 session) and `mcp__local__shout` (stdio) all answered over IPC; the `ftp://` entry
             was skipped by name in the log, `system.status` and `doctor`; `MCP servers closed` then
             `Daemon stopped`.
+      - [ ] *(found 2026-09-18)* **A modern HTTP server's tool list never refreshes.** Revision
+            2026-07-28 has no GET stream: change notifications (`notifications/tools/list_changed`)
+            arrive only on a `subscriptions/listen` request's SSE stream, which nanna-mcp never
+            opens — so `StreamableHttpTransport::list_changed_flags` is `None` and the cached tool
+            list is whatever `tools/list` said at connect. (Stdio still gets the notifications
+            inline.) Shape: one long-lived `subscriptions/listen` per HTTP server (it is a request
+            like any other; its response stream stays open), feeding the same `ListChangedFlags`,
+            re-opened with backoff when the stream drops; the discover result's `ttlMs` is the
+            fallback refresh interval for servers that do not support it.
+            Source: [subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions).
+      - [ ] *(found 2026-09-18)* **Serve MRTR elicitation through `ask_user` instead of refusing it.**
+            A modern server that needs input returns `resultType: "input_required"` with
+            `inputRequests` (elicitation/sampling/roots), and the client retries the original
+            request with `inputResponses`. Today nanna-mcp turns that into an error (no capability
+            is declared, so a conforming server should not ask). Elicitation maps directly onto the
+            `ask_user` question the owner wants kept: declare `elicitation` (form mode only),
+            surface the server's message + schema as an `ask_user` question, retry with the answer,
+            bounded rounds. Sampling stays undeclared. Source:
+            [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr).
+      - [ ] *(research 2026-09-18)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
+            2026-07-28** — stateless serving by default, a `ClientLifecycleMode::Discover` that
+            skips `initialized`, and version negotiation on connect. Two uses: (a) a second,
+            independent implementation for `dual_era_live.rs` — today every modern fixture is the
+            TypeScript SDK, so a bug the two ends share cannot be seen; a tiny `rmcp` example server
+            as a dev-only fixture would close that; (b) the standing question of whether nanna-mcp
+            should be `rmcp` underneath. Not urgent now that nanna-mcp is spec-current on both
+            transports, but decide by diffing what each covers (MRTR, subscriptions, tasks,
+            x-mcp-header) rather than by LOC. Sources: [crates.io/rmcp](https://crates.io/crates/rmcp),
+            [modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk).
       - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.
@@ -4992,7 +5021,14 @@ asks permission or restricts her.)*:
             lifetime needs a refresh during long tool calls, and the update's exact payload (not
             confirmed in the docs read). Sources: [Bot API changelog](https://core.telegram.org/bots/api-changelog),
             [sendMessageDraft reference (GramIO mirror)](https://gramio.dev/telegram/methods/sendmessagedraft),
-            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html). Follow-up the same day: a clear —
+            [aiogram sendMessageDraft](https://docs.aiogram.dev/en/latest/api/methods/send_message_draft.html).
+            *(research 2026-09-18 — the open payload question, answered from the changelog)* Bot API
+            10.3 (2026-08-24) names it: the Update field is **`stopped_message_generation`**, of the new
+            class **`MessageGenerationStopped`**; `can_stop`/`keep_on_stop` exist on both
+            `sendMessageDraft` and **`sendRichMessageDraft`** (Bot API 10.1, 2026-06-11, "streaming
+            AI-generated replies" with the Rich Messages formatting). The class's field table was
+            not retrievable this run — read it from the full API page before writing the parser.
+            Source: [Bot API changelog](https://core.telegram.org/bots/api-changelog). Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
