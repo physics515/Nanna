@@ -158,6 +158,97 @@ async fn config_set_rebuilds_llm_router_providers() {
     assert!(providers.contains(&"ollama"));
 }
 
+/// The embedding router is built once, at boot. A token saved in Settings used
+/// to reach chat (whose router is rebuilt) and never the embedder: against a
+/// server that wants the token, every memory embed kept getting 401 and was
+/// stored without a vector until a restart — with nothing saying one was
+/// needed. Through the daemon's own wiring, the saved token must go out on the
+/// very next embed, even though the old token's 401 had benched the provider.
+///
+/// The same saves change the embedding model, which must NOT follow: the
+/// store's vectors are bound to the model the router was built with, and a
+/// silent swap is the dimension split-brain.
+///
+/// `ConfigAction::Set`, not `Reload`, so the test never touches the real
+/// on-disk config; every mutation path shares the propagation step.
+#[tokio::test]
+async fn a_saved_ollama_token_reaches_the_running_embedder_but_the_model_waits() {
+    let (base, seen) = crate::embedding_reload::test_ollama::spawn_token_gated("new-token").await;
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = crate::server::DaemonServer::new(
+        crate::server::DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..crate::server::DaemonConfig::default()
+        },
+        crate::server::EmbeddingConfig {
+            provider: "ollama".into(),
+            model: "boot-embed".into(),
+            ollama_host: base.clone(),
+            ollama_api_key: Some("old-token".into()),
+            priority: Vec::new(),
+        },
+        None,
+        None,
+    );
+    let (info, client) = server
+        .embedding_provider_for("ollama/boot-embed")
+        .expect("an Ollama spec always resolves");
+    let router = crate::embedding_router::EmbeddingRouter::new(info, client);
+    router
+        .embed_one_now("before")
+        .await
+        .expect_err("the server refuses the token the daemon booted with");
+
+    let cp = ControlPlane::new(Arc::new(SessionManager::new()))
+        .with_live_embedding(server.live_embedding());
+    {
+        // The running config names the server and model the daemon booted with.
+        let mut config = cp.config.write().await;
+        config.memory.ollama_host.clone_from(&base);
+        config.memory.embedding_provider = "ollama".into();
+        config.memory.embedding_model = "boot-embed".into();
+        config.memory.embedding_priority.clear();
+    }
+    let cp = Arc::new(cp);
+    for (path, value) in [
+        ("memory.embedding_model", json!("other-embed")),
+        ("llm.ollama_api_key", json!("new-token")),
+    ] {
+        let resp = cp
+            .handle(
+                "test",
+                Action::Config(ConfigAction::Set {
+                    path: path.into(),
+                    value,
+                }),
+            )
+            .await;
+        assert_eq!(resp["status"], "updated", "{path}: {resp}");
+    }
+
+    let (vector, switched) = router
+        .embed_one_now("after")
+        .await
+        .expect("the saved token opens the server on the next embed");
+    assert_eq!(vector.len(), 3);
+    assert!(
+        switched.is_none(),
+        "the one provider stays the one provider"
+    );
+    let last = seen
+        .lock()
+        .expect("record lock")
+        .last()
+        .cloned()
+        .expect("the embed reached the server");
+    assert_eq!(last.authorization.as_deref(), Some("Bearer new-token"));
+    assert_eq!(
+        last.model.as_deref(),
+        Some("boot-embed"),
+        "the model the store is bound to, not the one just saved"
+    );
+}
+
 /// Negative space: with no memory configured at all, consolidation reports the
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]
