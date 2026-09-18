@@ -37,18 +37,41 @@ impl ProviderId {
         }
     }
 
+    /// Explicit routing prefixes, each with the provider it names.
+    ///
+    /// `openrouter/` comes first: an `OpenRouter` id carries its upstream
+    /// vendor after the prefix (`openrouter/anthropic/claude-haiku-4.5`), and
+    /// that id must stay on `OpenRouter` rather than be read as Anthropic's.
+    /// `anthropic/` and `openai/` are what the Settings summarization picker
+    /// writes; the chat picker writes bare family names instead, which the
+    /// family rules in [`Self::from_model`] route.
+    const PREFIXES: [(&'static str, Self); 5] = [
+        ("openrouter/", Self::OpenRouter),
+        ("github/", Self::GitHubModels),
+        ("ollama/", Self::Ollama),
+        ("anthropic/", Self::Anthropic),
+        ("openai/", Self::OpenAI),
+    ];
+
+    /// The explicit routing prefix `model` starts with, matched without regard
+    /// to case, and the provider it names.
+    fn explicit_prefix(model: &str) -> Option<(&'static str, Self)> {
+        Self::PREFIXES.into_iter().find(|(prefix, _)| {
+            model
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+    }
+
     /// Parse provider from model string prefix
     #[must_use]
     pub fn from_model(model: &str) -> Self {
+        if let Some((_, provider)) = Self::explicit_prefix(model) {
+            return provider;
+        }
         let lower = model.to_lowercase();
 
-        if lower.starts_with("openrouter/") {
-            Self::OpenRouter
-        } else if lower.starts_with("github/") {
-            Self::GitHubModels
-        } else if lower.starts_with("ollama/") {
-            Self::Ollama
-        } else if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
+        if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
             Self::OpenAI
         } else if lower.starts_with("claude") {
             Self::Anthropic
@@ -62,13 +85,13 @@ impl ProviderId {
     }
 
     /// Strip provider prefix from model name (e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b")
+    ///
+    /// Exactly the prefix [`Self::from_model`] routed on, in the same case
+    /// rule, so a spec is never sent to a provider under a name that still
+    /// carries the provider's own prefix.
     #[must_use]
     pub fn strip_prefix(model: &str) -> &str {
-        model
-            .strip_prefix("openrouter/")
-            .or_else(|| model.strip_prefix("github/"))
-            .or_else(|| model.strip_prefix("ollama/"))
-            .unwrap_or(model)
+        Self::explicit_prefix(model).map_or(model, |(prefix, _)| &model[prefix.len()..])
     }
 }
 
@@ -923,5 +946,61 @@ mod tests {
         // Family-named models keep their name (the family IS the model id).
         assert_eq!(ProviderId::strip_prefix("gpt-4o"), "gpt-4o");
         assert_eq!(ProviderId::strip_prefix("claude-opus-4"), "claude-opus-4");
+    }
+
+    /// The Settings summarization picker writes `anthropic/<id>` and
+    /// `openai/<id>`. Unknown to the router, both went to the Anthropic client
+    /// with the prefix still on: `openai/gpt-4o-mini` was sent to Anthropic,
+    /// and `anthropic/claude-haiku-4-5` named a model Anthropic does not have.
+    /// Every dream cycle, IPC consolidation and `memory.summarize` call walked
+    /// past such an entry as a failure.
+    #[test]
+    fn the_settings_pickers_provider_prefixes_route_and_strip() {
+        assert_eq!(
+            ProviderId::from_model("anthropic/claude-haiku-4-5"),
+            ProviderId::Anthropic
+        );
+        assert_eq!(
+            ProviderId::strip_prefix("anthropic/claude-haiku-4-5"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            ProviderId::from_model("openai/gpt-4o-mini"),
+            ProviderId::OpenAI
+        );
+        assert_eq!(ProviderId::strip_prefix("openai/gpt-4o-mini"), "gpt-4o-mini");
+
+        // OpenRouter ids carry the upstream vendor after the router prefix;
+        // `openrouter/` is matched first, so they stay on OpenRouter and keep
+        // the vendor half of the id.
+        assert_eq!(
+            ProviderId::from_model("openrouter/anthropic/claude-haiku-4.5"),
+            ProviderId::OpenRouter
+        );
+        assert_eq!(
+            ProviderId::strip_prefix("openrouter/anthropic/claude-haiku-4.5"),
+            "anthropic/claude-haiku-4.5"
+        );
+        assert_eq!(
+            ProviderId::from_model("openrouter/openai/gpt-4o-mini"),
+            ProviderId::OpenRouter
+        );
+    }
+
+    /// `from_model` has always matched prefixes without regard to case, and
+    /// `strip_prefix` did not: `Ollama/qwen3:4b` went to Ollama under the name
+    /// `Ollama/qwen3:4b`, which no server has. One grammar means the two agree.
+    #[test]
+    fn a_prefix_strips_in_whatever_case_it_routes_in() {
+        for (spec, provider, bare) in [
+            ("Ollama/qwen3:4b", ProviderId::Ollama, "qwen3:4b"),
+            ("Anthropic/claude-haiku-4-5", ProviderId::Anthropic, "claude-haiku-4-5"),
+            ("OPENAI/gpt-4o-mini", ProviderId::OpenAI, "gpt-4o-mini"),
+            ("OpenRouter/meta-llama/llama-3", ProviderId::OpenRouter, "meta-llama/llama-3"),
+            ("GitHub/gpt-4o", ProviderId::GitHubModels, "gpt-4o"),
+        ] {
+            assert_eq!(ProviderId::from_model(spec), provider, "{spec}");
+            assert_eq!(ProviderId::strip_prefix(spec), bare, "{spec}");
+        }
     }
 }
