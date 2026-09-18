@@ -4756,7 +4756,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             (2025 session) and `mcp__local__shout` (stdio) all answered over IPC; the `ftp://` entry
             was skipped by name in the log, `system.status` and `doctor`; `MCP servers closed` then
             `Daemon stopped`.
-      - [ ] *(found 2026-09-18)* **A modern HTTP server's tool list never refreshes.** Revision
+      - [x] *(found 2026-09-18)* **A modern HTTP server's tool list never refreshes.** Revision
             2026-07-28 has no GET stream: change notifications (`notifications/tools/list_changed`)
             arrive only on a `subscriptions/listen` request's SSE stream, which nanna-mcp never
             opens — so `StreamableHttpTransport::list_changed_flags` is `None` and the cached tool
@@ -4766,6 +4766,22 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             re-opened with backoff when the stream drops; the discover result's `ttlMs` is the
             fallback refresh interval for servers that do not support it.
             Source: [subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions).
+            *(2026-09-18, same night — and the gap was wider than filed.)* Nothing ever re-read a
+            server's tools after boot on **either** transport: `McpIntegration::refresh` had no
+            caller, so even a legacy stdio server's inline `list_changed` only dirtied a flag
+            nobody read, and the registry kept the boot-time tools for the daemon's lifetime. Now:
+            `ListChangedFlags` wakes a waiter (`Notify`, permit-stored so a mark is never lost); a
+            modern connect opens `subscriptions/listen` for the lists the server says can change
+            (stdio: written on the shared channel; HTTP: its own task and client, idle-reopened
+            after 5 min, reconnect backoff 1 s → 60 s, a reopened stream marks every list dirty, a
+            server without the method is left alone); `McpToolsManager::resync_server` unregisters
+            tools a server dropped and registers new ones; `watch_list_changes` runs in the
+            daemon's MCP task until shutdown, resyncs at most once a second. Live (8/8 in
+            `dual_era_live.rs`): a real SDK server that registers a tool 1.5 s after connect — over
+            stdio, and over HTTP via its `toolsChanged()` notifier — reaches a real `ToolRegistry`;
+            **negative control**: with the listen request disabled both tests fail. Real debug
+            daemon: `mcp__grow__late` registered at +1.5 s and answered over IPC
+            (`late tool answered`).
       - [ ] *(found 2026-09-18)* **Serve MRTR elicitation through `ask_user` instead of refusing it.**
             A modern server that needs input returns `resultType: "input_required"` with
             `inputRequests` (elicitation/sampling/roots), and the client retries the original

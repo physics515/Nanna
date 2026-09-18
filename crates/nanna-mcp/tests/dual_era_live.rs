@@ -264,3 +264,103 @@ async fn the_legacy_everything_http_server_falls_back_to_a_session() {
     assert!(echoed.contains("legacy http"), "{echoed}");
     client.close().await.expect("close ends the session");
 }
+
+// ---------------------------------------------------------------------------
+// Tool-list changes reach the registry
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tools-integration")]
+mod registry {
+    use super::{McpClient, script, start_http};
+
+    /// Run the manager's watch loop until `wanted` shows up in `registry` (or
+    /// the deadline passes); returns whether it did.
+    async fn watch_until_registered<T: nanna_mcp::Transport + 'static>(
+        manager: &nanna_mcp::McpToolsManager<T>,
+        registry: &nanna_tools::ToolRegistry,
+        wanted: &str,
+    ) -> bool {
+        let (found_tx, found_rx) = tokio::sync::oneshot::channel::<()>();
+        let poll = async {
+            for _ in 0..200 {
+                if registry.get(wanted).await.is_some() {
+                    let _ = found_tx.send(());
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        };
+        let stop = async {
+            let _ = found_rx.await;
+        };
+        let (found, ()) = tokio::join!(poll, async {
+            tokio::select! {
+                () = manager.watch_list_changes(registry, stop) => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(12)) => {}
+            }
+        });
+        found
+    }
+
+    #[tokio::test]
+    #[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+    async fn a_tool_added_by_a_modern_stdio_server_reaches_the_registry() {
+        let modern = script("modern.mjs");
+        let client = McpClient::spawn("node", &[modern.as_str(), "grow"])
+            .await
+            .expect("connect");
+        let manager = nanna_mcp::McpToolsManager::new();
+        manager.register("grow", client).await.expect("register");
+        let registry = nanna_tools::ToolRegistry::new();
+        manager
+            .register_with_registry(&registry)
+            .await
+            .expect("registry");
+        assert!(
+            registry.get("mcp__grow__late").await.is_none(),
+            "not there before the change"
+        );
+        assert!(
+            watch_until_registered(&manager, &registry, "mcp__grow__late").await,
+            "the late tool must arrive through subscriptions/listen"
+        );
+        assert!(
+            registry.get("mcp__grow__shout").await.is_some(),
+            "the old tool stays"
+        );
+        manager.close_all().await.expect("close");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+    async fn a_tool_added_by_a_modern_http_server_reaches_the_registry() {
+        let modern = script("modern-http.mjs");
+        let server = start_http(&[modern.as_str(), "{port}", "json"], &[]).await;
+        let client = McpClient::connect_streamable(&server.url, None)
+            .await
+            .expect("connect");
+        let manager = nanna_mcp::McpToolsManager::new();
+        manager.register("remote", client).await.expect("register");
+        let registry = nanna_tools::ToolRegistry::new();
+        manager
+            .register_with_registry(&registry)
+            .await
+            .expect("registry");
+        assert!(registry.get("mcp__remote__late").await.is_none());
+
+        // Let the listen stream open, then change the server's tools.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let grow_url = server.url.replace("/mcp", "/grow");
+        reqwest::Client::new()
+            .post(&grow_url)
+            .send()
+            .await
+            .expect("grow");
+        assert!(
+            watch_until_registered(&manager, &registry, "mcp__remote__late").await,
+            "the late tool must arrive through the HTTP listen stream"
+        );
+        manager.close_all().await.expect("close");
+    }
+}

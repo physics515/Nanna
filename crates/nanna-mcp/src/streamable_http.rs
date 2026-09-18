@@ -18,12 +18,16 @@
 
 use crate::era::META_PROTOCOL_VERSION;
 use crate::transport::reply_to_server_request;
-use crate::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, Result, Transport};
+use crate::{
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListChangedFlags, McpError, McpList,
+    Result, Transport,
+};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
@@ -38,6 +42,17 @@ pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// daemon would hand a model, and it stops a runaway stream from growing
 /// memory without limit.
 pub const HTTP_BODY_BYTES_MAX: usize = 16 * 1024 * 1024;
+
+/// A `subscriptions/listen` stream that has been silent this long is
+/// reopened.
+///
+/// Servers are encouraged to send keep-alive comments; one that
+/// does not still gets its stream renewed, at the cost of one request.
+pub const LISTEN_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// First and last wait between listen reconnects (doubling in between).
+const LISTEN_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const LISTEN_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Bound on how much of an error body is kept for the message.
 const ERROR_BODY_BYTES_MAX: usize = 512;
@@ -381,6 +396,10 @@ pub struct StreamableHttpTransport {
     legacy_version: Mutex<Option<String>>,
     /// `x-mcp-header` parameters by tool name, from the last `tools/list`.
     tool_headers: RwLock<HashMap<String, Vec<HeaderParam>>>,
+    /// Marked by the listen task when the server announces a list change.
+    list_changed: Arc<ListChangedFlags>,
+    /// Signals the listen task to stop; dropping the transport does too.
+    listen_stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl StreamableHttpTransport {
@@ -410,6 +429,8 @@ impl StreamableHttpTransport {
             session_id: Mutex::new(None),
             legacy_version: Mutex::new(None),
             tool_headers: RwLock::new(HashMap::new()),
+            list_changed: Arc::new(ListChangedFlags::default()),
+            listen_stop: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -529,6 +550,131 @@ impl StreamableHttpTransport {
     }
 }
 
+/// Everything the listen task needs, owned, so it outlives no borrow.
+struct Listener {
+    client: reqwest::Client,
+    endpoint: String,
+    bearer_token: Option<String>,
+    request: JsonRpcRequest,
+    flags: Arc<ListChangedFlags>,
+    stop: tokio::sync::watch::Receiver<bool>,
+}
+
+/// How one listen stream ended.
+enum ListenEnd {
+    /// The stream dropped or went idle: reopen it.
+    Reopen,
+    /// The server does not serve `subscriptions/listen` (or refused it): stop.
+    Unsupported(String),
+}
+
+impl Listener {
+    /// Keep a listen stream open until told to stop, reconnecting with a
+    /// bounded backoff. A stream that reconnects marks every list dirty: the
+    /// gap may have hidden a change.
+    async fn run(self) {
+        // A separate handle: `select!` below borrows it mutably while
+        // `listen_once` borrows the rest of `self`.
+        let mut stop = self.stop.clone();
+        let mut backoff = LISTEN_BACKOFF_MIN;
+        let mut opened_before = false;
+        loop {
+            let started = tokio::time::Instant::now();
+            let end = tokio::select! {
+                _ = stop.changed() => return,
+                end = self.listen_once(&mut opened_before) => end,
+            };
+            if let ListenEnd::Unsupported(reason) = end {
+                debug!(reason, "MCP server has no change-notification stream");
+                return;
+            }
+            if started.elapsed() > LISTEN_BACKOFF_MAX {
+                backoff = LISTEN_BACKOFF_MIN;
+            }
+            tokio::select! {
+                _ = stop.changed() => return,
+                () = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(LISTEN_BACKOFF_MAX);
+            debug_assert!(backoff <= LISTEN_BACKOFF_MAX);
+        }
+    }
+
+    /// Open one stream and route its notifications until it ends.
+    async fn listen_once(&self, opened_before: &mut bool) -> ListenEnd {
+        let mut builder = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            );
+        for (name, value) in routing_headers(&self.request, None) {
+            builder = builder.header(name, value);
+        }
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        let Ok(body) = serde_json::to_string(&self.request) else {
+            return ListenEnd::Unsupported("request did not serialize".into());
+        };
+        let response = match builder.body(body).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                debug!(error = %e, "MCP listen request failed; will retry");
+                return ListenEnd::Reopen;
+            }
+        };
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream"));
+        if !(response.status().is_success() && is_sse) {
+            return ListenEnd::Unsupported(format!("HTTP {} without a stream", response.status()));
+        }
+        let mut parser = SseParser::default();
+        let mut stream = response.bytes_stream();
+        loop {
+            let Ok(Some(Ok(chunk))) =
+                tokio::time::timeout(LISTEN_IDLE_TIMEOUT, stream.next()).await
+            else {
+                // Dropped, ended, or idle past the timeout: reopen.
+                return ListenEnd::Reopen;
+            };
+            let Ok(events) = parser.push(&chunk) else {
+                return ListenEnd::Reopen;
+            };
+            for data in events {
+                self.route(&data, opened_before);
+            }
+        }
+    }
+
+    /// Route one event from the listen stream into the flags.
+    fn route(&self, data: &str, opened_before: &mut bool) {
+        let Ok(message) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match message.get("method").and_then(Value::as_str) {
+            Some("notifications/subscriptions/acknowledged") => {
+                if *opened_before {
+                    // A reopened stream: anything may have changed meanwhile.
+                    for list in [McpList::Tools, McpList::Resources, McpList::Prompts] {
+                        self.flags.mark(list);
+                    }
+                }
+                *opened_before = true;
+            }
+            Some("notifications/tools/list_changed") => self.flags.mark(McpList::Tools),
+            Some("notifications/resources/list_changed") => self.flags.mark(McpList::Resources),
+            Some("notifications/prompts/list_changed") => self.flags.mark(McpList::Prompts),
+            _ => {}
+        }
+    }
+}
+
 /// Parse a body as a JSON-RPC answer. An error with a missing or `null` id
 /// (allowed when the server could not read ours) is attributed to `id`.
 fn json_rpc_answer(bytes: &[u8], id: &crate::RequestId) -> Option<JsonRpcResponse> {
@@ -611,6 +757,7 @@ impl Transport for StreamableHttpTransport {
     /// Nothing to tear down in the modern revision (no sessions); a legacy
     /// session is ended with the `DELETE` its revision defines, best effort.
     async fn close(&self) -> Result<()> {
+        let _ = self.listen_stop.send(true);
         let Some(session) = self.session_id.lock().await.take() else {
             return Ok(());
         };
@@ -624,6 +771,30 @@ impl Transport for StreamableHttpTransport {
         if let Err(e) = builder.send().await {
             debug!(error = %e, "Ending the legacy MCP session failed");
         }
+        Ok(())
+    }
+
+    fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+        Some(self.list_changed.clone())
+    }
+
+    /// Run the listen stream on its own task (with its own client: the
+    /// request client's 30 s total timeout would cut a long-lived stream).
+    async fn open_listen(&self, request: JsonRpcRequest) -> Result<()> {
+        debug_assert_eq!(request.method, "subscriptions/listen");
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| McpError::Transport(e.to_string()))?;
+        let listener = Listener {
+            client,
+            endpoint: self.endpoint.clone(),
+            bearer_token: self.bearer_token.clone(),
+            request,
+            flags: self.list_changed.clone(),
+            stop: self.listen_stop.subscribe(),
+        };
+        tokio::spawn(listener.run());
         Ok(())
     }
 }

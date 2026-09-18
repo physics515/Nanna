@@ -34,12 +34,22 @@ pub struct ListChangedFlags {
     tools: AtomicBool,
     resources: AtomicBool,
     prompts: AtomicBool,
+    /// Wakes whoever waits in [`Self::changed`]. `notify_one` stores a permit
+    /// when nobody is waiting, so a mark between two waits is never lost.
+    wake: tokio::sync::Notify,
 }
 
 impl ListChangedFlags {
     /// Mark a list dirty (called by the transport on a `list_changed` notification).
     pub fn mark(&self, list: McpList) {
         self.flag(list).store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// Resolve once any list has been marked since the last call (or at once,
+    /// if one was marked while nobody waited).
+    pub async fn changed(&self) {
+        self.wake.notified().await;
     }
 
     /// Atomically read-and-clear a list's dirty flag. Returns whether it was set.
@@ -76,6 +86,20 @@ pub trait Transport: Send + Sync {
     /// the client simply keeps serving its cache until an explicit refresh.
     fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
         None
+    }
+
+    /// Open a `subscriptions/listen` stream (MCP 2026-07-28): a request whose
+    /// answer is a long-lived stream of the change notifications it opted
+    /// into, which the transport routes into its [`ListChangedFlags`]. It is
+    /// never awaited like a normal request. The default does nothing — a
+    /// transport without flags has nowhere to deliver them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the request could not be sent at all.
+    async fn open_listen(&self, request: JsonRpcRequest) -> Result<()> {
+        let _ = request;
+        Ok(())
     }
 }
 
@@ -498,6 +522,16 @@ pub mod stdio {
         fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
             Some(self.list_changed.clone())
         }
+
+        /// On stdio a listen stream shares the one channel: write the request
+        /// and let the reader route the notifications that follow (they carry
+        /// the subscription id in `_meta`, and the flags need no more than the
+        /// method). The stream lives as long as the process.
+        async fn open_listen(&self, request: JsonRpcRequest) -> Result<()> {
+            debug_assert_eq!(request.method, "subscriptions/listen");
+            let line = serde_json::to_string(&request)?;
+            write_line(&self.stdin, &line).await
+        }
     }
 
     #[cfg(test)]
@@ -507,6 +541,21 @@ pub mod stdio {
             ListChangedFlags, McpList, ServerNotification, Transport, classify_incoming,
             classify_server_notification, handle_server_notification, mcp_level_is_severe,
         };
+
+        #[tokio::test]
+        async fn a_mark_wakes_a_waiter_even_if_it_came_first() {
+            let flags = ListChangedFlags::default();
+            // Marked before anyone waits: the stored permit resolves the wait.
+            flags.mark(McpList::Tools);
+            tokio::time::timeout(std::time::Duration::from_secs(1), flags.changed())
+                .await
+                .expect("a mark made while nobody waited must not be lost");
+            assert!(flags.take(McpList::Tools));
+            // And with nothing marked, the wait really waits.
+            let idle =
+                tokio::time::timeout(std::time::Duration::from_millis(50), flags.changed()).await;
+            assert!(idle.is_err(), "no mark, no wake");
+        }
 
         #[cfg(unix)]
         #[tokio::test]
@@ -1089,6 +1138,13 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.list_changed_flags(),
             Self::Http(inner) => inner.list_changed_flags(),
+        }
+    }
+
+    async fn open_listen(&self, request: JsonRpcRequest) -> Result<()> {
+        match self {
+            Self::Stdio(inner) => inner.open_listen(request).await,
+            Self::Http(inner) => inner.open_listen(request).await,
         }
     }
 }

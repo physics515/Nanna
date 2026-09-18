@@ -275,6 +275,16 @@ impl McpIntegration {
         Ok(tools.len())
     }
 
+    /// Keep `registry` in step with every server's tool list until `stop`
+    /// resolves (see [`McpToolsManager::watch_list_changes`]).
+    pub async fn watch(
+        &self,
+        registry: &ToolRegistry,
+        stop: impl std::future::Future<Output = ()>,
+    ) {
+        self.manager.watch_list_changes(registry, stop).await;
+    }
+
     /// Get the tool manager
     #[must_use]
     pub const fn manager(&self) -> &McpToolsManager<AnyTransport> {

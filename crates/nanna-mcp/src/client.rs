@@ -197,6 +197,7 @@ impl<T: Transport> McpClient<T> {
             instructions: discover.instructions,
         };
         self.adopt(&result).await;
+        self.open_listen(&result.capabilities).await;
         Ok(result)
     }
 
@@ -263,6 +264,44 @@ impl<T: Transport> McpClient<T> {
         {
             *self.prompts.write().await = prompts_result.prompts;
         }
+    }
+
+    /// Ask a modern server for its change notifications. Revision
+    /// 2026-07-28 sends `list_changed` only on a `subscriptions/listen`
+    /// stream, so without one a cached list never learns it is stale.
+    /// Best effort: a failure is logged and the lists stay as fetched.
+    async fn open_listen(&self, capabilities: &ServerCapabilities) {
+        let Some(filter) = crate::era::listen_filter(capabilities) else {
+            return;
+        };
+        let version = match &*self.era.read().await {
+            ProtocolEra::Modern { version } => version.clone(),
+            ProtocolEra::Legacy => return,
+        };
+        let params = match with_modern_meta(Some(filter), &version) {
+            Ok(params) => params,
+            Err(e) => {
+                warn!(error = %e, "Could not build subscriptions/listen");
+                return;
+            }
+        };
+        let request = JsonRpcRequest::new(self.next_id(), "subscriptions/listen", Some(params));
+        if let Err(e) = self.transport.open_listen(request).await {
+            warn!(error = %e, "Could not open the MCP change-notification stream");
+        }
+    }
+
+    /// The transport's list-changed flags, if it tracks any.
+    #[must_use]
+    pub fn list_changed_flags(&self) -> Option<Arc<crate::transport::ListChangedFlags>> {
+        self.transport.list_changed_flags()
+    }
+
+    /// Mark the client connected without a handshake — for tests that drive
+    /// a scripted transport through the real code paths.
+    #[cfg(all(test, feature = "tools-integration"))]
+    pub(crate) async fn mark_initialized_for_test(&self) {
+        *self.initialized.write().await = true;
     }
 
     /// The protocol era this client settled on (`Legacy` before `initialize`).

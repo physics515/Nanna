@@ -263,6 +263,36 @@ pub fn ensure_complete(result: &Value) -> Result<()> {
     }
 }
 
+/// The `subscriptions/listen` filter for the lists a server says can change,
+/// or `None` when it advertises none (nothing to listen for). Pure.
+#[must_use]
+pub fn listen_filter(capabilities: &ServerCapabilities) -> Option<Value> {
+    let tools = capabilities.tools.as_ref().is_some_and(|c| c.list_changed);
+    let prompts = capabilities
+        .prompts
+        .as_ref()
+        .is_some_and(|c| c.list_changed);
+    let resources = capabilities
+        .resources
+        .as_ref()
+        .is_some_and(|c| c.list_changed);
+    if !(tools || prompts || resources) {
+        return None;
+    }
+    let mut filter = Map::new();
+    for (key, wanted) in [
+        ("toolsListChanged", tools),
+        ("promptsListChanged", prompts),
+        ("resourcesListChanged", resources),
+    ] {
+        if wanted {
+            filter.insert(key.to_string(), Value::Bool(true));
+        }
+    }
+    debug_assert!(!filter.is_empty());
+    Some(json!({ "notifications": filter }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +446,23 @@ mod tests {
         assert!(ensure_complete(&json!({ "resultType": "complete" })).is_ok());
         assert!(ensure_complete(&json!({ "resultType": "input_required" })).is_err());
         assert!(ensure_complete(&json!({ "resultType": "teleport" })).is_err());
+    }
+
+    #[test]
+    fn the_listen_filter_asks_only_for_what_can_change() {
+        let none: ServerCapabilities = serde_json::from_value(json!({ "tools": {} })).unwrap();
+        assert_eq!(listen_filter(&none), None);
+        let caps: ServerCapabilities = serde_json::from_value(json!({
+            "tools": { "listChanged": true },
+            "resources": { "subscribe": true },
+            "prompts": { "listChanged": true }
+        }))
+        .unwrap();
+        assert_eq!(
+            listen_filter(&caps),
+            Some(
+                json!({ "notifications": { "toolsListChanged": true, "promptsListChanged": true } })
+            )
+        );
     }
 }

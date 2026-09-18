@@ -175,9 +175,14 @@ pub async fn spawn_mcp_servers(
                 }
             }
         }
-        // Keep the clients alive for the daemon's lifetime; close them on a
-        // clean shutdown rather than leaving it to process exit.
-        let _ = shutdown.recv().await;
+        // Keep the clients alive for the daemon's lifetime, following every
+        // server's tool-list changes into the registry; close them on a clean
+        // shutdown rather than leaving it to process exit.
+        integration
+            .watch(&tools, async {
+                let _ = shutdown.recv().await;
+            })
+            .await;
         if let Err(e) = integration.shutdown().await {
             warn!("MCP servers did not shut down cleanly: {e}");
         }

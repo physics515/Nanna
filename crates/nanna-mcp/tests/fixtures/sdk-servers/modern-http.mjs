@@ -1,11 +1,14 @@
 // A real @modelcontextprotocol/server 2.0 Streamable HTTP server for
 // dual_era_live.rs: `node modern-http.mjs <port> <json|sse> [bearer-token]`.
 // Serves the modern (2026-07-28) revision only (`legacy: 'reject'`).
+// `POST /grow` adds a tool (`late`) and announces tools/list_changed to every
+// open subscriptions/listen stream.
 import { createServer } from 'node:http';
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import * as z from 'zod';
 
 const [port, responseMode = 'json', token] = process.argv.slice(2);
+let grown = false;
 const handler = createMcpHandler(() => {
   const server = new McpServer(
     { name: 'modern-http-fixture', version: '1.0.0' },
@@ -24,12 +27,25 @@ const handler = createMcpHandler(() => {
     },
     async ({ region }, ctx) => ({ content: [{ type: 'text', text: `region=${region}` }] }),
   );
+  if (grown) {
+    server.registerTool(
+      'late',
+      { description: 'Registered after connect', inputSchema: z.object({}) },
+      async () => ({ content: [{ type: 'text', text: 'late tool answered' }] }),
+    );
+  }
   return server;
 }, { legacy: 'reject', responseMode });
 
 createServer(async (req, res) => {
   if (token && req.headers.authorization !== `Bearer ${token}`) {
     res.writeHead(401, { 'content-type': 'text/plain' }).end('missing or wrong bearer token');
+    return;
+  }
+  if (req.url === '/grow') {
+    grown = true;
+    handler.notify.toolsChanged();
+    res.writeHead(204).end();
     return;
   }
   const chunks = [];
