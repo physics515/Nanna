@@ -423,6 +423,7 @@ function installInPage(options = {}) {
           // real command never sends the token itself.
           ollama_token_saved: state.config.ollama_token_host !== null,
           ollama_token_host: state.config.ollama_token_host,
+          ollama_token_from_env: false,
         };
 
       case 'get_system_prompt':

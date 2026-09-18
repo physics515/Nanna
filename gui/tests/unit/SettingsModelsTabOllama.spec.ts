@@ -70,6 +70,7 @@ interface Saved {
   ollama_host: string
   ollama_token_saved: boolean
   ollama_token_host: string | null
+  ollama_token_from_env: boolean
 }
 
 let saved: Saved
@@ -145,7 +146,12 @@ function configChanged() {
 
 describe('SettingsModelsTab — Ollama server and token', () => {
   beforeEach(() => {
-    saved = { ollama_host: 'http://localhost:11434', ollama_token_saved: false, ollama_token_host: null }
+    saved = {
+      ollama_host: 'http://localhost:11434',
+      ollama_token_saved: false,
+      ollama_token_host: null,
+      ollama_token_from_env: false,
+    }
     invoke.mockReset()
     invoke.mockImplementation(answer)
     listeners.clear()
@@ -224,10 +230,27 @@ describe('SettingsModelsTab — Ollama server and token', () => {
     expect(note.text()).toContain('https://mummu.example/ollama')
     expect(note.text()).toMatch(/not sent/i)
     expect(tokenField(wrapper).placeholder).not.toMatch(/saved/i)
+    expect(wrapper.find('[data-testid="ollama-token-env"]').exists()).toBe(false)
 
     // Typing that server's address (spelled differently) is the same server.
     await wrapper.find('[data-testid="ollama-host"]').setValue('https://MUMMU.example:443/ollama/')
     expect(wrapper.find('[data-testid="ollama-token-elsewhere"]').exists()).toBe(false)
+  })
+
+  it('says when OLLAMA_API_KEY sends a token to this address instead of the saved one', async () => {
+    // The environment's token goes to whatever address is configured, so
+    // "the saved token is not sent here" is not the whole story.
+    saved.ollama_token_saved = true
+    saved.ollama_token_host = 'https://mummu.example/ollama'
+    saved.ollama_token_from_env = true
+    const wrapper = await mountTab()
+    const note = wrapper.find('[data-testid="ollama-token-env"]')
+    expect(note.exists()).toBe(true)
+    expect(note.text()).toContain('OLLAMA_API_KEY')
+
+    // That token crosses a plain-http link to another machine too.
+    await wrapper.find('[data-testid="ollama-host"]').setValue('http://gpu-box:11434')
+    expect(wrapper.find('[data-testid="ollama-token-cleartext"]').exists()).toBe(true)
   })
 
   it('warns that a token to a plain-http remote server travels unencrypted', async () => {

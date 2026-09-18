@@ -59,6 +59,7 @@ const savedSettings = {
   ollama_host: 'http://localhost:11434',
   ollama_token_saved: false,
   ollama_token_host: null as string | null,
+  ollama_token_from_env: false,
 }
 
 function answer(command: string, args?: Record<string, unknown>) {
@@ -124,6 +125,7 @@ describe('OnboardingWizard — Ollama server and token', () => {
     savedSettings.ollama_host = 'http://localhost:11434'
     savedSettings.ollama_token_saved = false
     savedSettings.ollama_token_host = null
+    savedSettings.ollama_token_from_env = false
     invoke.mockReset()
     invoke.mockImplementation(answer)
     localStorage.clear()
@@ -146,6 +148,19 @@ describe('OnboardingWizard — Ollama server and token', () => {
     const token = wrapper.find('[data-testid="onboarding-ollama-token"]').element as HTMLInputElement
     expect(token.value).toBe('')
     expect(token.placeholder).toMatch(/saved for this server/i)
+  })
+
+  it('says when OLLAMA_API_KEY sends a token to this address', async () => {
+    const wrapper = await mountAtOllamaStep()
+    expect(wrapper.find('[data-testid="onboarding-ollama-token-env"]').exists()).toBe(false)
+
+    savedSettings.ollama_token_from_env = true
+    const withEnv = await mountAtOllamaStep()
+    const note = withEnv.find('[data-testid="onboarding-ollama-token-env"]')
+    expect(note.exists()).toBe(true)
+    expect(note.text()).toContain('OLLAMA_API_KEY')
+    await withEnv.find('[data-testid="onboarding-ollama-host"]').setValue('http://gpu-box:11434')
+    expect(withEnv.find('[data-testid="onboarding-ollama-token-cleartext"]').exists()).toBe(true)
   })
 
   it('saves the address and token before probing, trimmed', async () => {
@@ -194,7 +209,12 @@ describe('OnboardingWizard — Ollama server and token', () => {
     const wrapper = await mountAtOllamaStep()
     await wrapper.find('[data-testid="onboarding-ollama-host"]').setValue('https://typed.example/ollama')
 
-    slow.resolve({ ollama_host: 'https://saved.example/ollama', ollama_token_saved: false, ollama_token_host: null })
+    slow.resolve({
+      ollama_host: 'https://saved.example/ollama',
+      ollama_token_saved: false,
+      ollama_token_host: null,
+      ollama_token_from_env: false,
+    })
     await flushPromises()
 
     const host = wrapper.find('[data-testid="onboarding-ollama-host"]').element as HTMLInputElement
@@ -217,6 +237,7 @@ describe('OnboardingWizard — Ollama server and token', () => {
       ollama_host: 'https://saved.example/ollama',
       ollama_token_saved: true,
       ollama_token_host: 'https://saved.example/ollama',
+      ollama_token_from_env: false,
     })
     await flushPromises()
 

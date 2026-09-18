@@ -155,6 +155,7 @@
                 <UiButton v-if="settings?.ollama_token_saved" data-testid="ollama-token-remove" @click="removeOllamaToken" :disabled="savingOllama" size="sm" variant="ghost">Remove token</UiButton>
               </div>
               <p v-if="ollamaTokenElsewhere" data-testid="ollama-token-elsewhere" class="text-[11px] text-nanna-text-muted mt-1">The saved token is for <code>{{ ollamaTokenElsewhere }}</code> and is not sent to this address. Enter one here if this server needs it.</p>
+              <p v-if="settings?.ollama_token_from_env" data-testid="ollama-token-env" class="text-[11px] text-nanna-text-muted mt-1"><code>OLLAMA_API_KEY</code> is set in Nanna's environment, so its token is sent to this address — to whatever address is set here — instead of a saved one.</p>
               <p v-if="ollamaTokenInClear" data-testid="ollama-token-cleartext" class="text-[11px] text-nanna-warning mt-1">This address is plain http:// to another machine, so the token would cross the network unencrypted. Use https:// if the server offers it.</p>
               <p class="text-[11px] text-nanna-text-muted mt-1">Sent as <code>Authorization: Bearer …</code> only to the server it was saved for. Stored in your OS keychain; leave empty to keep the saved one.</p>
             </div>
@@ -358,9 +359,12 @@ const ollamaTokenElsewhere = computed(() =>
 const ollamaTokenPlaceholder = computed(() =>
   ollamaTokenIsForHost.value ? 'A token is saved for this server — type to replace it' : 'Only if the server requires one',
 )
-/** A token that would go to this address over plain http to another machine. */
+/** A token that would go to this address over plain http to another machine:
+ *  one being typed, the one saved for it, or the environment's. */
 const ollamaTokenInClear = computed(
-  () => sendsTokenInClear(ollamaHostInput.value) && (ollamaTokenInput.value.trim() !== '' || ollamaTokenIsForHost.value),
+  () =>
+    sendsTokenInClear(ollamaHostInput.value) &&
+    (ollamaTokenInput.value.trim() !== '' || ollamaTokenIsForHost.value || !!settings.value?.ollama_token_from_env),
 )
 
 // Model priority lists (fallback chains)

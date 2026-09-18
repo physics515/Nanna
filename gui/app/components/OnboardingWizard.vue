@@ -61,6 +61,8 @@ const ollamaHostEdited = ref(false)
 /** Whether a token is saved, and for which server — never the token. */
 const ollamaTokenSaved = ref(false)
 const ollamaTokenHost = ref<string | null>(null)
+/** `OLLAMA_API_KEY` is set: its token goes to whatever address is set. */
+const ollamaTokenFromEnv = ref(false)
 const ollamaPrefill = ref<'idle' | 'loading' | 'loaded' | 'failed'>('idle')
 let ollamaPrefillRun: Promise<void> | null = null
 
@@ -78,11 +80,13 @@ function loadOllamaSettings(): Promise<void> {
         ollama_host?: string
         ollama_token_saved?: boolean
         ollama_token_host?: string | null
+        ollama_token_from_env?: boolean
       }>('get_extended_settings')
       // Typed while this was in flight: the user's, not the saved value's.
       if (s?.ollama_host && !ollamaHostEdited.value) ollamaHost.value = s.ollama_host
       ollamaTokenSaved.value = !!s?.ollama_token_saved
       ollamaTokenHost.value = s?.ollama_token_host ?? null
+      ollamaTokenFromEnv.value = !!s?.ollama_token_from_env
       ollamaPrefill.value = 'loaded'
     } catch {
       ollamaPrefill.value = 'failed'
@@ -104,9 +108,12 @@ const ollamaTokenElsewhere = computed(() =>
 const ollamaTokenPlaceholder = computed(() =>
   ollamaTokenIsForHost.value ? 'A token is saved for this server — leave empty to keep it' : 'Only if the server requires one',
 )
-/** A token that would go to this address over plain http to another machine. */
+/** A token that would go to this address over plain http to another machine:
+ *  one being typed, the one saved for it, or the environment's. */
 const ollamaTokenInClear = computed(
-  () => sendsTokenInClear(ollamaHost.value) && (ollamaToken.value.trim() !== '' || ollamaTokenIsForHost.value),
+  () =>
+    sendsTokenInClear(ollamaHost.value) &&
+    (ollamaToken.value.trim() !== '' || ollamaTokenIsForHost.value || ollamaTokenFromEnv.value),
 )
 
 const needsKey = computed(() => provider.value !== 'ollama')
@@ -420,6 +427,10 @@ const ollamaSummary = computed(() => {
                 <p v-if="ollamaTokenElsewhere" data-testid="onboarding-ollama-token-elsewhere" class="text-[11px] text-nanna-text-muted mt-1">
                   The saved token is for <code>{{ ollamaTokenElsewhere }}</code> and is not sent to this address.
                   Enter one here if this server needs it.
+                </p>
+                <p v-if="ollamaTokenFromEnv" data-testid="onboarding-ollama-token-env" class="text-[11px] text-nanna-text-muted mt-1">
+                  <code>OLLAMA_API_KEY</code> is set in Nanna's environment, so its token is sent to this address — to
+                  whatever address is set here — instead of a saved one.
                 </p>
                 <p v-if="ollamaTokenInClear" data-testid="onboarding-ollama-token-cleartext" class="text-[11px] text-amber-300 mt-1">
                   This address is plain http:// to another machine, so the token would cross the network unencrypted.
