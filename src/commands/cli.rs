@@ -132,6 +132,28 @@ fn summarizer_clients(config: &Config) -> Option<nanna_agent::SummarizerClients>
     Some(nanna_daemon::llm_router::summarizer_clients(&router))
 }
 
+/// The agent `nanna chat` and `nanna run` talk to: `agent_config` walking the
+/// config's summarization list, resolved through [`summarizer_clients`] over
+/// the same config — so the list the agent walks and the providers it
+/// reaches come from one place.
+fn cli_agent(
+    config: &Config,
+    agent_config: AgentConfig,
+    llm: Arc<nanna_core::LlmClient>,
+    tools: Arc<nanna_tools::ToolRegistry>,
+    context: AgentContext,
+) -> Agent {
+    let agent_config = AgentConfig {
+        summarization_priority: config.llm.summarization_priority.clone(),
+        ..agent_config
+    };
+    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    match summarizer_clients(config) {
+        Some(clients) => agent.with_summarizer_clients(clients),
+        None => agent,
+    }
+}
+
 /// Print tool call results.
 fn print_tool_calls(tool_calls: &[nanna_agent::ToolCallRecord]) {
     if tool_calls.is_empty() {
@@ -204,7 +226,6 @@ pub async fn run_cli(
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        summarization_priority: config.llm.summarization_priority.clone(),
         ..Default::default()
     };
 
@@ -234,10 +255,7 @@ pub async fn run_cli(
             }
         }
 
-    let mut agent = Agent::new(agent_config, llm, tools).with_context(context);
-    if let Some(clients) = summarizer_clients(config) {
-        agent = agent.with_summarizer_clients(clients);
-    }
+    let agent = cli_agent(config, agent_config, llm, tools, context);
     run_cli_loop(&agent, &storage, &session_id, stream).await
 }
 
@@ -351,7 +369,6 @@ pub async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> a
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        summarization_priority: config.llm.summarization_priority.clone(),
         ..Default::default()
     };
 
@@ -372,10 +389,7 @@ Be concise and direct.",
         cwd.display()
     ));
 
-    let mut agent = Agent::new(agent_config, llm, tools).with_context(context);
-    if let Some(clients) = summarizer_clients(config) {
-        agent = agent.with_summarizer_clients(clients);
-    }
+    let agent = cli_agent(config, agent_config, llm, tools, context);
 
     match agent.run(prompt, RunOptions::default()).await {
         Ok(response) => {
@@ -532,6 +546,37 @@ mod tests {
         assert_eq!(credentials.ollama_host, "https://ollama.example.test");
         assert_eq!(credentials.ollama_api_key.as_deref(), Some("ollama-bound-token"));
         assert_eq!(credentials.anthropic, None);
+    }
+
+    /// `nanna chat` and `nanna run` build their agent in one place: with a
+    /// listed Ollama summarizer the agent resolves it to the configured
+    /// server under its bare id; with no list it carries no resolver.
+    #[test]
+    fn the_cli_agent_summarizes_through_the_configured_server() {
+        let mut config = cli_config("anthropic");
+        config.memory.ollama_host = "http://ollama.example.test:11434".to_string();
+        config.llm.summarization_priority = vec!["ollama/qwen3:4b".to_string()];
+        let build = |config: &Config| {
+            cli_agent(
+                config,
+                AgentConfig::default(),
+                Arc::new(nanna_core::LlmClient::ollama("http://127.0.0.1:9")),
+                Arc::new(nanna_tools::ToolRegistry::new()),
+                AgentContext::new("cli-test"),
+            )
+        };
+
+        let agent = build(&config);
+        let (client, model) = agent
+            .summarizer_clients()
+            .expect("a listed model attaches a resolver")
+            .resolve("ollama/qwen3:4b")
+            .expect("the configured server serves it");
+        assert_eq!(model, "qwen3:4b");
+        assert_eq!(client.base_url(), "http://ollama.example.test:11434");
+
+        config.llm.summarization_priority.clear();
+        assert!(build(&config).summarizer_clients().is_none());
     }
 
     /// With nothing listed nothing would be resolved, so the CLI builds no
