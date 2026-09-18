@@ -368,6 +368,9 @@ impl Backend {
         // it by hand. And a failed connect is what arms the retry loop.
         match self.daemon_manager.start(app, since_stop).await {
             Ok(()) => info!("Daemon sidecar started"),
+            // Every restart ends the start it replaces this way; it is not a
+            // failure, and an ERROR line per Restart read like one in Logs.
+            Err(e) if e == crate::daemon_manager::START_CANCELLED => info!("{e}"),
             Err(e) => error!("Failed to start daemon sidecar: {e}"),
         }
         let result = if matches!(

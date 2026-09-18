@@ -1113,8 +1113,10 @@ async fn wait_for_terminated(watch: &SpawnWatch, timeout: Duration) -> bool {
     false
 }
 
-/// `start`'s error when a stop took over.
-const START_CANCELLED: &str = "Daemon start cancelled by a stop request";
+/// `start`'s error when a stop took over. Public to the crate so a caller can
+/// tell a start that was stopped on request (a restart, a quit, an update)
+/// from one that failed.
+pub(crate) const START_CANCELLED: &str = "Daemon start cancelled by a stop request";
 
 /// Manages the daemon sidecar process
 pub struct DaemonManager {
