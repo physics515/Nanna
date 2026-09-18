@@ -194,8 +194,8 @@ fn free_port() -> u16 {
 /// test before the first fixture binds it.
 static PORT_ALLOCATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Start a fixture and wait for it to say it is listening (both fixtures log
-/// a line containing "listening" on stderr once bound).
+/// Start a fixture and wait for it to say it is listening (the fixtures log
+/// "listening" or "running on port" on stderr once bound).
 ///
 /// Readiness is NOT probed with a TCP connect: a connect to a loopback port
 /// in the ephemeral range that nothing listens on yet can be given that same
@@ -230,7 +230,7 @@ async fn start_http(args: &[&str], env: &[(&str, String)]) -> HttpServer {
             .lines()
             .map_while(Result::ok)
         {
-            if line.contains("listening") {
+            if line.contains("listening") || line.contains("running on port") {
                 let _ = ready_tx.send(());
             }
         }
@@ -351,6 +351,46 @@ async fn the_legacy_everything_http_server_falls_back_to_a_session() {
     .await;
     assert!(echoed.contains("legacy http"), "{echoed}");
     client.close().await.expect("close ends the session");
+}
+
+#[tokio::test]
+#[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+async fn the_deprecated_http_sse_transport_still_works() {
+    let everything = script("node_modules/@modelcontextprotocol/server-everything/dist/index.js");
+    let server = start_http(&[everything.as_str(), "sse"], &[("PORT", "{port}".into())]).await;
+    let sse_url = server.url.replace("/mcp", "/sse");
+
+    // What the daemon sees first: the Streamable HTTP probe gets a bare 404.
+    let modern = McpClient::connect_streamable(&sse_url, None).await;
+    assert!(
+        matches!(
+            modern,
+            Err(nanna_mcp::McpError::HttpStatus { status: 404, .. })
+        ),
+        "the fallback cue: {:?}",
+        modern.err()
+    );
+
+    let transport = nanna_mcp::LegacySseTransport::connect(&sse_url, None)
+        .await
+        .expect("endpoint event");
+    let client = McpClient::new(transport);
+    client
+        .initialize_legacy()
+        .await
+        .expect("handshake over SSE");
+    let tools = client.list_tools().await.expect("tools/list");
+    assert!(tools.iter().any(|t| t.name == "echo"), "{tools:?}");
+    let echoed = client
+        .call_tool("echo", Some(serde_json::json!({ "message": "over sse" })))
+        .await
+        .expect("echo");
+    let text = serde_json::to_value(&echoed).expect("json")["content"][0]["text"].clone();
+    assert!(
+        text.as_str().unwrap_or_default().contains("over sse"),
+        "{text}"
+    );
+    client.close().await.expect("close");
 }
 
 // ---------------------------------------------------------------------------

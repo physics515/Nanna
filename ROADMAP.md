@@ -4730,7 +4730,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             one 2.0 s later, `MCP servers closed` **before** `Daemon stopped`, no node process left.
             Unit tests pin both paths (`cat` exits inside the grace; `sleep 30` is killed after it,
             within 2× grace) and that a closed transport refuses to write.
-      - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
+      - [x] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.
             *(2026-09-17, found while scoping this)* **`HttpTransport::connect` had undefined
@@ -4788,6 +4788,17 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             + `-32000` → `initialize` → session → `echo`). **Negative control:** with the
             `Mcp-Param-*` mirroring disabled the real server refuses the call with `-32020 … the
             Mcp-Param-Region header is absent` — so the test has teeth.
+      *(2026-09-18, closing this item)* Streamable HTTP (both eras) and config wiring landed tonight
+      (entries below). The last piece — a URL whose server only speaks the **deprecated 2024
+      HTTP+SSE** transport — is `LegacySseTransport` (`crates/nanna-mcp/src/sse_legacy.rs`): `GET`
+      the URL, wait (bounded, 10 s) for the `endpoint` event, `POST` messages there, route every
+      answer from the one stream (bounded parser, bearer token, server requests answered, pending
+      requests capped at 256). The daemon uses it exactly as the binding says: when the Streamable
+      HTTP attempt gets `400`/`404`/`405` with no modern error body. The old `HttpTransport`
+      (assumed `<url>/sse`, "waited" for the endpoint with a 100 ms sleep) is left for its one
+      caller, `McpClient::connect`. Verified against server-everything's real `sse` mode (live test
+      10/10) and on the real daemon: `url = "…/sse"` → *"No Streamable HTTP endpoint; trying the
+      2024 HTTP+SSE transport"* → 13 tools → `mcp__oldsse__echo` answered over IPC.
       - [x] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
             (mutually exclusive with `command`), its bearer token from the secure store the way
             `secret_env` already works for stdio (`nanna mcp secret set`), and the daemon's MCP

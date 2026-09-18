@@ -5,7 +5,8 @@
 
 #[cfg(feature = "mcp")]
 use nanna_mcp::{
-    AnyTransport, McpClient, McpToolsManager, StdioTransport, StreamableHttpTransport,
+    AnyTransport, LegacySseTransport, McpClient, McpToolsManager, StdioTransport,
+    StreamableHttpTransport,
 };
 use nanna_tools::ToolRegistry;
 use tracing::{debug, error, info};
@@ -234,30 +235,47 @@ impl McpIntegration {
         config: &McpServerConfig,
         elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
     ) -> Result<McpClient<AnyTransport>, nanna_mcp::McpError> {
-        let transport = if let Some(url) = &config.url {
-            AnyTransport::Http(Box::new(StreamableHttpTransport::new(
-                url,
-                config.bearer_token.clone(),
-            )?))
-        } else {
+        let with_elicitor = |client: McpClient<AnyTransport>| match &elicitor {
+            Some(elicitor) => client.with_elicitor(std::sync::Arc::clone(elicitor)),
+            None => client,
+        };
+        let Some(url) = &config.url else {
             let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
             let env: Vec<(&str, &str)> = config
                 .env
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            AnyTransport::Stdio(StdioTransport::spawn_with_env(
+            let transport = AnyTransport::Stdio(StdioTransport::spawn_with_env(
                 &config.command,
                 &args,
                 &env,
-            )?)
+            )?);
+            let client = with_elicitor(McpClient::new(transport));
+            client.initialize().await?;
+            return Ok(client);
         };
-        let mut client = McpClient::new(transport);
-        if let Some(elicitor) = elicitor {
-            client = client.with_elicitor(elicitor);
+        let token = config.bearer_token.clone();
+        let transport =
+            AnyTransport::Http(Box::new(StreamableHttpTransport::new(url, token.clone())?));
+        let client = with_elicitor(McpClient::new(transport));
+        match client.initialize().await {
+            Ok(_) => Ok(client),
+            // No Streamable HTTP endpoint here, and no modern error body
+            // either: the binding's cue to try the deprecated HTTP+SSE
+            // transport, which is legacy-only (so no era probe).
+            Err(nanna_mcp::McpError::HttpStatus {
+                status: 400 | 404 | 405,
+                ..
+            }) => {
+                info!(%url, "No Streamable HTTP endpoint; trying the 2024 HTTP+SSE transport");
+                let legacy = LegacySseTransport::connect(url, token).await?;
+                let client = with_elicitor(McpClient::new(AnyTransport::Sse(Box::new(legacy))));
+                client.initialize_legacy().await?;
+                Ok(client)
+            }
+            Err(e) => Err(e),
         }
-        client.initialize().await?;
-        Ok(client)
     }
 
     /// Start a single MCP server

@@ -1108,6 +1108,8 @@ pub enum AnyTransport {
     /// A Streamable HTTP endpoint (boxed: it is several times the size of a
     /// stdio transport, and a manager holds many of either).
     Http(Box<crate::StreamableHttpTransport>),
+    /// A server still on the deprecated 2024 HTTP+SSE transport.
+    Sse(Box<crate::LegacySseTransport>),
 }
 
 #[cfg(all(feature = "stdio", feature = "http"))]
@@ -1117,6 +1119,7 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.request(request).await,
             Self::Http(inner) => inner.request(request).await,
+            Self::Sse(inner) => inner.request(request).await,
         }
     }
 
@@ -1124,6 +1127,7 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.notify(notification).await,
             Self::Http(inner) => inner.notify(notification).await,
+            Self::Sse(inner) => inner.notify(notification).await,
         }
     }
 
@@ -1131,6 +1135,7 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.close().await,
             Self::Http(inner) => inner.close().await,
+            Self::Sse(inner) => inner.close().await,
         }
     }
 
@@ -1138,6 +1143,7 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.list_changed_flags(),
             Self::Http(inner) => inner.list_changed_flags(),
+            Self::Sse(inner) => inner.list_changed_flags(),
         }
     }
 
@@ -1145,6 +1151,7 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(inner) => inner.open_listen(request).await,
             Self::Http(inner) => inner.open_listen(request).await,
+            Self::Sse(inner) => inner.open_listen(request).await,
         }
     }
 }

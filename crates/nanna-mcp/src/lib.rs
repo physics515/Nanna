@@ -32,6 +32,8 @@ mod protocol;
 mod schema_guard;
 mod server;
 #[cfg(feature = "http")]
+pub mod sse_legacy;
+#[cfg(feature = "http")]
 pub mod streamable_http;
 mod transport;
 
@@ -49,6 +51,8 @@ pub use server::{McpServer, McpServerBuilder, McpServerConfig, ResourceHandler, 
 #[cfg(feature = "tools-integration")]
 pub use server::tools_bridge;
 pub use transport::*;
+#[cfg(feature = "http")]
+pub use sse_legacy::LegacySseTransport;
 #[cfg(feature = "http")]
 pub use streamable_http::StreamableHttpTransport;
 

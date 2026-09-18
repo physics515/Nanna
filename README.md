@@ -133,7 +133,7 @@ A fully local run needs none.
   the servers are shut down with the daemon. Both protocol eras work: a current (`2026-07-28`)
   server is detected with `server/discover` and spoken to without a handshake, an older one falls back
   to `initialize` — over stdio and over HTTP, verified against the official TypeScript SDK's servers of
-  each kind. The deprecated 2024 HTTP+SSE transport is not started from config.
+  each kind; a URL that only speaks the deprecated 2024 HTTP+SSE transport is detected and used too.
 - **Nanna's tools for other MCP clients** — `nanna mcp serve` speaks MCP over stdio (for Claude Code,
   Claude Desktop, editors). With the daemon running it serves the daemon's live tools — memory, files,
   shell, web, code and the MCP servers Nanna itself is connected to — each call executed by the daemon;

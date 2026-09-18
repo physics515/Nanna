@@ -338,6 +338,14 @@ pub fn gate_tools_list(result: &mut Value) -> HashMap<String, Vec<HeaderParam>> 
 pub struct SseParser {
     buffer: Vec<u8>,
     data: String,
+    event: Option<String>,
+}
+
+/// One complete SSE event: its `event:` name (if any) and its data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
 }
 
 impl SseParser {
@@ -348,6 +356,20 @@ impl SseParser {
     /// Returns [`McpError::Protocol`] if one event outgrows
     /// [`HTTP_BODY_BYTES_MAX`] or a line is not UTF-8.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>> {
+        Ok(self
+            .push_events(chunk)?
+            .into_iter()
+            .map(|e| e.data)
+            .collect())
+    }
+
+    /// As [`Self::push`], keeping each event's name (the 2024 HTTP+SSE
+    /// transport announces its message endpoint in an `endpoint` event).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::push`].
+    pub fn push_events(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         while let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
@@ -360,8 +382,16 @@ impl SseParser {
                 .map_err(|_| McpError::Protocol("SSE line is not UTF-8".into()))?;
             if line.is_empty() {
                 if !self.data.is_empty() {
-                    events.push(std::mem::take(&mut self.data));
+                    events.push(SseEvent {
+                        event: self.event.take(),
+                        data: std::mem::take(&mut self.data),
+                    });
                 }
+                self.event = None;
+                continue;
+            }
+            if let Some(name) = line.strip_prefix("event:") {
+                self.event = Some(name.trim().to_string());
                 continue;
             }
             if let Some(value) = line.strip_prefix("data:") {
