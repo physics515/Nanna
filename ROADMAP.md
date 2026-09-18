@@ -5031,6 +5031,12 @@ asks permission or restricts her.)*:
             the panel with 4 vitest (parser, wording, restore sends the clicked checkpoint of the
             open chat only after confirming). Placed in the header rather than the run timeline —
             the timeline is per message, and a restore is per chat. Not WebDriver-verified.
+            *(2026-09-18 — now WebDriver-verified on Linux.)* In the isolated GUI, `write_file` ran
+            twice through its sidecar under the open chat's session (14 B, then 37 B); the real
+            header's **Files** button listed `plan.md 14 B · Restore` and `plan.md new file ·
+            Restore`; **Restore** raised the in-app confirmation *"This will put plan.md back to its
+            14-byte version. Its current content is saved first, so you can undo this."*; confirming
+            put the file on disk back to `first version`.
 - [x] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
       before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
       not approval.
