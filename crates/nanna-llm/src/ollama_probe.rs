@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(listed_models(&serde_json::json!({})), none);
         assert_eq!(listed_models(&serde_json::json!({ "models": "nope" })), none);
         let down = OllamaProbe::Unreachable { reason: "x".to_string() };
-        assert!(down.model_names().is_empty());
+        assert_eq!(down.model_names(), Vec::<&str>::new());
     }
 
     /// A one-connection HTTP server on a free loopback port that answers its
