@@ -8928,9 +8928,10 @@ impl Agent {
     /// remembered long-term. Returns a list of extracted memory strings.
     ///
     /// The summarization models are asked first, in the order Settings lists
-    /// them, then the chat model — all of it within
-    /// [`MEMORY_EXTRACTION_DEADLINE`], because extraction runs inline. Running
-    /// out of time extracts nothing this time, and is logged, not an error.
+    /// them, then the chat model — all of it within one call's worth of the
+    /// transport's silence tolerance ([`nanna_llm::STREAM_READ_TIMEOUT_SECS`]),
+    /// because extraction runs inline. Running out of time extracts nothing
+    /// this time, and is logged, not an error.
     ///
     /// # Errors
     ///
