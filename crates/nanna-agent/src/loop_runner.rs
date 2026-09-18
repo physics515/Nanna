@@ -3299,6 +3299,22 @@ const DISTILLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const TOOL_OUTPUT_SUMMARY_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
 
+/// Upper bound on one memory extraction: every listed summarization model and
+/// the chat-model fallback after them, together.
+///
+/// Extraction is inline: it runs before a turn's reply is returned, and every
+/// tenth iteration of a long one. Before the list had fallbacks it made
+/// exactly one call, so a turn waited at most one call the transport lets
+/// live — the request is not streamed, so its whole generation is silence on
+/// the wire, bounded by [`nanna_llm::STREAM_READ_TIMEOUT_SECS`]. Holding the
+/// whole walk to that same figure keeps the bound rather than multiplying it
+/// by the list's length plus one: a later model, and then the chat model, get
+/// the time a fast failure (a refused connection, a 401, a missing provider)
+/// left over. Running out of time extracts nothing this time, which is what a
+/// failed call did before, and the next extraction tries again.
+const MEMORY_EXTRACTION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+
 /// The text blocks of a model's answer, concatenated; everything else (a
 /// thinking block, a stray tool call) is not part of a summary.
 fn joined_text(content: &[ContentBlock]) -> String {
@@ -8046,11 +8062,13 @@ impl Agent {
     /// `deadline` bounds the WHOLE walk, not each model: an inline caller's
     /// liveness bound must not multiply by the length of the list. When it
     /// passes, the walk ends there — trying a later model with no time left
-    /// would only fail again.
+    /// would only fail again. It is not optional: every caller of this walk
+    /// is on a step's critical path, and a walk with no bound is exactly the
+    /// wedge each caller's own deadline exists to close.
     async fn complete_with_summarizers<T>(
         &self,
         purpose: &'static str,
-        deadline: Option<tokio::time::Instant>,
+        deadline: tokio::time::Instant,
         request_for: impl Fn(String) -> AnthropicRequest,
         usable: impl Fn(&[ContentBlock]) -> Option<T>,
     ) -> Option<T> {
@@ -8064,16 +8082,9 @@ impl Agent {
             };
             let request = request_for(model);
             let call = client.complete_anthropic(&request);
-            let outcome = match deadline {
-                Some(deadline) => {
-                    if let Ok(outcome) = tokio::time::timeout_at(deadline, call).await {
-                        outcome
-                    } else {
-                        warn!(purpose, model = %spec, "Summarization ran out of time; no further model is tried");
-                        return None;
-                    }
-                }
-                None => call.await,
+            let Ok(outcome) = tokio::time::timeout_at(deadline, call).await else {
+                warn!(purpose, model = %spec, "Summarization ran out of time; no further model is tried");
+                return None;
             };
             match outcome {
                 Ok(response) => {
@@ -8231,7 +8242,7 @@ impl Agent {
         let facts = self
             .complete_with_summarizers(
                 "distillation",
-                Some(deadline),
+                deadline,
                 |model| AnthropicRequest {
                     context_limit: None,
                     messages: vec![AnthropicMessage::user_text(prompt.clone())],
@@ -8525,7 +8536,7 @@ impl Agent {
         let deadline = tokio::time::Instant::now() + TOOL_OUTPUT_SUMMARY_DEADLINE;
         self.complete_with_summarizers(
             "tool output summary",
-            Some(deadline),
+            deadline,
             |model| AnthropicRequest {
                 context_limit: None,
                 messages: vec![AnthropicMessage::user_text(prompt.clone())],
@@ -8916,10 +8927,25 @@ impl Agent {
     /// Uses a quick LLM call to identify noteworthy information that should be
     /// remembered long-term. Returns a list of extracted memory strings.
     ///
+    /// The summarization models are asked first, in the order Settings lists
+    /// them, then the chat model — all of it within
+    /// [`MEMORY_EXTRACTION_DEADLINE`], because extraction runs inline. Running
+    /// out of time extracts nothing this time, and is logged, not an error.
+    ///
     /// # Errors
     ///
-    /// Returns `AgentError::Llm` if the extraction LLM call fails.
+    /// Returns `AgentError::Llm` if the chat model's call fails after every
+    /// listed model has.
     pub async fn extract_memories(&self) -> Result<Vec<ExtractedMemory>, AgentError> {
+        self.extract_memories_within(MEMORY_EXTRACTION_DEADLINE).await
+    }
+
+    /// [`Self::extract_memories`], with every model call finished within
+    /// `budget` of the first one starting.
+    async fn extract_memories_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<Vec<ExtractedMemory>, AgentError> {
         let ctx = self.context.read().await;
 
         // Skip if no conversation yet
@@ -8969,26 +8995,40 @@ impl Agent {
             models = ?self.config.summarization_priority,
             "Running memory extraction"
         );
+        let deadline = tokio::time::Instant::now() + budget;
         let memories = if let Some(memories) = self
             .complete_with_summarizers(
                 "memory extraction",
-                None,
+                deadline,
                 &request_for,
                 parse_extracted_memories,
             )
             .await
         {
             memories
+        } else if tokio::time::Instant::now() >= deadline {
+            warn!(
+                model = %self.config.model,
+                "Memory extraction ran out of time before the chat model could be asked; \
+                 nothing is extracted this time"
+            );
+            Vec::new()
         } else {
             // Extraction is not truncation: with no summarization model
             // listed, or none answering, the chat model does the job, as it
-            // always has for an empty list.
+            // always has for an empty list — in the time the list left.
             info!(model = %self.config.model, "Running memory extraction on the chat model");
-            let response = self
-                .llm
-                .complete_anthropic(&request_for(self.config.model.clone()))
-                .await?;
-            parse_extracted_memories(&response.content).unwrap_or_default()
+            let request = request_for(self.config.model.clone());
+            let call = self.llm.complete_anthropic(&request);
+            let Ok(response) = tokio::time::timeout_at(deadline, call).await else {
+                warn!(
+                    model = %self.config.model,
+                    "Memory extraction on the chat model ran out of time; nothing is extracted \
+                     this time"
+                );
+                return Ok(Vec::new());
+            };
+            parse_extracted_memories(&response?.content).unwrap_or_default()
         };
 
         info!("Extracted {} memories from conversation", memories.len());
@@ -15487,6 +15527,74 @@ mod summarizer_walk_tests {
         assert_eq!(models_seen(&chat_seen), vec!["nanna-test-chat:1b".to_string()]);
     }
 
+    /// Extraction runs inline at the end of every turn, so all of it — each
+    /// listed model and the chat model after them — shares one deadline. A
+    /// model still thinking when it passes ends extraction for this turn:
+    /// nothing later is started with no time left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_memory_extraction_and_its_chat_fallback() {
+        let silent = spawn_silent().await;
+        let (second_url, second_seen) = spawn_answering(MEMORIES).await;
+        let (chat_url, chat_seen) = spawn_answering(MEMORIES).await;
+        let config = AgentConfig {
+            model: "nanna-test-chat:1b".to_string(),
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(&chat_url)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(stub_clients(&[(FIRST, &silent), (SECOND, &second_url)]));
+        seed_conversation(&agent).await;
+        let started = std::time::Instant::now();
+
+        let memories = agent
+            .extract_memories_within(std::time::Duration::from_millis(300))
+            .await
+            .expect("running out of time is not an error");
+
+        assert!(memories.is_empty(), "nothing is extracted this time: {memories:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "extraction ends at its deadline, not at the transport's"
+        );
+        assert_eq!(models_seen(&second_seen), Vec::<String>::new());
+        assert_eq!(models_seen(&chat_seen), Vec::<String>::new());
+    }
+
+    /// The chat model after the list gets the time the list's fast failures
+    /// left over, and no more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chat_fallback_is_held_to_what_the_list_left() {
+        let silent_chat = spawn_silent().await;
+        let config = AgentConfig {
+            model: "nanna-test-chat:1b".to_string(),
+            summarization_priority: vec![FIRST.to_string(), SECOND.to_string()],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(LlmClient::ollama(&silent_chat)),
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_summarizer_clients(stub_clients(&[(FIRST, REFUSING), (SECOND, REFUSING)]));
+        seed_conversation(&agent).await;
+        let started = std::time::Instant::now();
+
+        let memories = agent
+            .extract_memories_within(std::time::Duration::from_millis(300))
+            .await
+            .expect("running out of time is not an error");
+
+        assert!(memories.is_empty(), "{memories:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the chat model's call ends at the deadline, not at the transport's"
+        );
+    }
+
     /// A model that answers with nothing usable has failed as surely as one
     /// that refused: a degenerate summary would REPLACE the output, and prose
     /// where JSON was asked for holds no memories.
@@ -15548,7 +15656,7 @@ mod summarizer_walk_tests {
         let answer = agent
             .complete_with_summarizers(
                 "test",
-                Some(deadline),
+                deadline,
                 |model| AnthropicRequest {
                     context_limit: None,
                     messages: vec![AnthropicMessage::user_text("summarize")],
