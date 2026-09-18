@@ -3282,21 +3282,39 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 /// the iteration its first distillation fired.
 const DISTILLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Upper bound on summarizing one large tool output, across every model in
-/// the summarization list.
+/// Upper bound on compacting one large tool output: the compression walk and
+/// the summary walk after it, across every model in the summarization list.
 ///
-/// The call is inline, on the step's critical path, and had no bound at all:
-/// the same wedge [`DISTILLATION_TIMEOUT`] closes for distillation. The bound
-/// is the transport's own declared silence tolerance
-/// ([`nanna_llm::STREAM_READ_TIMEOUT_SECS`]), because this request is not
-/// streamed: its whole generation is silence on the wire, so one call the
-/// transport would let live takes at most that long. Holding the whole walk to
-/// the same figure means a later model is tried only in time a fast failure
-/// left over — a refused connection, a 401, a missing provider — which is what
-/// the fallback is for. A model too slow to finish in that time is not one
-/// the step should wait on; its output is cut to a preview instead, and the
-/// cut says so.
-const TOOL_OUTPUT_SUMMARY_DEADLINE: std::time::Duration =
+/// Both walks are inline, on the step's critical path, and had no bound at
+/// all: the same wedge [`DISTILLATION_TIMEOUT`] closes for distillation. The
+/// bound is the transport's own declared silence tolerance
+/// ([`nanna_llm::STREAM_READ_TIMEOUT_SECS`]), because neither request is
+/// streamed: a whole generation is silence on the wire, so one call the
+/// transport would let live takes at most that long. Holding both walks
+/// together to that one figure means a later model — or the summary after a
+/// compression that came to nothing — is tried only in time a fast failure
+/// left over (a refused connection, a 401, a missing provider, an answer with
+/// no scores), which is what the fallbacks are for. A model too slow to
+/// finish in that time is not one the step should wait on; the output is cut
+/// to a preview instead, and the cut says so.
+const TOOL_OUTPUT_COMPACTION_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+
+/// Upper bound on one proactive (Tier 1) compression pass: every older tool
+/// result it compresses, and every listed model for each, together.
+///
+/// The pass is inline — it runs before the step's next request — and each
+/// compression is one scoring call that is not streamed, so its whole
+/// generation is silence on the wire, bounded by
+/// [`nanna_llm::STREAM_READ_TIMEOUT_SECS`]. Held per result, that figure
+/// would let a server that takes requests and never answers hold the step
+/// once per older result per listed model; held per pass, a hung server costs
+/// the step one call the transport would let live, while a healthy scorer
+/// (seconds a result) still gets through the pass. Results the pass did not
+/// reach stay whole for the next pass or the tiers above, and a pass that
+/// compressed nothing takes the ladder's drop fallback, as it does when no
+/// model answers.
+const PROACTIVE_COMPRESSION_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
 
 /// Upper bound on one memory extraction: every listed summarization model and
@@ -7892,20 +7910,44 @@ impl Agent {
 
     /// What CONTEXT gets from a context-targeted result: the whole result, or
     /// — past `threshold` — its compression, summary or truncation.
+    /// Fit a context-targeted tool result into the window: compress it, else
+    /// summarize it, else cut it to a preview — within
+    /// [`TOOL_OUTPUT_COMPACTION_DEADLINE`].
     async fn compact_context_result(
         &self,
         name: &str,
         result_content: String,
         threshold: usize,
     ) -> String {
+        self.compact_context_result_within(
+            name,
+            result_content,
+            threshold,
+            TOOL_OUTPUT_COMPACTION_DEADLINE,
+        )
+        .await
+    }
+
+    /// [`Self::compact_context_result`] with its time bound passed in, so the
+    /// bound can be exercised without waiting it out.
+    async fn compact_context_result_within(
+        &self,
+        name: &str,
+        result_content: String,
+        threshold: usize,
+        budget: std::time::Duration,
+    ) -> String {
         // Context-targeted tools: never store in memory, never stub.
         // For large outputs: try LLMLingua compression → summarization → truncation.
-        // Compression walks `summarization_priority` (settings) with client failover.
+        // Both walk `summarization_priority` (settings) with client failover,
+        // under ONE deadline: the summary gets what the compression left.
         if result_content.len() > threshold {
+            let deadline = tokio::time::Instant::now() + budget;
             let compressed = crate::compressor::compress_with_priority(
                 &result_content,
                 4,
                 &self.config.summarization_priority,
+                deadline,
                 |model_spec| self.create_client_for_model(model_spec),
             )
             .await;
@@ -7922,7 +7964,7 @@ impl Agent {
                     );
                     compressed
                 } else if let Some(summarized) =
-                    self.summarize_tool_output(name, &result_content).await
+                    self.summarize_tool_output(name, &result_content, deadline).await
                 {
                     summarized
                 } else {
@@ -7937,7 +7979,7 @@ impl Agent {
                     )
                 }
             } else if let Some(summarized) =
-                self.summarize_tool_output(name, &result_content).await
+                self.summarize_tool_output(name, &result_content, deadline).await
             {
                 info!(
                     tool = name,
@@ -7983,49 +8025,71 @@ impl Agent {
     }
 
     /// Compress large tool results in older messages using the summarization-model
-    /// priority from settings (LLMLingua-style selective compression).
+    /// priority from settings (LLMLingua-style selective compression), within
+    /// [`PROACTIVE_COMPRESSION_DEADLINE`] for the whole pass.
     ///
-    /// Returns how many tool results were rewritten. Zero means either nothing
-    /// was large enough or no summarization model is configured — callers may
-    /// fall back to `drop_oldest`.
+    /// Returns how many tool results were rewritten. Zero means nothing was
+    /// large enough, no summarization model is configured or reachable, or
+    /// none answered in time — callers may fall back to `drop_oldest`.
     async fn compress_older_context_tool_results(
         &self,
         ctx: &mut AgentContext,
         keep_recent: usize,
     ) -> usize {
+        self.compress_older_context_tool_results_within(
+            ctx,
+            keep_recent,
+            PROACTIVE_COMPRESSION_DEADLINE,
+        )
+        .await
+    }
+
+    /// [`Self::compress_older_context_tool_results`] with its time bound
+    /// passed in, so the bound can be exercised without waiting it out.
+    async fn compress_older_context_tool_results_within(
+        &self,
+        ctx: &mut AgentContext,
+        keep_recent: usize,
+        budget: std::time::Duration,
+    ) -> usize {
         if self.config.summarization_priority.is_empty() {
             return 0;
         }
-        // Pre-resolve every model client once so the awaitable compressor can
-        // own them without re-borrowing `&self`.
-        let mut clients: Vec<(LlmClient, String)> = Vec::new();
-        for model_spec in &self.config.summarization_priority {
-            match self.create_client_for_model(model_spec) {
-                Ok(pair) => clients.push(pair),
-                Err(e) => {
-                    debug!(
-                        model = %model_spec,
-                        error = %e,
-                        "Skipping compression model for older context"
-                    );
-                }
+        // A list none of whose models resolves compresses nothing, exactly as
+        // an empty one — the ladder then takes its drop fallback. Each refusal
+        // is a warning, as in every other summarizing consumer: it is where an
+        // absent or expired credential shows. (When some model resolves, the
+        // walk below warns about the others itself.)
+        let refused: Vec<(&String, String)> = self
+            .config
+            .summarization_priority
+            .iter()
+            .filter_map(|spec| self.create_client_for_model(spec).err().map(|e| (spec, e)))
+            .collect();
+        if refused.len() == self.config.summarization_priority.len() {
+            for (model_spec, e) in &refused {
+                warn!(
+                    model = %model_spec,
+                    error = %e,
+                    "Skipping compression model for older context"
+                );
             }
-        }
-        if clients.is_empty() {
             return 0;
         }
 
+        // The compressor owns what it resolves with, so each result's walk
+        // resolves afresh — a router rebuild mid-pass reaches the next result.
+        let summarizers = self.summarizers.clone();
+        let models = self.config.summarization_priority.clone();
+        let deadline = tokio::time::Instant::now() + budget;
         ctx.compress_older_tool_results(keep_recent, 500, |content| {
-            let clients = clients.clone();
+            let summarizers = summarizers.clone();
+            let models = models.clone();
             async move {
-                for (client, model_name) in &clients {
-                    if let Some(compressed) =
-                        crate::compressor::compress_text(client, model_name, &content, 4).await
-                        && compressed.len() < content.len() {
-                            return Some(compressed);
-                        }
-                }
-                None
+                crate::compressor::compress_with_priority(&content, 4, &models, deadline, |spec| {
+                    crate::summarizer::resolve_summarizer(summarizers.as_ref(), spec)
+                })
+                .await
             }
         })
         .await
@@ -8500,8 +8564,15 @@ impl Agent {
     ///
     /// Returns `None` — and the caller cuts the output to a preview — when the
     /// list is empty, when no listed model gives a plausible summary, or when
-    /// [`TOOL_OUTPUT_SUMMARY_DEADLINE`] passes first.
-    async fn summarize_tool_output(&self, tool_name: &str, content: &str) -> Option<String> {
+    /// `deadline` passes first. The caller's deadline is the whole
+    /// compaction's ([`TOOL_OUTPUT_COMPACTION_DEADLINE`]), so this walk gets
+    /// what the compression walk before it left.
+    async fn summarize_tool_output(
+        &self,
+        tool_name: &str,
+        content: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<String> {
         if self.config.summarization_priority.is_empty() {
             return None;
         }
@@ -8533,7 +8604,6 @@ impl Agent {
             content.len()
         );
 
-        let deadline = tokio::time::Instant::now() + TOOL_OUTPUT_SUMMARY_DEADLINE;
         self.complete_with_summarizers(
             "tool output summary",
             deadline,
@@ -15377,6 +15447,11 @@ mod summarizer_walk_tests {
         seen.lock().expect("record lock").clone()
     }
 
+    /// The deadline a real compaction hands its summary walk.
+    fn compaction_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + TOOL_OUTPUT_COMPACTION_DEADLINE
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_context_ladder_summarizes_on_the_next_model() {
         let (url, seen) = spawn_answering(SUMMARY).await;
@@ -15434,12 +15509,167 @@ mod summarizer_walk_tests {
         assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
     }
 
+    /// The marker a character-level head-and-tail cut leaves
+    /// (`compressor::fallback_compress`): the content was reduced
+    /// mechanically, not by a model's scores.
+    const MECHANICAL_CUT: &str = "[...compressed:";
+
+    /// An answer with no score in it: a model that summarized when it was
+    /// asked to score.
+    const UNSCORED: &str = "Here is a summary: the build ran and every test passed.";
+
+    /// One score per sentence of `prose(sentences)`: every fourth sentence
+    /// (0, 4, 8, …) scores 9 and the rest 1, so a ratio-4 compression keeps
+    /// exactly those.
+    fn scores_keeping_every_fourth(sentences: usize) -> String {
+        (0..sentences)
+            .map(|i| if i % 4 == 0 { "9" } else { "1" })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A context whose one older tool result is `content`, followed by three
+    /// recent turns that a `keep_recent` of 2 protects.
+    fn context_with_older_result(content: String) -> AgentContext {
+        let mut ctx = AgentContext::new("s");
+        ctx.messages.push(AnthropicMessage::user_text("the request"));
+        ctx.messages
+            .push(AnthropicMessage::tool_result("t1", content, false));
+        for i in 0..3 {
+            ctx.messages
+                .push(AnthropicMessage::user_text(format!("recent {i}")));
+        }
+        ctx
+    }
+
+    /// The older tool result of a [`context_with_older_result`] context.
+    fn older_result(ctx: &AgentContext) -> String {
+        match &ctx.messages[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("the fixture's second message is a tool result: {other:?}"),
+        }
+    }
+
+    /// A model that answers without one score per sentence selects nothing,
+    /// so both compression paths move on to the next model. The answer used
+    /// to be taken as success: the walk stopped at a mechanical head-and-tail
+    /// cut, and the next model, which could score, was never asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unscored_answer_hands_the_compression_to_the_next_model() {
+        let (unscored, _) = spawn_answering(UNSCORED).await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &unscored), (SECOND, &scorer)]));
+
+        let mut ctx = context_with_older_result(prose(20));
+        assert_eq!(agent.compress_older_context_tool_results(&mut ctx, 2).await, 1);
+        let older = older_result(&ctx);
+        assert!(!older.contains(MECHANICAL_CUT), "{older}");
+        assert!(
+            older.contains("Sentence number 4 ") && !older.contains("Sentence number 5 "),
+            "the second model's selection: {older}"
+        );
+
+        let compacted = agent.compact_context_result("exec", prose(20), 100).await;
+        assert!(!compacted.contains(MECHANICAL_CUT), "{compacted}");
+        assert!(
+            compacted.contains("Sentence number 4 ") && !compacted.contains("Sentence number 5 "),
+            "the second model's selection: {compacted}"
+        );
+
+        assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string(); 2]);
+    }
+
+    /// When no listed model scores, the walk still ends in the mechanical
+    /// reduction it always fell back to — but only after every model has had
+    /// its turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn when_no_model_scores_each_one_is_asked_before_the_mechanical_cut() {
+        let (first, first_seen) = spawn_answering(UNSCORED).await;
+        let (second, second_seen) = spawn_answering(UNSCORED).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &first), (SECOND, &second)]));
+
+        let mut ctx = context_with_older_result(prose(20));
+        assert_eq!(agent.compress_older_context_tool_results(&mut ctx, 2).await, 1);
+        let older = older_result(&ctx);
+        assert!(older.contains(MECHANICAL_CUT), "{older}");
+        let compacted = agent.compact_context_result("exec", prose(20), 100).await;
+        assert!(compacted.contains(MECHANICAL_CUT), "{compacted}");
+
+        assert_eq!(models_seen(&first_seen).len(), 2, "once per compression");
+        assert_eq!(
+            models_seen(&second_seen).len(),
+            2,
+            "the second model is asked before the mechanical cut"
+        );
+    }
+
+    /// One deadline bounds a whole compaction — the compression walk and the
+    /// summary walk after it. A silent first model holds the step to that
+    /// deadline, not to the transport's timeout (once per walk), and the
+    /// output is cut to a preview that says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_a_whole_compaction() {
+        let silent = spawn_silent().await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &silent), (SECOND, &scorer)]));
+        let started = std::time::Instant::now();
+
+        let compacted = agent
+            .compact_context_result_within(
+                "exec",
+                prose(20),
+                100,
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+
+        assert!(compacted.contains("[PREVIEW CUT"), "{compacted}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the compaction ends at its deadline, not at the transport's"
+        );
+        assert_eq!(
+            models_seen(&seen),
+            Vec::<String>::new(),
+            "no later model is started once the deadline has passed"
+        );
+    }
+
+    /// A proactive compression pass shares one deadline across every older
+    /// result it compresses: a silent model costs the step that deadline
+    /// once, not the transport's timeout per result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_deadline_bounds_a_proactive_compression_pass() {
+        let silent = spawn_silent().await;
+        let (scorer, seen) = spawn_answering(&scores_keeping_every_fourth(20)).await;
+        let agent = agent_with(stub_clients(&[(FIRST, &silent), (SECOND, &scorer)]));
+        let mut ctx = context_with_older_result(prose(20));
+        ctx.messages
+            .insert(2, AnthropicMessage::tool_result("t2", prose(20), false));
+        let started = std::time::Instant::now();
+
+        let compressed = agent
+            .compress_older_context_tool_results_within(
+                &mut ctx,
+                2,
+                std::time::Duration::from_millis(300),
+            )
+            .await;
+
+        assert_eq!(compressed, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the pass ends at its deadline, not at the transport's"
+        );
+        assert_eq!(models_seen(&seen), Vec::<String>::new());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tool_output_summary_moves_past_a_refusing_model() {
         let (url, seen) = spawn_answering(SUMMARY).await;
         let agent = agent_with_two_summarizers(&url);
 
-        let summary = agent.summarize_tool_output("exec", &prose(40)).await;
+        let summary = agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await;
 
         assert_eq!(summary.as_deref(), Some(SUMMARY));
         assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
@@ -15605,7 +15835,7 @@ mod summarizer_walk_tests {
         let (good, seen) = spawn_answering(SUMMARY).await;
         let agent = agent_with(stub_clients(&[(FIRST, &degenerate), (SECOND, &good)]));
         assert_eq!(
-            agent.summarize_tool_output("exec", &prose(40)).await.as_deref(),
+            agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await.as_deref(),
             Some(SUMMARY)
         );
         assert_eq!(models_seen(&seen), vec![SECOND_BARE.to_string()]);
@@ -15703,7 +15933,7 @@ mod summarizer_walk_tests {
             notices[0]
         );
 
-        assert_eq!(agent.summarize_tool_output("exec", &prose(40)).await, None);
+        assert_eq!(agent.summarize_tool_output("exec", &prose(40), compaction_deadline()).await, None);
         let compacted = agent.compact_context_result("exec", prose(8), 100).await;
         assert!(compacted.contains("[PREVIEW CUT"), "{compacted}");
 
