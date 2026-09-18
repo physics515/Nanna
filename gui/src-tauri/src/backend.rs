@@ -75,20 +75,29 @@ impl InitGate {
         self.holder.borrow().is_some()
     }
 
-    /// Claim the gate for an init decided on under stop count `since_stop`,
-    /// unless an init already holds it.
-    fn try_claim(self: &Arc<Self>, since_stop: u64) -> Option<InitClaim> {
-        self.holder
-            .send_if_modified(|holder| {
-                let open = holder.is_none();
-                if open {
-                    *holder = Some(since_stop);
-                }
-                open
-            })
-            .then(|| InitClaim {
-                gate: Arc::clone(self),
-            })
+    /// Claim the gate for an init decided on under stop count `since_stop`.
+    ///
+    /// # Errors
+    ///
+    /// The stop count of the init that holds the gate, read in the same step
+    /// as the failed claim.
+    fn try_claim(self: &Arc<Self>, since_stop: u64) -> Result<InitClaim, u64> {
+        let mut held_by = None;
+        self.holder.send_if_modified(|holder| {
+            held_by = *holder;
+            if held_by.is_none() {
+                *holder = Some(since_stop);
+            }
+            held_by.is_none()
+        });
+        held_by.map_or_else(
+            || {
+                Ok(InitClaim {
+                    gate: Arc::clone(self),
+                })
+            },
+            Err,
+        )
     }
 
     /// Wait until no init holds the gate.
@@ -229,7 +238,7 @@ impl Backend {
         let since_stop = self.daemon_manager.stop_epoch();
         // Serialize concurrent init attempts. A second caller waits for the
         // first and reports what it achieved; it starts nothing itself.
-        let Some(claim) = self.init_gate.try_claim(since_stop) else {
+        let Ok(claim) = self.init_gate.try_claim(since_stop) else {
             info!("Backend initialization already in progress, waiting...");
             self.init_gate.finished().await;
             return if self.daemon_client.is_connected().await {
@@ -302,11 +311,22 @@ impl Backend {
         // restart. An init decided on since is the fresh boot a restart asks
         // for. Its boot has no deadline, so waiting for it could hold up every
         // later restart for as long as it runs; this one joins it instead.
-        self.init_gate.settled_since(since_stop).await;
-        // The count read above, not a fresh one: a stop that comes after it
-        // (a quit, an update) must cancel this restart's boot, not be undone
-        // by it.
-        let claim = self.init_gate.try_claim(since_stop);
+        //
+        // The claim below is a second step, so another init can take the
+        // gate between the two. The failed claim names that init's count,
+        // and one decided on before the stop is waited out as well: joining
+        // it left nothing running and nothing retrying.
+        let claim = loop {
+            self.init_gate.settled_since(since_stop).await;
+            // The count read above, not a fresh one: a stop that comes after
+            // it (a quit, an update) must cancel this restart's boot, not be
+            // undone by it.
+            match self.init_gate.try_claim(since_stop) {
+                Ok(claim) => break Some(claim),
+                Err(holder) if holder >= since_stop => break None,
+                Err(_) => {}
+            }
+        };
         self.restarts.done.fetch_add(1, Ordering::SeqCst);
         if claim.is_none() {
             info!("An init that began after the restart's stop is already starting the daemon");
@@ -927,9 +947,13 @@ mod tests {
     #[tokio::test]
     async fn the_init_gate_admits_one_and_wakes_waiters_when_it_opens() {
         let gate = InitGate::new();
-        let claim = gate.try_claim(0).expect("the gate is open");
+        let claim = gate.try_claim(3).expect("the gate is open");
         assert!(gate.in_progress());
-        assert!(gate.try_claim(0).is_none(), "one init at a time");
+        assert_eq!(
+            gate.try_claim(5).err(),
+            Some(3),
+            "one init at a time, and a failed claim names the one holding it"
+        );
 
         let waiter = tokio::spawn({
             let gate = Arc::clone(&gate);
@@ -943,7 +967,7 @@ mod tests {
             .expect("the waiter wakes when the init ends")
             .unwrap();
         assert!(!gate.in_progress());
-        assert!(gate.try_claim(0).is_some());
+        assert!(gate.try_claim(0).is_ok());
     }
 
     /// The race that absorbed a Retry: a stop, then an init that landed
