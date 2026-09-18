@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { readonly, ref } from 'vue'
 
 export type CloseMode = 'ask' | 'minimize_to_tray' | 'quit_completely'
 
@@ -133,6 +134,7 @@ export function useCloseHandler() {
     handleClose,
     minimizeToTray,
     quitCompletely,
+    performQuit,
     cancelClose,
   }
 }

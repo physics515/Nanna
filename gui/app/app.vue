@@ -1,12 +1,36 @@
 <template>
   <ErrorBoundary>
-    <NuxtLayout>
-      <NuxtPage />
+    <!-- The startup gate (useStartupGate): the shell mounts once a daemon has
+         answered, or once the person opens Nanna without one. The splash
+         leaves by v-if, never by a leave transition: those wait on
+         requestAnimationFrame, which can stall in a hidden or automated window.
+         The page key changes once, on the first attach after opening without
+         a daemon, so a page that loaded offline loads again. -->
+    <NuxtLayout v-if="released">
+      <NuxtPage :key="pageEpoch" />
     </NuxtLayout>
+    <StartupSplash v-else />
   </ErrorBoundary>
   <ConfirmDialog />
   <UiSonner />
 </template>
+
+<script setup lang="ts">
+import { watch } from 'vue'
+import { useBackend } from '~/composables/useBackend'
+import { useStartupGate } from '~/composables/useStartupGate'
+
+const { status } = useBackend()
+const { released, pageEpoch, noteConnected } = useStartupGate()
+
+watch(
+  () => status.value?.connected === true,
+  (connected) => {
+    if (connected) noteConnected()
+  },
+  { immediate: true },
+)
+</script>
 
 <style>
 html, body {

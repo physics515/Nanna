@@ -6,6 +6,25 @@
 
 export type BackendMode = 'daemon' | 'disconnected' | 'embedded'
 
+/** What went wrong, as `BackendStatus.last_error.kind` names it. */
+export type DaemonFailureKind =
+  | 'sidecar_unresolved'
+  | 'spawn_failed'
+  | 'exited_during_boot'
+  | 'exited_after_ready'
+  | 'health_check_failed'
+  | 'restarts_exhausted'
+
+/** The most recent reason the daemon failed to start or stay up. */
+export interface DaemonFailure {
+  kind: DaemonFailureKind | string
+  /** Human-readable; for an exit during boot, the daemon's own last error line when it printed one. */
+  message: string
+  exit_code: number | null
+  signal: number | null
+  at_ms: number
+}
+
 export interface BackendStatusLike {
   mode?: BackendMode | string | null
   connected?: boolean | null
@@ -16,6 +35,13 @@ export interface BackendStatusLike {
   starting_for_s?: number | null
   /** Not connected, and the app will try the daemon again shortly. */
   retrying?: boolean | null
+  /**
+   * An init is running right now. It is what tells "stopped, and about to
+   * start" from "stopped, and nothing will start it".
+   */
+  init_in_progress?: boolean | null
+  /** Why the daemon last failed to start or stay up; cleared once one is ready. */
+  last_error?: DaemonFailure | null
 }
 
 /**
