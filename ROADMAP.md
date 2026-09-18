@@ -5281,9 +5281,24 @@ asks permission or restricts her.)*:
             the list is empty, and memory consolidation falls back to the chat models in order.
             An old config carrying `ollama_url` still loads. The `ollama.servers` check and the
             second-server probe are gone: `--online` probes the one server for chat, embedding
-            and summary models, and a new `llm.summarization` check warns on a bare untagged
-            entry the router would send to Anthropic. Lost on purpose: summarizing on a second
-            Ollama server; that needs a per-spec syntax, not a global key.)*
+            and summary models, and a new `llm.summarization` check warns on a hand-edited entry
+            the router misplaces (a bare untagged name or an unknown `vendor/` namespace sent to
+            Anthropic, a `gpt-…:tag` Ollama model sent to OpenAI). `config.set llm.ollama_url`
+            is refused by name. The CLI's router gives `[llm].api_key` only to `[llm].provider`,
+            since there that key is the chat provider's, not Anthropic's. Lost on purpose:
+            summarizing on a second Ollama server; that needs a per-spec syntax, not a global
+            key.)*
+      - [ ] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
+            two things.** The CLI (`nanna init`, the missing-key prompt, `init_components`) reads
+            it as the key of `[llm].provider` and files it in the keyring under the *Anthropic*
+            entry; the daemon's `LlmConfig::from_nanna` reads it as the Anthropic key whatever
+            `[llm].provider` says. The CLI's own router now follows the CLI's meaning
+            (`commands::cli::summarizer_credentials`), but a config written by `nanna init` for
+            OpenRouter or OpenAI and then served by the daemon still registers that key as the
+            Anthropic credential, where a `claude-*` chat or an `anthropic/` summary would send
+            it. Fix at the source: `nanna init` should write the key to the provider's own slot
+            (`openrouter_api_key`, `openai_api_key`) and keyring entry, with a one-time
+            migration of the existing ones keyed on `[llm].provider`.
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet
