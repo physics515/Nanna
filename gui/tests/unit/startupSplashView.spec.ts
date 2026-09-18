@@ -101,8 +101,29 @@ describe('describeSplash', () => {
     expect(v.tone).toBe('failed')
     // Nothing respawns a daemon that died before the first connection; the
     // retry loop only reconnects. Say both, and no more.
-    expect(v.detail).toMatch(/won't restart by itself/)
+    expect(v.detail).toMatch(/won't start it again by itself/)
     expect(v.detail).toMatch(/keeps trying/)
+  })
+
+  it('names the exit once when the reason already says it', () => {
+    // The daemon printed no error of its own, so the backend's message is how
+    // it ended; the line below it used to repeat "exit code 1".
+    const view = describeSplash(
+      status({
+        daemon_state: 'crashed',
+        last_error: failure({ kind: 'exited_during_boot', message: 'The daemon exited during startup (exit code 1)', exit_code: 1 }),
+      }),
+    )
+    expect(view.reason).toBe('The daemon exited during startup (exit code 1)')
+    expect(view.exit).toBeNull()
+
+    const signalled = describeSplash(
+      status({
+        daemon_state: 'crashed',
+        last_error: failure({ kind: 'exited_after_ready', message: 'The daemon exited (signal 9)', exit_code: null, signal: 9 }),
+      }),
+    )
+    expect(signalled.exit).toBeNull()
   })
 
   it('names each failure kind for what the person sees', () => {

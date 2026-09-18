@@ -77,7 +77,7 @@ export interface SplashContext {
 }
 
 /** The client's retry loop is alive: a daemon that answers now is attached without a restart. */
-const KEEPS_TRYING = 'Nanna keeps trying and opens as soon as a daemon answers.'
+const KEEPS_TRYING = 'Nanna keeps trying to connect and opens as soon as a daemon answers.'
 
 function view(phase: SplashPhase, headline: string, rest: Partial<SplashView> = {}): SplashView {
   return {
@@ -125,7 +125,14 @@ export function describeExit(failure: DaemonFailure | null | undefined): string 
 
 function failureParts(failure: DaemonFailure | null | undefined): Pick<SplashView, 'reason' | 'exit'> {
   const message = failure?.message?.trim()
-  return { reason: message ? message : null, exit: describeExit(failure) }
+  const exit = describeExit(failure)
+  // When the daemon printed no error of its own, the backend's message is
+  // how it ended ("The daemon exited during startup (exit code 1)"): say it
+  // once, not again on the line below.
+  return {
+    reason: message ? message : null,
+    exit: exit !== null && message?.includes(exit) ? null : exit,
+  }
 }
 
 /**
@@ -185,7 +192,7 @@ export function describeSplash(
       // Before the first connection nothing respawns a daemon that died: the
       // health monitor arms on that connection, and the client's retry loop
       // only reconnects a socket.
-      detail: "It won't restart by itself." + (retrying ? ' ' + KEEPS_TRYING : ''),
+      detail: "Nanna won't start it again by itself." + (retrying ? ' ' + KEEPS_TRYING : ''),
       primary: 'restart',
       tone: 'failed',
     })
