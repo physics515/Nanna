@@ -129,7 +129,10 @@ A fully local run needs none.
 - **MCP servers** — list stdio MCP servers under `[mcp]` and the daemon starts them at boot, in the
   background so a slow first `npx` download never delays startup; their tools appear to the model as
   `mcp__<server>__<tool>`. A server that fails to start is logged by name and the rest still start, and
-  the servers are shut down with the daemon. HTTP/SSE servers are not started from config yet.
+  the servers are shut down with the daemon. Both protocol eras work: a current (`2026-07-28`)
+  server is detected with `server/discover` and spoken to without a handshake, an older one falls back
+  to `initialize` — verified against the official TypeScript SDK's servers of each kind. HTTP/SSE
+  servers are not started from config yet.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---

@@ -2,12 +2,15 @@
 
 use crate::{
     McpError, Result,
+    era::{
+        DiscoverResult, LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSIONS, ProbeVerdict,
+        ProtocolEra, classify_probe, ensure_complete, with_modern_meta,
+    },
     protocol::{
         CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
         GetPromptResult, InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest,
         ListPromptsResult, ListResourcesResult, ListToolsResult, Prompt, ReadResourceParams,
-        ReadResourceResult, RequestId, Resource, RootsCapability, ServerCapabilities, ServerInfo,
-        Tool,
+        ReadResourceResult, RequestId, Resource, ServerCapabilities, ServerInfo, Tool,
     },
     transport::{McpList, Transport},
 };
@@ -19,8 +22,8 @@ use tracing::{debug, info, warn};
 
 use crate::schema_guard::validate_tool_schema;
 
-/// MCP protocol version
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The legacy MCP revision the `initialize` handshake offers.
+pub const PROTOCOL_VERSION: &str = LEGACY_PROTOCOL_VERSION;
 
 /// Map a `resources/read` failure onto a typed error.
 ///
@@ -58,6 +61,9 @@ pub struct McpClient<T: Transport> {
     prompts: RwLock<Vec<Prompt>>,
     /// Whether client is initialized
     initialized: RwLock<bool>,
+    /// The server's protocol era, decided once by [`McpClient::initialize`]
+    /// and cached for the server's lifetime. `Legacy` until then.
+    era: RwLock<ProtocolEra>,
 }
 
 impl<T: Transport> McpClient<T> {
@@ -72,6 +78,7 @@ impl<T: Transport> McpClient<T> {
             resources: RwLock::new(Vec::new()),
             prompts: RwLock::new(Vec::new()),
             initialized: RwLock::new(false),
+            era: RwLock::new(ProtocolEra::Legacy),
         }
     }
 
@@ -80,11 +87,26 @@ impl<T: Transport> McpClient<T> {
         RequestId::Number(self.id_counter.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// Send a request and parse the result
+    /// Send a request and parse the result. Under the modern era every
+    /// request carries the per-request `_meta`.
     async fn request<R>(&self, method: &str, params: Option<serde_json::Value>) -> Result<R>
     where
         R: serde::de::DeserializeOwned,
     {
+        let params = match &*self.era.read().await {
+            ProtocolEra::Modern { version } => Some(with_modern_meta(params, version)?),
+            ProtocolEra::Legacy => params,
+        };
+        let result = self.request_value(method, params).await?;
+        serde_json::from_value(result).map_err(Into::into)
+    }
+
+    /// Send a request exactly as given and return its raw result.
+    async fn request_value(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let request = JsonRpcRequest::new(self.next_id(), method, params);
         let response = self.transport.request(request).await?;
 
@@ -99,22 +121,99 @@ impl<T: Transport> McpClient<T> {
         let result = response
             .result
             .ok_or_else(|| McpError::Protocol("Missing result in response".into()))?;
-
-        serde_json::from_value(result).map_err(Into::into)
+        ensure_complete(&result)?;
+        Ok(result)
     }
 
-    /// Initialize the connection with the server
+    /// Connect to the server in whichever protocol era it speaks.
     ///
-    /// Must be called before using any other methods.
+    /// Must be called before using any other methods. Probes with
+    /// `server/discover` (MCP 2026-07-28): a modern server is then spoken to
+    /// statelessly with per-request `_meta`; any other answer, or none within
+    /// the transport's request timeout, falls back to the legacy
+    /// `initialize` handshake. The era is cached for the client's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the server dies during the probe, is a modern server
+    /// sharing no revision with this client, or rejects the connection.
+    pub async fn initialize(&self) -> Result<InitializeResult> {
+        let probe_version = MODERN_PROTOCOL_VERSIONS[0];
+        let outcome = self
+            .request_value(
+                "server/discover",
+                Some(with_modern_meta(None, probe_version)?),
+            )
+            .await;
+        let answered = outcome.as_ref().ok().cloned();
+        match classify_probe(outcome)? {
+            ProbeVerdict::Modern { version } => {
+                let discover = match answered {
+                    Some(result) if version == probe_version => result,
+                    // The server named another mutual revision: ask again in it.
+                    _ => {
+                        let params = with_modern_meta(None, &version)?;
+                        self.request_value("server/discover", Some(params)).await?
+                    }
+                };
+                self.finish_modern(version, discover).await
+            }
+            ProbeVerdict::Legacy => {
+                debug!(
+                    "MCP server did not answer server/discover as a modern server; using initialize"
+                );
+                self.initialize_legacy().await
+            }
+            ProbeVerdict::Incompatible { reason } => Err(McpError::Protocol(reason)),
+        }
+    }
+
+    /// Adopt the modern era from a `server/discover` answer.
+    async fn finish_modern(
+        &self,
+        version: String,
+        discover: serde_json::Value,
+    ) -> Result<InitializeResult> {
+        assert!(!version.is_empty(), "a modern era names its revision");
+        let discover: DiscoverResult = serde_json::from_value(discover)?;
+        debug_assert!(discover.supported_versions.contains(&version));
+        let server_info = discover.server_info().unwrap_or_else(|| ServerInfo {
+            name: "unnamed MCP server".to_string(),
+            version: None,
+        });
+        info!(
+            server = %server_info.name,
+            version = server_info.version.as_deref().unwrap_or("unknown"),
+            protocol = %version,
+            "Connected to MCP server (modern, no handshake)"
+        );
+        *self.era.write().await = ProtocolEra::Modern {
+            version: version.clone(),
+        };
+        let result = InitializeResult {
+            protocol_version: version,
+            capabilities: discover.capabilities,
+            server_info,
+            instructions: discover.instructions,
+        };
+        self.adopt(&result).await;
+        Ok(result)
+    }
+
+    /// Connect with the legacy `initialize` handshake only, skipping the
+    /// era probe. For transports whose era detection is not the stdio probe
+    /// (the deprecated HTTP+SSE transport speaks only this).
     ///
     /// # Errors
     ///
     /// Returns error if initialization fails or server rejects the connection
-    pub async fn initialize(&self) -> Result<InitializeResult> {
+    pub async fn initialize_legacy(&self) -> Result<InitializeResult> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            // No `roots`: this client has none to list, and a declared
+            // capability invites a `roots/list` request it would only refuse.
             capabilities: ClientCapabilities {
-                roots: Some(RootsCapability { list_changed: true }),
+                roots: None,
                 sampling: None,
                 experimental: None,
             },
@@ -134,49 +233,41 @@ impl<T: Transport> McpClient<T> {
             "Connected to MCP server"
         );
 
-        // Store server info and capabilities
-        {
-            let mut info = self.server_info.write().await;
-            *info = Some(result.server_info.clone());
-        }
-        {
-            let mut caps = self.capabilities.write().await;
-            *caps = Some(result.capabilities.clone());
-        }
-
         // Send initialized notification
         self.transport
             .notify(JsonRpcNotification::new("notifications/initialized", None))
             .await?;
+        self.adopt(&result).await;
+        Ok(result)
+    }
 
-        {
-            let mut init = self.initialized.write().await;
-            *init = true;
-        }
+    /// Record a connected server's identity and capabilities, mark the client
+    /// initialized, and pre-fetch the lists the server says it has.
+    async fn adopt(&self, result: &InitializeResult) {
+        *self.server_info.write().await = Some(result.server_info.clone());
+        *self.capabilities.write().await = Some(result.capabilities.clone());
+        *self.initialized.write().await = true;
 
-        // Pre-fetch tools, resources, and prompts if supported
         if result.capabilities.tools.is_some()
             && let Ok(tools_result) = self.list_tools_internal().await
         {
-            let mut tools = self.tools.write().await;
-            *tools = Self::gate_tool_schemas(tools_result.tools);
+            *self.tools.write().await = Self::gate_tool_schemas(tools_result.tools);
         }
-
         if result.capabilities.resources.is_some()
             && let Ok(resources_result) = self.list_resources_internal().await
         {
-            let mut resources = self.resources.write().await;
-            *resources = resources_result.resources;
+            *self.resources.write().await = resources_result.resources;
         }
-
         if result.capabilities.prompts.is_some()
             && let Ok(prompts_result) = self.list_prompts_internal().await
         {
-            let mut prompts = self.prompts.write().await;
-            *prompts = prompts_result.prompts;
+            *self.prompts.write().await = prompts_result.prompts;
         }
+    }
 
-        Ok(result)
+    /// The protocol era this client settled on (`Legacy` before `initialize`).
+    pub async fn era(&self) -> ProtocolEra {
+        self.era.read().await.clone()
     }
 
     /// Check if client is initialized
@@ -547,7 +638,8 @@ impl McpClient<crate::HttpTransport> {
     pub async fn connect(url: impl Into<String>) -> Result<Self> {
         let transport = crate::HttpTransport::connect(url).await?;
         let client = Self::new(transport);
-        client.initialize().await?;
+        // The deprecated HTTP+SSE transport predates the modern era entirely.
+        client.initialize_legacy().await?;
         Ok(client)
     }
 }
@@ -755,6 +847,197 @@ mod tests {
         match read_missing(-32601).await {
             McpError::JsonRpc { code, .. } => assert_eq!(code, -32601),
             other => panic!("method-not-found must pass through, got {other:?}"),
+        }
+    }
+
+    /// A server that answers like either reference SDK: `modern` like
+    /// `@modelcontextprotocol/server` 2.0 (discover answered, `initialize`
+    /// rejected with -32022), otherwise like `@modelcontextprotocol/sdk` 1.30
+    /// (discover is `-32601`, `initialize` answered). Records what it saw.
+    struct EraTransport {
+        modern: bool,
+        requests: std::sync::Mutex<Vec<JsonRpcRequest>>,
+        notifications: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl EraTransport {
+        fn new(modern: bool) -> Self {
+            Self {
+                modern,
+                requests: std::sync::Mutex::new(Vec::new()),
+                notifications: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn answer(
+            &self,
+            method: &str,
+        ) -> std::result::Result<serde_json::Value, (i32, serde_json::Value)> {
+            let tools = serde_json::json!({ "tools": [{ "name": "shout", "inputSchema": { "type": "object" } }] });
+            match (self.modern, method) {
+                (true, "server/discover") => Ok(serde_json::json!({
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": { "tools": { "listChanged": true } },
+                    "resultType": "complete",
+                    "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "modern", "version": "2" } }
+                })),
+                (true, "initialize") => {
+                    Err((-32022, serde_json::json!({ "supported": ["2026-07-28"] })))
+                }
+                (false, "initialize") => Ok(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "legacy" }
+                })),
+                (_, "tools/list") => Ok(tools),
+                _ => Err((-32601, serde_json::Value::Null)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for EraTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let answer = self.answer(&request.method);
+            let id = request.id.clone();
+            self.requests.lock().unwrap().push(request);
+            let (result, error) = match answer {
+                Ok(result) => (Some(result), None),
+                Err((code, data)) => (
+                    None,
+                    Some(crate::protocol::JsonRpcError {
+                        code,
+                        message: "refused".to_string(),
+                        data: Some(data),
+                    }),
+                ),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result,
+                error,
+            })
+        }
+        async fn notify(&self, n: JsonRpcNotification) -> Result<()> {
+            self.notifications.lock().unwrap().push(n.method);
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_modern_server_is_spoken_to_without_a_handshake() {
+        let client = McpClient::new(EraTransport::new(true));
+        let connected = client
+            .initialize()
+            .await
+            .expect("modern server must connect");
+        assert_eq!(connected.protocol_version, "2026-07-28");
+        assert_eq!(connected.server_info.name, "modern");
+        assert_eq!(
+            client.era().await,
+            ProtocolEra::Modern {
+                version: "2026-07-28".into()
+            }
+        );
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "shout");
+
+        let transport = &client.transport;
+        let methods: Vec<String> = transport
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.method.clone())
+            .collect();
+        assert_eq!(
+            methods,
+            ["server/discover", "tools/list"],
+            "no initialize to a modern server"
+        );
+        assert!(
+            transport.notifications.lock().unwrap().is_empty(),
+            "no notifications/initialized"
+        );
+        for request in transport.requests.lock().unwrap().iter() {
+            let meta = &request
+                .params
+                .as_ref()
+                .expect("modern requests carry params")["_meta"];
+            assert_eq!(
+                meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+                "{}",
+                request.method
+            );
+            assert!(
+                meta["io.modelcontextprotocol/clientCapabilities"].is_object(),
+                "{}",
+                request.method
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_server_falls_back_to_initialize() {
+        let client = McpClient::new(EraTransport::new(false));
+        let connected = client
+            .initialize()
+            .await
+            .expect("legacy server must connect");
+        assert_eq!(connected.server_info.name, "legacy");
+        assert_eq!(client.era().await, ProtocolEra::Legacy);
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "shout");
+
+        let transport = &client.transport;
+        let requests = transport.requests.lock().unwrap();
+        let methods: Vec<&str> = requests.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["server/discover", "initialize", "tools/list"]);
+        assert!(
+            requests[2].params.is_none(),
+            "legacy requests carry no modern _meta"
+        );
+        drop(requests);
+        assert_eq!(
+            *transport.notifications.lock().unwrap(),
+            ["notifications/initialized"]
+        );
+    }
+
+    /// A modern server whose `tools/call` needs client input (MRTR).
+    struct InputRequiredTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for InputRequiredTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(
+                    serde_json::json!({ "resultType": "input_required", "inputRequests": {} }),
+                ),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_input_required_result_is_an_error_not_an_empty_success() {
+        let client = McpClient::new(InputRequiredTransport);
+        *client.initialized.write().await = true;
+        match client.call_tool("ask", None).await {
+            Err(McpError::Protocol(message)) => {
+                assert!(message.contains("more input"), "{message}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
         }
     }
 }

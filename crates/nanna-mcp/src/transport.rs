@@ -183,6 +183,64 @@ pub mod stdio {
         }
     }
 
+    /// What one line from the server is, decided by JSON-RPC shape alone.
+    ///
+    /// The order matters: a server→client *request* (`id` + `method`) also
+    /// deserializes as a [`JsonRpcResponse`] — `result` and `error` are both
+    /// optional — so shape must be checked before the response parse, or a
+    /// request is delivered to whichever pending client call shares its `id`.
+    #[derive(Debug)]
+    enum Incoming {
+        Response(JsonRpcResponse),
+        ServerRequest {
+            id: serde_json::Value,
+            method: String,
+        },
+        Notification(JsonRpcNotification),
+        Unreadable(String),
+    }
+
+    /// Classify one line from the server. Pure.
+    fn classify_incoming(line: &str) -> Incoming {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => return Incoming::Unreadable(error.to_string()),
+        };
+        let method = value.get("method").and_then(serde_json::Value::as_str);
+        let id = value.get("id").filter(|id| !id.is_null());
+        match (method, id) {
+            (Some(method), Some(id)) => Incoming::ServerRequest {
+                id: id.clone(),
+                method: method.to_string(),
+            },
+            (Some(_), None) => serde_json::from_value(value).map_or_else(
+                |e| Incoming::Unreadable(e.to_string()),
+                Incoming::Notification,
+            ),
+            (None, _) => serde_json::from_value(value)
+                .map_or_else(|e| Incoming::Unreadable(e.to_string()), Incoming::Response),
+        }
+    }
+
+    /// The reply to a server→client request. Pure.
+    ///
+    /// `ping` MUST be answered with an empty result. Everything else — roots,
+    /// sampling, elicitation — is a capability this client never declares, so
+    /// it is refused with `-32601`. Unanswered, the server waits on it forever:
+    /// measured 2026-09-18, `@modelcontextprotocol/server-everything` holding an
+    /// unanswered `roots/list` did not exit on stdin EOF and outlived the daemon.
+    fn reply_to_server_request(id: &serde_json::Value, method: &str) -> serde_json::Value {
+        debug_assert!(!id.is_null(), "a request always has an id");
+        if method == "ping" {
+            return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+        }
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("nanna does not serve `{method}`") },
+        })
+    }
+
     /// Stdio transport - spawns a process and communicates via stdin/stdout
     pub struct StdioTransport {
         /// Child process
@@ -251,8 +309,10 @@ pub mod stdio {
             // Spawn reader task
             let pending_clone = pending.clone();
             let list_changed_clone = list_changed.clone();
+            let stdin = Arc::new(Mutex::new(stdin));
             tokio::spawn(Self::reader_task(
                 stdout,
+                stdin.clone(),
                 pending_clone,
                 shutdown_rx,
                 list_changed_clone,
@@ -260,16 +320,19 @@ pub mod stdio {
 
             Ok(Self {
                 child: Arc::new(Mutex::new(child)),
-                stdin: Arc::new(Mutex::new(stdin)),
+                stdin,
                 pending,
                 shutdown_tx,
                 list_changed,
             })
         }
 
-        /// Background task that reads responses from stdout
+        /// Background task that reads the server's stdout: responses go to the
+        /// waiting caller, notifications to the router, and server requests are
+        /// answered on stdin.
         async fn reader_task(
             stdout: ChildStdout,
+            stdin: Arc<Mutex<ChildStdin>>,
             pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
             mut shutdown_rx: mpsc::Receiver<()>,
             list_changed: Arc<ListChangedFlags>,
@@ -286,30 +349,7 @@ pub mod stdio {
                         match line {
                             Ok(Some(line)) => {
                                 trace!(line, "Received from MCP server");
-                                
-                                // Try to parse as response
-                                match serde_json::from_str::<JsonRpcResponse>(&line) {
-                                    Ok(response) => {
-                                        let id = response.id.to_string();
-                                        let mut pending = pending.lock().await;
-                                        if let Some(tx) = pending.remove(&id) {
-                                            let _ = tx.send(response);
-                                        } else {
-                                            warn!(id, "Received response for unknown request");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Might be a notification, try to parse that
-                                        match serde_json::from_str::<JsonRpcNotification>(&line) {
-                                            Ok(notif) => {
-                                                handle_server_notification(&notif, &list_changed);
-                                            }
-                                            Err(_) => {
-                                                warn!(error = %e, line, "Failed to parse response");
-                                            }
-                                        }
-                                    }
-                                }
+                                Self::route_line(&line, &stdin, &pending, &list_changed).await;
                             }
                             Ok(None) => {
                                 debug!("MCP server closed stdout");
@@ -321,6 +361,45 @@ pub mod stdio {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        /// Deliver one server line to where its shape says it belongs.
+        async fn route_line(
+            line: &str,
+            stdin: &Mutex<ChildStdin>,
+            pending: &Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>,
+            list_changed: &ListChangedFlags,
+        ) {
+            match classify_incoming(line) {
+                Incoming::Response(response) => {
+                    let id = response.id.to_string();
+                    let waiter = pending.lock().await.remove(&id);
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(response);
+                    } else {
+                        warn!(id, "Received response for unknown request");
+                    }
+                }
+                Incoming::Notification(notif) => handle_server_notification(&notif, list_changed),
+                Incoming::ServerRequest { id, method } => {
+                    debug!(%id, method, "MCP server sent a request; answering");
+                    let reply = reply_to_server_request(&id, &method).to_string();
+                    let mut stdin = stdin.lock().await;
+                    let written = async {
+                        stdin.write_all(reply.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await
+                    }
+                    .await;
+                    drop(stdin);
+                    if let Err(e) = written {
+                        warn!(error = %e, method, "Could not answer an MCP server request");
+                    }
+                }
+                Incoming::Unreadable(error) => {
+                    warn!(error, line, "Failed to parse MCP server line");
                 }
             }
         }
@@ -395,9 +474,79 @@ pub mod stdio {
     #[cfg(test)]
     mod tests {
         use super::{
-            classify_server_notification, handle_server_notification, mcp_level_is_severe,
-            JsonRpcNotification, ListChangedFlags, McpList, ServerNotification,
+            Incoming, JsonRpcNotification, JsonRpcResponse, ListChangedFlags, McpList,
+            ServerNotification, classify_incoming, classify_server_notification,
+            handle_server_notification, mcp_level_is_severe, reply_to_server_request,
         };
+
+        #[test]
+        fn a_server_request_is_never_mistaken_for_a_response() {
+            // The exact line @modelcontextprotocol/server-everything sends after
+            // `initialized` when the client declared roots. It deserializes as a
+            // JsonRpcResponse too, which is the bug this classification closes.
+            let line = r#"{"method":"roots/list","jsonrpc":"2.0","id":0}"#;
+            assert!(
+                serde_json::from_str::<JsonRpcResponse>(line).is_ok(),
+                "the trap is real"
+            );
+            match classify_incoming(line) {
+                Incoming::ServerRequest { id, method } => {
+                    assert_eq!(id, serde_json::json!(0));
+                    assert_eq!(method, "roots/list");
+                }
+                other => panic!("expected a server request, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn responses_notifications_and_garbage_classify_by_shape() {
+            assert!(matches!(
+                classify_incoming(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#),
+                Incoming::Response(_)
+            ));
+            assert!(matches!(
+                classify_incoming(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"x"}}"#),
+                Incoming::Response(_)
+            ));
+            assert!(matches!(
+                classify_incoming(
+                    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#
+                ),
+                Incoming::Notification(_)
+            ));
+            // A null id is a notification's shape, not a request's.
+            assert!(matches!(
+                classify_incoming(
+                    r#"{"jsonrpc":"2.0","method":"notifications/progress","id":null}"#
+                ),
+                Incoming::Notification(_)
+            ));
+            assert!(matches!(
+                classify_incoming("not json"),
+                Incoming::Unreadable(_)
+            ));
+        }
+
+        #[test]
+        fn ping_is_answered_and_everything_else_refused() {
+            let id = serde_json::json!("abc");
+            let pong = reply_to_server_request(&id, "ping");
+            assert_eq!(pong["id"], "abc");
+            assert_eq!(pong["result"], serde_json::json!({}));
+            assert!(pong.get("error").is_none());
+
+            for method in ["roots/list", "sampling/createMessage", "elicitation/create"] {
+                let refusal = reply_to_server_request(&id, method);
+                assert_eq!(refusal["error"]["code"], -32601, "{method}");
+                assert!(refusal.get("result").is_none(), "{method}");
+                assert!(
+                    refusal["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(method)
+                );
+            }
+        }
 
         #[test]
         fn classifies_known_notifications() {

@@ -18,7 +18,7 @@
 //!
 //! let transport = StdioTransport::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])?;
 //! let client = McpClient::new(transport);
-//! client.initialize().await?;
+//! client.initialize().await?; // probes the era: modern `server/discover` or legacy `initialize`
 //!
 //! let tools = client.list_tools().await?;
 //! let result = client.call_tool("read_file", json!({"path": "/tmp/test.txt"})).await?;
@@ -26,6 +26,7 @@
 
 mod adapter;
 mod client;
+pub mod era;
 mod protocol;
 mod schema_guard;
 mod server;
@@ -33,6 +34,7 @@ mod transport;
 
 pub use adapter::*;
 pub use client::{McpClient, McpClientBuilder};
+pub use era::ProtocolEra;
 pub use protocol::*;
 pub use schema_guard::{
     MCP_SCHEMA_DEPTH_MAX, MCP_SCHEMA_NODES_MAX, SchemaViolation, validate_tool_schema,
@@ -44,8 +46,8 @@ pub use server::{McpServer, McpServerBuilder, McpServerConfig, ResourceHandler, 
 pub use server::tools_bridge;
 pub use transport::*;
 
-/// MCP protocol version
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The legacy (handshake) MCP revision; see [`era`] for the modern ones.
+pub const PROTOCOL_VERSION: &str = era::LEGACY_PROTOCOL_VERSION;
 
 use thiserror::Error;
 

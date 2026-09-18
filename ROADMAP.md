@@ -4610,7 +4610,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       command and a duplicate name each logged and skipped while the good server started, and on
       SIGTERM the daemon exited `clean_shutdown` with the fixture child reaped. Not verified: a
       model actually choosing the tool (no model on this host), and a real `npx` server.
-      - [ ] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
+      - [x] *(research 2026-09-17 — raises the priority of everything below)* **nanna-mcp is a
             "legacy" client, and the current spec cannot talk to it.** MCP's current revision is
             **`2026-07-28`**, which removes the `initialize` handshake: every request carries
             `_meta["io.modelcontextprotocol/protocolVersion"]`, servers MUST implement
@@ -4632,6 +4632,40 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             [versioning](https://modelcontextprotocol.io/specification/versioning),
             [2026-07-28 compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
             [stdio backward compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio).
+            *(2026-09-18) The stdio half landed — built and verified against the REAL reference
+            servers, not a fixture.* `crates/nanna-mcp/src/era.rs` holds the whole decision table
+            as pure functions: `DiscoverResult` → modern (mutual version, OUR preference order);
+            `-32022` with a mutual version → modern, with only our legacy revision → `initialize`,
+            with nothing in common → a named error and **no** fallback; `-32021`/`-32020` → error,
+            no fallback; any other code, a timeout, or a non-discover answer → legacy; a dead
+            process → the transport error (never a handshake into a corpse). Modern requests carry
+            `_meta` (`protocolVersion`, empty `clientCapabilities`, `clientInfo`); no
+            `notifications/initialized`; `resultType: input_required` becomes an error instead of an
+            empty success. The era is cached per client. `tests/dual_era_live.rs` (ignored; needs
+            `npm install` in `tests/fixtures/sdk-servers`, pinned `@modelcontextprotocol/server`
+            2.0.0 + `server-everything` 2026.8.31) drives a modern-only, a dual-era and a legacy
+            server end to end: 3/3. Then through the **real debug daemon** with all three in
+            `[[mcp.servers]]`: `mcp__modern__shout` → `HELLO FROM NANNA`, `mcp__dual__shout`,
+            `mcp__everything__echo` → `Echo: legacy ok`, all `started`. Before this, the modern-only
+            server answers our `initialize` with `-32022` — the failure the matrix predicts.
+            **Found on the way (fixed in the same commit):** the stdio reader parsed every line as
+            a *response* first, and a server→client *request* (`{"id":0,"method":"roots/list"}`)
+            deserializes as one — so it could be handed to whichever pending call shared its id,
+            and was never answered. The legacy handshake also advertised a `roots` capability the
+            client does not serve, which is what invited the request. Measured: server-everything
+            holding that unanswered `roots/list` **did not exit on stdin EOF and outlived the
+            daemon** (orphaned to the subreaper). Lines are now classified by shape; `ping` gets
+            `{}`, every other request `-32601`; `roots` is no longer declared. Re-run: no survivor,
+            `clean_shutdown`.
+      - [ ] **The daemon's MCP shutdown is never awaited.** `spawn_mcp_servers` closes the clients
+            in a detached task on the shutdown broadcast, but the daemon returns (`Daemon stopped`)
+            without waiting for it, so the `kill()` in `StdioTransport::close` does not run — the
+            orphan above survived a SIGKILL-capable close path, which is the proof. Today every
+            well-behaved server still exits on stdin EOF when the process dies; a server that
+            ignores EOF (the spec says SHOULD, not MUST) is orphaned. Shape: return the task's
+            `JoinHandle` and await it under a bounded deadline in the shutdown sequence, and follow
+            the spec's escalation (close stdin → wait → SIGTERM → SIGKILL) instead of an immediate
+            kill.
       - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.
