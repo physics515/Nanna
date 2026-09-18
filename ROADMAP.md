@@ -5262,7 +5262,7 @@ asks permission or restricts her.)*:
             - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
                   command without surprising whoever typed it; delete it, or define it as
                   "the daemon starts the HTTP surface" and wire that.
-      - [ ] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
+      - [x] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
             server.** Chat and embeddings reach Ollama through `[memory].ollama_host`;
             summarization (dreaming, context compression) through `[llm].ollama_url`, which
             defaults to localhost — so pointing the first at a GPU box leaves summaries on
@@ -5271,6 +5271,19 @@ asks permission or restricts her.)*:
             cannot tell a deliberate split from an untouched one (the `[server].host` trap
             again). Meanwhile `nanna doctor` warns when both are in use and differ
             (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
+            *(2026-09-18 — decided and done. Owner: "summarization should follow the
+            summarization model selection in settings, with fallbacks." `[llm].ollama_url` is
+            retired: every summarizer resolves each `[llm].summarization_priority` entry through
+            the chat router (one grammar, `anthropic/` and `openai/` now included; chat's
+            server, token and keys), per call, so a config change reaches a running turn. Each
+            consumer walks the list in Settings order and moves on when a model cannot be
+            reached or answers unusably; in-loop summaries cut to fit only when none answers or
+            the list is empty, and memory consolidation falls back to the chat models in order.
+            An old config carrying `ollama_url` still loads. The `ollama.servers` check and the
+            second-server probe are gone: `--online` probes the one server for chat, embedding
+            and summary models, and a new `llm.summarization` check warns on a bare untagged
+            entry the router would send to Anthropic. Lost on purpose: summarizing on a second
+            Ollama server; that needs a per-spec syntax, not a global key.)*
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet
