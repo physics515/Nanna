@@ -5287,7 +5287,17 @@ asks permission or restricts her.)*:
             is refused by name. The CLI's router gives `[llm].api_key` only to `[llm].provider`,
             since there that key is the chat provider's, not Anthropic's. Lost on purpose:
             summarizing on a second Ollama server; that needs a per-spec syntax, not a global
-            key.)*
+            key; loading warns when a leftover `ollama_url` named a server other than
+            `[memory].ollama_host`, since the first save drops the key. Review follow-ups, same
+            day: the memory consumers pass over an empty answer; tool-result compression passes
+            over one that does not score every sentence, and falls back to the whole-line cut
+            only when no listed model scores; compacting one tool result (compression plus
+            summary) and each Tier-1 pass have one deadline each (one un-streamed call's
+            transport tolerance); the Anthropic-shaped Ollama completion takes the per-server
+            generation slot, so a summary cannot cancel another session's stream; `--online`
+            expects each model on Ollama by its own router's rule. Still unbounded but for the
+            transport: the Tier 2/3 chunk walk, where one conversation can legitimately need
+            many calls.)*
       - [ ] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
             two things.** The CLI (`nanna init`, the missing-key prompt, `init_components`) reads
             it as the key of `[llm].provider` and files it in the keyring under the *Anthropic*
@@ -5298,7 +5308,13 @@ asks permission or restricts her.)*:
             Anthropic credential, where a `claude-*` chat or an `anthropic/` summary would send
             it. Fix at the source: `nanna init` should write the key to the provider's own slot
             (`openrouter_api_key`, `openai_api_key`) and keyring entry, with a one-time
-            migration of the existing ones keyed on `[llm].provider`.
+            migration of the existing ones keyed on `[llm].provider`. The same writer offers
+            OpenRouter users vendor-namespaced chat models (`anthropic/claude-sonnet-4`,
+            `openai/gpt-4o`, `google/gemini-pro`), which the daemon copies into its chat model:
+            since `anthropic/` and `openai/` became provider prefixes (2026-09-18) the first two
+            go to Anthropic and OpenAI directly — before, all three went to Anthropic unstripped
+            and failed. `nanna init` should write `openrouter/<id>`, and the migration should
+            prefix existing ones when `[llm].provider` is `openrouter`.
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

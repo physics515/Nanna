@@ -4945,14 +4945,14 @@ mod tests {
     /// A repeat GPU fault walks down the window of the server the router
     /// sends the model to, which is where the next attempt goes, and the
     /// runner's budgets are read from that same server. The model's size on
-    /// another server (the summarizer's, on this machine) is not the one that
-    /// faulted and stays as it was.
+    /// another server (here one on this machine) is not the one that faulted
+    /// and stays as it was.
     #[test]
     fn a_gpu_fault_walks_the_window_of_the_server_the_router_sends_to() {
         let model = "ollama/test-router-demotion:8b";
         let bare = "test-router-demotion:8b";
-        let summarizer = nanna_llm::LlmClient::ollama("http://127.0.0.1:11434");
-        assert_eq!(summarizer.demote_context(bare, None), Some(24_576));
+        let other_server = nanna_llm::LlmClient::ollama("http://127.0.0.1:11434");
+        assert_eq!(other_server.demote_context(bare, None), Some(24_576));
 
         let router = LlmRouter::new().with_ollama("https://gpubox.example/ollama");
         assert_eq!(
@@ -4964,7 +4964,7 @@ mod tests {
             cached_model_info_on_router(&router, model).context_window,
             12_288
         );
-        assert_eq!(summarizer.effective_num_ctx(bare), Some(24_576));
+        assert_eq!(other_server.effective_num_ctx(bare), Some(24_576));
     }
 
     /// Both process-level cures take their server from this guard, through the

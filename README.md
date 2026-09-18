@@ -214,7 +214,8 @@ nanna doctor --online
 Adds the one probe that needs no credential: your Ollama server
 (`[memory].ollama_host`, the one server chat, embeddings and summaries all use)
 is asked whether it is answering and whether it has every Ollama model you
-configured for any of them, and a missing one is reported with the
+configured for any of them — a model counts when chat, the embedders or the
+summarizers would send it there — and a missing one is reported with the
 `ollama pull` that fixes it. It never tests a provider API key — that would mean
 reading the keyring and sending the key off the machine.
 
