@@ -113,9 +113,15 @@ fn secret_wiring_note(config: &Config, server: &str, var: &str) -> Option<String
         None => Some(format!(
             "note: no [[mcp.servers]] entry is named '{server}' yet; add one with secret_env = [\"{var}\"]"
         )),
-        Some(entry) if !entry.secret_env.iter().any(|name| name == var) => Some(format!(
-            "note: '{server}' does not list {var} in secret_env, so it will not receive it"
-        )),
+        Some(entry)
+            if !entry.secret_env.iter().any(|name| name == var)
+                && entry.bearer_secret.as_deref() != Some(var) =>
+        {
+            Some(format!(
+                "note: '{server}' names {var} in neither secret_env nor bearer_secret, so it \
+                 will not receive it"
+            ))
+        }
         Some(_) => None,
     }
 }
@@ -190,6 +196,8 @@ mod secret_tests {
                 .is_some_and(|note| note.contains("no [[mcp.servers]] entry"))
         );
         config.mcp.servers.push(nanna_config::McpServerEntry {
+            url: String::new(),
+            bearer_secret: None,
             name: "github".into(),
             command: "npx".into(),
             args: Vec::new(),
@@ -198,7 +206,7 @@ mod secret_tests {
         });
         assert!(
             secret_wiring_note(&config, " github ", "GITHUB_TOKEN")
-                .is_some_and(|note| note.contains("does not list GITHUB_TOKEN"))
+                .is_some_and(|note| note.contains("names GITHUB_TOKEN in neither"))
         );
         config.mcp.servers[0].secret_env.push("GITHUB_TOKEN".into());
         assert_eq!(secret_wiring_note(&config, "github", "GITHUB_TOKEN"), None);

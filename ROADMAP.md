@@ -4737,12 +4737,25 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             + `-32000` → `initialize` → session → `echo`). **Negative control:** with the
             `Mcp-Param-*` mirroring disabled the real server refuses the call with `-32020 … the
             Mcp-Param-Region header is absent` — so the test has teeth.
-      - [ ] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
+      - [x] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
             (mutually exclusive with `command`), its bearer token from the secure store the way
             `secret_env` already works for stdio (`nanna mcp secret set`), and the daemon's MCP
             manager holding both transports. Not done with the transport because the manager and
             `McpIntegration` are generic over ONE transport type (`StdioTransport`), so this needs
             an either-transport type first.
+            *(2026-09-18, same night)* Done: `url` and `bearer_secret` on `McpServerEntry` (exactly
+            one of `command`/`url`; non-http URLs, `secret_env` on a url server and `bearer_secret`
+            on a command server are each named and skipped, and `doctor` reports them the same way);
+            the bearer resolves from the secure store all-or-nothing like `secret_env`; `nanna mcp
+            secret set` recognises a `bearer_secret` name; `nanna_mcp::AnyTransport` lets one
+            manager hold both kinds. `McpServerConfig`'s derived `Debug` printed `env` values —
+            secrets — and would have printed the token, so it is now hand-written and redacts both
+            (tested). Verified on the real debug daemon with the bearer stored through the real CLI
+            into a scratch file store: `mcp__remote__shout` (modern, bearer, SSE),
+            `mcp__remote__regional` (`x-mcp-header` → `region=eu-north-1`), `mcp__legacyhttp__echo`
+            (2025 session) and `mcp__local__shout` (stdio) all answered over IPC; the `ftp://` entry
+            was skipped by name in the log, `system.status` and `doctor`; `MCP servers closed` then
+            `Daemon stopped`.
       - [ ] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.

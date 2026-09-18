@@ -81,7 +81,7 @@ A fully local run needs none.
 | **WhatsApp Channel** | ✅ Stable | WhatsApp Business API |
 | **Cognitive Memory** | ✅ Stable | — |
 | **Tool System (47 tools, all wired)** | ✅ Stable | Some need a model, key, browser or display — see below |
-| **MCP Client** | ✅ Stable (stdio servers) | A server listed under `[mcp]` |
+| **MCP Client** | ✅ Stable (stdio and Streamable HTTP servers) | A server listed under `[mcp]` |
 | **Auto-Update** | ✅ Stable | Internet connection |
 
 ---
@@ -126,13 +126,14 @@ A fully local run needs none.
 - **Undo for file writes** — before `write_file`, `edit_file` or `file_buffer` changes a file, its previous content is saved outside your project (in Nanna's data directory, per conversation), and the `file_history` tool lists those checkpoints and puts a file back — including removing one a write created. A restore is itself undoable. Bounded: the 100 most recent checkpoints per conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall; changes made through `exec` are not tracked.
 - **Per-edit diffs** — every `edit_file` call records a bounded before/after view of what it changed, shown in the run timeline and kept with the session, so you can see what an unattended run did after the fact
 - **Conversation and memory export** — `nanna export <session-id>` writes a session out as a readable Markdown transcript (tool calls, edits and all) or, with `--format json`, as the complete stored session; `nanna export --memories` does the same for everything Nanna remembers, with each memory's provenance and FSRS state
-- **MCP servers** — list stdio MCP servers under `[mcp]` and the daemon starts them at boot, in the
+- **MCP servers** — list MCP servers under `[mcp]` (a `command` to spawn, or a Streamable HTTP
+  `url` with an optional bearer token from the keyring) and the daemon starts them at boot, in the
   background so a slow first `npx` download never delays startup; their tools appear to the model as
   `mcp__<server>__<tool>`. A server that fails to start is logged by name and the rest still start, and
   the servers are shut down with the daemon. Both protocol eras work: a current (`2026-07-28`)
   server is detected with `server/discover` and spoken to without a handshake, an older one falls back
-  to `initialize` — verified against the official TypeScript SDK's servers of each kind. HTTP/SSE
-  servers are not started from config yet.
+  to `initialize` — over stdio and over HTTP, verified against the official TypeScript SDK's servers of
+  each kind. The deprecated 2024 HTTP+SSE transport is not started from config.
 - **Auto-updates** — Background update checks with user-initiated install
 
 ---
@@ -311,6 +312,11 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
 # enabled = false         # keep the entry without starting it
 # secret_env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]  # values from the keyring, see below
+
+[[mcp.servers]]           # a remote server: url instead of command
+name = "notion"
+url = "https://mcp.example.com/mcp"
+# bearer_secret = "NOTION_TOKEN"  # sent as Authorization: Bearer; stored like secret_env
 ```
 
 Edits to `config.toml` apply to a running daemon within a couple of seconds (models and
@@ -320,7 +326,9 @@ that does not parse is logged and the running configuration is kept.
 MCP servers inherit the daemon's environment. There is deliberately no `env` table in
 `config.toml`: a token a server needs is named in `secret_env` and stored with
 `nanna mcp secret set <server> <VAR>` (prompted, or read from stdin — never a command-line
-argument). The value lives in the OS keyring and only that server's process receives it; a server
+argument). A `url` server's token works the same way through `bearer_secret`. The value lives in
+the OS keyring (or, with no keyring on the machine, an encrypted `0600` file) and only that server
+receives it; a server
 whose secret is missing is not started, and `system.status` / the Tools page say which command sets it.
 
 **Environment Variables:**

@@ -105,8 +105,11 @@ pub async fn spawn_mcp_servers(
     // Unlike `skipped`, these have a well-formed, unique name to report under.
     let mut refused: Vec<(String, String)> = Vec::new();
     for entry in startable {
-        match entry.resolve_secret_env(&secret) {
-            Ok(env) => start.push((entry, env)),
+        let resolved = entry
+            .resolve_secret_env(&secret)
+            .and_then(|env| Ok((env, entry.resolve_bearer(&secret)?)));
+        match resolved {
+            Ok((env, bearer)) => start.push((entry, env, bearer)),
             Err(reason) => refused.push((entry.name.trim().to_string(), reason)),
         }
     }
@@ -116,28 +119,11 @@ pub async fn spawn_mcp_servers(
     for reason in &skipped {
         warn!("{reason}");
     }
-    {
-        let mut servers = status.write().await;
-        servers.clear();
-        servers.extend(start.iter().map(|(entry, _)| McpServerState {
-            name: entry.name.trim().to_string(),
-            state: "starting",
-            tools: 0,
-            detail: None,
-        }));
-        servers.extend(refused.into_iter().map(|(name, reason)| McpServerState {
-            name,
-            state: "not_started",
-            tools: 0,
-            detail: Some(reason),
-        }));
-        servers.extend(skipped.iter().map(|reason| McpServerState {
-            name: String::new(),
-            state: "not_started",
-            tools: 0,
-            detail: Some(reason.clone()),
-        }));
-    }
+    let starting: Vec<&str> = start
+        .iter()
+        .map(|(entry, _, _)| entry.name.trim())
+        .collect();
+    publish_initial_states(&status, &starting, refused, &skipped).await;
     if start.is_empty() {
         return McpStartup {
             count: 0,
@@ -146,12 +132,15 @@ pub async fn spawn_mcp_servers(
     }
     let count = start.len();
     let mut integration = McpIntegration::new();
-    for (entry, env) in start {
-        integration.add_server(
+    for (entry, env, bearer) in start {
+        let url = entry.url.trim();
+        integration.add_server(if url.is_empty() {
             McpServerConfig::new(entry.name.trim(), entry.command.trim())
                 .args(entry.args.clone())
-                .env(env),
-        );
+                .env(env)
+        } else {
+            McpServerConfig::http(entry.name.trim(), url).bearer_token(bearer)
+        });
     }
     assert!(
         count <= nanna_config::MCP_SERVERS_MAX,
@@ -198,6 +187,38 @@ pub async fn spawn_mcp_servers(
         count,
         task: Some(task),
     }
+}
+
+/// Replace the status table with what boot decided: each server about to
+/// start, each one refused for a missing secret, each entry skipped.
+async fn publish_initial_states(
+    status: &McpStatus,
+    starting: &[&str],
+    refused: Vec<(String, String)>,
+    skipped: &[String],
+) {
+    let mut servers = status.write().await;
+    servers.clear();
+    servers.extend(starting.iter().map(|name| McpServerState {
+        name: (*name).to_string(),
+        state: "starting",
+        tools: 0,
+        detail: None,
+    }));
+    servers.extend(refused.into_iter().map(|(name, reason)| McpServerState {
+        name,
+        state: "not_started",
+        tools: 0,
+        detail: Some(reason),
+    }));
+    servers.extend(skipped.iter().map(|reason| McpServerState {
+        name: String::new(),
+        state: "not_started",
+        tools: 0,
+        detail: Some(reason.clone()),
+    }));
+    debug_assert!(servers.len() >= starting.len());
+    drop(servers);
 }
 
 /// Wait for the MCP task to close its servers, at most
@@ -250,6 +271,8 @@ mod tests {
         let status = McpStatus::default();
         let config = McpConfig {
             servers: vec![nanna_config::McpServerEntry {
+                url: String::new(),
+                bearer_secret: None,
                 name: "broken".into(),
                 command: " ".into(),
                 args: Vec::new(),
@@ -284,6 +307,8 @@ mod tests {
         let status = McpStatus::default();
         let config = McpConfig {
             servers: vec![nanna_config::McpServerEntry {
+                url: String::new(),
+                bearer_secret: None,
                 name: "github".into(),
                 command: "npx".into(),
                 args: Vec::new(),

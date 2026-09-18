@@ -235,7 +235,8 @@ fn check_mcp_servers(
     let (start, skipped) = config.mcp.startable();
     let missing: Vec<String> = start
         .iter()
-        .filter(|entry| !resolves(entry.command.trim()))
+        // A `url` server has no command to resolve.
+        .filter(|entry| !entry.command.trim().is_empty() && !resolves(entry.command.trim()))
         .map(|entry| {
             let command = entry.command.trim();
             let why = if command.contains('/') || command.contains(std::path::MAIN_SEPARATOR) {
@@ -249,7 +250,12 @@ fn check_mcp_servers(
     debug_assert!(missing.len() <= start.len());
     let unsecreted: Vec<String> = start
         .iter()
-        .filter_map(|entry| entry.resolve_secret_env(&secret).err())
+        .filter_map(|entry| {
+            entry
+                .resolve_secret_env(&secret)
+                .and_then(|_| entry.resolve_bearer(&secret))
+                .err()
+        })
         .collect();
     if missing.is_empty() && !unsecreted.is_empty() {
         let mut detail = unsecreted.join("; ");
@@ -260,7 +266,7 @@ fn check_mcp_servers(
             NAME,
             detail,
             "store each named secret with `nanna mcp secret set <server> <VAR>`, or remove it from \
-             that server's `secret_env`",
+             that server's `secret_env` / `bearer_secret`",
         );
     }
     if !missing.is_empty() {
@@ -1006,6 +1012,8 @@ mod tests {
         config.mcp.servers = servers
             .iter()
             .map(|(name, command)| nanna_config::McpServerEntry {
+                url: String::new(),
+                bearer_secret: None,
                 name: (*name).to_string(),
                 command: (*command).to_string(),
                 args: Vec::new(),

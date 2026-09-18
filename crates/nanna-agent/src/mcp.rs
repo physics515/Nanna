@@ -4,23 +4,48 @@
 //! with the agent's tool registry.
 
 #[cfg(feature = "mcp")]
-use nanna_mcp::{McpClient, McpToolsManager, StdioTransport};
+use nanna_mcp::{
+    AnyTransport, McpClient, McpToolsManager, StdioTransport, StreamableHttpTransport,
+};
 use nanna_tools::ToolRegistry;
 use tracing::{debug, error, info};
 
 /// MCP server configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpServerConfig {
     /// Unique name for this server
     pub name: String,
-    /// Command to run (e.g., "npx", "python", "node")
+    /// Command to run (e.g., "npx", "python", "node"); empty for a `url` server
     pub command: String,
     /// Arguments to pass to the command
     pub args: Vec<String>,
-    /// Environment variables
+    /// Environment variables (values may be secrets — never logged)
     pub env: Vec<(String, String)>,
+    /// Streamable HTTP endpoint; when set, `command`/`args`/`env` are unused
+    pub url: Option<String>,
+    /// Sent as `Authorization: Bearer` to a `url` server (never logged)
+    pub bearer_token: Option<String>,
     /// Whether to auto-start on agent init
     pub auto_start: bool,
+}
+
+/// Redacts every value that may be a secret: `env` values and the token.
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_names: Vec<&str> = self.env.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &env_names)
+            .field("url", &self.url)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auto_start", &self.auto_start)
+            .finish()
+    }
 }
 
 impl McpServerConfig {
@@ -31,8 +56,24 @@ impl McpServerConfig {
             command: command.into(),
             args: Vec::new(),
             env: Vec::new(),
+            url: None,
+            bearer_token: None,
             auto_start: true,
         }
+    }
+
+    /// A Streamable HTTP server at `url`.
+    pub fn http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        let mut config = Self::new(name, "");
+        config.url = Some(url.into());
+        config
+    }
+
+    /// The bearer token sent to a `url` server.
+    #[must_use]
+    pub fn bearer_token(mut self, token: Option<String>) -> Self {
+        self.bearer_token = token;
+        self
     }
 
     /// Add arguments
@@ -121,7 +162,7 @@ impl McpServerConfig {
 #[cfg(feature = "mcp")]
 pub struct McpIntegration {
     /// Tool manager for MCP servers
-    manager: McpToolsManager<StdioTransport>,
+    manager: McpToolsManager<AnyTransport>,
     /// Server configurations
     configs: Vec<McpServerConfig>,
 }
@@ -178,25 +219,45 @@ impl McpIntegration {
         Ok(outcomes)
     }
 
+    /// Spawn a `command` server or connect to a `url` one, and run the
+    /// dual-era handshake either way.
+    async fn connect(
+        config: &McpServerConfig,
+    ) -> Result<McpClient<AnyTransport>, nanna_mcp::McpError> {
+        let transport = if let Some(url) = &config.url {
+            AnyTransport::Http(Box::new(StreamableHttpTransport::new(
+                url,
+                config.bearer_token.clone(),
+            )?))
+        } else {
+            let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
+            let env: Vec<(&str, &str)> = config
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            AnyTransport::Stdio(StdioTransport::spawn_with_env(
+                &config.command,
+                &args,
+                &env,
+            )?)
+        };
+        let client = McpClient::new(transport);
+        client.initialize().await?;
+        Ok(client)
+    }
+
     /// Start a single MCP server
     async fn start_server(&self, config: &McpServerConfig) -> Result<usize, McpStartError> {
-        info!(server = %config.name, command = %config.command, "Starting MCP server");
-
-        // Convert args and env for spawn
-        let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
-        let env: Vec<(&str, &str)> = config
-            .env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        // Spawn the MCP client
-        let client = if env.is_empty() {
-            McpClient::spawn(&config.command, &args).await
+        if let Some(url) = &config.url {
+            info!(server = %config.name, %url, "Connecting to MCP server");
         } else {
-            McpClient::spawn_with_env(&config.command, &args, &env).await
+            info!(server = %config.name, command = %config.command, "Starting MCP server");
         }
-        .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
+
+        let client = Self::connect(config)
+            .await
+            .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
 
         // Register with manager
         let tools = self
@@ -216,7 +277,7 @@ impl McpIntegration {
 
     /// Get the tool manager
     #[must_use]
-    pub const fn manager(&self) -> &McpToolsManager<StdioTransport> {
+    pub const fn manager(&self) -> &McpToolsManager<AnyTransport> {
         &self.manager
     }
 
@@ -330,6 +391,18 @@ impl Default for McpIntegrationBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_never_prints_a_secret() {
+        let config = super::McpServerConfig::http("notion", "https://x/mcp")
+            .bearer_token(Some("sk-live-123".into()));
+        let stdio = super::McpServerConfig::new("gh", "npx").env([("GITHUB_TOKEN", "ghp_456")]);
+        let printed = format!("{config:?} {stdio:?}");
+        assert!(!printed.contains("sk-live-123"), "{printed}");
+        assert!(!printed.contains("ghp_456"), "{printed}");
+        assert!(printed.contains("GITHUB_TOKEN"), "names stay visible: {printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
     use super::*;
 
     #[test]

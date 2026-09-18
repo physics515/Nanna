@@ -1046,3 +1046,46 @@ pub mod http {
 
 #[cfg(feature = "http")]
 pub use http::HttpTransport;
+
+/// Either transport the daemon starts servers over, so one manager can hold
+/// stdio and Streamable HTTP servers side by side.
+#[cfg(all(feature = "stdio", feature = "http"))]
+pub enum AnyTransport {
+    /// A child process speaking over stdin/stdout.
+    Stdio(StdioTransport),
+    /// A Streamable HTTP endpoint (boxed: it is several times the size of a
+    /// stdio transport, and a manager holds many of either).
+    Http(Box<crate::StreamableHttpTransport>),
+}
+
+#[cfg(all(feature = "stdio", feature = "http"))]
+#[async_trait]
+impl Transport for AnyTransport {
+    async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+        match self {
+            Self::Stdio(inner) => inner.request(request).await,
+            Self::Http(inner) => inner.request(request).await,
+        }
+    }
+
+    async fn notify(&self, notification: JsonRpcNotification) -> Result<()> {
+        match self {
+            Self::Stdio(inner) => inner.notify(notification).await,
+            Self::Http(inner) => inner.notify(notification).await,
+        }
+    }
+
+    async fn close(&self) -> Result<()> {
+        match self {
+            Self::Stdio(inner) => inner.close().await,
+            Self::Http(inner) => inner.close().await,
+        }
+    }
+
+    fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+        match self {
+            Self::Stdio(inner) => inner.list_changed_flags(),
+            Self::Http(inner) => inner.list_changed_flags(),
+        }
+    }
+}
