@@ -481,6 +481,34 @@ pub fn effective_context_window(model: &str, reported: usize) -> usize {
     clamp_window(reported, LlmClient::smallest_latched_num_ctx(model))
 }
 
+/// How long one query to a server on this machine may take, as `curl
+/// --max-time` wants it. A local Ollama answers `/api/tags` and `/api/ps` in
+/// milliseconds; 3 s is past that with room (the daemon's Ollama probe uses
+/// the same figure), and a wedged server cannot hold up the sizing of a chat
+/// request, which runs before the request is sent, for longer than that.
+const LOCAL_OLLAMA_QUERY_MAX_SECS: &str = "3";
+
+/// Run `probe`, which waits on child processes (`nvidia-smi`, `curl`), without
+/// starving the async runtime it is called from.
+///
+/// Sizing a request's `num_ctx` runs on whatever thread asks, which is a tokio
+/// worker when a chat stream sizes its first request. A task parked in that
+/// worker's LIFO slot cannot be taken by the other workers, so when the task
+/// that would answer the probe (a server on the same runtime) sits there, the
+/// probe waits on itself; this hung a daemon test one run in four.
+/// `block_in_place` hands the worker's queued tasks to the others before
+/// blocking. It exists only on the multi-thread runtime (it panics on a
+/// current-thread one); there the curl bound
+/// ([`LOCAL_OLLAMA_QUERY_MAX_SECS`]) is what ends the wait.
+fn without_starving_the_runtime<T>(probe: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(probe)
+        }
+        _ => probe(),
+    }
+}
+
 /// `reported`, lowered to `num_ctx` when there is one. A latch is a ceiling,
 /// never a floor: a claim smaller than it stands.
 fn clamp_window(reported: usize, num_ctx: Option<u32>) -> usize {
@@ -2644,9 +2672,14 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             ollama_server_is_local(base_url),
             "only a server on this machine is sized from this machine's GPU"
         );
-        let free_bytes = Self::nvidia_free_vram_bytes()?;
-        let weights_bytes = Self::ollama_model_size_bytes(base_url, model)?;
-        let (ours_resident, others_resident) = Self::ollama_resident_vram(base_url, model);
+        let (free_bytes, weights_bytes, (ours_resident, others_resident)) =
+            without_starving_the_runtime(|| {
+                Some((
+                    Self::nvidia_free_vram_bytes()?,
+                    Self::ollama_model_size_bytes(base_url, model)?,
+                    Self::ollama_resident_vram(base_url, model),
+                ))
+            })?;
         let fitted = Self::fit_context_for_budget(
             lossy::u64_to_f64(free_bytes),
             lossy::u64_to_f64(weights_bytes),
@@ -2692,7 +2725,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     fn ollama_resident_vram(base_url: &str, model: &str) -> (u64, u64) {
         let name = model.strip_prefix("ollama/").unwrap_or(model);
         let Ok(out) = std::process::Command::new("curl")
-            .args(["-s", &format!("{base_url}/api/ps")])
+            .args(["-s", "--max-time", LOCAL_OLLAMA_QUERY_MAX_SECS, &format!("{base_url}/api/ps")])
             .output()
         else {
             return (0, 0);
@@ -2842,11 +2875,18 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 return *hit;
             }
 
+        let out = std::process::Command::new("curl")
+            .args(["-s", "--max-time", LOCAL_OLLAMA_QUERY_MAX_SECS, &format!("{base_url}/api/tags")])
+            .output()
+            .ok()?;
+        // No answer (refused, timed out) says nothing about the model, only
+        // about the server right now, so it is not cached: a server that was
+        // wedged for one request must not leave the model unsized for the
+        // rest of the process.
+        if !out.status.success() {
+            return None;
+        }
         let looked_up = (|| {
-            let out = std::process::Command::new("curl")
-                .args(["-s", &format!("{base_url}/api/tags")])
-                .output()
-                .ok()?;
             let body = String::from_utf8_lossy(&out.stdout);
             let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
             parsed
@@ -2858,9 +2898,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 .and_then(serde_json::Value::as_u64)
         })();
 
-        // A miss is cached too. If the model is not in `/api/tags` it will not
-        // appear later either, and retrying a failed lookup on every request
-        // would spawn a process per turn to learn the same thing.
+        // An answer without the model is cached too. If the model is not in
+        // `/api/tags` it will not appear later either, and retrying on every
+        // request would spawn a process per turn to learn the same thing.
         if let Ok(mut guard) = cache.lock() {
             guard.insert(key, looked_up);
         }
