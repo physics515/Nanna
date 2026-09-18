@@ -28,21 +28,15 @@ impl ControlPlane {
         );
     }
 
-    /// Tell every connected client the config changed.
-    ///
-    /// Carries no payload — see [`Event::ConfigChanged`]. Fired once per
-    /// COMMITTED mutation (the in-memory config was replaced and the router
-    /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
-    /// error only means nobody is subscribed.
     /// Make `new_config` the running configuration and push it everywhere a
-    /// live change must reach: the agent, the router, the scheduler loop, and
-    /// every client (`config_changed`).
+    /// live change must reach: the agent, then [`Self::propagate_committed`].
     ///
     /// This is the reload the GUI triggers after saving a credential — the step
     /// that makes a post-boot login actually reach the router. The Scheduler
     /// tab rides the same hop, and so does a hand edit of `config.toml` (see
     /// `config_watch`). What it does NOT re-apply is anything wired only at
-    /// boot (channels, MCP servers, the webhook server).
+    /// boot (channels, MCP servers, the webhook server, and the embedding
+    /// server and models — see `embedding_reload`).
     pub(super) async fn apply_loaded_config(&self, new_config: Config) {
         let mut config = self.config.write().await;
         *config = new_config;
@@ -52,11 +46,36 @@ impl ControlPlane {
         }
         let snapshot = config.clone();
         drop(config);
-        self.rebuild_llm_providers(&snapshot).await;
-        self.apply_scheduler_settings(&snapshot).await;
+        self.propagate_committed(&snapshot).await;
+    }
+
+    /// Push a committed config to everything that holds live settings — the
+    /// LLM router's provider set, the scheduler loop, the embedding clients'
+    /// Ollama token — and then tell every client.
+    ///
+    /// The one tail every mutation path (set, reset, reload, import, the file
+    /// watcher) shares, so a live setting cannot reach one path and miss
+    /// another. The Ollama token did exactly that: every path pushed it to the
+    /// chat router, none to the embedder, so a server that wanted the token
+    /// refused every memory embed until a restart.
+    ///
+    /// Called with the config lock released: provider resolution can block on
+    /// the keyring or refresh an expired Claude CLI token over the network.
+    async fn propagate_committed(&self, config: &Config) {
+        self.rebuild_llm_providers(config).await;
+        self.apply_scheduler_settings(config).await;
+        if let Some(ref live) = self.live_embedding {
+            live.apply(config);
+        }
         self.notify_config_changed();
     }
 
+    /// Tell every connected client the config changed.
+    ///
+    /// Carries no payload — see [`Event::ConfigChanged`]. Fired once per
+    /// COMMITTED mutation (the in-memory config was replaced and the router
+    /// re-derived); a rejected write emits nothing. Fire-and-forget: a send
+    /// error only means nobody is subscribed.
     pub(super) fn notify_config_changed(&self) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(Event::ConfigChanged);
@@ -133,9 +152,7 @@ impl ControlPlane {
 
                     let snapshot = config.clone();
                     drop(config);
-                    self.rebuild_llm_providers(&snapshot).await;
-                    self.apply_scheduler_settings(&snapshot).await;
-                    self.notify_config_changed();
+                    self.propagate_committed(&snapshot).await;
 
                     json!({ "status": "reset" })
                 }
@@ -184,9 +201,7 @@ impl ControlPlane {
 
                         let snapshot = config.clone();
                         drop(config);
-                        self.rebuild_llm_providers(&snapshot).await;
-                        self.apply_scheduler_settings(&snapshot).await;
-                        self.notify_config_changed();
+                        self.propagate_committed(&snapshot).await;
 
                         json!({ "status": "imported" })
                     }
@@ -240,13 +255,11 @@ impl ControlPlane {
                 }
 
                 // Re-derive the router's provider set (registration is
-                // not boot-only). Lock released first: resolution can
-                // block on keyring/network.
+                // not boot-only) and the rest of the live settings. Lock
+                // released first: resolution can block on keyring/network.
                 let snapshot = config.clone();
                 drop(config);
-                self.rebuild_llm_providers(&snapshot).await;
-                self.apply_scheduler_settings(&snapshot).await;
-                self.notify_config_changed();
+                self.propagate_committed(&snapshot).await;
 
                 json!({ "status": "updated", "path": path })
             }

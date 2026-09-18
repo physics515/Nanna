@@ -328,7 +328,7 @@ const OLLAMA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Whether two Ollama base URLs name the same server: compared trimmed,
 /// without trailing slashes and case-insensitively, with `localhost` read as
 /// `127.0.0.1` (the clients pin it that way).
-fn same_ollama_server(a: &str, b: &str) -> bool {
+pub fn same_ollama_server(a: &str, b: &str) -> bool {
     let canonical = |url: &str| {
         url.trim()
             .trim_end_matches('/')

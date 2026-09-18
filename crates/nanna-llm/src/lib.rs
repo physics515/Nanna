@@ -4193,12 +4193,96 @@ pub enum EmbeddingProvider {
     Ollama,
 }
 
+/// A bearer token every clone shares, read when each request is built — so it
+/// can be replaced while the clients holding it keep running.
+///
+/// An embedding client is built once, at daemon boot, and lives inside the
+/// embedding router for the life of the process. Holding its token by value
+/// meant a token saved afterwards never reached it: against a server that
+/// wants the token, every memory embed kept getting 401 until a restart, while
+/// chat — whose clients ARE rebuilt on a config change — used the new token at
+/// once. Replacing the token changes nothing else about a client: not its
+/// server, not its model, so not the vectors it produces.
+///
+/// Stored trimmed; empty means no token.
+#[derive(Clone, Default)]
+pub struct SharedBearer(std::sync::Arc<std::sync::RwLock<BearerState>>);
+
+#[derive(Default)]
+struct BearerState {
+    token: String,
+    /// Moves on every replacement that changed the token and at no other
+    /// time, so a holder can tell "the credential changed since then" without
+    /// keeping a copy of it.
+    generation: u64,
+}
+
+impl SharedBearer {
+    /// A handle holding `token`, trimmed.
+    #[must_use]
+    pub fn new(token: &str) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(BearerState {
+            token: token.trim().to_string(),
+            generation: 0,
+        })))
+    }
+
+    /// Make `token` (trimmed; blank clears it) the one every holder sends from
+    /// its next request on. Returns whether that changed anything.
+    pub fn replace(&self, token: &str) -> bool {
+        let token = token.trim();
+        let mut state = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.token == token {
+            return false;
+        }
+        token.clone_into(&mut state.token);
+        state.generation += 1;
+        true
+    }
+
+    /// The token as of now; empty when there is none.
+    #[must_use]
+    pub fn token(&self) -> String {
+        self.state().token.clone()
+    }
+
+    /// How many times the token has changed since this handle was made.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.state().generation
+    }
+
+    fn state(&self) -> std::sync::RwLockReadGuard<'_, BearerState> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for SharedBearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the token itself: a Debug print can land in a log.
+        let (set, generation) = {
+            let state = self.state();
+            (!state.token.is_empty(), state.generation)
+        };
+        f.debug_struct("SharedBearer")
+            .field("set", &set)
+            .field("generation", &generation)
+            .finish()
+    }
+}
+
 /// Embedding client for generating vector embeddings
 #[derive(Clone)]
 pub struct EmbeddingClient {
     http: Client,
     provider: EmbeddingProvider,
-    api_key: String,
+    /// Read as each request is built, never cached — see [`SharedBearer`].
+    api_key: SharedBearer,
     base_url: String,
     model: String,
 }
@@ -4212,7 +4296,7 @@ impl EmbeddingClient {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             provider: EmbeddingProvider::OpenAI,
-            api_key: api_key.into(),
+            api_key: SharedBearer::new(&api_key.into()),
             base_url: "https://api.openai.com".to_string(),
             model: "text-embedding-3-small".to_string(),
         }
@@ -4231,7 +4315,7 @@ impl EmbeddingClient {
             // loopback costs nothing.
             http: LlmClient::build_ollama_http_client(),
             provider: EmbeddingProvider::Ollama,
-            api_key: String::new(),
+            api_key: SharedBearer::default(),
             // The same IPv4 pin as the chat path: "localhost" resolves to
             // ::1 first on Windows, and v6 loopback is where streams were
             // observed cut mid-transfer. The 2026-08-10 embed storm ran over
@@ -4241,13 +4325,33 @@ impl EmbeddingClient {
         }
     }
 
-    /// Create an `Ollama` embedding client for a server that wants a bearer
-    /// token — a remote or proxied Ollama-compatible server. A blank key is no
-    /// key, so the result is then exactly [`Self::ollama`].
-    pub fn ollama_with_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        let mut client = Self::ollama(base_url);
-        client.api_key = api_key.into().trim().to_string();
-        client
+    /// Send whatever token `bearer` holds when each request is built, instead
+    /// of the one this client was made with — for a server that wants a bearer
+    /// token (a remote or proxied Ollama-compatible one) and a token that can
+    /// change while this client lives. A blank token sends no `Authorization`
+    /// header on the Ollama paths.
+    #[must_use]
+    pub fn with_bearer(mut self, bearer: SharedBearer) -> Self {
+        self.api_key = bearer;
+        self
+    }
+
+    /// The [`SharedBearer::generation`] of this client's token: it moves
+    /// exactly when the credential the next request will carry has changed.
+    #[must_use]
+    pub fn credential_generation(&self) -> u64 {
+        self.api_key.generation()
+    }
+
+    /// `request` with this client's token as of now, or untouched when there is
+    /// none — a blank token must mean no header, never `Bearer `.
+    fn with_ollama_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let token = self.api_key.token();
+        if token.is_empty() {
+            request
+        } else {
+            request.header("Authorization", format!("Bearer {token}"))
+        }
     }
 
     /// Create Ollama embedding client with default localhost URL
@@ -4309,7 +4413,7 @@ impl EmbeddingClient {
         let response = self
             .http
             .post(format!("{}/v1/embeddings", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.api_key.token()))
             .header("Content-Type", "application/json")
             .json(&EmbedRequest {
                 model: &self.model,
@@ -4370,13 +4474,11 @@ impl EmbeddingClient {
         struct LegacyResp { #[serde(default)] embedding: Vec<f32> }
 
         // Try new API: POST /api/embed { model, input }
-        let mut req = self
-            .http
-            .post(format!("{}/api/embed", self.base_url))
-            .header("Content-Type", "application/json");
-        if !self.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
-        }
+        let req = self.with_ollama_auth(
+            self.http
+                .post(format!("{}/api/embed", self.base_url))
+                .header("Content-Type", "application/json"),
+        );
         let response = req
             .json(&NewReq { model: &self.model, input: text })
             .send()
@@ -4395,13 +4497,11 @@ impl EmbeddingClient {
         }
 
         // Fall back to legacy API: POST /api/embeddings { model, prompt }
-        let mut req = self
-            .http
-            .post(format!("{}/api/embeddings", self.base_url))
-            .header("Content-Type", "application/json");
-        if !self.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
-        }
+        let req = self.with_ollama_auth(
+            self.http
+                .post(format!("{}/api/embeddings", self.base_url))
+                .header("Content-Type", "application/json"),
+        );
         let response = req
             .json(&LegacyReq { model: &self.model, prompt: text })
             .send()
@@ -4492,11 +4592,8 @@ impl EmbeddingClient {
     }
 
     async fn ollama_context_window(&self) -> Option<usize> {
-        let mut request = self.http.post(format!("{}/api/show", self.base_url));
-        if !self.api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        let response = request
+        let response = self
+            .with_ollama_auth(self.http.post(format!("{}/api/show", self.base_url)))
             .json(&serde_json::json!({ "name": self.model }))
             .send()
             .await
@@ -8419,6 +8516,110 @@ mod input_overflow_tests {
         // Ollama — the pin is an Ollama-path decision only.
         let client = EmbeddingClient::openai("k").with_base_url("http://localhost:8080");
         assert_eq!(client.base_url, "http://localhost:8080");
+    }
+}
+
+#[cfg(test)]
+mod embedding_bearer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer every request with one embedding, recording each request's
+    /// `Authorization` header (`None` when it carried none). `Connection:
+    /// close` makes every request its own connection.
+    async fn spawn_recording_server() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                // The whole head, however many reads it takes to arrive.
+                let mut head = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let authorization = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                record.lock().expect("record lock").push(authorization);
+                let body = r#"{"embeddings":[[0.1,0.2,0.3]]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An embedding client lives as long as the daemon; the token it sends is
+    /// whatever its [`SharedBearer`] holds when each request is built — so a
+    /// token saved after boot reaches the very next request, and clearing it
+    /// stops the header rather than sending `Bearer `.
+    #[tokio::test]
+    async fn an_ollama_embedder_sends_the_token_its_bearer_holds_now() {
+        let (url, seen) = spawn_recording_server().await;
+        let bearer = SharedBearer::new("old-token");
+        let client = EmbeddingClient::ollama(&url)
+            .with_bearer(bearer.clone())
+            .with_model("test-embed");
+
+        client.embed_one("first").await.expect("embeds");
+        assert!(
+            bearer.replace(" new-token "),
+            "a different token is a change"
+        );
+        assert!(
+            !bearer.replace("new-token"),
+            "the same token, trimmed, is not"
+        );
+        client.embed_one("second").await.expect("embeds");
+        assert!(bearer.replace("   "), "clearing the token is a change");
+        client.embed_one("third").await.expect("embeds");
+
+        assert_eq!(
+            *seen.lock().expect("record lock"),
+            vec![
+                Some("Bearer old-token".to_string()),
+                Some("Bearer new-token".to_string()),
+                None,
+            ]
+        );
+    }
+
+    /// The generation is what lets a holder notice "the credential changed"
+    /// without keeping a copy of the token: it moves on every change and only
+    /// then.
+    #[test]
+    fn the_generation_moves_only_when_the_token_changes() {
+        let bearer = SharedBearer::new("a");
+        let client = EmbeddingClient::ollama("http://127.0.0.1:1").with_bearer(bearer.clone());
+        let start = client.credential_generation();
+        assert!(!bearer.replace(" a "));
+        assert_eq!(client.credential_generation(), start, "an unchanged token");
+        assert!(bearer.replace("b"));
+        assert_eq!(
+            client.credential_generation(),
+            start + 1,
+            "one change, one step"
+        );
+        assert_eq!(bearer.token(), "b");
     }
 }
 

@@ -2899,6 +2899,10 @@ async fn deliver_scheduled_reminder(
 pub struct DaemonServer {
     config: DaemonConfig,
     embedding: EmbeddingConfig,
+    /// The part of `embedding` a config change may still move once the router
+    /// is built (the Ollama token), shared by every Ollama embedding client
+    /// and the control plane that applies config changes.
+    live_embedding: Arc<crate::embedding_reload::LiveEmbeddingSettings>,
     memory_path: Option<PathBuf>,
     _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
@@ -2945,7 +2949,7 @@ impl DaemonServer {
     /// with a line saying so, rather than substituting a different model. A
     /// silent substitution is what put a hardcoded paid embedder in front of
     /// the free one the user had chosen.
-    fn embedding_provider_for(
+    pub(crate) fn embedding_provider_for(
         &self,
         spec: &str,
     ) -> Option<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> {
@@ -2996,21 +3000,14 @@ impl DaemonServer {
                     ),
                 ))
             }
+            // Every Ollama entry shares the one token handle, read per request:
+            // a token saved while the daemon runs reaches these clients without
+            // rebuilding them (see `LiveEmbeddingSettings`).
             "ollama" => Some((
                 info,
                 Arc::new(
-                    self.embedding
-                        .ollama_api_key
-                        .as_deref()
-                        .map_or_else(
-                            || nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host),
-                            |key| {
-                                nanna_llm::EmbeddingClient::ollama_with_key(
-                                    &self.embedding.ollama_host,
-                                    key,
-                                )
-                            },
-                        )
+                    nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                        .with_bearer(self.live_embedding.ollama_bearer())
                         .with_model(&model),
                 ),
             )),
@@ -3069,9 +3066,14 @@ impl DaemonServer {
 
         let exit_reason = crate::exit_reason::ExitReasonFile::new(&config.data_dir);
 
+        let live_embedding = Arc::new(crate::embedding_reload::LiveEmbeddingSettings::new(
+            &embedding,
+        ));
+
         Self {
             config,
             embedding,
+            live_embedding,
             memory_path,
             _brave_api_key: brave_api_key,
             sessions,
@@ -3090,6 +3092,13 @@ impl DaemonServer {
             storage_error: None,
             exit_reason,
         }
+    }
+
+    /// What a config change may still update on the running embedding
+    /// clients; the control plane applies every committed change to it.
+    #[must_use]
+    pub(crate) fn live_embedding(&self) -> Arc<crate::embedding_reload::LiveEmbeddingSettings> {
+        Arc::clone(&self.live_embedding)
     }
 
     /// Recovery report from a startup quarantine + rebuild, if one happened.
@@ -3909,6 +3918,7 @@ impl DaemonServer {
         .with_mcp_status(Arc::clone(&self.mcp_status))
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
+        .with_live_embedding(self.live_embedding())
         .with_chat_runs(chat_runs.clone())
         .with_degradations(degradations.clone())
         .with_shutdown(self.shutdown_tx.clone());
@@ -4877,13 +4887,13 @@ impl DaemonServer {
         // injected whether or not the user wanted them, which is how a paid
         // 1536-dim embedder ended up live on an install whose config asked
         // for a free one first and a 768-dim local model second.
-        let specs: Vec<String> = if self.embedding.priority.is_empty() {
-            let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
-            info!("No embedding_priority configured; using the single pair '{legacy}'");
-            vec![legacy]
-        } else {
-            self.embedding.priority.clone()
-        };
+        if self.embedding.priority.is_empty() {
+            info!(
+                "No embedding_priority configured; using the single pair '{}/{}'",
+                self.embedding.provider, self.embedding.model
+            );
+        }
+        let specs = self.embedding.specs();
 
         let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
             .iter()
@@ -5593,7 +5603,7 @@ fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPol
 ///
 /// An entry with no slash is treated as a bare model on the default local
 /// provider, matching how a bare chat model name resolves.
-fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
+pub(crate) fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;
@@ -5639,6 +5649,40 @@ pub struct EmbeddingConfig {
     /// a user could put a free embedder first and watch a hardcoded paid one
     /// run instead, with no way to tell from the outside.
     pub priority: Vec<String>,
+}
+
+impl EmbeddingConfig {
+    /// The embedding settings as the config file states them — shared by boot
+    /// and the reload path, so the two cannot derive different embedders from
+    /// the same file.
+    #[must_use]
+    pub fn from_nanna(config: &nanna_config::Config) -> Self {
+        Self {
+            provider: config.memory.embedding_provider.clone(),
+            model: config.memory.embedding_model.clone(),
+            ollama_host: config.memory.ollama_host.clone(),
+            // The one Ollama credential, blank meaning none (as chat reads it).
+            ollama_api_key: config
+                .llm
+                .ollama_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
+            priority: config.memory.embedding_priority.clone(),
+        }
+    }
+
+    /// The ordered `provider/model` specs the router is built from:
+    /// [`Self::priority`], or the single legacy pair when it is empty.
+    #[must_use]
+    pub fn specs(&self) -> Vec<String> {
+        if self.priority.is_empty() {
+            vec![format!("{}/{}", self.provider, self.model)]
+        } else {
+            self.priority.clone()
+        }
+    }
 }
 
 impl Default for EmbeddingConfig {
@@ -5760,24 +5804,7 @@ impl DaemonBuilder {
     /// idle settings, the vision-model list and the MCP server list.
     fn apply_memory_settings(&mut self, config: &nanna_config::Config) {
         // Set embedding configuration from Nanna memory config
-        self.embedding
-            .provider
-            .clone_from(&config.memory.embedding_provider);
-        self.embedding.model.clone_from(&config.memory.embedding_model);
-        self.embedding
-            .ollama_host
-            .clone_from(&config.memory.ollama_host);
-        // The one Ollama credential, blank meaning none (as chat reads it).
-        self.embedding.ollama_api_key = config
-            .llm
-            .ollama_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string);
-        self.embedding
-            .priority
-            .clone_from(&config.memory.embedding_priority);
+        self.embedding = EmbeddingConfig::from_nanna(config);
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
