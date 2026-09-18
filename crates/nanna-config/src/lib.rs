@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -720,6 +720,31 @@ fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// What to tell someone whose `config.toml` still carries the retired
+/// `[llm].ollama_url` pointed at another server than `config` uses; `None`
+/// when it is absent or names the same server.
+///
+/// Read from the raw text because serde drops the key on the way in, and the
+/// next save drops it from disk — so this load is the last moment anything
+/// can see that summaries used to go somewhere else. The shipped default
+/// (this machine, like `[memory].ollama_host`'s) moves nothing and says
+/// nothing.
+fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
+    let raw: toml::Table = content.parse().ok()?;
+    let retired = raw.get("llm")?.get("ollama_url")?.as_str()?.trim();
+    let host = config.memory.ollama_host.trim();
+    if retired.is_empty() || same_ollama_server(retired, host) {
+        return None;
+    }
+    Some(format!(
+        "config.toml still sets [llm].ollama_url = \"{retired}\", which is no longer read: \
+         summaries now reach Ollama through chat's server, [memory].ollama_host = \"{host}\". \
+         If your summarization models are on {retired}, set it as the Ollama server in \
+         Settings -> Models (it is then chat's and the embedders' server too); otherwise \
+         delete the key."
+    ))
+}
+
 impl Config {
     /// Load config from default location.
     ///
@@ -747,6 +772,9 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
+        if let Some(notice) = retired_ollama_url_notice(&content, &config) {
+            warn!("{notice}");
+        }
         config.load_secrets_from_store();
         Ok(config)
     }
@@ -1624,6 +1652,48 @@ model = "qwen3.5:9b"
         // that looks like it points the summarizer somewhere.
         let written = toml::to_string(&config).expect("config serializes");
         assert!(!written.contains("ollama_url"), "no ollama_url is written: {written}");
+    }
+
+    /// A leftover `[llm].ollama_url` that named another server than chat's is
+    /// the one case where the retirement moves summaries somewhere new, and
+    /// serde drops the key before anything else could see it. Loading says
+    /// so, naming both servers and what to do.
+    #[test]
+    fn a_leftover_ollama_url_naming_another_server_is_announced() {
+        let legacy = r#"
+[llm]
+ollama_url = "http://gpu-box:11434"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        let notice =
+            retired_ollama_url_notice(legacy, &config).expect("a moved summarizer is announced");
+        assert!(
+            notice.contains("http://gpu-box:11434") && notice.contains("http://localhost:11434"),
+            "names both servers: {notice}"
+        );
+        assert!(notice.contains("Settings"), "says where to set it: {notice}");
+    }
+
+    /// The same server, however it is spelled, moves nothing — the shipped
+    /// default case — and neither does a config without the key.
+    #[test]
+    fn a_leftover_ollama_url_naming_the_same_server_is_quiet() {
+        let same = r#"
+[llm]
+ollama_url = "http://127.0.0.1:11434/"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(same).expect("parses");
+        assert_eq!(retired_ollama_url_notice(same, &config), None);
+
+        let without = "[memory]\nollama_host = \"http://gpu-box:11434\"\n";
+        let config: Config = toml::from_str(without).expect("parses");
+        assert_eq!(retired_ollama_url_notice(without, &config), None);
     }
 
     // -----------------------------------------------------------------
