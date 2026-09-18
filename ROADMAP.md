@@ -7609,9 +7609,12 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      run** and a single debug `cargo build -p nanna-tools -p nanna-daemon` took **~40 minutes**.
      Spending the run on one speculative release build would have shipped nothing else. Left for
      the next run on a quiet host.
-     - [ ] **Try `nightly-2026-09-07` (or later) on a quiet host**, gated on a green
+     - [x] **Try `nightly-2026-09-07` (or later) on a quiet host**, gated on a green
            `cargo build --release -p nanna-daemon`, and move the pin plus the mirrored `toolchain:`
            inputs in `.github/workflows/{budget-gate,release-check,test-compile}.yml` together.
+           *(2026-09-18)* Moved to **`nightly-2026-09-17`** (`923c95cdf`): cold release build
+           **7m35s** on tmpfs on a quiet host (load ~2), then clippy 0 warnings and
+           **2181 passed / 0 failed** under it. rust-toolchain.toml + all three workflows moved together.
      - [ ] **The nightly routines contend on DISK, not CPU, and it distorts every run's timings.**
            Three Rust routines were live at once on 2026-09-08 — `nanna`, `mummu`
            (`cargo test --workspace -j 6`) and `eggersmann/eas2` (`cargo build --workspace`) — all
@@ -7645,6 +7648,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      class as the `@formkit/drag-and-drop` removal. Typecheck 0 errors (canary proved), 251/251
      vitest, `pnpm build` green. TypeScript 7 not re-tried: npm `typescript` is still 7.0.2 and
      `vue-tsc` still 3.3.11, the two numbers the 2026-09-09 note says to check first.
+   - *(2026-09-18 sweep)* `cargo update` -> one real bump (`generator 0.8.9 -> 0.8.10`, which also
+     moves its `windows-sys`/`itertools`/`libloading` edges forward); `cargo upgrade --incompatible`
+     offered **no rows at all** this time - the `criterion`/`lopdf` downgrade traps did not appear.
+     Both guarded pins fired as usual and went back last (`libc 0.2.189 -> 0.2.186`,
+     `malachite-bigint@0.11.0 -> 0.9.2`). GUI: `pnpm outdated` lists only `typescript 7.0.2`
+     (still blocked, see above). **Master itself was red on arrival**: `cargo test --workspace` did
+     not compile `nanna-daemon`'s lib tests (a probe_ollama test named an un-imported `Action`,
+     from #343), and clippy was back to 14 warnings after #340 had reached zero - fixed first, in
+     its own commit.
    - *(research 2026-09-17)* **Correction to the 2026-09-14 note below: `burn 0.22.0` is NOT a shipped
      release.** crates.io on 2026-09-17: `max_stable_version` **0.21.0**, newest `0.22.0-pre.3`
      (2026-08-25); `cubecl` likewise `0.10.0` stable / `0.11.0-pre.3`. The LibTorch deprecation is on
