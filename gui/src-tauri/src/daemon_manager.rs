@@ -389,6 +389,9 @@ impl DaemonManager {
                 args.push("--data-dir".into());
                 args.push(dev_data_dir);
             }
+        // A killed GUI must not leave its daemon behind (Unix; on Windows
+        // the Job Object already covers it, and the daemon ignores the flag).
+        args.push("--exit-with-parent".into());
         args.push("run".into());
         args
     }

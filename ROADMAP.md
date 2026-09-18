@@ -7276,13 +7276,22 @@ keep the phases readable; promote individual items into a phase when they become
             unattended): its `ensure` should check `tauri-webdriver` instead of `tauri-driver` +
             `WebKitWebDriver` on Linux, its `start` should set `GDK_BACKEND=x11` and the isolating
             variables above, and the app must be built with `--features e2e-webdriver`.
-      - [ ] *(found 2026-09-18, driving the GUI)* **A GUI that is killed leaves its daemon sidecar
+      - [x] *(found 2026-09-18, driving the GUI)* **A GUI that is killed leaves its daemon sidecar
             running on Linux.** Ending the WebDriver session terminated `nanna-gui`, and its sidecar
             (`nanna-daemon --port 51990 …`) stayed up, holding its port and store lock, until
             stopped by hand. `kill_sidecar_tree` is a deliberate no-op on Unix and the graceful stop
             path never runs when the GUI itself is killed. Shape: have the sidecar watch its parent
             (Linux `prctl(PR_SET_PDEATHSIG)` at spawn, or the daemon exiting when stdin — the pipe
             the shell plugin holds — reaches EOF) so an abrupt GUI death still ends it.
+            *(same night)* Fixed with an opt-in daemon flag, **`--exit-with-parent`**, which the
+            GUI now passes to its sidecar (a standalone daemon never gets it): on Unix the daemon
+            polls its parent PID once a second and, once re-parented, records `parent_exited` and
+            runs the same drain a signal does. Proven with the WebDriver harness: after the session
+            ended, the sidecar logged *"Parent process … exited (now re-parented to 1329); shutting
+            down"* → *"MCP servers closed"* → *"Daemon stopped"* within **1 s**, exit reason
+            `clean_shutdown`, no process left — where the run before it had to stop the orphan by
+            hand. Windows is unchanged (its Job Object already covers this; the flag is accepted
+            and ignored).
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
