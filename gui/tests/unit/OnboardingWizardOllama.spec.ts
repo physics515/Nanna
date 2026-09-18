@@ -9,6 +9,12 @@ import OnboardingWizard from '~/components/OnboardingWizard.vue'
  * probes that saved server. A remote, Ollama-compatible server (mummu's shim
  * behind a proxy, 2026-09-18) was unreachable from here before: the step only
  * said "Ollama runs locally" and probed whatever address the config held.
+ *
+ * The saved address is prefilled from `get_extended_settings`, which is slow
+ * while the daemon starts. What the user types meanwhile is theirs, and
+ * Continue never saves the default over a saved address it has not read yet.
+ * The page is never sent the token, so an empty token field means "keep the
+ * saved one".
  */
 
 const invoke = vi.fn()
@@ -26,6 +32,20 @@ const UiButtonStub = defineComponent({
   },
 })
 
+/** Emits a save of a (rejected) key, and shows the error it is handed. */
+const ApiKeyInputStub = defineComponent({
+  name: 'ApiKeyInput',
+  props: { externalError: { type: String, default: null }, provider: { type: String, default: '' } },
+  emits: ['save'],
+  setup(props, { emit }) {
+    return () =>
+      h('div', [
+        h('button', { type: 'button', 'data-testid': 'key-save', onClick: () => emit('save', props.provider, 'sk-bad') }, 'Save key'),
+        props.externalError ? h('p', { 'data-testid': 'key-error' }, props.externalError) : null,
+      ])
+  },
+})
+
 const probeReport = {
   reachable: true,
   base_url: 'https://mummu.example/ollama',
@@ -35,14 +55,22 @@ const probeReport = {
   missing: [],
 }
 
+const savedSettings = {
+  ollama_host: 'http://localhost:11434',
+  ollama_token_saved: false,
+  ollama_token_host: null as string | null,
+}
+
 function answer(command: string, args?: Record<string, unknown>) {
   switch (command) {
     case 'get_extended_settings':
-      return Promise.resolve({ ollama_host: 'http://localhost:11434', ollama_api_key: '' })
+      return Promise.resolve({ ...savedSettings })
     case 'set_ollama_host':
       return (args?.host as string)?.startsWith('http')
         ? Promise.resolve('saved')
         : Promise.reject(new Error('Ollama host must start with http:// or https://'))
+    case 'set_provider_api_key':
+      return Promise.reject(new Error('That key was refused'))
     case 'get_backend_status':
       return Promise.resolve({ running: true, version: '0.3.22' })
     case 'probe_ollama':
@@ -52,17 +80,40 @@ function answer(command: string, args?: Record<string, unknown>) {
   }
 }
 
-async function mountAtOllamaStep() {
-  const wrapper = mount(OnboardingWizard, {
+/** A promise the test settles by hand — `get_extended_settings` while the daemon starts. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+function mountWizard() {
+  return mount(OnboardingWizard, {
     props: { open: true, hasApiKey: false },
     global: {
-      stubs: { UiButton: UiButtonStub, ApiKeyInput: true, Teleport: true },
+      stubs: { UiButton: UiButtonStub, ApiKeyInput: ApiKeyInputStub, Teleport: true },
     },
     attachTo: document.body,
   })
-  // Step 1 → 2, then pick Ollama.
-  await wrapper.findAll('button').find((b) => b.text().includes('Continue'))!.trigger('click')
+}
+
+type Wizard = ReturnType<typeof mountWizard>
+
+const continueButton = (w: Wizard) => w.findAll('button').find((b) => b.text().includes('Continue'))!
+const calls = () => invoke.mock.calls.map((c) => c[0] as string)
+
+async function toProviderStep(wrapper: Wizard) {
+  await continueButton(wrapper).trigger('click')
   await flushPromises()
+}
+
+async function mountAtOllamaStep() {
+  const wrapper = mountWizard()
+  await toProviderStep(wrapper)
   await wrapper.find('select').setValue('ollama')
   await flushPromises()
   return wrapper
@@ -70,6 +121,9 @@ async function mountAtOllamaStep() {
 
 describe('OnboardingWizard — Ollama server and token', () => {
   beforeEach(() => {
+    savedSettings.ollama_host = 'http://localhost:11434'
+    savedSettings.ollama_token_saved = false
+    savedSettings.ollama_token_host = null
     invoke.mockReset()
     invoke.mockImplementation(answer)
     localStorage.clear()
@@ -84,29 +138,141 @@ describe('OnboardingWizard — Ollama server and token', () => {
     expect(invoke).toHaveBeenCalledWith('get_extended_settings')
   })
 
+  it('says a token is saved for the server without showing it', async () => {
+    savedSettings.ollama_host = 'https://mummu.example/ollama'
+    savedSettings.ollama_token_saved = true
+    savedSettings.ollama_token_host = 'https://mummu.example/ollama'
+    const wrapper = await mountAtOllamaStep()
+    const token = wrapper.find('[data-testid="onboarding-ollama-token"]').element as HTMLInputElement
+    expect(token.value).toBe('')
+    expect(token.placeholder).toMatch(/saved for this server/i)
+  })
+
   it('saves the address and token before probing, trimmed', async () => {
     const wrapper = await mountAtOllamaStep()
     await wrapper.find('[data-testid="onboarding-ollama-host"]').setValue('  https://mummu.example/ollama/  ')
     await wrapper.find('[data-testid="onboarding-ollama-token"]').setValue(' s3cret ')
-    await wrapper.findAll('button').find((b) => b.text().includes('Continue'))!.trigger('click')
+    await continueButton(wrapper).trigger('click')
     await flushPromises()
 
-    const calls = invoke.mock.calls.map((c) => c[0])
+    const order = calls()
     expect(invoke).toHaveBeenCalledWith('set_ollama_host', { host: 'https://mummu.example/ollama/' })
     expect(invoke).toHaveBeenCalledWith('set_ollama_api_key', { key: 's3cret' })
-    // Both saves land before the probe that checks them.
-    expect(calls.indexOf('set_ollama_host')).toBeLessThan(calls.indexOf('probe_ollama'))
-    expect(calls.indexOf('set_ollama_api_key')).toBeLessThan(calls.indexOf('probe_ollama'))
+    // Both saves land before the probe that checks them, the token after the
+    // address it is bound to.
+    expect(order.indexOf('set_ollama_host')).toBeLessThan(order.indexOf('set_ollama_api_key'))
+    expect(order.indexOf('set_ollama_api_key')).toBeLessThan(order.indexOf('probe_ollama'))
     expect(wrapper.find('[data-testid="ollama-probe"]').text()).toContain('https://mummu.example/ollama')
+  })
+
+  it('an empty token field keeps the saved token', async () => {
+    savedSettings.ollama_token_saved = true
+    savedSettings.ollama_token_host = 'http://localhost:11434'
+    const wrapper = await mountAtOllamaStep()
+    await wrapper.find('[data-testid="onboarding-ollama-token"]').setValue('   ')
+    await continueButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(calls()).not.toContain('set_ollama_api_key')
+    expect(calls()).toContain('probe_ollama')
   })
 
   it('stops on an address the app refuses, with the reason, and does not probe', async () => {
     const wrapper = await mountAtOllamaStep()
     await wrapper.find('[data-testid="onboarding-ollama-host"]').setValue('mummu.example/ollama')
-    await wrapper.findAll('button').find((b) => b.text().includes('Continue'))!.trigger('click')
+    await continueButton(wrapper).trigger('click')
     await flushPromises()
 
     expect(wrapper.find('[data-testid="onboarding-ollama-error"]').text()).toContain('http://')
-    expect(invoke.mock.calls.map((c) => c[0])).not.toContain('probe_ollama')
+    expect(calls()).not.toContain('probe_ollama')
+  })
+
+  it('what is typed before the saved settings arrive is not overwritten', async () => {
+    const slow = deferred<typeof savedSettings>()
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) =>
+      command === 'get_extended_settings' ? slow.promise : answer(command, args),
+    )
+    const wrapper = await mountAtOllamaStep()
+    await wrapper.find('[data-testid="onboarding-ollama-host"]').setValue('https://typed.example/ollama')
+
+    slow.resolve({ ollama_host: 'https://saved.example/ollama', ollama_token_saved: false, ollama_token_host: null })
+    await flushPromises()
+
+    const host = wrapper.find('[data-testid="onboarding-ollama-host"]').element as HTMLInputElement
+    expect(host.value).toBe('https://typed.example/ollama')
+  })
+
+  it('Continue waits for the saved settings instead of saving the default over them', async () => {
+    const slow = deferred<typeof savedSettings>()
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) =>
+      command === 'get_extended_settings' ? slow.promise : answer(command, args),
+    )
+    const wrapper = await mountAtOllamaStep()
+    await continueButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(calls()).not.toContain('set_ollama_host')
+    expect(calls()).not.toContain('set_ollama_api_key')
+    expect(calls()).not.toContain('probe_ollama')
+
+    slow.resolve({
+      ollama_host: 'https://saved.example/ollama',
+      ollama_token_saved: true,
+      ollama_token_host: 'https://saved.example/ollama',
+    })
+    await flushPromises()
+
+    // The saved remote address and its token are left as they were, and the
+    // check goes ahead against them.
+    const hostSaves = invoke.mock.calls.filter((c) => c[0] === 'set_ollama_host')
+    expect(hostSaves.every((c) => (c[1] as { host: string }).host !== 'http://localhost:11434')).toBe(true)
+    expect(calls()).not.toContain('set_ollama_api_key')
+    expect(calls()).toContain('probe_ollama')
+  })
+
+  it('a prefill that failed can be retried', async () => {
+    let attempts = 0
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command !== 'get_extended_settings') return answer(command, args)
+      attempts += 1
+      return attempts === 1 ? Promise.reject(new Error('daemon not ready')) : answer(command, args)
+    })
+    savedSettings.ollama_host = 'https://saved.example/ollama'
+    const wrapper = await mountAtOllamaStep()
+    const retry = wrapper.find('[data-testid="onboarding-ollama-prefill-retry"]')
+    expect(retry.exists()).toBe(true)
+
+    await retry.trigger('click')
+    await flushPromises()
+    expect(attempts).toBe(2)
+    const host = wrapper.find('[data-testid="onboarding-ollama-host"]').element as HTMLInputElement
+    expect(host.value).toBe('https://saved.example/ollama')
+    expect(wrapper.find('[data-testid="onboarding-ollama-prefill-retry"]').exists()).toBe(false)
+  })
+
+  it('an unread saved address is not overwritten by the default on Continue', async () => {
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) =>
+      command === 'get_extended_settings' ? Promise.reject(new Error('daemon not ready')) : answer(command, args),
+    )
+    const wrapper = await mountAtOllamaStep()
+    await continueButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(calls()).not.toContain('set_ollama_host')
+    expect(calls()).toContain('probe_ollama')
+  })
+
+  it("an API key's error is not shown on the Ollama step", async () => {
+    const wrapper = mountWizard()
+    await toProviderStep(wrapper)
+    await wrapper.find('[data-testid="key-save"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="key-error"]').text()).toContain('refused')
+
+    await wrapper.find('select').setValue('ollama')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="onboarding-ollama-error"]').exists()).toBe(false)
+
+    // And back: switching provider cleared it there too.
+    await wrapper.find('select').setValue('anthropic')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="key-error"]').exists()).toBe(false)
   })
 })
