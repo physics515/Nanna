@@ -61,6 +61,29 @@ pub fn summarization_models(
     models
 }
 
+/// [`summarization_models`] read from the agent service's live config — the
+/// view the dream cycle and `memory.summarize` hold.
+///
+/// The three fields are read here, once, rather than at each call site: a
+/// site that passed an empty chat list, or no chat model, would still compile
+/// and quietly narrow the fallback, and only this mapping is under test.
+#[must_use]
+pub fn for_agent_service(config: &crate::agent_service::AgentServiceConfig) -> Vec<String> {
+    summarization_models(
+        &config.summarization_priority,
+        &config.model,
+        &config.model_priority,
+    )
+}
+
+/// [`summarization_models`] read from the user config's `[llm]` table — the
+/// view IPC consolidation holds. See [`for_agent_service`] for why the fields
+/// are read here.
+#[must_use]
+pub fn for_llm_config(llm: &nanna_config::LlmConfig) -> Vec<String> {
+    summarization_models(&llm.summarization_priority, &llm.model, &llm.model_priority)
+}
+
 /// The cluster byte budget must hold for **whichever** model actually answers.
 ///
 /// A dream cycle builds one prompt and then walks the failover list with it, so
@@ -263,6 +286,37 @@ mod tests {
             summarization_models(&v(&["", "chosen"]), "main", &[]),
             v(&["chosen"])
         );
+    }
+
+    /// Each consumer's config view feeds all three fields: the chat list
+    /// wins over the single chat model, and the single chat model stands in
+    /// when there is no list — in both views.
+    #[test]
+    fn both_config_views_read_the_settings_list_and_both_chat_fields() {
+        let mut service = crate::agent_service::AgentServiceConfig {
+            model: "main".to_string(),
+            model_priority: v(&["chat-a", "chat-b"]),
+            summarization_priority: Vec::new(),
+            ..crate::agent_service::AgentServiceConfig::default()
+        };
+        let mut llm = nanna_config::LlmConfig {
+            model: "main".to_string(),
+            model_priority: v(&["chat-a", "chat-b"]),
+            summarization_priority: Vec::new(),
+            ..nanna_config::LlmConfig::default()
+        };
+        assert_eq!(for_agent_service(&service), v(&["chat-a", "chat-b"]));
+        assert_eq!(for_llm_config(&llm), v(&["chat-a", "chat-b"]));
+
+        service.model_priority.clear();
+        llm.model_priority.clear();
+        assert_eq!(for_agent_service(&service), v(&["main"]));
+        assert_eq!(for_llm_config(&llm), v(&["main"]));
+
+        service.summarization_priority = v(&["ollama/small:1b"]);
+        llm.summarization_priority = v(&["ollama/small:1b"]);
+        assert_eq!(for_agent_service(&service), v(&["ollama/small:1b"]));
+        assert_eq!(for_llm_config(&llm), v(&["ollama/small:1b"]));
     }
 
     #[test]

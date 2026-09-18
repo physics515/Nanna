@@ -1211,14 +1211,8 @@ fn memory_summarize_services(
                 let joined = texts.join("\n\n---\n\n");
                 // Resolved per call: whichever summarization list the
                 // user has set right now is the one that answers.
-                let models = {
-                    let live = summarizer_config.read().await;
-                    crate::dream_summarizer::summarization_models(
-                        &live.summarization_priority,
-                        &live.model,
-                        &live.model_priority,
-                    )
-                };
+                let models =
+                    crate::dream_summarizer::for_agent_service(&*summarizer_config.read().await);
                 if models.is_empty() {
                     return Err(crate::agent_service::NO_MODEL_CONFIGURED.to_string());
                 }
@@ -2518,11 +2512,7 @@ async fn dream_once(
     let summarization_models = {
         let handle = agent.config_handle();
         let live = handle.read().await;
-        crate::dream_summarizer::summarization_models(
-            &live.summarization_priority,
-            &live.model,
-            &live.model_priority,
-        )
+        crate::dream_summarizer::for_agent_service(&live)
     };
     if summarization_models.is_empty() {
         return (
