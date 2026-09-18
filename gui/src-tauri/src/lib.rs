@@ -428,6 +428,9 @@ pub fn run() {
                 // and until the state is managed every command fails with
                 // "state not managed". That includes `init_backend` and the
                 // status poll that is supposed to show the boot's progress.
+                // From here until the `init` below claims its gate, the
+                // status reports that init as on its way (see
+                // `Backend::launch_init_pending`), not a daemon that is down.
                 let state = setup_state(Arc::clone(&backend), log_buffer);
                 let workspaces = Arc::clone(&state.workspaces);
                 handle.manage(Arc::new(RwLock::new(state)));

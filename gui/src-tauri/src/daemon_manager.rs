@@ -1486,7 +1486,7 @@ impl DaemonManager {
     /// daemon's place, so it is Unix only too: a Windows test build would
     /// find it unused.
     #[cfg(all(test, unix))]
-    fn replace_sidecar_with(&self, argv: &[&str]) {
+    pub(crate) fn replace_sidecar_with(&self, argv: &[&str]) {
         *self.stand_in.lock().expect("the stand-in lock is never poisoned") =
             Some(argv.iter().map(ToString::to_string).collect());
     }
