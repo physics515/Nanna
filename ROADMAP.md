@@ -7271,6 +7271,20 @@ keep the phases readable; promote individual items into a phase when they become
             taken over WebDriver. Build: `pnpm generate`, the daemon copied to
             `gui/src-tauri/binaries/nanna-daemon-x86_64-unknown-linux-gnu`, `cargo build -p
             nanna-gui --features e2e-webdriver` (54 s warm).
+      - [x] *(2026-09-18, first use of the harness)* **Yesterday's onboarding → Ollama probe wiring
+            (#343), verified in the real app.** Scratch config with `provider = "ollama"`, two
+            models in `model_priority`, and `[memory].ollama_host` pointed at a mock Ollama whose
+            `/api/tags` lists only one of them. `invoke("probe_ollama")` through the GUI returned
+            `reachable: true, missing: [{name: "gemma4:12b", pull: "ollama pull gemma4:12b"}]`; the
+            wizard, walked Welcome → Connect a model (provider set to Ollama) → Ready check, showed
+            *"Ollama is running at http://127.0.0.1:51980, but a configured model is not pulled yet.
+            Run this in a terminal, then recheck: `ollama pull gemma4:12b`"* with Recheck.
+            **Harness caveat learned on the way:** in the automated window `requestAnimationFrame`
+            delivers **0 frames/s** (the timeline clock runs; rendering frames do not), so every CSS
+            transition sits at t=0 — the wizard's progress bar looked stuck on step 1 while its
+            classes said step 3, and computed styles flipped to the right color the moment
+            `transition` was disabled. That is the environment, not the product: do not "fix"
+            animation state from harness screenshots; read classes / DOM state instead.
       - [ ] **Point the shared harness at `tauri-webdriver`** (`~/.claude/scheduled-tasks/_shared/
             tauri-webdriver.sh`, outside this repo and shared with other routines — not edited
             unattended): its `ensure` should check `tauri-webdriver` instead of `tauri-driver` +
