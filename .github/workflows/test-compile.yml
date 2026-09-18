@@ -44,8 +44,10 @@ jobs:
     # minutes in, and was still compiling and linking its test targets when
     # the limit cancelled it at 28. Cancellation also skips the cache save, so
     # every retry started cold again: a limit a cold build cannot meet never
-    # heals. 60 is ~2x the last lower bound; replace this note with the
-    # measured cold time from the first run that finishes under it.
+    # heals. The next cold run (35395737558, "No cache found") finished: the
+    # compile step took 20m26s and the job 26m01s with the cache save, so a
+    # cold build now runs 20-30 minutes depending on the runner. 60 is ~2x the
+    # slower of the two.
     timeout-minutes: 60
 
     steps:
