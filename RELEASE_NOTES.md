@@ -48,6 +48,24 @@ as a live draft while she writes it. You see "Thinking…" until the first words
 
 ## What's Fixed
 
+**Nanna could fail to start at all.** If the embedding model was busy — the free OpenRouter model
+answering "too many requests" was enough — opening Nanna showed *Starting* forever. At startup the
+server asked that model one question to learn the shape of its vectors, and waited for an answer
+with the same patience it uses for saving a memory in the background: up to eight minutes. The app
+gave up after ninety seconds and stopped it, and every relaunch did the same. The startup question
+is now asked once, without waiting; a busy model means starting on a provisional setting that
+corrects itself as soon as the model answers. Checked against the real server with an embedding
+endpoint that refuses everything: the previous release still had its door closed after 30 seconds,
+this one opened in a quarter of a second.
+
+**The Ollama setup step now checks.** Onboarding used to assume a local Ollama was running. It now
+asks, and tells apart "Ollama isn't running" from "it's running but this model isn't pulled",
+with the exact `ollama pull` to run. The model picker in Settings asks the same way.
+
+**Commands Nanna runs from the Linux app picked up the app's own libraries.** The AppImage's
+`LD_LIBRARY_PATH` leaked into every command, so tools like `git` loaded the bundled copies of
+`libssl` and `libpcre2`. Commands now run with your system's.
+
 **MCP servers are shut down with the daemon.** Before, they were left running. Now each server is
 asked to exit, given two seconds, and then stopped. All servers are closed at once rather than one
 by one.

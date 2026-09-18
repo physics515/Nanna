@@ -1004,6 +1004,11 @@ impl DaemonClient {
     /// keeps "server down" (`reachable: false` + `reason`) apart from "server
     /// up, model missing" (`reachable: true` + `missing`), and lists the
     /// installed models as `{ name, size_bytes }`.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::request`] does: no daemon connection, or a dropped or
+    /// timed-out request.
     pub async fn system_probe_ollama(&self, base_url: Option<&str>, models: Vec<String>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",

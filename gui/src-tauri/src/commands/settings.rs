@@ -1109,7 +1109,7 @@ fn ollama_models_from_report(report: &serde_json::Value) -> Result<Vec<OllamaMod
         .get("base_url")
         .and_then(|u| u.as_str())
         .unwrap_or("the configured Ollama host");
-    if report.get("reachable").and_then(|r| r.as_bool()) != Some(true) {
+    if report.get("reachable").and_then(serde_json::Value::as_bool) != Some(true) {
         let reason = report
             .get("reason")
             .and_then(|r| r.as_str())
@@ -1124,7 +1124,7 @@ fn ollama_models_from_report(report: &serde_json::Value) -> Result<Vec<OllamaMod
                 .iter()
                 .filter_map(|m| {
                     let name = m.get("name").and_then(|n| n.as_str())?.to_string();
-                    let size_bytes = m.get("size_bytes").and_then(|s| s.as_u64()).unwrap_or(0);
+                    let size_bytes = m.get("size_bytes").and_then(serde_json::Value::as_u64).unwrap_or(0);
                     Some(OllamaModelInfo {
                         is_embedding_model: is_ollama_embedding_model(&name),
                         size_mb: size_bytes / 1_000_000,
@@ -1210,19 +1210,23 @@ pub struct OllamaProbeResult {
 /// Ollama model the config names. Unlike `get_ollama_models`, a down server
 /// is a *result* (`reachable: false`), not an error — the wizard renders
 /// "start Ollama" and "pull these models" as different next steps.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be asked (no connection, a dropped or
+/// timed-out request) or answers with an error instead of a report.
 #[tauri::command]
 pub async fn probe_ollama(
     state: State<'_, Arc<RwLock<AppState>>>,
     base_url: Option<String>,
     models: Option<Vec<String>>,
 ) -> Result<OllamaProbeResult, String> {
-    let report = {
-        let state_guard = state.read().await;
-        state_guard
-            .backend
-            .system_probe_ollama(base_url.as_deref(), models.unwrap_or_default())
-            .await?
-    };
+    // The probe is a network round-trip (up to its connect timeout), so the
+    // app-state lock is released before it rather than held across it.
+    let backend = backend_handle(&state).await;
+    let report = backend
+        .system_probe_ollama(base_url.as_deref(), models.unwrap_or_default())
+        .await?;
     ollama_probe_from_report(&report)
 }
 
@@ -1238,7 +1242,7 @@ fn ollama_probe_from_report(report: &serde_json::Value) -> Result<OllamaProbeRes
             .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
             .unwrap_or_default()
     };
-    let reachable = report.get("reachable").and_then(|r| r.as_bool()) == Some(true);
+    let reachable = report.get("reachable").and_then(serde_json::Value::as_bool) == Some(true);
     let models = if reachable {
         ollama_models_from_report(report)?
     } else {
@@ -2491,6 +2495,11 @@ pub struct DataDirInfo {
 /// daemon, because the GUI is a pure client and the value the daemon *booted*
 /// with may differ from the value on disk until it restarts — which is exactly
 /// what the UI tells the user.
+///
+/// # Errors
+///
+/// Fails when the platform data directory cannot be determined, or the
+/// configured one cannot be resolved.
 #[tauri::command]
 pub async fn get_data_dir(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -2516,6 +2525,13 @@ pub async fn get_data_dir(
 /// `config.toml` only; **no data is moved**. The daemon reads this at boot,
 /// so the change takes effect on its next restart, and the returned info is
 /// what the UI shows while stating that.
+///
+/// # Errors
+///
+/// Fails when the chosen folder is refused by `validate_data_dir` (relative,
+/// a file, not creatable or not writable), when `config.toml` cannot be
+/// saved, or when the platform or configured data directory cannot be
+/// resolved afterwards.
 #[tauri::command]
 pub async fn set_data_dir(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -2531,18 +2547,19 @@ pub async fn set_data_dir(
     }
 
     let mut state_guard = state.write().await;
-    state_guard.config.general.data_dir = chosen.clone();
+    state_guard.config.general.data_dir.clone_from(&chosen);
     state_guard
         .config
         .save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
 
-    match &chosen {
-        Some(dir) => info!(
+    if let Some(dir) = &chosen {
+        info!(
             "Data directory set to {} — takes effect when the daemon restarts; existing data is not moved",
             dir.display()
-        ),
-        None => info!("Data directory reset to the platform default — takes effect when the daemon restarts"),
+        );
+    } else {
+        info!("Data directory reset to the platform default — takes effect when the daemon restarts");
     }
 
     let default = nanna_config::Config::default_data_dir()

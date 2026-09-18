@@ -278,6 +278,12 @@ impl Backend {
     }
 
     /// Probe an Ollama server via the daemon (see `DaemonClient::system_probe_ollama`).
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`DaemonClient::request`] does: no daemon connection, or a
+    /// dropped or timed-out request. A down Ollama server is not an error —
+    /// the report says `reachable: false`.
     pub async fn system_probe_ollama(&self, base_url: Option<&str>, models: Vec<String>) -> Result<Value, String> {
         self.daemon_client.system_probe_ollama(base_url, models).await
     }
