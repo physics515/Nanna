@@ -2,7 +2,7 @@
 //!
 //! Handles connections from channel clients (GUI, CLI, API, etc.)
 
-use crate::protocol::{Event, Request, Response};
+use crate::protocol::{Event, Request, RequestId, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -668,9 +668,11 @@ async fn pump_incoming(
                             }
                             Err(e) => {
                                 warn!("Invalid request from {}: {}", client_id, e);
-                                // Send error response
+                                // Answer under the request's own id when it has
+                                // one: an error nobody can correlate reads, to
+                                // the client, as silence until its timeout.
                                 let error_response = Response::error(
-                                    "unknown".to_string(),
+                                    request_id_of(&text),
                                     "parse_error",
                                     format!("Invalid request: {e}"),
                                 );
@@ -705,6 +707,24 @@ async fn pump_incoming(
     }
 }
 
+/// The id a request that failed to decode was sent under, so its error can
+/// be matched to it: the raw JSON's `id` when it is a string or a number
+/// (`RequestId` is a string; a numeric id is echoed as its decimal form), or
+/// `"unknown"` when the text is not JSON or carries no usable id. Pure.
+fn request_id_of(text: &str) -> RequestId {
+    /// Bound on an echoed id: longer is not an id a client sent in earnest.
+    const ECHOED_ID_BYTES_MAX: usize = 256;
+    let id = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| match value.get("id") {
+            Some(serde_json::Value::String(id)) => Some(id.clone()),
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        })
+        .filter(|id| !id.is_empty() && id.len() <= ECHOED_ID_BYTES_MAX);
+    id.unwrap_or_else(|| "unknown".to_string())
+}
+
 /// What an IPC connection forwards for one receive from the shared event broadcast:
 /// the event itself; for a connection that fell behind the bounded broadcast, an
 /// `Error` event saying how many it missed so the client can resync; `None` once the
@@ -725,6 +745,54 @@ fn forwardable(received: Result<Event, tokio::sync::broadcast::error::RecvError>
             })
         }
         Err(RecvError::Closed) => None,
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::{Request, request_id_of};
+
+    #[test]
+    fn a_request_that_fails_to_decode_keeps_its_id() {
+        // Each of these was answered under id "unknown" — silence to the
+        // client that sent it, until its own timeout.
+        for (text, id) in [
+            (
+                r#"{"id":"a","action":{"type":"tool","action":"execute","name":"nope"}}"#,
+                "a",
+            ),
+            (
+                r#"{"id":"b","action":{"type":"tool","action":"teleport"}}"#,
+                "b",
+            ),
+            (r#"{"id":"c","action":{"type":"warp"}}"#, "c"),
+            (r#"{"id":42,"action":{"type":"warp"}}"#, "42"),
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(text).is_err(),
+                "must not decode: {text}"
+            );
+            assert_eq!(request_id_of(text), id, "{text}");
+        }
+    }
+
+    #[test]
+    fn no_usable_id_falls_back_to_unknown() {
+        for text in [
+            "this is not json",
+            r#"{"action":{"type":"system","action":"status"}}"#,
+            r#"{"id":null}"#,
+            r#"{"id":""}"#,
+            r#"{"id":{"nested":true}}"#,
+        ] {
+            assert_eq!(request_id_of(text), "unknown", "{text}");
+        }
+        let long = format!(r#"{{"id":"{}"}}"#, "x".repeat(300));
+        assert_eq!(
+            request_id_of(&long),
+            "unknown",
+            "an absurd id is not echoed"
+        );
     }
 }
 

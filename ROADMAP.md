@@ -656,13 +656,20 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       and `componentResolution` / `packageComponentExports` prove every component and lucide import
       on the new page really exists. `pnpm typecheck` 0 errors with its canary confirming it reads
       `app/`; 251 vitest; nanna-tools 153 and nanna-daemon 367 tests green.
-      - [ ] **One defect found while driving this, left unfixed as out of scope.** A `tool.execute`
+      - [x] **One defect found while driving this, left unfixed as out of scope.** A `tool.execute`
             request missing the non-optional `input` field gets **silence** — the client times out
             rather than being told the request was malformed. Measured: the same call *with*
             `input: {}` answers correctly with a `not_found` outcome, so this is the request-decode
             path, not the tool path. A control plane that drops an undeserializable request without
             answering is the same honesty failure the audit work was about; it deserves its own
             increment.
+            *(2026-09-18)* Correction and fix: the daemon *did* answer — under id `"unknown"`, which
+            no client can match to its request, so to the caller it was silence until its timeout.
+            A request that fails to decode is now answered under its own `id` (string, or a number's
+            decimal form; bounded at 256 bytes) whenever the raw JSON carries one. Verified on the
+            real daemon: `missing field \`input\``, `unknown variant \`teleport\`` and an unknown
+            action type each come back correlated, naming the problem; text with no id (or not JSON)
+            still gets the `"unknown"` error, which is all that can be done for it.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
@@ -1003,6 +1010,13 @@ health checks). **Shipped**, except:
       reads a flat top-level `properties`, so a composed schema silently yields zero params. Handle composition
       (at least surface the union of branch properties). Source:
       [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-09-18 — superseded by the dual-era client, see P18's MCP entry.)* Rather than moving the
+      one handshake version, the client now speaks **2026-07-28** to every server that answers
+      `server/discover` (stateless, per-request `_meta`, routable headers on HTTP) and keeps
+      `initialize` at `2024-11-05` only as the legacy fallback, where it is the widest-compatible
+      offer. Of the capability commitments listed: roots and sampling are simply not declared (and
+      `roots` was dropped from the legacy handshake too), logging notifications are routed, MRTR
+      `input_required` is refused with a clear error (serving elicitation is its own `[ ]`).
       *(2026-07-21)* **Point (3) shipped** — `schema_to_parameters` is now composition-aware: it folds the
       `properties` of each `allOf`/`anyOf`/`oneOf` branch (one level deep) into the parameter list on top of the
       top-level `properties`, so a 2020-12 composed tool no longer yields **zero** params (which would make the
@@ -1035,7 +1049,7 @@ health checks). **Shipped**, except:
       net new clippy warnings (44 lib / 42 lib-test, unchanged).
       Remaining on the RC: nested/conditional composition (`if`/`then`/`$defs`) in `schema_to_parameters`,
       and the client still advertises `PROTOCOL_VERSION = "2024-11-05"` — see the new item below.
-- [ ] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
+- [x] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
       the Nov-2024 revision, so a 2026-07-28 server may legitimately answer `-32022
       UnsupportedProtocolVersion` (constant now defined) or fall back to legacy behaviour. Bumping it is a
       capability commitment, not a string edit — it requires the Roots/Sampling/Logging deprecation
