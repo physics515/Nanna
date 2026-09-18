@@ -27,18 +27,42 @@ let subscribers = 0
 
 const POLL_MS = 2000
 
+/** The version request in flight, if any. */
+let versionAsk: Promise<void> | null = null
+/** Bumped on every disconnect, so an answer from the daemon before it is dropped. */
+let connectionEpoch = 0
+
+/**
+ * Ask the connected daemon for its version, without making anything wait.
+ *
+ * Fetched once per connection rather than on every poll: the version of a
+ * running process cannot change under it. Never awaited by a status read: a
+ * daemon too old to know `system.version` answers only after the client's
+ * request timeout (300 s), and a status read that waited on it froze the
+ * footer, the splash's release and the layout's first load for as long.
+ */
+function askDaemonVersion() {
+  if (versionAsk !== null || daemonVersion.value !== null) return
+  const epoch = connectionEpoch
+  versionAsk = invoke<string | null>('get_daemon_version')
+    .catch(() => null)
+    .then((version) => {
+      if (epoch === connectionEpoch) daemonVersion.value = version
+    })
+    .finally(() => {
+      versionAsk = null
+    })
+}
+
 async function refresh(): Promise<BackendStatus | null> {
   try {
     status.value = await invoke<BackendStatus>('get_backend_status')
-    // Fetched once per connection rather than on every 2s poll: the version of
-    // a running process cannot change under it. Cleared on disconnect so a
-    // reconnect re-asks — the daemon that comes back may be a different build,
-    // which is the whole reason for showing this.
+    // Cleared on disconnect so a reconnect re-asks — the daemon that comes
+    // back may be a different build, which is the whole reason for showing it.
     if (status.value?.connected) {
-      if (daemonVersion.value === null) {
-        daemonVersion.value = await invoke<string | null>('get_daemon_version').catch(() => null)
-      }
+      askDaemonVersion()
     } else {
+      connectionEpoch += 1
       daemonVersion.value = null
     }
     return status.value
@@ -53,9 +77,8 @@ let polling: Promise<BackendStatus | null> | null = null
 
 /**
  * A polled status read: one at a time, across every poll. get_backend_status
- * waits on the app state's and the daemon manager's locks, and a connected
- * refresh also asks the daemon for its version, so a read can take as long
- * as they do. An interval that did not wait stacked another read on every
+ * waits on the app state's and the daemon manager's locks, so a read can take
+ * as long as they are held. An interval that did not wait stacked another read on every
  * tick behind it. A tick that finds a read in flight gets that read.
  *
  * Only for polls: a caller that needs a read begun after something it did
