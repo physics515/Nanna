@@ -2572,7 +2572,12 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// use 127.0.0.1) — the same v6 path where streams were cut
     /// mid-generation. Remote hosts pass through untouched.
     fn normalize_ollama_url(url: &str) -> String {
-        url.replacen("://localhost", "://127.0.0.1", 1)
+        // Trimmed of whitespace and trailing slashes because every call appends
+        // `/api/...` itself: a pasted `https://host/ollama/` would otherwise
+        // address `//api/chat`, which a path-routing proxy answers with 404.
+        url.trim()
+            .trim_end_matches('/')
+            .replacen("://localhost", "://127.0.0.1", 1)
     }
 
     /// Create a new Anthropic client with API key
@@ -2660,7 +2665,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Self {
             http: Self::build_ollama_http_client(),
             provider: Provider::Ollama,
-            api_key: api_key.into(),
+            // Trimmed: a blank key must mean no `Authorization` header at all
+            // (`apply_ollama_auth` checks for empty), never `Bearer    `.
+            api_key: api_key.into().trim().to_string(),
             base_url: Self::normalize_ollama_url(&Into::<String>::into(base_url)),
         }
     }
@@ -2955,8 +2962,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let url = format!("{}/api/show", self.base_url);
 
         let response = self
-            .http
-            .post(&url)
+            .apply_ollama_auth(self.http.post(&url))
             .json(&serde_json::json!({ "name": model }))
             .send()
             .await?;
@@ -4124,6 +4130,15 @@ impl EmbeddingClient {
         }
     }
 
+    /// Create an `Ollama` embedding client for a server that wants a bearer
+    /// token — a remote or proxied Ollama-compatible server. A blank key is no
+    /// key, so the result is then exactly [`Self::ollama`].
+    pub fn ollama_with_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let mut client = Self::ollama(base_url);
+        client.api_key = api_key.into().trim().to_string();
+        client
+    }
+
     /// Create Ollama embedding client with default localhost URL
     #[must_use]
     pub fn ollama_default() -> Self {
@@ -4366,9 +4381,11 @@ impl EmbeddingClient {
     }
 
     async fn ollama_context_window(&self) -> Option<usize> {
-        let response = self
-            .http
-            .post(format!("{}/api/show", self.base_url))
+        let mut request = self.http.post(format!("{}/api/show", self.base_url));
+        if !self.api_key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = request
             .json(&serde_json::json!({ "name": self.model }))
             .send()
             .await

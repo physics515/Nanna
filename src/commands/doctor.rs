@@ -650,7 +650,9 @@ pub async fn run_online_checks(config: &Config) -> Vec<Check> {
         ));
     }
     for server in &servers {
-        let probe = probe_ollama(&server.url, ONLINE_PROBE_TIMEOUT).await;
+        // No token, by this command's rule never to carry a credential: a
+        // server that wants one is reported as needing it.
+        let probe = probe_ollama(&server.url, None, ONLINE_PROBE_TIMEOUT).await;
         checks.extend(judge_ollama_server(server, &probe));
     }
     debug_assert!(

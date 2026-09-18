@@ -2999,7 +2999,18 @@ impl DaemonServer {
             "ollama" => Some((
                 info,
                 Arc::new(
-                    nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                    self.embedding
+                        .ollama_api_key
+                        .as_deref()
+                        .map_or_else(
+                            || nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host),
+                            |key| {
+                                nanna_llm::EmbeddingClient::ollama_with_key(
+                                    &self.embedding.ollama_host,
+                                    key,
+                                )
+                            },
+                        )
                         .with_model(&model),
                 ),
             )),
@@ -5613,6 +5624,9 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Ollama host (if using Ollama)
     pub ollama_host: String,
+    /// Bearer token for that host — `[llm] ollama_api_key`, the one Ollama
+    /// credential, which chat already sends. `None` sends no `Authorization`.
+    pub ollama_api_key: Option<String>,
     /// Ordered `provider/model` specs, most preferred first.
     ///
     /// This is the user's stated order and it is authoritative: the router
@@ -5633,6 +5647,7 @@ impl Default for EmbeddingConfig {
             provider: "ollama".to_string(),
             model: "nomic-embed-text".to_string(),
             ollama_host: "http://localhost:11434".to_string(),
+            ollama_api_key: None,
             priority: Vec::new(),
         }
     }
@@ -5752,6 +5767,14 @@ impl DaemonBuilder {
         self.embedding
             .ollama_host
             .clone_from(&config.memory.ollama_host);
+        // The one Ollama credential, blank meaning none (as chat reads it).
+        self.embedding.ollama_api_key = config
+            .llm
+            .ollama_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
         self.embedding
             .priority
             .clone_from(&config.memory.embedding_priority);

@@ -106,7 +106,7 @@ impl ControlPlane {
                 }
             }
             SystemAction::ProbeOllama { base_url, models } => {
-                let (base_url, models) = {
+                let (base_url, models, bearer) = {
                     let config = self.config.read().await;
                     let base_url = base_url
                         .as_deref()
@@ -118,9 +118,19 @@ impl ControlPlane {
                     } else {
                         models
                     };
-                    (base_url, models)
+                    // The configured server's token, sent as chat sends it —
+                    // a server behind an authenticating proxy otherwise reads
+                    // as down to the very check that is meant to find it. Only
+                    // to that server: a probe of some other URL gets no token.
+                    let bearer = same_ollama_server(&base_url, &config.memory.ollama_host)
+                        .then(|| config.llm.ollama_api_key.clone())
+                        .flatten();
+                    // Released before the probe's network round-trip.
+                    drop(config);
+                    (base_url, models, bearer)
                 };
-                let probe = nanna_llm::probe_ollama(&base_url, OLLAMA_PROBE_TIMEOUT).await;
+                let probe =
+                    nanna_llm::probe_ollama(&base_url, bearer.as_deref(), OLLAMA_PROBE_TIMEOUT).await;
                 ollama_probe_report(&base_url, &probe, &models)
             }
             SystemAction::ValidateApiKey { provider, key } => {
@@ -315,6 +325,19 @@ impl ControlPlane {
 /// for longer than that. Same figure `nanna doctor --online` uses.
 const OLLAMA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Whether two Ollama base URLs name the same server: compared trimmed,
+/// without trailing slashes and case-insensitively, with `localhost` read as
+/// `127.0.0.1` (the clients pin it that way).
+fn same_ollama_server(a: &str, b: &str) -> bool {
+    let canonical = |url: &str| {
+        url.trim()
+            .trim_end_matches('/')
+            .to_lowercase()
+            .replacen("://localhost", "://127.0.0.1", 1)
+    };
+    canonical(a) == canonical(b)
+}
+
 /// Every Ollama model the configuration names — the chat model when the
 /// provider is Ollama, the chat priority list, and the embedding priority
 /// list — as the tags Ollama lists them under, deduplicated.
@@ -395,9 +418,17 @@ fn ollama_probe_report(
             "missing": [],
         }),
         nanna_llm::OllamaProbe::Reachable { models } => {
+            // Compared with Ollama's default tag supplied on BOTH sides: Ollama
+            // lists `name:latest`, but an Ollama-compatible server may list the
+            // bare name (mummu's shim lists `qwen3.8-27b-ud-q4ks`), and that
+            // model is installed — not missing.
             let missing: Vec<Value> = wanted
                 .iter()
-                .filter(|want| !models.iter().any(|have| have.name.eq_ignore_ascii_case(want)))
+                .filter(|want| {
+                    !models
+                        .iter()
+                        .any(|have| ollama_tag(&have.name).eq_ignore_ascii_case(want))
+                })
                 .map(|name| json!({ "name": name, "pull": format!("ollama pull {name}") }))
                 .collect();
             let models: Vec<Value> = models
@@ -505,6 +536,24 @@ mod ollama_probe_tests {
             vec!["qwen3.5:9b", "gemma4:12b", "nomic-embed-text:latest"],
             "cloud specs are skipped, duplicates folded, tags normalized"
         );
+    }
+
+    #[test]
+    fn a_server_listing_bare_names_has_them_installed() {
+        // mummu's Ollama shim lists names without a tag; Ollama's default tag
+        // is implied on both sides, so the configured model is not "missing".
+        let probe = installed(&[("qwen3.8-27b-ud-q4ks", 15_358_213_024)]);
+        let report =
+            ollama_probe_report("https://host/ollama", &probe, &wanted(&["ollama/qwen3.8-27b-ud-q4ks"]));
+        assert_eq!(report["missing"], json!([]), "{report}");
+    }
+
+    #[test]
+    fn the_token_goes_only_to_the_configured_server() {
+        assert!(same_ollama_server("https://Host/ollama/", "https://host/ollama"));
+        assert!(same_ollama_server("http://localhost:11434", " http://127.0.0.1:11434/ "));
+        assert!(!same_ollama_server("https://host/ollama", "https://host/api"));
+        assert!(!same_ollama_server("https://evil.example", "https://host/ollama"));
     }
 
     #[test]

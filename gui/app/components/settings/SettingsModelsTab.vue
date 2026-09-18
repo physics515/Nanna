@@ -140,22 +140,24 @@
               </UiButton>
             </div>
           </div>
-          <p class="text-xs text-nanna-text-muted">Local models for offline and private runs.</p>
-          <div v-if="showAdvanced" class="space-y-3 pt-1 border-t border-white/[0.04]">
+          <p class="text-xs text-nanna-text-muted">A local Ollama, or any Ollama-compatible server — on this machine or remote.</p>
+          <p v-if="ollamaStatus === 'error' && ollamaError" data-testid="ollama-error" class="text-[11px] text-red-400 break-words">{{ ollamaError }}</p>
+          <div class="space-y-3 pt-1 border-t border-white/[0.04]">
             <div>
               <label class="block text-xs text-nanna-text-dim mb-1">Server URL</label>
               <div class="flex gap-2">
-                <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
+                <UiInput v-model="ollamaHostInput" data-testid="ollama-host" placeholder="http://localhost:11434" class="flex-1" />
                 <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
               </div>
-              <p class="text-[11px] text-nanna-text-muted mt-1">Only needed if Ollama is not on the default port.</p>
+              <p class="text-[11px] text-nanna-text-muted mt-1">The address that answers <code>/api/tags</code> — Nanna adds <code>/api/…</code> itself. Include any path the server lives under, e.g. <code>https://host/ollama</code>.</p>
             </div>
             <div>
-              <label class="block text-xs text-nanna-text-dim mb-1">API Key <span class="text-nanna-text-dim/60">(optional)</span></label>
+              <label class="block text-xs text-nanna-text-dim mb-1">Bearer token <span class="text-nanna-text-dim/60">(optional)</span></label>
               <div class="flex gap-2">
-                <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="For remote/authenticated instances" class="flex-1" />
+                <UiInput v-model="ollamaApiKeyInput" data-testid="ollama-token" type="password" placeholder="Only if the server requires one" class="flex-1" />
                 <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
               </div>
+              <p class="text-[11px] text-nanna-text-muted mt-1">Sent as <code>Authorization: Bearer …</code> to this server only. Stored in your OS keychain.</p>
             </div>
           </div>
         </div>
@@ -322,8 +324,7 @@ import { useSettingsPage } from '~/composables/useSettingsPage'
 const store = useSettingsPage()
 const {
   settings,
-  showAdvanced,
-  ollamaModels, loadingOllamaModels, ollamaStatus, loadingModels,
+  ollamaModels, loadingOllamaModels, ollamaStatus, ollamaError, loadingModels,
   claudeProxyHealthy,
   allChatModels, allEmbeddingModels, allSummarizationModels, allOcrModels,
   loadSettings, refreshModels, refreshOllamaModels,
@@ -618,7 +619,9 @@ async function saveOllamaHost() {
 async function saveOllamaApiKey() {
   try {
     await invoke('set_ollama_api_key', { key: ollamaApiKeyInput.value })
-    showToast('Ollama API key saved', 'success')
+    showToast(ollamaApiKeyInput.value.trim() ? 'Ollama token saved' : 'Ollama token removed', 'success')
+    // Re-check the server: a token is usually why a remote one was refusing.
+    await refreshOllamaModels()
     await loadSettings()
   } catch (e: any) {
     showToast(`Couldn't save: ${e.message || e}`, 'error')

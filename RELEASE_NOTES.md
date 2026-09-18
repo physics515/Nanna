@@ -46,6 +46,15 @@ as a live draft while she writes it. You see "Thinking…" until the first words
 "typing…". The draft has a **stop button**, and pressing it stops the turn exactly like sending
 `/stop`.
 
+**Ollama on another machine, with a token.** Settings → Models and the onboarding step both take
+an Ollama server address and an optional bearer token. The address can be a local Ollama, one on
+another machine, or any Ollama-compatible server behind a proxy. Give the path the server lives
+under, for example `https://host/ollama`; Nanna adds `/api/…` itself. The token is kept in your OS
+keychain and sent as `Authorization: Bearer …` to that server only: chat, embeddings, model details
+and the connection check all carry it. When the server won't talk, you're told why. It wants a
+token, or it refused the one you gave, or nothing Ollama-compatible answers at that address (which
+usually means the path is missing).
+
 ## What's Fixed
 
 **Nanna could fail to start at all.** If the embedding model was busy — the free OpenRouter model
@@ -60,7 +69,8 @@ this one opened in a quarter of a second.
 
 **The Ollama setup step now checks.** Onboarding used to assume a local Ollama was running. It now
 asks, and tells apart "Ollama isn't running" from "it's running but this model isn't pulled",
-with the exact `ollama pull` to run. The model picker in Settings asks the same way.
+with the exact `ollama pull` to run. The model picker in Settings asks the same way. A server that
+lists a model as `qwen` rather than `qwen:latest` no longer has it reported missing.
 
 **Commands Nanna runs from the Linux app picked up the app's own libraries.** The AppImage's
 `LD_LIBRARY_PATH` leaked into every command, so tools like `git` loaded the bundled copies of
@@ -99,6 +109,12 @@ second and shuts down cleanly.
 **The Telegram draft stream and stop button were not tried with a real bot.** There is no bot token
 on the build host. They are tested against a scripted Bot API server, with request and update shapes
 from the Bot API changelog and a mirror of its reference page.
+
+**Conversation summaries do not use the Ollama server set above.** They still read their own
+`[llm].ollama_url` and send no token, so a summarizer pointed at a server that requires one is
+refused. A chat through a real remote model was not run either: the token path was driven against a
+test server that refuses every request without it, and the real remote server only answered the
+connection check.
 
 **Only Linux was driven end to end tonight.** The Windows and macOS builds are covered by the
 release workflow, not by a run of the real app.

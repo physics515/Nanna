@@ -44,10 +44,34 @@ const providers = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'openai', label: 'OpenAI' },
   { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'ollama', label: 'Ollama (local)' },
+  { value: 'ollama', label: 'Ollama (local or remote)' },
 ]
 
+/** Ollama server address and optional bearer token, for the Ollama choice. */
+const OLLAMA_DEFAULT_HOST = 'http://localhost:11434'
+const ollamaHost = ref(OLLAMA_DEFAULT_HOST)
+const ollamaToken = ref('')
+let ollamaSettingsLoaded = false
+
+/** Prefill from the saved config, once — a re-run of onboarding must not
+ *  show the default over an address the user already set. */
+async function loadOllamaSettings() {
+  if (ollamaSettingsLoaded) return
+  ollamaSettingsLoaded = true
+  try {
+    const s = await invoke<{ ollama_host?: string; ollama_api_key?: string }>('get_extended_settings')
+    if (s?.ollama_host) ollamaHost.value = s.ollama_host
+    if (s?.ollama_api_key) ollamaToken.value = s.ollama_api_key
+  } catch {
+    /* keep the defaults — the step still works with them */
+  }
+}
+
 const needsKey = computed(() => provider.value !== 'ollama')
+
+watch(provider, (p) => {
+  if (p === 'ollama') void loadOllamaSettings()
+})
 
 watch(
   () => props.open,
@@ -108,8 +132,18 @@ async function onKeySave(p: string, key: string) {
 async function continueWithoutKey() {
   error.value = null
   if (provider.value === 'ollama') {
+    saving.value = true
     try {
-      saving.value = true
+      // Address and token first: the health check probes the saved server.
+      // A bad address stops here with the reason, instead of probing the old one.
+      await invoke('set_ollama_host', { host: ollamaHost.value.trim() || OLLAMA_DEFAULT_HOST })
+      await invoke('set_ollama_api_key', { key: ollamaToken.value.trim() })
+    } catch (e: any) {
+      error.value = e?.message || String(e)
+      saving.value = false
+      return
+    }
+    try {
       await invoke('set_provider', { provider: 'ollama' })
     } catch {
       /* non-fatal — health check will surface issues */
@@ -165,6 +199,16 @@ async function runHealthCheck() {
   checking.value = false
 }
 
+/** Whether an Ollama base URL points at this machine. */
+function isLocalAddress(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '')
+    return host === 'localhost' || host === '::1' || host.startsWith('127.')
+  } catch {
+    return false
+  }
+}
+
 /** What the wizard says about Ollama, from the probe — one sentence, plus the fix. */
 const ollamaSummary = computed(() => {
   const p = ollamaProbe.value
@@ -173,7 +217,11 @@ const ollamaSummary = computed(() => {
     return {
       ok: false,
       text: `Ollama is not answering at ${p.base_url}${p.reason ? ` (${p.reason})` : ''}.`,
-      fix: 'Install Ollama and start it (`ollama serve`), then recheck.',
+      // "Install and start it" only makes sense for this machine; for a remote
+      // server the usual fix is the address (its path) or the token.
+      fix: isLocalAddress(p.base_url)
+        ? 'Install Ollama and start it (`ollama serve`), then recheck.'
+        : 'Check the server URL (including any path, e.g. /ollama) and the bearer token, then go back and recheck.',
       pulls: [] as string[],
     }
   }
@@ -261,7 +309,7 @@ const ollamaSummary = computed(() => {
               </div>
               <div>
                 <h2 class="text-lg font-semibold text-nanna-text">Connect a model</h2>
-                <p class="text-xs text-nanna-text-muted">Pick a provider and add a key, or use Ollama locally.</p>
+                <p class="text-xs text-nanna-text-muted">Pick a provider and add a key, or connect to an Ollama server.</p>
               </div>
             </div>
 
@@ -286,9 +334,39 @@ const ollamaSummary = computed(() => {
               :hint="hasApiKey ? 'A key is already saved. You can replace it or continue.' : undefined"
               @save="onKeySave"
             />
-            <p v-else class="text-xs text-nanna-text-muted">
-              Ollama runs locally — no API key needed. The next step checks whether it is running and has a model pulled.
-            </p>
+            <div v-else class="space-y-3" data-testid="ollama-connection">
+              <div>
+                <label class="block text-xs text-nanna-text-dim mb-1" for="onboarding-ollama-host">Server URL</label>
+                <input
+                  id="onboarding-ollama-host"
+                  v-model="ollamaHost"
+                  data-testid="onboarding-ollama-host"
+                  type="url"
+                  :placeholder="OLLAMA_DEFAULT_HOST"
+                  class="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-nanna-text focus:outline-none focus:border-nanna-primary/50"
+                >
+                <p class="text-[11px] text-nanna-text-muted mt-1">
+                  Leave the default for Ollama on this machine. For a remote or Ollama-compatible server, use the address
+                  that answers <code>/api/tags</code>, including any path it lives under (e.g. <code>https://host/ollama</code>).
+                </p>
+              </div>
+              <div>
+                <label class="block text-xs text-nanna-text-dim mb-1" for="onboarding-ollama-token">
+                  Bearer token <span class="text-nanna-text-dim/60">(optional)</span>
+                </label>
+                <input
+                  id="onboarding-ollama-token"
+                  v-model="ollamaToken"
+                  data-testid="onboarding-ollama-token"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Only if the server requires one"
+                  class="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-nanna-text focus:outline-none focus:border-nanna-primary/50"
+                >
+              </div>
+              <p v-if="error" class="text-xs text-red-400" data-testid="onboarding-ollama-error">{{ error }}</p>
+              <p class="text-xs text-nanna-text-muted">The next step checks the server is answering and has a model.</p>
+            </div>
 
             <div class="flex justify-between pt-2">
               <UiButton variant="ghost" size="sm" @click="step = 1">Back</UiButton>

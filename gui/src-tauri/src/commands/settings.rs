@@ -995,12 +995,15 @@ pub async fn set_ollama_host(
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
 
+    // A pasted address often carries whitespace; the scheme check must see
+    // past it, and so must what gets saved.
+    let host = host.trim();
     // Validate URL format
     if !host.starts_with("http://") && !host.starts_with("https://") {
         return Err("Ollama host must start with http:// or https://".to_string());
     }
 
-    // Remove trailing slash
+    // Remove trailing slash — every call appends `/api/...` itself.
     let host = host.trim_end_matches('/').to_string();
 
     // Save to config file (the daemon reads the same file)
