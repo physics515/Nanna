@@ -15,7 +15,7 @@ use tauri::{AppHandle, Runtime};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -169,7 +169,7 @@ const fn boot_wait_verdict(state: DaemonState, sidecar_exited: bool, answered: b
 /// would otherwise flash). Unix is a deliberate no-op — the sidecar is not
 /// spawned as a process-group leader, so the process_group(0)-at-spawn
 /// contract behind `nanna_proc`'s group kill does not hold here; the
-/// caller's [`Sidecar::kill`] covers the direct child.
+/// caller's [`Sidecar::kill`] kills the direct child.
 #[cfg(windows)]
 async fn kill_sidecar_tree(pid: u32) {
     nanna_proc::kill_process_tree(pid).await;
@@ -409,9 +409,16 @@ impl StartFailure {
     /// exits with 1, whether another daemon holds the role, another program
     /// holds the port, or the config does not load. The daemon says why in
     /// its last log line, so that line is the message whenever there is one.
+    /// A boot that stopped at its command line never logged, and what it
+    /// printed instead is the message.
     fn from_exit(kind: StartFailureKind, exit: &SidecarExit) -> Self {
-        let message = exit.reason.clone().unwrap_or_else(|| {
-            let what = if kind == StartFailureKind::ExitedDuringBoot {
+        let during_boot = kind == StartFailureKind::ExitedDuringBoot;
+        let own_words = exit
+            .reason
+            .clone()
+            .or_else(|| exit.command_line_error.clone().filter(|_| during_boot));
+        let message = own_words.unwrap_or_else(|| {
+            let what = if during_boot {
                 "The daemon exited during startup"
             } else {
                 "The daemon exited"
@@ -627,26 +634,19 @@ fn error_message(line: &str) -> Option<&str> {
 /// stderr is not the daemon's alone. Every stdio MCP server it starts
 /// writes there too, and one may go on writing after the daemon died: its
 /// chatter was taken for the reason a killed daemon exited. So stderr is
-/// the reason only in two cases:
-/// - it holds Rust's own fatal output (see [`runtime_fatal`]) after the
-///   last stdout line. A release daemon aborts on a panic, possibly before
-///   its log line is written;
-/// - the process never wrote a log line. It got no further than its
-///   command line, so it started nothing, and the first thing it said is
-///   what stopped it: a loader error, or an argument error followed by
-///   usage lines.
+/// the reason only when it holds Rust's own fatal output (see
+/// [`runtime_fatal`]) after the last stdout line, or anywhere when there is
+/// no stdout line. A release daemon aborts on a panic, possibly before its
+/// log line is written. A process that stopped at its command line says why
+/// on stderr too, but that is read only for a boot (see
+/// [`stopped_at_command_line`]).
 ///
 /// The two streams are read separately, so their order is only
 /// approximate; the daemon's own ERROR line therefore wins over stderr.
 /// Rust's `note: run with RUST_BACKTRACE=1 …` hint is never the reason.
 fn exit_reason(lines: &VecDeque<BootLine>) -> Option<String> {
     let Some(last_stdout) = lines.iter().rposition(|line| line.stream == BootStream::Stdout) else {
-        return runtime_fatal(lines.iter().map(|line| line.line.as_str())).or_else(|| {
-            lines
-                .iter()
-                .find(|line| !line.line.starts_with("note: "))
-                .map(|line| line.line.clone())
-        });
+        return runtime_fatal(lines.iter().map(|line| line.line.as_str()));
     };
     if let Some(message) = error_message(&lines[last_stdout].line) {
         return Some(message.to_string());
@@ -658,6 +658,38 @@ fn exit_reason(lines: &VecDeque<BootLine>) -> Option<String> {
             .filter(|line| line.stream == BootStream::Stderr)
             .map(|line| line.line.as_str()),
     )
+}
+
+/// What stopped a process that got no further than its command line: the
+/// first line it printed, Rust's `note: run with RUST_BACKTRACE=1 …` hint
+/// aside. That is a loader error, or an argument error followed by usage
+/// lines. Such a process started nothing, so its stderr is its own.
+///
+/// `None` unless the process looks like one:
+/// - it wrote no stdout line. The daemon's log is its stdout, and its first
+///   line comes before it starts anything;
+/// - it exited by itself, with `code`. A signal came from outside (a stop, a
+///   restart, the OOM killer), so nothing it printed says why it ended. The
+///   one it raises itself, an abort, comes with Rust's fatal output, which
+///   [`exit_reason`] reads;
+/// - it exited during its boot, which [`StartFailure::from_exit`] checks. A
+///   daemon that became ready got past its command line.
+///
+/// The first condition alone was not enough. The sidecar inherits the app's
+/// `RUST_LOG`, which can filter out the daemon's whole log, and the stdio
+/// MCP servers the daemon starts write to its stderr. A daemon killed after
+/// it started them was said to have exited because "Secure MCP Filesystem
+/// Server running on stdio". One case still gets through: a daemon whose
+/// log is filtered out, that starts its servers and then fails its boot with
+/// an exit code. The boot log shows what happened there.
+fn stopped_at_command_line(lines: &VecDeque<BootLine>, code: Option<i32>) -> Option<String> {
+    if code.is_none() || lines.iter().any(|line| line.stream == BootStream::Stdout) {
+        return None;
+    }
+    lines
+        .iter()
+        .find(|line| !line.line.starts_with("note: "))
+        .map(|line| line.line.clone())
 }
 
 /// The first fatal error that Rust's runtime printed among `stderr` lines,
@@ -699,6 +731,22 @@ struct SidecarExit {
     signal: Option<i32>,
     /// See [`exit_reason`].
     reason: Option<String>,
+    /// See [`stopped_at_command_line`]. A reason only for an exit during a
+    /// boot.
+    command_line_error: Option<String>,
+}
+
+impl SidecarExit {
+    /// The exit, with `code` or by `signal`, of a sidecar that printed
+    /// `lines`.
+    fn new(code: Option<i32>, signal: Option<i32>, lines: &VecDeque<BootLine>) -> Self {
+        Self {
+            code,
+            signal,
+            reason: exit_reason(lines),
+            command_line_error: stopped_at_command_line(lines, code),
+        }
+    }
 }
 
 /// How long a sidecar's exit waits, once its process is gone, for the
@@ -790,21 +838,60 @@ const fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// A request to the event task that owns a sidecar's process to kill it.
+/// The event task answers once it has sent the kill. It drops the request
+/// unanswered once the process has exited, and there is nothing to kill.
+type KillRequest = oneshot::Sender<()>;
+
+/// How long [`Sidecar::kill`] waits for the event task's answer. Answering
+/// takes one wake-up of that task and one system call: 24 to 76 µs here (20
+/// kills on each tokio runtime flavour, debug build, 2026-09-18), less than
+/// the 2.6 to 2.9 ms the output relay needs at an exit. So the answer gets
+/// the second [`OUTPUT_DRAIN`] gives the relay on a machine whose scheduler
+/// is saturated, over 10,000 times the slowest answer measured. The bound is
+/// there for a runtime that no longer runs the task at all, so that a quit
+/// cannot hang on it.
+const KILL_ANSWER: Duration = OUTPUT_DRAIN;
+
 /// The sidecar process in the manager's child slot, with its record. The
 /// process itself belongs to its event task, which waits for its exit.
 struct Sidecar {
     pid: u32,
-    /// Asks the event task to kill the process.
-    kill: Arc<Notify>,
+    /// Asks the event task to kill the process. It carries at most one
+    /// request: a sidecar is taken out of the child slot to be killed.
+    kill: mpsc::UnboundedSender<KillRequest>,
     watch: Arc<SpawnWatch>,
 }
 
 impl Sidecar {
-    /// Kill the process (`SIGKILL` on Unix). A process that has exited
-    /// already is left alone: its PID may belong to another by now, and
-    /// the event task that owns it never signals it once reaped.
-    fn kill(&self) {
-        self.kill.notify_one();
+    /// Kill the process (`SIGKILL` on Unix), and return once the kill has
+    /// been sent.
+    ///
+    /// The event task that owns the process sends it. Asking that task used
+    /// to be the whole kill, and a stop returned before the task had run. At
+    /// a quit, Tauri then ended the app, the task never ran, and a wedged
+    /// daemon outlived the app. A kill that has been sent needs nothing more
+    /// from this process: the operating system carries it out. The exit is
+    /// not waited for. A process blocked in disk I/O dies only once the I/O
+    /// completes, which on a busy disk takes seconds, and the next spawn
+    /// waits for it (see [`DaemonManager::previous_sidecar_gone`]).
+    ///
+    /// A process that has exited already is left alone: its PID may belong
+    /// to another by now, and the event task never signals it once reaped.
+    async fn kill(&self) {
+        let (answer, answered) = oneshot::channel();
+        if self.kill.send(answer).is_err() {
+            // The event task has seen the exit.
+            return;
+        }
+        // An `Err` inside means the request was dropped unanswered: the
+        // process had exited.
+        if tokio::time::timeout(KILL_ANSWER, answered).await.is_err() {
+            error!(
+                "The kill of the daemon process (PID {}) was not confirmed within {KILL_ANSWER:?}: it may outlive the app",
+                self.pid
+            );
+        }
     }
 }
 
@@ -823,9 +910,10 @@ enum ExitEffect {
     /// never this sidecar: it deferred (the `AlreadyRunning` exit) after the
     /// attach. The app stays attached.
     StayAttached,
-    /// The health monitor had reported the daemon down while its process
-    /// lived (see [`DaemonManager::not_serving`]). Now the process is gone,
-    /// and its exit replaces that report, which said it was still running.
+    /// The daemon is already down. If the health monitor reported it down
+    /// while its process lived (see [`DaemonManager::not_serving`]), the
+    /// exit replaces that report, which said it was still running. Any other
+    /// record stays (see [`replaces_record`]).
     EndsReport,
 }
 
@@ -838,7 +926,9 @@ enum ExitEffect {
 ///
 /// `Crashed` while the current sidecar lives has one cause: the monitor's
 /// report of a daemon that is alive but not serving. Every other crash
-/// comes after the sidecar's exit, or with no process at all.
+/// comes after the sidecar's exit, or with no process at all. That includes
+/// one recorded between the exit and this call, by whoever saw the exit
+/// first (see [`replaces_record`]).
 const fn exit_effect(current: bool, state: DaemonState, still_answering: bool) -> ExitEffect {
     if !current {
         return ExitEffect::Nothing;
@@ -850,6 +940,26 @@ const fn exit_effect(current: bool, state: DaemonState, still_answering: bool) -
         DaemonState::Crashed => ExitEffect::EndsReport,
         DaemonState::Stopping | DaemonState::Stopped => ExitEffect::Nothing,
     }
+}
+
+/// Whether the exit of a daemon that is already down replaces `record`, the
+/// failure on record. Only a failed health check is replaced, which the
+/// exit explains better: the monitor's report of a live daemon that does not
+/// serve, or its report of a refused connection after it saw the exit.
+///
+/// The event task flags the exit before it reads the state, so whoever sees
+/// the flag in between can record the exit first: the ready-wait, as a boot
+/// that exited, or the monitor, as it gives up on a daemon that is gone.
+/// Taking every `Crashed` for the monitor's report replaced those records
+/// with "exited after ready", which a boot that exited never was.
+const fn replaces_record(record: Option<&StartFailure>) -> bool {
+    matches!(
+        record,
+        Some(StartFailure {
+            kind: StartFailureKind::HealthCheckFailed,
+            ..
+        })
+    )
 }
 
 /// The event task of one spawned sidecar: it relays the output into the log
@@ -865,8 +975,8 @@ struct SidecarEvents {
 }
 
 impl SidecarEvents {
-    /// Relay `child`'s output, kill it when `kill` asks, and record its
-    /// exit.
+    /// Relay `child`'s output, kill it when `kills` asks (see
+    /// [`Sidecar::kill`]), and record its exit.
     ///
     /// The exit is the one the operating system reports. It used to be the
     /// shell plugin's, which comes only once both output streams have ended,
@@ -876,7 +986,7 @@ impl SidecarEvents {
     /// running and nothing retrying, and the health monitor reported the
     /// dead process as still running and never restarted it (the second
     /// splash review, 2026-09-18).
-    async fn run(self, mut child: Child, kill: Arc<Notify>) {
+    async fn run(self, mut child: Child, mut kills: mpsc::UnboundedReceiver<KillRequest>) {
         // Held open until the exit, as the shell plugin held it.
         let _stdin = child.stdin.take();
         let readers = [
@@ -890,13 +1000,17 @@ impl SidecarEvents {
         let status = loop {
             tokio::select! {
                 status = child.wait() => break status,
-                () = kill.notified() => {
+                Some(answer) = kills.recv() => {
                     if let Err(e) = child.start_kill() {
                         warn!("Failed to kill daemon process: {}", e);
                     }
+                    let _ = answer.send(());
                 }
             }
         };
+        // A kill asked for from here on finds the process gone at once,
+        // instead of waiting out the output drain below.
+        drop(kills);
         let drained = tokio::time::timeout(OUTPUT_DRAIN, async {
             for reader in readers.into_iter().flatten() {
                 let _ = reader.await;
@@ -941,11 +1055,7 @@ impl SidecarEvents {
             warn!("daemon terminated (unknown reason)");
         }
 
-        let exit = SidecarExit {
-            code,
-            signal,
-            reason: exit_reason(&self.watch.log.lock().await.lines),
-        };
+        let exit = SidecarExit::new(code, signal, &self.watch.log.lock().await.lines);
         *self.watch.exit.lock().await = Some(exit.clone());
         // Set before the probe below: a stop that runs meanwhile must see a
         // dead sidecar, and leave alone the daemon that may be answering.
@@ -975,8 +1085,10 @@ impl SidecarEvents {
                 if *state == DaemonState::Crashed
                     && self.current_attempt.load(Ordering::SeqCst) == self.attempt
                 {
-                    *self.last_failure.write().await =
-                        Some(StartFailure::from_exit(StartFailureKind::ExitedAfterReady, &exit));
+                    let mut last = self.last_failure.write().await;
+                    if replaces_record(last.as_ref()) {
+                        *last = Some(StartFailure::from_exit(StartFailureKind::ExitedAfterReady, &exit));
+                    }
                 }
                 drop(state);
             }
@@ -1286,7 +1398,7 @@ impl DaemonManager {
                 live.pid
             );
             kill_sidecar_tree(live.pid).await;
-            live.kill();
+            live.kill().await;
         }
         if !self.previous_sidecar_gone(attempt).await {
             info!("Daemon start abandoned before the spawn: a stop request took over");
@@ -1344,17 +1456,17 @@ impl DaemonManager {
         // `Some` until the process has been waited for, which nothing has
         // done yet.
         let pid = child.id().unwrap_or_default();
-        let kill = Arc::new(Notify::new());
+        let (kill, kills) = mpsc::unbounded_channel();
         *slot = Some(Sidecar {
             pid,
-            kill: Arc::clone(&kill),
+            kill,
             watch: Arc::clone(&watch),
         });
         drop(slot);
 
         // The event task also records the termination, which is what ends
         // the ready-wait for a sidecar that dies while booting.
-        tokio::spawn(self.sidecar_events(attempt, Arc::clone(&watch)).run(child, kill));
+        tokio::spawn(self.sidecar_events(attempt, Arc::clone(&watch)).run(child, kills));
         Ok(watch)
     }
 
@@ -1369,8 +1481,11 @@ impl DaemonManager {
         Some(app.shell().command(program).args(args))
     }
 
-    /// Run `argv` (program first) in the sidecar's place from now on.
-    #[cfg(test)]
+    /// Run `argv` (program first) in the sidecar's place from now on. Only
+    /// the Unix tests call this, since they run `/bin/sh` scripts in the
+    /// daemon's place, so it is Unix only too: a Windows test build would
+    /// find it unused.
+    #[cfg(all(test, unix))]
     fn replace_sidecar_with(&self, argv: &[&str]) {
         *self.stand_in.lock().expect("the stand-in lock is never poisoned") =
             Some(argv.iter().map(ToString::to_string).collect());
@@ -1605,14 +1720,16 @@ impl DaemonManager {
     /// Stop the daemon
     ///
     /// Returns once the stop is done. A stop requested while another runs
-    /// waits for it. A sidecar killed here may take a while to exit; the
-    /// next spawn waits for that (see [`Self::previous_sidecar_gone`]).
+    /// waits for it. A sidecar that had to be killed has been sent the kill
+    /// by then (see [`Sidecar::kill`]), so it cannot outlive an app that
+    /// exits right after. It may take a while to exit; the next spawn waits
+    /// for that (see [`Self::previous_sidecar_gone`]).
     ///
     /// # Errors
     ///
     /// Never returns `Err` today: an undeliverable or ignored shutdown request
-    /// falls back to a tree-kill, a failed kill is logged, and the manager
-    /// always ends `Stopped`.
+    /// falls back to a tree-kill, a failed or unconfirmed kill is logged, and
+    /// the manager always ends `Stopped`.
     pub async fn stop(&self) -> Result<(), String> {
         // Counted before anything else, even when there is nothing to stop:
         // from here on, every start decided on before this stop is refused
@@ -1670,7 +1787,7 @@ impl DaemonManager {
                     // Job Object never adopted (or that predate it).
                     warn!("Graceful daemon shutdown failed — tree-killing PID {}", sidecar.pid);
                     kill_sidecar_tree(sidecar.pid).await;
-                    sidecar.kill();
+                    sidecar.kill().await;
                 }
             }
         }
@@ -2176,7 +2293,7 @@ mod tests {
     /// The contract the splash reads: `snake_case` kinds, nullable exit fields.
     #[test]
     fn a_failure_serializes_as_the_status_reports_it() {
-        let exit = SidecarExit { code: None, signal: Some(9), reason: None };
+        let exit = SidecarExit { code: None, signal: Some(9), ..SidecarExit::default() };
         let failure = StartFailure::from_exit(StartFailureKind::ExitedAfterReady, &exit);
         let json = serde_json::to_value(&failure).unwrap();
         assert_eq!(json["kind"], "exited_after_ready");
@@ -2198,7 +2315,7 @@ mod tests {
 
     #[test]
     fn without_a_reason_the_message_is_the_exit_status() {
-        let exit = |code, signal| SidecarExit { code, signal, reason: None };
+        let exit = |code, signal| SidecarExit { code, signal, ..SidecarExit::default() };
         let message = |kind, exit| StartFailure::from_exit(kind, &exit).message;
         assert_eq!(
             message(StartFailureKind::ExitedDuringBoot, exit(Some(1), None)),
@@ -2294,6 +2411,90 @@ mod tests {
         let failure = manager.last_failure().await.expect("recorded");
         assert_eq!(failure.kind, StartFailureKind::ExitedAfterReady);
         assert_eq!(failure.message, "The daemon exited (signal 9)");
+    }
+
+    /// The event task flags the exit before it reads the state, so whoever
+    /// sees the flag in between can record the exit first: the ready-wait
+    /// (a boot that exited) or the health monitor (a daemon that is gone,
+    /// and no restarts left). The event task then read `Crashed` and took it
+    /// for the monitor's report of a live daemon, and "exited after ready"
+    /// replaced what was on record.
+    #[tokio::test]
+    async fn an_exit_already_on_record_is_not_replaced() {
+        let manager = manager_on(free_port().await);
+        let attempt = claimed(&manager).await;
+        let events = manager.sidecar_events(attempt, manager.new_spawn_watch().await);
+        let boot = StartFailure::new(
+            StartFailureKind::ExitedDuringBoot,
+            "Error: Already running".to_string(),
+        );
+        manager.fail_attempt(attempt, boot.clone()).await;
+        events.on_exit(Some(1), None).await;
+        assert_eq!(manager.last_failure().await, Some(boot), "the boot never became ready");
+
+        let manager = manager_on(free_port().await);
+        let attempt = claimed(&manager).await;
+        let watch = manager.new_spawn_watch().await;
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
+        *manager.restart_count.write().await = manager.config.max_restarts;
+        let check = StartFailure::new(StartFailureKind::HealthCheckFailed, "check".to_string());
+        assert_eq!(manager.on_failed_check(manager.stop_epoch(), check).await, FailedCheck::GaveUp);
+        let gave_up = manager.last_failure().await;
+        manager.sidecar_events(attempt, watch).on_exit(None, Some(9)).await;
+        assert_eq!(manager.last_failure().await, gave_up, "giving up is the news");
+    }
+
+    /// What stdio MCP servers print on the daemon's stderr, which they share.
+    const MCP_CHATTER: [&str; 2] = [
+        "Secure MCP Filesystem Server running on stdio",
+        "Allowed directories: [ '/home/user' ]",
+    ];
+
+    /// The sidecar inherits the app's `RUST_LOG`, which can filter out the
+    /// daemon's whole log (`RUST_LOG=nanna_gui=debug` names no daemon
+    /// target), so the daemon may write no stdout line at all. The first
+    /// line on its stderr, an MCP server's, was then taken for why a daemon
+    /// that had started its servers exited.
+    #[tokio::test]
+    async fn a_daemon_whose_log_is_filtered_out_is_not_explained_by_its_mcp_servers() {
+        let chatter = |events: &SidecarEvents| {
+            let watch = Arc::clone(&events.watch);
+            async move {
+                for text in MCP_CHATTER {
+                    watch.relay(BootStream::Stderr, format!("{text}\n").as_bytes()).await;
+                }
+            }
+        };
+
+        // Killed, and exited with a code, while it served.
+        for (code, signal, expected) in [
+            (None, Some(9), "The daemon exited (signal 9)"),
+            (Some(1), None, "The daemon exited (exit code 1)"),
+        ] {
+            let manager = manager_on(free_port().await);
+            let attempt = claimed(&manager).await;
+            let watch = manager.new_spawn_watch().await;
+            assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
+            let events = manager.sidecar_events(attempt, watch);
+            chatter(&events).await;
+            events.on_exit(code, signal).await;
+            let failure = manager.last_failure().await.expect("the crash is recorded");
+            assert_eq!(failure.message, expected);
+        }
+
+        // Killed during its boot: a restart of a boot that hung after it
+        // started its servers.
+        let manager = manager_on(free_port().await);
+        let attempt = claimed(&manager).await;
+        let watch = manager.new_spawn_watch().await;
+        let events = manager.sidecar_events(attempt, Arc::clone(&watch));
+        chatter(&events).await;
+        events.on_exit(None, Some(9)).await;
+        let exit = watch.exit.lock().await.clone().expect("the exit is recorded");
+        assert_eq!(
+            StartFailure::from_exit(StartFailureKind::ExitedDuringBoot, &exit).message,
+            "The daemon exited during startup (signal 9)"
+        );
     }
 
     /// A stop that finds nothing to stop still reads `Stopping` while it
@@ -2480,13 +2681,6 @@ mod tests {
         lines.push_back(line(BootStream::Stdout, "2026-09-18T17:30:00.000000Z  INFO nanna: ERROR is just a word here"));
         assert_eq!(exit_reason(&lines), None);
         assert_eq!(exit_reason(&VecDeque::new()), None);
-
-        // Only stderr: a program that never reached its log.
-        let loader = "nanna-daemon: error while loading shared libraries: libx.so: cannot open shared object file";
-        assert_eq!(
-            exit_reason(&VecDeque::from([line(BootStream::Stderr, loader)])).as_deref(),
-            Some(loader)
-        );
     }
 
     /// The daemon passes its stderr on to the MCP servers it starts, and
@@ -2498,7 +2692,7 @@ mod tests {
         lines.push_back(line(BootStream::Stderr, "Secure MCP Filesystem Server running on stdio"));
         lines.push_back(line(BootStream::Stderr, "Error: stdin closed, shutting down"));
         assert_eq!(exit_reason(&lines), None);
-        let exit = SidecarExit { code: None, signal: Some(9), reason: exit_reason(&lines) };
+        let exit = SidecarExit::new(None, Some(9), &lines);
         assert_eq!(
             StartFailure::from_exit(StartFailureKind::ExitedAfterReady, &exit).message,
             "The daemon exited (signal 9)"
@@ -2506,19 +2700,23 @@ mod tests {
     }
 
     /// A program that stopped at its command line (a daemon too old for an
-    /// argument, say) says why first, then prints usage.
+    /// argument, say) says why first, then prints usage. One the loader
+    /// could not start says why and nothing else.
     #[test]
-    fn a_program_that_never_logged_is_stopped_by_the_first_thing_it_said() {
-        let lines = [
+    fn a_boot_that_never_logged_is_stopped_by_the_first_thing_it_said() {
+        let boot_failure = |texts: &[&str], code| {
+            let lines = texts.iter().map(|text| line(BootStream::Stderr, text)).collect();
+            let exit = SidecarExit::new(Some(code), None, &lines);
+            StartFailure::from_exit(StartFailureKind::ExitedDuringBoot, &exit).message
+        };
+        let usage = [
             "error: unexpected argument '--exit-with-parent' found",
             "Usage: nanna-daemon [OPTIONS] <COMMAND>",
             "For more information, try '--help'.",
-        ]
-        .map(|text| line(BootStream::Stderr, text));
-        assert_eq!(
-            exit_reason(&VecDeque::from(lines)).as_deref(),
-            Some("error: unexpected argument '--exit-with-parent' found")
-        );
+        ];
+        assert_eq!(boot_failure(&usage, 2), usage[0]);
+        let loader = "nanna-daemon: error while loading shared libraries: libx.so: cannot open shared object file";
+        assert_eq!(boot_failure(&[loader], 127), loader);
     }
 
     #[test]
@@ -2654,7 +2852,7 @@ mod tests {
     #[tokio::test]
     async fn an_attach_clears_a_crash_at_once() {
         let manager = manager_on(free_port().await);
-        let exit = SidecarExit { code: Some(1), signal: None, reason: None };
+        let exit = SidecarExit { code: Some(1), ..SidecarExit::default() };
         manager
             .crash_for_test(StartFailure::from_exit(StartFailureKind::ExitedDuringBoot, &exit))
             .await;
@@ -2679,8 +2877,8 @@ mod tests {
         let attempt = claimed(&manager).await;
         let exit = SidecarExit {
             code: Some(1),
-            signal: None,
             reason: Some("Error: Already running".to_string()),
+            ..SidecarExit::default()
         };
         let boot = StartFailure::from_exit(StartFailureKind::ExitedDuringBoot, &exit);
         manager.fail_attempt(attempt, boot.clone()).await;
@@ -3100,5 +3298,55 @@ exit 1";
         assert_eq!(*manager.restart_count.read().await, 1, "restarted");
 
         signal(holder, "-KILL");
+    }
+
+    /// Whether process `pid` has ended: it is gone, or it is a zombie that
+    /// nothing has reaped yet.
+    fn ended(pid: u32) -> bool {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let stat = String::from_utf8_lossy(&ps.stdout);
+        stat.trim().is_empty() || stat.trim_start().starts_with('Z')
+    }
+
+    /// The user quits while the daemon is wedged: it takes the shutdown
+    /// request's connection and never answers, so the stop kills it. The
+    /// kill used to be only a request to the sidecar's event task, and the
+    /// stop returned before that task ran. Tauri then ends the process, the
+    /// task never runs again, and the wedged daemon outlived the app.
+    ///
+    /// The runtime here is the app's: once the stop returns it is abandoned,
+    /// as the process exit abandons it, with nothing run or dropped again.
+    #[test]
+    fn a_stop_that_kills_the_daemon_has_killed_it_when_it_returns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let pid = runtime.block_on(async {
+            let app = mock_app();
+            let port = Port::open(SERVE).await;
+            let manager = manager_running(HANGS, &port);
+            manager.start(app.handle(), manager.stop_epoch()).await.unwrap();
+            let pid = manager.live_sidecar_pid().await.expect("the sidecar runs");
+            port.set(SILENT);
+            manager.stop().await.unwrap();
+            pid
+        });
+        std::mem::forget(runtime);
+
+        let killed = (0..50).any(|_| {
+            let gone = ended(pid);
+            if !gone {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            gone
+        });
+        if !killed {
+            signal(pid, "-KILL");
+        }
+        assert!(killed, "the daemon (PID {pid}) outlived the app");
     }
 }
