@@ -1,5 +1,10 @@
 <template>
-  <div class="slash-menu" v-if="items.length">
+  <!-- The root always renders; only its visibility follows the items. The
+       suggestion plugin opens the menu before the items arrive (it fetches
+       them asynchronously), and VueRenderer hands tippy the root element at
+       that moment. A `v-if` root was still a comment then, so the popup stayed
+       empty while Enter kept picking commands nobody could see. -->
+  <div ref="menuEl" v-show="items.length" class="slash-menu">
     <button
       v-for="(item, index) in items"
       :key="item.name"
@@ -18,7 +23,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, nextTick } from 'vue'
 import type { SlashCommandItem } from '~/extensions/SlashCommands'
 
 const props = defineProps<{
@@ -32,12 +37,23 @@ watch(() => props.items, () => {
   selectedIndex.value = 0
 })
 
+// The list scrolls (max-height), so keep the keyboard-selected row in view.
+const menuEl = ref<HTMLElement | null>(null)
+watch(selectedIndex, (index) => {
+  nextTick(() => menuEl.value?.children[index]?.scrollIntoView?.({ block: 'nearest' }))
+})
+
 function selectItem(index: number) {
   const item = props.items[index]
   if (item) props.command(item)
 }
 
 function onKeyDown(event: KeyboardEvent): boolean {
+  // Nothing to pick (the text after "/" matches no command, e.g. a path like
+  // /usr/bin): the key is not ours, so the editor gets it.
+  if (!props.items.length) return false
+  // Chords belong to whoever binds them: Ctrl+Enter still sends the message.
+  if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false
   if (event.key === 'ArrowUp') {
     selectedIndex.value = (selectedIndex.value + props.items.length - 1) % props.items.length
     return true

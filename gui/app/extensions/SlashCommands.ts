@@ -1,4 +1,6 @@
 import { Extension } from '@tiptap/core'
+import { PluginKey } from '@tiptap/pm/state'
+import type { EditorView } from '@tiptap/pm/view'
 import Suggestion from '@tiptap/suggestion'
 import type { SuggestionOptions } from '@tiptap/suggestion'
 import tippy, { type Instance as TippyInstance } from 'tippy.js'
@@ -89,6 +91,24 @@ export const slashCommands: SlashCommandItem[] = [
   },
 ]
 
+/** Its own key rather than Suggestion's shared default, so the host can find it. */
+export const SlashCommandsPluginKey = new PluginKey('slashCommands')
+
+/**
+ * Offer a keydown to the open slash menu before the host editor handles it.
+ *
+ * ProseMirror asks the view's own `handleKeyDown` prop before any plugin, so a
+ * host that handles keys there sees the menu's keys first: in ChatInput,
+ * Escape meant to close the menu stopped the running turn. The host calls this
+ * first. It returns true when the menu consumed the key, which nobody else
+ * should then act on. Keys it declines are side-effect free to offer again, as
+ * ProseMirror will when it reaches the plugin itself.
+ */
+export function slashMenuKeyDown(view: EditorView, event: KeyboardEvent): boolean {
+  const plugin = SlashCommandsPluginKey.get(view.state)
+  return plugin?.props.handleKeyDown?.call(plugin, view, event) === true
+}
+
 export const SlashCommands = Extension.create({
   name: 'slashCommands',
 
@@ -165,6 +185,7 @@ export const SlashCommands = Extension.create({
       Suggestion({
         editor: this.editor,
         ...this.options.suggestion,
+        pluginKey: SlashCommandsPluginKey,
       }),
     ]
   },
