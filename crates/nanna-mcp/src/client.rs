@@ -453,13 +453,27 @@ impl<T: Transport> McpClient<T> {
 
         debug!(tool = name, "Calling MCP tool");
 
-        let params = CallToolParams {
+        let params = serde_json::to_value(&CallToolParams {
             name: name.to_string(),
             arguments,
+        })?;
+        let result = match self.request_with_input("tools/call", params.clone()).await {
+            // The server's headers and our cached tool definition disagree —
+            // typically a parameter that gained `x-mcp-header` since our last
+            // `tools/list`. The binding says: re-list, then retry. Once: a
+            // second mismatch is the server's problem, not a stale cache.
+            Err(McpError::JsonRpc { code, .. })
+                if code == crate::protocol::error_codes::HEADER_MISMATCH =>
+            {
+                debug!(
+                    tool = name,
+                    "MCP header mismatch; re-listing tools and retrying once"
+                );
+                self.refresh_tools().await?;
+                self.request_with_input("tools/call", params).await?
+            }
+            other => other?,
         };
-        let result = self
-            .request_with_input("tools/call", serde_json::to_value(&params)?)
-            .await?;
         serde_json::from_value(result).map_err(Into::into)
     }
 
@@ -1276,6 +1290,82 @@ mod tests {
             version: "2026-07-28".into(),
         };
         (client, replies)
+    }
+
+    /// A server whose first `tools/call` is refused with `-32020`; records
+    /// every method so the recovery order can be checked.
+    struct MismatchOnce {
+        methods: std::sync::Mutex<Vec<String>>,
+        refusals_left: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MismatchOnce {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let (result, error) = match request.method.as_str() {
+                "tools/call"
+                    if self
+                        .refusals_left
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok() =>
+                {
+                    (
+                        None,
+                        Some(crate::protocol::JsonRpcError {
+                            code: -32020,
+                            message: "Mcp-Param-Region header is absent".into(),
+                            data: None,
+                        }),
+                    )
+                }
+                "tools/call" => (
+                    Some(serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })),
+                    None,
+                ),
+                _ => (Some(serde_json::json!({ "tools": [] })), None),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result,
+                error,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_mismatch_relists_tools_and_retries_once() {
+        let client = McpClient::new(MismatchOnce {
+            methods: std::sync::Mutex::new(Vec::new()),
+            refusals_left: AtomicUsize::new(1),
+        });
+        *client.initialized.write().await = true;
+        client.call_tool("regional", None).await.expect("recovered");
+        let methods = client.transport.methods.lock().unwrap().clone();
+        assert_eq!(methods, ["tools/call", "tools/list", "tools/call"]);
+
+        // A server that keeps refusing gets one retry, not a loop.
+        let stubborn = McpClient::new(MismatchOnce {
+            methods: std::sync::Mutex::new(Vec::new()),
+            refusals_left: AtomicUsize::new(5),
+        });
+        *stubborn.initialized.write().await = true;
+        let error = stubborn
+            .call_tool("regional", None)
+            .await
+            .expect_err("still refused");
+        assert!(
+            matches!(error, McpError::JsonRpc { code: -32020, .. }),
+            "{error:?}"
+        );
+        assert_eq!(stubborn.transport.methods.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

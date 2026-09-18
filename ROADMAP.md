@@ -4799,6 +4799,11 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       caller, `McpClient::connect`. Verified against server-everything's real `sse` mode (live test
       10/10) and on the real daemon: `url = "…/sse"` → *"No Streamable HTTP endpoint; trying the
       2024 HTTP+SSE transport"* → 13 tools → `mcp__oldsse__echo` answered over IPC.
+      - [x] *(2026-09-18)* **A `-32020 HeaderMismatch` re-lists tools and retries once**, as the
+            binding asks (the usual cause: a parameter gained `x-mcp-header` since our cached
+            `tools/list`, so we sent no `Mcp-Param-*` for it). One retry only — a second mismatch
+            is the server's problem, not a stale cache. Test: scripted server refusing once →
+            `tools/call, tools/list, tools/call`; refusing always → the error after 3 requests.
       - [x] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
             (mutually exclusive with `command`), its bearer token from the secure store the way
             `secret_env` already works for stdio (`nanna mcp secret set`), and the daemon's MCP
