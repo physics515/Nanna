@@ -280,6 +280,25 @@ pub trait Channel: Send + Sync {
     /// Send a message
     async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError>;
 
+    /// Whether `channel` can show the reply while it is being written (a
+    /// streamed draft). Only Telegram private chats can today.
+    fn supports_drafts(&self, _channel: &ChannelId) -> bool {
+        false
+    }
+
+    /// Show `text` as the in-progress draft of the reply in `channel`.
+    /// Repeated calls with one `draft_id` update it in place; the real
+    /// message, sent with [`Channel::send`] when the turn ends, replaces it.
+    /// The default does nothing (see [`Channel::supports_drafts`]).
+    async fn send_draft(
+        &self,
+        _channel: &ChannelId,
+        _draft_id: i64,
+        _text: &str,
+    ) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
     /// React to a message
     async fn react(&self, _message_id: &str, _emoji: &str) -> Result<(), ChannelError> {
         Err(ChannelError::Send("Reactions not supported".into()))

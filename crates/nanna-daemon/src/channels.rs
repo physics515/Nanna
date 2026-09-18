@@ -698,6 +698,98 @@ struct Typing {
     route: ReplyChannel,
     last_sent: tokio::time::Instant,
     last_event: tokio::time::Instant,
+    /// The reply so far, streamed as a draft — only where the chat can show
+    /// one (a Telegram private chat).
+    draft: Option<Draft>,
+}
+
+/// Least time between two draft updates of one chat. Telegram allows about
+/// one message a second per chat; 1.5 s leaves the headroom the final
+/// `sendMessage` needs and still reads as live typing.
+const DRAFT_REFRESH: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Re-send an unchanged draft this often: a draft lives about 30 s, and a
+/// long tool call can leave the text unchanged for longer than that.
+const DRAFT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Most characters of a turn's text kept for its draft. Telegram shows at
+/// most 4096 (the tail, once longer); twice that bounds the buffer without
+/// trimming on every delta.
+const DRAFT_BUFFER_CHARS_MAX: usize = 2 * nanna_channels::telegram::TELEGRAM_DRAFT_CHARS_MAX;
+
+/// One turn's streamed draft.
+#[derive(Debug)]
+struct Draft {
+    /// Non-zero, constant for the turn, so updates replace each other.
+    id: i64,
+    text: String,
+    /// Text arrived since the last send.
+    dirty: bool,
+    last_sent: Option<tokio::time::Instant>,
+}
+
+impl Draft {
+    /// Append a delta, keeping at most [`DRAFT_BUFFER_CHARS_MAX`] characters
+    /// (the newest; a draft shows the tail).
+    fn append(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        self.dirty |= !delta.is_empty();
+        let excess = self
+            .text
+            .chars()
+            .count()
+            .saturating_sub(DRAFT_BUFFER_CHARS_MAX);
+        if excess > 0 {
+            let cut = self
+                .text
+                .char_indices()
+                .nth(excess)
+                .map_or(self.text.len(), |(i, _)| i);
+            self.text.drain(..cut);
+        }
+        debug_assert!(self.text.chars().count() <= DRAFT_BUFFER_CHARS_MAX);
+    }
+
+    /// Whether to send the draft now. Pure.
+    fn due(&self, now: tokio::time::Instant) -> bool {
+        self.last_sent.map_or(self.dirty, |last| {
+            let since = now.saturating_duration_since(last);
+            (self.dirty && since >= DRAFT_REFRESH) || since >= DRAFT_KEEPALIVE
+        })
+    }
+}
+
+/// Send one draft update for `route` on its own task (detached for the same
+/// reason as [`send_typing_to`]); failures are logged, never retried.
+fn send_draft_to(router: &Arc<RwLock<MessageRouter>>, route: &ReplyChannel, id: i64, text: String) {
+    let router = Arc::clone(router);
+    let target = ChannelId::new(&route.provider, &route.id);
+    tokio::spawn(async move {
+        let router = router.read().await;
+        if let Some(channel) = router.get(&target.provider)
+            && let Err(e) = channel.send_draft(&target, id, &text).await
+        {
+            debug!("draft for {}:{} not sent: {e}", target.provider, target.id);
+        }
+    });
+}
+
+/// Send a session's draft if it is due, and record it. Returns whether it went.
+fn flush_draft(
+    router: &Arc<RwLock<MessageRouter>>,
+    state: &mut Typing,
+    now: tokio::time::Instant,
+) -> bool {
+    let Some(draft) = state.draft.as_mut().filter(|draft| draft.due(now)) else {
+        return false;
+    };
+    if draft.text.trim().is_empty() {
+        return false;
+    }
+    send_draft_to(router, &state.route, draft.id, draft.text.clone());
+    draft.dirty = false;
+    draft.last_sent = Some(now);
+    true
 }
 
 /// How long a turn may go without any event before the keepalive stops
@@ -731,6 +823,86 @@ fn send_typing_to(router: &Arc<RwLock<MessageRouter>>, session_id: &str, route: 
             debug!("typing indicator for {session_id} not sent: {e}");
         }
     });
+}
+
+/// On each tick: forget turns that went silent, flush due drafts, and keep
+/// "typing…" up where no draft is showing yet.
+fn refresh_indicators(
+    router: &Arc<RwLock<MessageRouter>>,
+    typing: &mut std::collections::HashMap<String, Typing>,
+) {
+    let now = tokio::time::Instant::now();
+    typing.retain(|_, state| {
+        now.saturating_duration_since(state.last_event) < typing_abandon_after()
+    });
+    for (session_id, state) in typing.iter_mut() {
+        flush_draft(router, state, now);
+        // A showing draft is the progress indicator; "typing…" only covers
+        // the stretch before the first words.
+        let draft_showing = state.draft.as_ref().is_some_and(|d| d.last_sent.is_some());
+        if !draft_showing && typing_due(Some(state.last_sent), now) {
+            state.last_sent = now;
+            send_typing_to(router, session_id, &state.route);
+        }
+    }
+}
+
+/// Follow one event's effect on its session's turn: start tracking (and
+/// show "typing…") on its first sign of life, feed text into the draft,
+/// stop at `message_end`.
+async fn track_turn(
+    sessions: &SessionManager,
+    router: &Arc<RwLock<MessageRouter>>,
+    typing: &mut std::collections::HashMap<String, Typing>,
+    next_draft_id: &mut i64,
+    event: &Event,
+) {
+    match turn_signal(event) {
+        Some(TurnSignal::Working(session_id)) => {
+            let now = tokio::time::Instant::now();
+            if let Some(state) = typing.get_mut(session_id) {
+                state.last_event = now;
+            } else if let Some(route) = sessions.reply_channel(session_id).await {
+                send_typing_to(router, session_id, &route);
+                let target = ChannelId::new(&route.provider, &route.id);
+                let drafts = router
+                    .read()
+                    .await
+                    .get(&route.provider)
+                    .is_some_and(|channel| channel.supports_drafts(&target));
+                let draft = drafts.then(|| {
+                    let id = *next_draft_id;
+                    *next_draft_id = next_draft_id.checked_add(1).unwrap_or(1);
+                    Draft {
+                        id,
+                        text: String::new(),
+                        dirty: false,
+                        last_sent: None,
+                    }
+                });
+                typing.insert(
+                    session_id.to_string(),
+                    Typing {
+                        route,
+                        last_sent: now,
+                        last_event: now,
+                        draft,
+                    },
+                );
+            }
+            if let Event::MessageDelta { delta, .. } = event
+                && let Some(state) = typing.get_mut(session_id)
+                && let Some(draft) = state.draft.as_mut()
+            {
+                draft.append(delta);
+                flush_draft(router, state, now);
+            }
+        }
+        Some(TurnSignal::Finished(session_id)) => {
+            typing.remove(session_id);
+        }
+        None => {}
+    }
 }
 
 /// Most replies one chat may have waiting to be sent.
@@ -797,22 +969,15 @@ pub fn spawn_reply_forwarder(
             std::collections::HashMap::new();
         let mut outboxes: std::collections::HashMap<ChannelId, mpsc::Sender<OutgoingMessage>> =
             std::collections::HashMap::new();
-        let mut tick = tokio::time::interval(TYPING_REFRESH);
+        // Draft ids only need to differ between turns of one chat.
+        let mut next_draft_id: i64 = 1;
+        let mut tick = tokio::time::interval(DRAFT_REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let received = tokio::select! {
                 received = events.recv() => received,
                 _ = tick.tick() => {
-                    let now = tokio::time::Instant::now();
-                    typing.retain(|_, state| {
-                        now.saturating_duration_since(state.last_event) < typing_abandon_after()
-                    });
-                    for (session_id, state) in &mut typing {
-                        if typing_due(Some(state.last_sent), now) {
-                            state.last_sent = now;
-                            send_typing_to(&router, session_id, &state.route);
-                        }
-                    }
+                    refresh_indicators(&router, &mut typing);
                     continue;
                 }
             };
@@ -827,28 +992,7 @@ pub fn spawn_reply_forwarder(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            match turn_signal(&event) {
-                Some(TurnSignal::Working(session_id)) => {
-                    let now = tokio::time::Instant::now();
-                    if let Some(state) = typing.get_mut(session_id) {
-                        state.last_event = now;
-                    } else if let Some(route) = sessions.reply_channel(session_id).await {
-                        send_typing_to(&router, session_id, &route);
-                        typing.insert(
-                            session_id.to_string(),
-                            Typing {
-                                route,
-                                last_sent: now,
-                                last_event: now,
-                            },
-                        );
-                    }
-                }
-                Some(TurnSignal::Finished(session_id)) => {
-                    typing.remove(session_id);
-                }
-                None => {}
-            }
+            track_turn(&sessions, &router, &mut typing, &mut next_draft_id, &event).await;
             let Some((session_id, text)) = reply_text(&event) else {
                 continue;
             };
@@ -924,6 +1068,22 @@ mod tests {
                 .lock()
                 .expect("sent")
                 .push((channel_id.id.clone(), "<typing>".to_string()));
+            Ok(())
+        }
+        /// `dm-*` chats stand in for Telegram private chats.
+        fn supports_drafts(&self, channel: &ChannelId) -> bool {
+            channel.id.starts_with("dm-")
+        }
+        async fn send_draft(
+            &self,
+            channel: &ChannelId,
+            draft_id: i64,
+            text: &str,
+        ) -> Result<(), ChannelError> {
+            self.sent
+                .lock()
+                .expect("sent")
+                .push((channel.id.clone(), format!("<draft {draft_id}> {text}")));
             Ok(())
         }
     }
@@ -1420,6 +1580,123 @@ mod tests {
                 ("chat-7".to_string(), "abc".to_string()),
             ],
             "one typing for a burst of deltas, none for the GUI session"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_private_chat_sees_the_reply_as_a_throttled_draft_then_the_message() {
+        const DM: &str = "test:dm-1:ada";
+        let sessions = Arc::new(SessionManager::new());
+        let route = ReplyChannel {
+            provider: "test".into(),
+            id: "dm-1".into(),
+        };
+        sessions
+            .ensure_channel_session(DM, "test · ada", &route)
+            .await;
+        let (events_tx, events_rx) = broadcast::channel(64);
+        let (router, sent) = recording_router();
+        let counters = Arc::new(crate::channel_counters::ChannelCounters::default());
+        let forwarder = spawn_reply_forwarder(sessions.clone(), events_rx, router, counters);
+        let delta = |text: &str| Event::MessageDelta {
+            session_id: DM.into(),
+            message_id: "m".into(),
+            delta: text.into(),
+        };
+
+        events_tx
+            .send(Event::MessageStart {
+                session_id: DM.into(),
+                message_id: "m".into(),
+            })
+            .expect("rx");
+        events_tx.send(delta("Hel")).expect("rx");
+        events_tx.send(delta("lo")).expect("rx");
+        // Inside one refresh interval: the second delta waits for the tick.
+        tokio::time::sleep(DRAFT_REFRESH + Duration::from_millis(100)).await;
+        events_tx.send(delta(" there")).expect("rx");
+        // A long silent stretch: the draft is kept alive, "typing…" is not
+        // re-sent over it.
+        tokio::time::sleep(DRAFT_KEEPALIVE + 3 * DRAFT_REFRESH).await;
+        events_tx
+            .send(Event::MessageEnd {
+                session_id: DM.into(),
+                message_id: "m".into(),
+                content: "Hello there".into(),
+            })
+            .expect("rx");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(events_tx);
+        forwarder.await.expect("forwarder exits");
+
+        let log: Vec<String> = sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        let drafts: Vec<&String> = log.iter().filter(|t| t.starts_with("<draft")).collect();
+        assert_eq!(
+            drafts.first().map(|d| d.as_str()),
+            Some("<draft 1> Hel"),
+            "the first words go at once: {log:?}"
+        );
+        assert!(
+            drafts.iter().any(|d| d.as_str() == "<draft 1> Hello"),
+            "the throttled rest follows: {log:?}"
+        );
+        assert!(
+            drafts.iter().any(|d| d.as_str() == "<draft 1> Hello there"),
+            "{log:?}"
+        );
+        assert!(
+            drafts.iter().all(|d| d.starts_with("<draft 1>")),
+            "one draft id for the turn: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|t| t.as_str() == "<typing>").count(),
+            1,
+            "typing only before the first words: {log:?}"
+        );
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("Hello there"),
+            "the real message ends it: {log:?}"
+        );
+        let keepalives = drafts
+            .iter()
+            .filter(|d| d.as_str() == "<draft 1> Hello there")
+            .count();
+        assert!(
+            keepalives >= 2,
+            "an unchanged draft is re-sent within its lifetime: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_draft_buffer_keeps_the_newest_text_within_its_bound() {
+        let mut draft = Draft {
+            id: 1,
+            text: String::new(),
+            dirty: false,
+            last_sent: None,
+        };
+        draft.append(&"é".repeat(DRAFT_BUFFER_CHARS_MAX));
+        draft.append("END");
+        assert_eq!(draft.text.chars().count(), DRAFT_BUFFER_CHARS_MAX);
+        assert!(draft.text.ends_with("éEND"));
+        assert!(draft.dirty);
+        let now = tokio::time::Instant::now();
+        assert!(draft.due(now), "unsent text is due at once");
+        draft.dirty = false;
+        draft.last_sent = Some(now);
+        assert!(
+            !draft.due(now + DRAFT_REFRESH),
+            "nothing new, not yet stale"
+        );
+        assert!(
+            draft.due(now + DRAFT_KEEPALIVE),
+            "kept alive before the ~30 s expiry"
         );
     }
 

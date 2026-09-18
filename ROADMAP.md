@@ -1831,10 +1831,10 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             *(2026-09-18, context for whoever decides this)* Tool definitions now **change at
             runtime**: an MCP server's `list_changed` resyncs the registry (see P18's MCP entry), so
             a server that swaps a tool's description mid-session is live on the next turn, silently.
-            The owner's no-gates rule rules out "re-prompt on drift"; a shape that fits it would be
-            observability only — record each tool's definition hash at first sight and announce a
-            changed one (log, `system.status`, the Tools page) without blocking it. Not built
-            unattended: whether even that is wanted is the owner's call.
+            The owner's no-gates rule rules out "re-prompt on drift"; the 2026-08-24 note under P3
+            already names the shape that fits it — a *filter*, like `schema_guard`: a drifted tool is
+            dropped and announced, and re-pinned out of band, never in-turn. That note's precondition
+            ("wire the client first") is now met; this is the next MCP security increment.
 - [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
       *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
       `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;
@@ -3011,7 +3011,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   crate — so adopting it means a second on-disk structure beside the f32 BLOBs, which
                   is exactly the mirroring `hnswlib-rs` was shortlisted for avoiding. Record the
                   option, keep the shortlist as-is.
-            - [ ] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
+            - [x] *(research 2026-08-26)* **The FSRS default weight table is not FSRS-6's, despite
                   saying it is.** `crates/nanna-memory/src/fsrs.rs` is headed "Default FSRS-6
                   parameters", but `w0..w18` are FSRS-**5** values (`0.4072, 1.1829, 3.1262, 15.4722,
                   7.2102, 0.5316, ...` against FSRS-6's `0.212, 1.2931, 2.3065, 8.2956, 6.4133,
@@ -3032,6 +3032,10 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
                   `0.0658` at index 19 and `0.1542` at index 20) — settle that against `rs-fsrs`
                   source before touching anything. Source:
                   [FSRS algorithm wiki](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
+                  *(ticked 2026-09-18 — resolved by `1dd8c1cb`, which took the item's second option.)*
+                  `FsrsParameters`' doc now says what the table is: FSRS-5 values with six slots
+                  zeroed, of which only `w6..=w12` and `w20` are read, and why adopting FSRS-6's table
+                  for the rest would be cargo-culting (Nanna's stability update is not FSRS's).
             *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
             A registered SQL function is not a working one, and this decision is too load-bearing to rest
             on a source grep, so 3 tests now assert it end to end through the pinned dependency:
@@ -5094,7 +5098,7 @@ asks permission or restricts her.)*:
             send hangs while chat B's turn streams 64 events into a 16-slot bus — B's answer arrives
             and A's is sent once released; **against the previous forwarder the same test loses B's
             reply** (`[]`). 5/5 reruns.
-      - [ ] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
+      - [x] *(research 2026-09-17)* **Stream the answer into Telegram, not just "typing…".** Bot API
             now has `sendMessageDraft` (private chats only; `chat_id`, non-zero `draft_id` — repeated
             calls with one id animate in place; text ≤4096; a draft is an ephemeral ~30 s preview
             that disappears when the bot sends the real message with `sendMessage`), and Bot API
@@ -5115,7 +5119,26 @@ asks permission or restricts her.)*:
             `sendMessageDraft` and **`sendRichMessageDraft`** (Bot API 10.1, 2026-06-11, "streaming
             AI-generated replies" with the Rich Messages formatting). The class's field table was
             not retrievable this run — read it from the full API page before writing the parser.
-            Source: [Bot API changelog](https://core.telegram.org/bots/api-changelog). Follow-up the same day: a clear —
+            Source: [Bot API changelog](https://core.telegram.org/bots/api-changelog).
+            *(2026-09-18) Streaming landed; the stop button did not.* `Channel::supports_drafts` /
+            `send_draft` (default: not supported); Telegram implements them with `sendMessageDraft`
+            for private chats (positive chat id), the text tail-truncated to 4096 characters behind
+            `…`. The reply forwarder keeps a per-turn draft (buffer bounded at 8192 chars, one
+            non-zero id per turn): the first words go at once, then at most one update per 1.5 s
+            (Telegram's ~1 message/s per chat, with headroom for the final `sendMessage`), an
+            unchanged draft is re-sent every 20 s so it outlives a long tool call (drafts live ~30 s),
+            "typing…" stops once a draft shows, and `message_end` drops it as the real message
+            replaces it. Groups keep "typing…". Tests: the request captured on a local HTTP double is
+            exactly `{chat_id, draft_id, text}` at `/bot<token>/sendMessageDraft`; a paused-clock
+            forwarder test pins first-words-at-once, throttling, keepalive, one id per turn, typing
+            only before the first words, and the real message last. `TelegramChannel::with_api_base`
+            (also usable for a self-hosted Bot API server) makes that possible. **Not verified with a
+            real bot** — no bot token on this host.
+      - [ ] **Telegram: the stop button, and a live check of the drafts.** Bot API 10.3's `can_stop` /
+            `keep_on_stop` on `sendMessageDraft`, and the `stopped_message_generation` update routed
+            to the same arm as `/stop` (add it to `allowed_updates`; read `MessageGenerationStopped`'s
+            fields from the full API page first). Then one live round-trip with a real bot: a streamed
+            answer, a stop mid-answer. Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
