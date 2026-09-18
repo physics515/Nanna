@@ -4877,6 +4877,12 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             suite: its HTTP fixtures raced (1 run in 20) because the readiness probe was a TCP
             connect, which on loopback can self-connect to a not-yet-bound ephemeral port and then
             squat it; the fixtures now announce readiness on stderr and the suite ran 25/25 clean.
+      - [x] *(2026-09-18)* **The live interop suite runs in CI.** `dual_era_live.rs` is `#[ignore]`
+            locally (it needs Node and an `npm ci`), so nothing ran it. New `mcp-interop.yml`
+            (path-filtered to `nanna-mcp`, the agent's MCP glue and itself): Node 22, `npm ci` from
+            the fixture's committed lockfile, `cargo test -p nanna-mcp --test dual_era_live --locked
+            -- --ignored`. The exact command passes locally (10/10); `npm ci` from the lockfile alone
+            reproduces the fixture. Runner time not yet measured — its first run sets the bound.
       - [ ] *(research 2026-09-18)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
             2026-07-28** — stateless serving by default, a `ClientLifecycleMode::Discover` that
             skips `initialized`, and version negotiation on connect. Two uses: (a) a second,
