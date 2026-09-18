@@ -240,6 +240,9 @@ impl ControlPlane {
 
     /// `ConfigAction::Set`: write one dotted path, persist, and propagate the change live.
     async fn config_set(&self, path: String, value: Value) -> Value {
+        if let Some((_, instead)) = RETIRED_KEYS.iter().find(|(key, _)| *key == path) {
+            return json!({ "error": "retired_key", "message": instead, "path": path });
+        }
         let mut config = self.config.write().await;
         let mut config_value = match serde_json::to_value(&*config) {
             Ok(v) => v,
@@ -362,6 +365,20 @@ impl ControlPlane {
         config.clone()
     }
 }
+
+/// Keys the daemon once read and no longer does, each with the sentence
+/// saying what replaced it.
+///
+/// A `config.set` of one would answer `updated` and change nothing: serde
+/// drops an unknown key on the round trip, and the next save removes it from
+/// disk. Refusing it by name is how a script that used it learns it stopped
+/// working.
+const RETIRED_KEYS: [(&str, &str); 1] = [(
+    "llm.ollama_url",
+    "[llm].ollama_url is no longer read: summaries go through chat's router, so an \
+     `ollama/` summarization model uses chat's one Ollama server and its token. Set \
+     memory.ollama_host to move it.",
+)];
 
 /// Set `value` at the dotted `parts` path inside `obj`, creating intermediate
 /// objects as needed (pointer-based access for nested updates).

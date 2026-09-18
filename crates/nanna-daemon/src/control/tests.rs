@@ -742,3 +742,33 @@ async fn a_scheduled_job_can_post_into_an_existing_conversation_only() {
     let unrouted = cp.handle("test", add(None)).await;
     assert_eq!(unrouted["status"], "created");
 }
+
+/// `[llm].ollama_url` is retired: summaries go through chat's router and its
+/// one Ollama server. A `set` of it used to answer `updated` while serde
+/// dropped the key on the round trip, so a script that moved its summarizer
+/// that way would never learn it no longer does.
+#[tokio::test]
+async fn setting_a_retired_key_is_refused_with_what_replaced_it() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let before = cp.config.read().await.clone();
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.ollama_url".into(),
+                value: json!("http://gpu.example:11434"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "retired_key", "{resp}");
+    assert_eq!(resp["path"], "llm.ollama_url", "{resp}");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.contains("memory.ollama_host"), "{message}");
+    assert_eq!(
+        cp.config.read().await.memory.ollama_host,
+        before.memory.ollama_host,
+        "nothing else moves"
+    );
+}
