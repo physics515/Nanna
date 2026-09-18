@@ -3757,6 +3757,13 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             body["think"] = serde_json::json!(true);
         }
 
+        // The same single-slot discipline as the streaming path and
+        // `complete_ollama`. Every in-loop summarizer (context ladder,
+        // tool-output compression and summaries, distillation, memory
+        // extraction) calls this path on chat's own server, so without the
+        // permit one session's summary cancels another session's live stream.
+        let _slot = ollama_generation_slot(&self.base_url).acquire_owned().await;
+
         let response = self.apply_ollama_auth(self
             .http
             .post(format!("{}/api/chat", self.base_url))
@@ -7494,9 +7501,10 @@ mod tests {
         );
     }
 
-    /// Two servers in turn under one model name — the summarizer's client on
-    /// `[llm].ollama_url` (localhost by default) and chat's on the remote
-    /// `[memory].ollama_host`. Each keeps its own latch: the local server is
+    /// Two servers in turn under one model name — a client on this machine and
+    /// one on a remote server (as when `[memory].ollama_host` moves between
+    /// them, or, before 2026-09-18, when the summarizers had an Ollama address
+    /// of their own). Each keeps its own latch: the local server is
     /// not re-fitted on every return (a changed `num_ctx` makes Ollama evict
     /// and reload the model), and the remote server's demotion is not lost to
     /// a fresh start that faults the same way again.
@@ -7620,8 +7628,9 @@ mod tests {
         }
     }
 
-    /// One model, two servers: the summarizer's client on `[llm].ollama_url`
-    /// (this machine), chat's on a remote `[memory].ollama_host`. The local
+    /// One model, two servers: one client on this machine (where the
+    /// summarizers' own `[llm].ollama_url` pointed until 2026-09-18), another
+    /// on a remote `[memory].ollama_host`. The local
     /// server fitted 4096 while a game held the card; the remote one started
     /// at 16384, and chat's request was the latest. The summarizer's chunks
     /// are cut to the window its client reports, and its requests carry 4096:
@@ -9433,6 +9442,102 @@ mod embedding_bearer_tests {
             "one change, one step"
         );
         assert_eq!(bearer.token(), "b");
+    }
+}
+
+#[cfg(test)]
+mod ollama_generation_slot_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer `/api/chat` with a short assistant reply and count the chats;
+    /// every other path (the model-info lookups) is a 404.
+    async fn spawn_counting_ollama() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let chats = Arc::new(AtomicUsize::new(0));
+        let counter = chats.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut head = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let is_chat = String::from_utf8_lossy(&head).starts_with("POST /api/chat ");
+                let (status, body) = if is_chat {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        r#"{"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop"}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), chats)
+    }
+
+    /// The Anthropic-shaped completion — every in-loop summarizer's call —
+    /// takes the server's one generation slot like chat's stream and the
+    /// plain completion do. Without it, a summary for one session fired into
+    /// another session's live stream on the same server, and the server
+    /// cancelled the stream: the self-inflicted failure the slot exists for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_anthropic_shaped_completion_waits_for_the_generation_slot() {
+        let (url, chats) = spawn_counting_ollama().await;
+        let client = LlmClient::ollama(&url);
+        let request = AnthropicRequest {
+            context_limit: Some(4_096),
+            model: "slot-test:1b".to_string(),
+            messages: vec![AnthropicMessage::user_text("summarize")],
+            max_tokens: 16,
+            temperature: None,
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        };
+
+        // Another generation on this server holds its slot.
+        let held = ollama_generation_slot(&client.base_url)
+            .acquire_owned()
+            .await
+            .expect("the slot is open");
+        let call = tokio::spawn(async move { client.complete_anthropic(&request).await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            chats.load(Ordering::SeqCst),
+            0,
+            "no second generation reaches the server while one holds its slot"
+        );
+
+        drop(held);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the call proceeds once the slot is free")
+            .expect("the call task does not panic")
+            .expect("the server answers");
+        assert_eq!(chats.load(Ordering::SeqCst), 1);
+        assert!(!response.content.is_empty(), "{response:?}");
     }
 }
 

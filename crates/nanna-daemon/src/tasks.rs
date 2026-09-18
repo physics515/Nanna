@@ -3041,8 +3041,11 @@ impl AgentStepRunner {
             .ok_or_else(|| format!("No provider available for model '{model_display}'"))?;
         config.model = LlmRouter::strip_model_prefix(&config.model);
 
+        // Summarizers resolve through the chat router, per call: the same
+        // grammar and credentials as chat, and a reload reaches a running step.
         let mut agent = nanna_agent::Agent::new(config, llm_client, self.tools.clone())
-            .with_context(context);
+            .with_context(context)
+            .with_summarizer_clients(crate::llm_router::summarizer_clients(&self.router));
         if let Some(tracker) = &self.stats {
             agent = agent.with_stats(tracker.clone());
         }
@@ -4942,14 +4945,14 @@ mod tests {
     /// A repeat GPU fault walks down the window of the server the router
     /// sends the model to, which is where the next attempt goes, and the
     /// runner's budgets are read from that same server. The model's size on
-    /// another server (the summarizer's, on this machine) is not the one that
-    /// faulted and stays as it was.
+    /// another server (here one on this machine) is not the one that faulted
+    /// and stays as it was.
     #[test]
     fn a_gpu_fault_walks_the_window_of_the_server_the_router_sends_to() {
         let model = "ollama/test-router-demotion:8b";
         let bare = "test-router-demotion:8b";
-        let summarizer = nanna_llm::LlmClient::ollama("http://127.0.0.1:11434");
-        assert_eq!(summarizer.demote_context(bare, None), Some(24_576));
+        let other_server = nanna_llm::LlmClient::ollama("http://127.0.0.1:11434");
+        assert_eq!(other_server.demote_context(bare, None), Some(24_576));
 
         let router = LlmRouter::new().with_ollama("https://gpubox.example/ollama");
         assert_eq!(
@@ -4961,7 +4964,7 @@ mod tests {
             cached_model_info_on_router(&router, model).context_window,
             12_288
         );
-        assert_eq!(summarizer.effective_num_ctx(bare), Some(24_576));
+        assert_eq!(other_server.effective_num_ctx(bare), Some(24_576));
     }
 
     /// Both process-level cures take their server from this guard, through the
@@ -7978,6 +7981,91 @@ mod param_dialect_tests {
         assert!(
             open.is_empty(),
             "the refused add must not have written a half-formed task"
+        );
+    }
+}
+
+/// Every chat turn, sub-agent turn and background run builds its agents in
+/// [`AgentStepRunner::step_agent`], so this is where the summarizers must be
+/// given the router.
+#[cfg(test)]
+mod summarizer_wiring_tests {
+    use super::AgentStepRunner;
+    use crate::embedding_reload::test_ollama::{CHAT_MEMORY, ollama_credentials, spawn_token_gated};
+    use crate::llm_router::LlmRouter;
+    use nanna_llm::AnthropicMessage;
+    use std::sync::Arc;
+
+    fn runner(router: Arc<LlmRouter>) -> AgentStepRunner {
+        AgentStepRunner {
+            discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            user_selected_tools: Vec::new(),
+            repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
+            router,
+            tools: Arc::new(nanna_tools::ToolRegistry::new()),
+            agent_config: nanna_agent::AgentConfig {
+                model: "ollama/nanna-test-chat:1b".to_string(),
+                summarization_priority: vec!["ollama/nanna-test-summarizer:1b".to_string()],
+                ..nanna_agent::AgentConfig::default()
+            },
+            system_prompt: String::new(),
+            workspace_root: None,
+            workspace_context: None,
+            stats: None,
+            memory: None,
+            workspace_id: None,
+            chat_sink: None,
+            gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            degradations: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steps_summarizer_goes_where_chat_goes_and_follows_a_move() {
+        let (first_host, first_seen) = spawn_token_gated("bound-token").await;
+        let (moved_host, moved_seen) = spawn_token_gated("bound-token").await;
+        let router = Arc::new(LlmRouter::new());
+        router.rebuild(&ollama_credentials(
+            &first_host,
+            "bound-token",
+        ));
+
+        let mut context = nanna_agent::AgentContext::new("s");
+        context.messages.push(AnthropicMessage::user_text(
+            "Please keep the build green on every commit; that is the one rule here.",
+        ));
+        context.messages.push(AnthropicMessage::assistant_text(
+            "Understood: every commit keeps the build green.",
+        ));
+        let Ok(agent) = runner(Arc::clone(&router))
+            .step_agent(nanna_agent::harness::StepKind::Execute, context)
+        else {
+            panic!("Ollama always registers, so the chat model has a provider");
+        };
+
+        let memories = agent.extract_memories().await.expect("the summarizer answers");
+        assert_eq!(
+            memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec![CHAT_MEMORY]
+        );
+        let reached = first_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")
+                && r.model.as_deref() == Some("nanna-test-summarizer:1b")),
+            "{reached:?}"
+        );
+
+        router.rebuild(&ollama_credentials(
+            &moved_host,
+            "bound-token",
+        ));
+        agent.extract_memories().await.expect("the moved server answers");
+        let reached = moved_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")),
+            "{reached:?}"
         );
     }
 }

@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -188,12 +188,22 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
-    /// Model priority list for summarization (first working model is used)
-    /// Format: `["ollama/llama3.2", "ollama/mistral", "claude-haiku"]`
+    /// Model priority list for summarization, tried in order: the next model
+    /// answers when one cannot. Each entry is routed like a chat model, with
+    /// chat's credentials — `ollama/<model>` goes to `[memory].ollama_host`
+    /// with its bound token.
+    /// Format: `["ollama/llama3.2", "openrouter/<vendor>/<model>", "anthropic/claude-haiku-4-5"]`
     /// If empty, truncates instead of summarizing
     pub summarization_priority: Vec<String>,
-    /// Ollama server URL for summarization (if using ollama model)
-    pub ollama_url: Option<String>,
+    // NOTE: `ollama_url` was retired 2026-09-18 (owner decision: "summarization
+    // should follow the summarization model selection in settings, with
+    // fallbacks"). It was the summarizers' own Ollama address — localhost by
+    // default, with no token — so summaries went to a different server than
+    // chat whenever chat moved. Summaries now reach Ollama through chat's
+    // router. Existing config.toml files still carrying it load unchanged:
+    // nothing here uses `#[serde(deny_unknown_fields)]`, so serde ignores the
+    // stale key and the next save drops it. Covered by
+    // `legacy_llm_ollama_url_key_still_loads`.
     /// Ollama API key (optional — for remote/authenticated Ollama instances)
     pub ollama_api_key: Option<String>,
     /// Model routing priority for cost optimization.
@@ -292,7 +302,6 @@ impl Default for LlmConfig {
             anthropic_oauth_token: None,
             anthropic_use_oauth: false,
             summarization_priority: vec![], // Empty = truncate instead of summarize
-            ollama_url: Some("http://localhost:11434".to_string()),
             ollama_api_key: None,
             model_routing: vec![], // Empty = disabled (always use primary model)
             routing_first_turn_primary: true,
@@ -711,6 +720,31 @@ fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// What to tell someone whose `config.toml` still carries the retired
+/// `[llm].ollama_url` pointed at another server than `config` uses; `None`
+/// when it is absent or names the same server.
+///
+/// Read from the raw text because serde drops the key on the way in, and the
+/// next save drops it from disk — so this load is the last moment anything
+/// can see that summaries used to go somewhere else. The shipped default
+/// (this machine, like `[memory].ollama_host`'s) moves nothing and says
+/// nothing.
+fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
+    let raw: toml::Table = content.parse().ok()?;
+    let retired = raw.get("llm")?.get("ollama_url")?.as_str()?.trim();
+    let host = config.memory.ollama_host.trim();
+    if retired.is_empty() || same_ollama_server(retired, host) {
+        return None;
+    }
+    Some(format!(
+        "config.toml still sets [llm].ollama_url = \"{retired}\", which is no longer read: \
+         summaries now reach Ollama through chat's server, [memory].ollama_host = \"{host}\". \
+         If your summarization models are on {retired}, set it as the Ollama server in \
+         Settings -> Models (it is then chat's and the embedders' server too); otherwise \
+         delete the key."
+    ))
+}
+
 impl Config {
     /// Load config from default location.
     ///
@@ -738,6 +772,9 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
+        if let Some(notice) = retired_ollama_url_notice(&content, &config) {
+            warn!("{notice}");
+        }
         config.load_secrets_from_store();
         Ok(config)
     }
@@ -1591,6 +1628,72 @@ webhook_secret = "s3cret"
             .expect("the default config writes a [server] table");
         let server = server.split("\n[").next().unwrap_or_default();
         assert!(!server.contains("host"), "no host key is written: {server}");
+    }
+
+    #[test]
+    fn legacy_llm_ollama_url_key_still_loads() {
+        // `[llm].ollama_url` was retired 2026-09-18 (owner decision: summaries
+        // follow the Settings list through chat's providers). It was the
+        // summarizers' own Ollama address — localhost by default, no token —
+        // so every config ever saved carries it, and a config that refuses to
+        // parse is a dead app. The stale key must be ignored, and the keys
+        // beside it must still land.
+        let legacy = r#"
+[llm]
+summarization_priority = ["ollama/qwen3:4b"]
+ollama_url = "http://localhost:11434"
+model = "qwen3.5:9b"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.llm.summarization_priority, vec!["ollama/qwen3:4b"]);
+        assert_eq!(config.llm.model, "qwen3.5:9b", "the keys beside it still land");
+
+        // And it is gone for good: a saved config no longer carries a key
+        // that looks like it points the summarizer somewhere.
+        let written = toml::to_string(&config).expect("config serializes");
+        assert!(!written.contains("ollama_url"), "no ollama_url is written: {written}");
+    }
+
+    /// A leftover `[llm].ollama_url` that named another server than chat's is
+    /// the one case where the retirement moves summaries somewhere new, and
+    /// serde drops the key before anything else could see it. Loading says
+    /// so, naming both servers and what to do.
+    #[test]
+    fn a_leftover_ollama_url_naming_another_server_is_announced() {
+        let legacy = r#"
+[llm]
+ollama_url = "http://gpu-box:11434"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        let notice =
+            retired_ollama_url_notice(legacy, &config).expect("a moved summarizer is announced");
+        assert!(
+            notice.contains("http://gpu-box:11434") && notice.contains("http://localhost:11434"),
+            "names both servers: {notice}"
+        );
+        assert!(notice.contains("Settings"), "says where to set it: {notice}");
+    }
+
+    /// The same server, however it is spelled, moves nothing — the shipped
+    /// default case — and neither does a config without the key.
+    #[test]
+    fn a_leftover_ollama_url_naming_the_same_server_is_quiet() {
+        let same = r#"
+[llm]
+ollama_url = "http://127.0.0.1:11434/"
+
+[memory]
+ollama_host = "http://localhost:11434"
+"#;
+        let config: Config = toml::from_str(same).expect("parses");
+        assert_eq!(retired_ollama_url_notice(same, &config), None);
+
+        let without = "[memory]\nollama_host = \"http://gpu-box:11434\"\n";
+        let config: Config = toml::from_str(without).expect("parses");
+        assert_eq!(retired_ollama_url_notice(without, &config), None);
     }
 
     // -----------------------------------------------------------------

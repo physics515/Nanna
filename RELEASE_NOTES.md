@@ -115,6 +115,49 @@ asks, and tells apart "Ollama isn't running" from "it's running but this model i
 with the exact `ollama pull` to run. The model picker in Settings asks the same way. A server that
 lists a model as `qwen` rather than `qwen:latest` no longer has it reported missing.
 
+**Summaries use the Summarization models you chose in Settings, in order.** Shortening a long
+conversation, condensing a large tool result, the notes a long task keeps as it goes, and picking
+out memories to keep all use the Summarization Model Priority list (Settings → Models, Context
+Summarization), first to last. Each model is reached the same way chat reaches it, with the same
+keys, so an `ollama/` entry goes to the Ollama server set above, with its token. When a model
+cannot be reached, or its answer is empty or unusable, the next one is tried; for condensing a
+tool result, an answer that does not rate every sentence counts as unusable. The conversation is
+cut to fit only when no model in the list answers, or when the list is empty, as the hint in
+Settings says. Picking out memories falls back to the chat model instead. That used to happen only
+when the list was empty; now it also happens when every listed model fails, so with a local
+summarizer down, memories are picked out by your chat model, which may cost more. It still holds a
+reply up no longer than its one call used to. Condensing one large tool result, and the pass that
+condenses older ones, each stop after that same time in all (two minutes), so a server that takes
+a request and never answers holds the reply up once, not once for every model or every result.
+A summary on your Ollama server waits for a chat reply being generated there to finish, rather than
+cutting it off. Before this, summaries used their own `[llm].ollama_url`, which pointed at this
+computer unless you changed it, and sent no token, so with chat on a remote server they were
+refused. Several of them also tried only the first model in the list. In the app, a new server,
+token or key reaches summaries at once, even in a chat that is already running (`nanna chat` in a
+terminal reads them when it starts); a change to the list applies from the next message, and a
+background task keeps the list it started with. `[llm].ollama_url` is no longer read; an old config
+that has it still loads, and setting it through the daemon is refused with a note saying what
+replaced it. If yours pointed at a different server from the one in Settings → Models, the log says
+so when the config loads: set that server in Settings if your summarization models are on it.
+`nanna doctor` now checks one Ollama server, for chat, embedding and summary models together, and
+expects a model there exactly when chat, the embedders or the summarizers would send it there. An
+entry typed without a provider now goes where chat would send it: `qwen3` and `meta-llama/llama-3`
+to Anthropic, `gpt-oss:20b` to OpenAI. `nanna doctor` warns about each and shows how to write it
+(`ollama/qwen3`).
+
+**Memory consolidation skipped `anthropic/` and `openai/` summarization models.** Settings writes
+these entries as `anthropic/<model>` and `openai/<model>`. Both were sent to Anthropic with the
+prefix still on the name, so dreaming, consolidating on request, and the `day_dream` tool failed on
+them every time and moved on. They now reach their own provider under the model's real name. With
+the Summarization Model Priority list empty, all three now use your chat models in order; before,
+two of them used only the first chat model. A model that answers with no text is now passed over
+like one that fails. Before, it ended the search as if it had answered, so dreaming could replace a
+group of memories with an empty one and `day_dream` reported an empty result without asking the
+next model. The same routing applies to chat models. `nanna init` offers OpenRouter users
+`anthropic/claude-sonnet-4` and `openai/gpt-4o`; in the app these now go to Anthropic or OpenAI
+directly, where before they went to Anthropic with the prefix on and failed. To use them through
+OpenRouter, write `openrouter/openai/gpt-4o`.
+
 **Recovery acts on the Ollama server you set, and never kills a local one for a remote one.** When
 chat against Ollama kept failing, Nanna unloaded the model and, as a last resort, restarted Ollama.
 Both went to the server `OLLAMA_HOST` named, or to the default address on this computer, no matter
@@ -135,9 +178,9 @@ for a server on another machine, whose card it cannot see. A busy card here coul
 model's window to the minimum. A remote server now starts at 16,384 tokens, the size Nanna uses
 whenever the card cannot be read, and still steps down if that server runs out of memory. The size
 is kept per server, so changing the server in Settings while Nanna runs no longer carries the old
-server's size over, and a model used on two servers (summaries on this computer, chat on another)
-keeps one for each. Each prompt is sized for the window of the server it is sent to, and running
-out of memory on one server shrinks only that server's window.
+server's size over, and a model used on two servers keeps one for each. Each prompt is sized for
+the window of the server it is sent to, and running out of memory on one server shrinks only that
+server's window.
 
 **A failed model lookup is no longer remembered for a week.** When Nanna could not get a model's
 details from its provider (a refused token, a server that was down, a network error), it cached the
@@ -184,11 +227,9 @@ second and shuts down cleanly.
 on the build host. They are tested against a scripted Bot API server, with request and update shapes
 from the Bot API changelog and a mirror of its reference page.
 
-**Conversation summaries do not use the Ollama server set above.** They still read their own
-`[llm].ollama_url` and send no token, so a summarizer pointed at a server that requires one is
-refused. A chat through a real remote model was not run either: the token path was driven against a
-test server that refuses every request without it, and the real remote server only answered the
-connection check.
+**A chat through a real remote Ollama model was not run.** The token path was driven against a test
+server that refuses every request without it, and the real remote server only answered the
+connection check. Summaries on a remote server were checked the same way.
 
 **Only Linux was driven end to end tonight.** The Windows and macOS builds are covered by the
 release workflow, not by a run of the real app.

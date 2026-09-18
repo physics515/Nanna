@@ -248,14 +248,12 @@ impl ControlPlane {
 
         let router_for_summarize = router.clone();
 
-        // Summarization models from settings, falling back to the main
-        // model priority. Shared with the scheduled dream cycle so the
-        // two paths cannot drift (see `crate::dream_summarizer`).
+        // Summarization models from settings, falling back to the chat
+        // models in their configured order. Shared with the scheduled dream
+        // cycle and `memory.summarize` so the three cannot drift (see
+        // `crate::dream_summarizer`).
         let cfg = self.config.read().await;
-        let summarize_models = crate::dream_summarizer::summarization_models(
-            &cfg.llm.summarization_priority,
-            &cfg.llm.model_priority,
-        );
+        let summarize_models = crate::dream_summarizer::for_llm_config(&cfg.llm);
         let max_compression_ratio = cfg.memory.max_compression_ratio;
         let min_remaining_memories = cfg.memory.min_remaining_memories;
         drop(cfg);

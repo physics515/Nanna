@@ -742,3 +742,77 @@ async fn a_scheduled_job_can_post_into_an_existing_conversation_only() {
     let unrouted = cp.handle("test", add(None)).await;
     assert_eq!(unrouted["status"], "created");
 }
+
+/// `[llm].ollama_url` is retired: summaries go through chat's router and its
+/// one Ollama server. A `set` of it used to answer `updated` while serde
+/// dropped the key on the round trip, so a script that moved its summarizer
+/// that way would never learn it no longer does.
+#[tokio::test]
+async fn setting_a_retired_key_is_refused_with_what_replaced_it() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let before = cp.config.read().await.clone();
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.ollama_url".into(),
+                value: json!("http://gpu.example:11434"),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "retired_key", "{resp}");
+    assert_eq!(resp["path"], "llm.ollama_url", "{resp}");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.contains("memory.ollama_host"), "{message}");
+    assert_eq!(
+        cp.config.read().await.memory.ollama_host,
+        before.memory.ollama_host,
+        "nothing else moves"
+    );
+}
+
+/// The same key inside an object set at its parent is refused the same way:
+/// a `set` of `llm` carrying `ollama_url` used to answer `updated` and drop
+/// the key, and the rest of the object with it went through unnoticed.
+#[tokio::test]
+async fn a_retired_key_inside_a_parent_object_is_refused_too() {
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
+    let before = cp.config.read().await.llm.model.clone();
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm".into(),
+                value: json!({
+                    "model": "nanna-test-other-model",
+                    "ollama_url": "http://gpu.example:11434",
+                }),
+            }),
+        )
+        .await;
+
+    assert_eq!(resp["error"], "retired_key", "{resp}");
+    assert_eq!(resp["path"], "llm", "{resp}");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ollama_url") && message.contains("memory.ollama_host"),
+        "{message}"
+    );
+    assert_eq!(cp.config.read().await.llm.model, before, "nothing is applied");
+
+    // The same object without the retired key is an ordinary set.
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm".into(),
+                value: json!({ "model": "nanna-test-other-model" }),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated", "{resp}");
+    assert_eq!(cp.config.read().await.llm.model, "nanna-test-other-model");
+}

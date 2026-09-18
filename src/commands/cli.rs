@@ -3,6 +3,7 @@
 use crate::setup::init_components;
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions, Workspace};
 use nanna_config::Config;
+use nanna_daemon::llm_router::{AnthropicCredential, LlmRouter, ProviderCredentials, ProviderId};
 use nanna_storage::{Storage, StorageConfig};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -45,6 +46,112 @@ Be helpful. Be competent. Don't waste words.",
     }
 
     base
+}
+
+/// The credentials the CLI's summarizers may use, read the way the CLI reads
+/// its own config — not the way the daemon reads it.
+///
+/// The daemon's `LlmConfig::from_nanna` takes `[llm].api_key` for the
+/// Anthropic key, because that is what the GUI saves there. In the CLI the same
+/// field is the key of `[llm].provider` ([`crate::setup::chat_provider`]):
+/// `nanna init` stores an `OpenRouter` or `OpenAI` key there, and files it in
+/// the keyring under the Anthropic entry. Resolving the daemon's way therefore
+/// registered an Anthropic client holding that secret, and the first
+/// `anthropic/` summary — or any bare name the router sends to Anthropic —
+/// posted it to api.anthropic.com.
+///
+/// So the chat key serves the chat provider and no other, and every other
+/// provider gets only a credential stored under its own name: `OpenAI`,
+/// `OpenRouter` and GitHub their own keys, Ollama the token bound to
+/// `[memory].ollama_host`. The daemon's Anthropic chain (keyring entry, OAuth
+/// refresh, the Claude CLI login) is not walked: the CLI's chat never used it,
+/// and walking it would read — and may refresh and rewrite — a login on every
+/// start.
+fn summarizer_credentials(config: &Config) -> ProviderCredentials {
+    let non_blank = |value: Option<&String>| {
+        value
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let chat = crate::setup::chat_provider(&config.llm.provider);
+    let chat_key = non_blank(config.llm.api_key.as_ref());
+    let slot = |provider: ProviderId, own: Option<&String>| {
+        if provider == chat {
+            chat_key.clone().or_else(|| non_blank(own))
+        } else {
+            non_blank(own)
+        }
+    };
+    let anthropic = if chat == ProviderId::Anthropic {
+        chat_key.clone()
+    } else {
+        None
+    };
+    // Carried into the error a skipped `anthropic/` entry logs, so the log
+    // says why rather than only that Anthropic is missing.
+    let anthropic_absent_reason = match (&anthropic, chat) {
+        (Some(_), _) => None,
+        (None, ProviderId::Anthropic) => Some("no `[llm].api_key` is set".to_string()),
+        (None, provider) => Some(format!(
+            "in the CLI `[llm].api_key` is the {} key (`[llm].provider = \"{}\"`), and the CLI \
+             holds no other Anthropic credential",
+            provider.name(),
+            config.llm.provider
+        )),
+    };
+    ProviderCredentials {
+        anthropic: anthropic.map(AnthropicCredential::ApiKey),
+        anthropic_absent_reason,
+        openai_api_key: slot(ProviderId::OpenAI, config.llm.openai_api_key.as_ref()),
+        openrouter_api_key: slot(ProviderId::OpenRouter, config.llm.openrouter_api_key.as_ref()),
+        github_token: non_blank(config.llm.github_token.as_ref()),
+        ollama_host: config.memory.ollama_host.clone(),
+        ollama_api_key: non_blank(config.llm.ollama_api_key.as_ref()),
+    }
+}
+
+/// How the CLI's agent reaches its summarization models: a chat router like
+/// the daemon's, so an entry in `[llm].summarization_priority` routes by the
+/// one grammar (`ProviderId::from_model`), over [`summarizer_credentials`].
+///
+/// `None` when the list names no model. Nothing would ever be resolved, so no
+/// router is built and the CLI starts exactly as it did before summaries had
+/// one; the agent then cuts to fit, and extracts memories on the chat model.
+fn summarizer_clients(config: &Config) -> Option<nanna_agent::SummarizerClients> {
+    if config
+        .llm
+        .summarization_priority
+        .iter()
+        .all(|spec| spec.trim().is_empty())
+    {
+        return None;
+    }
+    let router = Arc::new(LlmRouter::new());
+    router.rebuild(&summarizer_credentials(config));
+    Some(nanna_daemon::llm_router::summarizer_clients(&router))
+}
+
+/// The agent `nanna chat` and `nanna run` talk to: `agent_config` walking the
+/// config's summarization list, resolved through [`summarizer_clients`] over
+/// the same config — so the list the agent walks and the providers it
+/// reaches come from one place.
+fn cli_agent(
+    config: &Config,
+    agent_config: AgentConfig,
+    llm: Arc<nanna_core::LlmClient>,
+    tools: Arc<nanna_tools::ToolRegistry>,
+    context: AgentContext,
+) -> Agent {
+    let agent_config = AgentConfig {
+        summarization_priority: config.llm.summarization_priority.clone(),
+        ..agent_config
+    };
+    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    match summarizer_clients(config) {
+        Some(clients) => agent.with_summarizer_clients(clients),
+        None => agent,
+    }
 }
 
 /// Print tool call results.
@@ -119,8 +226,6 @@ pub async fn run_cli(
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        summarization_priority: config.llm.summarization_priority.clone(),
-        summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()
     };
 
@@ -150,7 +255,7 @@ pub async fn run_cli(
             }
         }
 
-    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    let agent = cli_agent(config, agent_config, llm, tools, context);
     run_cli_loop(&agent, &storage, &session_id, stream).await
 }
 
@@ -264,8 +369,6 @@ pub async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> a
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        summarization_priority: config.llm.summarization_priority.clone(),
-        summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()
     };
 
@@ -286,7 +389,7 @@ Be concise and direct.",
         cwd.display()
     ));
 
-    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    let agent = cli_agent(config, agent_config, llm, tools, context);
 
     match agent.run(prompt, RunOptions::default()).await {
         Ok(response) => {
@@ -342,4 +445,148 @@ pub async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
     println!("\nResume with: nanna chat --session <ID>");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHAT_KEY: &str = "sk-chat-provider-key";
+
+    /// What `nanna init` leaves behind: `provider`'s key in `[llm].api_key`,
+    /// the only key the CLI has, and a summarization list naming Anthropic
+    /// both ways a hand-edit might (the Settings picker's prefix, and the
+    /// `OpenRouter` spelling of the same model).
+    fn cli_config(provider: &str) -> Config {
+        let mut config = Config::default();
+        config.llm.provider = provider.to_string();
+        config.llm.api_key = Some(CHAT_KEY.to_string());
+        config.llm.openai_api_key = None;
+        config.llm.openrouter_api_key = None;
+        config.llm.github_token = None;
+        config.llm.ollama_api_key = None;
+        config.llm.summarization_priority = vec![
+            "anthropic/claude-3.5-haiku".to_string(),
+            "openrouter/anthropic/claude-3.5-haiku".to_string(),
+        ];
+        config
+    }
+
+    fn resolved_model(clients: &nanna_agent::SummarizerClients, spec: &str) -> Result<String, String> {
+        clients.resolve(spec).map(|(_, model)| model)
+    }
+
+    /// The live hazard: an `OpenRouter` or `OpenAI` user's key must never become
+    /// an Anthropic client, which would post it to api.anthropic.com for an
+    /// `anthropic/` summary or for a bare name the router sends there.
+    #[test]
+    fn the_chat_key_serves_the_chat_provider_and_no_other() {
+        for (provider, own_prefix) in [
+            ("openrouter", "openrouter/anthropic/claude-3.5-haiku"),
+            ("openai", "openai/gpt-4o-mini"),
+        ] {
+            let config = cli_config(provider);
+            let credentials = summarizer_credentials(&config);
+            assert_eq!(credentials.anthropic, None, "{provider}");
+            let slots = [
+                ("openai", credentials.openai_api_key.as_deref()),
+                ("openrouter", credentials.openrouter_api_key.as_deref()),
+            ];
+            for (slot, key) in slots {
+                let expected = (slot == provider).then_some(CHAT_KEY);
+                assert_eq!(key, expected, "{provider}: the {slot} slot");
+            }
+
+            let clients = summarizer_clients(&config).expect("the list names models");
+            for spec in ["anthropic/claude-3.5-haiku", "llama3"] {
+                let why = resolved_model(&clients, spec).expect_err(spec);
+                assert!(
+                    why.contains(&format!("is the {provider} key")),
+                    "{provider}: `{spec}` is skipped and the log says why: {why}"
+                );
+            }
+            assert!(
+                resolved_model(&clients, own_prefix).is_ok(),
+                "{provider}: its own models still summarize"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anthropic_chat_key_summarizes_on_anthropic() {
+        let config = cli_config("anthropic");
+        let credentials = summarizer_credentials(&config);
+        assert_eq!(
+            credentials.anthropic,
+            Some(AnthropicCredential::ApiKey(CHAT_KEY.to_string()))
+        );
+        assert_eq!(credentials.anthropic_absent_reason, None);
+        assert_eq!(credentials.openrouter_api_key, None);
+
+        let clients = summarizer_clients(&config).expect("the list names models");
+        assert_eq!(
+            resolved_model(&clients, "anthropic/claude-3.5-haiku").as_deref(),
+            Ok("claude-3.5-haiku")
+        );
+        assert!(resolved_model(&clients, "openrouter/anthropic/claude-3.5-haiku").is_err());
+    }
+
+    /// A key stored under its own provider's name is that provider's whatever
+    /// chat uses, and the Ollama token goes only to the server it is bound to.
+    #[test]
+    fn keys_stored_under_their_own_name_serve_their_own_provider() {
+        let mut config = cli_config("openrouter");
+        config.llm.openai_api_key = Some("sk-openai-own".to_string());
+        config.llm.ollama_api_key = Some("ollama-bound-token".to_string());
+        config.memory.ollama_host = "https://ollama.example.test".to_string();
+
+        let credentials = summarizer_credentials(&config);
+        assert_eq!(credentials.openai_api_key.as_deref(), Some("sk-openai-own"));
+        assert_eq!(credentials.openrouter_api_key.as_deref(), Some(CHAT_KEY));
+        assert_eq!(credentials.ollama_host, "https://ollama.example.test");
+        assert_eq!(credentials.ollama_api_key.as_deref(), Some("ollama-bound-token"));
+        assert_eq!(credentials.anthropic, None);
+    }
+
+    /// `nanna chat` and `nanna run` build their agent in one place: with a
+    /// listed Ollama summarizer the agent resolves it to the configured
+    /// server under its bare id; with no list it carries no resolver.
+    #[test]
+    fn the_cli_agent_summarizes_through_the_configured_server() {
+        let mut config = cli_config("anthropic");
+        config.memory.ollama_host = "http://ollama.example.test:11434".to_string();
+        config.llm.summarization_priority = vec!["ollama/qwen3:4b".to_string()];
+        let build = |config: &Config| {
+            cli_agent(
+                config,
+                AgentConfig::default(),
+                Arc::new(nanna_core::LlmClient::ollama("http://127.0.0.1:9")),
+                Arc::new(nanna_tools::ToolRegistry::new()),
+                AgentContext::new("cli-test"),
+            )
+        };
+
+        let agent = build(&config);
+        let (client, model) = agent
+            .summarizer_clients()
+            .expect("a listed model attaches a resolver")
+            .resolve("ollama/qwen3:4b")
+            .expect("the configured server serves it");
+        assert_eq!(model, "qwen3:4b");
+        assert_eq!(client.base_url(), "http://ollama.example.test:11434");
+
+        config.llm.summarization_priority.clear();
+        assert!(build(&config).summarizer_clients().is_none());
+    }
+
+    /// With nothing listed nothing would be resolved, so the CLI builds no
+    /// router and starts as it always did.
+    #[test]
+    fn an_empty_list_builds_no_router() {
+        let mut config = cli_config("anthropic");
+        config.llm.summarization_priority = Vec::new();
+        assert!(summarizer_clients(&config).is_none());
+        config.llm.summarization_priority = vec!["  ".to_string()];
+        assert!(summarizer_clients(&config).is_none());
+    }
 }

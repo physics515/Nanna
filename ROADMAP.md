@@ -5262,7 +5262,7 @@ asks permission or restricts her.)*:
             - [ ] **`enabled`:** owner call. It cannot gate an explicit `nanna server`
                   command without surprising whoever typed it; delete it, or define it as
                   "the daemon starts the HTTP surface" and wire that.
-      - [ ] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
+      - [x] *(found 2026-09-11, in a real-binary smoke run)* **Two keys configure one Ollama
             server.** Chat and embeddings reach Ollama through `[memory].ollama_host`;
             summarization (dreaming, context compression) through `[llm].ollama_url`, which
             defaults to localhost — so pointing the first at a GPU box leaves summaries on
@@ -5271,6 +5271,50 @@ asks permission or restricts her.)*:
             cannot tell a deliberate split from an untouched one (the `[server].host` trap
             again). Meanwhile `nanna doctor` warns when both are in use and differ
             (`ollama.servers`), folding `localhost`/`127.0.0.1`/`[::1]` and the default port.
+            *(2026-09-18 — decided and done. Owner: "summarization should follow the
+            summarization model selection in settings, with fallbacks." `[llm].ollama_url` is
+            retired: every summarizer resolves each `[llm].summarization_priority` entry through
+            the chat router (one grammar, `anthropic/` and `openai/` now included; chat's
+            server, token and keys), per call, so a config change reaches a running turn. Each
+            consumer walks the list in Settings order and moves on when a model cannot be
+            reached or answers unusably; in-loop summaries cut to fit only when none answers or
+            the list is empty, and memory consolidation falls back to the chat models in order.
+            An old config carrying `ollama_url` still loads. The `ollama.servers` check and the
+            second-server probe are gone: `--online` probes the one server for chat, embedding
+            and summary models, and a new `llm.summarization` check warns on a hand-edited entry
+            the router misplaces (a bare untagged name or an unknown `vendor/` namespace sent to
+            Anthropic, a `gpt-…:tag` Ollama model sent to OpenAI). `config.set llm.ollama_url`
+            is refused by name. The CLI's router gives `[llm].api_key` only to `[llm].provider`,
+            since there that key is the chat provider's, not Anthropic's. Lost on purpose:
+            summarizing on a second Ollama server; that needs a per-spec syntax, not a global
+            key; loading warns when a leftover `ollama_url` named a server other than
+            `[memory].ollama_host`, since the first save drops the key. Review follow-ups, same
+            day: the memory consumers pass over an empty answer; tool-result compression passes
+            over one that does not score every sentence, and falls back to the whole-line cut
+            only when no listed model scores; compacting one tool result (compression plus
+            summary) and each Tier-1 pass have one deadline each (one un-streamed call's
+            transport tolerance); the Anthropic-shaped Ollama completion takes the per-server
+            generation slot, so a summary cannot cancel another session's stream; `--online`
+            expects each model on Ollama by its own router's rule. Still unbounded but for the
+            transport: the Tier 2/3 chunk walk, where one conversation can legitimately need
+            many calls.)*
+      - [ ] *(found 2026-09-18, reviewing the CLI's summarizer router)* **`[llm].api_key` means
+            two things.** The CLI (`nanna init`, the missing-key prompt, `init_components`) reads
+            it as the key of `[llm].provider` and files it in the keyring under the *Anthropic*
+            entry; the daemon's `LlmConfig::from_nanna` reads it as the Anthropic key whatever
+            `[llm].provider` says. The CLI's own router now follows the CLI's meaning
+            (`commands::cli::summarizer_credentials`), but a config written by `nanna init` for
+            OpenRouter or OpenAI and then served by the daemon still registers that key as the
+            Anthropic credential, where a `claude-*` chat or an `anthropic/` summary would send
+            it. Fix at the source: `nanna init` should write the key to the provider's own slot
+            (`openrouter_api_key`, `openai_api_key`) and keyring entry, with a one-time
+            migration of the existing ones keyed on `[llm].provider`. The same writer offers
+            OpenRouter users vendor-namespaced chat models (`anthropic/claude-sonnet-4`,
+            `openai/gpt-4o`, `google/gemini-pro`), which the daemon copies into its chat model:
+            since `anthropic/` and `openai/` became provider prefixes (2026-09-18) the first two
+            go to Anthropic and OpenAI directly — before, all three went to Anthropic unstripped
+            and failed. `nanna init` should write `openrouter/<id>`, and the migration should
+            prefix existing ones when `[llm].provider` is `openrouter`.
       - [~] **The network leg, deliberately separate:** provider connectivity, API-key validity,
             Ollama reachability. Kept out of the offline pass on purpose — slow, and they fail for
             reasons that are not configuration, so mixing them means a laptop with no internet

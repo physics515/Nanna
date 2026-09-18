@@ -198,10 +198,10 @@ nanna doctor
 
 Checks the configuration and, for anything it finds, prints the fix rather than
 just the verdict — a missing tools directory, a `[infer]` section that names no
-model, a clustering configuration that would merge unrelated memories, chat and
-summarization pointed at two different Ollama servers by accident. Exits
-non-zero when something is actually broken, so it also works from a script or a
-health probe.
+model, a clustering configuration that would merge unrelated memories, a
+hand-edited summarization model with no provider prefix that will be sent to the
+wrong provider (and how to write it, e.g. `ollama/qwen3`). Exits non-zero when
+something is actually broken, so it also works from a script or a health probe.
 
 By default it is **offline**: no provider call, no network probe, no keyring
 read. That makes it fast and safe to run anywhere, and it means a clean report
@@ -211,11 +211,13 @@ says your *configuration* is sound — not that a provider is reachable.
 nanna doctor --online
 ```
 
-Adds the one probe that needs no credential: each Ollama server your
-configuration uses is asked whether it is answering and whether it has the
-models you configured, and a missing one is reported with the `ollama pull`
-that fixes it. It never tests a provider API key — that would mean reading the
-keyring and sending the key off the machine.
+Adds the one probe that needs no credential: your Ollama server
+(`[memory].ollama_host`, the one server chat, embeddings and summaries all use)
+is asked whether it is answering and whether it has every Ollama model you
+configured for any of them — a model counts when chat, the embedders or the
+summarizers would send it there — and a missing one is reported with the
+`ollama pull` that fixes it. It never tests a provider API key — that would mean
+reading the keyring and sending the key off the machine.
 
 ### API Key Invalid
 - Verify the key in **Settings → Models**

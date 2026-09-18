@@ -240,6 +240,9 @@ impl ControlPlane {
 
     /// `ConfigAction::Set`: write one dotted path, persist, and propagate the change live.
     async fn config_set(&self, path: String, value: Value) -> Value {
+        if let Some(instead) = retired_key_set(&path, &value) {
+            return json!({ "error": "retired_key", "message": instead, "path": path });
+        }
         let mut config = self.config.write().await;
         let mut config_value = match serde_json::to_value(&*config) {
             Ok(v) => v,
@@ -361,6 +364,41 @@ impl ControlPlane {
         }
         config.clone()
     }
+}
+
+/// Keys the daemon once read and no longer does, each with the sentence
+/// saying what replaced it.
+///
+/// A `config.set` of one would answer `updated` and change nothing: serde
+/// drops an unknown key on the round trip, and the next save removes it from
+/// disk. Refusing it by name is how a script that used it learns it stopped
+/// working.
+const RETIRED_KEYS: [(&str, &str); 1] = [(
+    "llm.ollama_url",
+    "[llm].ollama_url is no longer read: summaries go through chat's router, so an \
+     `ollama/` summarization model uses chat's one Ollama server and its token. Set \
+     memory.ollama_host to move it.",
+)];
+
+/// What replaced the retired key a `set` of `value` at `path` would write, or
+/// `None` when it writes none.
+///
+/// Either the key's own path, or a parent of it given an object that carries
+/// the key (`llm` with `{"ollama_url": …}`): the round trip drops the key the
+/// same way in both, so both are refused the same way.
+fn retired_key_set(path: &str, value: &Value) -> Option<&'static str> {
+    RETIRED_KEYS.iter().find_map(|(key, instead)| {
+        let written = *key == path
+            || key
+                .strip_prefix(path)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|rest| {
+                    rest.split('.')
+                        .try_fold(value, |node, part| node.get(part))
+                        .is_some()
+                });
+        written.then_some(*instead)
+    })
 }
 
 /// Set `value` at the dotted `parts` path inside `obj`, creating intermediate

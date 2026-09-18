@@ -13,7 +13,7 @@
 //! its config as broken. The default pass runs in milliseconds, is
 //! deterministic, and is safe to run anywhere.
 //!
-//! **`--online` adds the one probe that needs no credential**: each Ollama
+//! **`--online` adds the one probe that needs no credential**: the Ollama
 //! server in use is asked for its model list ([`run_online_checks`]). Provider
 //! key checks are absent on purpose — they would read the keyring and send a
 //! key off the machine.
@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use nanna_config::Config;
 use nanna_config::credentials::{ClaudeCredentialManager, OAuthCredential};
+use nanna_daemon::llm_router::ProviderId;
 use nanna_llm::{OllamaProbe, probe_ollama};
 
 /// How bad a finding is.
@@ -117,7 +118,7 @@ pub fn run_checks(config: &Config, config_path: &Path) -> Vec<Check> {
     checks.push(check_server_exposure());
     checks.push(check_tools_dir(config));
     checks.push(check_embeddings(config));
-    checks.push(check_ollama_servers(config));
+    checks.push(check_summarization_models(config));
     checks.push(check_mcp_servers(config, command_resolves, |key| {
         nanna_config::credentials::SecureStore::new().get(key).ok()
     }));
@@ -506,109 +507,98 @@ fn check_embeddings(config: &Config) -> Check {
     }
 }
 
-/// Ollama's own default port, which a base URL without one means.
-const OLLAMA_DEFAULT_PORT: u16 = 11434;
-
-/// What the summarizer falls back to when `[llm].ollama_url` is unset.
-const OLLAMA_DEFAULT_URL: &str = "http://localhost:11434";
-
-/// Two Ollama servers configured without meaning to.
+/// Summarization entries the chat router will send somewhere the user did not
+/// mean.
 ///
-/// Chat and embeddings reach Ollama through `[memory].ollama_host`;
-/// summarization — the model behind dreaming and context compression —
-/// through `[llm].ollama_url`, which defaults to localhost. Point the first at a
-/// GPU box and summaries still go to localhost. Found 2026-09-11 in a smoke
-/// run. Which key should win is an owner call — a saved config carries the
-/// default on disk, so code cannot tell a deliberate split from an untouched
-/// one — so this says so rather than guessing.
-fn check_ollama_servers(config: &Config) -> Check {
-    let summarizes_on_ollama = config
-        .llm
-        .summarization_priority
+/// Every summarizer resolves `[llm].summarization_priority` through the chat
+/// router, by the router's grammar ([`misplaced_by_router`] says which
+/// entries it misplaces). The Settings picker always writes a provider prefix,
+/// so such an entry was typed by hand — and the summarizers used to send every
+/// unprefixed name to Ollama, so it is most likely an Ollama model that
+/// another provider will now be asked for and does not have. The walk passes
+/// over it on every summary.
+fn check_summarization_models(config: &Config) -> Check {
+    const NAME: &str = "llm.summarization";
+    let listed = &config.llm.summarization_priority;
+    let misrouted: Vec<(&str, &str)> = listed
         .iter()
-        .any(|m| is_ollama_summary_spec(m));
-    let chats_on_ollama = config.llm.provider.eq_ignore_ascii_case("ollama")
-        || config.llm.model_priority.iter().any(|m| is_ollama_spec(m))
-        || config
-            .memory
-            .embedding_provider
-            .eq_ignore_ascii_case("ollama")
-        || config
-            .memory
-            .embedding_priority
-            .iter()
-            .any(|m| is_ollama_spec(m));
-    if !(summarizes_on_ollama && chats_on_ollama) {
-        return Check::ok("ollama.servers", "at most one Ollama server is in use");
-    }
-    let chat_url = config.memory.ollama_host.as_str();
-    let summary_url = config
-        .llm
-        .ollama_url
-        .as_deref()
-        .unwrap_or(OLLAMA_DEFAULT_URL);
-    if ollama_endpoint(chat_url) == ollama_endpoint(summary_url) {
+        .map(|m| m.trim())
+        .filter_map(|m| misplaced_by_router(m).map(|why| (m, why)))
+        .collect();
+    let Some((example, _)) = misrouted.first() else {
         return Check::ok(
-            "ollama.servers",
-            format!("chat, embeddings and summarization share {chat_url}"),
+            NAME,
+            if listed.is_empty() {
+                "no summarization model is listed; history is cut to fit instead".to_string()
+            } else {
+                format!(
+                    "{} summarization model(s), tried in order through chat's providers",
+                    listed.len()
+                )
+            },
         );
-    }
+    };
+    let named = misrouted
+        .iter()
+        .map(|(m, why)| format!("`{m}` {why}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let it = if misrouted.len() == 1 { "it" } else { "them" };
     Check::warn(
-        "ollama.servers",
+        NAME,
         format!(
-            "chat and embeddings use `[memory].ollama_host = \"{chat_url}\"` but summarization \
-             uses `[llm].ollama_url = \"{summary_url}\"` — two different Ollama servers"
+            "in `[llm].summarization_priority`, {named}. No such model is there, so every \
+             summary skips {it}"
         ),
-        "set both to the same URL, unless summarizing on a separate server is deliberate",
+        format!(
+            "write each entry with its provider: `ollama/{example}` for a model on your Ollama \
+             server, or `openrouter/<vendor>/<model>`, `openai/<model>`, `anthropic/<claude id>`"
+        ),
     )
 }
 
-/// Does a model spec name an Ollama model? `ollama/<model>`, or a bare
-/// `name:tag` (how Ollama ids look, and how the router detects them).
-fn is_ollama_spec(model: &str) -> bool {
+/// Where the router sends `model` when that is almost certainly not where it
+/// was meant to go, as a clause for the warning; `None` for every entry the
+/// router places deliberately.
+///
+/// An explicit provider prefix (`ollama/`, `anthropic/`, …) is the user
+/// saying where, and is never second-guessed. Without one, two placements are
+/// accidents:
+/// - Anthropic, for a name outside the Claude family or one carrying a `/`.
+///   Anthropic ids are bare Claude names; such an entry landed there only
+///   because nothing else claimed it (a bare `qwen3`, or `meta-llama/llama-3`,
+///   whose vendor namespace is not a provider prefix), and is sent unstripped.
+/// - `OpenAI`, for a name with an Ollama `:tag`. `OpenAI` ids have none, but
+///   the router's `gpt-`/`o1`/`o3` family rule runs before its tag rule, so a
+///   tagged Ollama model such as `gpt-oss:20b` goes to `OpenAI`.
+fn misplaced_by_router(model: &str) -> Option<&'static str> {
     let model = model.trim();
-    model.starts_with("ollama/") || (!model.contains('/') && model.contains(':'))
-}
-
-/// Does a `summarization_priority` entry go to Ollama? The summarizer's own
-/// rule, which is looser than the chat router's: an `ollama/` prefix, or **no
-/// provider prefix at all** — `qwen3` with no tag is Ollama there
-/// (`nanna_agent::context`, `create_client_for_model`).
-fn is_ollama_summary_spec(model: &str) -> bool {
-    let model = model.trim();
-    match model.split_once('/') {
-        Some((provider, _)) => provider.eq_ignore_ascii_case("ollama"),
-        None => !model.is_empty(),
+    if model.is_empty() || ProviderId::strip_prefix(model).len() != model.len() {
+        return None;
+    }
+    match ProviderId::from_model(model) {
+        ProviderId::Anthropic if model.contains('/') => Some(
+            "is sent to Anthropic as a model id, slash and all: what precedes the `/` is not a \
+             provider prefix",
+        ),
+        ProviderId::Anthropic if !model.to_ascii_lowercase().starts_with("claude") => {
+            Some("has no provider prefix, so it is sent to Anthropic as a model id")
+        }
+        ProviderId::OpenAI if model.contains(':') => Some(
+            "is sent to OpenAI: its name puts it in an OpenAI family before its Ollama `:tag` \
+             is looked at",
+        ),
+        _ => None,
     }
 }
 
-/// `(host, port)` of an Ollama base URL, the host lowercased and every
-/// loopback spelling folded to one — `localhost`, `127.0.0.1` and `[::1]` on the
-/// same port are the same server. A missing port means Ollama's default.
-fn ollama_endpoint(url: &str) -> (String, u16) {
-    let trimmed = url.trim();
-    let rest = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
-    let authority = rest.split('/').next().unwrap_or_default();
-    let (host, port) = authority.strip_prefix('[').map_or_else(
-        || match authority.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), Some(port)),
-            None => (authority.to_string(), None),
-        },
-        |bracketed| match bracketed.split_once(']') {
-            Some((inner, tail)) => (format!("[{inner}]"), tail.strip_prefix(':')),
-            None => (authority.to_string(), None),
-        },
-    );
-    let port = port
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(OLLAMA_DEFAULT_PORT);
-    let host = if nanna_config::is_loopback_host(&host) {
-        "loopback".to_string()
-    } else {
-        host.to_ascii_lowercase()
-    };
-    debug_assert!(!host.contains('/'), "the host carries no path");
-    (host, port)
+/// Does a chat or `summarization_priority` entry go to Ollama? Exactly when
+/// the chat router says so ([`ProviderId::from_model`]): chat and the
+/// summarizers both resolve through it, so neither has a looser rule of its
+/// own.
+fn routed_to_ollama(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty() && ProviderId::from_model(model) == ProviderId::Ollama
 }
 
 /// How long one Ollama probe may take, connect and answer together. A local
@@ -627,8 +617,9 @@ struct OllamaServer {
     models: Vec<String>,
 }
 
-/// The network leg of `doctor`: probe every Ollama server the configuration
-/// uses, and check that each has the models configured against it.
+/// The network leg of `doctor`: probe the Ollama server the configuration
+/// uses, and check that it has every model configured against it — chat's,
+/// the embedders' and the summarizers', which all go to that one server.
 ///
 /// Ollama is the only thing probed over the *network*, by design: it is the one
 /// dependency that answers without a credential. Probing a provider key would
@@ -640,20 +631,18 @@ struct OllamaServer {
 /// lives behind `--online` rather than in the offline pass, whose whole promise
 /// is that it touches nothing but the config file.
 pub async fn run_online_checks(config: &Config) -> Vec<Check> {
-    let servers = ollama_servers_in_use(config);
-    let mut checks = Vec::with_capacity(servers.len() * 2 + 2);
+    let mut checks = Vec::with_capacity(4);
     checks.push(check_anthropic_credential(config));
-    if servers.is_empty() {
+    if let Some(server) = ollama_server_in_use(config) {
+        // No token, by this command's rule never to carry a credential: a
+        // server that wants one is reported as needing it.
+        let probe = probe_ollama(&server.url, None, ONLINE_PROBE_TIMEOUT).await;
+        checks.extend(judge_ollama_server(&server, &probe));
+    } else {
         checks.push(Check::ok(
             "ollama.online",
             "no Ollama model is configured; there was nothing to probe",
         ));
-    }
-    for server in &servers {
-        // No token, by this command's rule never to carry a credential: a
-        // server that wants one is reported as needing it.
-        let probe = probe_ollama(&server.url, None, ONLINE_PROBE_TIMEOUT).await;
-        checks.extend(judge_ollama_server(server, &probe));
     }
     debug_assert!(
         !checks.is_empty(),
@@ -676,6 +665,12 @@ fn anthropic_is_in_use(config: &Config) -> bool {
         let model = model.trim().to_ascii_lowercase();
         model.starts_with("claude") || model.starts_with("anthropic")
     };
+    // The summarizers route by the chat router's grammar, so its answer is
+    // the one that counts for them — an unprefixed name included.
+    let summarizes_on_anthropic = |model: &str| {
+        let model = model.trim();
+        !model.is_empty() && ProviderId::from_model(model) == ProviderId::Anthropic
+    };
     config.llm.provider.eq_ignore_ascii_case("anthropic")
         || names_anthropic(&config.llm.model)
         || config.llm.model_priority.iter().any(|m| names_anthropic(m))
@@ -683,7 +678,7 @@ fn anthropic_is_in_use(config: &Config) -> bool {
             .llm
             .summarization_priority
             .iter()
-            .any(|m| names_anthropic(m))
+            .any(|m| summarizes_on_anthropic(m))
 }
 
 /// Verdict on a stored Anthropic OAuth credential.
@@ -792,70 +787,51 @@ fn check_anthropic_credential(config: &Config) -> Check {
     )
 }
 
-/// Every Ollama server in use, each with the models expected there. Chat and
-/// embeddings go to `[memory].ollama_host`, summarization to
-/// `[llm].ollama_url`; when both name one server it is probed once.
-fn ollama_servers_in_use(config: &Config) -> Vec<OllamaServer> {
-    let mut chat_models: Vec<&str> = config
-        .llm
-        .model_priority
+/// The one Ollama server in use — `[memory].ollama_host` — with every model
+/// expected there: chat's, the embedders', and the summarizers'. Summaries
+/// reach Ollama through the chat router, so they go to the same server chat
+/// does; `None` when no model is configured on Ollama at all.
+///
+/// Each model is expected there exactly when the code serving it sends it
+/// there, so a probe's "missing" is never about a model that goes elsewhere:
+/// - chat's models as the daemon walks them (`model_priority`, else `model`)
+///   and the summarization list, by the chat router's rule;
+/// - `[llm].model` when `[llm].provider` is `ollama` too — the CLI's chat;
+/// - the embedding specs the daemon tries ([`embedding_specs`]), by the
+///   embedding router's rule ([`split_embedding_spec`]).
+fn ollama_server_in_use(config: &Config) -> Option<OllamaServer> {
+    let chat_models: &[String] = if config.llm.model_priority.is_empty() {
+        std::slice::from_ref(&config.llm.model)
+    } else {
+        &config.llm.model_priority
+    };
+    let mut models: Vec<String> = chat_models
         .iter()
-        .chain(&config.memory.embedding_priority)
-        .map(String::as_str)
-        .filter(|m| is_ollama_spec(m))
+        .chain(&config.llm.summarization_priority)
+        .filter(|m| routed_to_ollama(m))
+        .cloned()
         .collect();
     if config.llm.provider.eq_ignore_ascii_case("ollama") {
-        chat_models.push(&config.llm.model);
+        models.push(config.llm.model.clone());
     }
-    if config
-        .memory
-        .embedding_provider
-        .eq_ignore_ascii_case("ollama")
-    {
-        chat_models.push(&config.memory.embedding_model);
-    }
-    let summary_models: Vec<&str> = config
-        .llm
-        .summarization_priority
-        .iter()
-        .map(String::as_str)
-        .filter(|m| is_ollama_summary_spec(m))
-        .collect();
-    let summary_url = config
-        .llm
-        .ollama_url
-        .as_deref()
-        .unwrap_or(OLLAMA_DEFAULT_URL);
-    let mut servers: Vec<OllamaServer> = Vec::with_capacity(2);
-    for (url, models) in [
-        (config.memory.ollama_host.as_str(), chat_models),
-        (summary_url, summary_models),
-    ] {
-        if models.is_empty() {
-            continue;
-        }
-        let tags = models.iter().map(|m| ollama_tag(m));
-        let same = servers
-            .iter()
-            .position(|s| ollama_endpoint(&s.url) == ollama_endpoint(url));
-        match same {
-            Some(index) => servers[index].models.extend(tags),
-            None => servers.push(OllamaServer {
-                url: url.trim().to_string(),
-                models: tags.collect(),
-            }),
-        }
-    }
-    for server in &mut servers {
-        server.models.sort_unstable();
-        server.models.dedup();
-    }
-    debug_assert!(servers.len() <= 2, "two keys name at most two servers");
-    debug_assert!(
-        servers.iter().all(|s| !s.models.is_empty()),
-        "only a server with models configured against it is probed"
+    models.extend(
+        embedding_specs(config)
+            .into_iter()
+            .filter_map(|spec| split_embedding_spec(&spec))
+            .filter(|(provider, _)| provider == "ollama")
+            .map(|(_, model)| model),
     );
-    servers
+    if models.is_empty() {
+        return None;
+    }
+    let mut tags: Vec<String> = models.iter().map(|m| ollama_tag(m)).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    debug_assert!(!tags.is_empty(), "only a server with models configured against it is probed");
+    Some(OllamaServer {
+        url: config.memory.ollama_host.trim().to_string(),
+        models: tags,
+    })
 }
 
 /// A configured model as the tag Ollama lists it under: no `ollama/` prefix,
@@ -1392,84 +1368,114 @@ mod tests {
         assert!(check.detail.contains("--host"));
     }
 
-    #[test]
-    fn ollama_endpoints_fold_loopback_spellings_and_the_default_port() {
-        let local = ollama_endpoint("http://localhost:11434");
-        assert_eq!(ollama_endpoint("http://127.0.0.1:11434/"), local);
-        assert_eq!(ollama_endpoint("http://[::1]:11434"), local);
-        assert_eq!(
-            ollama_endpoint("http://localhost"),
-            local,
-            "a missing port is Ollama's default"
-        );
-        assert_ne!(ollama_endpoint("http://gpu-box:11434"), local);
-        assert_ne!(
-            ollama_endpoint("http://localhost:11435"),
-            local,
-            "a different port is a different server"
-        );
-        assert_eq!(
-            ollama_endpoint("http://GPU-Box:11434"),
-            ollama_endpoint("http://gpu-box:11434")
-        );
-    }
-
-    fn ollama_everywhere() -> Config {
-        let mut config = cfg();
-        config.llm.provider = "ollama".to_string();
-        config.llm.summarization_priority = vec!["ollama/qwen3:8b".to_string()];
-        config
-    }
-
-    fn ollama_check(config: &Config) -> Check {
+    fn summarization_check(config: &Config) -> Check {
         run_checks(config, Path::new("/x"))
             .into_iter()
-            .find(|c| c.name == "ollama.servers")
-            .expect("ollama.servers is always checked")
+            .find(|c| c.name == "llm.summarization")
+            .expect("llm.summarization is always checked")
     }
 
-    /// The smoke-run finding: chat on a GPU box, summaries still on localhost.
+    /// Summaries route by the chat router's grammar. A bare name with no
+    /// provider prefix and no tag, not a family the router knows, goes to
+    /// Anthropic — which has no such model. The summarizers used to send it
+    /// to Ollama, so an old hand-edited `qwen3` now fails every time, and the
+    /// doctor says what will happen and how to write it.
     #[test]
-    fn two_ollama_servers_are_flagged_with_the_fix() {
-        let mut config = ollama_everywhere();
-        config.memory.ollama_host = "http://gpu-box:11434".to_string();
-        config.llm.ollama_url = None;
-        let check = ollama_check(&config);
-        assert_eq!(check.severity, Severity::Warn);
-        assert!(check.detail.contains("gpu-box"), "{}", check.detail);
+    fn a_bare_untagged_summary_model_is_flagged_with_how_to_write_it() {
+        let mut config = cfg();
+        config.llm.summarization_priority =
+            vec!["ollama/qwen3:4b".to_string(), "qwen3".to_string()];
+        let check = summarization_check(&config);
+        assert_eq!(check.severity, Severity::Warn, "{check:?}");
+        assert!(check.detail.contains("`qwen3`"), "{}", check.detail);
+        assert!(check.detail.contains("Anthropic"), "{}", check.detail);
         assert!(
-            check.detail.contains(OLLAMA_DEFAULT_URL),
-            "an unset key shows the URL it actually falls back to: {}",
+            !check.detail.contains("ollama/qwen3:4b"),
+            "only the entry that misroutes is named: {}",
             check.detail
         );
         assert!(
             check
                 .remedy
                 .as_ref()
-                .is_some_and(|r| r.contains("same URL")),
-            "{check:?}"
+                .is_some_and(|r| r.contains("ollama/qwen3")),
+            "the remedy spells the entry out: {check:?}"
         );
     }
 
+    /// The Anthropic default is not the only place a hand-edited entry lands
+    /// by accident. A name in another vendor's namespace (`meta-llama/…`) is
+    /// no provider prefix, so Anthropic is asked for it, slash and all; and a
+    /// tagged Ollama model whose name starts `gpt-` (`gpt-oss:20b`) is claimed
+    /// by the router's `OpenAI` family rule before its tag can mark it as
+    /// Ollama's. The old summarizers sent every one of these to Ollama.
     #[test]
-    fn one_ollama_server_in_any_spelling_is_fine() {
-        let mut config = ollama_everywhere();
-        config.memory.ollama_host = "http://localhost:11434".to_string();
-        config.llm.ollama_url = Some("http://127.0.0.1:11434/".to_string());
-        let check = ollama_check(&config);
-        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+    fn other_hand_edits_the_router_misplaces_are_flagged_too() {
+        for (entry, destination) in [
+            ("meta-llama/llama-3", "Anthropic"),
+            ("claude-proxy/claude-3", "Anthropic"),
+            ("gpt-oss:20b", "OpenAI"),
+        ] {
+            let mut config = cfg();
+            config.llm.summarization_priority = vec![entry.to_string()];
+            let check = summarization_check(&config);
+            assert_eq!(check.severity, Severity::Warn, "{entry}: {check:?}");
+            assert!(
+                check.detail.contains(&format!("`{entry}`")),
+                "{entry}: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains(destination),
+                "{entry} goes to {destination}: {}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remedy
+                    .as_ref()
+                    .is_some_and(|r| r.contains(&format!("ollama/{entry}"))),
+                "{entry}: {check:?}"
+            );
+        }
+    }
 
-        // Summarizing on Ollama while chat and embeddings are cloud is one
-        // Ollama server, not two.
+    #[test]
+    fn every_spelling_the_router_places_is_fine() {
         let mut config = cfg();
-        config.llm.provider = "anthropic".to_string();
-        config.llm.model_priority = vec!["claude-opus-5".to_string()];
-        config.memory.embedding_provider = "openai".to_string();
-        config.memory.embedding_priority.clear();
-        config.llm.summarization_priority = vec!["ollama/qwen3:8b".to_string()];
-        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
-        let check = ollama_check(&config);
-        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+        config.llm.summarization_priority = [
+            "ollama/qwen3",
+            "qwen3:4b",
+            "ollama/gpt-oss:20b",
+            "hf.co/unsloth/qwen3-4b-gguf:q4_k_m",
+            "claude-haiku-4-5",
+            "anthropic/claude-haiku-4-5",
+            "openai/gpt-4o-mini",
+            "gpt-4o-mini",
+            "openrouter/meta-llama/llama-3.1-8b-instruct",
+            "github/gpt-4o",
+        ]
+        .map(String::from)
+        .to_vec();
+        let check = summarization_check(&config);
+        assert_eq!(check.severity, Severity::Ok, "{check:?}");
+
+        // An empty list is a choice the Settings page offers: cut to fit.
+        config.llm.summarization_priority.clear();
+        assert_eq!(summarization_check(&config).severity, Severity::Ok);
+    }
+
+    /// The summarizers' Ollama rule is the chat router's, not a looser one of
+    /// their own: a bare `qwen3` is not an Ollama model there.
+    #[test]
+    fn a_summary_model_is_ollamas_exactly_when_the_router_says_so() {
+        assert!(routed_to_ollama("ollama/qwen3"));
+        assert!(routed_to_ollama("Ollama/qwen3:4b"));
+        assert!(routed_to_ollama("qwen3:4b"));
+        assert!(!routed_to_ollama("qwen3"));
+        assert!(!routed_to_ollama("anthropic/claude-haiku-4-5"));
+        assert!(!routed_to_ollama("openrouter/meta-llama/llama-3:free"));
+        assert!(!routed_to_ollama("  "));
     }
 
     #[test]
@@ -1511,7 +1517,6 @@ mod tests {
         config.llm.model = "qwen3:8b".to_string();
         config.llm.model_priority = Vec::new();
         config.llm.summarization_priority = vec!["ollama/qwen3:4b".to_string()];
-        config.llm.ollama_url = None;
         config.memory.embedding_provider = "ollama".to_string();
         config.memory.embedding_model = "nomic-embed-text".to_string();
         config.memory.embedding_priority = Vec::new();
@@ -1519,32 +1524,79 @@ mod tests {
     }
 
     #[test]
-    fn one_shared_server_is_probed_once_for_every_model() {
-        let servers = ollama_servers_in_use(&probe_config());
-        assert_eq!(servers.len(), 1, "{servers:?}");
+    fn one_server_is_probed_for_every_model() {
+        let server = ollama_server_in_use(&probe_config()).expect("models are configured");
+        assert_eq!(server.url, "http://localhost:11434");
         assert_eq!(
-            servers[0].models,
+            server.models,
             vec!["nomic-embed-text:latest", "qwen3:4b", "qwen3:8b"]
         );
     }
 
+    /// The smoke-run finding (2026-09-11): chat on a GPU box, summaries on
+    /// localhost. Summaries now reach Ollama through chat's router, so the
+    /// server chat uses is the one that must have the summary model — and
+    /// the only one probed.
     #[test]
-    fn a_split_config_probes_each_server_for_its_own_models() {
+    fn summaries_on_ollama_are_probed_on_chats_server() {
         let mut config = probe_config();
-        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
-        let servers = ollama_servers_in_use(&config);
-        assert_eq!(servers.len(), 2, "{servers:?}");
-        assert_eq!(servers[1].url, "http://gpu-box:11434");
-        assert_eq!(servers[1].models, vec!["qwen3:4b"]);
+        config.memory.ollama_host = "http://gpu-box:11434".to_string();
+        let server = ollama_server_in_use(&config).expect("models are configured");
+        assert_eq!(server.url, "http://gpu-box:11434");
+        assert!(server.models.contains(&"qwen3:4b".to_string()), "{server:?}");
+
+        // Summarizing on Ollama while chat and embeddings are cloud still
+        // summarizes on that one server. (Chat is routed by its model's
+        // name, so cloud chat is a cloud model, not only a provider.)
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
+        config.memory.embedding_provider = "openai".to_string();
+        let server = ollama_server_in_use(&config).expect("the summarizer is on Ollama");
+        assert_eq!(server.url, "http://gpu-box:11434");
+        assert_eq!(server.models, vec!["qwen3:4b"]);
+    }
+
+    /// Every model is expected on the Ollama server exactly when the code
+    /// that serves it sends it there: chat models by the chat router's rule,
+    /// embedding models by the embedding router's. The probe used one looser
+    /// rule of its own for both, so it expected `gpt-oss:20b` there though
+    /// chat sends it to `OpenAI`, and skipped a namespaced tagged chat model and
+    /// a bare embedding name that both go to Ollama.
+    #[test]
+    fn each_model_is_probed_where_its_router_sends_it() {
+        let mut config = probe_config();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
+        config.llm.model_priority = vec![
+            "gpt-oss:20b".to_string(),
+            "hf.co/org/model:q4_k_m".to_string(),
+        ];
+        config.llm.summarization_priority = Vec::new();
+        config.memory.embedding_priority = vec!["mxbai-embed-large".to_string()];
+
+        let server = ollama_server_in_use(&config).expect("models are configured on Ollama");
+        assert_eq!(
+            server.models,
+            vec!["hf.co/org/model:q4_k_m", "mxbai-embed-large:latest"]
+        );
+
+        // The chat model itself goes where the router sends it too, whatever
+        // `[llm].provider` says.
+        config.llm.model_priority = Vec::new();
+        config.memory.embedding_priority = vec!["openai/text-embedding-3-small".to_string()];
+        config.llm.model = "qwen3:8b".to_string();
+        let server = ollama_server_in_use(&config).expect("the chat model is on Ollama");
+        assert_eq!(server.models, vec!["qwen3:8b"]);
     }
 
     #[test]
     fn nothing_on_ollama_means_nothing_to_probe() {
         let mut config = probe_config();
         config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
         config.llm.summarization_priority = Vec::new();
         config.memory.embedding_provider = "openai".to_string();
-        assert_eq!(ollama_servers_in_use(&config), Vec::new());
+        assert_eq!(ollama_server_in_use(&config), None);
     }
 
     #[test]
@@ -1623,7 +1675,6 @@ mod tests {
         };
         let mut config = probe_config();
         config.memory.ollama_host = format!("http://127.0.0.1:{port}");
-        config.llm.ollama_url = Some(format!("http://localhost:{port}"));
         let checks = run_online_checks(&config).await;
         let probed: Vec<_> = checks
             .iter()
@@ -1633,22 +1684,21 @@ mod tests {
         assert_eq!(probed[0].severity, Severity::Fail);
     }
 
-    /// The summarizer sends any spec without a provider prefix to Ollama —
-    /// an untagged `qwen3` included — so a split with one must still be
-    /// flagged, and the server summaries really go to must be probed.
+    /// An untagged summary model is Anthropic's by the router's rule, so it
+    /// is not expected on the Ollama server — the offline check flags it
+    /// instead — while a prefixed one is, under the tag Ollama lists.
     #[test]
-    fn an_untagged_summary_model_still_counts_as_ollama() {
-        assert!(is_ollama_summary_spec("qwen3"));
-        assert!(is_ollama_summary_spec("Ollama/qwen3:4b"));
-        assert!(!is_ollama_summary_spec("anthropic/claude-haiku-4-5"));
-        assert!(!is_ollama_summary_spec("  "));
+    fn only_summary_models_the_router_sends_to_ollama_are_expected_there() {
         assert_eq!(ollama_tag("Ollama/qwen3:4b"), "qwen3:4b");
         let mut config = probe_config();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
+        config.memory.embedding_provider = "openai".to_string();
         config.llm.summarization_priority = vec!["qwen3".to_string()];
-        config.llm.ollama_url = Some("http://gpu-box:11434".to_string());
-        assert_eq!(ollama_check(&config).severity, Severity::Warn);
-        let servers = ollama_servers_in_use(&config);
-        assert_eq!(servers.len(), 2, "{servers:?}");
-        assert_eq!(servers[1].models, vec!["qwen3:latest"]);
+        assert_eq!(ollama_server_in_use(&config), None);
+
+        config.llm.summarization_priority = vec!["ollama/qwen3".to_string()];
+        let server = ollama_server_in_use(&config).expect("the summarizer is on Ollama");
+        assert_eq!(server.models, vec!["qwen3:latest"]);
     }
 }
