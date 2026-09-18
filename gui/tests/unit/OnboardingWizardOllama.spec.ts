@@ -73,7 +73,10 @@ function answer(command: string, args?: Record<string, unknown>) {
     case 'set_provider_api_key':
       return Promise.reject(new Error('That key was refused'))
     case 'get_backend_status':
-      return Promise.resolve({ running: true, version: '0.3.22' })
+      // The real shape: `version` is the GUI's own build, not the daemon's.
+      return Promise.resolve({ mode: 'daemon', connected: true, daemon_state: 'running', version: '0.0.0-gui', daemon_url: 'ws://127.0.0.1:5149', starting_for_s: null, retrying: false })
+    case 'get_daemon_version':
+      return Promise.resolve('0.3.22')
     case 'probe_ollama':
       return Promise.resolve(probeReport)
     default:
@@ -295,5 +298,43 @@ describe('OnboardingWizard — Ollama server and token', () => {
     await wrapper.find('select').setValue('anthropic')
     await flushPromises()
     expect(wrapper.find('[data-testid="key-error"]').exists()).toBe(false)
+  })
+})
+
+describe('OnboardingWizard — ready check', () => {
+  beforeEach(() => {
+    savedSettings.ollama_host = 'http://localhost:11434'
+    savedSettings.ollama_token_saved = false
+    savedSettings.ollama_token_host = null
+    savedSettings.ollama_token_from_env = false
+    invoke.mockReset()
+    invoke.mockImplementation(answer)
+    localStorage.clear()
+  })
+
+  async function readyCheck(status: Record<string, unknown>) {
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) =>
+      command === 'get_backend_status' ? Promise.resolve(status) : answer(command, args),
+    )
+    const wrapper = await mountAtOllamaStep()
+    await continueButton(wrapper).trigger('click')
+    await flushPromises()
+    return wrapper.find('[data-testid="onboarding-health"]')
+  }
+
+  // The check read a `running` field the status never had, so it passed
+  // whenever the call returned, and named the app's build as the daemon's.
+  it("names the daemon's own version, not the app's", async () => {
+    const health = await readyCheck({ mode: 'daemon', connected: true, daemon_state: 'running', version: '0.0.0-gui', retrying: false })
+    expect(health.attributes('data-ok')).toBe('true')
+    expect(health.text()).toContain('Backend ready · 0.3.22')
+    expect(health.text()).not.toContain('0.0.0-gui')
+  })
+
+  it('does not call a daemon that is still starting ready', async () => {
+    const health = await readyCheck({ mode: 'disconnected', connected: false, daemon_state: 'starting', starting_for_s: 45, version: '0.0.0-gui', retrying: false })
+    expect(health.attributes('data-ok')).toBe('false')
+    expect(health.text()).toContain('Still starting · 45s')
+    expect(calls()).not.toContain('probe_ollama')
   })
 })

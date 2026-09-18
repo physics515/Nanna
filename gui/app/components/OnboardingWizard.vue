@@ -7,6 +7,7 @@ import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { ArrowRight, Check, HeartPulse, KeyRound, Sparkles, X } from '@lucide/vue'
 import { isLoopbackUrl, sameOllamaServer, sendsTokenInClear } from '~/lib/ollamaServer'
+import { describeBackend, type BackendStatusLike } from '~/lib/backendLabels'
 
 const props = defineProps<{
   open: boolean
@@ -222,18 +223,20 @@ async function runHealthCheck() {
   healthDetail.value = ''
   ollamaProbe.value = null
   try {
-    const status = await invoke<{ running?: boolean; version?: string; error?: string } | string>('get_backend_status')
-    if (typeof status === 'string') {
+    // `connected` is the one field that says the daemon answers. This used to
+    // read a `running` field the status has never had, so the check passed
+    // whenever the call returned, and showed the app's own version as the
+    // daemon's: `version` is this GUI's build; the daemon reports its own.
+    const status = await invoke<BackendStatusLike | null>('get_backend_status')
+    if (status?.connected === true) {
       healthOk.value = true
-      healthDetail.value = status
-    } else if (status && (status.running !== false)) {
-      healthOk.value = true
-      healthDetail.value = status.version
-        ? `Backend ready · ${status.version}`
+      const daemonVersion = await invoke<string | null>('get_daemon_version').catch(() => null)
+      healthDetail.value = daemonVersion
+        ? `Backend ready · ${daemonVersion}`
         : 'Backend is reachable.'
     } else {
       healthOk.value = false
-      healthDetail.value = status?.error || 'Backend is not ready yet — you can still start chatting.'
+      healthDetail.value = `${describeBackend(status).short}. You can finish setup now; chats work once the daemon connects.`
     }
   } catch (e: any) {
     healthOk.value = false
@@ -480,7 +483,7 @@ const ollamaSummary = computed(() => {
               "
             >
               <span v-if="checking">Checking backend…</span>
-              <span v-else class="flex items-start gap-2">
+              <span v-else class="flex items-start gap-2" data-testid="onboarding-health" :data-ok="healthOk">
                 <Check v-if="healthOk" class="w-4 h-4 shrink-0 mt-0.5" />
                 {{ healthDetail || 'Status unknown.' }}
               </span>
