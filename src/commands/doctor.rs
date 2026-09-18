@@ -511,21 +511,21 @@ fn check_embeddings(config: &Config) -> Check {
 /// mean.
 ///
 /// Every summarizer resolves `[llm].summarization_priority` through the chat
-/// router, by the router's grammar. There, a name with no provider prefix, no
-/// `:tag` and no family the router knows (`claude…`, `gpt-…`, `o1…`, `o3…`)
-/// is Anthropic's. The Settings picker always writes a prefix, so such an
-/// entry was typed by hand — and the summarizers used to send a bare name to
-/// Ollama, so it is most likely an Ollama model that Anthropic will now be
-/// asked for and does not have. The walk passes over it on every summary.
+/// router, by the router's grammar ([`misplaced_by_router`] says which
+/// entries it misplaces). The Settings picker always writes a provider prefix,
+/// so such an entry was typed by hand — and the summarizers used to send every
+/// unprefixed name to Ollama, so it is most likely an Ollama model that
+/// another provider will now be asked for and does not have. The walk passes
+/// over it on every summary.
 fn check_summarization_models(config: &Config) -> Check {
     const NAME: &str = "llm.summarization";
     let listed = &config.llm.summarization_priority;
-    let misrouted: Vec<&str> = listed
+    let misrouted: Vec<(&str, &str)> = listed
         .iter()
         .map(|m| m.trim())
-        .filter(|m| anthropic_by_default(m))
+        .filter_map(|m| misplaced_by_router(m).map(|why| (m, why)))
         .collect();
-    let Some(example) = misrouted.first() else {
+    let Some((example, _)) = misrouted.first() else {
         return Check::ok(
             NAME,
             if listed.is_empty() {
@@ -540,14 +540,15 @@ fn check_summarization_models(config: &Config) -> Check {
     };
     let named = misrouted
         .iter()
-        .map(|m| format!("`{m}`"))
+        .map(|(m, why)| format!("`{m}` {why}"))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join("; ");
+    let it = if misrouted.len() == 1 { "it" } else { "them" };
     Check::warn(
         NAME,
         format!(
-            "{named} in `[llm].summarization_priority` has no provider prefix, so it is sent to \
-             Anthropic as a model id; Anthropic has no such model, and every summary skips it"
+            "in `[llm].summarization_priority`, {named}. No such model is there, so every \
+             summary skips {it}"
         ),
         format!(
             "write each entry with its provider: `ollama/{example}` for a model on your Ollama \
@@ -556,15 +557,39 @@ fn check_summarization_models(config: &Config) -> Check {
     )
 }
 
-/// Does the router send `model` to Anthropic only because nothing else claims
-/// it? True for a bare name with no prefix and no tag outside the Claude
-/// family; false for anything the router places deliberately.
-fn anthropic_by_default(model: &str) -> bool {
-    !model.is_empty()
-        && !model.contains('/')
-        && !model.contains(':')
-        && !model.to_ascii_lowercase().starts_with("claude")
-        && ProviderId::from_model(model) == ProviderId::Anthropic
+/// Where the router sends `model` when that is almost certainly not where it
+/// was meant to go, as a clause for the warning; `None` for every entry the
+/// router places deliberately.
+///
+/// An explicit provider prefix (`ollama/`, `anthropic/`, …) is the user
+/// saying where, and is never second-guessed. Without one, two placements are
+/// accidents:
+/// - Anthropic, for a name outside the Claude family or one carrying a `/`.
+///   Anthropic ids are bare Claude names; such an entry landed there only
+///   because nothing else claimed it (a bare `qwen3`, or `meta-llama/llama-3`,
+///   whose vendor namespace is not a provider prefix), and is sent unstripped.
+/// - `OpenAI`, for a name with an Ollama `:tag`. `OpenAI` ids have none, but
+///   the router's `gpt-`/`o1`/`o3` family rule runs before its tag rule, so a
+///   tagged Ollama model such as `gpt-oss:20b` goes to `OpenAI`.
+fn misplaced_by_router(model: &str) -> Option<&'static str> {
+    let model = model.trim();
+    if model.is_empty() || ProviderId::strip_prefix(model).len() != model.len() {
+        return None;
+    }
+    match ProviderId::from_model(model) {
+        ProviderId::Anthropic if model.contains('/') => Some(
+            "is sent to Anthropic as a model id, slash and all: what precedes the `/` is not a \
+             provider prefix",
+        ),
+        ProviderId::Anthropic if !model.to_ascii_lowercase().starts_with("claude") => {
+            Some("has no provider prefix, so it is sent to Anthropic as a model id")
+        }
+        ProviderId::OpenAI if model.contains(':') => Some(
+            "is sent to OpenAI: its name puts it in an OpenAI family before its Ollama `:tag` \
+             is looked at",
+        ),
+        _ => None,
+    }
 }
 
 /// Does a model spec name an Ollama model? `ollama/<model>`, or a bare
@@ -1381,12 +1406,51 @@ mod tests {
         );
     }
 
+    /// The Anthropic default is not the only place a hand-edited entry lands
+    /// by accident. A name in another vendor's namespace (`meta-llama/…`) is
+    /// no provider prefix, so Anthropic is asked for it, slash and all; and a
+    /// tagged Ollama model whose name starts `gpt-` (`gpt-oss:20b`) is claimed
+    /// by the router's `OpenAI` family rule before its tag can mark it as
+    /// Ollama's. The old summarizers sent every one of these to Ollama.
+    #[test]
+    fn other_hand_edits_the_router_misplaces_are_flagged_too() {
+        for (entry, destination) in [
+            ("meta-llama/llama-3", "Anthropic"),
+            ("claude-proxy/claude-3", "Anthropic"),
+            ("gpt-oss:20b", "OpenAI"),
+        ] {
+            let mut config = cfg();
+            config.llm.summarization_priority = vec![entry.to_string()];
+            let check = summarization_check(&config);
+            assert_eq!(check.severity, Severity::Warn, "{entry}: {check:?}");
+            assert!(
+                check.detail.contains(&format!("`{entry}`")),
+                "{entry}: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains(destination),
+                "{entry} goes to {destination}: {}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remedy
+                    .as_ref()
+                    .is_some_and(|r| r.contains(&format!("ollama/{entry}"))),
+                "{entry}: {check:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_spelling_the_router_places_is_fine() {
         let mut config = cfg();
         config.llm.summarization_priority = [
             "ollama/qwen3",
             "qwen3:4b",
+            "ollama/gpt-oss:20b",
+            "hf.co/unsloth/qwen3-4b-gguf:q4_k_m",
             "claude-haiku-4-5",
             "anthropic/claude-haiku-4-5",
             "openai/gpt-4o-mini",
