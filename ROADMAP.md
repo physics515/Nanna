@@ -7296,6 +7296,11 @@ keep the phases readable; promote individual items into a phase when they become
             unattended): its `ensure` should check `tauri-webdriver` instead of `tauri-driver` +
             `WebKitWebDriver` on Linux, its `start` should set `GDK_BACKEND=x11` and the isolating
             variables above, and the app must be built with `--features e2e-webdriver`.
+            *(2026-09-18)* The recipe now lives in the repo as **`gui/scripts/webdriver-smoke.sh
+            <nanna-gui> <out dir>`**: isolated HOME/config/data/daemon port, `GDK_BACKEND=x11`, a
+            session, waits for `#__nuxt` + the Tauri bridge, one `invoke` that must reach the
+            sidecar, a screenshot, and a trap that stops what it started by PID (and reports a
+            sidecar that outlived its GUI). Ran PASS on this host. The shared harness can wrap it.
       - [x] *(found 2026-09-18, driving the GUI)* **A GUI that is killed leaves its daemon sidecar
             running on Linux.** Ending the WebDriver session terminated `nanna-gui`, and its sidecar
             (`nanna-daemon --port 51990 …`) stayed up, holding its port and store lock, until
