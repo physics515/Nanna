@@ -172,10 +172,11 @@ pub struct RequestModelStats {
     pub input_tokens: u32,
     /// Output tokens
     pub output_tokens: u32,
-    /// The LIVE effective context window (Ollama `num_ctx` latch) this request
-    /// ran under, when the local sizing path has one. `None` for cloud models
-    /// and unlatched local models. Records mid-run demotions in the per-request
-    /// trail so a shrunken window is visible in the stats, not only in logs.
+    /// The LIVE effective context window (the Ollama `num_ctx` latch of the
+    /// server the request went to) this request ran under, when the sizing
+    /// path has one. `None` for cloud models and unlatched local models.
+    /// Records mid-run demotions in the per-request trail so a shrunken window
+    /// is visible in the stats, not only in logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_context_window: Option<usize>,
 }

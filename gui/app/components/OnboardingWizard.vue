@@ -6,6 +6,8 @@
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { ArrowRight, Check, HeartPulse, KeyRound, Sparkles, X } from '@lucide/vue'
+import { isLoopbackUrl, sameOllamaServer, sendsTokenInClear } from '~/lib/ollamaServer'
+import { describeBackend, type BackendStatusLike } from '~/lib/backendLabels'
 
 const props = defineProps<{
   open: boolean
@@ -25,7 +27,10 @@ const provider = ref('anthropic')
 const saving = ref(false)
 const checking = ref(false)
 const keySaved = ref(false)
-const error = ref<string | null>(null)
+/** Each path's own error: a refused API key is not the Ollama step's, and
+ *  switching provider clears both. */
+const keyError = ref<string | null>(null)
+const ollamaError = ref<string | null>(null)
 const healthOk = ref(false)
 const healthDetail = ref('')
 
@@ -44,17 +49,89 @@ const providers = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'openai', label: 'OpenAI' },
   { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'ollama', label: 'Ollama (local)' },
+  { value: 'ollama', label: 'Ollama (local or remote)' },
 ]
 
+/** Ollama server address and optional bearer token, for the Ollama choice. */
+const OLLAMA_DEFAULT_HOST = 'http://localhost:11434'
+const ollamaHost = ref(OLLAMA_DEFAULT_HOST)
+const ollamaToken = ref('')
+/** Set once the user types an address: the prefill never overwrites it, and
+ *  only then does Continue save one. */
+const ollamaHostEdited = ref(false)
+/** Whether a token is saved, and for which server — never the token. */
+const ollamaTokenSaved = ref(false)
+const ollamaTokenHost = ref<string | null>(null)
+/** `OLLAMA_API_KEY` is set: its token goes to whatever address is set. */
+const ollamaTokenFromEnv = ref(false)
+const ollamaPrefill = ref<'idle' | 'loading' | 'loaded' | 'failed'>('idle')
+let ollamaPrefillRun: Promise<void> | null = null
+
+/** Prefill from the saved config — a re-run of onboarding must not show the
+ *  default over an address the user already set. `get_extended_settings` is
+ *  slow while the daemon starts: this returns the one in-flight read, and a
+ *  failed read can be asked again. */
+function loadOllamaSettings(): Promise<void> {
+  if (ollamaPrefill.value === 'loaded') return Promise.resolve()
+  if (ollamaPrefillRun) return ollamaPrefillRun
+  ollamaPrefill.value = 'loading'
+  ollamaPrefillRun = (async () => {
+    try {
+      const s = await invoke<{
+        ollama_host?: string
+        ollama_token_saved?: boolean
+        ollama_token_host?: string | null
+        ollama_token_from_env?: boolean
+      }>('get_extended_settings')
+      // Typed while this was in flight: the user's, not the saved value's.
+      if (s?.ollama_host && !ollamaHostEdited.value) ollamaHost.value = s.ollama_host
+      ollamaTokenSaved.value = !!s?.ollama_token_saved
+      ollamaTokenHost.value = s?.ollama_token_host ?? null
+      ollamaTokenFromEnv.value = !!s?.ollama_token_from_env
+      ollamaPrefill.value = 'loaded'
+    } catch {
+      ollamaPrefill.value = 'failed'
+    } finally {
+      ollamaPrefillRun = null
+    }
+  })()
+  return ollamaPrefillRun
+}
+
+/** The saved token goes to the address in the field. */
+const ollamaTokenIsForHost = computed(
+  () => ollamaTokenSaved.value && !!ollamaTokenHost.value && sameOllamaServer(ollamaTokenHost.value, ollamaHost.value),
+)
+/** The server the saved token belongs to, when it is not this one. */
+const ollamaTokenElsewhere = computed(() =>
+  ollamaTokenSaved.value && ollamaTokenHost.value && !ollamaTokenIsForHost.value ? ollamaTokenHost.value : null,
+)
+const ollamaTokenPlaceholder = computed(() =>
+  ollamaTokenIsForHost.value ? 'A token is saved for this server — leave empty to keep it' : 'Only if the server requires one',
+)
+/** A token that would go to this address over plain http to another machine:
+ *  one being typed, the one saved for it, or the environment's. */
+const ollamaTokenInClear = computed(
+  () =>
+    sendsTokenInClear(ollamaHost.value) &&
+    (ollamaToken.value.trim() !== '' || ollamaTokenIsForHost.value || ollamaTokenFromEnv.value),
+)
+
 const needsKey = computed(() => provider.value !== 'ollama')
+
+watch(provider, (p) => {
+  keyError.value = null
+  ollamaError.value = null
+  if (p === 'ollama') void loadOllamaSettings()
+})
 
 watch(
   () => props.open,
   (open) => {
     if (open) {
       step.value = 1
-      error.value = null
+      keyError.value = null
+      ollamaError.value = null
       keySaved.value = !!props.hasApiKey
       healthOk.value = false
       healthDetail.value = ''
@@ -91,7 +168,7 @@ function goStep2() {
 
 async function onKeySave(p: string, key: string) {
   saving.value = true
-  error.value = null
+  keyError.value = null
   try {
     await invoke('set_provider_api_key', { provider: p, apiKey: key })
     try { await invoke('set_provider', { provider: p }) } catch { /* non-fatal */ }
@@ -99,17 +176,36 @@ async function onKeySave(p: string, key: string) {
     step.value = 3
     await runHealthCheck()
   } catch (e: any) {
-    error.value = e?.message || String(e) || "Couldn't save that key."
+    keyError.value = e?.message || String(e) || "Couldn't save that key."
   } finally {
     saving.value = false
   }
 }
 
 async function continueWithoutKey() {
-  error.value = null
+  keyError.value = null
+  ollamaError.value = null
   if (provider.value === 'ollama') {
+    saving.value = true
+    // The saved address has to be known before anything is saved over it.
+    await loadOllamaSettings()
     try {
-      saving.value = true
+      // Address and token first: the health check probes the saved server.
+      // A bad address stops here with the reason, instead of probing the old one.
+      // Only what was typed is saved: an untouched address keeps the saved
+      // one (even one the prefill could not read), and an empty token field
+      // keeps the saved token. The token goes after the address it is for.
+      if (ollamaHostEdited.value) {
+        await invoke('set_ollama_host', { host: ollamaHost.value.trim() || OLLAMA_DEFAULT_HOST })
+      }
+      const token = ollamaToken.value.trim()
+      if (token) await invoke('set_ollama_api_key', { key: token })
+    } catch (e: any) {
+      ollamaError.value = e?.message || String(e)
+      saving.value = false
+      return
+    }
+    try {
       await invoke('set_provider', { provider: 'ollama' })
     } catch {
       /* non-fatal — health check will surface issues */
@@ -127,18 +223,20 @@ async function runHealthCheck() {
   healthDetail.value = ''
   ollamaProbe.value = null
   try {
-    const status = await invoke<{ running?: boolean; version?: string; error?: string } | string>('get_backend_status')
-    if (typeof status === 'string') {
+    // `connected` is the one field that says the daemon answers. This used to
+    // read a `running` field the status has never had, so the check passed
+    // whenever the call returned, and showed the app's own version as the
+    // daemon's: `version` is this GUI's build; the daemon reports its own.
+    const status = await invoke<BackendStatusLike | null>('get_backend_status')
+    if (status?.connected === true) {
       healthOk.value = true
-      healthDetail.value = status
-    } else if (status && (status.running !== false)) {
-      healthOk.value = true
-      healthDetail.value = status.version
-        ? `Backend ready · ${status.version}`
+      const daemonVersion = await invoke<string | null>('get_daemon_version').catch(() => null)
+      healthDetail.value = daemonVersion
+        ? `Backend ready · ${daemonVersion}`
         : 'Backend is reachable.'
     } else {
       healthOk.value = false
-      healthDetail.value = status?.error || 'Backend is not ready yet — you can still start chatting.'
+      healthDetail.value = `${describeBackend(status).short}. You can finish setup now; chats work once the daemon connects.`
     }
   } catch (e: any) {
     healthOk.value = false
@@ -173,7 +271,11 @@ const ollamaSummary = computed(() => {
     return {
       ok: false,
       text: `Ollama is not answering at ${p.base_url}${p.reason ? ` (${p.reason})` : ''}.`,
-      fix: 'Install Ollama and start it (`ollama serve`), then recheck.',
+      // "Install and start it" only makes sense for this machine; for a remote
+      // server the usual fix is the address (its path) or the token.
+      fix: isLoopbackUrl(p.base_url)
+        ? 'Install Ollama and start it (`ollama serve`), then recheck.'
+        : 'Check the server URL (including any path, e.g. /ollama) and the bearer token, then go back and recheck.',
       pulls: [] as string[],
     }
   }
@@ -261,7 +363,7 @@ const ollamaSummary = computed(() => {
               </div>
               <div>
                 <h2 class="text-lg font-semibold text-nanna-text">Connect a model</h2>
-                <p class="text-xs text-nanna-text-muted">Pick a provider and add a key, or use Ollama locally.</p>
+                <p class="text-xs text-nanna-text-muted">Pick a provider and add a key, or connect to an Ollama server.</p>
               </div>
             </div>
 
@@ -282,13 +384,64 @@ const ollamaSummary = computed(() => {
               placeholder="Paste API key"
               :is-set="keySaved || hasApiKey"
               :saving="saving"
-              :external-error="error"
+              :external-error="keyError"
               :hint="hasApiKey ? 'A key is already saved. You can replace it or continue.' : undefined"
               @save="onKeySave"
             />
-            <p v-else class="text-xs text-nanna-text-muted">
-              Ollama runs locally — no API key needed. The next step checks whether it is running and has a model pulled.
-            </p>
+            <div v-else class="space-y-3" data-testid="ollama-connection">
+              <div>
+                <label class="block text-xs text-nanna-text-dim mb-1" for="onboarding-ollama-host">Server URL</label>
+                <input
+                  id="onboarding-ollama-host"
+                  v-model="ollamaHost"
+                  data-testid="onboarding-ollama-host"
+                  type="url"
+                  :placeholder="OLLAMA_DEFAULT_HOST"
+                  class="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-nanna-text focus:outline-none focus:border-nanna-primary/50"
+                  @input="ollamaHostEdited = true"
+                >
+                <p v-if="ollamaPrefill === 'failed'" class="text-[11px] text-nanna-text-muted mt-1">
+                  Couldn't read the saved address yet — Continue keeps it unless you type one.
+                  <button
+                    type="button"
+                    data-testid="onboarding-ollama-prefill-retry"
+                    class="underline hover:text-nanna-text"
+                    @click="loadOllamaSettings"
+                  >Try again</button>
+                </p>
+                <p class="text-[11px] text-nanna-text-muted mt-1">
+                  Leave the default for Ollama on this machine. For a remote or Ollama-compatible server, use the address
+                  that answers <code>/api/tags</code>, including any path it lives under (e.g. <code>https://host/ollama</code>).
+                </p>
+              </div>
+              <div>
+                <label class="block text-xs text-nanna-text-dim mb-1" for="onboarding-ollama-token">
+                  Bearer token <span class="text-nanna-text-dim/60">(optional)</span>
+                </label>
+                <input
+                  id="onboarding-ollama-token"
+                  v-model="ollamaToken"
+                  data-testid="onboarding-ollama-token"
+                  type="password"
+                  autocomplete="off"
+                  :placeholder="ollamaTokenPlaceholder"
+                  class="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm text-nanna-text focus:outline-none focus:border-nanna-primary/50"
+                >
+                <p v-if="ollamaTokenElsewhere" data-testid="onboarding-ollama-token-elsewhere" class="text-[11px] text-nanna-text-muted mt-1">
+                  The saved token is for <code>{{ ollamaTokenElsewhere }}</code> and is not sent to this address.
+                  Enter one here if this server needs it.
+                </p>
+                <p v-if="ollamaTokenFromEnv" data-testid="onboarding-ollama-token-env" class="text-[11px] text-nanna-text-muted mt-1">
+                  <code>OLLAMA_API_KEY</code> is set in Nanna's environment, so its token is sent to this address — to
+                  whatever address is set here — instead of a saved one.
+                </p>
+                <p v-if="ollamaTokenInClear" data-testid="onboarding-ollama-token-cleartext" class="text-[11px] text-amber-300 mt-1">
+                  This address is plain http:// to another machine, so the token would cross the network unencrypted.
+                </p>
+              </div>
+              <p v-if="ollamaError" class="text-xs text-red-400" data-testid="onboarding-ollama-error">{{ ollamaError }}</p>
+              <p class="text-xs text-nanna-text-muted">The next step checks the server is answering and has a model.</p>
+            </div>
 
             <div class="flex justify-between pt-2">
               <UiButton variant="ghost" size="sm" @click="step = 1">Back</UiButton>
@@ -330,7 +483,7 @@ const ollamaSummary = computed(() => {
               "
             >
               <span v-if="checking">Checking backend…</span>
-              <span v-else class="flex items-start gap-2">
+              <span v-else class="flex items-start gap-2" data-testid="onboarding-health" :data-ok="healthOk">
                 <Check v-if="healthOk" class="w-4 h-4 shrink-0 mt-0.5" />
                 {{ healthDetail || 'Status unknown.' }}
               </span>
