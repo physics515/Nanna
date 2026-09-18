@@ -584,6 +584,20 @@ function installInPage(options = {}) {
           { name: 'qwen3.5:9b', size_mb: 6000, is_embedding_model: false },
           { name: 'nomic-embed-text', size_mb: 274, is_embedding_model: true },
         ];
+      // The daemon's hardened probe, as the wizard sees it: a live local
+      // server with every configured model pulled.
+      case 'probe_ollama':
+        return {
+          base_url: 'http://localhost:11434',
+          reachable: true,
+          reason: null,
+          models: [
+            { name: 'qwen3.5:9b', size_mb: 6000, is_embedding_model: false },
+            { name: 'nomic-embed-text:latest', size_mb: 274, is_embedding_model: true },
+          ],
+          wanted: ['qwen3.5:9b'],
+          missing: [],
+        };
       case 'check_claude_proxy_health':
         return false;
       case 'get_cognitive_memory_stats':

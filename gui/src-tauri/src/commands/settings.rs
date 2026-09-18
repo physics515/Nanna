@@ -1073,50 +1073,73 @@ pub async fn set_ollama_api_key(
     Ok("Ollama API key saved".to_string())
 }
 
-/// Fetch available models from Ollama
+/// Fetch available models from Ollama.
+///
+/// Answers from the daemon's `system.probe_ollama` — the one hardened probe
+/// (bounded body, model cap, connect timeout, "answered but is not Ollama")
+/// — rather than a private `GET /api/tags`. The GUI links no `nanna-llm`
+/// (P16), so the daemon is the only place the probe can run. A server that
+/// is down is an `Err` naming why; a server that is up lists what it has.
 ///
 /// # Errors
 ///
-/// Fails with the HTTP client builder's error when the client cannot be built,
-/// `Failed to connect to Ollama at …` when the request fails, `Ollama returned
-/// error: …` for a non-success status, and `Failed to parse Ollama response: …`
-/// when the body is not a model list.
+/// `Failed to connect to Ollama at …: <reason>` when the daemon reports the
+/// server unreachable, or the daemon's own error text when the probe request
+/// itself failed.
 #[tauri::command]
 pub async fn get_ollama_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<OllamaModelInfo>, String> {
-    #[derive(Deserialize)]
-    struct OllamaTagsResponse {
-        models: Vec<OllamaModel>,
+    let report = {
+        let state_guard = state.read().await;
+        let host = state_guard.config.memory.ollama_host.clone();
+        state_guard.backend.system_probe_ollama(Some(&host), Vec::new()).await?
+    };
+    ollama_models_from_report(&report)
+}
+
+/// Turn a `system.probe_ollama` answer into the picker's model list, or the
+/// reason nothing could be listed. Pure, so the daemon's wire shape is
+/// pinned by a test on this side too.
+fn ollama_models_from_report(report: &serde_json::Value) -> Result<Vec<OllamaModelInfo>, String> {
+    if let Some(error) = report.get("error").and_then(|e| e.as_str()) {
+        return Err(error.to_string());
     }
-
-    #[derive(Deserialize)]
-    struct OllamaModel {
-        name: String,
-        size: u64,
+    let base_url = report
+        .get("base_url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("the configured Ollama host");
+    if report.get("reachable").and_then(|r| r.as_bool()) != Some(true) {
+        let reason = report
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("no usable answer");
+        return Err(format!("Failed to connect to Ollama at {base_url}: {reason}"));
     }
+    let models = report
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|n| n.as_str())?.to_string();
+                    let size_bytes = m.get("size_bytes").and_then(|s| s.as_u64()).unwrap_or(0);
+                    Some(OllamaModelInfo {
+                        is_embedding_model: is_ollama_embedding_model(&name),
+                        size_mb: size_bytes / 1_000_000,
+                        name,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
+}
 
-    let ollama_host = state.read().await.config.memory.ollama_host.clone();
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .get(format!("{ollama_host}/api/tags"))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Ollama at {ollama_host}: {e}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Ollama returned error: {}", response.status()));
-    }
-
-    let tags: OllamaTagsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Ollama response: {e}"))?;
-
-    // Convert to our info struct, marking known embedding models
+/// Does a model name look like an embedding model? Name-based, because
+/// `/api/tags` says nothing about a model's purpose.
+fn is_ollama_embedding_model(name: &str) -> bool {
     // Comprehensive list of known embedding model name patterns
     let embedding_patterns = [
         // BGE family
@@ -1142,26 +1165,9 @@ pub async fn get_ollama_models(
         // Generic patterns (catch-all)
         "-embed-", "-embed:",
     ];
-
-    let models: Vec<OllamaModelInfo> = tags.models
-        .into_iter()
-        .map(|m| {
-            let name_lower = m.name.to_lowercase();
-            let base_name = m.name.split(':').next().unwrap_or(&m.name).to_lowercase();
-
-            // Check if model name contains "embed" or matches known embedding patterns
-            let is_embedding = name_lower.contains("embed")
-                || embedding_patterns.iter().any(|p| base_name.contains(p));
-
-            OllamaModelInfo {
-                name: m.name,
-                size_mb: m.size / 1_000_000,
-                is_embedding_model: is_embedding,
-            }
-        })
-        .collect();
-
-    Ok(models)
+    let name_lower = name.to_lowercase();
+    let base_name = name.split(':').next().unwrap_or(name).to_lowercase();
+    name_lower.contains("embed") || embedding_patterns.iter().any(|p| base_name.contains(p))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1175,173 @@ pub struct OllamaModelInfo {
     pub name: String,
     pub size_mb: u64,
     pub is_embedding_model: bool,
+}
+
+/// One model the daemon says is configured but not installed, with the
+/// command that installs it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaMissingModel {
+    pub name: String,
+    pub pull: String,
+}
+
+/// The onboarding wizard's two questions, answered separately: is the
+/// server running, and is each configured model pulled?
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaProbeResult {
+    /// The server that was asked.
+    pub base_url: String,
+    /// Did anything usable answer `GET /api/tags`?
+    pub reachable: bool,
+    /// Why not, in words — only when `reachable` is false.
+    pub reason: Option<String>,
+    /// Every model installed on a reachable server.
+    pub models: Vec<OllamaModelInfo>,
+    /// The models that were checked for, as Ollama names them.
+    pub wanted: Vec<String>,
+    /// Configured models the reachable server does not have. Empty when the
+    /// server is down: a dead server has said nothing about models.
+    pub missing: Vec<OllamaMissingModel>,
+}
+
+/// Probe an Ollama server for the onboarding wizard / setup assistant.
+///
+/// `base_url` blank/absent = the configured host; `models` empty = every
+/// Ollama model the config names. Unlike `get_ollama_models`, a down server
+/// is a *result* (`reachable: false`), not an error — the wizard renders
+/// "start Ollama" and "pull these models" as different next steps.
+#[tauri::command]
+pub async fn probe_ollama(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    base_url: Option<String>,
+    models: Option<Vec<String>>,
+) -> Result<OllamaProbeResult, String> {
+    let report = {
+        let state_guard = state.read().await;
+        state_guard
+            .backend
+            .system_probe_ollama(base_url.as_deref(), models.unwrap_or_default())
+            .await?
+    };
+    ollama_probe_from_report(&report)
+}
+
+/// Decode the daemon's `system.probe_ollama` answer. Pure.
+fn ollama_probe_from_report(report: &serde_json::Value) -> Result<OllamaProbeResult, String> {
+    if let Some(error) = report.get("error").and_then(|e| e.as_str()) {
+        return Err(error.to_string());
+    }
+    let str_list = |key: &str| -> Vec<String> {
+        report
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    let reachable = report.get("reachable").and_then(|r| r.as_bool()) == Some(true);
+    let models = if reachable {
+        ollama_models_from_report(report)?
+    } else {
+        Vec::new()
+    };
+    let missing = report
+        .get("missing")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|n| n.as_str())?.to_string();
+                    let pull = m
+                        .get("pull")
+                        .and_then(|p| p.as_str())
+                        .map_or_else(|| format!("ollama pull {name}"), str::to_string);
+                    Some(OllamaMissingModel { name, pull })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(OllamaProbeResult {
+        base_url: report
+            .get("base_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        reachable,
+        reason: report.get("reason").and_then(|r| r.as_str()).map(str::to_string),
+        models,
+        wanted: str_list("wanted"),
+        missing,
+    })
+}
+
+#[cfg(test)]
+mod ollama_probe_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_down_server_is_an_error_for_the_picker_and_a_result_for_the_wizard() {
+        let report = json!({
+            "base_url": "http://localhost:11434",
+            "reachable": false,
+            "reason": "connection refused or host unreachable",
+            "models": [], "wanted": ["qwen3.5:9b"], "missing": []
+        });
+        let err = ollama_models_from_report(&report).expect_err("down is an error here");
+        assert!(err.contains("localhost:11434") && err.contains("connection refused"), "{err}");
+
+        let probe = ollama_probe_from_report(&report).expect("down is a result here");
+        assert!(!probe.reachable);
+        assert_eq!(probe.reason.as_deref(), Some("connection refused or host unreachable"));
+        assert!(probe.models.is_empty());
+        // Down is not "every model is missing".
+        assert!(probe.missing.is_empty());
+        assert_eq!(probe.wanted, vec!["qwen3.5:9b"]);
+    }
+
+    #[test]
+    fn a_live_server_lists_models_with_sizes_and_names_what_is_missing() {
+        let report = json!({
+            "base_url": "http://localhost:11434",
+            "reachable": true,
+            "models": [
+                { "name": "qwen3.5:9b", "size_bytes": 6_000_000_000_u64 },
+                { "name": "nomic-embed-text:latest", "size_bytes": 274_000_000_u64 }
+            ],
+            "wanted": ["qwen3.5:9b", "gemma4:12b"],
+            "missing": [{ "name": "gemma4:12b", "pull": "ollama pull gemma4:12b" }]
+        });
+        let models = ollama_models_from_report(&report).expect("listed");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "qwen3.5:9b");
+        assert_eq!(models[0].size_mb, 6000);
+        assert!(!models[0].is_embedding_model);
+        assert_eq!(models[1].size_mb, 274);
+        assert!(models[1].is_embedding_model);
+
+        let probe = ollama_probe_from_report(&report).expect("decoded");
+        assert!(probe.reachable && probe.reason.is_none());
+        assert_eq!(probe.models.len(), 2);
+        assert_eq!(probe.missing.len(), 1);
+        assert_eq!(probe.missing[0].name, "gemma4:12b");
+        assert_eq!(probe.missing[0].pull, "ollama pull gemma4:12b");
+    }
+
+    #[test]
+    fn a_daemon_error_envelope_is_surfaced_not_read_as_down() {
+        let report = json!({ "error": "Config not available" });
+        assert_eq!(ollama_models_from_report(&report).unwrap_err(), "Config not available");
+        assert_eq!(ollama_probe_from_report(&report).unwrap_err(), "Config not available");
+    }
+
+    #[test]
+    fn embedding_models_are_recognised_by_name() {
+        assert!(is_ollama_embedding_model("nomic-embed-text:latest"));
+        assert!(is_ollama_embedding_model("BGE-M3:latest"));
+        assert!(is_ollama_embedding_model("all-minilm:22m"));
+        assert!(!is_ollama_embedding_model("qwen3.5:9b"));
+        assert!(!is_ollama_embedding_model("gemma4:12b"));
+    }
 }
 
 /// Fetch available models from Anthropic
@@ -2295,6 +2468,94 @@ pub async fn set_sub_agent_models(
     info!("Sub-agent models set: {:?}", state_guard.config.llm.sub_agent_models);
     drop(state_guard);
     Ok(())
+}
+
+// =============================================================================
+// Data storage location (`[general] data_dir`)
+// =============================================================================
+
+/// Where the daemon keeps its store, as the GUI can report it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataDirInfo {
+    /// The directory the current config selects (override or platform default).
+    pub effective: String,
+    /// The platform default, so the UI can offer "reset to default".
+    pub default: String,
+    /// Whether `[general] data_dir` names somewhere other than the default.
+    pub is_custom: bool,
+}
+
+/// Report the configured data directory.
+///
+/// Reads the in-memory config the GUI already holds; nothing here touches the
+/// daemon, because the GUI is a pure client and the value the daemon *booted*
+/// with may differ from the value on disk until it restarts — which is exactly
+/// what the UI tells the user.
+#[tauri::command]
+pub async fn get_data_dir(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<DataDirInfo, String> {
+    let state_guard = state.read().await;
+    let default = nanna_config::Config::default_data_dir()
+        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
+    let effective = state_guard
+        .config
+        .resolve_data_dir()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    Ok(DataDirInfo {
+        effective: effective.display().to_string(),
+        default: default.display().to_string(),
+        is_custom: state_guard.config.has_custom_data_dir(),
+    })
+}
+
+/// Set (or, with `None` / blank, clear) the configured data directory.
+///
+/// Validates the folder first — absolute, a directory, creatable, writable —
+/// and refuses rather than persisting a path the daemon cannot use. Writes
+/// `config.toml` only; **no data is moved**. The daemon reads this at boot,
+/// so the change takes effect on its next restart, and the returned info is
+/// what the UI shows while stating that.
+#[tauri::command]
+pub async fn set_data_dir(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    path: Option<String>,
+) -> Result<DataDirInfo, String> {
+    let chosen = path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+
+    if let Some(dir) = &chosen {
+        nanna_config::validate_data_dir(dir).map_err(|e| e.to_string())?;
+    }
+
+    let mut state_guard = state.write().await;
+    state_guard.config.general.data_dir = chosen.clone();
+    state_guard
+        .config
+        .save()
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+
+    match &chosen {
+        Some(dir) => info!(
+            "Data directory set to {} — takes effect when the daemon restarts; existing data is not moved",
+            dir.display()
+        ),
+        None => info!("Data directory reset to the platform default — takes effect when the daemon restarts"),
+    }
+
+    let default = nanna_config::Config::default_data_dir()
+        .map_err(|e| format!("Cannot determine the platform data directory: {e}"))?;
+    let effective = state_guard
+        .config
+        .resolve_data_dir()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    Ok(DataDirInfo {
+        effective: effective.display().to_string(),
+        default: default.display().to_string(),
+        is_custom: state_guard.config.has_custom_data_dir(),
+    })
 }
 
 // =============================================================================

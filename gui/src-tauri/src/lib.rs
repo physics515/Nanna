@@ -195,6 +195,7 @@ macro_rules! command_handler {
             // Embedding configuration
             commands::settings::set_embedding_config,
             commands::settings::get_ollama_models,
+            commands::settings::probe_ollama,
             commands::settings::set_ollama_host,
             commands::settings::set_ollama_api_key,
             // Dynamic model fetching
@@ -261,6 +262,8 @@ macro_rules! command_handler {
             commands::settings::set_routing_first_turn_primary,
             commands::settings::get_sub_agent_models,
             commands::settings::set_sub_agent_models,
+            commands::settings::get_data_dir,
+            commands::settings::set_data_dir,
             // Model status
             commands::system::get_model_status,
             commands::system::get_model_stats,

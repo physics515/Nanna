@@ -996,6 +996,22 @@ impl DaemonClient {
             "action": "status"
         })).await
     }
+
+    /// Probe an Ollama server through the daemon's one hardened probe.
+    ///
+    /// `base_url: None` means the daemon's configured `[memory].ollama_host`;
+    /// `models` empty means every Ollama model the config names. The answer
+    /// keeps "server down" (`reachable: false` + `reason`) apart from "server
+    /// up, model missing" (`reachable: true` + `missing`), and lists the
+    /// installed models as `{ name, size_bytes }`.
+    pub async fn system_probe_ollama(&self, base_url: Option<&str>, models: Vec<String>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "system",
+            "action": "probe_ollama",
+            "base_url": base_url,
+            "models": models
+        })).await
+    }
     
     // =========================================================================
     // Session management (additional methods)

@@ -679,14 +679,40 @@ pub enum SystemAction {
         tool_name: Option<String>,
         limit: Option<u32>,
     },
-    /// Probe an Ollama server reachability and which models it has.
-    /// The GUI cannot call `probe_ollama` directly (it would duplicate the
-    /// unhardened logic in `get_ollama_models`); instead it sends this action
-    /// to the daemon which uses the hardened `nanna_llm::probe_ollama`.
+    /// Probe an Ollama server: is it answering, what models does it have, and
+    /// which of the models the caller (or the config) expects are missing.
+    ///
+    /// The GUI links no `nanna-llm` (P16 pruning), so it cannot call
+    /// `probe_ollama` itself; it asks the daemon, which owns the one hardened
+    /// implementation. The answer distinguishes "server down" (`reachable:
+    /// false`, `reason`) from "server up, model missing" (`reachable: true`,
+    /// non-empty `missing`) — the two questions onboarding asks.
     ProbeOllama {
-        /// Base URL of the Ollama server (e.g. <http://localhost:11434>).
-        /// The daemon resolves this from the config it was started with.
-        base_url: String,
+        /// Base URL of the Ollama server (e.g. `http://localhost:11434`).
+        /// Absent ⇒ the daemon's configured `[memory].ollama_host`.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Models the caller wants checked for presence (as the user typed
+        /// them — `ollama/qwen3.5:9b`, `qwen3.5:9b` or bare `qwen3.5`).
+        /// Empty ⇒ every Ollama model the daemon's config names.
+        #[serde(default)]
+        models: Vec<String>,
+    },
+    /// Check an API key the user just typed against its provider with one
+    /// minimal request, and say whether it was accepted.
+    ///
+    /// The key travels IN the request and is used once — this never reads
+    /// the keyring, so a check can run before anything is saved and cannot
+    /// leak a stored credential. The answer is a three-way verdict: `valid`,
+    /// `invalid` (the provider refused the key — 401/403), or `unreachable`
+    /// (nothing usable answered, so the key was neither proven nor refuted),
+    /// each with a readable `reason`. The key itself never appears in the
+    /// answer or in the log.
+    ValidateApiKey {
+        /// `anthropic` | `openai` | `openrouter` | `github` (GitHub Models).
+        provider: String,
+        /// The key as typed. Blank is refused before any network.
+        key: String,
     },
 }
 

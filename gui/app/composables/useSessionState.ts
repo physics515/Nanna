@@ -41,9 +41,13 @@ interface QueuedMessage {
  * daemon's internal healing restarts.
  */
 export interface TimelineEntry {
-  kind: 'thinking' | 'text' | 'tool' | 'fault'
+  /** `user` is GUI-only: a message the user sent mid-run (P19 interjection),
+   *  journaled where it was sent so it renders after the assistant content
+   *  that preceded it rather than beside the previous reply. The daemon's
+   *  journal never emits it — the daemon persists the message to history. */
+  kind: 'thinking' | 'text' | 'tool' | 'fault' | 'user'
   at: string
-  // thinking / text / fault
+  // thinking / text / fault / user
   content?: string
   message?: string
   // tool
@@ -410,6 +414,30 @@ export function useSessionState(sessionId: Ref<string | null>) {
     state.value.liveTimeline.push({ kind: 'fault', message, at: new Date().toISOString() })
   }
 
+  /** Journal a mid-run user message (P19 interjection) at the point it was
+   *  sent. Appending to the journal — not to the page's message list — is
+   *  what puts it AFTER the assistant content streamed so far: the message
+   *  list renders wholesale above the live journal, so a user message pushed
+   *  there landed beside the previous reply while the run kept streaming
+   *  below it. Also closes the open text segment, so the next chunk opens a
+   *  new one after the user message rather than extending the one before it.
+   *  Returns the entry so a failed send can retract it. */
+  function timelineUserMessage(content: string): TimelineEntry | null {
+    if (!state.value) return null
+    const entry: TimelineEntry = { kind: 'user', content, at: new Date().toISOString() }
+    state.value.liveTimeline.push(entry)
+    return entry
+  }
+
+  /** Retract a journal entry by identity (a send that never reached the
+   *  daemon must not stay in the journal as if it had). */
+  function timelineRemove(entry: TimelineEntry) {
+    if (!state.value) return
+    const items = state.value.liveTimeline
+    const idx = items.lastIndexOf(entry)
+    if (idx >= 0) items.splice(idx, 1)
+  }
+
   /** Replace the journal wholesale (remount restore from daemon run state). */
   function setLiveTimeline(items: TimelineEntry[]) {
     if (state.value) state.value.liveTimeline = items
@@ -498,6 +526,8 @@ export function useSessionState(sessionId: Ref<string | null>) {
     timelineToolStart,
     timelineToolEnd,
     timelineFault,
+    timelineUserMessage,
+    timelineRemove,
     setLiveTimeline,
     clearStreamingState,
     resetState,

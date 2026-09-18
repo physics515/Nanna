@@ -65,6 +65,7 @@ pub mod channel_counters;
 pub mod ask_user_service;
 pub mod cost_rollup;
 pub mod user_tools;
+pub mod validate_api_key;
 pub mod webhook;
 
 #[cfg(windows)]

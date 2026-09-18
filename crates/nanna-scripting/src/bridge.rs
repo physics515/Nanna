@@ -833,6 +833,31 @@ impl NannaBridge {
         cmd.env("NO_COLOR", "1");
         cmd.env("TERM", "dumb");
 
+        // Do not hand the child the AppImage's private library path. When the
+        // daemon is a sidecar of an AppImage-launched GUI, AppRun has put the
+        // bundle's own `usr/lib` at the FRONT of `LD_LIBRARY_PATH` so the GUI
+        // finds its bundled WebKit. A child inherits that verbatim, and every
+        // host binary it runs then loads the bundle's `liblzma`/`libpcre2`
+        // instead of the system's: `git` warns "no version information
+        // available" on every call, and a freshly built test binary dies at
+        // load with "version `XZ_5.4' not found" (observed 2026-09-17, on a
+        // `cargo test` run through `exec`). Only the bundle's own entries go —
+        // whatever the user had set stays.
+        #[cfg(unix)]
+        {
+            let appdir = std::env::var_os("APPDIR");
+            let inherited = std::env::var_os("LD_LIBRARY_PATH");
+            match scrub_appimage_library_path(appdir.as_deref(), inherited.as_deref()) {
+                ScrubbedLibraryPath::Unchanged => {}
+                ScrubbedLibraryPath::Cleared => {
+                    cmd.env_remove("LD_LIBRARY_PATH");
+                }
+                ScrubbedLibraryPath::Narrowed(kept) => {
+                    cmd.env("LD_LIBRARY_PATH", kept);
+                }
+            }
+        }
+
         // Smart default timeout: longer for known slow commands.
         // Git, cargo, npm, pip, and build tools regularly exceed 30s on large repos.
         let timeout = timeout_secs.unwrap_or_else(|| default_exec_timeout_secs(command));
@@ -1470,6 +1495,128 @@ pub struct LogEntry {
     pub level: LogLevel,
     pub message: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// What `scrub_appimage_library_path` decided about the child's
+/// `LD_LIBRARY_PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrubbedLibraryPath {
+    /// Not running from an AppImage, or the variable carries none of the
+    /// bundle's directories: the child inherits it as-is.
+    Unchanged,
+    /// Every entry was the bundle's: the child gets no `LD_LIBRARY_PATH` at all,
+    /// which is the state the system's own binaries expect.
+    Cleared,
+    /// The bundle's entries removed; these are the ones that remain, in order.
+    Narrowed(std::ffi::OsString),
+}
+
+/// Drop the AppImage bundle's own directories from an inherited
+/// `LD_LIBRARY_PATH`. `appdir` is the mount AppRun exported (`$APPDIR`); an
+/// entry is the bundle's when it lies under that mount. Pure, so the three
+/// outcomes can be pinned without an AppImage on the machine.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn scrub_appimage_library_path(
+    appdir: Option<&std::ffi::OsStr>,
+    ld_library_path: Option<&std::ffi::OsStr>,
+) -> ScrubbedLibraryPath {
+    let (Some(appdir), Some(inherited)) = (appdir, ld_library_path) else {
+        return ScrubbedLibraryPath::Unchanged;
+    };
+    let appdir = std::path::Path::new(appdir);
+    if appdir.as_os_str().is_empty() {
+        return ScrubbedLibraryPath::Unchanged;
+    }
+    let mut kept: Vec<std::path::PathBuf> = Vec::new();
+    let mut dropped = 0usize;
+    for entry in std::env::split_paths(inherited) {
+        // AppRun writes its entries with a trailing slash; `starts_with` is
+        // component-wise, so `/mnt/x/usr/lib/` is under `/mnt/x` either way.
+        if entry.starts_with(appdir) {
+            dropped += 1;
+        } else {
+            kept.push(entry);
+        }
+    }
+    if dropped == 0 {
+        return ScrubbedLibraryPath::Unchanged;
+    }
+    if kept.is_empty() {
+        return ScrubbedLibraryPath::Cleared;
+    }
+    match std::env::join_paths(&kept) {
+        Ok(joined) => ScrubbedLibraryPath::Narrowed(joined),
+        // A kept entry contains the separator itself — cannot be re-encoded.
+        // Leave the variable alone rather than hand the child a mangled one.
+        Err(_) => ScrubbedLibraryPath::Unchanged,
+    }
+}
+
+#[cfg(test)]
+mod appimage_library_path_tests {
+    use super::{ScrubbedLibraryPath, scrub_appimage_library_path};
+    use std::ffi::OsStr;
+
+    const APPDIR: &str = "/tmp/.mount_Nanna_kMlAkL";
+
+    #[test]
+    fn outside_an_appimage_the_variable_is_inherited_untouched() {
+        assert_eq!(
+            scrub_appimage_library_path(None, Some(OsStr::new("/opt/cuda/lib64"))),
+            ScrubbedLibraryPath::Unchanged
+        );
+        assert_eq!(
+            scrub_appimage_library_path(Some(OsStr::new(APPDIR)), None),
+            ScrubbedLibraryPath::Unchanged
+        );
+        assert_eq!(
+            scrub_appimage_library_path(Some(OsStr::new("")), Some(OsStr::new(APPDIR))),
+            ScrubbedLibraryPath::Unchanged,
+            "an empty APPDIR names no mount and must not match everything"
+        );
+    }
+
+    #[test]
+    fn the_bundles_own_entries_are_dropped_and_nothing_else() {
+        // Exactly what AppRun exported in the 2026-09-17 incident, plus one
+        // entry the user had set themselves.
+        let inherited = format!(
+            "{APPDIR}/usr/lib/:{APPDIR}/usr/lib/x86_64-linux-gnu/:/opt/cuda/lib64:{APPDIR}/lib64/:"
+        );
+        assert_eq!(
+            scrub_appimage_library_path(Some(OsStr::new(APPDIR)), Some(OsStr::new(&inherited))),
+            ScrubbedLibraryPath::Narrowed("/opt/cuda/lib64:".into()),
+            "the user's entry (and the trailing empty one) survive; the bundle's go"
+        );
+    }
+
+    #[test]
+    fn a_variable_that_is_entirely_the_bundles_is_removed_outright() {
+        let inherited = format!("{APPDIR}/usr/lib/:{APPDIR}/lib/");
+        assert_eq!(
+            scrub_appimage_library_path(Some(OsStr::new(APPDIR)), Some(OsStr::new(&inherited))),
+            ScrubbedLibraryPath::Cleared
+        );
+    }
+
+    #[test]
+    fn a_variable_with_no_bundle_entries_is_left_alone() {
+        assert_eq!(
+            scrub_appimage_library_path(
+                Some(OsStr::new(APPDIR)),
+                Some(OsStr::new("/opt/cuda/lib64:/usr/local/lib"))
+            ),
+            ScrubbedLibraryPath::Unchanged
+        );
+        // A sibling mount is not this bundle: prefix, not substring.
+        assert_eq!(
+            scrub_appimage_library_path(
+                Some(OsStr::new(APPDIR)),
+                Some(OsStr::new("/tmp/.mount_Nanna_kMlAkL2/usr/lib"))
+            ),
+            ScrubbedLibraryPath::Unchanged
+        );
+    }
 }
 
 /// Strip ANSI escape sequences from text.

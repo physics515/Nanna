@@ -146,4 +146,40 @@ describe('RunTimeline', () => {
     const wrapper = mountTimeline([failed])
     expect(wrapper.get('[data-testid="tool"]').attributes('data-status')).toBe('error')
   })
+
+  /**
+   * P19 interjection placement: a user message journaled mid-run renders as a
+   * user bubble in its chronological slot — after the assistant text that
+   * preceded it and before the text that followed — while live and after the
+   * run is finalized alike.
+   */
+  it('renders a mid-run user message in its chronological slot', () => {
+    const user = { kind: 'user', content: 'actually, use bash', at: '2026-07-30T08:11:00Z' } as TimelineEntry
+    const wrapper = mountTimeline([text('Working on it'), user, text('Switching to bash')], true)
+    const bubbles = wrapper.findAll('[data-testid="bubble"]')
+    // Live: the trailing open text segment belongs to the streaming bubble,
+    // so exactly two bubbles render here — the earlier text, then the user.
+    expect(bubbles.map(b => b.text())).toEqual(['Working on it', 'actually, use bash'])
+
+    const finalized = mountTimeline([text('Working on it'), user, text('Switching to bash')], false)
+    expect(finalized.findAll('[data-testid="bubble"]').map(b => b.text()))
+      .toEqual(['Working on it', 'actually, use bash', 'Switching to bash'])
+  })
+
+  it('gives the mid-run user message the user role', () => {
+    const roleStubs = {
+      ...stubs,
+      NuiMessage: {
+        props: ['role', 'accent', 'author'],
+        template: '<div data-testid="bubble" :data-role="role"><slot /></div>',
+      },
+    }
+    const user = { kind: 'user', content: 'hello?', at: '2026-07-30T08:11:00Z' } as TimelineEntry
+    const wrapper = mount(RunTimeline, {
+      props: { items: [text('a'), user, text('b')], isLive: false },
+      global: { stubs: roleStubs },
+    })
+    expect(wrapper.findAll('[data-testid="bubble"]').map(b => b.attributes('data-role')))
+      .toEqual(['assistant', 'user', 'assistant'])
+  })
 })

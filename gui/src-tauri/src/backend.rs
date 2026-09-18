@@ -267,6 +267,11 @@ impl Backend {
     pub async fn system_status(&self) -> Result<Value, String> {
         self.daemon_client.system_status().await
     }
+
+    /// Probe an Ollama server via the daemon (see `DaemonClient::system_probe_ollama`).
+    pub async fn system_probe_ollama(&self, base_url: Option<&str>, models: Vec<String>) -> Result<Value, String> {
+        self.daemon_client.system_probe_ollama(base_url, models).await
+    }
 }
 
 /// The Tauri window event a daemon event is forwarded as — its name and JSON

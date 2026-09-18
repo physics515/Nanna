@@ -29,6 +29,17 @@ const error = ref<string | null>(null)
 const healthOk = ref(false)
 const healthDetail = ref('')
 
+/** The daemon's answer to "is Ollama running, and is a model pulled?" */
+interface OllamaProbeResult {
+  base_url: string
+  reachable: boolean
+  reason: string | null
+  models: { name: string; size_mb: number; is_embedding_model: boolean }[]
+  wanted: string[]
+  missing: { name: string; pull: string }[]
+}
+const ollamaProbe = ref<OllamaProbeResult | null>(null)
+
 const providers = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'openai', label: 'OpenAI' },
@@ -47,6 +58,7 @@ watch(
       keySaved.value = !!props.hasApiKey
       healthOk.value = false
       healthDetail.value = ''
+      ollamaProbe.value = null
       saving.value = false
       checking.value = false
     }
@@ -113,6 +125,7 @@ async function runHealthCheck() {
   checking.value = true
   healthOk.value = false
   healthDetail.value = ''
+  ollamaProbe.value = null
   try {
     const status = await invoke<{ running?: boolean; version?: string; error?: string } | string>('get_backend_status')
     if (typeof status === 'string') {
@@ -130,10 +143,58 @@ async function runHealthCheck() {
   } catch (e: any) {
     healthOk.value = false
     healthDetail.value = e?.message || "Couldn't reach the backend. You can still start and fix this in Settings."
-  } finally {
-    checking.value = false
   }
+  // Ollama is keyless, so "the backend answers" says nothing about whether a
+  // model can actually run. Ask the daemon's probe instead of assuming a local
+  // server is up: down and missing-model are different next steps.
+  if (provider.value === 'ollama' && healthOk.value) {
+    try {
+      const probe = await invoke<OllamaProbeResult>('probe_ollama', {})
+      ollamaProbe.value = probe
+      if (!probe.reachable) {
+        healthOk.value = false
+      } else if (probe.missing.length > 0) {
+        healthOk.value = false
+      }
+    } catch (e: any) {
+      ollamaProbe.value = null
+      healthOk.value = false
+      healthDetail.value = `Backend is reachable, but the Ollama check failed: ${e?.message || String(e)}`
+    }
+  }
+  checking.value = false
 }
+
+/** What the wizard says about Ollama, from the probe — one sentence, plus the fix. */
+const ollamaSummary = computed(() => {
+  const p = ollamaProbe.value
+  if (!p) return null
+  if (!p.reachable) {
+    return {
+      ok: false,
+      text: `Ollama is not answering at ${p.base_url}${p.reason ? ` (${p.reason})` : ''}.`,
+      fix: 'Install Ollama and start it (`ollama serve`), then recheck.',
+      pulls: [] as string[],
+    }
+  }
+  if (p.missing.length > 0) {
+    return {
+      ok: false,
+      text: `Ollama is running at ${p.base_url}, but ${p.missing.length === 1 ? 'a configured model is' : `${p.missing.length} configured models are`} not pulled yet.`,
+      fix: 'Run this in a terminal, then recheck:',
+      pulls: p.missing.map((m) => m.pull),
+    }
+  }
+  const count = p.models.length
+  return {
+    ok: true,
+    text: p.wanted.length > 0
+      ? `Ollama is running at ${p.base_url} with every configured model pulled (${count} installed).`
+      : `Ollama is running at ${p.base_url} with ${count} model${count === 1 ? '' : 's'} installed.`,
+    fix: count === 0 ? 'Pull a model to chat with, e.g. `ollama pull qwen3.5:9b`.' : null,
+    pulls: [] as string[],
+  }
+})
 </script>
 
 <template>
@@ -226,7 +287,7 @@ async function runHealthCheck() {
               @save="onKeySave"
             />
             <p v-else class="text-xs text-nanna-text-muted">
-              Ollama runs locally — no API key needed. Ensure Ollama is running on this machine.
+              Ollama runs locally — no API key needed. The next step checks whether it is running and has a model pulled.
             </p>
 
             <div class="flex justify-between pt-2">
@@ -273,6 +334,28 @@ async function runHealthCheck() {
                 <Check v-if="healthOk" class="w-4 h-4 shrink-0 mt-0.5" />
                 {{ healthDetail || 'Status unknown.' }}
               </span>
+            </div>
+
+            <div
+              v-if="!checking && ollamaSummary"
+              data-testid="ollama-probe"
+              class="rounded-lg border px-3 py-3 text-sm space-y-2"
+              :class="
+                ollamaSummary.ok
+                  ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-100'
+                  : 'border-amber-500/25 bg-amber-500/10 text-amber-100'
+              "
+            >
+              <span class="flex items-start gap-2">
+                <Check v-if="ollamaSummary.ok" class="w-4 h-4 shrink-0 mt-0.5" />
+                {{ ollamaSummary.text }}
+              </span>
+              <p v-if="ollamaSummary.fix" class="text-xs opacity-80">{{ ollamaSummary.fix }}</p>
+              <ul v-if="ollamaSummary.pulls.length" class="space-y-1">
+                <li v-for="pull in ollamaSummary.pulls" :key="pull">
+                  <code class="block rounded bg-black/30 px-2 py-1 text-xs font-mono select-all">{{ pull }}</code>
+                </li>
+              </ul>
             </div>
 
             <div class="flex justify-between pt-2">
