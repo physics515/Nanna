@@ -9,7 +9,7 @@
  * Accepts markdown via v-model, converts internally to Tiptap HTML, and emits
  * markdown back on changes.
  */
-import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onBeforeUnmount, onMounted } from 'vue'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
@@ -22,6 +22,7 @@ import TaskItem from '@tiptap/extension-task-item'
 import Image from '@tiptap/extension-image'
 import Typography from '@tiptap/extension-typography'
 import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
+import { SlashCommands, slashMenuKeyDown } from '~/extensions/SlashCommands'
 // Markdown ↔ Tiptap conversion lives in lib/ so the outbound path (the one
 // that decides what the daemon actually receives) is unit-testable.
 import { jsonToMarkdown, markdownToHtml } from '~/lib/tiptapMarkdown'
@@ -88,12 +89,11 @@ function buildExtensions() {
     exts.push(Image.configure({ inline: true, allowBase64: true }))
   }
 
-  // Lazy-load SlashCommands only if needed
+  // Imported statically: this used to be a `require` inside a silent catch,
+  // and `require` does not exist in the ESM browser build, so the menu never
+  // registered and nothing said so.
   if (props.slashCommands) {
-    try {
-      const { SlashCommands } = require('~/extensions/SlashCommands')
-      exts.push(SlashCommands)
-    } catch { /* slash commands extension not available */ }
+    exts.push(SlashCommands)
   }
 
   return exts
@@ -138,6 +138,10 @@ const editor = useEditor({
       return false
     },
     handleKeyDown: (view, event) => {
+      // An open slash menu takes the keys it handles (arrows, Enter, Escape)
+      // before the parent sees them: closing the menu with Escape must not
+      // also stop the running turn, as ChatInput's Escape does.
+      if (slashMenuKeyDown(view, event)) return true
       emit('keydown', event, view)
       // Return false — let parent decide via event handler
       return false
