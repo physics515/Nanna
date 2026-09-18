@@ -74,6 +74,17 @@ describe('describeSplash', () => {
     expect(retrying.detail).toMatch(/keeps trying/)
   })
 
+  it('offers Restart, quietly, for a running daemon that has not answered', () => {
+    // The client is retrying, so the daemon is up but not answering: a hung
+    // daemon looks exactly like this, and only a restart gets past it.
+    const retrying = describeSplash(status({ daemon_state: 'running', retrying: true }))
+    expect(retrying.offerRestart).toBe(true)
+    expect(retrying.primary).toBeNull()
+    // The moment between "ready" and the attach is not worth a restart.
+    const attaching = describeSplash(status({ daemon_state: 'running', retrying: false }))
+    expect(attaching.offerRestart).toBe(false)
+  })
+
   it('shows a crash with the reason, the exit code and a primary Restart', () => {
     const v = describeSplash(status({
       daemon_state: 'crashed',
@@ -146,7 +157,9 @@ describe('describeSplash', () => {
 
   it('says "keeps trying" for a stopped daemon only when the client is retrying', () => {
     const idle = describeSplash(status({ daemon_state: 'stopped', init_in_progress: false, retrying: false }))
-    expect(idle.detail).toBe('Start it here, or open Nanna without it.')
+    // Opening Nanna anyway runs the layout's init, which starts a stopped
+    // daemon: "without it" would be untrue.
+    expect(idle.detail).toBe('Start it here, or open Nanna anyway, which starts it too. Chats work once it answers.')
     const retrying = describeSplash(status({ daemon_state: 'stopped', init_in_progress: false, retrying: true }))
     expect(retrying.detail).toMatch(/keeps trying/)
   })

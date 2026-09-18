@@ -61,7 +61,10 @@ export interface SplashView {
   /** "exit code 1", "signal 9": how the process ended, when it reported it. */
   exit: string | null
   primary: SplashAction | null
-  /** Restart as a quiet secondary action: a boot this slow may be hung, and only a restart kills it. */
+  /**
+   * Restart as a quiet secondary action: a boot this slow, or a running
+   * daemon that does not answer, may be hung, and only a restart kills it.
+   */
   offerRestart: boolean
   tone: SplashTone
 }
@@ -169,6 +172,10 @@ export function describeSplash(
   if (state === 'running') {
     return view('connecting', 'Connecting…', {
       detail: retrying ? 'The daemon is running but has not answered yet. ' + KEEPS_TRYING : '',
+      // A retrying client means the daemon is up and not answering, which a
+      // hung one does for good; only a restart gets past it. Not while the
+      // client is still attaching: that is a moment, not a state.
+      offerRestart: retrying,
     })
   }
 
@@ -193,7 +200,9 @@ export function describeSplash(
     if (status.init_in_progress === true) return view('starting', 'Starting the daemon…')
     return view('stopped', "The daemon isn't running", {
       ...failureParts(status.last_error),
-      detail: retrying ? KEEPS_TRYING : 'Start it here, or open Nanna without it.',
+      // Opening anyway runs the layout's init, and that starts a stopped
+      // daemon: "open Nanna without it" was not what happens.
+      detail: retrying ? KEEPS_TRYING : 'Start it here, or open Nanna anyway, which starts it too. Chats work once it answers.',
       primary: 'start',
       tone: 'idle',
     })

@@ -48,10 +48,32 @@ async function refresh(): Promise<BackendStatus | null> {
   }
 }
 
+/** The polls' read in flight, if any. */
+let polling: Promise<BackendStatus | null> | null = null
+
+/**
+ * A polled status read: one at a time, across every poll. get_backend_status
+ * waits on the app state's and the daemon manager's locks, and a connected
+ * refresh also asks the daemon for its version, so a read can take as long
+ * as they do. An interval that did not wait stacked another read on every
+ * tick behind it. A tick that finds a read in flight gets that read.
+ *
+ * Only for polls: a caller that needs a read begun after something it did
+ * (a restart) calls `refresh`.
+ */
+function poll(): Promise<BackendStatus | null> {
+  if (polling === null) {
+    polling = refresh().finally(() => {
+      polling = null
+    })
+  }
+  return polling
+}
+
 function ensurePolling() {
   if (pollHandle !== null) return
   pollHandle = setInterval(() => {
-    void refresh()
+    void poll()
   }, POLL_MS)
 }
 
@@ -142,5 +164,6 @@ export function useBackend() {
     label,
     init,
     refresh,
+    poll,
   }
 }

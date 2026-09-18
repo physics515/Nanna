@@ -7,7 +7,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from 'vue'
+import { computed, nextTick, onBeforeUpdate, onMounted, onUnmounted, onUpdated, ref, useId, watch } from 'vue'
 import { useAppUpdater } from '~/composables/useAppUpdater'
 import { useBackend } from '~/composables/useBackend'
 import { useCloseHandler } from '~/composables/useCloseHandler'
@@ -18,7 +18,9 @@ import { describeSplash, type BootLogLine, type SplashTone } from '~/lib/startup
  * get_backend_status is an in-process read of the GUI's own state, with no
  * daemon round trip, and nothing else runs in the window during a boot.
  * Half a second is the longest a finished boot should sit behind the splash
- * before the window notices; the shared poll's 2 s would be visible.
+ * before the window notices; the shared poll's 2 s would be visible. Reads
+ * go through useBackend's poll, one at a time: the read waits on the app
+ * state's and the daemon manager's locks, as long as their holders take.
  */
 const STATUS_POLL_MS = 500
 /**
@@ -46,7 +48,7 @@ const QUIET_BUTTON =
   'disabled:pointer-events-none disabled:opacity-50 ' +
   'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-nui-accent'
 
-const { status, refresh } = useBackend()
+const { status, refresh, poll } = useBackend()
 const { continueOffline } = useStartupGate()
 const { updateVersion, updating, checking, applyUpdate } = useAppUpdater()
 const { showCloseDialog, handleClose, performQuit } = useCloseHandler()
@@ -66,6 +68,11 @@ watch(() => status.value?.daemon_state, () => { actionError.value = null })
 
 const updateLabel = computed(() =>
   updating.value ? 'Updating…' : 'Update to v' + (updateVersion.value ?? ''),
+)
+
+/** A slow boot is a process still starting; a daemon that does not answer is one already running. */
+const restartTitle = computed(() =>
+  view.value.phase === 'slow' ? 'Stop this boot and start the daemon again' : 'Stop the daemon and start it again',
 )
 
 // ═══ Status poll ═══
@@ -95,8 +102,16 @@ async function restartDaemon() {
   }
 }
 
+/**
+ * "Open Nanna anyway" mounts the shell now, and the layout's init then starts
+ * the daemon if it is not running. Not while an update installs: the updater
+ * stopped the daemon on purpose, and that init would start the old one again
+ * mid-install.
+ */
+const canOpenAnyway = computed(() => !updating.value)
+
 function openAnyway() {
-  continueOffline()
+  if (canOpenAnyway.value) continueOffline()
 }
 
 async function quit() {
@@ -172,21 +187,20 @@ async function toggleMaximizeWindow() {
 
 /**
  * Close honours the saved close preference, as it does in the shell:
- * handle_window_close hides the window to the tray, quits, or answers "ask",
- * which opens the CloseDialog mounted below (the layout's is not mounted
- * yet). handleClose answers true when the close should go ahead: after
- * "quit", which is already under way, or after a lookup that failed because
- * the app's state is not managed yet. Quit then, so the button always does
- * something.
+ * handleClose hides the window to the tray, quits, or opens the CloseDialog
+ * mounted below (the layout's is not mounted yet), and does all of it
+ * itself. Before the app's state is managed it cannot read the preference,
+ * and it quits, so the button always ends in something.
  */
 async function closeWindow() {
-  if (await handleClose()) await quit()
+  await handleClose()
 }
 
 /**
- * Esc opens Nanna anyway. Heard in the capture phase, ahead of the close
- * dialog's own Esc handling, so a press that closes the dialog is not also
- * read as "open anyway" once the dialog is gone.
+ * Esc opens Nanna anyway (not while an update installs; see openAnyway).
+ * Heard in the capture phase, ahead of the close dialog's own Esc handling,
+ * so a press that closes the dialog is not also read as "open anyway" once
+ * the dialog is gone.
  */
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape' || showCloseDialog.value) return
@@ -194,6 +208,9 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 // ═══ Focus: the action that addresses the state, when there is one ═══
+const splashEl = ref<HTMLElement | null>(null)
+const statusEl = ref<HTMLElement | null>(null)
+
 async function focusPrimary() {
   await nextTick()
   primaryButton.value?.focus()
@@ -202,16 +219,32 @@ watch(() => view.value.primary, (primary) => {
   if (primary) void focusPrimary()
 })
 
+/**
+ * An action the new state removes (Restart, once clicked) takes focus with
+ * it to <body>, where a keyboard user loses their place, and "Restarting…"
+ * has no action to take it. The status line, which says what happened, gets
+ * it then. Checked around every render, since any render can remove the
+ * focused element; the next primary action takes focus from there as usual.
+ */
+let focusWasInside = false
+onBeforeUpdate(() => {
+  focusWasInside = splashEl.value?.contains(document.activeElement) ?? false
+})
+onUpdated(() => {
+  if (focusWasInside && !splashEl.value?.contains(document.activeElement)) statusEl.value?.focus()
+})
+
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown, true)
-  void refresh()
-  statusTimer = setInterval(() => { void refresh() }, STATUS_POLL_MS)
+  void poll()
+  statusTimer = setInterval(() => { void poll() }, STATUS_POLL_MS)
   if (view.value.primary) void focusPrimary()
 
   try {
     const appWindow = getCurrentWindow()
     // The window's own close (Alt+F4, the taskbar) takes the same route as
-    // the close button.
+    // the close button. Prevented, since the JS API would otherwise destroy
+    // the window itself, which the capabilities do not grant.
     adopt(await appWindow.onCloseRequested(async (event) => {
       event.preventDefault()
       await closeWindow()
@@ -236,6 +269,7 @@ onUnmounted(() => {
   <!-- Full window, with the shell's 32px radius on the transparent window
        (dropped while maximized: a maximized window has no corners). -->
   <main
+    ref="splashEl"
     data-testid="startup-splash"
     class="nui-root relative h-screen w-screen overflow-hidden text-xs leading-normal"
     :class="!isMaximized && 'rounded-[32px]'"
@@ -264,7 +298,14 @@ onUnmounted(() => {
         <h1 class="splash-breathe">
           <NuiLogo :height="40" />
         </h1>
-        <p role="status" aria-live="polite" class="flex items-center gap-2 text-sm leading-normal text-nui-fg">
+        <!-- tabindex="-1": focus lands here when the focused action goes away. -->
+        <p
+          ref="statusEl"
+          role="status"
+          aria-live="polite"
+          tabindex="-1"
+          class="flex items-center gap-2 rounded-lg text-sm leading-normal text-nui-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-nui-accent"
+        >
           <span
             aria-hidden="true"
             class="h-2 w-2 shrink-0 rounded-full"
@@ -299,7 +340,7 @@ onUnmounted(() => {
             v-if="view.offerRestart"
             type="button"
             :class="[QUIET_BUTTON, 'text-nui-muted']"
-            title="Stop this boot and start the daemon again"
+            :title="restartTitle"
             :disabled="restarting"
             @click="restartDaemon"
           >
@@ -308,8 +349,9 @@ onUnmounted(() => {
           <button
             type="button"
             :class="[QUIET_BUTTON, 'flex items-center gap-2 text-nui-muted']"
-            title="Settings and logs work without the daemon; chats need it."
+            title="Settings and logs work now. Nanna starts the daemon if it isn't running, and chats work once it answers."
             aria-keyshortcuts="Escape"
+            :disabled="!canOpenAnyway"
             @click="openAnyway"
           >
             Open Nanna anyway
@@ -376,7 +418,10 @@ onUnmounted(() => {
 <style scoped>
 /* Motion only for those who have not asked for less. The logo breathes
    slowly while the app waits; the actions settle in once. Neither gates
-   anything: the splash leaves by v-if, never at the end of an animation. */
+   anything: the splash leaves by v-if, never at the end of an animation.
+   Each starts fully opaque. A window that renders no frames (the
+   tauri-webdriver one) holds every animation at its first keyframe, and a
+   fade in from 0 left the reason and every action invisible there. */
 @media (prefers-reduced-motion: no-preference) {
   .splash-breathe {
     animation: splash-breathe 4s ease-in-out infinite;
@@ -392,7 +437,7 @@ onUnmounted(() => {
 }
 
 @keyframes splash-enter {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: none; }
+  from { transform: translateY(4px); }
+  to { transform: none; }
 }
 </style>

@@ -348,19 +348,102 @@ describe('StartupSplash', () => {
     expect(updater.applyUpdate).toHaveBeenCalledTimes(1)
   })
 
-  it('closes through the saved close preference, and quits when that cannot answer', async () => {
+  it('closes through the saved close preference, which also owns quitting', async () => {
     const { wrapper } = await show(baseStatus())
-    closeHandler.handleClose.mockResolvedValueOnce(false)
+    // handleClose hides, asks or quits by itself. Its old answer, true, read
+    // as "quit now" here, which ran perform_quit twice in "quit" mode.
+    closeHandler.handleClose.mockResolvedValue(true)
     await wrapper.get('button[aria-label="Close"]').trigger('click')
     await flushPromises()
     expect(closeHandler.handleClose).toHaveBeenCalledTimes(1)
     expect(closeHandler.performQuit).not.toHaveBeenCalled()
-
-    closeHandler.handleClose.mockResolvedValueOnce(true)
-    await wrapper.get('button[aria-label="Close"]').trigger('click')
-    await flushPromises()
-    expect(closeHandler.performQuit).toHaveBeenCalledTimes(1)
     expect(wrapper.find('[data-testid="close-dialog"]').exists()).toBe(true)
+  })
+
+  it("takes the window's own close (Alt+F4) the same route as the button", async () => {
+    let onClose: ((event: { preventDefault: () => void }) => Promise<void>) | null = null
+    appWindow.onCloseRequested.mockImplementation(async (handler) => {
+      onClose = handler
+      return () => {}
+    })
+    await show(baseStatus())
+    expect(onClose).not.toBeNull()
+    const event = { preventDefault: vi.fn() }
+    await onClose!(event)
+    // Prevented, since the JS API would otherwise destroy the window, which
+    // the capabilities do not allow; handleClose then ends it.
+    expect(event.preventDefault).toHaveBeenCalledTimes(1)
+    expect(closeHandler.handleClose).toHaveBeenCalledTimes(1)
+    expect(closeHandler.performQuit).not.toHaveBeenCalled()
+  })
+
+  it('never opens anyway while an update installs', async () => {
+    // The updater stops the daemon before installing. Opening the shell then
+    // runs the layout's init, which would start the old daemon mid-install.
+    updater.updating.value = true
+    const { wrapper, gate } = await show(baseStatus({ daemon_state: 'stopped', init_in_progress: false }))
+    expect(button(wrapper, /^Open Nanna anyway/).attributes('disabled')).toBeDefined()
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    expect(gate.released.value).toBe(false)
+  })
+
+  it('says what opening anyway does: the daemon is started if it is not running', async () => {
+    const { wrapper } = await show(baseStatus())
+    expect(button(wrapper, /^Open Nanna anyway/).attributes('title')).toBe(
+      "Settings and logs work now. Nanna starts the daemon if it isn't running, and chats work once it answers.",
+    )
+  })
+
+  it('offers Restart while a running daemon does not answer', async () => {
+    const { wrapper } = await show(baseStatus({ daemon_state: 'running', retrying: true, starting_for_s: null }))
+    const restart = button(wrapper, 'Restart the daemon')
+    expect(restart.attributes('title')).toBe('Stop the daemon and start it again')
+    await restart.trigger('click')
+    await flushPromises()
+    expect(invoke).toHaveBeenCalledWith('restart_daemon')
+  })
+
+  it('moves focus to the status line when the focused action goes away', async () => {
+    const { wrapper } = await show(baseStatus({ daemon_state: 'crashed', init_in_progress: false }))
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'restart_daemon') return new Promise(() => {})
+      return answer(cmd)
+    })
+    const restart = button(wrapper, 'Restart the daemon')
+    expect(document.activeElement).toBe(restart.element)
+    await restart.trigger('click')
+    await flushPromises()
+    // "Restarting…" has no action to focus; <body> would lose the reader's place.
+    expect(statusLine(wrapper)).toBe('Restarting the daemon…')
+    expect(document.activeElement).toBe(wrapper.get('[role="status"]').element)
+  })
+
+  it('moves focus to the status line when a quiet Restart is used', async () => {
+    const { wrapper } = await show(baseStatus({ starting_for_s: 65 }))
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'restart_daemon') return new Promise(() => {})
+      return answer(cmd)
+    })
+    const restart = button(wrapper, 'Restart the daemon')
+    ;(restart.element as HTMLButtonElement).focus()
+    await restart.trigger('click')
+    await flushPromises()
+    expect(document.activeElement).toBe(wrapper.get('[role="status"]').element)
+  })
+
+  it('never stacks status reads behind one that has not answered', async () => {
+    await show(baseStatus())
+    const reads = () => invoke.mock.calls.filter(([cmd]) => cmd === 'get_backend_status').length
+    // get_backend_status waits on the app state's and the daemon manager's
+    // locks. Neither the splash's 500 ms poll nor the shared 2 s one starts
+    // another read while this one is out.
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_backend_status') return new Promise(() => {})
+      return answer(cmd)
+    })
+    const before = reads()
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(reads()).toBe(before + 1)
   })
 
   it('drops the corner radius while maximized', async () => {
