@@ -3113,12 +3113,13 @@ mod tests {
         // walks the latch down rung by rung (3/4 on the 512 quantum, clamped
         // at the caller's floor), and the effective window follows. (An
         // unlatched model starts from the ladder ceiling.)
-        while LlmClient::demote_context(model, Some(4_096)).is_some() {}
-        let live = nanna_llm::effective_context_window(model, claim.context_window);
+        let llm = LlmClient::ollama("http://127.0.0.1:9");
+        while llm.demote_context(model, Some(4_096)).is_some() {}
+        let live = llm.effective_context_window(model, claim.context_window);
         assert_eq!(live, 4_096, "the latch is the live window source");
 
         // The rebind the agent loop performs: every budget re-derives.
-        let live_info = nanna_llm::clamp_model_info_to_effective_window(model, claim);
+        let live_info = llm.clamp_model_info_to_effective_window(model, claim);
         ctx.configure_for_model_with_output(&live_info, 2_048);
         assert!(ctx.hard_limit < old_hard, "hard limit must shrink with the window");
         assert!(ctx.compression_threshold < old_threshold);

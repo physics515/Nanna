@@ -437,27 +437,37 @@ pub fn model_context_window(model: &str) -> usize {
 /// Build a [`ModelInfo`] from the on-disk cache, or the universal unknown floor.
 ///
 /// Used by sync paths that cannot await a provider fetch (e.g. consolidation
-/// sizing). Prefer [`LlmClient::get_model_info`] whenever a client is available.
+/// sizing). Prefer [`LlmClient::get_model_info`] whenever a client is available,
+/// and [`LlmClient::model_info_from_cache_or_unknown`] for a sync read through
+/// one.
 ///
-/// The result is clamped to the LIVE effective runner window
+/// The result is clamped to the effective runner window
 /// ([`clamp_model_info_to_effective_window`]): a cached provider claim is a
 /// static fact, but a mid-run `num_ctx` demotion is live state, and budgets
 /// derived from the stale claim overflow every subsequent prompt.
 #[must_use]
 pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInfo {
-    if let Some(cache) = ModelInfoCache::default_location()
-        && let Some(info) = cache.get(model) {
-            return clamp_model_info_to_effective_window(model, info);
-        }
-    clamp_model_info_to_effective_window(model, unknown_model_info(model, provider))
+    clamp_model_info_to_effective_window(model, cached_model_info_or_unknown(model, provider))
 }
 
-/// The context window the local runner will actually honour for `model` right
-/// now.
+/// The cached provider claim for `model`, or the universal unknown floor, as
+/// the provider states it: not clamped to any runner window.
+fn cached_model_info_or_unknown(model: &str, provider: &str) -> ModelInfo {
+    ModelInfoCache::default_location()
+        .and_then(|cache| cache.get(model))
+        .unwrap_or_else(|| unknown_model_info(model, provider))
+}
+
+/// The context window every Ollama server that has sized `model` will honour
+/// right now.
 ///
-/// That is `reported` (provider metadata / cache / config) clamped by the live
-/// Ollama `num_ctx` latch. Models that were never sized by the Ollama path
-/// (cloud providers, unlatched local models) pass `reported` through unchanged.
+/// That is `reported` (provider metadata / cache / config) clamped by the
+/// smallest `num_ctx` latched for `model` on any server: without the server a
+/// request goes to, only a window all of them honour is safe. A caller holding
+/// the client reads [`LlmClient::effective_context_window`] instead, the window
+/// of the one server that client sends to. Models that were never sized by the
+/// Ollama path (cloud providers, unlatched local models) pass `reported`
+/// through unchanged.
 ///
 /// This is the read side of [`LlmClient::demote_context`]. A mid-run VRAM
 /// demotion rewrites the latch, and every downstream budget (compression
@@ -468,11 +478,17 @@ pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInf
 /// 4-hour eval scored 1/42 against 4/42-per-hour at full context.
 #[must_use]
 pub fn effective_context_window(model: &str, reported: usize) -> usize {
-    LlmClient::effective_num_ctx(model).map_or(reported, |latched| reported.min(latched as usize))
+    clamp_window(reported, LlmClient::smallest_latched_num_ctx(model))
 }
 
-/// `info` with its window clamped to the live effective runner window for
-/// `model` (see [`effective_context_window`]).
+/// `reported`, lowered to `num_ctx` when there is one. A latch is a ceiling,
+/// never a floor: a claim smaller than it stands.
+fn clamp_window(reported: usize, num_ctx: Option<u32>) -> usize {
+    num_ctx.map_or(reported, |num_ctx| reported.min(num_ctx as usize))
+}
+
+/// `info` with its window clamped to the effective runner window for `model`
+/// (see [`effective_context_window`]).
 ///
 /// `max_output_tokens` is re-bounded to half the clamped window, mirroring how
 /// the Ollama fetch derives it from the full window — so every budget the
@@ -481,8 +497,14 @@ pub fn effective_context_window(model: &str, reported: usize) -> usize {
 /// with the window the runner will actually honour. No-op when no latch exists
 /// or the latch is at/above the reported window.
 #[must_use]
-pub fn clamp_model_info_to_effective_window(model: &str, mut info: ModelInfo) -> ModelInfo {
+pub fn clamp_model_info_to_effective_window(model: &str, info: ModelInfo) -> ModelInfo {
     let effective = effective_context_window(model, info.context_window);
+    clamp_model_info_to_window(model, info, effective)
+}
+
+/// `info` with its window lowered to `effective` and its output cap re-bounded
+/// to half of it (see [`clamp_model_info_to_effective_window`]).
+fn clamp_model_info_to_window(model: &str, mut info: ModelInfo, effective: usize) -> ModelInfo {
     if effective < info.context_window {
         tracing::debug!(
             model,
@@ -529,62 +551,6 @@ pub const NUM_CTX_CEILING: u32 = 32_768;
 /// (`nanna_agent`'s min-viable-window derivation); this constant only covers
 /// call sites that have no agent state to measure.
 pub const DEFAULT_MIN_VIABLE_NUM_CTX: u32 = 4_608;
-
-/// One model's `num_ctx` latch, held per Ollama server.
-///
-/// Per server because what a size is fitted to is per server: one on this
-/// machine is fitted to this machine's free VRAM, one elsewhere starts at the
-/// size for unknown VRAM, and each is walked down by its own GPU-memory
-/// faults. Keyed by model alone, the latch served one server's size to
-/// another: a local fit taken while a game held this machine's card went on
-/// sizing the remote server Settings then pointed chat at, until the daemon
-/// restarted.
-#[derive(Debug)]
-struct ModelCtxLatch {
-    /// The live size: the one the model's latest request was sent with, which
-    /// [`LlmClient::effective_num_ctx`] reports and
-    /// [`LlmClient::demote_context`] walks down.
-    live: u32,
-    /// The server `live` belongs to. `None` for a size set before any request
-    /// resolved one (a demotion with no sizing behind it): the first server
-    /// the model is sent to adopts it, as the model-keyed latch did.
-    server: Option<String>,
-    /// The sizes latched for other servers this model has been sent to — the
-    /// summarizer's `[llm].ollama_url` and chat's `[memory].ollama_host` can
-    /// both serve one model name. Returning to a server resumes its size
-    /// instead of re-sizing it: a changed `num_ctx` makes Ollama evict and
-    /// reload the model there, and its demotions were paid for by its own
-    /// faults. Bounded by the servers the configuration has named this
-    /// process, as the model size cache is.
-    others: std::collections::HashMap<String, u32>,
-}
-
-impl ModelCtxLatch {
-    /// The size latched for `server`, made live; `None` when that server was
-    /// never sized for this model.
-    fn serve(&mut self, server: &str) -> Option<u32> {
-        match &self.server {
-            None => self.server = Some(server.to_string()),
-            Some(live_server) if live_server == server => {}
-            Some(_) => {
-                let resumed = self.others.remove(server)?;
-                self.make_live(server, resumed);
-            }
-        }
-        Some(self.live)
-    }
-
-    /// Make `size` the live size, for `server`, keeping the size it replaces
-    /// for the server it belonged to.
-    fn make_live(&mut self, server: &str, size: u32) {
-        if let Some(previous) = self.server.replace(server.to_string())
-            && previous != server
-        {
-            self.others.insert(previous, self.live);
-        }
-        self.live = size;
-    }
-}
 
 /// The provider clients' declared silence tolerance.
 ///
@@ -2242,10 +2208,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// non-streaming builder alone, while the agent loop streams exclusively,
     /// so it would have had no effect on the thing it was written to fix.)
     ///
-    /// Source order: what the caller explicitly asked for, then the live
-    /// latch, then the env pin outright (falling back to the probed/nominal
-    /// size only when no pin is set) at latch initialization. Only a server on
-    /// this machine is probed — see [`Self::unpinned_start_num_ctx`].
+    /// Source order: what the caller explicitly asked for, then the size
+    /// latched for this server, then the env pin outright (falling back to the
+    /// probed/nominal size only when no pin is set) at latch initialization.
+    /// Only a server on this machine is probed — see
+    /// [`Self::unpinned_start_num_ctx`].
     fn resolve_num_ctx(base_url: &str, model: &str, explicit: Option<u32>) -> u32 {
         Self::resolve_num_ctx_with(base_url, model, explicit, |model| {
             Self::fit_context_to_free_vram(base_url, model)
@@ -2264,8 +2231,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             return explicit;
         }
         // The latch is this server's: a size fitted for another server says
-        // nothing about this one's VRAM (see `ModelCtxLatch`).
-        if let Some(latched) = Self::serve_latched_num_ctx(base_url, model) {
+        // nothing about this one's VRAM (see `ctx_latch`).
+        if let Some(latched) = Self::latched_num_ctx(base_url, model) {
             return latched;
         }
         // Explicit beats computed — in BOTH directions. `NANNA_OLLAMA_NUM_CTX`
@@ -2318,19 +2285,37 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         model: &str,
         fit_to_this_gpu: impl FnOnce(&str) -> Option<u32>,
     ) -> u32 {
-        /// The start when the VRAM the model will load into is unknown.
-        const UNKNOWN_VRAM_START: u32 = 16_384;
         if !ollama_server_is_local(base_url) {
             tracing::info!(
                 model,
                 server = base_url,
-                num_ctx = UNKNOWN_VRAM_START,
+                num_ctx = Self::UNKNOWN_VRAM_NUM_CTX,
                 "not sizing num_ctx to this machine's GPU: the Ollama server is not on this \
                  machine, so the model starts at the size used when VRAM is unknown"
             );
-            return UNKNOWN_VRAM_START;
+            return Self::UNKNOWN_VRAM_NUM_CTX;
         }
-        fit_to_this_gpu(model).unwrap_or(UNKNOWN_VRAM_START)
+        fit_to_this_gpu(model).unwrap_or(Self::UNKNOWN_VRAM_NUM_CTX)
+    }
+
+    /// The start when the VRAM the model will load into is unknown: this
+    /// machine's card cannot be read, or the server is on another machine.
+    const UNKNOWN_VRAM_NUM_CTX: u32 = 16_384;
+
+    /// The start a model's first request to `base_url` will latch, when it is
+    /// known without measuring anything: the operator's pin, else, for a
+    /// server not on this machine, [`Self::UNKNOWN_VRAM_NUM_CTX`]. `None` for
+    /// a server on this machine with nothing pinned, whose start is this
+    /// card's fit. Measuring shells out to `nvidia-smi` and asks the server
+    /// what it holds, which a reader polled on every agent iteration must not
+    /// do, so it is left to the first request.
+    ///
+    /// The precedence is [`Self::resolve_num_ctx_with`]'s, without its
+    /// announcements, so a window read before a request is the `num_ctx` that
+    /// request carries.
+    fn unmeasured_start_num_ctx(base_url: &str) -> Option<u32> {
+        Self::env_num_ctx()
+            .or_else(|| (!ollama_server_is_local(base_url)).then_some(Self::UNKNOWN_VRAM_NUM_CTX))
     }
 
     /// The operator's explicit context size, if they set one.
@@ -2341,106 +2326,149 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .filter(|v| *v >= 2048)
     }
 
-    fn ctx_latch() -> &'static std::sync::Mutex<std::collections::HashMap<String, ModelCtxLatch>> {
+    /// The `num_ctx` latched for each model on each Ollama server, keyed by
+    /// [`Self::ctx_latch_key`].
+    ///
+    /// Per server because what a size is fitted to is per server: one on this
+    /// machine is fitted to this machine's free VRAM, one elsewhere starts at
+    /// the size for unknown VRAM, and each is walked down by its own
+    /// GPU-memory faults. Keyed by model alone, the latch served one server's
+    /// size to another: a local fit taken while a game held this machine's
+    /// card went on sizing the remote server Settings then pointed chat at,
+    /// and a summarizer's chunks were cut for chat's server while its requests
+    /// carried its own, smaller size. So every reader names its server, which
+    /// a client does by being one. Bounded by the servers the configuration
+    /// has named this process, times the models sent to them.
+    fn ctx_latch() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), u32>> {
         static LATCH: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, ModelCtxLatch>>,
+            std::sync::Mutex<std::collections::HashMap<(String, String), u32>>,
         > = std::sync::OnceLock::new();
         LATCH.get_or_init(Default::default)
     }
 
-    /// The latch is keyed on the bare model name. The request carries
-    /// `gemma4:12b` while callers hold the routed `ollama/gemma4:12b`, and two
-    /// spellings of one model means the demotion writes an entry the request
-    /// path never reads — a self-correcting loop that silently corrects
-    /// nothing.
-    fn ctx_latch_key(model: &str) -> String {
-        model.strip_prefix("ollama/").unwrap_or(model).to_string()
+    /// A latch key: the server's base URL and the bare model name. The request
+    /// carries `gemma4:12b` while callers hold the routed `ollama/gemma4:12b`,
+    /// and two spellings of one model means the demotion writes an entry the
+    /// request path never reads — a self-correcting loop that silently
+    /// corrects nothing.
+    fn ctx_latch_key(server: &str, model: &str) -> (String, String) {
+        (server.to_string(), Self::bare_model(model).to_string())
     }
 
-    /// The live size for `model`, whichever server it was latched for.
-    fn latched_num_ctx(model: &str) -> Option<u32> {
+    fn bare_model(model: &str) -> &str {
+        model.strip_prefix("ollama/").unwrap_or(model)
+    }
+
+    /// The size latched for `model` on `server`; `None` when the model was
+    /// never sized there.
+    fn latched_num_ctx(server: &str, model: &str) -> Option<u32> {
         Self::ctx_latch()
             .lock()
             .ok()?
-            .get(&Self::ctx_latch_key(model))
-            .map(|latch| latch.live)
+            .get(&Self::ctx_latch_key(server, model))
+            .copied()
     }
 
-    /// The size latched for `model` on `server`, made the live one; `None`
-    /// when the model was never sized for that server.
-    fn serve_latched_num_ctx(server: &str, model: &str) -> Option<u32> {
+    /// The smallest size latched for `model` on any server.
+    fn smallest_latched_num_ctx(model: &str) -> Option<u32> {
+        let model = Self::bare_model(model);
         Self::ctx_latch()
             .lock()
             .ok()?
-            .get_mut(&Self::ctx_latch_key(model))?
-            .serve(server)
+            .iter()
+            .filter(|((_, latched_model), _)| latched_model == model)
+            .map(|(_, &size)| size)
+            .min()
     }
 
-    /// Latch `ctx` as `model`'s size on `server`, and return the size now
-    /// live there. A size another request latched for that server while this
-    /// one was being measured is kept: the first request already went out with
-    /// it, and changing it would make Ollama reload the model.
+    /// The `num_ctx` a request for `model` to `server` will carry, as far as
+    /// that is known without measuring: the size latched there, else the start
+    /// [`Self::unmeasured_start_num_ctx`] can name.
+    fn known_num_ctx(server: &str, model: &str) -> Option<u32> {
+        Self::latched_num_ctx(server, model).or_else(|| Self::unmeasured_start_num_ctx(server))
+    }
+
+    /// Latch `ctx` as `model`'s size on `server`, and return the size latched
+    /// there. A size another request latched for that server while this one
+    /// was being measured is kept: that request already went out with it, and
+    /// changing it would make Ollama reload the model.
     fn latch_num_ctx_for(server: &str, model: &str, ctx: u32) -> u32 {
         let Ok(mut latches) = Self::ctx_latch().lock() else {
             return ctx;
         };
-        match latches.entry(Self::ctx_latch_key(model)) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let latch = entry.get_mut();
-                latch.serve(server).unwrap_or_else(|| {
-                    latch.make_live(server, ctx);
-                    ctx
-                })
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(ModelCtxLatch {
-                    live: ctx,
-                    server: Some(server.to_string()),
-                    others: std::collections::HashMap::new(),
-                });
-                ctx
-            }
-        }
+        *latches
+            .entry(Self::ctx_latch_key(server, model))
+            .or_insert(ctx)
     }
 
-    /// Set `model`'s live size, as a sizing or a demotion would leave it.
+    /// Set `model`'s size on `server`, as a sizing or a demotion would leave
+    /// it.
     #[cfg(test)]
-    fn latch_num_ctx(model: &str, ctx: u32) {
+    fn latch_num_ctx(server: &str, model: &str, ctx: u32) {
         if let Ok(mut latches) = Self::ctx_latch().lock() {
-            latches
-                .entry(Self::ctx_latch_key(model))
-                .and_modify(|latch| latch.live = ctx)
-                .or_insert_with(|| ModelCtxLatch {
-                    live: ctx,
-                    server: None,
-                    others: std::collections::HashMap::new(),
-                });
+            latches.insert(Self::ctx_latch_key(server, model), ctx);
         }
     }
 
-    /// The LIVE effective `num_ctx` for `model`, if the Ollama sizing path has
-    /// latched one. `None` means the model was never sized here (cloud models,
-    /// or a local model before its first request) and the provider-reported
-    /// window stands. With the model sized for more than one server, it is the
-    /// size of the server the model's latest request went to.
+    /// The effective `num_ctx` for `model` on this client's server: the size
+    /// its next request there will carry, when that is known without
+    /// measuring (the size latched there, else the operator's pin, else for a
+    /// server on another machine the unknown-VRAM start). `None` means the
+    /// provider-reported window stands: the client is not Ollama's (only an
+    /// Ollama server has a `num_ctx`), or the server is on this machine and
+    /// the model's first request has not measured the card yet.
     ///
     /// This is deliberately a poll-getter rather than a change notification:
-    /// the latch is process-global state keyed by model name, and the agent
-    /// loop already has a natural per-iteration point to re-read it. Callers
-    /// budgeting prompts MUST treat the value as live — [`Self::demote_context`]
-    /// rewrites it mid-run under VRAM pressure.
+    /// the latch is process-global state, and the agent loop already has a
+    /// natural per-iteration point to re-read it. Callers budgeting prompts
+    /// MUST treat the value as live — [`Self::demote_context`] rewrites it
+    /// mid-run under VRAM pressure — and must read it through the client that
+    /// sends the request: the same model on another server has a size of its
+    /// own.
     #[must_use]
-    pub fn effective_num_ctx(model: &str) -> Option<u32> {
-        Self::latched_num_ctx(model)
+    pub fn effective_num_ctx(&self, model: &str) -> Option<u32> {
+        if self.provider != Provider::Ollama {
+            return None;
+        }
+        Self::known_num_ctx(&self.base_url, model)
     }
 
-    /// Drop `model` to the next smaller context rung after the runner failed
-    /// in a way that means it ran out of GPU memory — the live size, the one
-    /// the model's latest request took to its server. Returns the new size, or
-    /// `None` when the latch already sits at (or below) the minimum viable
-    /// window — demoting past the floor manufactures a window the agent will
-    /// loudly refuse, so the fault is surfaced instead of "healed" into an
-    /// unusable size.
+    /// The context window this client's server will honour for `model` right
+    /// now: `reported` clamped by [`Self::effective_num_ctx`]. The form of
+    /// [`effective_context_window`] to budget a request this client sends.
+    #[must_use]
+    pub fn effective_context_window(&self, model: &str, reported: usize) -> usize {
+        clamp_window(reported, self.effective_num_ctx(model))
+    }
+
+    /// `info` with its window clamped to [`Self::effective_context_window`]
+    /// and its output cap re-bounded to half of it, as
+    /// [`clamp_model_info_to_effective_window`] does.
+    #[must_use]
+    pub fn clamp_model_info_to_effective_window(&self, model: &str, info: ModelInfo) -> ModelInfo {
+        let effective = self.effective_context_window(model, info.context_window);
+        clamp_model_info_to_window(model, info, effective)
+    }
+
+    /// [`model_info_from_cache_or_unknown`], clamped to the window of this
+    /// client's server instead of the smallest window of any server.
+    #[must_use]
+    pub fn model_info_from_cache_or_unknown(&self, model: &str) -> ModelInfo {
+        self.clamp_model_info_to_effective_window(model, cached_model_info_or_unknown(model, ""))
+    }
+
+    /// Drop `model` to the next smaller context rung on this client's server
+    /// after the runner there failed in a way that means it ran out of GPU
+    /// memory. Returns the new size, or `None` when the latch already sits at
+    /// (or below) the minimum viable window — demoting past the floor
+    /// manufactures a window the agent will loudly refuse, so the fault is
+    /// surfaced instead of "healed" into an unusable size. `None` too, with
+    /// nothing changed, for a client that is not Ollama's: only an Ollama
+    /// server has a `num_ctx`.
+    ///
+    /// Only this server's size moves. Another server serving the same model
+    /// did not fault, and walking its size instead left this one at the size
+    /// that faults.
     ///
     /// This is the half of the sizing loop that measurement cannot supply.
     /// Sizing happens on the FIRST request, which is structurally the most
@@ -2452,9 +2480,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// the memory that justified the change. The only signal that is both late
     /// enough to be honest and unambiguous is the failure itself.
     ///
-    /// The rung is **3/4 of the current latch**, rounded DOWN to
-    /// [`NUM_CTX_QUANTUM`], never below `min_viable_ctx` (rounded UP to the
-    /// same quantum; `None` falls back to [`DEFAULT_MIN_VIABLE_NUM_CTX`]).
+    /// The rung is **3/4 of the current size** (the latched one, else the
+    /// start this server's first request would latch, else
+    /// [`NUM_CTX_CEILING`]), rounded DOWN to [`NUM_CTX_QUANTUM`], never below
+    /// `min_viable_ctx` (rounded UP to the same quantum; `None` falls back to
+    /// [`DEFAULT_MIN_VIABLE_NUM_CTX`]).
     /// Derivation of the step: the KV cache scales linearly with `num_ctx`,
     /// so a 25% cut frees ~25% of the KV allocation — comfortably more than
     /// one retry's worth of KV growth, which is what the step must outpace —
@@ -2467,20 +2497,25 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// floor in bounded rungs — ⌈log₄∕₃(start/floor)⌉, 7 from 32768 to 4608
     /// — and its 25% cuts can never skip PAST a viable window the way a 50%
     /// cut can.
-    pub fn demote_context(model: &str, min_viable_ctx: Option<u32>) -> Option<u32> {
+    pub fn demote_context(&self, model: &str, min_viable_ctx: Option<u32>) -> Option<u32> {
+        if self.provider != Provider::Ollama {
+            return None;
+        }
         let clamp = min_viable_ctx
             .unwrap_or(DEFAULT_MIN_VIABLE_NUM_CTX)
             .div_ceil(NUM_CTX_QUANTUM)
             .saturating_mul(NUM_CTX_QUANTUM);
-        let key = Self::ctx_latch_key(model);
+        let key = Self::ctx_latch_key(&self.base_url, model);
         let mut guard = Self::ctx_latch().lock().ok()?;
-        let (current, server) = guard.get(&key).map_or((NUM_CTX_CEILING, None), |latch| {
-            (latch.live, latch.server.clone())
-        });
+        let current = guard
+            .get(&key)
+            .copied()
+            .or_else(|| Self::unmeasured_start_num_ctx(&self.base_url))
+            .unwrap_or(NUM_CTX_CEILING);
         if current <= clamp {
             tracing::warn!(
                 model,
-                server = ?server,
+                server = %self.base_url,
                 current,
                 floor = clamp,
                 "GPU memory failure at the context floor — NOT demoting further; \
@@ -2493,18 +2528,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let stepped = (current / 4 * 3) / NUM_CTX_QUANTUM * NUM_CTX_QUANTUM;
         let clamped = stepped < clamp;
         let next = if clamped { clamp } else { stepped };
-        guard
-            .entry(key)
-            .and_modify(|latch| latch.live = next)
-            .or_insert_with(|| ModelCtxLatch {
-                live: next,
-                server: None,
-                others: std::collections::HashMap::new(),
-            });
+        guard.insert(key, next);
         drop(guard);
         tracing::warn!(
             model,
-            server = ?server,
+            server = %self.base_url,
             from = current,
             to = next,
             floor = clamp,
@@ -3010,6 +3038,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// Checks the file cache first, then fetches from the API if needed.
     /// Falls back to defaults if the API doesn't provide context window info.
+    /// The window is clamped to the one this client's server honours for the
+    /// model now ([`Self::effective_context_window`]), so a prompt sized from
+    /// it fits the `num_ctx` this client's request carries.
     ///
     /// # Errors
     ///
@@ -3018,7 +3049,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // Check cache first
         if let Some(cache) = cache
             && let Some(info) = cache.get(model) {
-                return clamp_model_info_to_effective_window(model, info);
+                return self.clamp_model_info_to_effective_window(model, info);
             }
 
         // Fetch from API
@@ -3070,7 +3101,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
                 warn!(model = %model, error = %e, "Failed to cache model info");
             }
 
-        clamp_model_info_to_effective_window(model, info)
+        self.clamp_model_info_to_effective_window(model, info)
     }
 
     /// Force refresh model info from API (bypasses cache).
@@ -6712,40 +6743,45 @@ mod tests {
     /// size has to be decided once and then only ever walked down deliberately.
     #[test]
     fn a_latched_size_survives_re_measurement_and_only_walks_down() {
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         let model = "test-latch-model:1b";
-        LlmClient::latch_num_ctx(model, 32_768);
-        assert_eq!(LlmClient::latched_num_ctx(model), Some(32_768));
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 32_768);
+        assert_eq!(
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, model),
+            Some(32_768)
+        );
 
         // Demotion steps 3/4 at a time on the 512 quantum — the full default
         // ladder, documented end to end: geometric (bounded rungs) but never
         // the 50% cliff that skips past viable windows.
         for expected in [24_576, 18_432, 13_824, 10_240, 7_680, 5_632] {
-            assert_eq!(LlmClient::demote_context(model, None), Some(expected));
+            assert_eq!(local.demote_context(model, None), Some(expected));
         }
         // The last rung clamps AT the default minimum viable window (4608 —
         // the quantized pressure-tier floor), not below it...
-        assert_eq!(LlmClient::demote_context(model, None), Some(4_608));
+        assert_eq!(local.demote_context(model, None), Some(4_608));
         // ...and once there, a repeat fault does NOT demote further: the
         // loud fault path stands rather than a manufactured unusable window.
-        assert_eq!(LlmClient::demote_context(model, None), None);
-        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_608));
+        assert_eq!(local.demote_context(model, None), None);
+        assert_eq!(LlmClient::latched_num_ctx(LOCAL_OLLAMA, model), Some(4_608));
     }
 
     /// The rung arithmetic itself: 3/4 of the current latch, rounded DOWN to
     /// the 512 quantum, strictly decreasing on every step.
     #[test]
     fn demotion_steps_to_three_quarters_on_the_quantum() {
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         let model = "test-three-quarter-step:1b";
-        LlmClient::latch_num_ctx(model, 8_192);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 8_192);
         // Floor far below: pure stepping is visible. 8192·¾ = 6144 (on the
         // quantum), 6144·¾ = 4608 (on the quantum), 4608·¾ = 3456 → 3072
         // (rounded DOWN to the quantum), 3072·¾ = 2304 → 2048.
         let floor = Some(2_048);
-        assert_eq!(LlmClient::demote_context(model, floor), Some(6_144));
-        assert_eq!(LlmClient::demote_context(model, floor), Some(4_608));
-        assert_eq!(LlmClient::demote_context(model, floor), Some(3_072));
-        assert_eq!(LlmClient::demote_context(model, floor), Some(2_048));
-        assert_eq!(LlmClient::demote_context(model, floor), None);
+        assert_eq!(local.demote_context(model, floor), Some(6_144));
+        assert_eq!(local.demote_context(model, floor), Some(4_608));
+        assert_eq!(local.demote_context(model, floor), Some(3_072));
+        assert_eq!(local.demote_context(model, floor), Some(2_048));
+        assert_eq!(local.demote_context(model, floor), None);
         for size in [6_144u32, 4_608, 3_072, 2_048] {
             assert_eq!(size % NUM_CTX_QUANTUM, 0, "every rung sits on the quantum");
         }
@@ -6756,25 +6792,26 @@ mod tests {
     /// that would undershoot clamps TO the floor's quantum instead.
     #[test]
     fn demotion_clamps_to_the_floor_quantum_instead_of_skipping_past_it() {
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         let model = "test-floor-clamp:1b";
-        LlmClient::latch_num_ctx(model, 8_192);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 8_192);
         // An agent floor of 4300 tokens (≈ the live pressure-tier floor)
         // quantizes UP to 4608. 8192·¾ = 6144 clears it...
-        assert_eq!(LlmClient::demote_context(model, Some(4_300)), Some(6_144));
+        assert_eq!(local.demote_context(model, Some(4_300)), Some(6_144));
         // ...but 6144·¾ = 4608 lands exactly on it, and the next rung
         // (4608·¾ = 3456) would undershoot — so it clamps and then stops.
-        assert_eq!(LlmClient::demote_context(model, Some(4_300)), Some(4_608));
-        assert_eq!(LlmClient::demote_context(model, Some(4_300)), None);
-        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_608));
+        assert_eq!(local.demote_context(model, Some(4_300)), Some(4_608));
+        assert_eq!(local.demote_context(model, Some(4_300)), None);
+        assert_eq!(LlmClient::latched_num_ctx(LOCAL_OLLAMA, model), Some(4_608));
 
         // A rung strictly between two quanta clamps UP, never down: from
         // 8192 with a 5000-token floor (quantum 5120), ¾ gives 6144, then
         // 4608 < 5120 → the demotion lands AT 5120.
         let model2 = "test-floor-clamp-up:1b";
-        LlmClient::latch_num_ctx(model2, 8_192);
-        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), Some(6_144));
-        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), Some(5_120));
-        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), None);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model2, 8_192);
+        assert_eq!(local.demote_context(model2, Some(5_000)), Some(6_144));
+        assert_eq!(local.demote_context(model2, Some(5_000)), Some(5_120));
+        assert_eq!(local.demote_context(model2, Some(5_000)), None);
     }
 
     /// No demotion may EVER produce a window below the supplied floor — even
@@ -6782,23 +6819,24 @@ mod tests {
     /// a fatter step frame). The latch is left alone and the fault surfaces.
     #[test]
     fn no_demotion_ever_lands_below_the_floor() {
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         let model = "test-never-below-floor:1b";
-        LlmClient::latch_num_ctx(model, 4_096);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 4_096);
         assert_eq!(
-            LlmClient::demote_context(model, Some(8_192)),
+            local.demote_context(model, Some(8_192)),
             None,
             "a latch already below the floor must not be walked further"
         );
         assert_eq!(
-            LlmClient::latched_num_ctx(model),
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, model),
             Some(4_096),
             "refusing to demote must not touch the latch"
         );
         // And with no floor supplied, the conservative default holds the line.
-        LlmClient::latch_num_ctx(model, DEFAULT_MIN_VIABLE_NUM_CTX);
-        assert_eq!(LlmClient::demote_context(model, None), None);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, DEFAULT_MIN_VIABLE_NUM_CTX);
+        assert_eq!(local.demote_context(model, None), None);
         assert_eq!(
-            LlmClient::latched_num_ctx(model),
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, model),
             Some(DEFAULT_MIN_VIABLE_NUM_CTX)
         );
     }
@@ -6808,10 +6846,11 @@ mod tests {
     /// just as loud, so an operator can read the ladder off the logs.
     #[test]
     fn a_demotion_announces_old_new_floor_and_clamp() {
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         let model = "test-demotion-announces:1b";
-        LlmClient::latch_num_ctx(model, 6_144);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 6_144);
         let out = capture_info_logs(|| {
-            assert_eq!(LlmClient::demote_context(model, Some(5_000)), Some(5_120));
+            assert_eq!(local.demote_context(model, Some(5_000)), Some(5_120));
         });
         assert!(out.contains("demoting context"), "the decision: {out}");
         assert!(out.contains("test-demotion-announces:1b"), "the model: {out}");
@@ -6820,7 +6859,7 @@ mod tests {
         assert!(out.contains("clamped=true"), "clamped-or-not: {out}");
 
         let refused = capture_info_logs(|| {
-            assert_eq!(LlmClient::demote_context(model, Some(5_000)), None);
+            assert_eq!(local.demote_context(model, Some(5_000)), None);
         });
         assert!(
             refused.contains("NOT demoting further"),
@@ -6832,17 +6871,21 @@ mod tests {
     /// model; if they key different latch entries, demotion corrects nothing.
     #[test]
     fn the_latch_ignores_the_provider_prefix() {
-        LlmClient::latch_num_ctx("ollama/test-prefix-model:1b", 16_384);
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, "ollama/test-prefix-model:1b", 16_384);
         assert_eq!(
-            LlmClient::latched_num_ctx("test-prefix-model:1b"),
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, "test-prefix-model:1b"),
             Some(16_384),
             "demotion keyed on the routed name must reach the request path"
         );
         assert_eq!(
-            LlmClient::demote_context("ollama/test-prefix-model:1b", None),
+            local.demote_context("ollama/test-prefix-model:1b", None),
             Some(12_288)
         );
-        assert_eq!(LlmClient::latched_num_ctx("test-prefix-model:1b"), Some(12_288));
+        assert_eq!(
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, "test-prefix-model:1b"),
+            Some(12_288)
+        );
     }
 
     /// The demotion must be OBSERVABLE, not just latched: a model that was
@@ -6852,20 +6895,27 @@ mod tests {
     /// failure was exactly this value existing but being unreadable.
     #[test]
     fn a_demotion_is_visible_through_the_effective_window() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see `an_explicit_override_beats_the_vram_heuristic`.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
         let model = "test-effective-window-model:9b";
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
         // Never sized: the provider claim stands, for local and cloud alike.
-        assert_eq!(LlmClient::effective_num_ctx(model), None);
+        assert_eq!(local.effective_num_ctx(model), None);
+        assert_eq!(local.effective_context_window(model, 32_000), 32_000);
         assert_eq!(effective_context_window(model, 32_000), 32_000);
 
         // Sized at 16384, then demoted: the effective window follows the
         // latch, and a claim SMALLER than the latch is never inflated.
-        LlmClient::latch_num_ctx(model, 16_384);
-        assert_eq!(effective_context_window(model, 32_000), 16_384);
-        assert_eq!(LlmClient::demote_context(model, None), Some(12_288));
-        assert_eq!(LlmClient::effective_num_ctx(model), Some(12_288));
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 16_384);
+        assert_eq!(local.effective_context_window(model, 32_000), 16_384);
+        assert_eq!(local.demote_context(model, None), Some(12_288));
+        assert_eq!(local.effective_num_ctx(model), Some(12_288));
+        assert_eq!(local.effective_context_window(model, 32_000), 12_288);
         assert_eq!(effective_context_window(model, 32_000), 12_288);
         assert_eq!(
-            effective_context_window(model, 4_000),
+            local.effective_context_window(model, 4_000),
             4_000,
             "the latch is a ceiling, not a floor"
         );
@@ -6894,8 +6944,18 @@ mod tests {
         assert_eq!(untouched.context_window, 16_384);
         assert_eq!(untouched.max_output_tokens, 8_192);
 
-        LlmClient::latch_num_ctx(model, 4_096);
+        LlmClient::latch_num_ctx(LOCAL_OLLAMA, model, 4_096);
+        let through_the_client = LlmClient::ollama(LOCAL_OLLAMA)
+            .clamp_model_info_to_effective_window(model, claim.clone());
         let clamped = clamp_model_info_to_effective_window(model, claim);
+        assert_eq!(
+            (clamped.context_window, clamped.max_output_tokens),
+            (
+                through_the_client.context_window,
+                through_the_client.max_output_tokens
+            ),
+            "one server: the client's window is the smallest there is"
+        );
         assert_eq!(clamped.context_window, 4_096);
         assert_eq!(
             clamped.max_output_tokens, 2_048,
@@ -6979,7 +7039,7 @@ mod tests {
             8_192
         );
         assert_eq!(
-            LlmClient::latched_num_ctx("test-env-pin-shrinks:1b"),
+            LlmClient::latched_num_ctx(LOCAL_OLLAMA, "test-env-pin-shrinks:1b"),
             Some(8_192),
             "the pin must be LATCHED as the start, not re-derived per request"
         );
@@ -7015,7 +7075,7 @@ mod tests {
         );
 
         assert_eq!(
-            LlmClient::demote_context("test-env-pin-demotes:1b", None),
+            LlmClient::ollama(LOCAL_OLLAMA).demote_context("test-env-pin-demotes:1b", None),
             Some(6_144)
         );
         assert_eq!(
@@ -7136,7 +7196,10 @@ mod tests {
                 16_384
             );
         });
-        assert_eq!(LlmClient::latched_num_ctx(model), Some(16_384));
+        assert_eq!(
+            LlmClient::latched_num_ctx(REMOTE_OLLAMA, model),
+            Some(16_384)
+        );
         assert!(
             out.contains("not on this machine") && out.contains("gpubox.example"),
             "the skipped sizing must name the server and the reason, got: {out}"
@@ -7153,8 +7216,8 @@ mod tests {
     /// The switch the latch outlived: a local server's model fitted while a
     /// game held this machine's card, then Settings pointed chat at a remote
     /// server (a config reload, no restart). The remote server gets the size
-    /// for a server whose VRAM is unknown, not this card's fit, and the live
-    /// window the agent budgets from is the one now being sent.
+    /// for a server whose VRAM is unknown, not this card's fit, and that is
+    /// the window a client on the remote server reads.
     #[test]
     fn a_size_latched_for_one_server_is_not_served_to_another() {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7169,7 +7232,10 @@ mod tests {
             16_384,
             "the local card's fit must not size {REMOTE_OLLAMA}"
         );
-        assert_eq!(LlmClient::effective_num_ctx(model), Some(16_384));
+        assert_eq!(
+            LlmClient::ollama(REMOTE_OLLAMA).effective_num_ctx(model),
+            Some(16_384)
+        );
     }
 
     /// Two servers in turn under one model name — the summarizer's client on
@@ -7185,6 +7251,10 @@ mod tests {
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
 
         let model = "test-latch-alternating:8b";
+        let (local, remote) = (
+            LlmClient::ollama(LOCAL_OLLAMA),
+            LlmClient::ollama(REMOTE_OLLAMA),
+        );
         let fits = std::cell::Cell::new(0_u32);
         let fit = |_: &str| {
             fits.set(fits.get() + 1);
@@ -7195,9 +7265,8 @@ mod tests {
             LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
             16_384
         );
-        // The remote server runs out of memory: the ladder walks down the live
-        // size, the one just sent there.
-        assert_eq!(LlmClient::demote_context(model, None), Some(12_288));
+        // The remote server runs out of memory: the ladder walks down its size.
+        assert_eq!(remote.demote_context(model, None), Some(12_288));
 
         assert_eq!(LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, fit), 8_192);
         assert_eq!(
@@ -7205,34 +7274,274 @@ mod tests {
             1,
             "returning to the local server must resume its size, not re-fit it"
         );
-        assert_eq!(LlmClient::effective_num_ctx(model), Some(8_192));
+        assert_eq!(local.effective_num_ctx(model), Some(8_192));
         assert_eq!(
             LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
             12_288,
             "the remote server's demotion must survive the local server's turn"
         );
-        assert_eq!(LlmClient::effective_num_ctx(model), Some(12_288));
+        assert_eq!(remote.effective_num_ctx(model), Some(12_288));
     }
 
-    /// A size set before any request resolved one — a demotion with no sizing
-    /// behind it, as the agent's tests walk the latch — is taken up by the
-    /// first server the model is sent to, as the model-keyed latch did.
+    /// A fault before any request sized the model starts from what that
+    /// server's first request would carry: the unknown-VRAM start for a server
+    /// elsewhere, the ladder's ceiling for one on this machine whose card
+    /// nothing has measured. The size is that server's alone.
     #[test]
-    fn a_size_latched_before_any_request_is_adopted_by_the_first_server() {
+    fn a_demotion_before_any_request_starts_from_that_servers_own_start() {
         let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: see above.
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
 
-        let model = "test-latch-adopted:8b";
-        assert_eq!(LlmClient::demote_context(model, None), Some(24_576));
+        let model = "test-demotion-before-sizing:8b";
         assert_eq!(
-            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
-            24_576
+            LlmClient::ollama(REMOTE_OLLAMA).demote_context(model, None),
+            Some(12_288)
         );
         assert_eq!(
-            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, |_: &str| Some(8_192)),
-            8_192,
-            "once owned, the size is that server's alone"
+            LlmClient::ollama(LOCAL_OLLAMA).demote_context(model, None),
+            Some(24_576)
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            12_288
+        );
+        let latched = |_: &str| -> Option<u32> { unreachable!("the demoted size is latched") };
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, latched),
+            24_576
+        );
+    }
+
+    /// A model info cache of its own, in a fresh directory, holding one
+    /// provider claim, so `get_model_info` answers without a server. The
+    /// directory goes with it.
+    struct ClaimCache {
+        cache: ModelInfoCache,
+        dir: std::path::PathBuf,
+    }
+
+    impl ClaimCache {
+        fn claiming(model: &str, window: usize) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "nanna-llm-claims-{}-{}",
+                std::process::id(),
+                model.replace([':', '/'], "-")
+            ));
+            let cache = ModelInfoCache::new(&dir);
+            cache
+                .set(&ModelInfo {
+                    id: model.to_string(),
+                    context_window: window,
+                    max_output_tokens: window / 2,
+                    supports_tools: true,
+                    supports_vision: false,
+                    embedding_dimension: None,
+                    cached_at: current_timestamp(),
+                    provider: "ollama".to_string(),
+                })
+                .expect("write the claim");
+            Self { cache, dir }
+        }
+
+        /// `client`'s model info for `model`, from this cache.
+        fn info(&self, client: &LlmClient, model: &str) -> ModelInfo {
+            futures::executor::block_on(client.get_model_info(model, Some(&self.cache)))
+        }
+    }
+
+    impl Drop for ClaimCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// One model, two servers: the summarizer's client on `[llm].ollama_url`
+    /// (this machine), chat's on a remote `[memory].ollama_host`. The local
+    /// server fitted 4096 while a game held the card; the remote one started
+    /// at 16384, and chat's request was the latest. The summarizer's chunks
+    /// are cut to the window its client reports, and its requests carry 4096:
+    /// a window read from chat's server cut them for 16384, and Ollama
+    /// silently dropped three quarters of each.
+    #[test]
+    fn model_info_is_sized_for_the_server_the_client_sends_to() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let model = "test-info-per-server:8b";
+        let claims = ClaimCache::claiming(model, 32_768);
+        let starved = |_: &str| Some(4_096);
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, starved),
+            4_096
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            16_384
+        );
+
+        let summarizer = LlmClient::ollama(LOCAL_OLLAMA);
+        assert_eq!(
+            claims.info(&summarizer, model).context_window,
+            4_096,
+            "the summarizer's requests carry 4096, whatever chat's server was sized to"
+        );
+        let chat = LlmClient::ollama(REMOTE_OLLAMA);
+        assert_eq!(claims.info(&chat, model).context_window, 16_384);
+    }
+
+    /// Chat ran on this machine's server at a 24576 fit; Settings then point it
+    /// at a remote server that has never served the model. That server's first
+    /// request carries 16384, so the prompt must be sized for 16384 before it
+    /// goes: sized for the old server's 24576, the first turn after the switch
+    /// was truncated silently.
+    #[test]
+    fn after_a_server_switch_the_prompt_is_sized_for_the_new_servers_start() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let model = "test-info-server-switch:8b";
+        let claims = ClaimCache::claiming(model, 32_768);
+        let roomy = |_: &str| Some(24_576);
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, roomy),
+            24_576
+        );
+
+        let chat = LlmClient::ollama(REMOTE_OLLAMA);
+        assert_eq!(
+            claims.info(&chat, model).context_window,
+            16_384,
+            "the budget for the new server's first request"
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            16_384,
+            "the size that request carries"
+        );
+    }
+
+    /// The window a client reports before a model's first request is the
+    /// `num_ctx` that request carries, whenever it can be known without
+    /// measuring: the operator's pin, or for a server elsewhere the
+    /// unknown-VRAM start. A server on this machine with nothing pinned is
+    /// sized by measuring this machine's card, which only the first request
+    /// does, so until then the provider's claim stands.
+    #[test]
+    fn the_window_read_before_a_request_is_the_num_ctx_it_carries() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fit = |_: &str| Some(8_192);
+
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+        let model = "test-read-before-request-remote:8b";
+        let remote = LlmClient::ollama(REMOTE_OLLAMA);
+        assert_eq!(remote.effective_num_ctx(model), Some(16_384));
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            16_384
+        );
+
+        let model = "test-read-before-request-local:8b";
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
+        assert_eq!(
+            local.effective_num_ctx(model),
+            None,
+            "unmeasured, so unknown"
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, fit),
+            8_192
+        );
+        assert_eq!(local.effective_num_ctx(model), Some(8_192));
+
+        // SAFETY: see above.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "12288") };
+        for (server, model) in [
+            (LOCAL_OLLAMA, "test-read-before-request-pinned-local:8b"),
+            (REMOTE_OLLAMA, "test-read-before-request-pinned-remote:8b"),
+        ] {
+            assert_eq!(
+                LlmClient::ollama(server).effective_num_ctx(model),
+                Some(12_288)
+            );
+            assert_eq!(
+                LlmClient::resolve_num_ctx_with(server, model, None, fit),
+                12_288
+            );
+        }
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    /// Only an Ollama server has a `num_ctx`. A cloud provider's address is
+    /// not on this machine, and it must not read as a remote Ollama starting
+    /// at 16384, nor inherit a window an Ollama server latched for a model
+    /// of the same name.
+    #[test]
+    fn a_cloud_client_is_never_clamped_by_an_ollama_window() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let model = "test-cloud-same-name:8b";
+        let fit = |_: &str| Some(4_096);
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, fit),
+            4_096
+        );
+        for cloud in [
+            LlmClient::openrouter("key"),
+            LlmClient::anthropic("key"),
+            LlmClient::openai("key"),
+        ] {
+            assert_eq!(
+                cloud.effective_num_ctx(model),
+                None,
+                "{:?}",
+                cloud.provider()
+            );
+            assert_eq!(cloud.effective_context_window(model, 32_000), 32_000);
+            assert_eq!(cloud.demote_context(model, None), None, "nothing to demote");
+        }
+    }
+
+    /// A GPU-memory fault is walked down on the server that faulted. Another
+    /// server's size for the same model is untouched, whichever server the
+    /// model's latest request went to: walking that one instead left the
+    /// faulting server at the size that faults.
+    #[test]
+    fn a_fault_walks_down_only_the_window_of_the_server_that_faulted() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let model = "test-fault-per-server:8b";
+        let fit = |_: &str| Some(8_192);
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, fit),
+            8_192
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            16_384
+        );
+
+        let local = LlmClient::ollama(LOCAL_OLLAMA);
+        assert_eq!(local.demote_context(model, None), Some(6_144));
+        assert_eq!(local.effective_num_ctx(model), Some(6_144));
+        assert_eq!(
+            LlmClient::ollama(REMOTE_OLLAMA).effective_num_ctx(model),
+            Some(16_384)
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(REMOTE_OLLAMA, model, None, never_fit),
+            16_384
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx_with(LOCAL_OLLAMA, model, None, fit),
+            6_144
         );
     }
 

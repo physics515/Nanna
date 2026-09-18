@@ -4586,9 +4586,10 @@ impl Agent {
         );
         // The window the budgets above were derived from. `get_model_info` is
         // already clamped to the LIVE effective runner window (the Ollama
-        // num_ctx latch), so a step starting AFTER a demotion budgets small
-        // from its first token. The loop below re-reads the latch every
-        // iteration and re-derives when it shrinks mid-run.
+        // num_ctx latch of the server this agent's client sends to), so a
+        // step starting AFTER a demotion budgets small from its first token.
+        // The loop below re-reads the latch every iteration, through the same
+        // client, and re-derives when it shrinks mid-run.
         let configured_window = model_info.context_window;
 
         // Mission mode: put the completion contract in the system prompt UP
@@ -4786,11 +4787,12 @@ impl Agent {
         // budgets from the live window here, and the tiered compression
         // ladder directly below shrinks history down to the new
         // thresholds in this same iteration.
-        let live_window =
-            nanna_llm::effective_context_window(&self.config.model, limits.configured_window);
+        let live_window = self
+            .llm
+            .effective_context_window(&self.config.model, limits.configured_window);
         let mut window_shrink_note: Option<String> = None;
         if live_window != limits.configured_window {
-            let live_info = nanna_llm::clamp_model_info_to_effective_window(
+            let live_info = self.llm.clamp_model_info_to_effective_window(
                 &self.config.model,
                 limits.model_info.clone(),
             );
@@ -4842,13 +4844,14 @@ impl Agent {
         // definitions, step frame, or output reserve — so when the window
         // drops under their sum the ONLY honest move is a loud stop (the
         // step/eval is resumable); anything else is a silently truncated
-        // prompt. Scoped to models the runner latch actually governs (a
-        // latch exists only once the Ollama sizing/demotion path has run;
-        // cloud models keep their provider-error path) and checked on the
-        // first iteration (a fresh step may start already-demoted) and
-        // again on every further shrink.
+        // prompt. Scoped to models the runner latch actually governs (this
+        // client's server has a known num_ctx: the Ollama sizing/demotion
+        // path has run there, or the size its first request will carry is
+        // known without measuring; cloud models keep their provider-error
+        // path) and checked on the first iteration (a fresh step may start
+        // already-demoted) and again on every further shrink.
         let mut tool_pressure_note: Option<String> = None;
-        if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
+        if self.llm.effective_num_ctx(&self.config.model).is_some()
             && (state.iterations == 1 || window_shrunk)
         {
             let restrict = options.tool_activation.restrict_to_active_tools && !options.tool_activation.all_tools_active;
@@ -5365,10 +5368,7 @@ impl Agent {
             nanna_llm::anthropic_model_contract(&request.model);
         let primary_mode =
             options.thinking_mode.unwrap_or(self.config.thinking_mode);
-        let primary_info = nanna_llm::model_info_from_cache_or_unknown(
-            &request.model,
-            "",
-        );
+        let primary_info = self.llm.model_info_from_cache_or_unknown(&request.model);
         request.max_tokens = request_output_budget(
             &request.model,
             &primary_info,
@@ -5569,10 +5569,10 @@ impl Agent {
                 // The live latch, not `configured_window`: an escalated or
                 // routed request may run a different model than the one
                 // the loop budgets for.
-                effective_context_window: nanna_llm::LlmClient::effective_num_ctx(
-                    &actual_model,
-                )
-                .map(|n| n as usize),
+                effective_context_window: self
+                    .llm
+                    .effective_num_ctx(&actual_model)
+                    .map(|n| n as usize),
             });
 
         if let Some(ref tracker) = self.stats {
@@ -8538,7 +8538,9 @@ impl Agent {
             // Window-scaled: a demoted window shrinks the reserve with it
             // (window/4, floored at the derived per-step minimum) instead of
             // letting a half-window claim dominate the floor.
-            let info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+            let info = self
+                .llm
+                .model_info_from_cache_or_unknown(&self.config.model);
             let reserve = info.effective_output_budget(window_scaled_output_reserve(
                 info.context_window,
                 self.config.max_tokens as usize,
@@ -8629,7 +8631,9 @@ impl Agent {
             msgs
         };
 
-        let model_info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+        let model_info = self
+            .llm
+            .model_info_from_cache_or_unknown(&self.config.model);
         // Paired with configure_for_model_with_output at run start: the
         // context's hard input limit reserved this budget (plus the Claude
         // thinking budget), so input + output can't over-commit THIS model's
@@ -11768,14 +11772,14 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_below_floor_demotion_fails_the_step_loudly() {
         let model = "test-below-floor-model:9b";
-        // Walk the latch to a 4096 floor exactly as VRAM pressure with that
-        // caller-supplied clamp would.
-        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
-        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(4_096));
-
-        let tools = Arc::new(ToolRegistry::new());
         // Never contacted: the floor check fires before the first request.
         let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        // Walk the latch to a 4096 floor exactly as VRAM pressure with that
+        // caller-supplied clamp would.
+        while llm.demote_context(model, Some(4_096)).is_some() {}
+        assert_eq!(llm.effective_num_ctx(model), Some(4_096));
+
+        let tools = Arc::new(ToolRegistry::new());
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -11817,6 +11821,43 @@ mod repeat_failure_breaker_tests {
         );
     }
 
+    /// The agent budgets from the window of the server its own client sends
+    /// to. The same model walked down to 4096 on another server (a summarizer
+    /// on a second Ollama, or the server chat used before a Settings change)
+    /// must not stop this step at the floor, shrink its budgets, or cut its
+    /// prompt for a window its requests do not carry.
+    #[tokio::test]
+    async fn a_window_walked_down_on_another_server_does_not_stop_this_agent() {
+        let model = "test-other-server-floor-model:9b";
+        let elsewhere = LlmClient::ollama("https://gpubox.example/ollama");
+        while elsewhere.demote_context(model, Some(4_096)).is_some() {}
+        assert_eq!(elsewhere.effective_num_ctx(model), Some(4_096));
+
+        let tools = Arc::new(ToolRegistry::new());
+        // Connection refused instantly: the run must get past the floor check
+        // and die at the LLM.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        {
+            // Past the other server's 4096, well inside this server's window.
+            let mut ctx = agent.context.write().await;
+            ctx.system_prompt = "system directive ".repeat(1_500);
+        }
+
+        let err = agent
+            .run("do the thing", RunOptions::default())
+            .await
+            .expect_err("the LLM at port 9 must refuse the connection");
+        assert!(
+            !matches!(err, AgentError::ContextBelowFloor { .. }),
+            "another server's window stopped this agent: {err}"
+        );
+    }
+
     /// After a demotion to 4096, a step prompt assembled by the REAL request
     /// builder fits the new window: input estimate under the re-derived hard
     /// limit, and the request's `max_tokens` claims only the remainder. The
@@ -11825,10 +11866,10 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_step_prompt_assembled_after_demotion_fits_the_new_window() {
         let model = "test-post-demotion-fit-model:9b";
-        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        while llm.demote_context(model, Some(4_096)).is_some() {}
 
         let tools = Arc::new(ToolRegistry::new());
-        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -11847,7 +11888,7 @@ mod repeat_failure_breaker_tests {
 
             // The fresh-step path: budgets configured from the latch-clamped
             // info, then the no-LLM ladder tail brings history under them.
-            let live_info = nanna_llm::model_info_from_cache_or_unknown(model, "");
+            let live_info = agent.llm.model_info_from_cache_or_unknown(model);
             assert_eq!(
                 live_info.context_window, 4_096,
                 "model info must serve the demoted window, not the provider claim"
@@ -12087,16 +12128,16 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_pressure_tier_step_fits_an_8192_window_where_the_full_catalog_did_not() {
         let model = "test-pressure-tier-model:9b";
-        // Walk the latch to 8192 exactly as repeated VRAM demotions clamped
-        // at an 8192 floor would land it.
-        while nanna_llm::LlmClient::demote_context(model, Some(8_192)).is_some() {}
-        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(8_192));
-
-        let tools = Arc::new(ToolRegistry::new());
-        let fat_names = fat_catalog(&tools).await;
         // Connection refused instantly — the run must get PAST the floor
         // check and die at the LLM, proving the step was allowed to proceed.
         let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        // Walk the latch to 8192 exactly as repeated VRAM demotions clamped
+        // at an 8192 floor would land it.
+        while llm.demote_context(model, Some(8_192)).is_some() {}
+        assert_eq!(llm.effective_num_ctx(model), Some(8_192));
+
+        let tools = Arc::new(ToolRegistry::new());
+        let fat_names = fat_catalog(&tools).await;
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()
@@ -12162,15 +12203,15 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_full_window_keeps_the_full_catalog_and_stays_silent() {
         let model = "test-full-window-catalog-model:9b";
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         assert!(
-            nanna_llm::LlmClient::effective_num_ctx(model).is_none(),
+            llm.effective_num_ctx(model).is_none(),
             "this model must be unlatched — the floor path is scoped to \
              latch-governed models"
         );
 
         let tools = Arc::new(ToolRegistry::new());
         let fat_names = fat_catalog(&tools).await;
-        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
         let config = AgentConfig {
             model: model.to_string(),
             ..AgentConfig::default()

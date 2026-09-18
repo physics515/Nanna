@@ -2776,10 +2776,8 @@ impl AgentStepRunner {
                 // existing loud below-floor/fault failure
                 // surfaces (resumable) instead of a manufactured
                 // unusable window.
-                let demoted = nanna_llm::LlmClient::demote_context(
-                    &self.agent_config.model,
-                    Some(floor),
-                );
+                let demoted =
+                    demote_context_on_router(&self.router, &self.agent_config.model, Some(floor));
                 tracing::warn!(
                     gpu_faults = fault,
                     min_viable_ctx = floor,
@@ -2818,19 +2816,13 @@ impl AgentStepRunner {
     ///
     /// Computed exactly as [`nanna_agent::AgentContext`] computes the limit
     /// the request is actually judged against (`configure_for_model_with_output`):
-    /// model info from the cache-or-universal-floor — already clamped to the
-    /// live `num_ctx` latch, so a mid-run VRAM demotion is reflected — paired
-    /// with this runner's own output reservation. Deriving it a second way
-    /// would let the budget and the window it is a share of disagree.
-    ///
-    /// The lookup takes the prefix-stripped name for the same reason
-    /// [`Self::try_run_step`] strips it before building the agent: the model
-    /// info cache is written under the id the provider was asked about, so a
-    /// `provider/model` spelling misses every entry and silently falls back to
-    /// the universal floor.
+    /// model info from the cache-or-universal-floor — clamped to the `num_ctx`
+    /// of the server the router sends the model to, so a mid-run VRAM
+    /// demotion is reflected — paired with this runner's own output
+    /// reservation. Deriving it a second way would let the budget and the
+    /// window it is a share of disagree.
     fn live_hard_input_limit(&self) -> usize {
-        let model = LlmRouter::strip_model_prefix(&self.agent_config.model);
-        let info = nanna_llm::model_info_from_cache_or_unknown(&model, "");
+        let info = cached_model_info_on_router(&self.router, &self.agent_config.model);
         let reserve = info.effective_output_budget(self.agent_config.max_tokens as usize);
         info.hard_input_limit_for(reserve)
     }
@@ -4038,6 +4030,33 @@ pub(crate) struct OllamaHealTarget {
     pub(crate) on_this_machine: bool,
 }
 
+/// Walk `model`'s context window down one rung on the server the router
+/// sends it to, which is where its next attempt goes. See
+/// [`nanna_llm::LlmClient::demote_context`] for the rung and the floor.
+fn demote_context_on_router(
+    router: &LlmRouter,
+    model: &str,
+    min_viable_ctx: Option<u32>,
+) -> Option<u32> {
+    router
+        .client_for_model(model)?
+        .demote_context(&LlmRouter::strip_model_prefix(model), min_viable_ctx)
+}
+
+/// `model`'s info from the cache or the universal floor, clamped to the window
+/// the server the router sends it to honours now.
+///
+/// The lookup takes the prefix-stripped name: the model info cache is written
+/// under the id the provider was asked about, so a `provider/model` spelling
+/// misses every entry and silently falls back to the universal floor.
+fn cached_model_info_on_router(router: &LlmRouter, model: &str) -> nanna_llm::ModelInfo {
+    let bare = LlmRouter::strip_model_prefix(model);
+    router.client_for_model(model).map_or_else(
+        || nanna_llm::model_info_from_cache_or_unknown(&bare, ""),
+        |client| client.model_info_from_cache_or_unknown(&bare),
+    )
+}
+
 /// The healing target for the Ollama server at `base_url`.
 pub(crate) fn ollama_heal_target(base_url: &str) -> OllamaHealTarget {
     OllamaHealTarget {
@@ -4918,6 +4937,31 @@ mod tests {
                 "{url} answered {status}, so it is up"
             );
         }
+    }
+
+    /// A repeat GPU fault walks down the window of the server the router
+    /// sends the model to, which is where the next attempt goes, and the
+    /// runner's budgets are read from that same server. The model's size on
+    /// another server (the summarizer's, on this machine) is not the one that
+    /// faulted and stays as it was.
+    #[test]
+    fn a_gpu_fault_walks_the_window_of_the_server_the_router_sends_to() {
+        let model = "ollama/test-router-demotion:8b";
+        let bare = "test-router-demotion:8b";
+        let summarizer = nanna_llm::LlmClient::ollama("http://127.0.0.1:11434");
+        assert_eq!(summarizer.demote_context(bare, None), Some(24_576));
+
+        let router = LlmRouter::new().with_ollama("https://gpubox.example/ollama");
+        assert_eq!(
+            demote_context_on_router(&router, model, None),
+            Some(12_288),
+            "one rung down from the 16384 the remote server's requests carry"
+        );
+        assert_eq!(
+            cached_model_info_on_router(&router, model).context_window,
+            12_288
+        );
+        assert_eq!(summarizer.effective_num_ctx(bare), Some(24_576));
     }
 
     /// Both process-level cures take their server from this guard, through the
