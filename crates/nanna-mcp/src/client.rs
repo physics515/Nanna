@@ -644,6 +644,28 @@ impl McpClient<crate::HttpTransport> {
     }
 }
 
+#[cfg(feature = "http")]
+impl McpClient<crate::StreamableHttpTransport> {
+    /// Connect to a Streamable HTTP MCP endpoint in whichever era it speaks:
+    /// a modern (2026-07-28) server is used statelessly, a 2025-era one
+    /// through its `initialize` handshake and session. `bearer_token` is sent
+    /// as `Authorization: Bearer` on every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the URL is not http(s), the server refuses the
+    /// credential, or the connection fails.
+    pub async fn connect_streamable(
+        url: impl Into<String>,
+        bearer_token: Option<String>,
+    ) -> Result<Self> {
+        let transport = crate::StreamableHttpTransport::new(url, bearer_token)?;
+        let client = Self::new(transport);
+        client.initialize().await?;
+        Ok(client)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

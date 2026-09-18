@@ -9,7 +9,7 @@ default = ["stdio", "http", "tools-integration"]
 stdio = ["tokio/process"]
 # SSE over reqwest. `tokio-tungstenite` used to be here for a WebSocket
 # transport that was never written, and no file ever imported it.
-http = ["reqwest"]
+http = ["reqwest", "base64"]
 tools-integration = ["nanna-tools"]
 
 [dependencies]
@@ -22,6 +22,8 @@ async-trait.workspace = true
 
 # HTTP transport (optional)
 reqwest = { workspace = true, optional = true }
+# The Base64 sentinel Streamable HTTP puts non-header-safe values in.
+base64 = { version = "0.23", optional = true }
 
 # For stdio line reading
 futures = "0.3"

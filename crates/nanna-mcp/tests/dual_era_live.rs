@@ -107,3 +107,160 @@ async fn the_legacy_everything_server_falls_back_to_initialize() {
     );
     client.close().await.expect("close");
 }
+
+// ---------------------------------------------------------------------------
+// Streamable HTTP
+// ---------------------------------------------------------------------------
+
+/// A fixture HTTP server on a free port, killed on drop.
+struct HttpServer {
+    child: std::process::Child,
+    url: String,
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+async fn start_http(args: &[&str], env: &[(&str, String)]) -> HttpServer {
+    let port = free_port();
+    let mut command = std::process::Command::new("node");
+    for arg in args {
+        command.arg(arg.replace("{port}", &port.to_string()));
+    }
+    for (key, value) in env {
+        command.env(key, value.replace("{port}", &port.to_string()));
+    }
+    // Owned by the guard from the start, so every path (including the
+    // panic below) kills and reaps it.
+    let server = HttpServer {
+        child: command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("node"),
+        url: format!("http://127.0.0.1:{port}/mcp"),
+    };
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return server;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("fixture HTTP server did not listen on {port}");
+}
+
+async fn call_text(
+    client: &McpClient<nanna_mcp::StreamableHttpTransport>,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let result = client
+        .call_tool(tool, Some(arguments))
+        .await
+        .expect("tools/call must succeed");
+    serde_json::to_value(&result).expect("serializable")["content"][0]["text"]
+        .as_str()
+        .expect("text content")
+        .to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+async fn a_modern_http_server_answering_json_and_sse_is_spoken_to_statelessly() {
+    let modern = script("modern-http.mjs");
+    for mode in ["json", "sse"] {
+        let server = start_http(&[modern.as_str(), "{port}", mode], &[]).await;
+        let client = McpClient::connect_streamable(&server.url, None)
+            .await
+            .expect("connect");
+        assert_eq!(
+            client.era().await,
+            ProtocolEra::Modern {
+                version: "2026-07-28".into()
+            },
+            "{mode}"
+        );
+        let tools = client.list_tools().await.expect("tools/list");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["shout", "regional"], "{mode}");
+        // The server rejects a tools/call whose Mcp-Name header is missing
+        // (-32020), so success proves the routing headers are right.
+        let text = call_text(&client, "shout", serde_json::json!({ "text": "over http" })).await;
+        assert_eq!(text, "OVER HTTP", "{mode}");
+        // `region` is annotated x-mcp-header: the call only passes the
+        // server's header/body validation if Mcp-Param-Region is mirrored.
+        let text = call_text(
+            &client,
+            "regional",
+            serde_json::json!({ "region": "us-west1" }),
+        )
+        .await;
+        assert_eq!(text, "region=us-west1", "{mode}");
+        let text = call_text(
+            &client,
+            "regional",
+            serde_json::json!({ "region": "Zürich " }),
+        )
+        .await;
+        assert_eq!(
+            text, "region=Zürich ",
+            "{mode}: a non-ASCII value travels base64-wrapped"
+        );
+        client.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+async fn a_bearer_token_is_sent_and_a_wrong_one_is_named_not_retried_as_legacy() {
+    let modern = script("modern-http.mjs");
+    let server = start_http(&[modern.as_str(), "{port}", "json", "s3cret"], &[]).await;
+    let client = McpClient::connect_streamable(&server.url, Some("s3cret".into()))
+        .await
+        .expect("connect");
+    assert_eq!(
+        call_text(&client, "shout", serde_json::json!({ "text": "authed" })).await,
+        "AUTHED"
+    );
+
+    match McpClient::connect_streamable(&server.url, Some("wrong".into())).await {
+        Err(nanna_mcp::McpError::HttpStatus { status, .. }) => assert_eq!(status, 401),
+        Err(other) => panic!("expected HTTP 401, got {other:?}"),
+        Ok(_) => panic!("a wrong token must not connect"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+async fn the_legacy_everything_http_server_falls_back_to_a_session() {
+    let everything = script("node_modules/@modelcontextprotocol/server-everything/dist/index.js");
+    let server = start_http(
+        &[everything.as_str(), "streamableHttp"],
+        &[("PORT", "{port}".into())],
+    )
+    .await;
+    let client = McpClient::connect_streamable(&server.url, None)
+        .await
+        .expect("legacy connect");
+    assert_eq!(client.era().await, ProtocolEra::Legacy);
+    let echoed = call_text(
+        &client,
+        "echo",
+        serde_json::json!({ "message": "legacy http" }),
+    )
+    .await;
+    assert!(echoed.contains("legacy http"), "{echoed}");
+    client.close().await.expect("close ends the session");
+}

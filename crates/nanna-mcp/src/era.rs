@@ -143,8 +143,16 @@ pub fn classify_probe(outcome: Result<Value>) -> Result<ProbeVerdict> {
         Err(error @ (McpError::ConnectionClosed | McpError::Io(_) | McpError::Transport(_))) => {
             Err(error)
         }
+        // A refused credential says nothing about the era, and falling back
+        // would only repeat the refusal under a less useful message.
+        Err(
+            error @ McpError::HttpStatus {
+                status: 401 | 403, ..
+            },
+        ) => Err(error),
         // No answer within the request timeout (the spec's "does not respond"
-        // case), or an answer we could not read: legacy.
+        // case), an HTTP error with no modern JSON-RPC body (the Streamable
+        // HTTP binding's legacy signal), or an answer we could not read: legacy.
         Err(_) => Ok(ProbeVerdict::Legacy),
     }
 }

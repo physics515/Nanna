@@ -30,6 +30,8 @@ pub mod era;
 mod protocol;
 mod schema_guard;
 mod server;
+#[cfg(feature = "http")]
+pub mod streamable_http;
 mod transport;
 
 pub use adapter::*;
@@ -45,6 +47,8 @@ pub use server::{McpServer, McpServerBuilder, McpServerConfig, ResourceHandler, 
 #[cfg(feature = "tools-integration")]
 pub use server::tools_bridge;
 pub use transport::*;
+#[cfg(feature = "http")]
+pub use streamable_http::StreamableHttpTransport;
 
 /// The legacy (handshake) MCP revision; see [`era`] for the modern ones.
 pub const PROTOCOL_VERSION: &str = era::LEGACY_PROTOCOL_VERSION;
@@ -74,6 +78,11 @@ pub enum McpError {
 
     #[error("Timeout waiting for response")]
     Timeout,
+
+    /// An HTTP answer that carried no JSON-RPC message (a proxy's page, an
+    /// auth refusal, a legacy server's bare 404).
+    #[error("HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
 
     #[error("Server not initialized")]
     NotInitialized,

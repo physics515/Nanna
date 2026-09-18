@@ -76,6 +76,26 @@ pub trait Transport: Send + Sync {
     }
 }
 
+/// The reply to a server→client request. Pure.
+///
+/// `ping` MUST be answered with an empty result. Everything else — roots,
+/// sampling, elicitation — is a capability this client never declares, so
+/// it is refused with `-32601`. Unanswered, the server waits on it forever:
+/// measured 2026-09-18, `@modelcontextprotocol/server-everything` holding an
+/// unanswered `roots/list` did not exit on stdin EOF and outlived the daemon.
+#[must_use]
+pub fn reply_to_server_request(id: &serde_json::Value, method: &str) -> serde_json::Value {
+    debug_assert!(!id.is_null(), "a request always has an id");
+    if method == "ping" {
+        return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32601, "message": format!("nanna does not serve `{method}`") },
+    })
+}
+
 // ============================================================================
 // Stdio Transport
 // ============================================================================
@@ -84,7 +104,7 @@ pub trait Transport: Send + Sync {
 pub mod stdio {
     use super::{
         Arc, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListChangedFlags, McpError,
-        McpList, Mutex, Result, Transport, async_trait,
+        McpList, Mutex, Result, Transport, async_trait, reply_to_server_request,
     };
     use std::collections::HashMap;
     use std::process::Stdio;
@@ -220,25 +240,6 @@ pub mod stdio {
             (None, _) => serde_json::from_value(value)
                 .map_or_else(|e| Incoming::Unreadable(e.to_string()), Incoming::Response),
         }
-    }
-
-    /// The reply to a server→client request. Pure.
-    ///
-    /// `ping` MUST be answered with an empty result. Everything else — roots,
-    /// sampling, elicitation — is a capability this client never declares, so
-    /// it is refused with `-32601`. Unanswered, the server waits on it forever:
-    /// measured 2026-09-18, `@modelcontextprotocol/server-everything` holding an
-    /// unanswered `roots/list` did not exit on stdin EOF and outlived the daemon.
-    fn reply_to_server_request(id: &serde_json::Value, method: &str) -> serde_json::Value {
-        debug_assert!(!id.is_null(), "a request always has an id");
-        if method == "ping" {
-            return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} });
-        }
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": -32601, "message": format!("nanna does not serve `{method}`") },
-        })
     }
 
     /// How long a stdio server gets to exit after its stdin closes before it
@@ -499,9 +500,9 @@ pub mod stdio {
     #[cfg(test)]
     mod tests {
         use super::{
-            Incoming, JsonRpcNotification, JsonRpcResponse, ListChangedFlags, McpList,
-            ServerNotification, Transport, classify_incoming, classify_server_notification,
-            handle_server_notification, mcp_level_is_severe, reply_to_server_request,
+            super::reply_to_server_request, Incoming, JsonRpcNotification, JsonRpcResponse,
+            ListChangedFlags, McpList, ServerNotification, Transport, classify_incoming,
+            classify_server_notification, handle_server_notification, mcp_level_is_severe,
         };
 
         #[cfg(unix)]

@@ -4713,6 +4713,39 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             Consequence for this item: build the modern POST client first and keep the SSE transport
             only as the last fallback — or drop it, since it is deprecated and eligible for removal.
             Source: [Streamable HTTP, 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+            *(2026-09-18) The transport half landed: `StreamableHttpTransport`
+            (`crates/nanna-mcp/src/streamable_http.rs`), driven by the same dual-era client.* One
+            `POST` per message with `Accept: application/json, text/event-stream`; answers read as
+            JSON **or** a per-request SSE stream (bounded parser, 16 MiB per message, comments and
+            `event:`/`id:` ignored); `MCP-Protocol-Version` mirrored from the body's `_meta`,
+            `Mcp-Method` always, `Mcp-Name` for `tools/call`/`prompts/get`/`resources/read`, the
+            Base64 sentinel for non-header-safe values (the spec's own five encoding examples are a
+            unit test); `x-mcp-header` parameters validated at `tools/list` (token, case-insensitive
+            unique, string/integer/boolean only, reachable through `properties` alone — an invalid
+            tool is dropped, the rest kept) and mirrored as `Mcp-Param-*` on `tools/call`; bearer
+            token on every request. Era: a JSON-RPC body is returned whatever the HTTP status (modern
+            servers put their era-identifying errors in 400/404 bodies), anything else is the new
+            `McpError::HttpStatus`, which the probe reads as legacy — except 401/403, which surface as
+            the auth failure they are instead of being retried as a handshake. Legacy (2025-era)
+            servers get `initialize`, their `Mcp-Session-Id` echoed, the negotiated version as the
+            header, a best-effort `DELETE` on close, and any mid-stream server request answered.
+            Live against the REAL servers (`tests/dual_era_live.rs`, now 6/6): `createMcpHandler`
+            from `@modelcontextprotocol/server` 2.0 in both `json` and `sse` response modes (modern
+            era, `shout` + an `x-mcp-header` tool, including a base64-wrapped `Zürich ` value), the
+            same behind a bearer check (right token works; wrong token → `HttpStatus 401`, not a
+            fallback), and server-everything's legacy `streamableHttp` mode (probe answered `400`
+            + `-32000` → `initialize` → session → `echo`). **Negative control:** with the
+            `Mcp-Param-*` mirroring disabled the real server refuses the call with `-32020 … the
+            Mcp-Param-Region header is absent` — so the test has teeth.
+      - [ ] **Wire Streamable HTTP servers into `[[mcp.servers]]`** — a `url` form of the entry
+            (mutually exclusive with `command`), its bearer token from the secure store the way
+            `secret_env` already works for stdio (`nanna mcp secret set`), and the daemon's MCP
+            manager holding both transports. Not done with the transport because the manager and
+            `McpIntegration` are generic over ONE transport type (`StdioTransport`), so this needs
+            an either-transport type first.
+      - [ ] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
+            warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
+            feature-gated build nobody gates. Trivial; gate the imports on their features.
       - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).
