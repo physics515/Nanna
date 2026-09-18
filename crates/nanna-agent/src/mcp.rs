@@ -160,6 +160,17 @@ impl McpServerConfig {
 }
 
 /// MCP integration manager for the agent
+/// What starting one MCP server produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpStarted {
+    /// Tools it registered.
+    pub tools: usize,
+    /// The protocol revision and transport it was reached over, e.g.
+    /// `2026-07-28 over Streamable HTTP` — so a fallback (to the 2024
+    /// handshake, or to HTTP+SSE) is visible rather than silent.
+    pub link: String,
+}
+
 #[cfg(feature = "mcp")]
 pub struct McpIntegration {
     /// Tool manager for MCP servers
@@ -206,7 +217,7 @@ impl McpIntegration {
     pub async fn start_all(
         &self,
         registry: &ToolRegistry,
-    ) -> Result<Vec<(String, Result<usize, String>)>, McpStartError> {
+    ) -> Result<Vec<(String, Result<McpStarted, String>)>, McpStartError> {
         let mut outcomes = Vec::with_capacity(self.configs.len());
         for config in &self.configs {
             if !config.auto_start {
@@ -234,7 +245,7 @@ impl McpIntegration {
     async fn connect(
         config: &McpServerConfig,
         elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
-    ) -> Result<McpClient<AnyTransport>, nanna_mcp::McpError> {
+    ) -> Result<(McpClient<AnyTransport>, &'static str), nanna_mcp::McpError> {
         let with_elicitor = |client: McpClient<AnyTransport>| match &elicitor {
             Some(elicitor) => client.with_elicitor(std::sync::Arc::clone(elicitor)),
             None => client,
@@ -253,14 +264,14 @@ impl McpIntegration {
             )?);
             let client = with_elicitor(McpClient::new(transport));
             client.initialize().await?;
-            return Ok(client);
+            return Ok((client, "stdio"));
         };
         let token = config.bearer_token.clone();
         let transport =
             AnyTransport::Http(Box::new(StreamableHttpTransport::new(url, token.clone())?));
         let client = with_elicitor(McpClient::new(transport));
         match client.initialize().await {
-            Ok(_) => Ok(client),
+            Ok(_) => Ok((client, "Streamable HTTP")),
             // No Streamable HTTP endpoint here, and no modern error body
             // either: the binding's cue to try the deprecated HTTP+SSE
             // transport, which is legacy-only (so no era probe).
@@ -272,23 +283,29 @@ impl McpIntegration {
                 let legacy = LegacySseTransport::connect(url, token).await?;
                 let client = with_elicitor(McpClient::new(AnyTransport::Sse(Box::new(legacy))));
                 client.initialize_legacy().await?;
-                Ok(client)
+                Ok((client, "HTTP+SSE"))
             }
             Err(e) => Err(e),
         }
     }
 
     /// Start a single MCP server
-    async fn start_server(&self, config: &McpServerConfig) -> Result<usize, McpStartError> {
+    async fn start_server(&self, config: &McpServerConfig) -> Result<McpStarted, McpStartError> {
         if let Some(url) = &config.url {
             info!(server = %config.name, %url, "Connecting to MCP server");
         } else {
             info!(server = %config.name, command = %config.command, "Starting MCP server");
         }
 
-        let client = Self::connect(config, self.elicitor.clone())
+        let (client, transport) = Self::connect(config, self.elicitor.clone())
             .await
             .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
+        let link = match client.era().await {
+            nanna_mcp::ProtocolEra::Modern { version } => format!("{version} over {transport}"),
+            nanna_mcp::ProtocolEra::Legacy => {
+                format!("{} over {transport}", nanna_mcp::PROTOCOL_VERSION)
+            }
+        };
 
         // Register with manager
         let tools = self
@@ -300,10 +317,14 @@ impl McpIntegration {
         info!(
             server = %config.name,
             tools = tools.len(),
+            link = %link,
             "MCP server started"
         );
 
-        Ok(tools.len())
+        Ok(McpStarted {
+            tools: tools.len(),
+            link,
+        })
     }
 
     /// Keep `registry` in step with every server's tool list until `stop`

@@ -30,6 +30,9 @@ pub struct McpServerState {
     /// Why it failed or was not started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// How a started server was reached, e.g. `2026-07-28 over stdio`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// Per-server MCP state, shared between the boot task that writes it and the
@@ -37,7 +40,11 @@ pub struct McpServerState {
 pub type McpStatus = Arc<tokio::sync::RwLock<Vec<McpServerState>>>;
 
 /// Record one server's outcome in place. Pure over the slice.
-fn record_outcome(servers: &mut [McpServerState], name: &str, outcome: Result<usize, String>) {
+fn record_outcome(
+    servers: &mut [McpServerState],
+    name: &str,
+    outcome: Result<nanna_agent::mcp::McpStarted, String>,
+) {
     let Some(state) = servers.iter_mut().find(|s| s.name == name) else {
         debug_assert!(
             false,
@@ -46,9 +53,10 @@ fn record_outcome(servers: &mut [McpServerState], name: &str, outcome: Result<us
         return;
     };
     match outcome {
-        Ok(tools) => {
+        Ok(started) => {
             state.state = "started";
-            state.tools = tools;
+            state.tools = started.tools;
+            state.link = Some(started.link);
         }
         Err(reason) => {
             state.state = "failed";
@@ -213,18 +221,21 @@ async fn publish_initial_states(
         state: "starting",
         tools: 0,
         detail: None,
+        link: None,
     }));
     servers.extend(refused.into_iter().map(|(name, reason)| McpServerState {
         name,
         state: "not_started",
         tools: 0,
         detail: Some(reason),
+        link: None,
     }));
     servers.extend(skipped.iter().map(|reason| McpServerState {
         name: String::new(),
         state: "not_started",
         tools: 0,
         detail: Some(reason.clone()),
+        link: None,
     }));
     debug_assert!(servers.len() >= starting.len());
     drop(servers);
@@ -258,6 +269,7 @@ mod tests {
             state: "starting",
             tools: 0,
             detail: None,
+            link: None,
         }
     }
 
@@ -265,9 +277,21 @@ mod tests {
     fn outcomes_land_on_the_server_they_belong_to() {
         let mut servers = vec![starting("files"), starting("git")];
         record_outcome(&mut servers, "git", Err("No such file or directory".into()));
-        record_outcome(&mut servers, "files", Ok(3));
+        record_outcome(
+            &mut servers,
+            "files",
+            Ok(nanna_agent::mcp::McpStarted {
+                tools: 3,
+                link: "2026-07-28 over stdio".into(),
+            }),
+        );
         assert_eq!(servers[0].state, "started");
         assert_eq!(servers[0].tools, 3);
+        assert_eq!(servers[0].link.as_deref(), Some("2026-07-28 over stdio"));
+        assert_eq!(
+            servers[1].link, None,
+            "a failed server was reached over nothing"
+        );
         assert_eq!(servers[1].state, "failed");
         assert_eq!(
             servers[1].detail.as_deref(),

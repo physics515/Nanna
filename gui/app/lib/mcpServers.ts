@@ -13,6 +13,8 @@ export interface McpServerState {
   state: McpServerStateName
   tools: number
   detail?: string
+  /** How a started server was reached, e.g. `2026-07-28 over Streamable HTTP`. */
+  link?: string
 }
 
 const STATES: ReadonlySet<string> = new Set(['starting', 'started', 'failed', 'not_started'])
@@ -34,6 +36,7 @@ export function parseMcpServers(payload: unknown): McpServerState[] {
       state: e.state as McpServerStateName,
       tools: e.tools,
       ...(typeof e.detail === 'string' ? { detail: e.detail } : {}),
+      ...(typeof e.link === 'string' && e.link !== '' ? { link: e.link } : {}),
     })
   }
   return servers
@@ -42,8 +45,10 @@ export function parseMcpServers(payload: unknown): McpServerState[] {
 /** One line a person can read at a glance. Pure. */
 export function describeMcpServer(server: McpServerState): string {
   switch (server.state) {
-    case 'started':
-      return `${server.tools} tool${server.tools === 1 ? '' : 's'}`
+    case 'started': {
+      const tools = `${server.tools} tool${server.tools === 1 ? '' : 's'}`
+      return server.link ? `${tools} · ${server.link}` : tools
+    }
     case 'starting':
       return 'starting…'
     case 'failed':

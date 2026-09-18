@@ -4877,6 +4877,15 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             suite: its HTTP fixtures raced (1 run in 20) because the readiness probe was a TCP
             connect, which on loopback can self-connect to a not-yet-bound ephemeral port and then
             squat it; the fixtures now announce readiness on stderr and the suite ran 25/25 clean.
+      - [x] *(2026-09-18)* **Each MCP server's status says how it was reached.** After tonight a
+            server can land on three transports and two protocol eras, and every fallback (to the
+            2024 handshake, to HTTP+SSE) was visible only as one log line. `system.status` →
+            `mcp_servers[].link` (`2026-07-28 over stdio`, `2024-11-05 over HTTP+SSE`, …), shown on
+            the Tools page after the tool count. Verified: the real daemon reported
+            `2026-07-28 over stdio` / `2024-11-05 over stdio` / `2024-11-05 over HTTP+SSE` for the
+            SDK modern server, server-everything on stdio and on SSE; 277/277 vitest, `vue-tsc`
+            clean, `nuxt dev` served a 200 `__nuxt` shell. Not WebDriver-verified (no
+            `WebKitWebDriver` on this host).
       - [x] *(2026-09-18)* **The live interop suite runs in CI.** `dual_era_live.rs` is `#[ignore]`
             locally (it needs Node and an `npm ci`), so nothing ran it. New `mcp-interop.yml`
             (path-filtered to `nanna-mcp`, the agent's MCP glue and itself): Node 22, `npm ci` from
