@@ -501,13 +501,19 @@ onMounted(async () => {
   const mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   loadTabsFromStorage()
-  await loadOpenWorkspaces()
+  // Without a daemon the workspace list comes back empty, and loading it would
+  // wipe the tabs just restored from storage. The attach watcher below loads
+  // it once a daemon answers.
+  if (mode === 'daemon') await loadOpenWorkspaces()
   await loadSessions()
   await loadConfig()
   maybeShowOnboarding()
 
   // Sync restored workspace state with daemon
-  syncDaemonWorkspace(currentTab.value)
+  if (mode === 'daemon') syncDaemonWorkspace(currentTab.value)
+  initialLoadDone = true
+  // Attached between init's answer and here: the watcher skipped it.
+  if (mode !== 'daemon' && backendStatus.value?.connected) void reloadFromDaemon()
 
   const urlSessionId = route.query.session as string | undefined
   if (urlSessionId && sessions.value.some(s => s.id === urlSessionId)) {
@@ -557,6 +563,23 @@ onUnmounted(() => {
   unlistenSessionRenamed?.()
   unlistenWorkspacesChanged?.()
 })
+
+// The backend attaches a daemon that answers late (a slow boot, one started
+// by hand, a restart) without an app restart. This lets the window catch up
+// on what the first load could not get.
+let initialLoadDone = false
+async function reloadFromDaemon() {
+  await loadOpenWorkspaces()
+  await loadSessions()
+  await loadConfig()
+  await syncDaemonWorkspace(currentTab.value)
+}
+watch(
+  () => backendStatus.value?.connected === true,
+  (connected, wasConnected) => {
+    if (connected && !wasConnected && initialLoadDone) void reloadFromDaemon()
+  },
+)
 
 watch(() => route.query.session, (newSessionId) => {
   if (typeof newSessionId === 'string' && sessions.value.some(s => s.id === newSessionId)) {

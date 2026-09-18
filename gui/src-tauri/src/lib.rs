@@ -36,19 +36,25 @@ use tracing::{error, info, warn};
 // App Setup
 // =============================================================================
 
-/// Hydrate the workspace-registry cache from the daemon.
+/// Fill the workspace-registry cache from the daemon.
 ///
 /// The daemon owns workspace persistence; this cache backs local reads and the
-/// workspace-file editing commands. Best-effort: an empty registry if the
-/// daemon is unreachable at startup (the reconnect loop will attach later).
-async fn load_workspaces_from_daemon(backend: &Backend) -> WorkspaceRegistry {
-    let mut registry = WorkspaceRegistry::new();
-
+/// workspace-file editing commands. This runs after the state is managed (see
+/// `run`), so the window may already be using the cache. The fill therefore
+/// only adds entries the cache does not have, the way `list_workspaces` does.
+/// It leaves the active workspace alone. That is the window's own choice, and
+/// the layout sets it on mount with `set_active_workspace` or
+/// `clear_active_workspace`. Adopting the daemon's choice here could overwrite
+/// what the window already picked.
+///
+/// Best-effort: an unreachable daemon leaves the cache as it is, and
+/// `list_workspaces` reads through once the daemon attaches.
+async fn hydrate_workspaces(backend: &Backend, cache: &RwLock<WorkspaceRegistry>) {
     let result = match backend.workspace_list().await {
         Ok(result) => result,
         Err(e) => {
             warn!("Failed to load workspaces from daemon: {e}");
-            return registry;
+            return;
         }
     };
 
@@ -57,12 +63,10 @@ async fn load_workspaces_from_daemon(backend: &Backend) -> WorkspaceRegistry {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let active_id = result
-        .get("active_id")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
     let count = records.len();
 
+    // Context loads are file I/O, so they run before the cache is locked.
+    let mut loaded = Vec::with_capacity(count);
     for record in &records {
         let (Some(id), Some(path)) = (
             record.get("id").and_then(|v| v.as_str()),
@@ -77,26 +81,29 @@ async fn load_workspaces_from_daemon(backend: &Backend) -> WorkspaceRegistry {
             if let Err(e) = ws.load_context().await {
                 warn!("Failed to load workspace context for {path:?}: {e}");
             }
-            registry.register(ws);
+            loaded.push(ws);
         } else {
             warn!("Daemon workspace path no longer exists: {path:?}");
         }
     }
-    if let Some(id) = active_id {
-        registry.set_active(&id);
+    {
+        let mut registry = cache.write().await;
+        for ws in loaded {
+            if registry.get(&ws.id).is_none() {
+                registry.register(ws);
+            }
+        }
     }
     if count > 0 {
         info!("Restored {count} workspaces from daemon");
     }
-
-    registry
 }
 
 /// Build the thin-client [`AppState`]. All heavy subsystems live in the daemon.
-async fn setup_state(
-    backend: Arc<Backend>,
-    log_buffer: LogBuffer,
-) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
+///
+/// Nothing here needs the daemon. The state has to exist before the daemon
+/// answers, which can take minutes, because every command needs it.
+fn setup_state(backend: Arc<Backend>, log_buffer: LogBuffer) -> AppState {
     let mut config = Config::load().unwrap_or_default().with_env_overrides();
 
     // `Config::load` already hydrated `llm.anthropic_oauth_token` from the
@@ -112,7 +119,7 @@ async fn setup_state(
         config.llm.anthropic_oauth_token = Some(loaded.credential.access_token);
     }
 
-    let workspaces = Arc::new(RwLock::new(load_workspaces_from_daemon(&backend).await));
+    let workspaces = Arc::new(RwLock::new(WorkspaceRegistry::new()));
 
     // Initial active model for the badge, from the priority list or default.
     let initial_active_model = config
@@ -124,7 +131,7 @@ async fn setup_state(
 
     info!("Nanna GUI (daemon client) initialized with model: {}", config.llm.model);
 
-    Ok(AppState {
+    AppState {
         config,
         close_mode: Arc::new(RwLock::new(CloseMode::default())),
         active_model: Arc::new(RwLock::new(initial_active_model)),
@@ -132,7 +139,7 @@ async fn setup_state(
         workspaces,
         backend,
         log_buffer,
-    })
+    }
 }
 
 /// Recent in-process log lines, kept so the Logs page can show the GUI's own
@@ -396,25 +403,29 @@ pub fn run() {
             setup_system_tray(app)?;
 
             tauri::async_runtime::spawn(async move {
-                // Start and connect to the daemon sidecar. A failed connect is a
-                // hard, user-visible state (the frontend shows a "start the
-                // daemon" affordance); there is no embedded fallback.
                 let backend = Arc::new(Backend::new());
-                let mode = backend.init(&handle).await;
-                match mode {
-                    BackendMode::Daemon => info!("Backend connected to daemon"),
-                    BackendMode::Disconnected => {
-                        error!("Backend could not reach the daemon — the app will show a disconnected state until it connects");
-                    }
-                }
 
-                match setup_state(backend, log_buffer).await {
-                    Ok(state) => {
-                        handle.manage(Arc::new(RwLock::new(state)));
-                        info!("App state initialized successfully");
+                // Manage the state BEFORE reaching the daemon. A boot can take
+                // minutes (a cold model load, a migration, a slow provider),
+                // and until the state is managed every command fails with
+                // "state not managed". That includes `init_backend` and the
+                // status poll that is supposed to show the boot's progress.
+                let state = setup_state(Arc::clone(&backend), log_buffer);
+                let workspaces = Arc::clone(&state.workspaces);
+                handle.manage(Arc::new(RwLock::new(state)));
+                info!("App state initialized successfully");
+
+                // Start and connect to the daemon sidecar. A failed connect is a
+                // user-visible state (the frontend shows a "start the daemon"
+                // affordance) while the client keeps retrying; there is no
+                // embedded fallback.
+                match backend.init(&handle).await {
+                    BackendMode::Daemon => {
+                        info!("Backend connected to daemon");
+                        hydrate_workspaces(&backend, &workspaces).await;
                     }
-                    Err(e) => {
-                        error!("Failed to initialize app state: {e}");
+                    BackendMode::Disconnected => {
+                        error!("Backend could not reach the daemon — the app shows a disconnected state and keeps retrying until one answers");
                     }
                 }
             });
