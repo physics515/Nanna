@@ -930,13 +930,24 @@ health checks). **Shipped**, except:
       contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
       Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
       services, which this standalone path does not build — see the new item below.
-- [ ] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
+- [x] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
       `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
       `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
       (a) build the script services in the CLI path (needs storage + an embedding provider), or
       (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
       store — (b) matches the "channels as control-plane clients" architecture and avoids a second
       process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
+      *(2026-09-18)* Done as (b). `nanna mcp serve` connects to the daemon (2 s budget) and serves its
+      live registry: `tool.list` for the enabled names, `tool.get` for each definition (the same
+      parameter → schema conversion `tools_bridge` uses), every call a `tool.execute` over IPC, the
+      reply mapped to a tool result (`isError` on failure, never an empty success). No daemon →
+      a stderr warning and the standalone surface; `--standalone` forces it; `--daemon <url>`
+      names one and makes its absence an error. Verified on the real CLI + debug daemon over
+      stdio: 43 tools listed, `remember` stored a memory through the daemon — the same call
+      `--standalone` fails with `Service not found: memory.store`. Found on the way and fixed: the
+      MCP **server** logged every notification (`notifications/initialized`) as a failed parse, and
+      silently dropped a request it could not read; notifications are now accepted quietly, and an
+      unreadable line is answered `-32700` (`id: null`) or `-32600` (its id echoed).
 - [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
       *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
       `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
@@ -1802,6 +1813,13 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
             class where one tool's description steers another tool's parameters. Applies to MCP-discovered
             tools and `discover_tools` activation. Source:
             [CrowdStrike agentic tool-chain attacks](https://www.crowdstrike.com/en-us/blog/how-agentic-tool-chain-attacks-threaten-ai-agent-security/).
+            *(2026-09-18, context for whoever decides this)* Tool definitions now **change at
+            runtime**: an MCP server's `list_changed` resyncs the registry (see P18's MCP entry), so
+            a server that swaps a tool's description mid-session is live on the next turn, silently.
+            The owner's no-gates rule rules out "re-prompt on drift"; a shape that fits it would be
+            observability only — record each tool's definition hash at first sight and announce a
+            changed one (log, `system.status`, the Tools page) without blocking it. Not built
+            unattended: whether even that is wanted is the owner's call.
 - [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
       *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
       `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;

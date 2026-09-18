@@ -3,7 +3,7 @@
 //! Exposes Nanna tools as an MCP server that external clients can connect to.
 //! Supports stdio transport (for CLI tools) and HTTP/SSE (for web clients).
 
-use crate::protocol::{CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult};
+use crate::protocol::{RequestId, CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult};
 #[cfg(any(test, feature = "tools-integration"))]
 use crate::protocol::ToolContent;
 use crate::{McpError, Result};
@@ -328,20 +328,25 @@ impl McpServer {
         while let Ok(Some(line)) = lines.next_line().await {
             debug!(line = %line, "Received request");
 
-            // Parse request
-            let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "Failed to parse request");
+            let response_json = match classify_line(&line) {
+                Incoming::Request(request) => {
+                    serde_json::to_string(&self.handle_request(request).await)?
+                }
+                // Notifications (`notifications/initialized`, `cancelled`, …)
+                // are one-way: nothing to answer, nothing wrong.
+                Incoming::Notification(method) => {
+                    debug!(method, "MCP notification");
                     continue;
+                }
+                // JSON-RPC requires an answer to a request it cannot read —
+                // dropping it leaves the client waiting out its timeout.
+                Incoming::Malformed(response) => {
+                    warn!(error = %response["error"], "Malformed MCP request");
+                    response.to_string()
                 }
             };
 
-            // Handle request
-            let response = self.handle_request(request).await;
-
             // Send response
-            let response_json = serde_json::to_string(&response)?;
             debug!(response = %response_json, "Sending response");
 
             stdout.write_all(response_json.as_bytes()).await?;
@@ -352,6 +357,46 @@ impl McpServer {
         info!("MCP server stdio loop ended");
         Ok(())
     }
+}
+
+/// One line from an MCP client, by JSON-RPC shape.
+#[derive(Debug)]
+enum Incoming {
+    Request(JsonRpcRequest),
+    Notification(String),
+    /// The error answer for a line that is not a readable request.
+    Malformed(Value),
+}
+
+/// Classify one line: a request, a notification (a `method` and no `id`),
+/// or something to answer with a parse (`-32700`) or invalid-request
+/// (`-32600`) error under whatever id could be read. Pure.
+fn classify_line(line: &str) -> Incoming {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Incoming::Malformed(malformed(&Value::Null, -32700, "Parse error"));
+    };
+    let id = value.get("id").filter(|id| !id.is_null()).cloned();
+    let method = value.get("method").and_then(Value::as_str);
+    match (id, method) {
+        (None, Some(method)) => Incoming::Notification(method.to_string()),
+        (id, _) => serde_json::from_value::<JsonRpcRequest>(value).map_or_else(
+            |e| {
+                // Echo the id only if it is one (string or number).
+                let id = id
+                    .filter(|id| serde_json::from_value::<RequestId>(id.clone()).is_ok())
+                    .unwrap_or(Value::Null);
+                Incoming::Malformed(malformed(&id, -32600, &format!("Invalid request: {e}")))
+            },
+            Incoming::Request,
+        ),
+    }
+}
+
+/// A JSON-RPC error response; `id` is `null` when the request's could not
+/// be read, as the spec requires. Pure.
+fn malformed(id: &Value, code: i32, message: &str) -> Value {
+    debug_assert!(id.is_null() || id.is_string() || id.is_number());
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 /// Protocol version
@@ -526,6 +571,33 @@ pub mod tools_bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifications_are_accepted_and_bad_requests_answered() {
+        assert!(matches!(
+            classify_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            Incoming::Notification(m) if m == "notifications/initialized"
+        ));
+        assert!(matches!(
+            classify_line(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+            Incoming::Request(_)
+        ));
+        let Incoming::Malformed(parse) = classify_line("not json") else {
+            panic!("unreadable text must be answered");
+        };
+        assert_eq!(parse["error"]["code"], -32700);
+        assert!(parse["id"].is_null(), "an unreadable id is null");
+        let Incoming::Malformed(invalid) =
+            classify_line(r#"{"jsonrpc":"2.0","id":"x","params":{}}"#)
+        else {
+            panic!("a request without a method must be answered");
+        };
+        assert_eq!(invalid["error"]["code"], -32600);
+        assert_eq!(
+            invalid["id"], "x",
+            "the id is echoed so the client can match it"
+        );
+    }
 
     #[tokio::test]
     async fn test_server_creation() {
