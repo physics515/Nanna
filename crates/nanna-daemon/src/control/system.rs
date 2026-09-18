@@ -418,6 +418,7 @@ fn ollama_probe_report(
 #[cfg(test)]
 mod ollama_probe_tests {
     use super::*;
+    use crate::protocol::Action;
     use nanna_llm::OllamaProbe;
 
     fn wanted(models: &[&str]) -> Vec<String> {
