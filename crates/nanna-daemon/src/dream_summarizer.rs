@@ -27,30 +27,36 @@ use std::sync::Arc;
 /// the byte-budget math meaningful instead of collapsing to zero.
 const MIN_SUMMARIZER_CONTEXT_TOKENS: usize = 8_192;
 
-/// The ordered list of models a dream cycle may summarize with.
+/// The ordered list of models a memory consolidation may summarize with: the
+/// Settings summarization list (`summarization_priority`) in its order, else
+/// the chat models in their configured order.
 ///
-/// Returns `priority` when the user configured one, else `fallback` — the two
-/// callers differ in what "fallback" means (the scheduled cycle falls back to
-/// the agent's single main model, the IPC one to the whole `model_priority`
-/// list), so it is taken as a slice rather than baked in.
+/// The one rule for all three memory consumers — the scheduled dream cycle,
+/// IPC consolidation and the `memory.summarize` script service. In-loop
+/// summarization answers an empty Settings list by cutting to fit, but a
+/// memory fold has nothing to cut, so it needs models from somewhere, and the
+/// three used to take them from three different places (the single chat
+/// model twice, the whole chat priority list once). The chat fallback is the
+/// agent service's `configured_models`: exactly the models a chat walks, in
+/// the order it walks them.
 ///
-/// Pure. The result is empty only when **both** inputs are empty, which is the
-/// genuinely unconfigured case the callers report as such.
+/// Blank entries are not models, in either list. Pure. The result is empty
+/// only when nothing at all is configured, the case callers report as such.
 #[must_use]
-pub fn summarization_models(priority: &[String], fallback: &[String]) -> Vec<String> {
-    let models: Vec<String> = if priority.is_empty() {
-        fallback.to_vec()
+pub fn summarization_models(
+    summarization_priority: &[String],
+    chat_model: &str,
+    chat_priority: &[String],
+) -> Vec<String> {
+    let listed = crate::agent_service::named_models(summarization_priority);
+    let models = if listed.is_empty() {
+        crate::agent_service::configured_models(chat_model, chat_priority)
     } else {
-        priority.to_vec()
+        listed
     };
-
     debug_assert!(
-        !(models.is_empty() && !(priority.is_empty() && fallback.is_empty())),
-        "the list may only be empty when both inputs are empty"
-    );
-    debug_assert!(
-        priority.is_empty() || models.len() == priority.len(),
-        "a configured priority list must be preserved verbatim"
+        models.iter().all(|m| !m.trim().is_empty()),
+        "a blank entry names no model"
     );
     models
 }
@@ -214,33 +220,58 @@ mod tests {
         // The whole list, in order — this is the fix: the scheduled cycle used
         // to take only the head and make a single attempt.
         let priority = v(&["small-local", "big-cloud"]);
-        let models = summarization_models(&priority, &v(&["main-model"]));
+        let models = summarization_models(&priority, "main-model", &v(&["chat-a", "chat-b"]));
         assert_eq!(models, priority, "order and contents must be preserved");
     }
 
+    /// Memory cannot be "truncated" instead of summarized, so with no
+    /// summarization list the three memory consumers need models from
+    /// somewhere — and used to take them from three different places: the
+    /// dream cycle and `memory.summarize` the single chat model, IPC
+    /// consolidation the whole chat priority list. One rule now: the chat
+    /// models in their configured order, exactly the list a chat walks.
     #[test]
-    fn empty_priority_falls_back() {
-        // Single-model fallback (the scheduled cycle's shape)…
-        assert_eq!(summarization_models(&[], &v(&["main"])), v(&["main"]));
-        // …and a whole fallback list (the IPC path's shape).
-        assert_eq!(summarization_models(&[], &v(&["a", "b"])), v(&["a", "b"]));
+    fn with_no_settings_list_every_memory_consumer_uses_the_chat_models_in_order() {
+        assert_eq!(
+            summarization_models(&[], "main", &v(&["chat-a", "chat-b"])),
+            v(&["chat-a", "chat-b"]),
+            "the whole chat list, in order — not only its head"
+        );
+        assert_eq!(
+            summarization_models(&[], "main", &[]),
+            v(&["main"]),
+            "no chat list: the single chat model"
+        );
     }
 
     #[test]
     fn priority_wins_over_fallback() {
         // Negative space: the fallback must not leak in when a priority exists.
-        let models = summarization_models(&v(&["chosen"]), &v(&["ignored"]));
+        let models = summarization_models(&v(&["chosen"]), "ignored", &v(&["ignored-too"]));
         assert_eq!(models, v(&["chosen"]));
-        assert!(!models.contains(&"ignored".to_string()));
+    }
+
+    /// A blank entry is not a model, in either list: a list of blanks is an
+    /// empty list, and falls back the way an empty one does.
+    #[test]
+    fn blank_entries_are_not_models() {
+        assert_eq!(
+            summarization_models(&v(&["", "  "]), "main", &[]),
+            v(&["main"])
+        );
+        assert_eq!(
+            summarization_models(&v(&["", "chosen"]), "main", &[]),
+            v(&["chosen"])
+        );
     }
 
     #[test]
     fn empty_only_when_nothing_is_configured() {
         // The single case callers must report as unconfigured.
-        assert_eq!(summarization_models(&[], &[]), Vec::<String>::new());
+        assert_eq!(summarization_models(&[], "", &[]), Vec::<String>::new());
         // …and never otherwise.
-        assert_ne!(summarization_models(&v(&["a"]), &[]), Vec::<String>::new());
-        assert_ne!(summarization_models(&[], &v(&["b"])), Vec::<String>::new());
+        assert_ne!(summarization_models(&v(&["a"]), "", &[]), Vec::<String>::new());
+        assert_ne!(summarization_models(&[], "b", &[]), Vec::<String>::new());
+        assert_ne!(summarization_models(&[], "", &v(&["c"])), Vec::<String>::new());
     }
-
 }

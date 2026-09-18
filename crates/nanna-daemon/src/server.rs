@@ -1215,9 +1215,13 @@ fn memory_summarize_services(
                     let live = summarizer_config.read().await;
                     crate::dream_summarizer::summarization_models(
                         &live.summarization_priority,
-                        std::slice::from_ref(&live.model),
+                        &live.model,
+                        &live.model_priority,
                     )
                 };
+                if models.is_empty() {
+                    return Err(crate::agent_service::NO_MODEL_CONFIGURED.to_string());
+                }
                 let summarize =
                     crate::dream_summarizer::summarize_with_failover(router, models);
                 let summary = summarize(joined).await?;
@@ -2508,14 +2512,28 @@ async fn dream_once(
 
     // Read the summarization list LIVE, once per
     // cycle: whatever the user last set is what
-    // this dream summarizes on. Falls back to the
-    // chat model exactly as the boot path did.
-    let live_cfg = agent.agent_config().await;
-    let summarization_models =
+    // this dream summarizes on. With none, the
+    // chat models in their configured order — the
+    // one rule every memory consumer shares.
+    let summarization_models = {
+        let handle = agent.config_handle();
+        let live = handle.read().await;
         crate::dream_summarizer::summarization_models(
-            &live_cfg.summarization_priority,
-            std::slice::from_ref(&live_cfg.model),
+            &live.summarization_priority,
+            &live.model,
+            &live.model_priority,
+        )
+    };
+    if summarization_models.is_empty() {
+        return (
+            true,
+            Some(format!(
+                "Skipped ({})",
+                crate::agent_service::NO_MODEL_CONFIGURED
+            )),
+            None,
         );
+    }
 
     // The idle gate AND the full dream cycle (feedback
     // flush -> FSRS testing-effect flush -> consolidate)
@@ -6201,7 +6219,44 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 mod tests {
     use super::*;
 
+    /// With no Settings summarization list, `memory.summarize` walks the chat
+    /// models in their configured order — the rule every memory consumer
+    /// shares. It used to take the single chat model, so a first chat model
+    /// with no provider failed the call while a second one could answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_summarize_walks_the_chat_models_when_settings_list_none() {
+        use crate::embedding_reload::test_ollama::{ollama_credentials, spawn_token_gated};
+        let (host, seen) = spawn_token_gated("bound-token").await;
+        let router = Arc::new(crate::llm_router::LlmRouter::new());
+        router.rebuild(&ollama_credentials(&host, "bound-token"));
+        let chat_models = vec![
+            // No OpenRouter key is registered: this one cannot answer.
+            "openrouter/nanna-test/unreachable".to_string(),
+            "ollama/nanna-test-chat:1b".to_string(),
+        ];
+        let config = Arc::new(tokio::sync::RwLock::new(
+            crate::agent_service::AgentServiceConfig {
+                model: chat_models[0].clone(),
+                model_priority: chat_models,
+                summarization_priority: Vec::new(),
+                ..crate::agent_service::AgentServiceConfig::default()
+            },
+        ));
+        let services = memory_summarize_services(router, config);
+        let summarize = services.get("memory.summarize").expect("registered");
 
+        let reply = summarize(serde_json::json!({ "texts": ["one fragment", "another"] }))
+            .await
+            .expect("the second chat model answers");
+
+        assert!(reply["summary"].as_str().is_some_and(|s| !s.is_empty()), "{reply}");
+        let reached = seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.model.as_deref() == Some("nanna-test-chat:1b")),
+            "{reached:?}"
+        );
+    }
 
     /// A memory saved through the `remember` TOOL used to carry no `fact_type`
     /// at all, so the drift pin — which can only protect what it can identify —
