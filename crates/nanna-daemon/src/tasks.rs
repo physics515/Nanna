@@ -3005,9 +3005,10 @@ impl AgentStepRunner {
         }))
     }
 
-    /// Whether this runner's model is served by the local Ollama instance.
-    /// Healing must be provider-aware: a `:free` suffix on an `OpenRouter`
-    /// model id must never trigger local-server surgery.
+    /// Whether this runner's model is served by Ollama. Healing must be
+    /// provider-aware: a `:free` suffix on an `OpenRouter` model id must never
+    /// trigger local-server surgery. (Where that server runs is the healers'
+    /// own check — see [`OllamaHealTarget`].)
     #[must_use]
     pub fn is_ollama_model(&self) -> bool {
         crate::llm_router::ProviderId::from_model(&self.agent_config.model)
@@ -3017,9 +3018,10 @@ impl AgentStepRunner {
     /// Force Ollama to unload the model (`keep_alive: 0`), clearing runner
     /// state — the observed degraded mode restores a stale KV context
     /// checkpoint that sends every generation straight to a stop token, and
-    /// only a fresh runner clears it. No-op for non-Ollama models.
+    /// only a fresh runner clears it. No-op for non-Ollama models, and for an
+    /// Ollama server not on this machine.
     pub async fn reset_ollama_runner(&self) {
-        reset_ollama_runner_for(&self.agent_config.model).await;
+        reset_ollama_runner_for(&self.router, &self.agent_config.model).await;
     }
 
     /// The agent for one step: the runner's config with a step-appropriate
@@ -4014,40 +4016,56 @@ const OLLAMA_RESTART_COOLDOWN_SECS: u64 = 600;
 static LAST_OLLAMA_RESTART_EPOCH_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Normalize a raw `OLLAMA_HOST` value into a CLIENT-usable base URL.
+/// Where the healing ladder acts: the Ollama server chat is talking to, and
+/// whether its processes are this machine's.
 ///
-/// `OLLAMA_HOST` is a SERVER bind address: `0.0.0.0` / `[::]` (all
-/// interfaces) still mean THIS machine, but as connect targets they must
-/// become loopback; a bare `host[:port]` needs the http scheme; a missing
-/// port gets Ollama's default 11434. Observed live: with
-/// `OLLAMA_HOST=0.0.0.0` the runner reset posted to a scheme-less URL
-/// (silently failed) and the server restart refused as "not local" — the
-/// entire healing ladder was neutered by one env var.
-pub(crate) fn normalize_ollama_base(raw: &str) -> String {
-    let with_scheme = if raw.contains("://") {
-        raw.to_string()
-    } else {
-        format!("http://{raw}")
-    };
-    let mapped = with_scheme
-        .replace("0.0.0.0", "127.0.0.1")
-        .replace("[::]", "[::1]");
-    match reqwest::Url::parse(&mapped) {
-        Ok(mut url) => {
-            if url.port().is_none() && url.set_port(Some(11434)).is_err() {
-                return "http://127.0.0.1:11434".to_string();
-            }
-            url.to_string().trim_end_matches('/').to_string()
-        }
-        Err(_) => "http://127.0.0.1:11434".to_string(),
+/// The address is the configured one (`[memory].ollama_host`, Settings →
+/// Models → Server URL), taken from the router's Ollama client at the moment
+/// of healing; a config reload rebuilds that client, so a server changed
+/// mid-run is the server healed. `OLLAMA_HOST` is not read: it is Ollama's own
+/// bind variable, chat never read it, and letting it steer only the ladder is
+/// how the ladder came to wait on, unload from and kill a local server while
+/// chat was failing against a remote one. A local server on a non-default port
+/// is configured like any other (`http://127.0.0.1:11500`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OllamaHealTarget {
+    /// The server's base URL, as chat addresses it.
+    pub(crate) base_url: String,
+    /// Whether the server runs on this machine. Only then may the ladder act
+    /// on processes: unload the model's runner, or kill and respawn the server
+    /// (`pkill` reaches this machine's processes, whichever server they
+    /// serve). A server elsewhere is only waited on.
+    pub(crate) on_this_machine: bool,
+}
+
+/// The healing target for the Ollama server at `base_url`.
+pub(crate) fn ollama_heal_target(base_url: &str) -> OllamaHealTarget {
+    OllamaHealTarget {
+        base_url: base_url.to_string(),
+        on_this_machine: nanna_llm::ollama_server_is_local(base_url),
     }
 }
 
-/// The client base URL for the local Ollama server (env-driven, normalized).
-pub(crate) fn ollama_local_base() -> String {
-    let raw =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    normalize_ollama_base(&raw)
+/// The router's Ollama server as a healing target, read now. `None` when the
+/// router serves no Ollama, so there is nothing to heal.
+fn current_ollama_target(router: &LlmRouter) -> Option<OllamaHealTarget> {
+    router
+        .ollama_client()
+        .map(|client| ollama_heal_target(client.base_url()))
+}
+
+/// Whether the router's Ollama server answers its API right now, asked with
+/// chat's token — one probe, bounded to 3s.
+///
+/// `/api/tags` rather than `/api/version`: it is the endpoint an
+/// Ollama-compatible server is known to serve (the model list needs it), and
+/// the one the daemon's own probe reads as reachable. The client is read per
+/// probe, so a wait that spans a config reload polls the new server.
+async fn ollama_answers(router: &LlmRouter) -> bool {
+    match router.ollama_client() {
+        Some(client) => client.ollama_answers(std::time::Duration::from_secs(3)).await,
+        None => false,
+    }
 }
 
 /// Restart the local Ollama server: tree-kill the server process AND its
@@ -4057,8 +4075,9 @@ pub(crate) fn ollama_local_base() -> String {
 /// This is the cure for the sticky degraded-runner state (every generation
 /// aborted with `done:false`; model unloads do not clear it — verified live).
 /// Callers gate it: bouncing a shared local service is an operator decision.
-/// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
-/// most once per `OLLAMA_RESTART_COOLDOWN_SECS` process-wide.
+/// Refuses to act when the configured server is not on this machine (see
+/// [`OllamaHealTarget`]), and at most once per `OLLAMA_RESTART_COOLDOWN_SECS`
+/// process-wide.
 ///
 /// REGRESSION (2026-08-09): the kill must take the whole runner tree, not
 /// just the server. This function originally ran `taskkill /F /IM
@@ -4072,15 +4091,17 @@ pub(crate) fn ollama_local_base() -> String {
 /// died in minutes on below-floor stops. Each restart heal leaks one runner
 /// per loaded model, so repeated heals (e.g. the 2026-08-08 ministral leg's
 /// two) starve the card cumulatively while looking like successful cures.
-pub async fn restart_ollama_server() -> bool {
-    // Normalization maps bind-all addresses to loopback, so after it a
-    // genuinely remote host is the only thing that won't look local.
-    let base = ollama_local_base();
-    let is_local = ["localhost", "127.0.0.1", "[::1]"]
-        .iter()
-        .any(|h| base.contains(h));
-    if !is_local {
-        tracing::warn!(host = %base, "refusing Ollama restart: OLLAMA_HOST is not a local server");
+pub async fn restart_ollama_server(router: &LlmRouter) -> bool {
+    let Some(target) = current_ollama_target(router) else {
+        tracing::warn!("not restarting Ollama: no Ollama server is configured");
+        return false;
+    };
+    if !target.on_this_machine {
+        tracing::warn!(
+            server = %target.base_url,
+            "not restarting the Ollama server: it is not on this machine, and killing this \
+             machine's ollama/llama-server processes cannot cure a server elsewhere"
+        );
         return false;
     }
 
@@ -4106,7 +4127,10 @@ pub async fn restart_ollama_server() -> bool {
         return false;
     }
 
-    tracing::warn!("restarting the Ollama server (degraded runner state)");
+    tracing::warn!(
+        server = %target.base_url,
+        "restarting the Ollama server (degraded runner state)"
+    );
     // Every model's runner dies with the server, so every fingerprint
     // describing one is now stale.
     forget_all_wedges();
@@ -4136,13 +4160,7 @@ pub async fn restart_ollama_server() -> bool {
     }
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let up = reqwest::Client::new()
-            .get(format!("{base}/api/version"))
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success());
-        if up {
+        if ollama_answers(router).await {
             info!("Ollama is back after restart");
             return true;
         }
@@ -4160,25 +4178,18 @@ pub(crate) fn ollama_restart_allowed() -> bool {
     std::env::var("NANNA_OLLAMA_RESTART_ON_DEGRADED").as_deref() != Ok("0")
 }
 
-/// Poll the local Ollama server until it answers `/api/version`, up to
-/// `max_secs`. The chat healer uses this to WAIT OUT a server-down window
-/// (our own runner-surgery restart, or any external restart) instead of
-/// burning retry budget: attempts against a down server complete zero tool
-/// calls, so the progress-based replenishment can never refill the budget,
-/// and the 2/5/10s backoffs burn out inside a ~20-60s restart — observed
-/// live killing a 4h55m mission two minutes after the surgery that cured
-/// its fault storm.
-pub(crate) async fn wait_for_ollama_ready(max_secs: u64) -> bool {
-    let base = ollama_local_base();
+/// Poll the configured Ollama server — on this machine or not — until it
+/// answers, up to `max_secs`. The chat healer uses this to WAIT OUT a
+/// server-down window (our own runner-surgery restart, or any external
+/// restart) instead of burning retry budget: attempts against a down server
+/// complete zero tool calls, so the progress-based replenishment can never
+/// refill the budget, and the 2/5/10s backoffs burn out inside a ~20-60s
+/// restart — observed live killing a 4h55m mission two minutes after the
+/// surgery that cured its fault storm.
+pub(crate) async fn wait_for_ollama_ready(router: &LlmRouter, max_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {
-        let up = reqwest::Client::new()
-            .get(format!("{base}/api/version"))
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success());
-        if up {
+        if ollama_answers(router).await {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -4193,19 +4204,32 @@ pub(crate) async fn wait_for_ollama_ready(max_secs: u64) -> bool {
 /// sends every generation straight to a stop token, and only a fresh runner
 /// clears it. Free-function variant so the chat path can heal with the same
 /// ladder as the step runner. No-op for non-Ollama models: healing is
-/// provider-gated, a `:free` `OpenRouter` suffix must never trigger it.
-pub(crate) async fn reset_ollama_runner_for(model: &str) {
+/// provider-gated, a `:free` `OpenRouter` suffix must never trigger it. No-op
+/// too for a server not on this machine: its runners are its own operator's,
+/// and an unload there pulls the model from every other client it serves.
+pub(crate) async fn reset_ollama_runner_for(router: &LlmRouter, model: &str) {
     if crate::llm_router::ProviderId::from_model(model) != crate::llm_router::ProviderId::Ollama {
         return;
     }
-    let base = ollama_local_base();
+    let Some(target) = current_ollama_target(router) else {
+        return;
+    };
+    if !target.on_this_machine {
+        tracing::warn!(
+            model = %model,
+            server = %target.base_url,
+            "not resetting the Ollama runner: the server is not on this machine, and unloading \
+             the model there would pull it from every other client that server has"
+        );
+        return;
+    }
     tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after transient failures");
     // The runner this fingerprint described is about to stop existing, so the
     // next wedge must be judged fresh rather than matched against it.
     forget_wedge(model);
     let client = reqwest::Client::new();
     let _ = client
-        .post(format!("{base}/api/generate"))
+        .post(format!("{}/api/generate", target.base_url))
         .json(&serde_json::json!({
             "model": LlmRouter::strip_model_prefix(model),
             "keep_alive": 0
@@ -4765,28 +4789,79 @@ mod tests {
         );
     }
 
+    /// The live hazard: `[memory].ollama_host` names a remote server, that
+    /// server's proxy answers 502, and the ladder unloaded a model on THIS
+    /// machine's Ollama and then `pkill`ed its `ollama` and `llama-server`. A
+    /// remote server is the one the ladder acts on, and only by waiting.
     #[test]
-    fn ollama_base_normalization_handles_bind_addresses() {
-        // The live regression: OLLAMA_HOST=0.0.0.0 (a server BIND address)
-        // must normalize to a loopback CLIENT url — it neutered the whole
-        // healing ladder when treated verbatim.
-        assert_eq!(normalize_ollama_base("0.0.0.0"), "http://127.0.0.1:11434");
-        assert_eq!(
-            normalize_ollama_base("0.0.0.0:11434"),
-            "http://127.0.0.1:11434"
+    fn a_remote_configured_server_is_never_operated_on_locally() {
+        for remote in ["https://gpubox.example/ollama", "http://192.168.1.20:11434"] {
+            let target = ollama_heal_target(remote);
+            assert_eq!(target.base_url, remote, "the ladder must act on the configured server");
+            assert!(!target.on_this_machine, "{remote}'s processes are not this machine's");
+        }
+    }
+
+    /// A server on this machine is healed where it listens — a non-default
+    /// port included, which only the configured address knows.
+    #[test]
+    fn a_local_configured_server_is_healed_where_it_listens() {
+        for local in ["http://127.0.0.1:11500", "http://localhost:11434", "http://0.0.0.0:11434"] {
+            let target = ollama_heal_target(local);
+            assert_eq!(target.base_url, local, "the ladder must act on the configured server");
+            assert!(target.on_this_machine, "{local} is on this machine");
+        }
+    }
+
+    /// An Ollama-compatible server on a free loopback port that lists a model
+    /// to a request carrying `Authorization: Bearer <token>` and answers 401 to
+    /// any other — the shape of a server behind an authenticating proxy.
+    async fn serve_tags_requiring(token: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 4096];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..n]).to_lowercase();
+                let (status, body) = if head.contains(&format!("authorization: bearer {token}")) {
+                    ("200 OK", r#"{"models":[{"name":"qwen3:8b","size":7}]}"#)
+                } else {
+                    ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The wait polls the server chat talks to, with chat's token: that server
+    /// being up ends it at once, and a configured address with nothing
+    /// listening is not "reachable again" because some other Ollama is.
+    #[tokio::test]
+    async fn the_readiness_wait_polls_the_configured_server() {
+        let url = serve_tags_requiring("s3cret").await;
+        let router = LlmRouter::new().with_ollama_authenticated(&url, "s3cret");
+        assert!(
+            wait_for_ollama_ready(&router, 5).await,
+            "the configured server at {url} is up"
         );
-        assert_eq!(
-            normalize_ollama_base("http://localhost:11434"),
-            "http://localhost:11434"
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let router = LlmRouter::new().with_ollama(&format!("http://127.0.0.1:{port}"));
+        assert!(
+            !wait_for_ollama_ready(&router, 0).await,
+            "nothing listens at the configured 127.0.0.1:{port}"
         );
-        assert_eq!(
-            normalize_ollama_base("localhost"),
-            "http://localhost:11434"
-        );
-        // A genuinely remote host stays remote (and stays refusable).
-        let remote = normalize_ollama_base("http://gpubox.lan:11434");
-        assert!(remote.contains("gpubox.lan"));
-        assert!(!remote.contains("127.0.0.1"));
     }
 
     #[test]
@@ -6542,10 +6617,11 @@ impl TaskRunManager {
                 // Healing ladder — provider-aware. Local Ollama: server
                 // restart (unless opted out), else runner reset. Cloud
                 // providers (incl. the openrouter/free auto-router, where the
-                // serving model varies per request): nothing local to heal —
-                // the pause + resume + in-step retries ARE the healing.
+                // serving model varies per request) and an Ollama server on
+                // another machine (both calls decline it): nothing local to
+                // heal — the pause + resume + in-step retries ARE the healing.
                 if runner.is_ollama_model()
-                    && !(ollama_restart_allowed() && restart_ollama_server().await)
+                    && !(ollama_restart_allowed() && restart_ollama_server(&runner.router).await)
                 {
                     runner.reset_ollama_runner().await;
                 }

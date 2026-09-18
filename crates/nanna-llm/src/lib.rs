@@ -2762,6 +2762,30 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Self::ollama("http://localhost:11434")
     }
 
+    /// The base URL this client's requests go to — for Ollama, the configured
+    /// server as the client addresses it (trimmed, `localhost` pinned to
+    /// `127.0.0.1`).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Whether this Ollama client's server answers the Ollama API right now:
+    /// one [`probe_ollama`] of its base URL, bounded by `timeout`, carrying the
+    /// client's own token — without it, a server behind an authenticating
+    /// proxy reads as down however healthy it is.
+    ///
+    /// `false` for any other provider: its key is not Ollama's to send.
+    pub async fn ollama_answers(&self, timeout: std::time::Duration) -> bool {
+        if self.provider != Provider::Ollama {
+            return false;
+        }
+        matches!(
+            probe_ollama(&self.base_url, Some(&self.api_key), timeout).await,
+            OllamaProbe::Reachable { .. }
+        )
+    }
+
     /// Check if this client uses OAuth authentication
     fn is_oauth(&self) -> bool {
         is_oauth_token(&self.api_key)

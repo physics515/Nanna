@@ -163,6 +163,14 @@ impl LlmRouter {
             .cloned()
     }
 
+    /// The Ollama client chat is using right now — the configured server and
+    /// its token, as of the last rebuild. Snapshotted per call, so a caller
+    /// that asks again after a config reload gets the new server.
+    #[must_use]
+    pub fn ollama_client(&self) -> Option<Arc<LlmClient>> {
+        self.client_for(ProviderId::Ollama)
+    }
+
     /// Rebuild the provider set from resolved credentials, replacing the
     /// current map. Safe to call on a shared `Arc<LlmRouter>`; requests
     /// in flight keep the client `Arc` they already snapshotted.

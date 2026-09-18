@@ -72,6 +72,16 @@ asks, and tells apart "Ollama isn't running" from "it's running but this model i
 with the exact `ollama pull` to run. The model picker in Settings asks the same way. A server that
 lists a model as `qwen` rather than `qwen:latest` no longer has it reported missing.
 
+**Recovery acts on the Ollama server you set, and never kills a local one for a remote one.** When
+chat against Ollama kept failing, Nanna unloaded the model and, as a last resort, restarted Ollama.
+It did both to an Ollama on this computer (the one `OLLAMA_HOST` named, or the default address), no
+matter which server chat was using. With a server on another machine, a failing proxy there meant
+Nanna unloaded a model from the Ollama on your own computer and then killed it, and "waited for
+Ollama to come back" by checking that one. Recovery now uses the address in Settings → Models. It
+waits for that server wherever it is, sending its token, and it unloads or restarts only a server on
+this computer. `OLLAMA_HOST` no longer changes which server Nanna looks at: a local Ollama on another
+port is entered in Settings like any other address.
+
 **A remote Ollama's context window is no longer sized from this computer's graphics card.** Nanna
 sizes a local model's context window to the video memory free on this machine, and it did the same
 for a server on another machine, whose card it cannot see. A busy card here could shrink a remote

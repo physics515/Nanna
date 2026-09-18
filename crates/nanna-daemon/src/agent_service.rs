@@ -1813,17 +1813,18 @@ impl AgentService {
             at: chrono::Utc::now().to_rfc3339(),
         });
 
-        // A DOWN local server (connection refused — e.g. our own
+        // A DOWN server (connection refused — e.g. our own
         // runner-surgery restart window, observed live killing a
         // 4h55m mission two minutes after the surgery cured its
         // fault storm) is a WAIT condition, not a fault to
         // retry-count: attempts against a down server complete
         // zero tool calls, so progress-based replenishment can
         // never refill the budget, and the 2/5/10s backoffs burn
-        // out inside a ~20-60s restart. Wait for readiness
-        // (bounded) and resume the same model with the budget
-        // untouched; if the server never comes back, fall
-        // through to normal retry accounting and exhaust.
+        // out inside a ~20-60s restart. Wait (bounded) for the
+        // configured server, wherever it runs, to answer, and
+        // resume the same model with the budget untouched; if
+        // the server never comes back, fall through to normal
+        // retry accounting and exhaust.
         if provider == crate::llm_router::ProviderId::Ollama
             && Self::is_server_down_error(error_str)
             && walk.server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
@@ -1834,7 +1835,7 @@ impl AgentService {
             warn!(
                 "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
             );
-            if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
+            if crate::tasks::wait_for_ollama_ready(&self.router, CHAT_SERVER_DOWN_WAIT_SECS).await {
                 info!("Ollama is reachable again — resuming the run");
                 return;
             }
@@ -1848,7 +1849,8 @@ impl AgentService {
         // otherwise dies on the first hiccup and heartbeats fail
         // for hours. Mirrors the task harness's step-retry
         // ladder; Ollama-served models additionally get runner
-        // surgery (provider-gated — never fires for cloud models).
+        // surgery (provider-gated — never fires for cloud models,
+        // and declined for an Ollama server on another machine).
         // Rate-limit/overload errors (429/529) are excluded: the
         // branch below honors the provider's Retry-After and the
         // shared-bucket skip instead of hammering it. A cancelled
@@ -1905,12 +1907,12 @@ impl AgentService {
                 // server — the sticky degraded state survives
                 // unloads (verified live in the endurance runs).
                 if same_model_retries == 2 {
-                    crate::tasks::reset_ollama_runner_for(model).await;
+                    crate::tasks::reset_ollama_runner_for(&self.router, model).await;
                 }
                 if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
                     && crate::tasks::ollama_restart_allowed()
                 {
-                    crate::tasks::restart_ollama_server().await;
+                    crate::tasks::restart_ollama_server(&self.router).await;
                 }
             }
             return;
