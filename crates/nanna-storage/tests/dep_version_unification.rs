@@ -214,11 +214,10 @@ fn resolved_packages(contents: &str) -> Vec<(&str, &str)> {
         let trimmed = line.trim();
         if let Some(name) = quoted_value(trimmed, "name") {
             pending_name = Some(name);
-        } else if let Some(version) = quoted_value(trimmed, "version") {
-            if let Some(name) = pending_name.take() {
+        } else if let Some(version) = quoted_value(trimmed, "version")
+            && let Some(name) = pending_name.take() {
                 packages.push((name, version));
             }
-        }
     }
 
     assert!(

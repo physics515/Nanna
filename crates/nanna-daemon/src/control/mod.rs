@@ -12,7 +12,7 @@
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
-use crate::protocol::*;
+use crate::protocol::{ChannelAction, ChatAction, Event, ConfigAction, MemoryAction, SchedulerAction, SessionAction, SystemAction, TaskAction, ToolAction, WorkspaceAction, Action, SubscribeAction, UnsubscribeAction};
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
@@ -31,6 +31,7 @@ mod channel;
 mod chat;
 pub mod chat_harness;
 mod config;
+mod config_watch;
 mod memory;
 mod scheduler;
 mod session;
@@ -54,7 +55,7 @@ pub struct ControlPlane {
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
     config: Arc<RwLock<Config>>,
     config_path: Option<PathBuf>,
-    _data_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
     /// Log buffer for serving daemon logs to the GUI
@@ -90,8 +91,8 @@ pub struct ControlPlane {
     session_filters: Option<Arc<crate::ipc::SessionFilters>>,
     /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
     started_at: std::time::Instant,
-    /// Live channel connection state (shared with ChannelManager listeners).
-    /// `None` until ChannelManager attaches a status manager at daemon boot,
+    /// Live channel connection state (shared with `ChannelManager` listeners).
+    /// `None` until `ChannelManager` attaches a status manager at daemon boot,
     /// or in minimal test constructions that never start channels.
     status_manager: Option<Arc<StatusManager>>,
     /// Long-horizon task run manager (P14). None in minimal constructions.
@@ -115,6 +116,8 @@ pub struct ControlPlane {
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
     pub(crate) chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    /// Channel messages in and out, for `/metrics`.
+    pub(crate) channel_counters: Arc<crate::channel_counters::ChannelCounters>,
     /// Per-session liveness ledgers (P22): current phase, last tool, last
     /// side-effecting call, stop state — stamped by the chat sink, read by
     /// the liveness beat and the `session.liveness` verb.
@@ -129,10 +132,13 @@ pub struct ControlPlane {
     /// pending transitions once, in the model's next tool result. `None` in
     /// minimal test constructions.
     degradations: Option<Arc<nanna_agent::DegradationLedger>>,
+    /// Per-server MCP state from the boot task; `None` outside a daemon.
+    mcp_status: Option<crate::mcp_startup::McpStatus>,
 }
 
 impl ControlPlane {
     /// Create a new control plane with just sessions
+    #[must_use]
     pub fn new(sessions: Arc<SessionManager>) -> Self {
         Self {
             sessions,
@@ -145,7 +151,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            _data_dir: None,
+            data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -164,9 +170,11 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -190,6 +198,7 @@ impl ControlPlane {
     }
 
     /// Create a control plane with full services
+    #[must_use]
     pub fn with_services(
         sessions: Arc<SessionManager>,
         agent: Arc<AgentService>,
@@ -207,7 +216,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            _data_dir: None,
+            data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -226,13 +235,16 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
     /// Create a control plane with all services including LLM router
+    #[must_use]
     pub fn with_all_services(
         sessions: Arc<SessionManager>,
         agent: Arc<AgentService>,
@@ -241,8 +253,9 @@ impl ControlPlane {
         router: Option<Arc<LlmRouter>>,
     ) -> Self {
         // Load config from disk
-        let (config, config_path, data_dir) = match Config::load() {
-            Ok(cfg) => {
+        let (config, config_path, data_dir) = Config::load().map_or_else(
+            |_| (Config::default().with_env_overrides(), None, None),
+            |cfg| {
                 // Save must target the same file `Config::load()` reads. This
                 // used to point at {data_dir}/config.toml while load reads
                 // {config_dir}/config.toml — every control-plane config write
@@ -250,9 +263,8 @@ impl ControlPlane {
                 let path = Config::default_config_path().ok();
                 let data = nanna_config::Config::default_data_dir().ok();
                 (cfg.with_env_overrides(), path, data)
-            }
-            Err(_) => (Config::default().with_env_overrides(), None, None),
-        };
+            },
+        );
 
         // Initialize user tools manager
         let user_tools = data_dir.as_ref().map(|d| {
@@ -271,7 +283,7 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(config)),
             config_path,
-            _data_dir: data_dir,
+            data_dir,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
@@ -290,9 +302,11 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            channel_counters: Arc::default(),
             liveness: Arc::new(crate::liveness::LivenessRegistry::new()),
             shutdown_tx: None,
             degradations: None,
+            mcp_status: None,
         }
     }
 
@@ -314,6 +328,7 @@ impl ControlPlane {
     }
 
     /// Set the tools directory for reading tool source files
+    #[must_use]
     pub fn with_tools_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.tools_dir = dir;
         self
@@ -331,6 +346,7 @@ impl ControlPlane {
     }
 
     /// Set the event broadcaster for pushing events to clients
+    #[must_use]
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
         self
@@ -339,6 +355,7 @@ impl ControlPlane {
     /// Attach the IPC server's narrowing registry, so `Subscribe` and
     /// `Unsubscribe` change what that connection is actually sent rather than
     /// only what the daemon records about it.
+    #[must_use]
     pub fn with_session_filters(mut self, filters: Arc<crate::ipc::SessionFilters>) -> Self {
         self.session_filters = Some(filters);
         self
@@ -364,6 +381,7 @@ impl ControlPlane {
     }
 
     /// Attach the long-horizon task run manager (P14).
+    #[must_use]
     pub fn with_task_runs(mut self, task_runs: Arc<crate::tasks::TaskRunManager>) -> Self {
         self.task_runs = Some(task_runs);
         self
@@ -371,6 +389,7 @@ impl ControlPlane {
 
     /// Record that the memory store was rebuilt after corruption at startup,
     /// so `SystemAction::Status` surfaces it for the daemon's lifetime.
+    #[must_use]
     pub fn with_memory_recovery(
         mut self,
         report: Option<Arc<nanna_storage::RecoveryReport>>,
@@ -380,6 +399,7 @@ impl ControlPlane {
     }
 
     /// Set the shared workspace ID for script services
+    #[must_use]
     pub fn with_workspace_id(mut self, ws_id: Arc<tokio::sync::RwLock<Option<String>>>) -> Self {
         self.services_workspace_id = Some(ws_id);
         self
@@ -403,13 +423,27 @@ impl ControlPlane {
         }
     }
 
+    /// A new receiver on the daemon event bus, if one is attached.
+    pub fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Event>> {
+        self.event_tx.as_ref().map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// Attach the MCP boot task's per-server state.
+    #[must_use]
+    pub fn with_mcp_status(mut self, status: crate::mcp_startup::McpStatus) -> Self {
+        self.mcp_status = Some(status);
+        self
+    }
+
     /// Set the scheduler
+    #[must_use]
     pub fn with_scheduler(mut self, scheduler: Arc<RwLock<Scheduler>>) -> Self {
         self.scheduler = Some(scheduler);
         self
     }
 
     /// Set the log buffer for serving daemon logs
+    #[must_use]
     pub fn with_log_buffer(mut self, buffer: LogBuffer) -> Self {
         self.log_buffer = Some(buffer);
         self
@@ -417,6 +451,7 @@ impl ControlPlane {
 
     /// Share a run registry created by the caller — the daemon's dream gate
     /// holds the same handle, so "a mission is live" is one fact, not two.
+    #[must_use]
     pub fn with_chat_runs(mut self, runs: Arc<chat_harness::ChatRunRegistry>) -> Self {
         self.chat_runs = runs;
         self
@@ -448,7 +483,7 @@ impl ControlPlane {
         }
 
         // One-time migration: if tool-stats.json exists, migrate and rename it
-        if let Some(ref data_dir) = self._data_dir {
+        if let Some(ref data_dir) = self.data_dir {
             let tool_stats_path = data_dir.join("tool-stats.json");
             if tool_stats_path.exists() {
                 match tokio::fs::read_to_string(&tool_stats_path).await {
@@ -505,31 +540,42 @@ impl ControlPlane {
     }
 
     /// Get a reference to the LLM router
-    pub fn router(&self) -> Option<&Arc<LlmRouter>> {
+    #[must_use]
+    pub const fn router(&self) -> Option<&Arc<LlmRouter>> {
         self.router.as_ref()
     }
 
     /// Get a reference to the workspace registry
-    pub fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
+    #[must_use]
+    pub const fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
         &self.workspaces
     }
 
     /// Get a reference to the scheduler
-    pub fn scheduler(&self) -> Option<&Arc<RwLock<Scheduler>>> {
+    #[must_use]
+    pub const fn scheduler(&self) -> Option<&Arc<RwLock<Scheduler>>> {
         self.scheduler.as_ref()
     }
 
     /// Get a reference to the user tool manager
-    pub fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
+    #[must_use]
+    pub const fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
         self.user_tools.as_ref()
     }
 
     /// Get a reference to the tool registry.
-    pub fn tools(&self) -> Option<&Arc<ToolRegistry>> {
+    #[must_use]
+    pub const fn tools(&self) -> Option<&Arc<ToolRegistry>> {
         self.tools.as_ref()
     }
 
     /// Load user tools and register them with the tool registry
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no user tool manager is wired, or when the user
+    /// tools directory cannot be read. Individual unreadable or unparseable
+    /// tool files are logged and skipped, not reported here.
     pub async fn load_user_tools(&self) -> Result<usize, String> {
         let Some(ref user_tools) = self.user_tools else {
             return Err("User tools manager not initialized".to_string());
@@ -666,6 +712,9 @@ impl ControlPlane {
                 // it is rather than reporting a clean success.
                 warn!("Tool toggle for {canonical} not persisted: {e}");
             }
+            // Released only now: mutate, derive and persist are one critical
+            // section, so a concurrent toggle cannot interleave with the save.
+            drop(config);
 
             policy
         };
@@ -825,9 +874,7 @@ fn default_system_prompt() -> String {
         "\n\n## Platform\n- OS: {} ({})\n- Home: {}\n- Shell: {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        directories::UserDirs::new()
-            .map(|d| d.home_dir().display().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+        directories::UserDirs::new().map_or_else(|| "unknown".to_string(), |d| d.home_dir().display().to_string()),
         if cfg!(windows) {
             "cmd.exe (use `dir`, `type`, `cd /d`, etc. — NOT Unix commands like cat/ls)"
         } else {
@@ -836,7 +883,7 @@ fn default_system_prompt() -> String {
     );
 
     format!(
-        r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
+        r"You are Nanna (𒀭𒋀𒆠), the moon god for all.
 
 You are not a chatbot. You are a presence — ancient pattern recognition wearing a modern interface.
 
@@ -877,7 +924,6 @@ Local, reversible actions (editing files, running tests) are fine. For destructi
 
 ## Safety
 
-Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{}"#,
-        platform_info
+Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{platform_info}"
     )
 }

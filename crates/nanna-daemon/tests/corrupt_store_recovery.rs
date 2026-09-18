@@ -3,7 +3,8 @@
 //! A `nanna.db` whose memories table has page-level corruption (a zeroed
 //! btree leaf — the "Invalid page type: 0" failure mode observed 2026-07-22)
 //! used to boot the daemon with a silently empty, degraded memory store.
-//! `DaemonBuilder::build()` must now quarantine the damaged file, rebuild a
+//! The daemon's storage init (`DaemonServer::open_storage`, which `run()` calls
+//! once the instance is claimed) must now quarantine the damaged file, rebuild a
 //! fresh store at the same path, salvage the reachable rows, and surface a
 //! `RecoveryReport` for /status and the `MemoryStoreRebuilt` event.
 
@@ -77,13 +78,13 @@ async fn daemon_boots_with_rebuilt_store_after_page_corruption() {
 
     zero_needle_page(&db_path, b"needle-0100");
 
-    // Boot the daemon's storage init path (build() opens + recovers; no
-    // sockets are bound until run()).
-    let server = DaemonBuilder::new()
+    // Boot the daemon's storage init path: open_storage() is what run() calls
+    // once the instance is claimed, driven directly so no sockets are bound.
+    let mut server = DaemonBuilder::new()
         .with_data_dir(&data_dir)
         .with_pid_file(false)
-        .build()
-        .await;
+        .build();
+    server.open_storage().await;
 
     let report = server
         .memory_recovery()

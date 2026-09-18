@@ -981,7 +981,7 @@ fn identical_failure_streak_counts_only_consecutive_identical_errors() {
         3,
         "the third identical failure reaches the stop bound"
     );
-    assert!(3 >= IDENTICAL_FAILURE_STOP_AFTER);
+    const { assert!(3 >= IDENTICAL_FAILURE_STOP_AFTER) };
 
     // A DIFFERENT error is new weather: the streak restarts at 1...
     assert_eq!(streak.observe("step error: 502 stream ended without done"), 1);

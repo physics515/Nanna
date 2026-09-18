@@ -5,7 +5,7 @@
 //! then keeps the highest-scoring sentences in original order until a target
 //! compression ratio is hit.
 //!
-//! Unlike true LLMLingua (per-token perplexity via a local causal LM), this is a
+//! Unlike true `LLMLingua` (per-token perplexity via a local causal LM), this is a
 //! sentence-level approach that works over the same chat API the rest of the
 //! agent uses — no separate GPU tokenizer stack required.
 //!
@@ -111,35 +111,7 @@ pub async fn compress_text_with_config(
         return elide_by_lines(content, config.ratio);
     }
 
-    let numbered: String = sentences
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{}: {}", i + 1, s.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "Rate each numbered sentence by information importance (1-10). \
-         1=filler/boilerplate, 10=critical information. \
-         Output ONLY numbers, one per line, in order.\n\n{numbered}"
-    );
-
-    let request = AnthropicRequest {
-        context_limit: None,
-        model: model.to_string(),
-        messages: vec![AnthropicMessage::user_text(prompt)],
-        max_tokens,
-        temperature: nanna_llm::sampling_temperature_for_model(model, 0.1),
-        system: Some(
-            "You are an information density scorer. Output ONLY one number (1-10) per line, nothing else."
-                .to_string(),
-        ),
-        tools: None,
-        stream: None,
-        thinking: None,
-        cache_control: None,
-    };
-
+    let request = scoring_request(model, &sentences, max_tokens);
     let response = match client.complete_anthropic(&request).await {
         Ok(r) => r,
         Err(e) => {
@@ -148,20 +120,7 @@ pub async fn compress_text_with_config(
         }
     };
 
-    let scores_text: String = response
-        .content
-        .iter()
-        .filter_map(|b| {
-            if let ContentBlock::Text { text } = b {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let scores = parse_scores(&scores_text);
+    let scores = parse_scores(&joined_text_blocks(&response.content));
     if scores.len() != sentences.len() {
         debug!(
             expected = sentences.len(),
@@ -174,23 +133,7 @@ pub async fn compress_text_with_config(
 
     let keep_count = target_count.max(2).min(sentences.len());
     let keep_indices = select_keep_indices(&scores, keep_count);
-    // Survivors keep the shape they arrived in. A "sentence" here can be a
-    // whole LINE (`split_sentences` treats `\n` as a terminator), and joining
-    // trimmed lines with spaces flattened a listing onto one line with its
-    // line-number prefixes still attached — under a banner calling it a
-    // summary. A line stays a line, indentation and all.
-    let mut compressed = String::new();
-    for &i in &keep_indices {
-        let sentence = sentences[i];
-        if sentence.ends_with('\n') {
-            compressed.push_str(sentence.trim_end());
-            compressed.push('\n');
-        } else {
-            compressed.push_str(sentence.trim());
-            compressed.push(' ');
-        }
-    }
-    let compressed = compressed.trim_end().to_string();
+    let compressed = join_survivors(&sentences, &keep_indices);
 
     let original_len = content.len();
     let compressed_len = compressed.len();
@@ -210,6 +153,78 @@ pub async fn compress_text_with_config(
     );
 
     Some(compressed)
+}
+
+/// The scoring round-trip: every sentence numbered, one score per line asked
+/// back, output capped at `max_tokens`.
+fn scoring_request(model: &str, sentences: &[&str], max_tokens: u32) -> AnthropicRequest {
+    let numbered: String = sentences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}: {}", i + 1, s.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "Rate each numbered sentence by information importance (1-10). \
+         1=filler/boilerplate, 10=critical information. \
+         Output ONLY numbers, one per line, in order.\n\n{numbered}"
+    );
+
+    AnthropicRequest {
+        context_limit: None,
+        model: model.to_string(),
+        messages: vec![AnthropicMessage::user_text(prompt)],
+        max_tokens,
+        temperature: nanna_llm::sampling_temperature_for_model(model, 0.1),
+        system: Some(
+            "You are an information density scorer. Output ONLY one number (1-10) per line, nothing else."
+                .to_string(),
+        ),
+        tools: None,
+        stream: None,
+        thinking: None,
+        cache_control: None,
+    }
+}
+
+/// The text blocks of a response, joined by newlines; non-text blocks are
+/// skipped.
+fn joined_text_blocks(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Join the kept sentences (by index, in the order given) into the compressed
+/// text.
+///
+/// Survivors keep the shape they arrived in. A "sentence" here can be a
+/// whole LINE (`split_sentences` treats `\n` as a terminator), and joining
+/// trimmed lines with spaces flattened a listing onto one line with its
+/// line-number prefixes still attached — under a banner calling it a
+/// summary. A line stays a line, indentation and all.
+fn join_survivors(sentences: &[&str], keep_indices: &[usize]) -> String {
+    let mut compressed = String::new();
+    for &i in keep_indices {
+        let sentence = sentences[i];
+        if sentence.ends_with('\n') {
+            compressed.push_str(sentence.trim_end());
+            compressed.push('\n');
+        } else {
+            compressed.push_str(sentence.trim());
+            compressed.push(' ');
+        }
+    }
+    compressed.trim_end().to_string()
 }
 
 /// Try each summarization model in priority order.
@@ -298,7 +313,7 @@ pub fn parse_scores(scores_text: &str) -> Vec<u8> {
                 score.trim()
             } else if let Some((_prefix, score)) = trimmed.split_once(')') {
                 score.trim()
-            } else if let Some((first, rest)) = trimmed.split_once(|c: char| c == '.' || c == '-') {
+            } else if let Some((first, rest)) = trimmed.split_once(['.', '-']) {
                 // Only treat as labeled if the left side is a pure index number
                 if first.trim().chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty() {
                     rest.trim()
@@ -312,7 +327,7 @@ pub fn parse_scores(scores_text: &str) -> Vec<u8> {
             let token: String = num_str
                 .chars()
                 .skip_while(|c| !c.is_ascii_digit())
-                .take_while(|c| c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
                 .collect();
             if token.is_empty() {
                 None
@@ -555,7 +570,7 @@ pub fn split_sentences(text: &str) -> Vec<&str> {
         if (c == '.' || c == '!' || c == '?' || c == '\n') && i > start + 10 {
             let next_char = text[i + c.len_utf8()..].chars().next();
             let is_sentence_end = match next_char {
-                Some(' ') | Some('\n') | None => true,
+                Some(' ' | '\n') | None => true,
                 _ => c == '\n',
             };
             if is_sentence_end {
@@ -726,9 +741,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn numbered_listing(lines: usize) -> String {
-        (1..=lines)
-            .map(|n| format!("{n}\tfn handler_{n}(req: Request) -> Response {{ todo!() }}\n"))
-            .collect()
+        use std::fmt::Write as _;
+        (1..=lines).fold(String::new(), |mut out, n| {
+            let _ = writeln!(out, "{n}\tfn handler_{n}(req: Request) -> Response {{ todo!() }}");
+            out
+        })
     }
 
     /// The scorer must return one number per sentence and its output is

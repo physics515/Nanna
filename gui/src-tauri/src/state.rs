@@ -5,8 +5,14 @@
 //! what a thin client needs — a config cache, the backend (daemon) handle, a
 //! workspace-registry cache, UI-model state, and its own log buffer.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::Backend;
+use nanna_config::Config;
+use nanna_core::log_buffer::LogBuffer;
+use nanna_core::WorkspaceRegistry;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// What happens when user closes the main window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -49,6 +55,19 @@ pub struct AppState {
     pub(crate) log_buffer: LogBuffer,
 }
 
+/// The daemon backend handle, cloned out of the shared state.
+///
+/// [`AppState::backend`] is set once when the state is built and never
+/// replaced, so the state lock guards nothing a daemon call needs. Commands
+/// take the handle and release the lock *before* the round-trip: a chat turn
+/// lasts as long as the daemon works on it, and a read lock held that long
+/// stalls every settings write — and, because tokio's `RwLock` queues new
+/// readers behind a waiting writer, every command after that write too,
+/// Stop included.
+pub(crate) async fn backend_handle(state: &RwLock<AppState>) -> Arc<Backend> {
+    Arc::clone(&state.read().await.backend)
+}
+
 /// Model status event for frontend
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelStatusEvent {
@@ -72,7 +91,7 @@ pub struct ChatMessage {
     /// raw JSON — the daemon owns the schema; the frontend renders it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline: Option<serde_json::Value>,
-    /// Run benchmark totals {input_tokens, output_tokens, duration_ms, model}.
+    /// Run benchmark totals {`input_tokens`, `output_tokens`, `duration_ms`, model}.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
 }

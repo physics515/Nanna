@@ -27,13 +27,13 @@ pub struct PersistedSession {
 
 impl From<PersistedSession> for Session {
     fn from(persisted: PersistedSession) -> Self {
-        Session {
+        Self {
             id: persisted.id,
             name: persisted.name,
             created_at: persisted.created_at,
             updated_at: persisted.updated_at,
             messages: persisted.messages,
-            subscribers: Default::default(),
+            subscribers: std::collections::HashSet::default(),
             owner: None,
             metadata: persisted.metadata,
             workspace_id: persisted.workspace_id,

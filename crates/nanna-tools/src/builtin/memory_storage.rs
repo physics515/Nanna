@@ -35,6 +35,7 @@ impl TursoMemoryStorage {
     }
 
     /// Enable semantic search with an embedding function
+    #[must_use]
     pub fn with_embeddings(mut self, embed_fn: EmbedFn, model: &str) -> Self {
         self.embed_fn = Some(embed_fn);
         self.embedding_model = model.to_string();
@@ -169,7 +170,10 @@ impl MemoryStorage for TursoMemoryStorage {
         let memories = self
             .storage
             .memories()
-            .list_all(limit as i64)
+            // Exact for every limit up to `i64::MAX`. A larger one (no real
+            // request) used to wrap to a negative LIMIT; it now saturates,
+            // which asks for every row.
+            .list_all(i64::try_from(limit).unwrap_or(i64::MAX))
             .await
             .map_err(|e| e.to_string())?;
 

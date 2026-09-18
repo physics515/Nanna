@@ -82,10 +82,6 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Build the four `browser.*` services, or an empty map with no browser.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "must match the concrete map the daemon builds, not a generic one"
-)]
 pub fn build_browser_services(data_dir: &std::path::Path) -> HashMap<String, ServiceFn> {
     let Some(executable) = find_browser_executable() else {
         info!(
@@ -155,10 +151,10 @@ fn required_url(params: &Value) -> Result<String, String> {
 fn passthrough(params: &Value, keys: &[&str]) -> HashMap<String, Value> {
     let mut out = HashMap::new();
     for key in keys {
-        if let Some(value) = params.get(*key) {
-            if !value.is_null() {
-                out.insert((*key).to_string(), value.clone());
-            }
+        if let Some(value) = params.get(*key)
+            && !value.is_null()
+        {
+            out.insert((*key).to_string(), value.clone());
         }
     }
     out

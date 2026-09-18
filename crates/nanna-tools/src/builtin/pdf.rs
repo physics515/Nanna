@@ -20,6 +20,7 @@ use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -240,13 +241,14 @@ impl ReadPdfTool {
             return Ok(());
         }
         let Some(ref ocr_fn) = self.ocr_fn else {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "
 
 *Note: {} page(s) had no extractable text. Configure an OCR \
                  pipeline to recover text from image-only pages.*",
                 empty_pages.len()
-            ));
+            );
             return Ok(());
         };
 
@@ -275,23 +277,25 @@ impl ReadPdfTool {
                 .to_string();
             match ocr_fn(encoded, prompt, media_type).await {
                 Ok(text) if !text.trim().is_empty() => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (OCR)
 {text}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (OCR failed)
 Error: {e}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
             }
         }
@@ -335,22 +339,24 @@ Error: {e}
             let encoded = base64_simd::STANDARD.encode_to_string(&image_data);
             match vision_fn(encoded, prompt.to_string(), media_type).await {
                 Ok(description) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {}
 {description}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
                 Err(e) => {
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Image {} (analysis failed)
 Error: {e}
 
 ",
                         index + 1
-                    ));
+                    );
                 }
             }
         }
@@ -407,7 +413,7 @@ impl Tool for ReadPdfTool {
 
         let extract_images = params
             .get("extract_images")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // `pages` is what the read_pdf skill has always sent; `max_pages` is
@@ -418,8 +424,8 @@ impl Tool for ReadPdfTool {
             Some(spec) => parse_page_selection(spec).map_err(ToolError::InvalidParams)?,
             None => params
                 .get("max_pages")
-                .and_then(|v| v.as_u64())
-                .map_or(PageSelection::All, |n| PageSelection::First(n as usize)),
+                .and_then(serde_json::Value::as_u64)
+                .map_or(PageSelection::All, |n| PageSelection::First(crate::u64_to_usize(n))),
         };
 
         let image_prompt = params
@@ -430,14 +436,13 @@ impl Tool for ReadPdfTool {
         // OCR fallback is on by default when an OCR function is configured
         let ocr_fallback = params
             .get("ocr_fallback")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
 
         let path = Path::new(path_str);
         if !path.exists() {
             return Err(ToolError::ExecutionFailed(format!(
-                "File not found: {}",
-                path_str
+                "File not found: {path_str}"
             )));
         }
 
@@ -457,14 +462,14 @@ impl Tool for ReadPdfTool {
         // Read PDF bytes
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {e}")))?;
 
         // ------------------------------------------------------------------
         // Tier 1: lopdf text extraction
         // ------------------------------------------------------------------
         let extracted = read_pdf_text(&bytes, selection)?;
         let (text, empty_pages) = (extracted.text, extracted.empty_pages);
-        let mut result = format!("# PDF Content: {}\n\n{}", path_str, text);
+        let mut result = format!("# PDF Content: {path_str}\n\n{text}");
 
         // Both optional stages live in their own methods: `execute` is the
         // one place a reader looks to see what a call does, and it should not
@@ -520,22 +525,24 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
     debug_assert!(pages_read <= page_count, "cannot read more than exists");
 
     let mut text = String::new();
-    text.push_str(&format!(
+    let _ = write!(
+        text,
         "*{page_count} pages total, reading {pages_read}*\n\n"
-    ));
+    );
 
     // A selection that matched nothing must say so. An empty body plus a
     // "0 pages read" header is otherwise indistinguishable from a document
     // whose pages were all blank.
     if pages_read == 0 && page_count > 0 {
-        text.push_str(&format!(
-            "*[No pages matched the requested selection; the document has {page_count} pages]*\n"
-        ));
+        let _ = writeln!(
+            text,
+            "*[No pages matched the requested selection; the document has {page_count} pages]*"
+        );
     }
 
     let mut empty_pages: Vec<u32> = Vec::new();
     for page_num in &selected {
-        text.push_str(&format!("--- Page {page_num} ---\n"));
+        let _ = writeln!(text, "--- Page {page_num} ---");
 
         match doc.extract_text(&[*page_num]) {
             Ok(page_text) => {
@@ -549,7 +556,7 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
                 }
             }
             Err(e) => {
-                text.push_str(&format!("*[Failed to extract: {e}]*\n"));
+                let _ = writeln!(text, "*[Failed to extract: {e}]*");
                 empty_pages.push(*page_num);
             }
         }
@@ -559,10 +566,11 @@ pub fn read_pdf_text(bytes: &[u8], selection: PageSelection) -> Result<PdfExtrac
     // Announce the cut in counts rather than as "N more pages": the latter
     // reads as the tail, which is wrong for a range that skipped the front.
     if pages_read < page_count {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "\n*... {} of {page_count} pages not shown (selection read {pages_read})*",
             page_count - pages_read
-        ));
+        );
     }
 
     Ok(PdfExtract {
@@ -613,8 +621,6 @@ pub async fn ocr_empty_pages(
     empty_page_count: usize,
     ocr_fn: Option<&OcrFn>,
 ) -> Result<PdfOcrOutcome, ToolError> {
-    use std::fmt::Write as _;
-
     if empty_page_count == 0 {
         return Ok(PdfOcrOutcome::NotNeeded);
     }
@@ -666,12 +672,12 @@ fn extract_pdf_images(
     use lopdf::{Document, Object};
 
     let doc = Document::load_mem(bytes)
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse PDF: {}", e)))?;
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse PDF: {e}")))?;
 
     let mut images = Vec::new();
 
     // Iterate through objects looking for images
-    for (_obj_id, object) in doc.objects.iter() {
+    for object in doc.objects.values() {
         if images.len() >= 20 {
             // Limit to 20 images
             break;
@@ -683,8 +689,7 @@ fn extract_pdf_images(
             // Check if this is an image
             let is_image = dict
                 .get(b"Subtype")
-                .map(|o| matches!(o, Object::Name(n) if n == b"Image"))
-                .unwrap_or(false);
+                .is_ok_and(|o| matches!(o, Object::Name(n) if n == b"Image"));
 
             if is_image {
                 // Try to get the image data
@@ -692,13 +697,12 @@ fn extract_pdf_images(
                     // Determine image type from filter
                     let media_type = dict
                         .get(b"Filter")
-                        .map(|f| match f {
+                        .map_or("image/png", |f| match f {
                             Object::Name(n) if n == b"DCTDecode" => "image/jpeg",
                             Object::Name(n) if n == b"FlateDecode" => "image/png",
                             Object::Name(n) if n == b"JPXDecode" => "image/jp2",
                             _ => "image/png",
-                        })
-                        .unwrap_or("image/png");
+                        });
 
                     images.push((data, media_type.to_string()));
                 }

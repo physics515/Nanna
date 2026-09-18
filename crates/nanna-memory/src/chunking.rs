@@ -69,10 +69,7 @@ impl ChunkParams {
 #[must_use]
 pub fn derive_chunk_params(window_tokens: Option<usize>) -> ChunkParams {
     ChunkParams {
-        max_chars: match window_tokens {
-            Some(w) => chunk_max_chars_for_window(w),
-            None => MEMORY_CHUNK_TARGET_CHARS,
-        },
+        max_chars: window_tokens.map_or(MEMORY_CHUNK_TARGET_CHARS, chunk_max_chars_for_window),
         version: CHUNKER_VERSION,
     }
 }
@@ -98,7 +95,7 @@ pub struct Chunk {
 ///
 /// Breaks prefer, in order: a paragraph end, a line end, a sentence end, any
 /// whitespace, and finally the window edge itself. A break is only taken in the
-/// back half of the window (see [`BREAK_SEARCH_FRACTION`]). Delimiters stay
+/// back half of the window (see `BREAK_SEARCH_FRACTION`). Delimiters stay
 /// with the chunk that precedes them — nothing is trimmed, because trimming is
 /// how a splitter silently loses text.
 #[must_use]
@@ -259,7 +256,7 @@ mod tests {
 
         let mut expected_start = 0i64;
         for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.ordinal, i as i64, "ordinals must be dense from zero");
+            assert_eq!(chunk.ordinal, i64::try_from(i).unwrap(), "ordinals must be dense from zero");
             assert_eq!(chunk.char_start, expected_start, "chunks must not have gaps");
             let slice: String = chars
                 [usize::try_from(chunk.char_start).unwrap()..usize::try_from(chunk.char_end).unwrap()]
@@ -326,7 +323,7 @@ mod tests {
 
     #[test]
     fn empty_content_produces_no_chunks() {
-        assert!(chunk_text("", &params(3200)).is_empty());
+        assert_eq!(chunk_text("", &params(3200)), Vec::<Chunk>::new());
     }
 
     /// The window is the *hard* bound and the target is the *soft* one; the

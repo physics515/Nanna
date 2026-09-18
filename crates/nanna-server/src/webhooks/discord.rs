@@ -310,7 +310,7 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    /// Sign `timestamp || body` with `key`, returning (pubkey_hex, signature_hex).
+    /// Sign `timestamp || body` with `key`, returning (`pubkey_hex`, `signature_hex`).
     fn sign(key: &SigningKey, timestamp: &str, body: &[u8]) -> (String, String) {
         let mut message = timestamp.as_bytes().to_vec();
         message.extend_from_slice(body);

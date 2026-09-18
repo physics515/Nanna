@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 
+use crate::lossy::LossyF32;
+
 /// How much corroboration may improve a hit's rank, as a fraction of the
 /// distance from its best score to a perfect 1.0.
 ///
@@ -53,9 +55,8 @@ impl ChunkHit {
     /// from corroboration alone, and never drops below `best`.
     #[must_use]
     pub fn rank(&self) -> f32 {
-        #[allow(clippy::cast_precision_loss)]
-        let saturating = 1.0 - 1.0 / (1.0 + self.corroborating as f32);
-        self.best + (1.0 - self.best) * CORROBORATION_HEADROOM * saturating
+        let saturating = 1.0 - 1.0 / (1.0 + self.corroborating.lossy_f32());
+        ((1.0 - self.best) * CORROBORATION_HEADROOM).mul_add(saturating, self.best)
     }
 }
 

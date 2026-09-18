@@ -31,6 +31,7 @@ You have persistent memory via `remember`, `recall`, `reflect`. Use them freely 
 "#;
 
 /// Prompt for when tools are available
+#[must_use]
 pub fn tools_available_prompt(tool_count: usize) -> String {
     format!(
         "{tool_count} tools at your disposal. Use them as extensions of will."
@@ -41,6 +42,7 @@ pub fn tools_available_prompt(tool_count: usize) -> String {
 pub const CONTINUE_PROMPT: &str = "The tools have spoken. Continue.";
 
 /// Error recovery prompt
+#[must_use]
 pub fn error_recovery_prompt(error: &str) -> String {
     format!(
         "An obstacle: {error}\n\nAdapt. Find another path, or acknowledge the limitation."

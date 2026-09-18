@@ -4,7 +4,7 @@
 //! Used as fallback when Boa cannot execute a script.
 
 use crate::{NannaBridge, Result, ScriptError, ScriptedTool};
-use deno_core::{extension, JsRuntime, ModuleSpecifier, RuntimeOptions, v8, scope};
+use deno_core::{extension, JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8, scope};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -36,6 +36,14 @@ pub async fn execute(
     }
 }
 
+// The whole point of this function is the non-`Send` V8 runtime: `JsRuntime`
+// holds an `Rc<ContextState>` and is driven across two awaits
+// (`run_event_loop`, `resolve`). `execute` above already pins it to a
+// current-thread runtime inside `spawn_blocking` for exactly that reason, so
+// there is no restructuring that makes the future `Send` without giving up the
+// engine.
+#[expect(clippy::future_not_send, reason = "JsRuntime is !Send by construction; \
+    `execute` drives this on a current-thread runtime inside spawn_blocking")]
 async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Result<Value> {
     // Transpile TypeScript if needed
     let js_source = if is_typescript {
@@ -44,17 +52,11 @@ async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Resu
         source.to_string()
     };
 
-    // Create runtime
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        extensions: vec![nanna_extension::init()],
-        ..Default::default()
-    });
-
     let input_json = serde_json::to_string(input)?;
 
     // Execute the script - returns JSON string
     let script = format!(
-        r#"
+        r"
         (function() {{
             globalThis.INPUT = {input_json};
             globalThis.console = {{
@@ -77,8 +79,14 @@ async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Resu
             
             throw new Error('No execute function found');
         }})()
-        "#
+        "
     );
+
+    // Create runtime
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        extensions: vec![nanna_extension::init()],
+        ..Default::default()
+    });
 
     let result = runtime
         .execute_script("<tool>", script)
@@ -86,7 +94,7 @@ async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Resu
 
     // Run event loop for any pending async work
     runtime
-        .run_event_loop(Default::default())
+        .run_event_loop(PollEventLoopOptions::default())
         .await
         .map_err(|e| ScriptError::Execution(format!("Event loop error: {e}")))?;
 
@@ -97,21 +105,29 @@ async fn execute_inner(source: &str, input: &Value, is_typescript: bool) -> Resu
         .map_err(|e| ScriptError::Execution(format!("Promise resolution error: {e}")))?;
 
     // Extract the JSON string using scope! macro
-    let json_str: String = {
+    let extracted = {
         scope!(scope, runtime);
         let local = v8::Local::new(scope, &resolved);
-        deno_core::serde_v8::from_v8(scope, local)
-            .map_err(|e| ScriptError::Execution(format!("Failed to deserialize: {e}")))?
+        deno_core::serde_v8::from_v8::<String>(scope, local)
     };
+    // The handle scope is gone with the block and the JSON is already a Rust
+    // `String`, so nothing V8 is left alive: release the isolate here instead
+    // of at the end of the function, in the same order the scope would have
+    // (`resolved` borrows `runtime`'s isolate, so it goes first). A failed
+    // deserialize took the whole isolate with it to the `?` below either way;
+    // now the successful path does not hold one across the JSON parse.
+    drop(resolved);
+    drop(runtime);
+
+    let json_str = extracted
+        .map_err(|e| ScriptError::Execution(format!("Failed to deserialize: {e}")))?;
 
     // Parse JSON to Value
-    let result_value: Value = serde_json::from_str(&json_str)
-        .map_err(|e| ScriptError::Execution(format!("Failed to parse JSON: {e}")))?;
-
-    Ok(result_value)
+    serde_json::from_str(&json_str)
+        .map_err(|e| ScriptError::Execution(format!("Failed to parse JSON: {e}")))
 }
 
-/// Transpile TypeScript to JavaScript using deno_ast
+/// Transpile TypeScript to JavaScript using `deno_ast`
 pub fn transpile_typescript(source: &str) -> Result<String> {
     use deno_ast::{EmitOptions, MediaType, ParseParams, TranspileModuleOptions, TranspileOptions};
 
@@ -134,7 +150,7 @@ pub fn transpile_typescript(source: &str) -> Result<String> {
         )
         .map_err(|e| ScriptError::Transpile(format!("Transpile error: {e}")))?;
 
-    Ok(transpiled.into_source().text.to_string())
+    Ok(transpiled.into_source().text)
 }
 
 // Minimal extension
@@ -146,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_transpile() {
-        let ts_source = r#"
+        let ts_source = r"
             function greet(name: string): string {
                 return `Hello, ${name}!`;
             }
@@ -154,7 +170,7 @@ mod tests {
             function execute(input: { name: string }) {
                 return greet(input.name);
             }
-        "#;
+        ";
 
         let js = transpile_typescript(ts_source).unwrap();
         assert!(!js.contains(": string"));

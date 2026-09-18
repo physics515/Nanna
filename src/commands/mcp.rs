@@ -87,3 +87,120 @@ pub async fn serve(
     info!("MCP client disconnected");
     Ok(())
 }
+
+/// Why `server`/`var` cannot name a stored MCP secret, if they cannot. Pure.
+fn secret_target_problem(server: &str, var: &str) -> Option<String> {
+    if server.trim().is_empty() {
+        return Some("the server name is empty".to_string());
+    }
+    if !nanna_config::mcp::is_env_var_name(var) {
+        return Some(format!(
+            "'{var}' is not an environment variable name (letters, digits and _, not starting with a digit)"
+        ));
+    }
+    None
+}
+
+/// A note when the stored secret is not wired to a configured server yet. Pure.
+fn secret_wiring_note(config: &Config, server: &str, var: &str) -> Option<String> {
+    let server = server.trim();
+    match config
+        .mcp
+        .servers
+        .iter()
+        .find(|entry| entry.name.trim() == server)
+    {
+        None => Some(format!(
+            "note: no [[mcp.servers]] entry is named '{server}' yet; add one with secret_env = [\"{var}\"]"
+        )),
+        Some(entry) if !entry.secret_env.iter().any(|name| name == var) => Some(format!(
+            "note: '{server}' does not list {var} in secret_env, so it will not receive it"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// `nanna mcp secret set <server> <VAR>`: read the value without echoing it
+/// (or from stdin when piped) and store it in the secure store.
+///
+/// # Errors
+///
+/// Returns an error for a bad name, an empty value, or a store failure.
+pub fn secret_set(config: &Config, server: &str, var: &str) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal};
+    if let Some(problem) = secret_target_problem(server, var) {
+        anyhow::bail!("{problem}");
+    }
+    let value = if std::io::stdin().is_terminal() {
+        dialoguer::Password::new()
+            .with_prompt(format!("{var} for MCP server '{}'", server.trim()))
+            .interact()?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    anyhow::ensure!(
+        !value.trim().is_empty(),
+        "the value is empty; nothing was stored"
+    );
+    nanna_config::credentials::SecureStore::new()
+        .set(&nanna_config::mcp_secret_key(server, var), &value)
+        .context("could not write the secure store")?;
+    eprintln!("Stored {var} for MCP server '{}'.", server.trim());
+    if let Some(note) = secret_wiring_note(config, server, var) {
+        eprintln!("{note}");
+    }
+    eprintln!("The daemon reads it when it starts the server (restart the daemon to apply).");
+    Ok(())
+}
+
+/// `nanna mcp secret delete <server> <VAR>`.
+///
+/// # Errors
+///
+/// Returns an error for a bad name or a store failure.
+pub fn secret_delete(server: &str, var: &str) -> anyhow::Result<()> {
+    if let Some(problem) = secret_target_problem(server, var) {
+        anyhow::bail!("{problem}");
+    }
+    nanna_config::credentials::SecureStore::new()
+        .delete(&nanna_config::mcp_secret_key(server, var))
+        .context("could not remove it from the secure store")?;
+    eprintln!("Removed {var} for MCP server '{}'.", server.trim());
+    Ok(())
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn secret_targets_are_checked_before_the_store_is_touched() {
+        assert_eq!(secret_target_problem("github", "GITHUB_TOKEN"), None);
+        assert!(secret_target_problem("  ", "GITHUB_TOKEN").is_some());
+        assert!(secret_target_problem("github", "GITHUB-TOKEN").is_some());
+    }
+
+    #[test]
+    fn a_secret_nobody_will_receive_is_pointed_out() {
+        let mut config = Config::default();
+        assert!(
+            secret_wiring_note(&config, "github", "GITHUB_TOKEN")
+                .is_some_and(|note| note.contains("no [[mcp.servers]] entry"))
+        );
+        config.mcp.servers.push(nanna_config::McpServerEntry {
+            name: "github".into(),
+            command: "npx".into(),
+            args: Vec::new(),
+            enabled: true,
+            secret_env: Vec::new(),
+        });
+        assert!(
+            secret_wiring_note(&config, " github ", "GITHUB_TOKEN")
+                .is_some_and(|note| note.contains("does not list GITHUB_TOKEN"))
+        );
+        config.mcp.servers[0].secret_env.push("GITHUB_TOKEN".into());
+        assert_eq!(secret_wiring_note(&config, "github", "GITHUB_TOKEN"), None);
+    }
+}

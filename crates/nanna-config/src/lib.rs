@@ -12,6 +12,9 @@ pub use infer::{
     PrecisionReason, ResolvedPrecision,
 };
 pub mod bind;
+/// MCP servers started at boot (`[mcp]`).
+pub mod mcp;
+pub use mcp::{MCP_SERVERS_MAX, McpConfig, McpServerEntry, mcp_secret_key};
 
 /// Canonical application identity for [`directories::ProjectDirs`].
 ///
@@ -32,7 +35,9 @@ pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
 }
 
-/// Legacy pre-unification identity (`bot/clawd/Nanna`). Kept solely so the first
+/// Legacy pre-unification identity (`bot/clawd/Nanna`).
+///
+/// Kept solely so the first
 /// boot after upgrade can migrate existing config and credential files into the
 /// canonical tree instead of stranding a user's data under the old vendor slug.
 #[must_use]
@@ -91,6 +96,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     /// Local (on-device) inference settings — the Mummu runner.
     pub infer: InferConfig,
+    /// MCP servers the daemon starts at boot.
+    pub mcp: McpConfig,
 }
 
 
@@ -165,21 +172,21 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
-    /// OpenAI API key for embeddings (semantic memory)
+    /// `OpenAI` API key for embeddings (semantic memory)
     pub openai_api_key: Option<String>,
-    /// OpenRouter API key for multi-provider access
+    /// `OpenRouter` API key for multi-provider access
     pub openrouter_api_key: Option<String>,
     /// GitHub token for GitHub Models
     pub github_token: Option<String>,
     /// Model priority list for fallback (first working model is used)
-    /// Format: ["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]
+    /// Format: `["claude-opus-5", "claude-sonnet-5", "ollama/llama3.2"]`
     pub model_priority: Vec<String>,
     /// Anthropic OAuth access token (alternative to API key)
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
     /// Model priority list for summarization (first working model is used)
-    /// Format: ["ollama/llama3.2", "ollama/mistral", "claude-haiku"]
+    /// Format: `["ollama/llama3.2", "ollama/mistral", "claude-haiku"]`
     /// If empty, truncates instead of summarizing
     pub summarization_priority: Vec<String>,
     /// Ollama server URL for summarization (if using ollama model)
@@ -187,9 +194,9 @@ pub struct LlmConfig {
     /// Ollama API key (optional — for remote/authenticated Ollama instances)
     pub ollama_api_key: Option<String>,
     /// Model routing priority for cost optimization.
-    /// Format: ["model:tier", ...] where tier is simple|medium|complex.
+    /// Format: `["model:tier", ...]` where tier is simple|medium|complex.
     /// Cheapest models first. Empty = disabled (always use primary model).
-    /// Example: ["claude-haiku-4-5:simple", "claude-opus-5:complex"]
+    /// Example: `["claude-haiku-4-5:simple", "claude-opus-5:complex"]`
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
@@ -201,7 +208,7 @@ pub struct LlmConfig {
     /// Model priority list for sub-agents spawned via the `task` tool: first
     /// working model wins, failures fall back to the next in the list.
     /// Empty = sub-agents use the main chat list (`model_priority`).
-    /// Format: ["ollama/qwen3:4b", "claude-haiku-3-5"]
+    /// Format: `["ollama/qwen3:4b", "claude-haiku-3-5"]`
     pub sub_agent_models: Vec<String>,
     /// Anthropic prompt-cache lifetime: `"5m"` (default) or `"1h"`. A 1-hour cache write
     /// costs 2x input instead of 1.25x and pays only when requests sharing a prompt start
@@ -230,11 +237,10 @@ impl LlmConfig {
         if !self.sub_agent_models.is_empty() {
             return self.sub_agent_models.clone();
         }
-        if let Some(ref legacy) = self.sub_agent_model {
-            if !legacy.is_empty() {
+        if let Some(ref legacy) = self.sub_agent_model
+            && !legacy.is_empty() {
                 return vec![legacy.clone()];
             }
-        }
         if !self.model_priority.is_empty() {
             return self.model_priority.clone();
         }
@@ -248,7 +254,7 @@ impl LlmConfig {
     ///
     /// Onboarding uses this to decide whether to prompt for a key. The old check
     /// looked only at `api_key` (the Anthropic slot), so a user who had entered an
-    /// OpenAI / OpenRouter / GitHub-Models key, or was using Anthropic OAuth, was
+    /// `OpenAI` / `OpenRouter` / GitHub-Models key, or was using Anthropic OAuth, was
     /// wrongly told they had no key. Ollama is intentionally excluded here: it is a
     /// keyless local backend, so "needs a key at all" is a separate question the
     /// onboarding tracks with `needsKey`.
@@ -337,11 +343,11 @@ pub struct AgentConfig {
     pub nudge_interval_iterations: usize,
 }
 
-fn default_nudge_after() -> usize {
+const fn default_nudge_after() -> usize {
     500
 }
 
-fn default_nudge_interval() -> usize {
+const fn default_nudge_interval() -> usize {
     100
 }
 
@@ -474,12 +480,12 @@ pub struct ToolsConfig {
     pub disabled: Vec<String>,
     pub exec_allowlist: Option<Vec<String>>,
     pub file_sandbox: Option<PathBuf>,
-    /// Brave Search API key for web_search tool
+    /// Brave Search API key for `web_search` tool
     pub brave_api_key: Option<String>,
     /// Use TypeScript skill implementations instead of Rust builtins
     pub use_script_tools: bool,
-    /// Directory containing tool scripts (default: {data_dir}/tools/)
-    /// Can be overridden with NANNA_TOOLS_DIR environment variable
+    /// Directory containing tool scripts (default: {`data_dir}/tools`/)
+    /// Can be overridden with `NANNA_TOOLS_DIR` environment variable
     pub tools_dir: Option<PathBuf>,
     /// Append one JSON line per tool call to `{data_dir}/logs/tool-audit.jsonl`.
     ///
@@ -545,7 +551,7 @@ pub struct SchedulerConfig {
     pub heartbeat_interval_secs: u64,
 }
 
-fn default_heartbeat_interval_secs() -> u64 {
+const fn default_heartbeat_interval_secs() -> u64 {
     1800
 }
 
@@ -574,7 +580,7 @@ pub struct MemoryConfig {
     /// Model to use for memory extraction (empty = use chat model)
     pub extraction_model: String,
     /// Embedding model priority list for fallback
-    /// Format: ["openai/text-embedding-3-small", "ollama/nomic-embed-text"]
+    /// Format: `["openai/text-embedding-3-small", "ollama/nomic-embed-text"]`
     pub embedding_priority: Vec<String>,
     /// Maximum fraction of memories that can be removed in a single consolidation run (0.0-1.0).
     /// Default: 0.50 (50%)
@@ -640,14 +646,14 @@ pub struct MemoryConfig {
     pub use_embedded_ocr: bool,
 }
 
-fn default_max_compression_ratio() -> f32 { 0.50 }
-fn default_min_remaining_memories() -> usize { 20 }
-fn default_dream_idle_threshold_secs() -> u64 { 300 }
+const fn default_max_compression_ratio() -> f32 { 0.50 }
+const fn default_min_remaining_memories() -> usize { 20 }
+const fn default_dream_idle_threshold_secs() -> u64 { 300 }
 
 /// Remembering conversation is the default: see the field docs.
 const fn default_auto_remember_messages() -> bool { true }
-fn default_dream_memory_pressure_count() -> usize { 5000 }
-fn default_use_embedded_ocr() -> bool { true }
+const fn default_dream_memory_pressure_count() -> usize { 5000 }
+const fn default_use_embedded_ocr() -> bool { true }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -760,6 +766,15 @@ impl Config {
     /// Persist any secret fields currently held in-memory into the OS keyring
     /// (or encrypted file fallback), then blank them on this Config. Call after
     /// onboarding / GUI key entry so `save()` never writes secrets to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SecureStore::set`](crate::credentials::SecureStore::set)
+    /// failure: the keyring entry cannot be opened, or the keyring write fails and
+    /// the encrypted file fallback fails too. Secrets are processed in a fixed
+    /// order and each field is blanked before its write, so on error the failing
+    /// secret and those already stored are gone from this `Config`; later ones
+    /// are left in place.
     pub fn migrate_secrets_to_keyring(&mut self) -> Result<(), crate::credentials::CredentialError> {
         use crate::credentials::{keys, SecureStore};
         let store = SecureStore::new();
@@ -793,26 +808,24 @@ impl Config {
         Ok(())
     }
 
-    /// Hydrate secret fields from SecureStore + environment if they are unset.
+    /// Hydrate secret fields from `SecureStore` + environment if they are unset.
     /// Safe to call repeatedly; never overwrites a value already present.
     pub fn load_secrets_from_store(&mut self) {
         use crate::credentials::{keys, SecureStore};
         let store = SecureStore::new();
         let fill = |slot: &mut Option<String>, key: &str, env: &str| {
-            if slot.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            if slot.as_ref().is_some_and(|s| !s.trim().is_empty()) {
                 return;
             }
-            if let Ok(v) = std::env::var(env) {
-                if !v.trim().is_empty() {
+            if let Ok(v) = std::env::var(env)
+                && !v.trim().is_empty() {
                     *slot = Some(v);
                     return;
                 }
-            }
-            if let Ok(v) = store.get(key) {
-                if !v.trim().is_empty() {
+            if let Ok(v) = store.get(key)
+                && !v.trim().is_empty() {
                     *slot = Some(v);
                 }
-            }
         };
         fill(&mut self.llm.api_key, keys::ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
         fill(&mut self.llm.openai_api_key, keys::OPENAI_API_KEY, "OPENAI_API_KEY");
@@ -893,7 +906,7 @@ impl Config {
     /// `[general] data_dir` when the user set one, otherwise the platform
     /// default. A blank or whitespace-only value counts as unset — a text input
     /// that submits `""` must not redirect the whole store to a path of `""`,
-    /// which is the same policy [`Self::config_path_override`] applies.
+    /// which is the same policy `Self::config_path_override` applies.
     ///
     /// This is the single place the override is honoured, so every consumer
     /// that already funnels through the daemon's `data_dir` picks it up at
@@ -1177,8 +1190,10 @@ mod tests {
 
     #[test]
     fn blank_or_whitespace_key_does_not_count() {
-        let mut llm = LlmConfig::default();
-        llm.openai_api_key = Some("   ".into());
+        let mut llm = LlmConfig {
+            openai_api_key: Some("   ".into()),
+            ..Default::default()
+        };
         assert!(
             !llm.has_configured_api_key(),
             "a whitespace-only key is not a real credential"
@@ -1196,9 +1211,11 @@ mod tests {
 
     #[test]
     fn sub_agent_models_win_when_set() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
-        llm.sub_agent_models = vec!["sub-a".into(), "sub-b".into()];
+        let llm = LlmConfig {
+            model_priority: vec!["chat-a".into(), "chat-b".into()],
+            sub_agent_models: vec!["sub-a".into(), "sub-b".into()],
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["sub-a".to_string(), "sub-b".to_string()]
@@ -1207,8 +1224,10 @@ mod tests {
 
     #[test]
     fn an_empty_sub_agent_list_falls_back_to_the_chat_list() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
+        let llm = LlmConfig {
+            model_priority: vec!["chat-a".into(), "chat-b".into()],
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["chat-a".to_string(), "chat-b".to_string()],
@@ -1218,9 +1237,11 @@ mod tests {
 
     #[test]
     fn the_legacy_single_model_still_works_and_is_outranked_by_the_list() {
-        let mut llm = LlmConfig::default();
-        llm.model_priority = vec!["chat-a".into()];
-        llm.sub_agent_model = Some("legacy-sub".into());
+        let mut llm = LlmConfig {
+            model_priority: vec!["chat-a".into()],
+            sub_agent_model: Some("legacy-sub".into()),
+            ..Default::default()
+        };
         assert_eq!(
             llm.effective_sub_agent_models(),
             vec!["legacy-sub".to_string()],
@@ -1240,13 +1261,15 @@ mod tests {
         let llm = LlmConfig::default();
         assert_eq!(
             llm.effective_sub_agent_models(),
-            vec![llm.model.clone()],
+            vec![llm.model],
             "with nothing configured, sub-agents still get the primary model"
         );
         // An empty-string legacy value must not become a bogus candidate.
-        let mut blank = LlmConfig::default();
-        blank.sub_agent_model = Some(String::new());
-        assert_eq!(blank.effective_sub_agent_models(), vec![blank.model.clone()]);
+        let blank = LlmConfig {
+            sub_agent_model: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(blank.effective_sub_agent_models(), vec![blank.model]);
     }
 
     #[test]

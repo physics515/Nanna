@@ -107,6 +107,18 @@ pub struct NewMemory {
     pub fsrs_generation: i64,
 }
 
+/// FSRS state of one memory, as `MemoryRepository::update_fsrs` writes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemoryFsrsUpdate {
+    pub stability: f32,
+    pub difficulty: f32,
+    pub last_access: i64,
+    pub access_count: i64,
+    pub importance: f32,
+    pub storage_strength: f32,
+    pub generation: i64,
+}
+
 /// New cron job input
 #[derive(Debug, Clone)]
 pub struct NewCronJob {
@@ -165,7 +177,7 @@ pub struct Task {
     pub parent_id: Option<i64>,
     /// `session` | `workspace` | `global`
     pub scope: String,
-    /// session_id or workspace_id depending on scope (None for global)
+    /// `session_id` or `workspace_id` depending on scope (None for global)
     pub scope_id: Option<String>,
     pub project: Option<String>,
     pub title: String,

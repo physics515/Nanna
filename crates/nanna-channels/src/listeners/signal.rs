@@ -12,6 +12,7 @@ use super::{Listener, ListenerError, ListenerHandle};
 use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use tracing::{debug, error, info, warn};
 /// Signal listener using signal-cli-rest-api
 /// 
 /// This uses the simpler HTTP REST API approach with SSE for receiving messages.
-/// See: https://github.com/bbernhard/signal-cli-rest-api
+/// See: <https://github.com/bbernhard/signal-cli-rest-api>
 pub struct SignalListener {
     client: Client,
     /// Base URL of the signal-cli-rest-api server
@@ -36,24 +37,21 @@ pub struct SignalListener {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ReceiveMode {
     /// Use Server-Sent Events (recommended)
+    #[default]
     Sse,
     /// Poll /v1/receive endpoint
     Poll,
 }
 
-impl Default for ReceiveMode {
-    fn default() -> Self {
-        Self::Sse
-    }
-}
 
 impl SignalListener {
     /// Create a new Signal listener
     /// 
     /// # Arguments
-    /// * `api_url` - Base URL of signal-cli-rest-api (e.g., "http://localhost:8080")
+    /// * `api_url` - Base URL of signal-cli-rest-api (e.g., "<http://localhost:8080>")
     /// * `phone_number` - Phone number of the registered account (e.g., "+1234567890")
     pub fn new(api_url: impl Into<String>, phone_number: impl Into<String>) -> Self {
         let client = Client::builder()
@@ -72,7 +70,7 @@ impl SignalListener {
 
     /// Set the receive mode
     #[must_use]
-    pub fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
+    pub const fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
         self.receive_mode = mode;
         self
     }
@@ -108,21 +106,21 @@ impl SignalListener {
         if !response.status().is_success() {
             let status = response.status();
             if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(ListenerError::Auth(format!("HTTP {}", status)));
+                return Err(ListenerError::Auth(format!("HTTP {status}")));
             }
             let text = response.text().await.unwrap_or_default();
-            return Err(ListenerError::Api(format!("HTTP {}: {}", status, text)));
+            return Err(ListenerError::Api(format!("HTTP {status}: {text}")));
         }
 
         let envelopes: Vec<SignalEnvelope> = response
             .json()
             .await
-            .map_err(|e| ListenerError::Api(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| ListenerError::Api(format!("Failed to parse response: {e}")))?;
 
         Ok(envelopes)
     }
 
-    /// Parse a SignalEnvelope into IncomingMessage
+    /// Parse a `SignalEnvelope` into `IncomingMessage`
     fn parse_envelope(&self, envelope: SignalEnvelope) -> Option<IncomingMessage> {
         // Skip messages without data
         let data_message = envelope.envelope.data_message?;
@@ -134,16 +132,15 @@ impl SignalListener {
         }
 
         let source = envelope.envelope.source_number
-            .or(envelope.envelope.source_uuid.clone())?;
+            .or_else(|| envelope.envelope.source_uuid.clone())?;
 
         let sender_name = envelope.envelope.source_name.clone();
         
         // Determine if this is a group message
-        let (_chat_id, group_name) = if let Some(ref group) = data_message.group_info {
-            (group.group_id.clone(), group.group_name.clone())
-        } else {
-            (source.clone(), None)
-        };
+        let (_chat_id, group_name) = data_message.group_info.as_ref().map_or_else(
+            || (source.clone(), None),
+            |group| (group.group_id.clone(), group.group_name.clone()),
+        );
 
         Some(IncomingMessage {
             id: envelope.envelope.timestamp.to_string(),
@@ -244,7 +241,7 @@ impl SignalListener {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let detail = format!("SSE connect failed: {}", e);
+                    let detail = format!("SSE connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -256,11 +253,11 @@ impl SignalListener {
             if !response.status().is_success() {
                 let status = response.status();
                 if status.as_u16() == 401 || status.as_u16() == 403 {
-                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                    if cb.record_auth_failure(&format!("HTTP {status}")).await == BreakerAction::Stop {
                         break;
                     }
                 } else {
-                    let detail = format!("SSE connection returned HTTP {}", status);
+                    let detail = format!("SSE connection returned HTTP {status}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -273,7 +270,6 @@ impl SignalListener {
             info!("Connected to Signal SSE stream");
 
             // Read SSE stream
-            use futures_util::StreamExt;
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
 
@@ -294,17 +290,15 @@ impl SignalListener {
                                     buffer = buffer[pos + 2..].to_string();
                                     
                                     // Parse SSE event
-                                    if let Some(data) = event.strip_prefix("data: ") {
-                                        if let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(data.trim()) {
-                                            if let Some(msg) = self.parse_envelope(envelope) {
+                                    if let Some(data) = event.strip_prefix("data: ")
+                                        && let Ok(envelope) = serde_json::from_str::<SignalEnvelope>(data.trim())
+                                            && let Some(msg) = self.parse_envelope(envelope) {
                                                 debug!(msg_id = %msg.id, "Received Signal message via SSE");
                                                 if sender.send(msg).await.is_err() {
                                                     error!("Failed to send message to router");
                                                     return;
                                                 }
                                             }
-                                        }
-                                    }
                                 }
                             }
                             Some(Err(e)) => {
@@ -332,7 +326,7 @@ impl SignalListener {
 
 #[async_trait]
 impl Listener for SignalListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "signal"
     }
 
@@ -355,7 +349,7 @@ impl Listener for SignalListener {
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| ListenerError::Connection(format!("Cannot reach signal-cli-rest-api: {}", e)))?;
+            .map_err(|e| ListenerError::Connection(format!("Cannot reach signal-cli-rest-api: {e}")))?;
 
         if !response.status().is_success() {
             return Err(ListenerError::Connection(format!(

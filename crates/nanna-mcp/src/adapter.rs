@@ -24,13 +24,64 @@ pub struct McpToolResult {
     pub structured: Option<serde_json::Value>,
 }
 
+/// Longest tool name every provider Nanna routes to accepts.
+///
+/// Anthropic and `OpenAI` both validate tool names against
+/// `^[a-zA-Z0-9_-]{1,64}$`; a name outside it rejects the WHOLE request, not
+/// just the tool, so one badly named MCP tool would break every turn.
+pub const WIRE_TOOL_NAME_CHARS_MAX: usize = 64;
+
+/// Characters kept from a truncated name when a hash suffix is appended.
+const WIRE_TOOL_NAME_STEM_CHARS: usize = WIRE_TOOL_NAME_CHARS_MAX - 1 - 8;
+
+/// The model-facing name of MCP tool `tool` on server `server`. Pure.
+///
+/// `mcp__{server}__{tool}`, the convention MCP clients have settled on, with
+/// every character outside `[A-Za-z0-9_-]` replaced by `_`. The previous
+/// `server:tool` form was invalid for every provider (`:` is not allowed).
+/// A name longer than 64 characters keeps its first 55 and gains `_` plus an
+/// 8-hex FNV-1a hash of the full unsanitized name, so two long tools that share
+/// a prefix still get distinct names, and the same tool always gets the same
+/// one.
+#[must_use]
+pub fn wire_tool_name(server: &str, tool: &str) -> String {
+    let joined = if server.is_empty() {
+        tool.to_string()
+    } else {
+        format!("mcp__{server}__{tool}")
+    };
+    let sanitized: String = joined
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    debug_assert!(
+        sanitized.is_ascii(),
+        "sanitized names are ASCII by construction"
+    );
+    if sanitized.len() <= WIRE_TOOL_NAME_CHARS_MAX {
+        return sanitized;
+    }
+    let hash = joined.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    let name = format!("{}_{hash:08x}", &sanitized[..WIRE_TOOL_NAME_STEM_CHARS]);
+    debug_assert_eq!(name.len(), WIRE_TOOL_NAME_CHARS_MAX);
+    name
+}
+
 // ============================================================================
 // nanna-tools Integration
 // ============================================================================
 
 #[cfg(feature = "tools-integration")]
 mod tools_impl {
-    use super::*;
+    use super::{debug, warn, wire_tool_name, Transport, Arc, McpClient, McpTool, HashMap, ToolContent, RwLock, McpError};
     use async_trait::async_trait;
     use nanna_tools::{ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolResult};
     use serde_json::Value;
@@ -56,14 +107,10 @@ mod tools_impl {
             }
         }
 
-        /// Get the full tool name (prefix:name)
+        /// The model-facing tool name — see [`wire_tool_name`].
         #[must_use]
         pub fn full_name(&self) -> String {
-            if self.prefix.is_empty() {
-                self.tool.name.clone()
-            } else {
-                format!("{}:{}", self.prefix, self.tool.name)
-            }
+            wire_tool_name(&self.prefix, &self.tool.name)
         }
     }
 
@@ -312,7 +359,7 @@ mod tools_impl {
             Ok(wrappers)
         }
 
-        /// Register all tools with a ToolRegistry
+        /// Register all tools with a `ToolRegistry`
         ///
         /// # Errors
         ///
@@ -327,6 +374,7 @@ mod tools_impl {
             for wrapper in wrappers.iter() {
                 registry.register_boxed(wrapper.clone()).await;
             }
+            drop(wrappers);
 
             Ok(count)
         }
@@ -359,8 +407,11 @@ mod tools_impl {
                 }
             }
 
-            let mut tool_wrappers = self.tool_wrappers.write().await;
-            *tool_wrappers = new_wrappers;
+            *self.tool_wrappers.write().await = new_wrappers;
+            // `clients` is held until the refreshed wrappers are published, as it
+            // always was: a concurrent `connect` waits for its client insert, so
+            // the tools it appends land after this replacement, not under it.
+            drop(clients);
 
             Ok(())
         }
@@ -375,6 +426,7 @@ mod tools_impl {
             for client in clients.values() {
                 client.close().await?;
             }
+            drop(clients);
             Ok(())
         }
     }
@@ -494,7 +546,7 @@ pub struct McpToolAdapter<T: Transport + 'static> {
 
 impl<T: Transport + 'static> McpToolAdapter<T> {
     /// Create a new adapter for an MCP tool
-    pub fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
+    pub const fn new(client: Arc<McpClient<T>>, tool: McpTool) -> Self {
         Self { client, tool }
     }
 
@@ -512,7 +564,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
 
     /// Get the input schema
     #[must_use]
-    pub fn input_schema(&self) -> &serde_json::Value {
+    pub const fn input_schema(&self) -> &serde_json::Value {
         &self.tool.input_schema
     }
 
@@ -603,7 +655,6 @@ impl<T: Transport + 'static> McpManager<T> {
     }
 
     /// Get all available tools
-    #[must_use]
     pub fn tools(&self) -> impl Iterator<Item = (&str, &McpToolAdapter<T>)> {
         self.tools.iter().map(|(k, v)| (k.as_str(), v))
     }
@@ -687,7 +738,7 @@ pub fn to_anthropic_format(tool: &McpTool) -> serde_json::Value {
     })
 }
 
-/// Convert an MCP tool to OpenAI tool format
+/// Convert an MCP tool to `OpenAI` tool format
 #[must_use]
 pub fn to_openai_format(tool: &McpTool) -> serde_json::Value {
     serde_json::json!({
@@ -703,6 +754,54 @@ pub fn to_openai_format(tool: &McpTool) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_provider_valid(name: &str) -> bool {
+        (1..=WIRE_TOOL_NAME_CHARS_MAX).contains(&name.len())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn wire_names_are_valid_for_every_provider() {
+        assert_eq!(
+            wire_tool_name("files", "read_file"),
+            "mcp__files__read_file"
+        );
+        assert_eq!(wire_tool_name("", "read_file"), "read_file");
+        assert_eq!(
+            wire_tool_name("my.server", "get:thing/x"),
+            "mcp__my_server__get_thing_x"
+        );
+        // One `_` per non-ASCII character, not per byte.
+        assert_eq!(wire_tool_name("ünï", "t"), "mcp___n___t");
+        for (server, tool) in [("a b", "c d"), ("x", &"y".repeat(200)), ("日本", "ツール")] {
+            let name = wire_tool_name(server, tool);
+            assert!(is_provider_valid(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn long_names_stay_distinct_and_stable() {
+        let stem = "t".repeat(80);
+        let a = wire_tool_name("srv", &format!("{stem}_alpha"));
+        let b = wire_tool_name("srv", &format!("{stem}_beta"));
+        assert_eq!(a.len(), WIRE_TOOL_NAME_CHARS_MAX);
+        assert_ne!(
+            a, b,
+            "a shared prefix must not collapse two tools into one name"
+        );
+        assert_eq!(a, wire_tool_name("srv", &format!("{stem}_alpha")));
+        let exactly = "t".repeat(WIRE_TOOL_NAME_CHARS_MAX - "mcp__s__".len());
+        assert_eq!(
+            wire_tool_name("s", &exactly).len(),
+            WIRE_TOOL_NAME_CHARS_MAX
+        );
+        assert!(
+            wire_tool_name("s", &exactly).ends_with('t'),
+            "at the limit nothing is hashed"
+        );
+    }
 
     #[test]
     fn test_tool_format_conversion() {

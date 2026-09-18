@@ -1,8 +1,8 @@
 export default {
   name: "cancel_reminder",
   requires: ["schedule.cancel"],
-  version: "0.1.0",
-  description: "Cancel an active reminder by its ID.",
+  version: "0.2.0",
+  description: "Cancel a pending reminder by its ID (list_reminders shows the IDs).",
   parameters: {
     type: "object",
     properties: {
@@ -16,9 +16,13 @@ export default {
       if (result && result.cancelled) {
         return "Cancelled reminder: " + input.id;
       }
-      return "Reminder not found: " + input.id;
+      return {
+        content: "cancel_reminder: no pending reminder has id " + input.id + ", so nothing was cancelled. list_reminders shows the ids that exist.",
+        success: false
+      };
     } catch (e) {
-      return "Error: Schedule service not available. " + e;
+      var msg = "" + (e && e.message ? e.message : e);
+      return { content: "cancel_reminder: " + msg, success: false };
     }
   }
 }

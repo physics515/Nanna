@@ -1,6 +1,6 @@
 //! Scheduler handlers for the [`ControlPlane`].
 
-use super::*;
+use super::{json, info, ControlPlane, RwLock, SchedulerAction, Value, Scheduler};
 
 impl ControlPlane {
     // =========================================================================
@@ -14,91 +14,25 @@ impl ControlPlane {
         
         match action {
             SchedulerAction::List => {
-                let scheduler = scheduler.read().await;
-                let tasks = scheduler.list_tasks().await;
-                let jobs: Vec<_> = tasks.into_iter()
-                    .map(|t| {
-                        let (schedule, next_run) = match &t.task_type {
-                            nanna_core::TaskType::Heartbeat => ("heartbeat".to_string(), None),
-                            nanna_core::TaskType::Cron { schedule, next_run, .. } => {
-                                (schedule.clone(), next_run.map(|dt| dt.to_rfc3339()))
-                            }
-                            nanna_core::TaskType::Recurring { interval } => {
-                                (format!("every_{}s", interval.as_secs()), None)
-                            }
-                            nanna_core::TaskType::Delayed { delay, .. } => {
-                                (format!("delay_{}s", delay.as_secs()), None)
-                            }
-                        };
-                        json!({
-                            "id": t.id,
-                            "name": t.name,
-                            "schedule": schedule,
-                            "payload": t.payload,
-                            "enabled": t.enabled,
-                            "last_run": t.last_run.map(|dt| dt.to_rfc3339()),
-                            "next_run": next_run,
-                            "run_count": t.run_count,
-                            "timezone": t.timezone,
-                            "target_channel": t.target_channel,
-                            "target_session": t.target_session,
-                        })
-                    })
-                    .collect();
+                let tasks = scheduler.read().await.list_tasks().await;
+                let jobs: Vec<_> = tasks.iter().map(Self::scheduler_job_json).collect();
                 json!({ "jobs": jobs })
             }
             SchedulerAction::Get { id } => {
-                let scheduler = scheduler.read().await;
-                if let Some(task) = scheduler.get_task(&id).await {
-                    let (schedule, next_run) = match &task.task_type {
-                        nanna_core::TaskType::Heartbeat => ("heartbeat".to_string(), None),
-                        nanna_core::TaskType::Cron { schedule, next_run, .. } => {
-                            (schedule.clone(), next_run.map(|dt| dt.to_rfc3339()))
-                        }
-                        nanna_core::TaskType::Recurring { interval } => {
-                            (format!("every_{}s", interval.as_secs()), None)
-                        }
-                        nanna_core::TaskType::Delayed { delay, .. } => {
-                            (format!("delay_{}s", delay.as_secs()), None)
-                        }
-                    };
-                    json!({
-                        "job": {
-                            "id": task.id,
-                            "name": task.name,
-                            "schedule": schedule,
-                            "payload": task.payload,
-                            "enabled": task.enabled,
-                            "last_run": task.last_run.map(|dt| dt.to_rfc3339()),
-                            "next_run": next_run,
-                            "run_count": task.run_count,
-                            "timezone": task.timezone,
-                            "target_channel": task.target_channel,
-                            "target_session": task.target_session,
-                        }
-                    })
-                } else {
-                    json!({ "error": "not_found", "id": id })
-                }
+                let task = scheduler.read().await.get_task(&id).await;
+                task.as_ref().map_or_else(
+                    || json!({ "error": "not_found", "id": id }),
+                    |task| json!({ "job": Self::scheduler_job_json(task) }),
+                )
             }
-            SchedulerAction::Add { schedule, task, name } => {
-                // Try to parse as cron expression
-                match Scheduler::cron_task(
-                    name.as_deref().unwrap_or("unnamed"),
-                    &schedule,
-                    &task,
-                ) {
-                    Ok(scheduled_task) => {
-                        let id = scheduled_task.id.clone();
-                        let scheduler = scheduler.read().await;
-                        scheduler.add_task(scheduled_task).await;
-                        info!("Added scheduled job: {}", id);
-                        json!({ "status": "created", "id": id })
-                    }
-                    Err(e) => {
-                        json!({ "error": "invalid_schedule", "message": e.to_string() })
-                    }
-                }
+            SchedulerAction::Add {
+                schedule,
+                task,
+                name,
+                session_id,
+            } => {
+                self.scheduler_add(scheduler, schedule, task, name, session_id)
+                    .await
             }
             SchedulerAction::Update { id, schedule, task: _, enabled } => {
                 let scheduler = scheduler.read().await;
@@ -116,6 +50,9 @@ impl ControlPlane {
                 if let Some(en) = enabled {
                     scheduler.set_task_enabled(&id, en).await;
                 }
+                // Held across both updates above, so no writer lands between
+                // them; the reply needs no lock.
+                drop(scheduler);
                 
                 // Note: task/payload update would require more logic
                 json!({ "status": "updated", "id": id })
@@ -145,8 +82,7 @@ impl ControlPlane {
                 }
             }
             SchedulerAction::History { id, limit } => {
-                let scheduler = scheduler.read().await;
-                let runs = scheduler.get_history(&id, limit.unwrap_or(10)).await;
+                let runs = scheduler.read().await.get_history(&id, limit.unwrap_or(10)).await;
                 let history: Vec<_> = runs.into_iter()
                     .map(|r| json!({
                         "run_id": r.id,
@@ -161,5 +97,58 @@ impl ControlPlane {
                 json!({ "history": history, "job_id": id })
             }
         }
+    }
+
+    /// `SchedulerAction::Add`: parse `schedule` as cron and store the job.
+    async fn scheduler_add(
+        &self,
+        scheduler: &RwLock<Scheduler>,
+        schedule: String,
+        task: String,
+        name: Option<String>,
+        session_id: Option<String>,
+    ) -> Value {
+        // A result posted into a conversation that does not exist would
+        // be dropped on every run; refuse it now instead.
+        if let Some(ref id) = session_id
+            && !self.sessions.exists(id).await
+        {
+            return json!({
+                "error": "session_not_found",
+                "message": format!("Session {id} not found; the job was not added"),
+            });
+        }
+        // Try to parse as cron expression
+        match Scheduler::cron_task(name.as_deref().unwrap_or("unnamed"), &schedule, &task) {
+            Ok(mut scheduled_task) => {
+                scheduled_task.target_session = session_id;
+                let id = scheduled_task.id.clone();
+                scheduler.read().await.add_task(scheduled_task).await;
+                info!("Added scheduled job: {}", id);
+                json!({ "status": "created", "id": id })
+            }
+            Err(e) => {
+                json!({ "error": "invalid_schedule", "message": e.to_string() })
+            }
+        }
+    }
+
+    /// One scheduled job as the `list` and `get` replies render it.
+    fn scheduler_job_json(task: &nanna_core::ScheduledTask) -> Value {
+        let schedule = task.task_type.schedule_label();
+        let next_run = task.task_type.next_run().map(|dt| dt.to_rfc3339());
+        json!({
+            "id": task.id,
+            "name": task.name,
+            "schedule": schedule,
+            "payload": task.payload,
+            "enabled": task.enabled,
+            "last_run": task.last_run.map(|dt| dt.to_rfc3339()),
+            "next_run": next_run,
+            "run_count": task.run_count,
+            "timezone": task.timezone,
+            "target_channel": task.target_channel,
+            "target_session": task.target_session,
+        })
     }
 }

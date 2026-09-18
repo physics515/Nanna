@@ -4,7 +4,7 @@
 //! - Telegram webhook (`/webhook/telegram`)
 //! - Discord interactions (`/webhook/discord`)
 //! - Slack events (`/webhook/slack`)
-//! - WhatsApp webhook (`/webhook/whatsapp`)
+//! - `WhatsApp` webhook (`/webhook/whatsapp`)
 //! - Generic webhooks (`/webhook/:id`)
 
 use axum::{
@@ -96,10 +96,12 @@ const MAX_TIMESTAMP_HEADER_LEN: usize = 20;
 fn signed_timestamp_is_fresh(timestamp: &str) -> bool {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    debug_assert!(
-        MAX_SIGNED_TIMESTAMP_AGE_SECS > 0,
-        "a zero window would reject every request, including legitimate ones"
-    );
+    const {
+        assert!(
+            MAX_SIGNED_TIMESTAMP_AGE_SECS > 0,
+            "a zero window would reject every request, including legitimate ones"
+        );
+    }
     debug_assert!(
         MAX_TIMESTAMP_HEADER_LEN >= u64::MAX.to_string().len(),
         "the header bound must still admit every representable u64 second"
@@ -143,7 +145,7 @@ fn refuse_unconfigured(channel: &str, config_key: &str) -> StatusCode {
 /// Verify a Meta/WhatsApp `X-Hub-Signature-256` header against the raw body.
 ///
 /// Meta signs each webhook POST with `sha256=<hex>` where the digest is
-/// HMAC-SHA256(app_secret, raw_body). Without this check the `/webhook/whatsapp`
+/// HMAC-SHA256(app_secret, `raw_body`). Without this check the `/webhook/whatsapp`
 /// POST endpoint accepts **any** payload from anyone who learns the URL. The body
 /// is HMAC'd as raw bytes; comparison is constant-time via `Mac::verify_slice`.
 fn verify_meta_signature(app_secret: &str, signature_header: Option<&str>, body: &[u8]) -> bool {
@@ -221,13 +223,13 @@ pub struct WebhookConfig {
     pub discord_public_key: Option<String>,
     /// Slack signing secret
     pub slack_signing_secret: Option<String>,
-    /// WhatsApp verify token (GET subscription handshake)
+    /// `WhatsApp` verify token (GET subscription handshake)
     pub whatsapp_verify_token: Option<String>,
     /// WhatsApp/Meta app secret — HMAC-SHA256 key for the `X-Hub-Signature-256`
     /// on inbound POST payloads. `None` skips verification (matches the other
     /// providers when unconfigured).
     pub whatsapp_app_secret: Option<String>,
-    /// Generic webhook secrets (webhook_id -> secret)
+    /// Generic webhook secrets (`webhook_id` -> secret)
     pub generic_secrets: HashMap<String, String>,
 }
 
@@ -263,7 +265,8 @@ pub struct WebhookState {
 }
 
 impl WebhookState {
-    pub fn new(config: WebhookConfig, event_tx: mpsc::Sender<WebhookEvent>) -> Self {
+    #[must_use]
+    pub const fn new(config: WebhookConfig, event_tx: mpsc::Sender<WebhookEvent>) -> Self {
         Self { config, event_tx }
     }
 }
@@ -380,7 +383,7 @@ async fn telegram_webhook(
             sender_name: Some(format!(
                 "{}{}",
                 sender.first_name,
-                sender.last_name.map(|l| format!(" {}", l)).unwrap_or_default()
+                sender.last_name.map(|l| format!(" {l}")).unwrap_or_default()
             )),
             chat_id: msg.chat.id.to_string(),
             content: text,
@@ -568,12 +571,12 @@ async fn discord_webhook(
     
     let webhook_message = user.and_then(|u| {
         let content = interaction.data.as_ref().and_then(|d| {
-            d.name.clone().or(d.custom_id.clone())
+            d.name.clone().or_else(|| d.custom_id.clone())
         })?;
         
         Some(WebhookMessage {
             sender_id: u.id.clone(),
-            sender_name: Some(u.username.clone()),
+            sender_name: Some(u.username),
             chat_id: interaction.channel_id.clone().unwrap_or_default(),
             content,
             message_id: None,
@@ -651,8 +654,7 @@ fn verify_slack_signature(
     };
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     if now_secs.abs_diff(ts) > 300 {
         return false;
     }
@@ -717,11 +719,11 @@ async fn slack_webhook(
     };
     
     // Handle URL verification challenge
-    if event_wrapper.event_type == "url_verification" {
-        if let Some(challenge) = event_wrapper.challenge {
-            info!("Slack webhook: responding to URL verification");
-            return (StatusCode::OK, challenge).into_response();
-        }
+    if event_wrapper.event_type == "url_verification"
+        && let Some(challenge) = event_wrapper.challenge
+    {
+        info!("Slack webhook: responding to URL verification");
+        return (StatusCode::OK, challenge).into_response();
     }
     
     debug!("Slack webhook: received event type {}", event_wrapper.event_type);
@@ -762,29 +764,28 @@ async fn slack_webhook(
 // WhatsApp Webhook
 // =============================================================================
 
-/// WhatsApp webhook verification (GET request)
+/// `WhatsApp` webhook verification (GET request)
 async fn whatsapp_verify(
     State(state): State<Arc<WebhookState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let mode = params.get("hub.mode").map(|s| s.as_str());
-    let token = params.get("hub.verify_token").map(|s| s.as_str());
+    let mode = params.get("hub.mode").map(std::string::String::as_str);
+    let token = params.get("hub.verify_token").map(std::string::String::as_str);
     let challenge = params.get("hub.challenge");
     
-    if mode == Some("subscribe") {
-        if let Some(ref verify_token) = state.config.whatsapp_verify_token {
-            if webhook_secret_matches(verify_token, token) {
-                info!("WhatsApp webhook: verification successful");
-                return (StatusCode::OK, challenge.cloned().unwrap_or_default()).into_response();
-            }
-        }
+    if mode == Some("subscribe")
+        && let Some(ref verify_token) = state.config.whatsapp_verify_token
+        && webhook_secret_matches(verify_token, token)
+    {
+        info!("WhatsApp webhook: verification successful");
+        return (StatusCode::OK, challenge.cloned().unwrap_or_default()).into_response();
     }
     
     warn!("WhatsApp webhook: verification failed");
     (StatusCode::FORBIDDEN, "Verification failed").into_response()
 }
 
-/// WhatsApp webhook message structure
+/// `WhatsApp` webhook message structure
 #[derive(Debug, Deserialize)]
 struct WhatsAppWebhook {
     entry: Vec<WhatsAppEntry>,
@@ -841,7 +842,7 @@ struct WhatsAppText {
     body: String,
 }
 
-/// Handle WhatsApp webhook
+/// Handle `WhatsApp` webhook
 async fn whatsapp_webhook(
     State(state): State<Arc<WebhookState>>,
     headers: HeaderMap,
@@ -1037,7 +1038,7 @@ fn extract_generic_message(payload: &Value, webhook_id: &str) -> Option<WebhookM
                 .map(String::from),
             chat_id: payload
                 .get("channel")
-                .or(payload.get("chat_id"))
+                .or_else(|| payload.get("chat_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(webhook_id)
                 .to_string(),
@@ -1094,6 +1095,7 @@ pub struct WebhookServer {
 
 impl WebhookServer {
     /// Create a new webhook server
+    #[must_use]
     pub fn new(config: WebhookConfig) -> (Self, mpsc::Receiver<WebhookEvent>) {
         let (event_tx, event_rx) = mpsc::channel(100);
         (Self { config, event_tx }, event_rx)
@@ -1130,6 +1132,12 @@ impl WebhookServer {
     }
     
     /// Run the webhook server
+    ///
+    /// # Errors
+    ///
+    /// Returns an `InvalidInput` error when `host:port` is not a socket
+    /// address, the error from binding the listener, or the error that ends
+    /// serving.
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let addr: SocketAddr = format!("{}:{}", self.config.host, self.config.port)
             .parse()
@@ -1155,9 +1163,10 @@ impl WebhookServer {
     }
     
     /// Spawn the webhook server as a background task
+    #[must_use]
     pub fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<WebhookEvent>) {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let server = WebhookServer {
+        let server = Self {
             config: self.config,
             event_tx,
         };

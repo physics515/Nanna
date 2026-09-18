@@ -86,8 +86,7 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), String> {
         // Create daemon using builder (loads config from file)
         let mut daemon = crate::server::DaemonBuilder::from_nanna_config()
             .unwrap_or_else(|_| crate::server::DaemonBuilder::new())
-            .build()
-            .await;
+            .build();
         let daemon_shutdown = daemon.shutdown_handle();
 
         // Spawn the daemon

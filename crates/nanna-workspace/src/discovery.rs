@@ -95,16 +95,14 @@ fn walk_stop_points() -> Vec<PathBuf> {
 
 /// Resolve the user's home directory without adding a hard dependency on `dirs`.
 fn dirs_home() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty() {
             return Some(PathBuf::from(h));
         }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.is_empty() {
+    if let Ok(h) = std::env::var("USERPROFILE")
+        && !h.is_empty() {
             return Some(PathBuf::from(h));
         }
-    }
     None
 }
 
@@ -136,7 +134,7 @@ pub fn find_workspace_root(start: &Path) -> Option<(PathBuf, WorkspaceMarker)> {
                     marker,
                     current.display()
                 );
-                return Some((current.clone(), marker));
+                return Some((current, marker));
             }
         }
 
@@ -158,6 +156,14 @@ pub fn find_workspace_root(start: &Path) -> Option<(PathBuf, WorkspaceMarker)> {
 }
 
 /// Discover workspace from current directory or explicit path
+///
+/// # Errors
+///
+/// Returns [`WorkspaceError::Io`] when the current directory cannot be read
+/// (needed for a relative `explicit_path`, or when no path is given), and
+/// [`WorkspaceError::NotFound`] when `explicit_path` does not exist or, with no
+/// explicit path, when no workspace marker is found from the current directory
+/// upward. An existing explicit path is accepted even without a marker.
 pub fn discover_workspace(explicit_path: Option<&Path>) -> Result<PathBuf, WorkspaceError> {
     if let Some(path) = explicit_path {
         let abs_path = if path.is_absolute() {
@@ -186,7 +192,7 @@ pub fn discover_workspace(explicit_path: Option<&Path>) -> Result<PathBuf, Works
         let cwd = std::env::current_dir()?;
         find_workspace_root(&cwd)
             .map(|(path, _)| path)
-            .ok_or_else(|| WorkspaceError::NotFound(cwd))
+            .ok_or(WorkspaceError::NotFound(cwd))
     }
 }
 

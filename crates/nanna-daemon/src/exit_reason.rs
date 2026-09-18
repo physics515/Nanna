@@ -7,10 +7,10 @@
 //! published a 0/42 score for a daemon that was dead for 96% of the window.
 //!
 //! Mechanism (a classic dirty bit):
-//! - On startup, AFTER the PID file is acquired (so a losing duplicate can
-//!   never clobber the live daemon's record), the daemon reads whatever the
-//!   previous process left, logs it, and overwrites the file with a
-//!   `state: running` marker.
+//! - On startup, AFTER the PID file and the IPC port are claimed (so a
+//!   losing duplicate can never clobber the live daemon's record), the daemon
+//!   reads whatever the previous process left, logs it, and overwrites the
+//!   file with a `state: running` marker.
 //! - Every deliberate exit path (clean shutdown drain, panic hook, signal /
 //!   ctrl handler, IPC-server hard exit) overwrites the marker with
 //!   `state: exited` plus a reason. Last writer wins.
@@ -20,8 +20,8 @@
 //!
 //! The writer is disarmed until the startup marker lands: `record_exit` and
 //! the panic hook are no-ops in a process that never owned the file, so a
-//! second instance that fails the PID race (or is Ctrl-C'd while losing it)
-//! cannot overwrite the live daemon's record.
+//! second instance that fails the PID or port claim (or is Ctrl-C'd while
+//! losing it) cannot overwrite the live daemon's record.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +74,7 @@ pub enum PreviousExit {
 impl PreviousExit {
     /// True when the previous process died without recording a terminal
     /// reason — the log-just-ends case this file exists to catch.
+    #[must_use]
     pub fn is_unclean(&self) -> bool {
         match self {
             Self::Absent => false,
@@ -83,6 +84,7 @@ impl PreviousExit {
     }
 
     /// One line for the startup log describing the previous exit.
+    #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Self::Absent => "no previous exit record (first boot or record deleted)".to_string(),
@@ -122,6 +124,7 @@ pub struct ExitReasonFile {
 }
 
 impl ExitReasonFile {
+    #[must_use]
     pub fn new(data_dir: &Path) -> Self {
         Self {
             path: data_dir.join(EXIT_REASON_FILE),
@@ -129,12 +132,14 @@ impl ExitReasonFile {
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Read whatever the previous process left. Never errors: absence and
     /// corruption are verdicts, not failures.
+    #[must_use]
     pub fn read_previous(&self) -> PreviousExit {
         match std::fs::read_to_string(&self.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreviousExit::Absent,
@@ -147,9 +152,9 @@ impl ExitReasonFile {
     }
 
     /// Write the `running` startup marker and arm the terminal writers.
-    /// Call exactly once, after the PID file is acquired.
+    /// Call exactly once, after the PID file and the IPC port are claimed.
     pub fn mark_running(&self) {
-        self.write(ExitReasonRecord {
+        self.write(&ExitReasonRecord {
             state: ExitState::Running,
             pid: std::process::id(),
             reason: None,
@@ -166,7 +171,7 @@ impl ExitReasonFile {
         if !self.armed.load(Ordering::Acquire) {
             return;
         }
-        self.write(ExitReasonRecord {
+        self.write(&ExitReasonRecord {
             state: ExitState::Exited,
             pid: std::process::id(),
             reason: Some(reason.to_string()),
@@ -181,10 +186,9 @@ impl ExitReasonFile {
     /// beside an old record — never a half-written destination. If the temp
     /// path itself is unwritable, fall back to a direct write: a torn record
     /// reads as Corrupt, which the reader already treats as unclean.
-    fn write(&self, record: ExitReasonRecord) {
-        let json = match serde_json::to_string_pretty(&record) {
-            Ok(j) => j,
-            Err(_) => return,
+    fn write(&self, record: &ExitReasonRecord) {
+        let Ok(json) = serde_json::to_string_pretty(record) else {
+            return;
         };
         let tmp = self.path.with_extension("json.tmp");
         if std::fs::write(&tmp, &json).is_ok() {

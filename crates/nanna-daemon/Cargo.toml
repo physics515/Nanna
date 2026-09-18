@@ -81,6 +81,10 @@ tempfile = "3"
 # service is proven against a parsed document rather than a fixture blob.
 # Same version nanna-tools already resolves, so it adds no graph entry.
 lopdf = "0.45"
+# Test-only: paused time, so the channel typing keepalive's 4 s refresh and
+# 60 s abandonment are tested without a minute of wall clock. nanna-llm already
+# enables it, so it adds no graph entry.
+tokio = { workspace = true, features = ["test-util"] }
 
 # Platform services
 [target.'cfg(windows)'.dependencies]

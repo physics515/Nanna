@@ -18,8 +18,8 @@ pub enum OutputTargetField {
 impl From<&OutputTargetField> for OutputTarget {
     fn from(field: &OutputTargetField) -> Self {
         match field {
-            OutputTargetField::Memory => OutputTarget::Memory,
-            OutputTargetField::Context => OutputTarget::Context,
+            OutputTargetField::Memory => Self::Memory,
+            OutputTargetField::Context => Self::Context,
         }
     }
 }
@@ -58,7 +58,7 @@ pub struct SkillManifest {
     pub output: OutputTargetField,
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     30
 }
 
@@ -82,9 +82,14 @@ pub enum ExecutionMethod {
 
 impl SkillManifest {
     /// Load manifest from a tool.yaml file
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Io`] if the file cannot be read, and
+    /// [`ToolError::InvalidParams`] if its YAML is not a valid manifest.
     pub fn from_file(path: &Path) -> Result<Self, ToolError> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::Io(e))?;
+            .map_err(ToolError::Io)?;
         
         let manifest: Self = serde_yaml::from_str(&content)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid manifest: {e}")))?;
@@ -93,21 +98,22 @@ impl SkillManifest {
     }
     
     /// Get the script/binary path, resolved relative to the manifest directory
+    #[must_use]
     pub fn resolve_executable(&self, manifest_dir: &Path) -> PathBuf {
         match &self.execution {
-            ExecutionMethod::Python(p) => manifest_dir.join(p),
-            ExecutionMethod::Shell(p) => manifest_dir.join(p),
-            ExecutionMethod::Binary(p) => manifest_dir.join(p),
+            ExecutionMethod::Python(p) | ExecutionMethod::Shell(p) | ExecutionMethod::Binary(p) => {
+                manifest_dir.join(p)
+            }
             ExecutionMethod::Command(_) => manifest_dir.to_path_buf(),
         }
     }
     
     /// Get the working directory, resolved relative to the manifest directory
+    #[must_use]
     pub fn resolve_workdir(&self, manifest_dir: &Path) -> PathBuf {
-        match &self.workdir {
-            Some(wd) => manifest_dir.join(wd),
-            None => manifest_dir.to_path_buf(),
-        }
+        self.workdir
+            .as_ref()
+            .map_or_else(|| manifest_dir.to_path_buf(), |wd| manifest_dir.join(wd))
     }
 }
 
@@ -117,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_parse_python_manifest() {
-        let yaml = r#"
+        let yaml = r"
 name: pdf_rotate
 description: Rotate PDF pages by specified degrees
 parameters:
@@ -132,7 +138,7 @@ parameters:
   required: [file, degrees]
 python: tool.py
 timeout: 60
-"#;
+";
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(manifest.name, "pdf_rotate");
         assert_eq!(manifest.timeout, 60);
@@ -141,11 +147,11 @@ timeout: 60
 
     #[test]
     fn test_parse_command_manifest() {
-        let yaml = r#"
+        let yaml = r"
 name: image_resize
 description: Resize an image
 command: magick convert {{input}} -resize {{size}} {{output}}
-"#;
+";
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(manifest.name, "image_resize");
         assert!(matches!(manifest.execution, ExecutionMethod::Command(_)));
@@ -153,23 +159,23 @@ command: magick convert {{input}} -resize {{size}} {{output}}
 
     #[test]
     fn test_parse_shell_manifest() {
-        let yaml = r#"
+        let yaml = r"
 name: quick_hash
 description: Hash a file
 shell: hash.sh
-"#;
+";
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(manifest.execution, ExecutionMethod::Shell(_)));
     }
 
     #[test]
     fn test_parse_output_context() {
-        let yaml = r#"
+        let yaml = r"
 name: my_lookup
 description: Look something up
 output: context
 shell: lookup.sh
-"#;
+";
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(manifest.output, OutputTargetField::Context));
         assert_eq!(OutputTarget::from(&manifest.output), OutputTarget::Context);
@@ -177,11 +183,11 @@ shell: lookup.sh
 
     #[test]
     fn test_parse_output_defaults_to_memory() {
-        let yaml = r#"
+        let yaml = r"
 name: runner
 description: Run a thing
 shell: run.sh
-"#;
+";
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(manifest.output, OutputTargetField::Memory));
         assert_eq!(OutputTarget::from(&manifest.output), OutputTarget::Memory);

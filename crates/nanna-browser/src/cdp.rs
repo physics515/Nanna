@@ -1,4 +1,4 @@
-//! CDP (Chrome DevTools Protocol) backend via chromiumoxide
+//! CDP (Chrome `DevTools` Protocol) backend via chromiumoxide
 
 use crate::{Browser, BrowserConfig, BrowserError, BrowserPage, BrowserType, ImageFormat, ScreenshotOptions};
 use async_trait::async_trait;
@@ -15,6 +15,15 @@ use tracing::{debug, info};
 pub struct CdpBrowser {
     config: BrowserConfig,
     browser: RwLock<Option<CoBrowser>>,
+    /// The launched browser's own profile directory, removed when it closes.
+    ///
+    /// Chromium refuses to start on a profile another Chromium holds ("Failed
+    /// to create `SingletonLock` ... Aborting now to avoid profile corruption"),
+    /// and chromiumoxide's default profile is one fixed path
+    /// (`/tmp/chromiumoxide-runner`) shared by every process using the crate.
+    /// So a second daemon — or a test running beside one — could not launch a
+    /// browser at all.
+    profile: RwLock<Option<tempfile::TempDir>>,
 }
 
 impl CdpBrowser {
@@ -24,6 +33,7 @@ impl CdpBrowser {
         Self {
             config,
             browser: RwLock::new(None),
+            profile: RwLock::new(None),
         }
     }
 
@@ -56,6 +66,14 @@ impl Browser for CdpBrowser {
 
         let mut builder = CoConfig::builder();
 
+        // A profile of this browser's own: see `profile` for what sharing one
+        // costs. Kept until `close`, which deletes it.
+        let profile = tempfile::Builder::new()
+            .prefix("nanna-chromium-")
+            .tempdir()
+            .map_err(|e| BrowserError::LaunchFailed(format!("profile directory: {e}")))?;
+        builder = builder.user_data_dir(profile.path());
+
         if !self.config.headless {
             builder = builder.with_head();
         }
@@ -84,7 +102,7 @@ impl Browser for CdpBrowser {
 
         let co_config = builder
             .build()
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+            .map_err(BrowserError::LaunchFailed)?;
 
         let (browser, mut handler) = CoBrowser::launch(co_config)
             .await
@@ -97,7 +115,9 @@ impl Browser for CdpBrowser {
             }
         });
 
+        *self.profile.write().await = Some(profile);
         *browser_guard = Some(browser);
+        drop(browser_guard);
         info!("CDP browser launched successfully");
         Ok(())
     }
@@ -112,6 +132,7 @@ impl Browser for CdpBrowser {
             .new_page("about:blank")
             .await
             .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
+        drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
     }
@@ -130,13 +151,24 @@ impl Browser for CdpBrowser {
         page.wait_for_navigation()
             .await
             .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
+        // Held until navigation settles, as it always was: a concurrent
+        // `close()` (which takes the write side) waits for the page to load
+        // instead of tearing the browser down underneath it.
+        drop(browser_guard);
 
         Ok(Arc::new(CdpPage::new(page, self.config.timeout_ms)))
     }
 
     async fn close(&self) -> Result<(), BrowserError> {
         let mut browser_guard = self.browser.write().await;
-        if browser_guard.take().is_some() {
+        // The taken browser is dropped inside this statement, so it is still
+        // torn down under the write lock, before any `launch()` can proceed.
+        let was_open = browser_guard.take().is_some();
+        drop(browser_guard);
+        // Dropping the handle deletes the profile directory; the browser that
+        // held it is already gone.
+        self.profile.write().await.take();
+        if was_open {
             info!("CDP browser closed");
         }
         Ok(())
@@ -214,7 +246,7 @@ where
 
 #[async_trait]
 impl BrowserPage for CdpPage {
-    fn url(&self) -> &str {
+    fn url(&self) -> &'static str {
         ""
     }
 
@@ -288,7 +320,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .click()
@@ -306,7 +338,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .type_str(text)
@@ -329,7 +361,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             // Focus and clear
             element.focus().await.ok();
@@ -361,7 +393,7 @@ impl BrowserPage for CdpPage {
                 .page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
 
             element
                 .press_key(key)
@@ -381,7 +413,7 @@ impl BrowserPage for CdpPage {
             self.page
                 .find_element(selector)
                 .await
-                .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
+                .map_err(|e| BrowserError::ElementNotFound(format!("{selector}: {e}")))?;
             Ok(())
         })
         .await
@@ -401,10 +433,10 @@ impl BrowserPage for CdpPage {
 
     async fn get_attribute(&self, selector: &str, attribute: &str) -> Result<Option<String>, BrowserError> {
         let script = format!(
-            r#"(() => {{
+            r"(() => {{
                 const el = document.querySelector('{}');
                 return el ? el.getAttribute('{}') : null;
-            }})()"#,
+            }})()",
             selector.replace('\'', "\\'"),
             attribute.replace('\'', "\\'")
         );
@@ -439,7 +471,7 @@ impl BrowserPage for CdpPage {
 
     async fn query_all_text(&self, selector: &str) -> Result<Vec<String>, BrowserError> {
         let script = format!(
-            r#"Array.from(document.querySelectorAll('{}')).map(el => el.textContent || '')"#,
+            r"Array.from(document.querySelectorAll('{}')).map(el => el.textContent || '')",
             selector.replace('\'', "\\'")
         );
 

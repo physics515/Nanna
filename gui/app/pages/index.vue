@@ -53,6 +53,7 @@
              confidently name a model this chat is not using. Fallback state
              and the rate-limited count are process-wide facts that hold for
              a pinned chat too, so the badge keeps reporting them. -->
+        <FileHistoryButton v-if="currentSession" :session-id="currentSession.id" />
         <SessionModelPicker v-if="currentSession" :session-id="currentSession.id" />
         <ModelStatusBadge :model-name-superseded="!!chatModel" class="shrink-0" />
       </NuiChatHeader>
@@ -261,6 +262,8 @@ import { useSessionState, type TimelineEntry } from '~/composables/useSessionSta
 import { useBackend } from '~/composables/useBackend'
 import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
 import { parseEditDiff } from '~/lib/editDiff'
+import { parseSessionMessageAdded, shouldAppendSessionMessage } from '~/lib/sessionMessageAdded'
+import { shouldReloadForClear } from '~/lib/sessionCleared'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {
@@ -491,6 +494,8 @@ let unlistenDaemonError: UnlistenFn | null = null
 let unlistenContextUsage: UnlistenFn | null = null
 let unlistenLivenessBeat: UnlistenFn | null = null
 let unlistenConfigChanged: UnlistenFn | null = null
+let unlistenSessionMessageAdded: UnlistenFn | null = null
+let unlistenSessionCleared: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -931,6 +936,30 @@ onMounted(async () => {
     }
   })
 
+  // A message the daemon appended with no streamed turn around it — a
+  // reminder coming due. It is already persisted, so a chat opened later reads
+  // it from history; this only makes the open chat show it now.
+  unlistenSessionMessageAdded = await listen('session-message-added', (event) => {
+    const added = parseSessionMessageAdded(event.payload)
+    if (!added) return
+    const shownIds = messages.value.map(m => m.id)
+    if (!shouldAppendSessionMessage(added, currentSession.value?.id, shownIds)) return
+    messages.value.push({
+      id: added.message_id,
+      role: added.role,
+      content: added.content,
+      timestamp: new Date().toISOString(),
+    })
+    scrollToBottom(true)
+  })
+
+  // The open conversation was emptied elsewhere (a chat app's /new, another
+  // client's session.clear): re-read it so the view matches what the next turn sees.
+  unlistenSessionCleared = await listen('session-cleared', (event) => {
+    if (!shouldReloadForClear(event.payload, currentSession.value?.id)) return
+    void loadSession()
+  })
+
   // Load initial session (listeners are already active to capture any events)
   await loadSession()
 })
@@ -961,6 +990,8 @@ onUnmounted(() => {
   if (unlistenContextUsage) unlistenContextUsage()
   if (unlistenLivenessBeat) unlistenLivenessBeat()
   if (unlistenConfigChanged) unlistenConfigChanged()
+  if (unlistenSessionMessageAdded) unlistenSessionMessageAdded()
+  if (unlistenSessionCleared) unlistenSessionCleared()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null

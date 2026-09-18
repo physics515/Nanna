@@ -8,12 +8,12 @@ use super::{Listener, ListenerError, ListenerHandle};
 use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{
     connect_async,
@@ -47,7 +47,7 @@ pub struct DiscordListener {
 impl DiscordListener {
     /// Create a new Discord Gateway listener
     ///
-    /// Default intents: GUILDS, GUILD_MESSAGES, MESSAGE_CONTENT, DIRECT_MESSAGES
+    /// Default intents: GUILDS, `GUILD_MESSAGES`, `MESSAGE_CONTENT`, `DIRECT_MESSAGES`
     pub fn new(bot_token: impl Into<String>) -> Self {
         Self {
             bot_token: bot_token.into(),
@@ -64,7 +64,7 @@ impl DiscordListener {
 
     /// Set custom intents
     #[must_use]
-    pub fn with_intents(mut self, intents: u64) -> Self {
+    pub const fn with_intents(mut self, intents: u64) -> Self {
         self.intents = intents;
         self
     }
@@ -111,11 +111,11 @@ impl DiscordListener {
         })
     }
 
-    /// Convert Discord message to IncomingMessage
-    fn convert_message(&self, data: &Value, self_id: &Option<String>) -> Option<IncomingMessage> {
+    /// Convert Discord message to `IncomingMessage`
+    fn convert_message(&self, data: &Value, self_id: Option<&str>) -> Option<IncomingMessage> {
         // Skip messages from self
         let author_id = data.get("author")?.get("id")?.as_str()?;
-        if self_id.as_deref() == Some(author_id) {
+        if self_id == Some(author_id) {
             return None;
         }
 
@@ -127,14 +127,12 @@ impl DiscordListener {
         let guild_id = data.get("guild_id").and_then(|v| v.as_str());
         
         // Check if guild is allowed
-        if !self.allowed_guilds.is_empty() {
-            if let Some(gid) = guild_id {
-                if !self.allowed_guilds.iter().any(|g| g == gid) {
+        if !self.allowed_guilds.is_empty()
+            && let Some(gid) = guild_id
+                && !self.allowed_guilds.iter().any(|g| g == gid) {
                     debug!("Ignoring message from non-allowed guild {}", gid);
                     return None;
                 }
-            }
-        }
 
         let channel_id = data.get("channel_id")?.as_str()?;
         let message_id = data.get("id")?.as_str()?;
@@ -151,15 +149,17 @@ impl DiscordListener {
 
         // Build timestamp from snowflake (Discord epoch: 2015-01-01)
         let snowflake: u64 = message_id.parse().ok()?;
-        let timestamp = ((snowflake >> 22) + 1420070400000) as i64 / 1000;
+        // `snowflake >> 22` is below 2^42, so the sum stays far below `i64::MAX`
+        // and the sign reinterpretation never wraps.
+        let timestamp = ((snowflake >> 22) + 1_420_070_400_000).cast_signed() / 1000;
 
         let referenced = data.get("referenced_message")
             .and_then(|r| r.get("id"))
             .and_then(|v| v.as_str())
-            .map(|id| format!("{}:{}", channel_id, id));
+            .map(|id| format!("{channel_id}:{id}"));
 
         Some(IncomingMessage {
-            id: format!("{}:{}", channel_id, message_id),
+            id: format!("{channel_id}:{message_id}"),
             channel: ChannelId::new("discord", channel_id.to_string()),
             sender: Sender {
                 id: author_id.to_string(),
@@ -207,7 +207,7 @@ impl DiscordListener {
             let (ws_stream, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = match connect_async(&url).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    let detail = format!("WebSocket connect failed: {}", e);
+                    let detail = format!("WebSocket connect failed: {e}");
                     if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
                         break;
                     }
@@ -217,9 +217,6 @@ impl DiscordListener {
             };
 
             let (mut write, mut read) = ws_stream.split();
-
-            // Heartbeat interval (set by Hello) - tracked for debugging
-            let mut _heartbeat_interval: Option<Duration> = None;
 
             info!("Discord Gateway connected");
 
@@ -266,118 +263,16 @@ impl DiscordListener {
                             self.sequence.store(seq, Ordering::SeqCst);
                         }
 
-                        match payload.op {
-                            // Dispatch (event)
-                            0 => {
-                                let event_name = payload.t.as_deref().unwrap_or("");
-                                
-                                match event_name {
-                                    "READY" => {
-                                        if let Some(d) = &payload.d {
-                                            // Store session info for resume
-                                            if let Some(sid) = d.get("session_id").and_then(|v| v.as_str()) {
-                                                *self.session_id.write().await = Some(sid.to_string());
-                                            }
-                                            if let Some(url) = d.get("resume_gateway_url").and_then(|v| v.as_str()) {
-                                                *self.resume_url.write().await = Some(url.to_string());
-                                            }
-                                            if let Some(user) = d.get("user") {
-                                                if let Some(id) = user.get("id").and_then(|v| v.as_str()) {
-                                                    *self.self_id.write().await = Some(id.to_string());
-                                                }
-                                            }
-                                            cb.record_success().await;
-                                            info!("Discord Gateway READY");
-                                        }
-                                    }
-                                    "RESUMED" => {
-                                        cb.record_success().await;
-                                        info!("Discord Gateway RESUMED");
-                                    }
-                                    "MESSAGE_CREATE" => {
-                                        if let Some(d) = &payload.d {
-                                            let self_id = self.self_id.read().await.clone();
-                                            if let Some(message) = self.convert_message(d, &self_id) {
-                                                debug!("Discord message: {:?}", message.id);
-                                                if sender.send(message).await.is_err() {
-                                                    error!("Failed to send message to router");
-                                                    break 'connection;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        debug!("Discord event: {}", event_name);
-                                    }
-                                }
-                            }
-                            // Heartbeat (server requesting)
-                            1 => {
-                                let seq = self.sequence.load(Ordering::SeqCst);
-                                let hb = json!({ "op": 1, "d": seq });
-                                if write.send(WsMessage::Text(hb.to_string().into())).await.is_err() {
-                                    warn!("Failed to send heartbeat");
-                                    break 'connection;
-                                }
-                            }
-                            // Reconnect
-                            7 => {
-                                info!("Discord Gateway requested reconnect");
-                                should_resume = true;
-                                break 'connection;
-                            }
-                            // Invalid session
-                            9 => {
-                                let resumable = payload.d.as_ref()
-                                    .and_then(|d| d.as_bool())
-                                    .unwrap_or(false);
-                                warn!("Discord Gateway invalid session (resumable: {})", resumable);
-                                should_resume = resumable;
-                                if !resumable {
-                                    *self.session_id.write().await = None;
-                                    if cb.record_auth_failure("invalid session (non-resumable)").await == BreakerAction::Stop {
-                                        return;
-                                    }
-                                }
-                                break 'connection;
-                            }
-                            // Hello
-                            10 => {
-                                if let Some(d) = &payload.d {
-                                    if let Some(interval) = d.get("heartbeat_interval").and_then(|v| v.as_u64()) {
-                                        _heartbeat_interval = Some(Duration::from_millis(interval));
-                                        debug!("Heartbeat interval: {}ms", interval);
-                                    }
-                                }
-
-                                // Send identify or resume
-                                let session = self.session_id.read().await.clone();
-                                let identify = if should_resume && session.is_some() {
-                                    let seq = self.sequence.load(Ordering::SeqCst);
-                                    self.resume_payload(session.as_ref().unwrap(), seq)
-                                } else {
-                                    self.identify_payload()
-                                };
-
-                                if write.send(WsMessage::Text(identify.to_string().into())).await.is_err() {
-                                    warn!("Failed to send identify/resume");
-                                    break 'connection;
-                                }
-
-                                should_resume = false;
-
-                                // Start heartbeat task
-                                // Note: heartbeat sending is handled inline when we receive op:1
-                                // In a full implementation, we'd spawn a task that sends heartbeats on interval
-                                // and coordinate with the main loop. For now, we rely on Discord's heartbeat requests.
-                            }
-                            // Heartbeat ACK
-                            11 => {
-                                debug!("Heartbeat ACK");
-                            }
-                            _ => {
-                                debug!("Unknown opcode: {}", payload.op);
-                            }
+                        let mut conn = GatewayConnection {
+                            write: &mut write,
+                            sender: &sender,
+                            cb: &mut cb,
+                            should_resume: &mut should_resume,
+                        };
+                        match self.handle_payload(&payload, &mut conn).await {
+                            PayloadFlow::Continue => {}
+                            PayloadFlow::Reconnect => break 'connection,
+                            PayloadFlow::Stop => return,
                         }
                     }
                 }
@@ -389,11 +284,169 @@ impl DiscordListener {
 
         info!("Discord Gateway listener stopped");
     }
+
+    /// Act on one decoded gateway payload (its sequence number is already stored).
+    async fn handle_payload(
+        &self,
+        payload: &GatewayPayload,
+        conn: &mut GatewayConnection<'_>,
+    ) -> PayloadFlow {
+        match payload.op {
+            // Dispatch (event)
+            0 => self.handle_dispatch(payload, conn).await,
+            // Heartbeat (server requesting)
+            1 => {
+                let seq = self.sequence.load(Ordering::SeqCst);
+                let hb = json!({ "op": 1, "d": seq });
+                if conn.write.send(WsMessage::Text(hb.to_string().into())).await.is_err() {
+                    warn!("Failed to send heartbeat");
+                    return PayloadFlow::Reconnect;
+                }
+                PayloadFlow::Continue
+            }
+            // Reconnect
+            7 => {
+                info!("Discord Gateway requested reconnect");
+                *conn.should_resume = true;
+                PayloadFlow::Reconnect
+            }
+            // Invalid session
+            9 => {
+                let resumable = payload.d.as_ref()
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                warn!("Discord Gateway invalid session (resumable: {})", resumable);
+                *conn.should_resume = resumable;
+                if !resumable {
+                    *self.session_id.write().await = None;
+                    if conn.cb.record_auth_failure("invalid session (non-resumable)").await == BreakerAction::Stop {
+                        return PayloadFlow::Stop;
+                    }
+                }
+                PayloadFlow::Reconnect
+            }
+            // Hello
+            10 => self.handle_hello(payload, conn).await,
+            // Heartbeat ACK
+            11 => {
+                debug!("Heartbeat ACK");
+                PayloadFlow::Continue
+            }
+            _ => {
+                debug!("Unknown opcode: {}", payload.op);
+                PayloadFlow::Continue
+            }
+        }
+    }
+
+    /// Handle an op 0 dispatch event (`READY`, `RESUMED`, `MESSAGE_CREATE`, ...).
+    async fn handle_dispatch(
+        &self,
+        payload: &GatewayPayload,
+        conn: &mut GatewayConnection<'_>,
+    ) -> PayloadFlow {
+        let event_name = payload.t.as_deref().unwrap_or("");
+
+        match event_name {
+            "READY" => {
+                if let Some(d) = &payload.d {
+                    // Store session info for resume
+                    if let Some(sid) = d.get("session_id").and_then(|v| v.as_str()) {
+                        *self.session_id.write().await = Some(sid.to_string());
+                    }
+                    if let Some(url) = d.get("resume_gateway_url").and_then(|v| v.as_str()) {
+                        *self.resume_url.write().await = Some(url.to_string());
+                    }
+                    if let Some(user) = d.get("user")
+                        && let Some(id) = user.get("id").and_then(|v| v.as_str()) {
+                            *self.self_id.write().await = Some(id.to_string());
+                        }
+                    conn.cb.record_success().await;
+                    info!("Discord Gateway READY");
+                }
+            }
+            "RESUMED" => {
+                conn.cb.record_success().await;
+                info!("Discord Gateway RESUMED");
+            }
+            "MESSAGE_CREATE" => {
+                if let Some(d) = &payload.d {
+                    let self_id = self.self_id.read().await.clone();
+                    if let Some(message) = self.convert_message(d, self_id.as_deref()) {
+                        debug!("Discord message: {:?}", message.id);
+                        if conn.sender.send(message).await.is_err() {
+                            error!("Failed to send message to router");
+                            return PayloadFlow::Reconnect;
+                        }
+                    }
+                }
+            }
+            _ => {
+                debug!("Discord event: {}", event_name);
+            }
+        }
+        PayloadFlow::Continue
+    }
+
+    /// Handle op 10 Hello: log the heartbeat interval, then identify or resume.
+    async fn handle_hello(
+        &self,
+        payload: &GatewayPayload,
+        conn: &mut GatewayConnection<'_>,
+    ) -> PayloadFlow {
+        if let Some(d) = &payload.d
+            && let Some(interval) = d.get("heartbeat_interval").and_then(serde_json::Value::as_u64) {
+                debug!("Heartbeat interval: {}ms", interval);
+            }
+
+        // Send identify or resume
+        let session = self.session_id.read().await.clone();
+        let identify = if *conn.should_resume && let Some(session) = session.as_deref() {
+            let seq = self.sequence.load(Ordering::SeqCst);
+            self.resume_payload(session, seq)
+        } else {
+            self.identify_payload()
+        };
+
+        if conn.write.send(WsMessage::Text(identify.to_string().into())).await.is_err() {
+            warn!("Failed to send identify/resume");
+            return PayloadFlow::Reconnect;
+        }
+
+        *conn.should_resume = false;
+
+        // Start heartbeat task
+        // Note: heartbeat sending is handled inline when we receive op:1
+        // In a full implementation, we'd spawn a task that sends heartbeats on interval
+        // and coordinate with the main loop. For now, we rely on Discord's heartbeat requests.
+        PayloadFlow::Continue
+    }
+}
+
+/// Write half of the gateway WebSocket.
+type GatewaySink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+
+/// The per-connection state a gateway payload handler may touch.
+struct GatewayConnection<'a> {
+    write: &'a mut GatewaySink,
+    sender: &'a mpsc::Sender<IncomingMessage>,
+    cb: &'a mut CircuitBreaker,
+    should_resume: &'a mut bool,
+}
+
+/// What the connection loop does after handling one gateway payload.
+enum PayloadFlow {
+    /// Keep reading this connection.
+    Continue,
+    /// Leave this connection; the outer loop backs off and reconnects.
+    Reconnect,
+    /// Stop the listener immediately (the circuit breaker gave up).
+    Stop,
 }
 
 #[async_trait]
 impl Listener for DiscordListener {
-    fn provider(&self) -> &str {
+    fn provider(&self) -> &'static str {
         "discord"
     }
 

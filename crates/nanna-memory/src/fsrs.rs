@@ -1,6 +1,6 @@
 //! FSRS-6 (Free Spaced Repetition Scheduler) implementation
 //!
-//! Based on the FSRS-6 algorithm: https://github.com/open-spaced-repetition/fsrs4anki
+//! Based on the FSRS-6 algorithm: <https://github.com/open-spaced-repetition/fsrs4anki>
 //! Power law forgetting curve optimized on 700M+ Anki reviews.
 //!
 //! Key concepts:
@@ -8,6 +8,7 @@
 //! - Retrievability (R): Probability of successful recall (0-1)
 //! - Difficulty (D): Inherent difficulty of the memory (1-10)
 
+use crate::lossy::LossyF32;
 use serde::{Deserialize, Serialize};
 
 /// The 21 FSRS weights, in FSRS-6's slot order.
@@ -60,7 +61,7 @@ pub struct FsrsParameters {
     /// 2. The fix for (1) took `0.0658`, which is **`w[19]` of the FSRS-6
     ///    parameter vector, not `w[20]`** — an off-by-one into the published
     ///    array. `fsrs-rs` names the real value `FSRS6_DEFAULT_DECAY = 0.1542`
-    ///    and clamps this parameter to [`DECAY_MIN`]`..=`[`DECAY_MAX`]
+    ///    and clamps this parameter to <code>[DECAY_MIN]..=[DECAY_MAX]</code>
     ///    (`0.1..=0.8`), a range `0.0658` sits **below** — so the optimizer
     ///    could never have produced it.
     ///
@@ -208,20 +209,20 @@ impl FsrsState {
         // Retrieval strength decays faster than stability
         let r = self.retrievability(params);
         // Weight by access frequency (more accesses = stronger retrieval paths)
-        let access_factor = (self.access_count as f32 / 10.0).min(1.0);
-        r * (0.5 + 0.5 * access_factor)
+        let access_factor = (self.access_count.lossy_f32() / 10.0).min(1.0);
+        r * 0.5f32.mul_add(access_factor, 0.5)
     }
 
     /// Calculate overall accessibility score
     /// 
-    /// accessibility = 0.5 × retention + 0.3 × retrieval_strength + 0.2 × storage_strength
+    /// accessibility = 0.5 × retention + 0.3 × `retrieval_strength` + 0.2 × `storage_strength`
     #[must_use]
     pub fn accessibility(&self, params: &FsrsParameters) -> f32 {
         let retention = self.retrievability(params);
         let retrieval = self.retrieval_strength(params);
         let storage = self.storage_strength.min(1.0);
         
-        0.5 * retention + 0.3 * retrieval + 0.2 * storage
+        0.2f32.mul_add(storage, 0.3f32.mul_add(retrieval, 0.5 * retention))
     }
 
     /// Get memory state based on accessibility
@@ -245,7 +246,7 @@ impl FsrsState {
     #[must_use]
     pub fn elapsed_days(&self) -> f32 {
         let elapsed_secs = now() - self.last_access;
-        elapsed_secs as f32 / 86400.0
+        elapsed_secs.lossy_f32() / 86400.0
     }
 
     /// Record an access (the testing effect)
@@ -258,9 +259,9 @@ impl FsrsState {
         // Stability increase formula from FSRS
         let stability_modifier = match rating {
             Rating::Again => params.w9, // Decrease on failure
-            Rating::Hard => 1.0 + params.w8 * params.w11.powf(-self.difficulty / 10.0),
-            Rating::Good => 1.0 + params.w8 * (1.0 - r).powf(params.w10),
-            Rating::Easy => 1.0 + params.w8 * params.w12.powf(self.difficulty / 10.0),
+            Rating::Hard => params.w8.mul_add(params.w11.powf(-self.difficulty / 10.0), 1.0),
+            Rating::Good => params.w8.mul_add((1.0 - r).powf(params.w10), 1.0),
+            Rating::Easy => params.w8.mul_add(params.w12.powf(self.difficulty / 10.0), 1.0),
         };
         
         self.stability = (self.stability * stability_modifier).max(0.1);
@@ -296,22 +297,19 @@ impl FsrsState {
 
 /// Rating for memory access quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Rating {
     /// Complete failure to recall
     Again,
     /// Recalled with significant difficulty
     Hard,
     /// Recalled correctly
+    #[default]
     Good,
     /// Recalled easily
     Easy,
 }
 
-impl Default for Rating {
-    fn default() -> Self {
-        Self::Good
-    }
-}
 
 /// Calculate retrievability using power law forgetting curve
 /// 
@@ -391,9 +389,9 @@ mod tests {
         assert!(r7 > r30);
         
         // Should follow power law (not exponential - decay is slower)
-        println!("R at 1 day: {:.3}", r1);
-        println!("R at 7 days: {:.3}", r7);
-        println!("R at 30 days: {:.3}", r30);
+        println!("R at 1 day: {r1:.3}");
+        println!("R at 7 days: {r7:.3}");
+        println!("R at 30 days: {r30:.3}");
     }
 
     #[test]
@@ -465,15 +463,17 @@ mod tests {
         );
         // Negative space: the two values this default has wrongly held are
         // exactly the ones the range rejects and accepts-but-is-not.
-        assert!(
-            0.0658_f32 < DECAY_MIN,
-            "the w[19] misread must be out of range"
-        );
-        assert!(
-            FSRS5_DEFAULT_DECAY <= DECAY_MAX,
-            "FSRS-5's decay is in range, just wrong for FSRS-6"
-        );
-        assert!(FSRS5_DEFAULT_DECAY != FSRS6_DEFAULT_DECAY);
+        const {
+            assert!(
+                0.0658_f32 < DECAY_MIN,
+                "the w[19] misread must be out of range"
+            );
+            assert!(
+                FSRS5_DEFAULT_DECAY <= DECAY_MAX,
+                "FSRS-5's decay is in range, just wrong for FSRS-6"
+            );
+            assert!(FSRS5_DEFAULT_DECAY != FSRS6_DEFAULT_DECAY);
+        }
     }
 
     /// The curve is anchored: whatever the exponent, retrievability is 0.9 at

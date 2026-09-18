@@ -32,29 +32,7 @@ use std::path::{Path, PathBuf};
 /// needs it is withheld at every boot. Removing an entry once its service is
 /// implemented is the point — a stale entry is caught by
 /// [`no_known_missing_entry_is_stale`].
-const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[
-    (
-        "schedule.add",
-        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
-         already fires one-shot prompts; the blocker is that scheduler output \
-         reaches no channel (server.rs warns 'channel routing ... not \
-         implemented'), so a reminder would fire into the log",
-    ),
-    (
-        "schedule.cancel",
-        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
-         already fires one-shot prompts; the blocker is that scheduler output \
-         reaches no channel (server.rs warns 'channel routing ... not \
-         implemented'), so a reminder would fire into the log",
-    ),
-    (
-        "schedule.list",
-        "P18: NOT the missing bridge it looks like — TaskType::Delayed \
-         already fires one-shot prompts; the blocker is that scheduler output \
-         reaches no channel (server.rs warns 'channel routing ... not \
-         implemented'), so a reminder would fire into the log",
-    ),
-];
+const KNOWN_MISSING_SERVICES: &[(&str, &str)] = &[];
 
 /// Fewest skills the tree can plausibly hold; below this the walk found nothing
 /// and every assertion would pass for free. There were 44 on 2026-09-15.

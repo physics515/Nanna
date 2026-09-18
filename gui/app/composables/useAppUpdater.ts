@@ -2,6 +2,7 @@ import { ref, readonly } from 'vue'
 import { check, type Update } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { getVersion } from '@tauri-apps/api/app'
+import { invoke } from '@tauri-apps/api/core'
 import { toast } from 'vue-sonner'
 import { useNotifications } from '~/composables/useNotifications'
 
@@ -95,10 +96,22 @@ async function applyUpdate() {
   }
   updating.value = true
   updateError.value = null
-  const version = pending.version
+  // Held locally: a background check could replace `pending` mid-download.
+  const update = pending
+  const version = update.version
   toast.info(`Downloading Nanna v${version}…`, { duration: 6000 })
   try {
-    await pending.downloadAndInstall()
+    await update.download()
+    // The daemon must stop before the install: installing ends this process
+    // without the exit hook that stops it, and a daemon left running holds
+    // the port, so the updated app would attach to the old server.
+    await invoke('stop_backend_for_update')
+    try {
+      await update.install()
+    } catch (e) {
+      await invoke('init_backend').catch(() => {})
+      throw e
+    }
     toast.success(`Nanna v${version} installed — restarting…`)
     await relaunch()
   } catch (e) {

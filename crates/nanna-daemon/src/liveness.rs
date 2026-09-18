@@ -46,7 +46,7 @@ const BEATS_PER_SILENCE_WINDOW: u64 = 4;
 ///   default budget for a step's acceptance check, the other harness-owned
 ///   operation that legitimately holds the turn quiet.
 ///
-/// The beat is the tighter of the two divided by [`BEATS_PER_SILENCE_WINDOW`]
+/// The beat is the tighter of the two divided by `BEATS_PER_SILENCE_WINDOW`
 /// (30s today). Anything longer risks a whole legal silence window passing
 /// between beats, so "beats stopped" could mean "lawful quiet stretch" —
 /// exactly the ambiguity the beat exists to remove. If either budget changes,
@@ -138,7 +138,7 @@ impl Phase {
     /// Wire spelling, identical to the serde rename — for callers that need
     /// the phase as a plain string (log fields, the beat event).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Preparing => "preparing",
@@ -194,7 +194,7 @@ struct LivenessState {
 }
 
 impl LivenessState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             running: false,
             turn_started: None,
@@ -267,7 +267,7 @@ pub struct ToolMarkSnapshot {
 pub struct StopSnapshot {
     pub reason: String,
     /// The TURN's exit cause when the caller had one (see
-    /// [`StopMark::exit_cause`]) — absent rather than guessed.
+    /// `StopMark::exit_cause`) — absent rather than guessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_cause: Option<String>,
     pub at: String,
@@ -280,7 +280,7 @@ pub struct SessionLiveness {
 }
 
 impl SessionLiveness {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             state: Mutex::new(LivenessState::new()),
         }
@@ -479,18 +479,22 @@ impl SessionLiveness {
             .map(|t| t.elapsed().as_secs());
 
         let awaiting = if !s.running {
-            match &s.last_stop {
+            s.last_stop.as_ref().map_or_else(
+                || "idle — no turn this daemon lifetime".to_string(),
                 // The exit cause, when the caller supplied one, is the more
                 // honest half of "how did that end" — say it beside the stop.
-                Some(stop) => match &stop.exit_cause {
-                    Some(cause) => format!(
-                        "idle — last turn ended {} ({cause}) at {}",
-                        stop.kind, stop.at
-                    ),
-                    None => format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                |stop| {
+                    stop.exit_cause.as_ref().map_or_else(
+                        || format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                        |cause| {
+                            format!(
+                                "idle — last turn ended {} ({cause}) at {}",
+                                stop.kind, stop.at
+                            )
+                        },
+                    )
                 },
-                None => "idle — no turn this daemon lifetime".to_string(),
-            }
+            )
         } else if let Some(tool) = &s.tool_in_flight {
             format!(
                 "tool {} running for {}s",

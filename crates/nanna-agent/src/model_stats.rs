@@ -16,10 +16,28 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use nanna_storage::StoredModelStats;
 
+use crate::numeric::{millis_u64, u64_to_f64, usize_to_f64};
+/// Called with every recorded request.
+///
+/// It is the per-request history the in-memory aggregates cannot give back (a
+/// day's spend is not derivable from lifetime totals). Must not block: the
+/// daemon's sink hands the write to a task.
+pub type RequestSink = Arc<dyn Fn(&RequestObservation) + Send + Sync>;
+
 /// Global model statistics tracker. Thread-safe, designed for concurrent access.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelStatsTracker {
-    inner: Arc<RwLock<StatsInner>>, 
+    inner: Arc<RwLock<StatsInner>>,
+    /// Set once by the host; shared by every clone.
+    sink: Arc<std::sync::OnceLock<RequestSink>>,
+}
+
+impl std::fmt::Debug for ModelStatsTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelStatsTracker")
+            .field("sink_set", &self.sink.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,7 +95,7 @@ pub struct TierCounts {
 }
 
 /// A completed request observation to record.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestObservation {
     pub model: String,
     pub success: bool,
@@ -130,7 +148,7 @@ pub struct ModelCost {
     pub priced: bool,
 }
 
-/// Per-request stats to attach to an AgentResponse for UI display.
+/// Per-request stats to attach to an `AgentResponse` for UI display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestModelStats {
     /// Which model actually handled this request
@@ -172,16 +190,26 @@ impl ModelStatsTracker {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(StatsInner::default())),
+            sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Send every future observation to `sink` as well. Returns `false` when a
+    /// sink was already set (the first one stays).
+    pub fn set_request_sink(&self, sink: RequestSink) -> bool {
+        self.sink.set(sink).is_ok()
     }
 
     /// Record a completed request observation.
     pub async fn record(&self, obs: RequestObservation) {
+        if let Some(sink) = self.sink.get() {
+            sink(&obs);
+        }
         let mut inner = self.inner.write().await;
         let stats = inner.models.entry(obs.model.clone()).or_insert_with(|| ModelStats::new(&obs.model));
 
         stats.total_requests += 1;
-        let latency_ms = obs.latency.as_millis() as u64;
+        let latency_ms = millis_u64(obs.latency);
 
         if obs.success {
             stats.successful_requests += 1;
@@ -239,6 +267,7 @@ impl ModelStatsTracker {
         if obs.escalated {
             stats.escalations += 1;
         }
+        drop(inner);
 
         debug!(model = %obs.model, success = obs.success, latency_ms = latency_ms, input = obs.input_tokens, output = obs.output_tokens, cache_read = obs.cache_read_tokens, "📊 Model stats recorded");
     }
@@ -247,7 +276,7 @@ impl ModelStatsTracker {
     pub async fn is_healthy(&self, model: &str) -> bool {
         let inner = self.inner.read().await;
         inner.models.get(model)
-            .map_or(true, |s| s.consecutive_failures < UNHEALTHY_THRESHOLD)
+            .is_none_or(|s| s.consecutive_failures < UNHEALTHY_THRESHOLD)
     }
 
     /// Get summary statistics for all tracked models.
@@ -382,7 +411,7 @@ impl ModelStats {
 
     fn summary(&self) -> ModelStatsSummary {
         let success_rate = if self.total_requests > 0 {
-            self.successful_requests as f64 / self.total_requests as f64
+            u64_to_f64(self.successful_requests) / u64_to_f64(self.total_requests)
         } else {
             1.0
         };
@@ -398,12 +427,12 @@ impl ModelStats {
         let avg_throughput_tps = if self.throughput_tps.is_empty() {
             0.0
         } else {
-            self.throughput_tps.iter().sum::<f64>() / self.throughput_tps.len() as f64
+            self.throughput_tps.iter().sum::<f64>() / usize_to_f64(self.throughput_tps.len())
         };
 
         let total_cacheable = self.total_input_tokens + self.total_cache_read_tokens;
         let cache_hit_rate = if total_cacheable > 0 {
-            self.total_cache_read_tokens as f64 / total_cacheable as f64
+            u64_to_f64(self.total_cache_read_tokens) / u64_to_f64(total_cacheable)
         } else {
             0.0
         };
@@ -439,10 +468,11 @@ fn percentile(sorted_data: &[u64], pct: usize) -> u64 {
 }
 
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    millis_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 // =============================================================================
@@ -515,7 +545,7 @@ impl ModelStatsTracker {
     }
 }
 
-/// Flat struct matching nanna-storage::StoredModelStats layout.
+/// Flat struct matching `nanna-storage::StoredModelStats` layout.
 /// This avoids a cross-crate dependency while keeping the types aligned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorableModelStats {
@@ -606,6 +636,40 @@ impl From<StorableModelStats> for StoredModelStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_recorded_request_reaches_the_sink_once_set() {
+        let tracker = ModelStatsTracker::new();
+        tracker.record(observation("before-sink", true)).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen_in_sink = Arc::clone(&seen);
+        assert!(
+            tracker.set_request_sink(Arc::new(move |obs: &RequestObservation| {
+                seen_in_sink.lock().expect("seen").push(obs.model.clone());
+            }))
+        );
+        assert!(
+            !tracker.set_request_sink(Arc::new(|_: &RequestObservation| {})),
+            "set once"
+        );
+        // A clone shares the sink, as it shares the stats.
+        tracker
+            .clone()
+            .record(observation("claude-opus-5", true))
+            .await;
+        tracker
+            .record(observation("ollama/qwen3.5:9b", false))
+            .await;
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["claude-opus-5".to_string(), "ollama/qwen3.5:9b".to_string()]
+        );
+        assert_eq!(
+            tracker.summaries().await.len(),
+            3,
+            "the aggregates still record everything"
+        );
+    }
 
     fn observation(model: &str, success: bool) -> RequestObservation {
         RequestObservation {

@@ -17,8 +17,10 @@ use tracing::warn;
 /// Connection state for a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConnectionState {
     /// Not configured
+    #[default]
     Unconfigured,
     /// Configured but not connected
     Disconnected,
@@ -36,25 +38,23 @@ pub enum ConnectionState {
     Unavailable,
 }
 
-impl Default for ConnectionState {
-    fn default() -> Self {
-        Self::Unconfigured
-    }
-}
 
 impl ConnectionState {
     /// Check if the state represents a connected channel
-    pub fn is_connected(&self) -> bool {
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected | Self::Degraded | Self::RateLimited)
     }
 
     /// Check if the state represents a healthy channel
-    pub fn is_healthy(&self) -> bool {
+    #[must_use]
+    pub const fn is_healthy(&self) -> bool {
         matches!(self, Self::Connected)
     }
 
     /// Get a human-readable status string
-    pub fn status_text(&self) -> &'static str {
+    #[must_use]
+    pub const fn status_text(&self) -> &'static str {
         match self {
             Self::Unconfigured => "Not configured",
             Self::Disconnected => "Disconnected",
@@ -153,6 +153,7 @@ pub struct StatusManager {
 
 impl StatusManager {
     /// Create a new status manager
+    #[must_use]
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
@@ -164,12 +165,14 @@ impl StatusManager {
     }
 
     /// Set the health check interval
-    pub fn with_health_check_interval(mut self, interval: Duration) -> Self {
+    #[must_use]
+    pub const fn with_health_check_interval(mut self, interval: Duration) -> Self {
         self.health_check_interval = interval;
         self
     }
 
     /// Subscribe to status events
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StatusEvent> {
         self.event_tx.subscribe()
     }
@@ -194,6 +197,7 @@ impl StatusManager {
         } else if !enabled {
             status.state = ConnectionState::Disconnected;
         }
+        drop(statuses);
     }
 
     /// Update channel state
@@ -207,10 +211,10 @@ impl StatusManager {
                 return;
             };
 
-            let previous_state = if status.state != state {
-                Some(status.state)
-            } else {
+            let previous_state = if status.state == state {
                 None
+            } else {
+                Some(status.state)
             };
 
             status.state = state;
@@ -223,22 +227,22 @@ impl StatusManager {
                     status.health.last_healthy = Some(chrono::Utc::now().timestamp_millis());
                     status.health.consecutive_failures = 0;
                 }
-                ConnectionState::RateLimited => {
-                    // Don't count as failure, just degraded
-                }
                 ConnectionState::AuthFailed | ConnectionState::Unavailable => {
                     status.health.last_failure = Some(chrono::Utc::now().timestamp_millis());
                     status.health.consecutive_failures += 1;
                 }
+                // RateLimited lands here too: don't count it as a failure, just degraded
                 _ => {}
             }
 
-            StatusEvent {
+            let event = StatusEvent {
                 provider: provider.to_string(),
                 status: status.clone(),
                 previous_state,
                 timestamp: chrono::Utc::now().timestamp_millis(),
-            }
+            };
+            drop(statuses);
+            event
         };
 
         // Broadcast event (ignore send errors if no subscribers)
@@ -275,6 +279,7 @@ impl StatusManager {
             status.state = ConnectionState::Degraded;
             status.last_state_change = chrono::Utc::now().timestamp_millis();
         }
+        drop(statuses);
     }
 
     /// Update response time average
@@ -289,7 +294,10 @@ impl StatusManager {
             samples.remove(0);
         }
 
-        let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+        // `samples` was just trimmed to at most MAX_SAMPLES (100) entries, so the
+        // count always fits a u32, which converts to f64 exactly.
+        let sample_count = f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX));
+        let avg = samples.iter().sum::<f64>() / sample_count;
 
         // Update in status
         drop(response_times);
@@ -307,22 +315,24 @@ impl StatusManager {
                 return;
             };
 
-            let previous_state = if status.state != ConnectionState::RateLimited {
-                Some(status.state)
-            } else {
+            let previous_state = if status.state == ConnectionState::RateLimited {
                 None
+            } else {
+                Some(status.state)
             };
 
             status.state = ConnectionState::RateLimited;
             status.health.rate_limit_remaining_ms = Some(cooldown_ms);
             status.last_state_change = chrono::Utc::now().timestamp_millis();
 
-            StatusEvent {
+            let event = StatusEvent {
                 provider: provider.to_string(),
                 status: status.clone(),
                 previous_state,
                 timestamp: chrono::Utc::now().timestamp_millis(),
-            }
+            };
+            drop(statuses);
+            event
         };
 
         let _ = self.event_tx.send(event);
@@ -336,7 +346,7 @@ impl StatusManager {
                 return;
             };
 
-            if status.state == ConnectionState::RateLimited {
+            let event = if status.state == ConnectionState::RateLimited {
                 status.state = ConnectionState::Connected;
                 status.health.rate_limit_remaining_ms = None;
                 status.last_state_change = chrono::Utc::now().timestamp_millis();
@@ -349,7 +359,9 @@ impl StatusManager {
                 })
             } else {
                 None
-            }
+            };
+            drop(statuses);
+            event
         };
 
         if let Some(event) = event {
@@ -415,6 +427,7 @@ impl StatusManager {
                 summary.healthy += 1;
             }
         }
+        drop(statuses);
         
         summary
     }
@@ -473,6 +486,7 @@ pub struct HealthChecker {
 
 impl HealthChecker {
     /// Create a new health checker
+    #[must_use]
     pub fn new(status_manager: Arc<StatusManager>, interval: Duration) -> Self {
         Self {
             status_manager,

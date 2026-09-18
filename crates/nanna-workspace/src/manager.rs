@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 /// Configuration for a workspace (local non-md state in `.nanna/config.toml`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct WorkspaceConfig {
     /// Workspace name (defaults to directory name)
     pub name: Option<String>,
@@ -23,15 +24,6 @@ pub struct WorkspaceConfig {
     pub file_priority: Option<Vec<String>>,
 }
 
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            name: None,
-            max_context_tokens: None,
-            file_priority: None,
-        }
-    }
-}
 
 /// A loaded workspace with its files and configuration
 #[derive(Debug, Clone)]
@@ -48,14 +40,19 @@ pub struct Workspace {
 
 impl Workspace {
     /// Load a workspace from a directory
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NotFound`] when `root` does not exist. Unreadable
+    /// workspace files and a missing or invalid `.nanna/config.toml` are not
+    /// errors: they load as absent files and the default config.
     pub async fn load(root: PathBuf) -> Result<Self, WorkspaceError> {
         if !root.exists() {
             return Err(WorkspaceError::NotFound(root));
         }
 
         let marker = find_workspace_root(&root)
-            .map(|(_, m)| m)
-            .unwrap_or(WorkspaceMarker::AgentsFile);
+            .map_or(WorkspaceMarker::AgentsFile, |(_, m)| m);
 
         let files = WorkspaceFiles::load(&root).await;
         let config = Self::load_config(&root).await.unwrap_or_default();
@@ -86,6 +83,12 @@ impl Workspace {
     }
 
     /// Save workspace config to .nanna/config.toml
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Io`] when the `.nanna` directory cannot be
+    /// created or `config.toml` cannot be written, and [`WorkspaceError::Parse`]
+    /// when the config cannot be serialized to TOML.
     pub async fn save_config(&self) -> Result<(), WorkspaceError> {
         let config_dir = self.root.join(WORKSPACE_MARKER_DIR);
         fs::create_dir_all(&config_dir).await?;
@@ -102,13 +105,16 @@ impl Workspace {
     pub fn name(&self) -> String {
         self.config.name.clone().unwrap_or_else(|| {
             self.root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "workspace".to_string())
+                .file_name().map_or_else(|| "workspace".to_string(), |n| n.to_string_lossy().to_string())
         })
     }
 
     /// Reload workspace files from disk
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error today: files that cannot be read reload as absent
+    /// rather than failing the reload.
     pub async fn reload(&mut self) -> Result<(), WorkspaceError> {
         self.files = WorkspaceFiles::load(&self.root).await;
         debug!("Reloaded workspace files from {}", self.root.display());
@@ -122,6 +128,11 @@ impl Workspace {
     }
 
     /// Initialize workspace with a minimal root AGENTS.md (+ optional ROADMAP.md)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Io`] when the `.nanna` directory cannot be
+    /// created or a missing `AGENTS.md` cannot be written.
     pub async fn initialize(&self) -> Result<(), WorkspaceError> {
         // Optional local-state dir (non-md)
         let marker_dir = self.root.join(WORKSPACE_MARKER_DIR);
@@ -174,6 +185,12 @@ impl WorkspaceManager {
     }
 
     /// Load and activate a workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Io`] when `path` is relative and the current
+    /// directory cannot be read, and [`WorkspaceError::NotFound`] when the path
+    /// is not cached and does not exist.
     pub async fn activate(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
         let canonical = if path.is_absolute() {
             path.to_path_buf()
@@ -184,8 +201,7 @@ impl WorkspaceManager {
         {
             let cache = self.cache.read().await;
             if let Some(ws) = cache.get(&canonical) {
-                let mut active = self.active.write().await;
-                *active = Some(ws.clone());
+                *self.active.write().await = Some(ws.clone());
                 info!("Activated cached workspace: {}", ws.name());
                 return Ok(ws.clone());
             }
@@ -208,12 +224,22 @@ impl WorkspaceManager {
     }
 
     /// Auto-discover and activate a workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`discover_workspace`] when no workspace can be
+    /// discovered, and those of [`Self::activate`] for the discovered path.
     pub async fn auto_activate(&self, explicit_path: Option<&Path>) -> Result<Workspace, WorkspaceError> {
         let path = discover_workspace(explicit_path)?;
         self.activate(&path).await
     }
 
     /// Activate the default workspace (if configured)
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::activate`] for the configured default path,
+    /// or of [`Self::auto_activate`] when no default is configured.
     pub async fn activate_default(&self) -> Result<Workspace, WorkspaceError> {
         if let Some(ref path) = self.default_path {
             self.activate(path).await
@@ -223,16 +249,25 @@ impl WorkspaceManager {
     }
 
     /// Switch to a different workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::activate`].
     pub async fn switch(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
         self.activate(path).await
     }
 
     /// Reload the currently active workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Workspace::reload`], which currently never fails.
     pub async fn reload_active(&self) -> Result<(), WorkspaceError> {
         let mut active = self.active.write().await;
         if let Some(ref mut ws) = *active {
             ws.reload().await?;
         }
+        drop(active);
         Ok(())
     }
 
@@ -247,6 +282,11 @@ impl WorkspaceManager {
     }
 
     /// Create and initialize a new workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Io`] when the directory cannot be created or
+    /// [`Workspace::initialize`] cannot write its files.
     pub async fn create(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
         fs::create_dir_all(path).await?;
 

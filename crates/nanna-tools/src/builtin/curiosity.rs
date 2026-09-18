@@ -6,6 +6,7 @@ use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use tracing::debug;
 
 /// Tool to explore a directory and summarize its contents
@@ -28,10 +29,12 @@ impl Tool for ExploreTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
-        let max_depth = params
-            .get("depth")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(2) as usize;
+        let max_depth = crate::u64_to_usize(
+            params
+                .get("depth")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(2),
+        );
 
         debug!("Exploring {} (depth: {})", path, max_depth);
 
@@ -41,7 +44,7 @@ impl Tool for ExploreTool {
         }
 
         let mut output = String::new();
-        output.push_str(&format!("📂 {path}\n"));
+        let _ = writeln!(output, "📂 {path}");
 
         explore_recursive(root, 0, max_depth, &mut output)?;
 
@@ -85,7 +88,7 @@ fn explore_recursive(
 
     // Show directories first
     for (name, path) in &dirs {
-        output.push_str(&format!("{indent}📁 {name}/\n"));
+        let _ = writeln!(output, "{indent}📁 {name}/");
         explore_recursive(path, depth + 1, max_depth, output)?;
     }
 
@@ -93,10 +96,10 @@ fn explore_recursive(
     let file_count = files.len();
     for name in files.iter().take(10) {
         let emoji = file_emoji(name);
-        output.push_str(&format!("{indent}{emoji} {name}\n"));
+        let _ = writeln!(output, "{indent}{emoji} {name}");
     }
     if file_count > 10 {
-        output.push_str(&format!("{}   ... and {} more files\n", indent, file_count - 10));
+        let _ = writeln!(output, "{}   ... and {} more files", indent, file_count - 10);
     }
 
     Ok(())
@@ -173,16 +176,15 @@ impl Tool for StatusTool {
         status.push_str("🌙 Nanna Status\n\n");
 
         // System info
-        status.push_str(&format!("📍 Working directory: {}\n", 
+        let _ = writeln!(status, "📍 Working directory: {}", 
             std::env::current_dir().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string())
-        ));
+        );
 
         // Time
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        status.push_str(&format!("🕐 Current time: {now} (unix)\n"));
+            .map_or(0, |d| d.as_secs());
+        let _ = writeln!(status, "🕐 Current time: {now} (unix)");
 
         // Environment hints
         if std::env::var("OPENAI_API_KEY").is_ok() {

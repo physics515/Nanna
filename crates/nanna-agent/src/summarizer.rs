@@ -35,6 +35,7 @@ pub struct Summarizer {
 
 impl Summarizer {
     /// Create a new summarizer with the given config.
+    #[must_use]
     pub fn new(config: SummarizerConfig) -> Self {
         Self {
             config,
@@ -43,7 +44,8 @@ impl Summarizer {
     }
 
     /// Check if content should be summarized based on length threshold.
-    pub fn should_summarize(&self, content: &str) -> bool {
+    #[must_use]
+    pub const fn should_summarize(&self, content: &str) -> bool {
         content.len() > self.config.threshold
     }
 
@@ -51,6 +53,7 @@ impl Summarizer {
     ///
     /// Returns analysis of novel vs. redundant chunks.
     /// Used to skip processing previously-seen content.
+    #[must_use]
     pub fn analyze_redundancy(&self, content: &str) -> crate::chunker::DeduplicationAnalysis {
         analyze_content(content, &self.known_hashes)
     }
@@ -63,7 +66,8 @@ impl Summarizer {
     }
 
     /// Get the current configuration.
-    pub fn config(&self) -> &SummarizerConfig {
+    #[must_use]
+    pub const fn config(&self) -> &SummarizerConfig {
         &self.config
     }
 
@@ -75,8 +79,9 @@ impl Summarizer {
     /// Estimate the token count for content.
     ///
     /// Rough heuristic: ~4 characters per token.
-    pub fn estimate_tokens(&self, content: &str) -> usize {
-        (content.len() + 3) / 4
+    #[must_use]
+    pub const fn estimate_tokens(&self, content: &str) -> usize {
+        content.len().div_ceil(4)
     }
 }
 

@@ -13,7 +13,7 @@
 //!    `#`) are allowed through (they reference within the same document and need no
 //!    fetch). This is the client-side half of the 2026-07-28 MCP spec hardening.
 //!
-//! 2. **Pathological size/nesting (DoS).** `serde_json` already caps *parse* recursion
+//! 2. **Pathological size/nesting (`DoS`).** `serde_json` already caps *parse* recursion
 //!    at 128, but a schema that is merely deep-but-legal, or enormously wide, still
 //!    costs unbounded time in every later traversal (`schema_to_parameters`, token
 //!    estimation, serialization to the LLM). We bound both **depth** and **total node

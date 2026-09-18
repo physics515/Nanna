@@ -3,7 +3,7 @@
 //! Uses the `ParentChannel` trait abstraction so it knows nothing about session management.
 //! The concrete implementation lives in `nanna-daemon/src/server.rs`.
 //!
-//! The tool reads the current session ID from the shared ToolRegistry at execution time,
+//! The tool reads the current session ID from the shared `ToolRegistry` at execution time,
 //! so a single instance can be registered globally and work for any sub-agent.
 
 use crate::{ParentChannel, Tool, ToolDefinition, ToolError, ToolRegistry, ToolResult};
@@ -20,7 +20,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// The sub-agent's execution pauses while waiting. The parent receives the question
 /// as an event, processes it, and sends a reply back through the mailbox system.
 ///
-/// Reads the current session ID from the ToolRegistry at execution time so it works
+/// Reads the current session ID from the `ToolRegistry` at execution time so it works
 /// correctly even though the registry is shared across sessions.
 pub struct AskParentTool {
     channel: Arc<dyn ParentChannel>,

@@ -29,16 +29,12 @@
 // This module fabricates synthetic corpora with a small PRNG, so lossy numeric
 // conversions are intentional and bounded by test-scale inputs: memory/topic
 // counts (`usize`) and PRNG words (`u64`/`u32`) become `f32` vector components,
-// and day counts (`f32`) become `i64` Unix seconds. Fused-multiply-add rounding
-// differences are likewise immaterial to synthetic jitter. Silencing the pedantic
-// numeric lints here is cleaner than a per-line allow on every cast.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::suboptimal_flops
-)]
+// and day counts (`f32`) become `i64` Unix seconds. They go through the crate's
+// `lossy` helpers, each exactly the `as` cast it names.
 
 use std::collections::HashMap;
+
+use crate::lossy::{f32_to_i64, LossyF32};
 
 use crate::{
     ConsolidationConfig, ConsolidationResult, EmbedFn, FsrsState, MemoryEntry, MemoryError,
@@ -92,7 +88,7 @@ impl RetentionReport {
             return 0.0;
         }
         let removed = before - self.after.memory_count;
-        removed as f32 / before as f32
+        removed.lossy_f32() / before.lossy_f32()
     }
 
     /// Recall retained across the cycle: `after.recall / before.recall`, in `[0, ∞)`.
@@ -149,7 +145,7 @@ pub async fn measure_recall(
     let recall_at_k = if probe_count == 0 {
         0.0
     } else {
-        hits as f32 / probe_count as f32
+        hits.lossy_f32() / probe_count.lossy_f32()
     };
 
     debug_assert!(
@@ -278,7 +274,7 @@ pub async fn measure_gated_recall(
         }
     }
 
-    let fraction = hits as f32 / probe_count as f32;
+    let fraction = hits.lossy_f32() / probe_count.lossy_f32();
     debug_assert!(
         fraction.is_finite() && (0.0..=1.0).contains(&fraction),
         "gated recall fraction out of range: {fraction}"
@@ -388,17 +384,23 @@ impl RetentionCorpus {
             // Each topic lives in its own era and salience band so the composite
             // clusterer keeps them apart. Within a topic these are constant, so
             // members bind tightly; across topics they diverge.
-            let topic_age_days = params.age_days + topic as f32 * params.era_gap_days;
-            let topic_last_access = now - (topic_age_days * 86_400.0) as i64;
-            let topic_importance = params.importance.unwrap_or(1.0 + (topic % 3) as f32 * 0.5);
-            let topic_access_count = topic as u32 * 4;
+            // `mul_add` is the fused (single-rounding) form; on synthetic era
+            // offsets and jitter the last-ulp difference is immaterial, and it
+            // is the same on every platform.
+            let topic_age_days = topic.lossy_f32().mul_add(params.era_gap_days, params.age_days);
+            let topic_last_access = now - f32_to_i64(topic_age_days * 86_400.0);
+            // Exact either way: a small integer times 0.5.
+            let topic_importance =
+                params.importance.unwrap_or_else(|| (topic % 3).lossy_f32().mul_add(0.5, 1.0));
+            // Topic counts are test-scale; saturate rather than wrap if one never is.
+            let topic_access_count = u32::try_from(topic).map_or(u32::MAX, |t| t.saturating_mul(4));
 
             for member in 0..params.per_topic {
                 // Deterministic jitter keeps members distinct but tightly clustered.
                 let mut rng = SplitMix64::new(seed ^ mix_topic_member(topic as u64, member as u64));
                 let embedding: Vec<f32> = centroid
                     .iter()
-                    .map(|&c| c + (rng.next_unit() - 0.5) * params.member_spread)
+                    .map(|&c| (rng.next_unit() - 0.5).mul_add(params.member_spread, c))
                     .collect();
                 debug_assert_eq!(embedding.len(), params.dimension);
 
@@ -542,7 +544,8 @@ impl SplitMix64 {
     /// Next value in `[0, 1)`.
     fn next_unit(&mut self) -> f32 {
         // Top 24 bits → a float with full mantissa precision in [0, 1).
-        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+        // Both sides are exact in `f32`: 24 bits over 2^24.
+        (self.next_u64() >> 40).lossy_f32() / 16_777_216.0
     }
 }
 
@@ -561,15 +564,15 @@ mod tests {
     /// A `summarize_fn` that preserves the cluster's `topic:<n>` tag so the
     /// consolidated entry re-embeds onto the same centroid. Takes `String` by
     /// value to match the `Fn(String) -> Fut` contract the consolidator requires.
-    #[allow(clippy::needless_pass_by_value)]
-    fn echo_summarize(prompt: String) -> impl std::future::Future<Output = Result<String, String>> {
+    /// The future owns the prompt, as a real summarizer's request would.
+    async fn echo_summarize(prompt: String) -> Result<String, String> {
         // The prompt is built from member contents, each carrying `topic:<n>`.
         // Echo the first tag so the summary is deterministically re-embeddable.
         let summary = parse_topic_tag(&prompt).map_or_else(
             || "untagged consolidated".to_string(),
             |topic| format!("topic:{topic} consolidated"),
         );
-        async move { Ok(summary) }
+        Ok(summary)
     }
 
     // ---- Summarization drift ------------------------------------------------
@@ -586,7 +589,7 @@ mod tests {
     /// phase (b) folds them losslessly, while a larger spread drops them into the
     /// merely-*related* band that only the summarizing clusterer handles.
     fn drift_band(count: usize, dimension: usize, spread: f32) -> Vec<MemoryEntry> {
-        let aged_last_access = now_secs() - (1_000.0 * 86_400.0) as i64;
+        let aged_last_access = now_secs() - 1_000 * 86_400;
 
         (0..count)
             .map(|index| {
@@ -594,7 +597,7 @@ mod tests {
                 // scales it, so similarity falls as `spread` grows.
                 let mut embedding = vec![0.0_f32; dimension];
                 embedding[0] = 1.0;
-                embedding[1 + index % (dimension - 1)] = spread * (index as f32 + 1.0);
+                embedding[1 + index % (dimension - 1)] = spread * (index.lossy_f32() + 1.0);
 
                 let content = if index == 0 {
                     format!("topic:0 deployment policy — {CRITICAL_CLAUSE}")
@@ -977,7 +980,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // exact ratios of exactly-representable inputs
     fn report_ratio_math() {
         let m = |count, recall| RetentionMeasurement {
             memory_count: count,
@@ -1000,8 +1002,12 @@ mod tests {
             after: m(0, 0.0),
             memories_merged: 0,
         };
-        assert_eq!(empty.compression_ratio(), 0.0);
-        assert_eq!(empty.recall_retention(), 1.0);
+        // Exact: both are returned as literals, so compare the bits (which also
+        // rules out a NaN or a negative zero sneaking through).
+        let compression = empty.compression_ratio();
+        assert_eq!(compression.to_bits(), 0.0_f32.to_bits(), "compression {compression}");
+        let retention = empty.recall_retention();
+        assert_eq!(retention.to_bits(), 1.0_f32.to_bits(), "retention {retention}");
 
         // Recall appeared from nothing → infinity, not divide-by-zero.
         let appeared = RetentionReport {

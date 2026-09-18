@@ -138,6 +138,7 @@ pub fn escape_bare_controls_in_strings(s: &str) -> Option<String> {
 }
 
 /// Like [`heal_json`], but typed.
+#[must_use]
 pub fn heal_json_as<T: serde::de::DeserializeOwned>(input: &str) -> Option<T> {
     heal_json(input).and_then(|v| serde_json::from_value(v).ok())
 }
@@ -286,11 +287,17 @@ fn repair_common(s: &str) -> String {
         i += 1;
     }
 
-    // Balance braces/brackets if truncated
+    close_unbalanced(&mut out);
+    out
+}
+
+/// Balance braces/brackets if truncated: close an open string, then every
+/// unclosed array, then every unclosed object.
+fn close_unbalanced(out: &mut String) {
     let mut depth_obj = 0i32;
     let mut depth_arr = 0i32;
-    in_string = false;
-    escape = false;
+    let mut in_string = false;
+    let mut escape = false;
     for c in out.chars() {
         if in_string {
             if escape {
@@ -320,7 +327,6 @@ fn repair_common(s: &str) -> String {
     for _ in 0..depth_obj.max(0) {
         out.push('}');
     }
-    out
 }
 
 /// Count balanced top-level JSON objects/arrays in `s`.

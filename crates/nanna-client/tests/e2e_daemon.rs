@@ -29,16 +29,6 @@ use nanna_client::{Client, ClientConfig};
 use nanna_daemon::server::DaemonBuilder;
 use std::time::Duration;
 
-/// Claim a free TCP port from the OS, then release it.
-///
-/// There is an unavoidable race between releasing and the daemon binding, but asking
-/// the OS beats hardcoding a port that collides with a developer's real daemon (5149)
-/// or with a parallel test.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    listener.local_addr().expect("read back the bound port").port()
-}
-
 /// A daemon running on its own port and data dir for the duration of one test.
 struct TestDaemon {
     port: u16,
@@ -63,10 +53,21 @@ const READY_HANG_CEILING: Duration = Duration::from_secs(120);
 /// How often to re-probe the port while waiting.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Wait until the daemon's IPC port accepts a connection.
+/// The daemon's published IPC bind address (`None` until it binds).
+type BoundAddr = tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>;
+
+/// Wait until the daemon's IPC listener has bound, and return the port it got.
+///
+/// Daemons start on port 0 and report the port the OS assigned. Picking a free
+/// port up front and releasing it for the daemon to re-bind raced with every
+/// parallel test doing the same: two daemons chose one port, the loser exited
+/// ("returned cleanly without ever listening"), or — worse — the readiness probe
+/// connected to the *other* test's daemon and the test carried on against it until
+/// that daemon was stopped under it (observed 2026-09-17 under a full
+/// `cargo test --workspace`).
 ///
 /// **Watches the daemon, not the clock.** The task is the ground truth: if it
-/// finishes before the port opens, the daemon failed or panicked, and that is
+/// finishes before the listener binds, the daemon failed or panicked, and that is
 /// knowable *immediately* and reported with the actual cause — no waiting out a
 /// deadline to conclude something we already knew, and no "within Ns" message
 /// that blames time for a crash.
@@ -75,42 +76,43 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// and a daemon that is merely descheduled look identical to a bare timeout, and
 /// collapsing them is what made this suite fail on healthy code under load while
 /// giving a useless message when the code was genuinely broken.
-async fn wait_until_ready(port: u16, handle: &mut tokio::task::JoinHandle<Result<(), String>>) {
-    let started = std::time::Instant::now();
-
+async fn wait_until_ready(
+    started: std::time::Instant,
+    bound: &mut BoundAddr,
+    handle: &mut tokio::task::JoinHandle<Result<(), String>>,
+) -> u16 {
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
+        if let Some(addr) = *bound.borrow_and_update() {
+            return addr.port();
         }
 
-        // Ground truth: the task ended without ever binding the port.
+        // Ground truth: the task ended without ever binding the listener.
         if handle.is_finished() {
             match handle.await {
-                Ok(Ok(())) => {
-                    panic!("daemon on port {port} returned cleanly without ever listening")
-                }
-                Ok(Err(e)) => panic!("daemon on port {port} failed to run: {e}"),
+                Ok(Ok(())) => panic!("daemon returned cleanly without ever listening"),
+                Ok(Err(e)) => panic!("daemon failed to run: {e}"),
                 Err(join) if join.is_panic() => {
                     // Resume the panic so the original message and location
                     // survive, instead of being flattened into "task panicked".
                     std::panic::resume_unwind(join.into_panic());
                 }
-                Err(join) => panic!("daemon task on port {port} ended: {join}"),
+                Err(join) => panic!("daemon task ended: {join}"),
             }
         }
 
         assert!(
             started.elapsed() < READY_HANG_CEILING,
-            "daemon on port {port} is still running but never bound after {:?} — \
+            "daemon is still running but never bound after {:?} — \
              this is the hang ceiling, not a latency assertion, so treat it as a \
              wedged daemon rather than a slow one",
             READY_HANG_CEILING
         );
 
-        tokio::time::sleep(READY_POLL_INTERVAL).await;
+        // Wake on the bind, or come back to re-check the task. A closed channel
+        // means the server is gone; the task check above reports why.
+        if let Ok(Err(_)) = tokio::time::timeout(READY_POLL_INTERVAL, bound.changed()).await {
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -120,13 +122,15 @@ impl TestDaemon {
     /// Reusing a `data_dir` across calls is how the restart test proves persistence
     /// survives a full process lifecycle.
     async fn start(data_dir: tempfile::TempDir) -> Self {
-        let port = free_port();
         let dir_path = data_dir.path().to_path_buf();
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<BoundAddr>();
 
         let mut handle = tokio::spawn(async move {
             let mut server = DaemonBuilder::new()
                 .with_host("127.0.0.1")
-                .with_port(port)
+                // Port 0: the OS picks a free port at bind time and the daemon
+                // reports it, so parallel tests cannot collide.
+                .with_port(0)
                 .with_data_dir(dir_path)
                 // Keep the test hermetic and fast: no embeddings, no health/webhook
                 // ports to collide on, no PID file to fight a real local daemon over.
@@ -135,14 +139,32 @@ impl TestDaemon {
                 .with_webhook_server(false)
                 .with_pid_file(false)
                 .with_log_level("warn")
-                .build()
-                .await;
+                .build();
+            // The receiver outlives this send; if it were gone the test has
+            // already failed, so there is nothing to report here.
+            let _ = bound_tx.send(server.ipc_bound_addr());
             // Returning the error rather than discarding it is what lets
             // `wait_until_ready` say *why* a daemon never came up.
             server.run().await.map_err(|e| e.to_string())
         });
 
-        wait_until_ready(port, &mut handle).await;
+        // One ceiling over the whole boot, `build()` included: a build that
+        // wedges never sends its receiver, and must fail the test rather than
+        // hang it.
+        let started = std::time::Instant::now();
+        let mut bound = match tokio::time::timeout(READY_HANG_CEILING, bound_rx).await {
+            Ok(Ok(bound)) => bound,
+            // The task ended before the server was even built: surface its cause.
+            Ok(Err(_)) => match handle.await {
+                Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                other => panic!("daemon task ended before building the server: {other:?}"),
+            },
+            Err(_) => panic!(
+                "daemon is still building after {READY_HANG_CEILING:?} — this is the hang \
+                 ceiling, not a latency assertion, so treat it as a wedged boot"
+            ),
+        };
+        let port = wait_until_ready(started, &mut bound, &mut handle).await;
         Self { port, _data_dir: data_dir, handle }
     }
 
@@ -689,5 +711,55 @@ async fn narrowing_a_connection_stops_another_sessions_events_on_the_wire() {
     narrowed.disconnect().await;
     unfiltered.disconnect().await;
     actor.disconnect().await;
+    daemon.stop();
+}
+
+/// A daemon with no model configured answers a chat by naming the missing
+/// setting, instead of running a turn on a model named "".
+///
+/// That blank name used to resolve to whichever provider claims unprefixed
+/// names, so the turn's steps sent requests naming no model (a debug-assertion
+/// panic in the agent loop, a provider error in release) and the user got no
+/// explanation.
+#[tokio::test]
+async fn a_chat_with_no_model_configured_says_which_setting_is_missing() {
+    let daemon = TestDaemon::start(tempfile::tempdir().expect("temp dir")).await;
+    let client = daemon.connect_client().await;
+    let session = session_id_of(
+        &client
+            .sessions()
+            .create(Some("no model".to_string()))
+            .await
+            .expect("sessions.create succeeds"),
+    );
+    let mut events = client.subscribe_session(session.clone());
+
+    client
+        .chat()
+        .send(&session, "hello")
+        .await
+        .expect("chat.send is accepted");
+
+    let explained = tokio::time::timeout(READY_HANG_CEILING, async {
+        loop {
+            match events.recv().await {
+                Ok(nanna_client::Event::MessageDelta { delta, .. })
+                    if delta.contains("could not run") =>
+                {
+                    return delta;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the session's event stream ended before the turn answered: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the turn answers before the ceiling");
+    assert!(
+        explained.contains("No model is configured") && explained.contains("[llm] model"),
+        "the reply names the missing setting: {explained}"
+    );
+
+    client.disconnect().await;
     daemon.stop();
 }

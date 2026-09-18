@@ -110,10 +110,9 @@ impl ToolPolicy {
         // Matched by `filter` so there is no `unwrap` on this path.
         let real_allowlist = enabled.filter(|e| !e.is_empty() && !e.iter().any(|n| n == "*"));
 
-        let base = match real_allowlist {
-            Some(names) => Self::allow_only(names.iter().cloned()),
-            None => Self::allow_all(),
-        };
+        let base = real_allowlist.map_or_else(Self::allow_all, |names| {
+            Self::allow_only(names.iter().cloned())
+        });
 
         let policy = if disabled.is_empty() {
             base

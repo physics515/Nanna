@@ -142,30 +142,40 @@ impl McpIntegration {
         self.configs.push(config);
     }
 
-    /// Spawn all configured servers and register their tools
+    /// Spawn all configured servers and register their tools.
+    ///
+    /// One server failing does not stop the others. The outcome of each
+    /// auto-started server is returned in configuration order — `Ok(tools)` or
+    /// the reason it did not start — so a caller can report per-server state
+    /// instead of a single aggregate a failed server hides inside.
     ///
     /// # Errors
     ///
-    /// Returns error if any server fails to start
-    pub async fn start_all(&self, registry: &ToolRegistry) -> Result<usize, McpStartError> {
+    /// Returns error only if registering the started servers' tools fails.
+    pub async fn start_all(
+        &self,
+        registry: &ToolRegistry,
+    ) -> Result<Vec<(String, Result<usize, String>)>, McpStartError> {
+        let mut outcomes = Vec::with_capacity(self.configs.len());
         for config in &self.configs {
             if !config.auto_start {
                 debug!(server = %config.name, "Skipping MCP server (auto_start=false)");
                 continue;
             }
-
-            if let Err(e) = self.start_server(config).await {
+            let outcome = self.start_server(config).await.map_err(|e| {
                 error!(server = %config.name, error = %e, "Failed to start MCP server");
-                // Continue with other servers
-            }
+                e.to_string()
+            });
+            outcomes.push((config.name.clone(), outcome));
         }
+        debug_assert!(outcomes.len() <= self.configs.len());
 
         // Register all tools with the registry
         let registered = self.manager.register_with_registry(registry).await
             .map_err(|e| McpStartError::Registration(e.to_string()))?;
 
         info!(servers = self.configs.len(), tools = registered, "MCP integration started");
-        Ok(registered)
+        Ok(outcomes)
     }
 
     /// Start a single MCP server
@@ -206,7 +216,7 @@ impl McpIntegration {
 
     /// Get the tool manager
     #[must_use]
-    pub fn manager(&self) -> &McpToolsManager<StdioTransport> {
+    pub const fn manager(&self) -> &McpToolsManager<StdioTransport> {
         &self.manager
     }
 
@@ -265,7 +275,7 @@ pub struct McpIntegrationBuilder {
 impl McpIntegrationBuilder {
     /// Create a new builder
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             configs: Vec::new(),
         }

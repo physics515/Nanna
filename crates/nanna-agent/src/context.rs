@@ -5,9 +5,12 @@ use nanna_llm::{estimate_tokens, estimate_tokens_for_family, AnthropicMessage, A
 use nanna_workspace::{Workspace, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::numeric::{f32_to_usize, f64_to_usize, usize_to_f32, usize_to_f64};
 
 /// Minimum content size (chars) to consider for deduplication
 const DEDUP_MIN_SIZE: usize = 4_000; // Lowered since CDC handles small chunks well
@@ -46,7 +49,7 @@ fn dedup_coverage(content: &str, known_hashes: &HashSet<u64>) -> f32 {
         return 0.0;
     }
     let known_count = chunks.iter().filter(|c| known_hashes.contains(&c.hash)).count();
-    known_count as f32 / chunks.len() as f32
+    usize_to_f32(known_count) / usize_to_f32(chunks.len())
 }
 
 /// Get chunk hashes for content (for dedup tracking after summarization).
@@ -76,7 +79,9 @@ fn estimate_message_tokens(msg: &AnthropicMessage) -> usize {
 }
 
 /// Whether a model-produced summary is plausible enough to stand in for the
-/// original content. Small models sometimes return degenerate output — empty
+/// original content.
+///
+/// Small models sometimes return degenerate output — empty
 /// text, "...", or a bare title — which, if accepted, silently REPLACES real
 /// data (observed live 2026-07-10: an 80 KB tool result "summarized" to
 /// 17 chars). Reject anything too short in absolute terms or relative to the
@@ -109,7 +114,7 @@ pub fn plausible_summary(summary: &str, source_len: usize) -> bool {
 /// fired 80× at 4,423 tokens on a 16,384-token window with ~3.7k tokens of
 /// real headroom still free, each firing shrinking live working context.
 #[must_use]
-pub fn proactive_compression_due(
+pub const fn proactive_compression_due(
     estimated_tokens: usize,
     max_observed_growth: usize,
     compression_threshold: usize,
@@ -246,19 +251,20 @@ pub enum SummarizationTarget {
 /// Configuration for context summarization
 #[derive(Debug, Clone, Default)]
 pub struct ContextSummarizationConfig {
-    /// Model priority list for summarization (e.g., ["ollama/llama3.2", "anthropic/claude-3-haiku"])
+    /// Model priority list for summarization (e.g., `["ollama/llama3.2", "anthropic/claude-3-haiku"]`)
     pub model_priority: Vec<String>,
     /// Ollama URL if using ollama models
     pub ollama_url: Option<String>,
     /// Maximum iterations to prevent infinite loops
     pub max_iterations: usize,
-    /// OpenRouter API key (for "openrouter/" prefixed models)
+    /// `OpenRouter` API key (for "openrouter/" prefixed models)
     pub openrouter_api_key: Option<String>,
-    /// OpenAI API key (for "openai/" prefixed models)
+    /// `OpenAI` API key (for "openai/" prefixed models)
     pub openai_api_key: Option<String>,
 }
 
 impl ContextSummarizationConfig {
+    #[must_use]
     pub fn new(model_priority: Vec<String>) -> Self {
         Self {
             model_priority,
@@ -269,6 +275,7 @@ impl ContextSummarizationConfig {
         }
     }
 
+    #[must_use]
     pub fn with_ollama_url(mut self, url: impl Into<String>) -> Self {
         self.ollama_url = Some(url.into());
         self
@@ -276,7 +283,9 @@ impl ContextSummarizationConfig {
 }
 
 /// Compressed context summary — the RETURN of [`AgentContext::compress`],
-/// reporting what one pass did. It is not a stored copy of the summary text:
+/// reporting what one pass did.
+///
+/// It is not a stored copy of the summary text:
 /// the only text that reaches a request is [`AgentContext::consolidated_summary`],
 /// and a second copy of it used to be kept in a `summaries` vector that
 /// [`AgentContext::estimate_tokens`] charged to the budget while no request
@@ -372,7 +381,7 @@ pub struct AgentContext {
     /// execution.
     #[serde(default)]
     pub verified_outcomes: Vec<VerifiedOutcome>,
-    /// Live growth measurement feeding [`proactive_compression_due`].
+    /// Live growth measurement feeding `proactive_compression_due`.
     #[serde(default)]
     pub growth: ContextGrowthTracker,
     /// In-context loss announcements, composed where the loss happens (deep
@@ -382,7 +391,7 @@ pub struct AgentContext {
     pending_loss_notices: Vec<String>,
     /// Hashes of content that has been summarized (for deduplication).
     /// If new messages contain content matching these hashes, we skip it
-    /// since it's already represented in the consolidated_summary.
+    /// since it's already represented in the `consolidated_summary`.
     #[serde(default)]
     summarized_content_hashes: HashSet<u64>,
     /// Index of the message carrying the LIVE request — the thing the user
@@ -400,7 +409,7 @@ pub struct AgentContext {
     pinned_request: Option<usize>,
 }
 
-fn default_include_memory() -> bool {
+const fn default_include_memory() -> bool {
     true
 }
 
@@ -445,7 +454,7 @@ impl AgentContext {
     /// this file then routes around it: the request the model is answering
     /// must survive compression, or the run continues against a question it
     /// can no longer read.
-    pub fn pin_live_request(&mut self) {
+    pub const fn pin_live_request(&mut self) {
         self.pinned_request = self.messages.len().checked_sub(1);
     }
 
@@ -467,7 +476,7 @@ impl AgentContext {
     /// Shift the pin after `removed` messages were taken from positions
     /// strictly before it. Removal paths call this instead of touching the
     /// field, so the pin cannot silently drift onto a different message.
-    fn shift_pin_after_removal(&mut self, removed_before_pin: usize) {
+    const fn shift_pin_after_removal(&mut self, removed_before_pin: usize) {
         if let Some(idx) = self.pinned_request {
             self.pinned_request = Some(idx.saturating_sub(removed_before_pin));
         }
@@ -480,6 +489,7 @@ impl AgentContext {
     /// - Large content blocks that match previously summarized content are deduplicated
     /// - This way, previously summarized content is included without re-processing
     /// - Final messages are sanitized to remove empty text blocks (Anthropic rejects them)
+    #[must_use]
     pub fn messages_for_request(&self) -> Vec<AnthropicMessage> {
         // Deduplicate messages if we have summarized content hashes
         let deduped_messages = if self.summarized_content_hashes.is_empty() {
@@ -653,13 +663,14 @@ impl AgentContext {
                 chrono::DateTime::from_timestamp(outcome.verified_at, 0)
                     .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339())
             };
-            block.push_str(&format!(
-                "- {} → {} (×{}, last verified {})\n",
+            let _ = writeln!(
+                block,
+                "- {} → {} (×{}, last verified {})",
                 verified_subject_preview(&outcome.subject),
                 outcome.outcome,
                 outcome.times,
                 when,
-            ));
+            );
         }
         block.push_str("</verified_outcomes>");
         Some(block)
@@ -723,7 +734,7 @@ impl AgentContext {
     }
 
     /// Queue an in-context loss announcement (see
-    /// [`summarization_failure_notice`]). No-op when nothing was dropped —
+    /// `summarization_failure_notice`). No-op when nothing was dropped —
     /// an announcement of zero loss would be noise. Drained by the agent
     /// loop AFTER its compression ladder so the announcement cannot itself
     /// be compressed away in the same pass.
@@ -859,7 +870,7 @@ impl AgentContext {
     /// their framing, and the assistant acknowledgement that keeps
     /// user/assistant alternation.
     ///
-    /// Measured from the text [`Self::context_preamble`] actually produces
+    /// Measured from the text `Self::context_preamble` actually produces
     /// rather than re-derived from the parts, so the number cannot drift away
     /// from what gets sent when the framing changes. Compression's levers
     /// touch only the message list, so this is the part of the request the
@@ -947,9 +958,8 @@ impl AgentContext {
     /// classify text as, so a budget spent in chars can never measure back
     /// above the token budget it came from. Reuses `nanna-llm`'s own ratio
     /// rather than restating one.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn chars_for_tokens(tokens: usize) -> usize {
-        (tokens as f32 * nanna_llm::CHARS_PER_TOKEN_CODE) as usize
+        f32_to_usize(usize_to_f32(tokens) * nanna_llm::CHARS_PER_TOKEN_CODE)
     }
 
     /// Shrink `consolidated_summary` without an LLM so the preamble fits
@@ -1102,14 +1112,14 @@ impl AgentContext {
 
     /// Set the compression threshold
     #[must_use]
-    pub fn with_compression_threshold(mut self, threshold: usize) -> Self {
+    pub const fn with_compression_threshold(mut self, threshold: usize) -> Self {
         self.compression_threshold = threshold;
         self
     }
 
     /// Set the hard limit
     #[must_use]
-    pub fn with_hard_limit(mut self, limit: usize) -> Self {
+    pub const fn with_hard_limit(mut self, limit: usize) -> Self {
         self.hard_limit = limit;
         self
     }
@@ -1189,7 +1199,7 @@ impl AgentContext {
 
     /// Set the context budget in tokens
     #[must_use]
-    pub fn with_context_budget(mut self, budget: usize) -> Self {
+    pub const fn with_context_budget(mut self, budget: usize) -> Self {
         self.context_budget = Some(budget);
         self
     }
@@ -1212,7 +1222,7 @@ impl AgentContext {
 
     /// Deprecated no-op kept for call-site compatibility.
     #[must_use]
-    pub fn with_workspace_memory(self, _include: bool) -> Self {
+    pub const fn with_workspace_memory(self, _include: bool) -> Self {
         self
     }
 
@@ -1264,13 +1274,15 @@ impl AgentContext {
         // is true wherever the preamble renders. A root with no leaf to quote
         // (a filesystem or drive root) gets the rule without the illustration
         // rather than an invented stand-in.
-        let prefix_note = match root.file_name().and_then(std::ffi::OsStr::to_str) {
-            Some(leaf) => format!(
-                " A path beginning `{leaf}/` therefore lands under `{leaf}/{leaf}/`, \
-                 one directory deeper than the file you mean."
-            ),
-            None => String::new(),
-        };
+        let prefix_note = root.file_name().and_then(std::ffi::OsStr::to_str).map_or_else(
+            String::new,
+            |leaf| {
+                format!(
+                    " A path beginning `{leaf}/` therefore lands under `{leaf}/{leaf}/`, \
+                     one directory deeper than the file you mean."
+                )
+            },
+        );
         Some(format!(
             "# Working directory\n\nYou are working in `{}`.\n\nRelative paths in \
              tool calls resolve against this directory, so address files by their \
@@ -1330,23 +1342,23 @@ impl AgentContext {
     /// and ÷4 (25% share) cancel, so the cap in chars equals `hard_limit`.
     /// Derived from the live window (not a magic constant): system prompt,
     /// tools, and history must all fit under `hard_limit`, so the workspace
-    /// slice may claim at most a quarter of it. Floor of 2_000 chars keeps
+    /// slice may claim at most a quarter of it. Floor of `2_000` chars keeps
     /// tiny windows functional.
     #[must_use]
     pub fn workspace_context_cap_chars(&self) -> usize {
         self.hard_limit.max(2_000)
     }
 
-    /// Reload workspace context from disk
+    /// Reload workspace context from disk.
     ///
-    /// # Errors
-    /// Returns error if workspace cannot be loaded
-    pub async fn reload_workspace(&mut self) -> Result<(), nanna_workspace::WorkspaceError> {
+    /// Cannot fail: [`WorkspaceFiles::load`] reads each workspace file
+    /// leniently, so a missing or unreadable file simply drops out of the
+    /// context. Without a workspace root this does nothing.
+    pub async fn reload_workspace(&mut self) {
         if let Some(ref root) = self.workspace_root {
             let files = WorkspaceFiles::load(root).await;
             self.workspace_context = Some(files.to_system_context());
         }
-        Ok(())
     }
 
     /// Allocate a portion of context budget to a sub-agent.
@@ -1379,8 +1391,9 @@ impl AgentContext {
         // This creates a gentle gradient: first agent gets ~10% more than last
         let priority_bonus = if num_agents > 1 {
             let remaining_priority = (distributable * 10) / 100; // 10% for priority distribution
-            let position_factor = (num_agents - 1 - agent_index) as f64 / (num_agents - 1) as f64;
-            ((remaining_priority as f64 * position_factor) / num_agents as f64) as usize
+            let position_factor =
+                usize_to_f64(num_agents - 1 - agent_index) / usize_to_f64(num_agents - 1);
+            f64_to_usize((usize_to_f64(remaining_priority) * position_factor) / usize_to_f64(num_agents))
         } else {
             0
         };
@@ -1397,18 +1410,18 @@ impl AgentContext {
 
         match mode {
             ContextIsolation::Full => {
-                ctx.system_prompt = self.system_prompt.clone();
-                ctx.messages = self.messages.clone();
-                ctx.consolidated_summary = self.consolidated_summary.clone();
-                ctx.distilled_facts = self.distilled_facts.clone();
-                ctx.verified_outcomes = self.verified_outcomes.clone();
+                ctx.system_prompt.clone_from(&self.system_prompt);
+                ctx.messages.clone_from(&self.messages);
+                ctx.consolidated_summary.clone_from(&self.consolidated_summary);
+                ctx.distilled_facts.clone_from(&self.distilled_facts);
+                ctx.verified_outcomes.clone_from(&self.verified_outcomes);
                 ctx.pinned_request = self.pinned_request;
             }
             ContextIsolation::SystemOnly => {
-                ctx.system_prompt = self.system_prompt.clone();
+                ctx.system_prompt.clone_from(&self.system_prompt);
             }
             ContextIsolation::Summary => {
-                ctx.system_prompt = self.system_prompt.clone();
+                ctx.system_prompt.clone_from(&self.system_prompt);
                 // The compressed history lives in `consolidated_summary` —
                 // the one copy any request ever carries.
                 if let Some(ref summary) = self.consolidated_summary {
@@ -1426,7 +1439,7 @@ impl AgentContext {
         // Inherit model limits from parent
         ctx.compression_threshold = self.compression_threshold;
         ctx.hard_limit = self.hard_limit;
-        ctx.current_model = self.current_model.clone();
+        ctx.current_model.clone_from(&self.current_model);
 
         ctx
     }
@@ -1446,11 +1459,11 @@ impl AgentContext {
     /// Estimate token count of the MESSAGE side of a request: the system
     /// prompt plus the message list. This is the quantity compression can
     /// actually change, which is why it is the quantity every tier gates on
-    /// (against a preamble-deducted threshold — see [`Self::message_budget`]).
+    /// (against a preamble-deducted threshold — see `Self::message_budget`).
     ///
     /// Leans conservative on purpose: over-estimating triggers earlier
     /// compression, which is much better than hitting a 400
-    /// context_length_exceeded error mid-run.
+    /// `context_length_exceeded` error mid-run.
     #[must_use]
     pub fn estimate_tokens(&self) -> usize {
         // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
@@ -1484,7 +1497,7 @@ impl AgentContext {
     ///
     /// Same inequality as request-tokens-versus-hard-limit, expressed so it
     /// is ordered against [`Self::needs_compression`] by construction — see
-    /// [`Self::message_budget`].
+    /// `Self::message_budget`.
     #[must_use]
     pub fn exceeds_hard_limit(&self) -> bool {
         self.estimate_tokens() > self.message_hard_limit()
@@ -1568,11 +1581,10 @@ impl AgentContext {
             return;
         }
         self.messages.remove(index);
-        if let Some(pinned) = self.pinned_request {
-            if index < pinned {
+        if let Some(pinned) = self.pinned_request
+            && index < pinned {
                 self.pinned_request = Some(pinned - 1);
             }
-        }
     }
 
     /// Truncate individual content blocks that are too large.
@@ -1582,13 +1594,13 @@ impl AgentContext {
     /// shared equally by the oversized blocks, rather than a fixed
     /// 10,000-token deduction that bore no relation to either.
     fn truncate_large_content_blocks(&mut self) {
+        // Floor at 100 chars: below that the truncation marker is longer than
+        // what it replaces and truncation stops buying anything.
+        const MIN_BLOCK_CHARS: usize = 100;
         let budget_chars = Self::chars_for_tokens(
             self.message_hard_limit()
                 .saturating_sub(estimate_tokens(&self.system_prompt)),
         );
-        // Floor at 100 chars: below that the truncation marker is longer than
-        // what it replaces and truncation stops buying anything.
-        const MIN_BLOCK_CHARS: usize = 100;
         let oversized = self
             .messages
             .iter()
@@ -1622,8 +1634,8 @@ impl AgentContext {
                             );
                         }
                     }
-                    ContentBlock::Text { text } => {
-                        if text.len() > max_block_chars {
+                    ContentBlock::Text { text }
+                        if text.len() > max_block_chars => {
                             let original_len = text.len();
                             let end = text.floor_char_boundary(max_block_chars.min(text.len()));
                             let truncated = &text[..end];
@@ -1633,7 +1645,6 @@ impl AgentContext {
                                 original_len - truncated.len()
                             );
                         }
-                    }
                     _ => {}
                 }
             }
@@ -1656,10 +1667,8 @@ impl AgentContext {
         llm: &LlmClient,
         model: &str,
     ) -> Result<bool, nanna_llm::LlmError> {
-        let mut compressed = false;
-
         // Try compression first if over threshold
-        if self.needs_compression() && self.messages.len() > 10 {
+        let compressed = if self.needs_compression() && self.messages.len() > 10 {
             info!(
                 request_tokens = self.estimate_request_tokens(),
                 message_tokens = self.estimate_tokens(),
@@ -1669,8 +1678,10 @@ impl AgentContext {
                 "Context exceeds compression threshold, compressing"
             );
             self.compress(llm, model, 10).await?;
-            compressed = true;
-        }
+            true
+        } else {
+            false
+        };
 
         // If still over hard limit, truncate
         if self.exceeds_hard_limit() {
@@ -1693,13 +1704,15 @@ impl AgentContext {
     /// * `config` - Summarization configuration (models, limits, etc.)
     ///
     /// # Returns
-    /// * `Ok(iterations)` - Number of summarization passes performed
-    /// * `Err` - If all summarization models fail
+    /// The number of summarization passes performed. Failure is not an
+    /// outcome the caller has to handle: when every summarization model
+    /// fails, or no pass can make progress, the context is truncated here and
+    /// the loss announced through a pending loss notice.
     pub async fn enforce_limits_with_summarization(
         &mut self,
         config: &ContextSummarizationConfig,
         target: SummarizationTarget,
-    ) -> Result<usize, String> {
+    ) -> usize {
         if config.model_priority.is_empty() {
             // No summarization configured, fall back to truncation
             if self.exceeds_hard_limit() {
@@ -1711,7 +1724,7 @@ impl AgentContext {
                      stand in for the dropped messages",
                 );
             }
-            return Ok(0);
+            return 0;
         }
 
         let mut iterations = 0;
@@ -1782,69 +1795,14 @@ impl AgentContext {
             .await
             {
                 Ok((summary, consumed)) => {
-                    // Only messages the summarizer actually READ may be
-                    // dropped. It truncates the blob to its own window, which
-                    // on a small local summarizer is a fraction of a large
-                    // chat window — replacing the whole extraction on the
-                    // strength of that summary silently discarded the rest.
-                    let covered_messages =
-                        covered_ends.iter().take_while(|&&end| end <= consumed).count();
-
-                    if covered_messages == 0 {
-                        // Not even one whole message fit. Dropping anything
-                        // here would delete more than was summarized, and
-                        // looping would spin on the same content forever.
-                        warn!(
-                            consumed,
-                            first_message_ends_at = covered_ends.first().copied().unwrap_or(0),
-                            "summarizer window too small for a single message; truncating instead"
-                        );
-                        let dropped = self.truncate_to_limit();
-                        self.push_summarization_failure_notice(
-                            dropped,
-                            "the summarization model's window is too small to \
-                             read even one whole message",
-                        );
+                    if !self.apply_pass_summary(
+                        content_to_summarize.len(),
+                        &summary,
+                        consumed,
+                        &covered_ends,
+                    ) {
                         break;
                     }
-
-                    let before = self.estimate_request_tokens();
-                    let removed = self.replace_with_summary(covered_messages, &summary);
-                    let after = self.estimate_request_tokens();
-
-                    if removed == 0 {
-                        // Everything the summarizer read is pinned or inside
-                        // the reserved tail. Another pass would extract the
-                        // same content and reach the same verdict, so say so
-                        // and stop rather than logging a completion the exit
-                        // condition never tested.
-                        warn!(
-                            covered_messages,
-                            "summarized content is all pinned or reserved; \
-                             nothing could be replaced"
-                        );
-                        self.push_summarization_failure_notice(
-                            0,
-                            "the summarized messages were all pinned or reserved",
-                        );
-                        break;
-                    }
-
-                    info!(
-                        extracted_len = content_to_summarize.len(),
-                        summarized_len = consumed,
-                        covered_messages,
-                        removed_messages = removed,
-                        summary_len = summary.len(),
-                        request_tokens_before = before,
-                        request_tokens_after = after,
-                        request_tokens_saved = before.saturating_sub(after),
-                        compression = format!(
-                            "{:.1}x",
-                            consumed as f64 / summary.len().max(1) as f64
-                        ),
-                        "Content summarized successfully"
-                    );
                 }
                 Err(e) => {
                     warn!(error = %e, "All summarization models failed, truncating");
@@ -1873,7 +1831,87 @@ impl AgentContext {
             );
         }
 
-        Ok(iterations)
+        iterations
+    }
+
+    /// Replace what one successful summarization pass covered.
+    ///
+    /// `consumed` is how much of the extracted blob (of `extracted_len`
+    /// chars) the summarizer actually read, and `covered_ends` the blob
+    /// offsets where each removable message ended. Returns `false` when the
+    /// pass could not replace anything — the context has then been truncated
+    /// or the loss announced, and another pass would only repeat it.
+    fn apply_pass_summary(
+        &mut self,
+        extracted_len: usize,
+        summary: &str,
+        consumed: usize,
+        covered_ends: &[usize],
+    ) -> bool {
+        // Only messages the summarizer actually READ may be
+        // dropped. It truncates the blob to its own window, which
+        // on a small local summarizer is a fraction of a large
+        // chat window — replacing the whole extraction on the
+        // strength of that summary silently discarded the rest.
+        let covered_messages =
+            covered_ends.iter().take_while(|&&end| end <= consumed).count();
+
+        if covered_messages == 0 {
+            // Not even one whole message fit. Dropping anything
+            // here would delete more than was summarized, and
+            // looping would spin on the same content forever.
+            warn!(
+                consumed,
+                first_message_ends_at = covered_ends.first().copied().unwrap_or(0),
+                "summarizer window too small for a single message; truncating instead"
+            );
+            let dropped = self.truncate_to_limit();
+            self.push_summarization_failure_notice(
+                dropped,
+                "the summarization model's window is too small to \
+                 read even one whole message",
+            );
+            return false;
+        }
+
+        let before = self.estimate_request_tokens();
+        let removed = self.replace_with_summary(covered_messages, summary);
+        let after = self.estimate_request_tokens();
+
+        if removed == 0 {
+            // Everything the summarizer read is pinned or inside
+            // the reserved tail. Another pass would extract the
+            // same content and reach the same verdict, so say so
+            // and stop rather than logging a completion the exit
+            // condition never tested.
+            warn!(
+                covered_messages,
+                "summarized content is all pinned or reserved; \
+                 nothing could be replaced"
+            );
+            self.push_summarization_failure_notice(
+                0,
+                "the summarized messages were all pinned or reserved",
+            );
+            return false;
+        }
+
+        info!(
+            extracted_len,
+            summarized_len = consumed,
+            covered_messages,
+            removed_messages = removed,
+            summary_len = summary.len(),
+            request_tokens_before = before,
+            request_tokens_after = after,
+            request_tokens_saved = before.saturating_sub(after),
+            compression = format!(
+                "{:.1}x",
+                usize_to_f64(consumed) / usize_to_f64(summary.len().max(1))
+            ),
+            "Content summarized successfully"
+        );
+        true
     }
 
     /// Extract content from oldest messages for summarization
@@ -1913,7 +1951,7 @@ impl AgentContext {
                 let block_text = match block {
                     ContentBlock::Text { text } => text.clone(),
                     ContentBlock::ToolUse { name, input, .. } => {
-                        format!("[Tool call: {} with input: {}]", name, input)
+                        format!("[Tool call: {name} with input: {input}]")
                     }
                     ContentBlock::ToolResult { content, .. } => content.clone(),
                     ContentBlock::Thinking { thinking, .. } => {
@@ -1932,7 +1970,7 @@ impl AgentContext {
                     return (content, covered_ends);
                 }
 
-                content.push_str(&format!("[{}]: {}\n", msg.role, block_text));
+                let _ = writeln!(content, "[{}]: {}", msg.role, block_text);
                 chars_collected += block_text.len();
             }
             // Recorded only once every block of the message fit: a partially
@@ -2130,8 +2168,7 @@ impl AgentContext {
         let prompt = format!(
             "Summarize the following conversation history concisely. Preserve key facts, decisions, \
              file paths, code snippets, and important context needed to continue the conversation.\n\n\
-             ---\n{}\n---\n\nProvide a concise summary:",
-            truncated
+             ---\n{truncated}\n---\n\nProvide a concise summary:"
         );
 
         let request = AnthropicRequest {
@@ -2201,7 +2238,7 @@ impl AgentContext {
                     }
                 }
                 _ => {
-                    return Err(format!("Unknown provider: {}", provider));
+                    return Err(format!("Unknown provider: {provider}"));
                 }
             };
             Ok((client, model.to_string()))
@@ -2214,7 +2251,7 @@ impl AgentContext {
 
     /// Replace summarized content with the summary.
     ///
-    /// Updates the consolidated_summary field for incremental summarization.
+    /// Updates the `consolidated_summary` field for incremental summarization.
     /// On subsequent requests, the consolidated summary is prepended to messages,
     /// avoiding the need to re-summarize everything.
     ///
@@ -2279,15 +2316,15 @@ impl AgentContext {
             }
 
             // Update the consolidated summary (append new summary to existing if present)
-            let new_consolidated = if let Some(ref existing) = self.consolidated_summary {
+            let new_consolidated = self.consolidated_summary.as_ref().map_or_else(
+                || summary.to_string(),
                 // Combine existing summary with new summary
-                format!(
-                    "{}\n\n---\n\n[Additional context from {} more messages:]\n{}",
-                    existing, remove_count, summary
-                )
-            } else {
-                summary.to_string()
-            };
+                |existing| {
+                    format!(
+                        "{existing}\n\n---\n\n[Additional context from {remove_count} more messages:]\n{summary}"
+                    )
+                },
+            );
 
             self.consolidated_summary = Some(new_consolidated.clone());
 
@@ -2347,10 +2384,10 @@ impl AgentContext {
                         } else {
                             text.clone()
                         };
-                        dropped_summary_parts.push(format!("[{}]: {}", role, preview));
+                        dropped_summary_parts.push(format!("[{role}]: {preview}"));
                     }
                     ContentBlock::ToolUse { name, .. } => {
-                        dropped_summary_parts.push(format!("[{}]: [tool call: {}]", role, name));
+                        dropped_summary_parts.push(format!("[{role}]: [tool call: {name}]"));
                     }
                     ContentBlock::ToolResult { content, .. } => {
                         let preview = if content.len() > 80 {
@@ -2358,7 +2395,7 @@ impl AgentContext {
                         } else {
                             content.clone()
                         };
-                        dropped_summary_parts.push(format!("[tool result]: {}", preview));
+                        dropped_summary_parts.push(format!("[tool result]: {preview}"));
                     }
                     _ => {}
                 }
@@ -2373,7 +2410,7 @@ impl AgentContext {
 
         // Update consolidated summary
         let new_summary = if let Some(ref existing) = self.consolidated_summary {
-            format!("{}\n\n---\n\n{}", existing, drop_note)
+            format!("{existing}\n\n---\n\n{drop_note}")
         } else {
             drop_note
         };
@@ -2459,8 +2496,8 @@ impl AgentContext {
             if compressed.len() >= content.len() {
                 continue;
             }
-            if let Some(msg) = self.messages.get_mut(msg_idx) {
-                if let Some(ContentBlock::ToolResult {
+            if let Some(msg) = self.messages.get_mut(msg_idx)
+                && let Some(ContentBlock::ToolResult {
                     content: slot,
                     ..
                 }) = msg.content.get_mut(block_idx)
@@ -2488,7 +2525,6 @@ impl AgentContext {
                         "🗜️ Compressed older tool result in context"
                     );
                 }
-            }
         }
 
         if compressed_count > 0 {
@@ -2502,6 +2538,48 @@ impl AgentContext {
             );
         }
         compressed_count
+    }
+
+    /// The transcript [`Self::compress`] asks the model to summarize: one line
+    /// per block, with tool results and reasoning cut to their first 200
+    /// bytes (at a char boundary) and images reduced to a marker.
+    fn conversation_text_for_compression(messages: &[&AnthropicMessage]) -> String {
+        let mut conversation_text = String::new();
+        for msg in messages {
+            let role = &msg.role;
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        let _ = writeln!(conversation_text, "[{role}]: {text}");
+                    }
+                    ContentBlock::ToolUse { name, .. } => {
+                        let _ = writeln!(conversation_text, "[{role}]: [Called tool: {name}]");
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        // Truncate long tool results in summary
+                        let truncated = if content.len() > 200 {
+                            format!("{}...", &content[..content.floor_char_boundary(200)])
+                        } else {
+                            content.clone()
+                        };
+                        let _ = writeln!(conversation_text, "[tool result]: {truncated}");
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        // Include reasoning in summary, truncated
+                        let truncated = if thinking.len() > 200 {
+                            format!("{}...", &thinking[..thinking.floor_char_boundary(200)])
+                        } else {
+                            thinking.clone()
+                        };
+                        let _ = writeln!(conversation_text, "[thinking]: {truncated}");
+                    }
+                    ContentBlock::Image { .. } => {
+                        conversation_text.push_str("[image]\n");
+                    }
+                }
+            }
+        }
+        conversation_text
     }
 
     /// Compress old messages into a summary using LLM.
@@ -2535,55 +2613,20 @@ impl AgentContext {
             old_indices.iter().filter_map(|&i| self.messages.get(i)).collect();
 
         // Build a text representation of old messages
-        let mut conversation_text = String::new();
-        for msg in &old_messages {
-            let role = &msg.role;
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        conversation_text.push_str(&format!("[{role}]: {text}\n"));
-                    }
-                    ContentBlock::ToolUse { name, .. } => {
-                        conversation_text.push_str(&format!("[{role}]: [Called tool: {name}]\n"));
-                    }
-                    ContentBlock::ToolResult { content, .. } => {
-                        // Truncate long tool results in summary
-                        let truncated = if content.len() > 200 {
-                            format!("{}...", &content[..content.floor_char_boundary(200)])
-                        } else {
-                            content.clone()
-                        };
-                        conversation_text.push_str(&format!("[tool result]: {truncated}\n"));
-                    }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        // Include reasoning in summary, truncated
-                        let truncated = if thinking.len() > 200 {
-                            format!("{}...", &thinking[..thinking.floor_char_boundary(200)])
-                        } else {
-                            thinking.clone()
-                        };
-                        conversation_text.push_str(&format!("[thinking]: {truncated}\n"));
-                    }
-                    ContentBlock::Image { .. } => {
-                        conversation_text.push_str("[image]\n");
-                    }
-                }
-            }
-        }
+        let conversation_text = Self::conversation_text_for_compression(&old_messages);
 
         // Create summarization prompt
         let prompt = format!(
-            r#"Summarize this conversation concisely, preserving key facts, decisions, and context that would be important for continuing the conversation. Focus on:
+            r"Summarize this conversation concisely, preserving key facts, decisions, and context that would be important for continuing the conversation. Focus on:
 - Important user preferences or information shared
 - Key decisions or conclusions reached
 - Relevant context about ongoing tasks or projects
 - Any commitments or follow-ups mentioned
 
 Conversation to summarize:
-{}
+{conversation_text}
 
-Provide a concise summary (2-4 paragraphs max):"#,
-            conversation_text
+Provide a concise summary (2-4 paragraphs max):"
         );
 
         // Call LLM for summarization
@@ -2677,10 +2720,10 @@ impl Default for AgentContext {
 /// 4 chars/token ratio. For pure English prose the real ratio is ~4, but
 /// code identifiers, JSON keys, and special characters tokenize much worse.
 /// Over-estimating by ~20% is a good trade: it triggers compression a bit
-/// earlier but avoids the catastrophic 400 context_length_exceeded error.
-fn estimate_token_count(char_len: usize) -> usize {
+/// earlier but avoids the catastrophic 400 `context_length_exceeded` error.
+const fn estimate_token_count(char_len: usize) -> usize {
     // (char_len * 10) / 32 ≈ char_len / 3.2
-    (char_len * 10 + 31) / 32 // +31 for ceiling division
+    (char_len * 10).div_ceil(32) // +31 for ceiling division
 }
 
 fn chrono_timestamp() -> i64 {
@@ -2713,7 +2756,7 @@ mod tests {
             7,
             "10 messages, last 2 reserved, the pinned request never offered"
         );
-        assert!(!content.is_empty());
+        assert_ne!(content, "");
 
         // ...but suppose the summarizer's window only reached the third of them.
         let consumed = covered_ends[2];
@@ -3029,11 +3072,11 @@ mod tests {
     }
 
     /// The 2026-08-02 failure, replayed at the context level: a mid-run
-    /// num_ctx demotion (16384 → 4096) must rebind EVERY window-derived
+    /// `num_ctx` demotion (16384 → 4096) must rebind EVERY window-derived
     /// budget — compression threshold, hard limit, workspace cap — and the
     /// existing no-LLM ladder must then shrink a transcript budgeted for the
     /// old window down to the new one. The mock window source is the real
-    /// nanna-llm latch, driven by demote_context on a test-unique model.
+    /// nanna-llm latch, driven by `demote_context` on a test-unique model.
     #[test]
     fn a_mid_run_demotion_rebinds_budgets_and_the_ladder_fits_the_new_window() {
         let model = "test-ctx-demotion-model:9b";
@@ -3318,7 +3361,7 @@ mod tests {
             "max_messages": 100,
         });
         let ctx: AgentContext = serde_json::from_value(json).expect("pre-P22 contexts must load");
-        assert!(ctx.verified_outcomes.is_empty());
+        assert_eq!(ctx.verified_outcomes, Vec::<VerifiedOutcome>::new());
         assert!(ctx.distilled_facts.is_none());
         assert_eq!(ctx.growth.max_observed_growth, 0);
     }
@@ -3369,8 +3412,7 @@ mod tests {
             ..Default::default()
         };
         ctx.enforce_limits_with_summarization(&config, SummarizationTarget::HardLimit)
-            .await
-            .expect("the no-model path cannot fail");
+            .await;
 
         let notices = ctx.take_pending_loss_notices();
         assert_eq!(notices.len(), 1, "one loss event, one announcement");

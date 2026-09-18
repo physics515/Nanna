@@ -83,7 +83,7 @@ impl Tool for TextToSpeechTool {
 
         let audio_data = tts_fn(text.to_string(), voice)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("TTS failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("TTS failed: {e}")))?;
 
         // Save to file if output specified or default dir
         let output_path = params
@@ -94,18 +94,17 @@ impl Tool for TextToSpeechTool {
                 self.output_dir.as_ref().map(|dir| {
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    format!("{}/tts_{}.mp3", dir, timestamp)
+                        .map_or(0, |d| d.as_secs());
+                    format!("{dir}/tts_{timestamp}.mp3")
                 })
             });
 
         if let Some(path) = &output_path {
             tokio::fs::write(path, &audio_data)
                 .await
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write audio: {}", e)))?;
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write audio: {e}")))?;
 
-            Ok(ToolResult::success(format!("Generated speech saved to: {}", path))
+            Ok(ToolResult::success(format!("Generated speech saved to: {path}"))
                 .with_data(serde_json::json!({
                     "path": path,
                     "size_bytes": audio_data.len(),
@@ -173,18 +172,18 @@ impl Tool for TranscribeTool {
             // Treat as file path
             tokio::fs::read(audio)
                 .await
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read audio file: {}", e)))?
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read audio file: {e}")))?
         } else {
             // Treat as base64
             base64_decode(audio)
-                .map_err(|e| ToolError::ExecutionFailed(format!("Invalid base64 audio: {}", e)))?
+                .map_err(|e| ToolError::ExecutionFailed(format!("Invalid base64 audio: {e}")))?
         };
 
         debug!("Transcribing {} bytes of audio", audio_data.len());
 
         let transcript = transcribe_fn(audio_data, language)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Transcription failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Transcription failed: {e}")))?;
 
         Ok(ToolResult::success(transcript))
     }
@@ -201,7 +200,7 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// OpenAI TTS client helper
+/// `OpenAI` TTS client helper
 pub struct OpenAiTts {
     api_key: String,
     model: String,
@@ -249,23 +248,23 @@ impl OpenAiTts {
             }))
             .send()
             .await
-            .map_err(|e| format!("TTS request failed: {}", e))?;
+            .map_err(|e| format!("TTS request failed: {e}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("TTS API error {}: {}", status, body));
+            return Err(format!("TTS API error {status}: {body}"));
         }
 
         response
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| format!("Failed to read audio: {}", e))
+            .map_err(|e| format!("Failed to read audio: {e}"))
     }
 }
 
-/// OpenAI Whisper transcription client helper
+/// `OpenAI` Whisper transcription client helper
 pub struct OpenAiWhisper {
     api_key: String,
     model: String,
@@ -297,7 +296,7 @@ impl OpenAiWhisper {
         let file_part = reqwest::multipart::Part::bytes(audio.to_vec())
             .file_name("audio.mp3")
             .mime_str("audio/mpeg")
-            .map_err(|e| format!("Failed to create form part: {}", e))?;
+            .map_err(|e| format!("Failed to create form part: {e}"))?;
 
         let mut form = reqwest::multipart::Form::new()
             .text("model", self.model.clone())
@@ -313,18 +312,18 @@ impl OpenAiWhisper {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| format!("Transcription request failed: {}", e))?;
+            .map_err(|e| format!("Transcription request failed: {e}"))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("Whisper API error {}: {}", status, body));
+            return Err(format!("Whisper API error {status}: {body}"));
         }
 
         let result: WhisperResponse = response
             .json()
             .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
 
         Ok(result.text)
     }

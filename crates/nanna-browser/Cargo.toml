@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["cdp"]
-cdp = ["chromiumoxide"]
+cdp = ["chromiumoxide", "tempfile"]
 playwright = ["playwright-rs"]
 
 [dependencies]
@@ -20,6 +20,8 @@ futures = "0.3"
 # Browser automation via CDP (optional)
 # 0.9 is tokio-only; the old `tokio-runtime` feature no longer exists.
 chromiumoxide = { version = "0.9", optional = true }
+# Each launched browser gets its own profile directory (see cdp::CdpBrowser).
+tempfile = { version = "3", optional = true }
 
 # Playwright for multi-browser support (Firefox, WebKit, Chromium)
 playwright-rs = { version = "0.18", optional = true }

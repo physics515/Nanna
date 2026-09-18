@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 // Tracing available for future use
-use tracing::debug;
 
 /// Browser manager that maintains a browser instance for tool use.
 pub struct BrowserManager {
@@ -40,27 +39,22 @@ impl BrowserManager {
 
     /// Get or create a page for the given URL.
     async fn get_page(&self, url: &str) -> Result<Arc<dyn BrowserPage>, BrowserError> {
-        // Check if we have a cached page at the same URL
-        let cached = self.current_page.read().await;
-        if cached.is_some() {
-            // If same URL, reuse
-            // Note: page.url() might not work well, so we always navigate
-            drop(cached);
-        } else {
-            drop(cached);
-        }
-
-        // Navigate to URL
+        // A cached page is never reused, even at the same URL: `page.url()`
+        // might not work well, so we always navigate.
         let page = self.browser.navigate(url).await?;
         
         // Cache it
-        let mut guard = self.current_page.write().await;
-        *guard = Some(page.clone());
+        *self.current_page.write().await = Some(page.clone());
         
         Ok(page)
     }
 
     /// Take a screenshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's message if navigating to `url` or capturing the
+    /// screenshot fails.
     pub async fn screenshot(
         &self,
         url: &str,
@@ -70,22 +64,25 @@ impl BrowserManager {
 
         let full_page = params
             .get("full_page")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let format = params
             .get("format")
             .and_then(|v| v.as_str())
-            .map(|f| match f.to_lowercase().as_str() {
+            .map_or(ImageFormat::Png, |f| match f.to_lowercase().as_str() {
                 "jpeg" | "jpg" => ImageFormat::Jpeg,
                 _ => ImageFormat::Png,
-            })
-            .unwrap_or(ImageFormat::Png);
+            });
 
         let options = ScreenshotOptions {
             full_page,
             format,
-            quality: params.get("quality").and_then(|v| v.as_u64()).map(|q| q as u8),
+            // The low byte, exactly what the `as u8` this replaced kept.
+            quality: params
+                .get("quality")
+                .and_then(serde_json::Value::as_u64)
+                .map(|q| q.to_le_bytes()[0]),
             selector: params.get("selector").and_then(|v| v.as_str()).map(String::from),
         };
 
@@ -93,6 +90,12 @@ impl BrowserManager {
     }
 
     /// Extract content from a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if `attribute` is given
+    /// without a `selector`, or if reading the attribute, evaluating the
+    /// selector script, or reading the page's HTML or text fails.
     pub async fn extract(
         &self,
         url: &str,
@@ -147,6 +150,13 @@ impl BrowserManager {
     }
 
     /// Perform an action on a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if `action` is missing
+    /// or unknown, if a parameter the action needs (`selector`, `text`, `key`,
+    /// or the `value` URL for `navigate`) is missing, or if the page operation
+    /// itself fails.
     pub async fn action(
         &self,
         url: &str,
@@ -166,7 +176,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Click requires 'selector'")?;
                 page.click(selector).await.map_err(|e| e.to_string())?;
-                Ok(format!("Clicked '{}'", selector))
+                Ok(format!("Clicked '{selector}'"))
             }
             "type" => {
                 let selector = params
@@ -178,7 +188,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Type requires 'text'")?;
                 page.type_text(selector, text).await.map_err(|e| e.to_string())?;
-                Ok(format!("Typed into '{}'", selector))
+                Ok(format!("Typed into '{selector}'"))
             }
             "fill" => {
                 let selector = params
@@ -190,7 +200,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Fill requires 'text'")?;
                 page.fill(selector, text).await.map_err(|e| e.to_string())?;
-                Ok(format!("Filled '{}'", selector))
+                Ok(format!("Filled '{selector}'"))
             }
             "press" => {
                 let selector = params
@@ -202,15 +212,15 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("Press requires 'key'")?;
                 page.press(selector, key).await.map_err(|e| e.to_string())?;
-                Ok(format!("Pressed '{}' on '{}'", key, selector))
+                Ok(format!("Pressed '{key}' on '{selector}'"))
             }
             "wait" => {
                 let ms = params
                     .get("wait_ms")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(1000);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                Ok(format!("Waited {}ms", ms))
+                Ok(format!("Waited {ms}ms"))
             }
             "wait_selector" => {
                 let selector = params
@@ -218,7 +228,7 @@ impl BrowserManager {
                     .and_then(|v| v.as_str())
                     .ok_or("wait_selector requires 'selector'")?;
                 page.wait_for_selector(selector).await.map_err(|e| e.to_string())?;
-                Ok(format!("Found '{}'", selector))
+                Ok(format!("Found '{selector}'"))
             }
             // `scroll` and `navigate` are both in the `browser_action` skill's
             // advertised enum and neither was implemented, so the model was
@@ -247,11 +257,16 @@ impl BrowserManager {
                 page.goto(target).await.map_err(|e| e.to_string())?;
                 Ok(format!("Navigated to '{target}'"))
             }
-            _ => Err(format!("Unknown action: {}", action)),
+            _ => Err(format!("Unknown action: {action}")),
         }
     }
 
     /// Evaluate JavaScript on a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if navigating to `url` fails, if neither `expression`
+    /// nor `script` is given, or if evaluating the script fails.
     pub async fn evaluate(
         &self,
         url: &str,
@@ -272,6 +287,10 @@ impl BrowserManager {
     }
 
     /// Close the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's [`BrowserError`] if closing the browser fails.
     pub async fn close(&self) -> Result<(), BrowserError> {
         self.browser.close().await
     }
@@ -308,7 +327,7 @@ pub fn create_browser_tools(
     let action_tool = BrowserActionTool::new().with_action_fn(action_fn);
 
     // Evaluate tool
-    let mgr = manager.clone();
+    let mgr = manager;
     let evaluate_fn: BrowserFn<Value> = Arc::new(move |url, params| {
         let mgr = mgr.clone();
         Box::pin(async move { mgr.evaluate(&url, &params).await })
@@ -325,7 +344,7 @@ mod tests {
     #[test]
     fn test_browser_manager_creation() {
         // Just test that the types are correct - actual browser tests need integration
-        let config = BrowserConfig::default();
+        let _config = BrowserConfig::default();
         // Would need actual browser installed to test:
         // let manager = BrowserManager::from_config(config);
     }

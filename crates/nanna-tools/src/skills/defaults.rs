@@ -17,7 +17,8 @@ include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
 
 /// Parse a semver version string into (major, minor, patch) tuple.
 /// Returns None if the string is not a valid semver triple.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     // Strip leading 'v' if present
     let v = v.strip_prefix('v').unwrap_or(v);
@@ -35,7 +36,8 @@ fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Returns true if `embedded` version is strictly greater than `installed`.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn is_newer_version(embedded: &str, installed: &str) -> bool {
     match (parse_semver(embedded), parse_semver(installed)) {
         (Some(e), Some(i)) => e > i,
@@ -46,14 +48,15 @@ fn is_newer_version(embedded: &str, installed: &str) -> bool {
 
 /// Extract the version field from a tool.ts source string.
 /// Looks for `version: "x.y.z"` or `version: 'x.y.z'` in the source.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+// Release builds refresh extracted skills by version; tests cover it everywhere.
+#[cfg(any(not(debug_assertions), test))]
 fn extract_version_from_source(source: &str) -> Option<String> {
     // Reuse the same pattern as extract_string_field in nanna-scripting
     let patterns = [
         r#"version: ""#,
-        r#"version: '"#,
+        r"version: '",
         r#"version:""#,
-        r#"version:'"#,
+        r"version:'",
     ];
     for pattern in &patterns {
         if let Some(start) = source.find(pattern) {
@@ -68,6 +71,8 @@ fn extract_version_from_source(source: &str) -> Option<String> {
 }
 
 /// Directory name, under this crate, holding the bundled JS/TS skills.
+/// Only the debug-build source-tree fallback reads it.
+#[cfg(debug_assertions)]
 const DEV_SKILLS_DIR_NAME: &str = "default-skills";
 
 /// In debug builds, fall back to the source tree's `default-skills` directory.
@@ -137,7 +142,7 @@ const FILESYSTEM_WILDCARD: &str = "*";
 /// Pure and cheap, so the always-on guard in [`ensure_permissions`] and the test
 /// that pins this decision assert the identical property. A scope is home-bounded
 /// when it is non-empty (an empty list would break every undeclared tool rather
-/// than confine it) and names no [`FILESYSTEM_WILDCARD`].
+/// than confine it) and names no `FILESYSTEM_WILDCARD`.
 #[must_use]
 pub fn default_permissions_are_home_bounded() -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(DEFAULT_PERMISSIONS_JSON) else {
@@ -226,7 +231,7 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
     #[cfg(debug_assertions)]
     {
         let _ = tools_dir; // suppress unused warning
-        return 0;
+        0
     }
 
     #[cfg(not(debug_assertions))]
@@ -322,6 +327,13 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
 ///
 /// Returns the count of directories granted, so a caller can say so at boot and
 /// so the announcement is testable without scraping logs.
+///
+/// # Panics
+///
+/// Panics if [`DEFAULT_PERMISSIONS_JSON`] is not home-bounded (see
+/// [`default_permissions_are_home_bounded`]) — a defect in this build's
+/// constant, never in the directory. The check stays on in release builds so a
+/// fail-open default can never be written to disk.
 pub fn ensure_permissions(tools_dir: &Path) -> usize {
     assert!(
         default_permissions_are_home_bounded(),
@@ -409,7 +421,7 @@ mod tests {
         fn set(value: Option<&std::path::Path>) -> Self {
             // A poisoned lock only means some other test panicked; the env is still
             // ours to restore, so recover rather than cascade the failure.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous = std::env::var_os("NANNA_TOOLS_DIR");
             match value {
                 // SAFETY: every writer of this variable holds ENV_LOCK, so no other
@@ -673,10 +685,10 @@ mod tests {
             Some("0.1.0".to_string())
         );
 
-        let source_single = r#"export default {
+        let source_single = r"export default {
   name: 'exec',
   version: '1.2.3',
-}"#;
+}";
         assert_eq!(
             extract_version_from_source(source_single),
             Some("1.2.3".to_string())

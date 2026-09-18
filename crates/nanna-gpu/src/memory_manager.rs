@@ -158,7 +158,7 @@ impl GpuVectorStore {
     /// # Errors
     ///
     /// Returns error if GPU memory is insufficient.
-    pub async fn sync(&mut self, ctx: &GpuContext) -> Result<(), MemoryError> {
+    pub fn sync(&mut self, ctx: &GpuContext) -> Result<(), MemoryError> {
         let active_count = self.vectors.len() - self.removed_indices.len();
         let required_bytes = active_count as u64 * self.bytes_per_vector;
 
@@ -190,13 +190,13 @@ impl GpuVectorStore {
 
     /// Search for similar vectors using cosine similarity.
     ///
-    /// Returns vector of (original_index, similarity_score) pairs.
+    /// Returns vector of (`original_index`, `similarity_score`) pairs.
     ///
     /// # Arguments
     ///
     /// * `ctx` - GPU context
     /// * `search` - Cosine similarity search pipeline
-    /// * `query` - Query vector (must match vector_dim)
+    /// * `query` - Query vector (must match `vector_dim`)
     ///
     /// # Errors
     ///
@@ -240,12 +240,15 @@ impl GpuVectorStore {
     }
 
     /// Get current memory statistics.
+    #[must_use]
     pub fn stats(&self, ctx: &GpuContext) -> GpuMemoryStats {
         let vectors_resident = self.vectors.len() - self.removed_indices.len();
         let bytes_used = vectors_resident as u64 * self.bytes_per_vector;
-        let bytes_available = ctx.device.limits().max_storage_buffer_binding_size as u64;
+        let bytes_available = ctx.device.limits().max_storage_buffer_binding_size;
         let batches_required = if bytes_used > 0 {
-            ((bytes_used + self.max_buffer_size - 1) / self.max_buffer_size) as usize
+            // Saturates only where `usize` is narrower than `u64` and the count
+            // exceeds it; on 64-bit targets the conversion is always exact.
+            usize::try_from(bytes_used.div_ceil(self.max_buffer_size)).unwrap_or(usize::MAX)
         } else {
             0
         };
@@ -260,19 +263,19 @@ impl GpuVectorStore {
 
     /// Get the number of vectors in the store (including removed).
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.vectors.len()
     }
 
     /// Check if the store is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.vectors.is_empty()
     }
 
     /// Get the vector dimension.
     #[must_use]
-    pub fn vector_dim(&self) -> usize {
+    pub const fn vector_dim(&self) -> usize {
         self.vector_dim
     }
 
@@ -306,16 +309,17 @@ impl BatchedSearch {
     ///
     /// * `ctx` - GPU context (used to query memory limits)
     /// * `vector_dim` - Dimension of vectors
+    #[must_use]
     pub fn new(ctx: &GpuContext, vector_dim: usize) -> Self {
-        let max_buffer_size = ctx.device.limits().max_storage_buffer_binding_size as u64;
+        let max_buffer_size = ctx.device.limits().max_storage_buffer_binding_size;
         let bytes_per_vector = (vector_dim * std::mem::size_of::<f32>()) as u64;
         
         // Batch size: how many vectors fit in 80% of max buffer
-        let batch_size = if bytes_per_vector > 0 {
-            ((max_buffer_size * 80 / 100) / bytes_per_vector).max(1) as usize
-        } else {
-            1
-        };
+        // Zero-width vectors get a batch size of 1. The saturation applies only
+        // where `usize` is narrower than `u64`; on 64-bit targets it is exact.
+        let batch_size = (max_buffer_size * 80 / 100)
+            .checked_div(bytes_per_vector)
+            .map_or(1, |per_batch| usize::try_from(per_batch.max(1)).unwrap_or(usize::MAX));
 
         Self {
             batch_size,
@@ -324,11 +328,11 @@ impl BatchedSearch {
 
     /// Calculate the number of batches needed for a given number of vectors.
     #[must_use]
-    pub fn batches_needed(&self, num_vectors: usize) -> usize {
+    pub const fn batches_needed(&self, num_vectors: usize) -> usize {
         if num_vectors == 0 {
             0
         } else {
-            (num_vectors + self.batch_size - 1) / self.batch_size
+            num_vectors.div_ceil(self.batch_size)
         }
     }
 
@@ -384,7 +388,7 @@ impl BatchedSearch {
 
     /// Get the configured batch size.
     #[must_use]
-    pub fn batch_size(&self) -> usize {
+    pub const fn batch_size(&self) -> usize {
         self.batch_size
     }
 }
@@ -454,7 +458,7 @@ mod tests {
             Err(GpuError::NoAdapter) => {
                 println!("No GPU adapter, skipping test");
             }
-            Err(e) => panic!("Unexpected error: {}", e),
+            Err(e) => panic!("Unexpected error: {e}"),
         }
     }
 
@@ -470,7 +474,7 @@ mod tests {
             Err(GpuError::NoAdapter) => {
                 println!("No GPU adapter, skipping test");
             }
-            Err(e) => panic!("Unexpected error: {}", e),
+            Err(e) => panic!("Unexpected error: {e}"),
         }
     }
 

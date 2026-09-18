@@ -5,13 +5,17 @@
 //! `config.toml` (which the daemon also reads); model/tool listings that need
 //! live state are fetched from the daemon.
 
-#[allow(clippy::wildcard_imports)]
-use crate::*;
+use crate::backend::Backend;
+use crate::state::{backend_handle, AppConfig, AppState, ModelStatusEvent};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 /// Tool names as seen by the daemon's registry (empty if the daemon is down).
-async fn daemon_tool_names(state: &AppState) -> Vec<String> {
-    state
-        .backend
+async fn daemon_tool_names(backend: &Backend) -> Vec<String> {
+    backend
         .tool_list()
         .await
         .ok()
@@ -23,6 +27,53 @@ async fn daemon_tool_names(state: &AppState) -> Vec<String> {
             })
         })
         .unwrap_or_default()
+}
+
+/// The tools in a daemon `tool.list` reply; `None` when it has no `tools`
+/// array. Entries without a string `name` are skipped.
+pub(crate) fn tool_infos(reply: &serde_json::Value) -> Option<Vec<ToolInfo>> {
+    reply.get("tools").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|t| {
+                Some(ToolInfo {
+                    name: t.get("name")?.as_str()?.to_string(),
+                    description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    enabled: t.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                    is_user_tool: t.get("is_user_tool").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect()
+    })
+}
+
+/// The chat models the settings pickers offer before a provider's live list
+/// has been fetched.
+fn known_chat_models() -> Vec<String> {
+    vec![
+        // Anthropic
+        "claude-opus-4-20250514".to_string(),
+        "claude-sonnet-4-20250514".to_string(),
+        "claude-3-5-sonnet-20241022".to_string(),
+        "claude-3-5-haiku-20241022".to_string(),
+        // OpenAI
+        "gpt-4o".to_string(),
+        "gpt-4o-mini".to_string(),
+        "gpt-4-turbo".to_string(),
+        "o1".to_string(),
+        "o1-mini".to_string(),
+        // OpenRouter
+        "deepseek/deepseek-chat".to_string(),
+        "google/gemini-2.5-flash-preview-05-20".to_string(),
+        "google/gemini-2.5-pro-preview-05-06".to_string(),
+        // Ollama (local)
+        "llama3.2".to_string(),
+        "llama3.1".to_string(),
+        "mistral".to_string(),
+        "mixtral".to_string(),
+        "codellama".to_string(),
+        "qwen2.5".to_string(),
+        "deepseek-coder-v2".to_string(),
+    ]
 }
 
 /// Format Claude model IDs into friendly names.
@@ -38,11 +89,15 @@ fn format_claude_model_name(id: &str) -> String {
 }
 
 /// Get application config
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon lists no tools.
 #[tauri::command]
 pub async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppConfig, String> {
-    let state_guard = state.read().await;
+    let tool_names: Vec<String> = daemon_tool_names(&*backend_handle(&state).await).await;
 
-    let tool_names: Vec<String> = daemon_tool_names(&state_guard).await;
+    let state_guard = state.read().await;
 
     Ok(AppConfig {
         theme: "dark".to_string(),
@@ -57,84 +112,40 @@ pub async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppCo
             ]
             .iter()
             .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty())),
-        available_models: vec![
-            // Anthropic
-            "claude-opus-4-20250514".to_string(),
-            "claude-sonnet-4-20250514".to_string(),
-            "claude-3-5-sonnet-20241022".to_string(),
-            "claude-3-5-haiku-20241022".to_string(),
-            // OpenAI
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-            "gpt-4-turbo".to_string(),
-            "o1".to_string(),
-            "o1-mini".to_string(),
-            // OpenRouter
-            "deepseek/deepseek-chat".to_string(),
-            "google/gemini-2.5-flash-preview-05-20".to_string(),
-            "google/gemini-2.5-pro-preview-05-06".to_string(),
-            // Ollama (local)
-            "llama3.2".to_string(),
-            "llama3.1".to_string(),
-            "mistral".to_string(),
-            "mixtral".to_string(),
-            "codellama".to_string(),
-            "qwen2.5".to_string(),
-            "deepseek-coder-v2".to_string(),
-        ],
+        available_models: known_chat_models(),
         available_tools: tool_names,
     })
 }
 
 /// Update model setting
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async
+/// command that borrows `State`. The change is not saved to `config.toml`.
 #[tauri::command]
 pub async fn set_model(state: State<'_, Arc<RwLock<AppState>>>, model: String) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-    state_guard.config.llm.model = model;
-    Ok(())
-}
-
-/// Set API key
-#[tauri::command]
-pub async fn set_api_key(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    api_key: String,
-) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-
-    // The daemon owns the live LLM client; persist the key to config (which the
-    // daemon reads) and ask it to reload.
-    state_guard.config.llm.api_key = Some(api_key.clone());
-
-    // SAFETY: single-threaded application context
-    unsafe {
-        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
-    }
-
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save config: {e}");
-    }
-    let _ = state_guard.backend.config_reload().await;
-
-    info!("API key updated");
+    state.write().await.config.llm.model = model;
     Ok(())
 }
 
 /// Extended settings for the settings page
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedSettings {
-    // API Keys (masked for display)
-    pub anthropic_key_set: bool,
-    pub openai_key_set: bool,
-    pub openrouter_key_set: bool,
+    // API Keys (masked for display). The groups are flattened, so every key
+    // stays top-level on the wire.
+    #[serde(flatten)]
+    pub llm_api_keys: LlmApiKeys,
+    /// GitHub Models token (config or `GITHUB_TOKEN`).
     pub github_key_set: bool,
-    pub claude_proxy_enabled: bool,
-    pub claude_proxy_url: String,
+    #[serde(flatten)]
+    pub claude_proxy: ClaudeProxyStatus,
+    /// Brave Search key (`BRAVE_API_KEY`).
     pub brave_key_set: bool,
 
     // Anthropic OAuth status
-    pub anthropic_oauth_logged_in: bool,
-    pub anthropic_use_oauth: bool,
+    #[serde(flatten)]
+    pub anthropic_oauth: AnthropicOauthStatus,
 
     // Chat Provider
     pub provider: String,
@@ -168,18 +179,57 @@ pub struct ExtendedSettings {
     pub tools: Vec<ToolInfo>,
 
     // Memory & Scheduling
-    pub dreaming_enabled: bool,
-    pub auto_remember_messages: bool,
-    pub max_compression_ratio: f32,
-    pub min_remaining_memories: usize,
-    pub scheduler_enabled: bool,
-    pub heartbeat_enabled: bool,
-    pub heartbeat_interval_seconds: u64,
+    #[serde(flatten)]
+    pub memory: MemorySettings,
+    #[serde(flatten)]
+    pub scheduler: SchedulerSettings,
 
     // Agent loop (long-horizon worker). `agent_max_iterations` None = unlimited.
     pub agent_max_iterations: Option<usize>,
     pub agent_nudge_after_iterations: usize,
     pub agent_nudge_interval_iterations: usize,
+}
+
+/// Whether a key is configured — in the config cache or the provider's
+/// environment variable — for each pay-per-token LLM API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmApiKeys {
+    pub anthropic_key_set: bool,
+    pub openai_key_set: bool,
+    pub openrouter_key_set: bool,
+}
+
+/// The local Claude proxy: whether it is enabled, and the URL it is expected
+/// at (`CLAUDE_PROXY_ENABLED` / `CLAUDE_PROXY_URL`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeProxyStatus {
+    pub claude_proxy_enabled: bool,
+    pub claude_proxy_url: String,
+}
+
+/// Anthropic OAuth: whether a token is loaded, and whether requests use it
+/// instead of an API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnthropicOauthStatus {
+    pub anthropic_oauth_logged_in: bool,
+    pub anthropic_use_oauth: bool,
+}
+
+/// Memory consolidation and capture settings.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MemorySettings {
+    pub dreaming_enabled: bool,
+    pub auto_remember_messages: bool,
+    pub max_compression_ratio: f32,
+    pub min_remaining_memories: usize,
+}
+
+/// The whole-scheduler toggles mirrored from `[scheduler]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerSettings {
+    pub scheduler_enabled: bool,
+    pub heartbeat_enabled: bool,
+    pub heartbeat_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,68 +245,50 @@ pub struct ToolInfo {
 }
 
 /// Get extended settings
+///
+/// # Errors
+///
+/// Never returns `Err`: an unreachable daemon lists no tools, and everything
+/// else is read from the config cache and the environment.
 #[tauri::command]
 pub async fn get_extended_settings(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<ExtendedSettings, String> {
-    let state_guard = state.read().await;
-
     // Tools come from the daemon's live registry.
-    let tools: Vec<ToolInfo> = state_guard
-        .backend
+    let tools: Vec<ToolInfo> = backend_handle(&state)
+        .await
         .tool_list()
         .await
         .ok()
-        .and_then(|r| {
-            r.get("tools").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        Some(ToolInfo {
-                            name: t.get("name")?.as_str()?.to_string(),
-                            description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-                            is_user_tool: t.get("is_user_tool").and_then(|v| v.as_bool()).unwrap_or(false),
-                        })
-                    })
-                    .collect()
-            })
-        })
+        .and_then(|r| tool_infos(&r))
         .unwrap_or_default();
 
-    // Dreaming has no daemon control action yet; its setter is still a no-op, so
-    // report the enabled default.
-    let dreaming_enabled = true;
-    let auto_remember_messages = state_guard.config.memory.auto_remember_messages;
-    // Scheduler toggles are real settings now — read them back from the config
-    // the daemon also reads, so the switches reflect what the daemon is doing
-    // instead of hardcoded `true`s that never moved.
-    let scheduler_enabled = state_guard.config.scheduler.enabled;
-    let heartbeat_enabled = state_guard.config.scheduler.heartbeat_enabled;
-    let heartbeat_interval_seconds = state_guard.config.scheduler.heartbeat_interval_secs;
-
-    // Embedding settings come from the config cache (the daemon reads the same file).
-    let embedding_provider = state_guard.config.memory.embedding_provider.clone();
-    let embedding_model = state_guard.config.memory.embedding_model.clone();
-    let embedding_enabled = state_guard.config.memory.enabled;
-    let ollama_host = state_guard.config.memory.ollama_host.clone();
+    let state_guard = state.read().await;
 
     Ok(ExtendedSettings {
-        anthropic_key_set: state_guard.config.llm.api_key.is_some()
-            || std::env::var("ANTHROPIC_API_KEY").is_ok(),
-        openai_key_set: state_guard.config.llm.openai_api_key.is_some()
-            || std::env::var("OPENAI_API_KEY").is_ok(),
-        openrouter_key_set: state_guard.config.llm.openrouter_api_key.is_some()
-            || std::env::var("OPENROUTER_API_KEY").is_ok(),
+        llm_api_keys: LlmApiKeys {
+            anthropic_key_set: state_guard.config.llm.api_key.is_some()
+                || std::env::var("ANTHROPIC_API_KEY").is_ok(),
+            openai_key_set: state_guard.config.llm.openai_api_key.is_some()
+                || std::env::var("OPENAI_API_KEY").is_ok(),
+            openrouter_key_set: state_guard.config.llm.openrouter_api_key.is_some()
+                || std::env::var("OPENROUTER_API_KEY").is_ok(),
+        },
         github_key_set: state_guard.config.llm.github_token.is_some()
             || std::env::var("GITHUB_TOKEN").is_ok(),
-        claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
-        claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
-            .unwrap_or_else(|_| "http://localhost:3456".to_string()),
-        brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
+        claude_proxy: ClaudeProxyStatus {
+            claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
+            claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
+                .unwrap_or_else(|_| "http://localhost:3456".to_string()),
+        },
+        brave_key_set: state_guard.config.tools.brave_api_key.is_some()
+            || std::env::var("BRAVE_API_KEY").is_ok(),
 
         // Anthropic OAuth status
-        anthropic_oauth_logged_in: state_guard.config.llm.anthropic_oauth_token.is_some(),
-        anthropic_use_oauth: state_guard.config.llm.anthropic_use_oauth,
+        anthropic_oauth: AnthropicOauthStatus {
+            anthropic_oauth_logged_in: state_guard.config.llm.anthropic_oauth_token.is_some(),
+            anthropic_use_oauth: state_guard.config.llm.anthropic_use_oauth,
+        },
 
         provider: state_guard.config.llm.provider.clone(),
         available_providers: vec![
@@ -269,36 +301,13 @@ pub async fn get_extended_settings(
         ],
 
         model: state_guard.config.llm.model.clone(),
-        available_models: vec![
-            // Anthropic
-            "claude-opus-4-20250514".to_string(),
-            "claude-sonnet-4-20250514".to_string(),
-            "claude-3-5-sonnet-20241022".to_string(),
-            "claude-3-5-haiku-20241022".to_string(),
-            // OpenAI
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-            "gpt-4-turbo".to_string(),
-            "o1".to_string(),
-            "o1-mini".to_string(),
-            // OpenRouter
-            "deepseek/deepseek-chat".to_string(),
-            "google/gemini-2.5-flash-preview-05-20".to_string(),
-            "google/gemini-2.5-pro-preview-05-06".to_string(),
-            // Ollama (local)
-            "llama3.2".to_string(),
-            "llama3.1".to_string(),
-            "mistral".to_string(),
-            "mixtral".to_string(),
-            "codellama".to_string(),
-            "qwen2.5".to_string(),
-            "deepseek-coder-v2".to_string(),
-        ],
+        available_models: known_chat_models(),
 
-        // Embedding settings (separate from chat)
-        embedding_provider,
-        embedding_model,
-        embedding_enabled,
+        // Embedding settings come from the config cache (the daemon reads the
+        // same file), separate from chat.
+        embedding_provider: state_guard.config.memory.embedding_provider.clone(),
+        embedding_model: state_guard.config.memory.embedding_model.clone(),
+        embedding_enabled: state_guard.config.memory.enabled,
         available_embedding_providers: vec![
             "openai".to_string(),
             "ollama".to_string(),
@@ -314,7 +323,7 @@ pub async fn get_extended_settings(
             "all-minilm".to_string(),              // 384 dims
         ],
 
-        ollama_host,
+        ollama_host: state_guard.config.memory.ollama_host.clone(),
         ollama_api_key: state_guard.config.llm.ollama_api_key.clone().unwrap_or_default(),
 
         // Memory extraction model
@@ -333,14 +342,22 @@ pub async fn get_extended_settings(
 
         tools,
 
-        // Memory & Scheduling settings
-        dreaming_enabled,
-        auto_remember_messages,
-        max_compression_ratio: state_guard.config.memory.max_compression_ratio,
-        min_remaining_memories: state_guard.config.memory.min_remaining_memories,
-        scheduler_enabled,
-        heartbeat_enabled,
-        heartbeat_interval_seconds,
+        memory: MemorySettings {
+            // Dreaming has no daemon control action yet; its setter is still a
+            // no-op, so report the enabled default.
+            dreaming_enabled: true,
+            auto_remember_messages: state_guard.config.memory.auto_remember_messages,
+            max_compression_ratio: state_guard.config.memory.max_compression_ratio,
+            min_remaining_memories: state_guard.config.memory.min_remaining_memories,
+        },
+        // Scheduler toggles are real settings now — read them back from the
+        // config the daemon also reads, so the switches reflect what the daemon
+        // is doing instead of hardcoded `true`s that never moved.
+        scheduler: SchedulerSettings {
+            scheduler_enabled: state_guard.config.scheduler.enabled,
+            heartbeat_enabled: state_guard.config.scheduler.heartbeat_enabled,
+            heartbeat_interval_seconds: state_guard.config.scheduler.heartbeat_interval_secs,
+        },
 
         // Agent-loop iteration policy
         agent_max_iterations: state_guard.config.agent.max_iterations,
@@ -350,6 +367,11 @@ pub async fn get_extended_settings(
 }
 
 /// Set memory extraction model (empty string = use chat model)
+///
+/// # Errors
+///
+/// Never returns `Err`: a failed `config.toml` save is logged, and the daemon
+/// reload is best-effort.
 #[tauri::command]
 pub async fn set_extraction_model(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -358,11 +380,12 @@ pub async fn set_extraction_model(
     let mut state_guard = state.write().await;
 
     // Persist to config (the daemon reads the same file).
-    state_guard.config.memory.extraction_model = model.clone();
+    state_guard.config.memory.extraction_model.clone_from(&model);
     if let Err(e) = state_guard.config.save() {
         warn!("Failed to save extraction model to config: {}", e);
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
 
     if model.is_empty() {
         info!("Extraction model set to: (use chat model)");
@@ -373,6 +396,14 @@ pub async fn set_extraction_model(
 }
 
 /// Set a specific API key
+///
+/// # Errors
+///
+/// Returns `Unknown provider: …` for a provider other than `anthropic`,
+/// `openai`, `brave`, `openrouter`, `github` or `claude-proxy`, before anything
+/// changes. Returns `failed to store API key securely: …` when the key cannot
+/// be written to the OS keyring; it then stays set in this process's config
+/// cache and environment only. A failed `config.toml` save is only logged.
 #[tauri::command]
 pub async fn set_provider_api_key(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -382,28 +413,18 @@ pub async fn set_provider_api_key(
     let mut state_guard = state.write().await;
 
     // The daemon owns the live LLM clients and tool registry; persist the key to
-    // config (+ env for this process) and let the daemon reload.
+    // the secure store and let the daemon reload. This process reads keys from
+    // `state_guard.config` (refilled from the store below), not from its own
+    // environment: `set_var` from a command running on the multi-threaded
+    // runtime races every concurrent `getenv`, and an env copy was gone after a
+    // restart anyway — `get_openai_models` read only env, so a stored OpenAI key
+    // stopped listing models once the GUI restarted.
     match provider.as_str() {
-        "anthropic" => {
-            state_guard.config.llm.api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
-        }
-        "openai" => {
-            state_guard.config.llm.openai_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
-        }
-        "brave" => {
-            state_guard.config.tools.brave_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("BRAVE_API_KEY", &api_key); }
-        }
-        "openrouter" => {
-            state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
-            unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
-        }
-        "github" => {
-            state_guard.config.llm.github_token = Some(api_key.clone());
-            unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
-        }
+        "anthropic" => state_guard.config.llm.api_key = Some(api_key.clone()),
+        "openai" => state_guard.config.llm.openai_api_key = Some(api_key.clone()),
+        "brave" => state_guard.config.tools.brave_api_key = Some(api_key.clone()),
+        "openrouter" => state_guard.config.llm.openrouter_api_key = Some(api_key.clone()),
+        "github" => state_guard.config.llm.github_token = Some(api_key.clone()),
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
             unsafe {
@@ -411,7 +432,7 @@ pub async fn set_provider_api_key(
                 std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
             }
         }
-        _ => return Err(format!("Unknown provider: {}", provider)),
+        _ => return Err(format!("Unknown provider: {provider}")),
     }
 
     // Durable storage is the OS keyring; config.toml never receives secrets.
@@ -430,6 +451,7 @@ pub async fn set_provider_api_key(
         // Non-fatal - key is hydrated in-process for this session
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
 
     info!("API key set for provider: {} (secure store)", provider);
     Ok(())
@@ -441,7 +463,7 @@ pub async fn set_provider_api_key(
 
 /// Durably persist an OAuth login, then update live state and nudge the daemon.
 ///
-/// The SecureStore is written FIRST and a failure aborts the login: the config
+/// The `SecureStore` is written FIRST and a failure aborts the login: the config
 /// cache is session-only (`strip_secrets_for_disk` blanks the token in
 /// config.toml on every save), so a login that never reaches the store is
 /// exactly the restart-logout bug this path exists to prevent.
@@ -460,11 +482,21 @@ async fn persist_oauth_login(
         error!("Failed to save config: {e}");
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
     Ok(())
 }
 
 /// Run `claude setup-token` to authenticate via Claude Code CLI
 /// This opens a browser for OAuth, then persists the resulting credential
+///
+/// # Errors
+///
+/// Fails when the Claude Code CLI is not installed; when `claude setup-token`
+/// cannot be run (or the task running it panics); when it prints no token and
+/// no CLI credentials can be loaded, or the loaded ones are expired with no
+/// refresh token, or refreshing them fails; and with `Failed to store OAuth
+/// token securely: …` when the credential cannot be written to the secure
+/// store.
 #[tauri::command]
 pub async fn run_claude_setup_token(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -537,11 +569,19 @@ pub async fn run_claude_setup_token(
     persist_oauth_login(state.inner(), &credential).await?;
 
     info!("Successfully authenticated via claude setup-token (subscription: {})", subscription);
-    Ok(format!("Successfully authenticated! Subscription: {}", subscription))
+    Ok(format!("Successfully authenticated! Subscription: {subscription}"))
 }
 
 /// Import credentials from Claude Code CLI (~/.claude/.credentials.json)
 /// This uses the token that Claude Code CLI obtained, which is whitelisted
+///
+/// # Errors
+///
+/// Fails with `No credentials found: …` when the CLI credential store has none;
+/// for an expired token, with `Token expired and cannot auto-refresh…` when it
+/// has no refresh token and `Token expired and refresh failed: …` when
+/// refreshing fails; and with `Failed to store OAuth token securely: …` when
+/// the credential cannot be written to the secure store.
 #[tauri::command]
 pub async fn import_claude_code_credentials(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -552,14 +592,14 @@ pub async fn import_claude_code_credentials(
 
     // Load credentials (checks file and keychain)
     let loaded = manager.load()
-        .map_err(|e| format!("No credentials found: {}. Please run `claude login` first.", e))?;
+        .map_err(|e| format!("No credentials found: {e}. Please run `claude login` first."))?;
 
     // Check if token is expired
     if loaded.credential.is_expired() {
         if loaded.credential.can_refresh() {
             info!("Token expired, attempting auto-refresh...");
             let refreshed = manager.refresh_token(&loaded.credential).await
-                .map_err(|e| format!("Token expired and refresh failed: {}. Please run `claude login`.", e))?;
+                .map_err(|e| format!("Token expired and refresh failed: {e}. Please run `claude login`."))?;
 
             // Save refreshed token back to source
             if let Err(e) = manager.save(&refreshed, loaded.source) {
@@ -570,9 +610,8 @@ pub async fn import_claude_code_credentials(
 
             info!("Token refreshed and imported (subscription: {:?})", refreshed.subscription_type);
             return Ok(());
-        } else {
-            return Err("Token expired and cannot auto-refresh. Please run `claude login`.".to_string());
         }
+        return Err("Token expired and cannot auto-refresh. Please run `claude login`.".to_string());
     }
 
     info!(
@@ -587,6 +626,12 @@ pub async fn import_claude_code_credentials(
 }
 
 /// Save an Anthropic OAuth token directly (from `claude setup-token`)
+///
+/// # Errors
+///
+/// Returns `Token cannot be empty` for a blank token, and `Failed to store
+/// OAuth token securely: …` when the credential cannot be written to the secure
+/// store.
 #[tauri::command]
 pub async fn save_anthropic_oauth_token(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -614,6 +659,12 @@ pub async fn save_anthropic_oauth_token(
 }
 
 /// Log out of Anthropic OAuth (clear token and switch to API key mode)
+///
+/// # Errors
+///
+/// Returns `Failed to remove stored OAuth token: …` when the secure-store entry
+/// cannot be deleted; nothing else changes then. A failed `config.toml` save
+/// afterwards is only logged.
 #[tauri::command]
 pub async fn logout_anthropic_oauth(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -634,6 +685,7 @@ pub async fn logout_anthropic_oauth(
         error!("Failed to save config after logout: {}", e);
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
 
     info!("Anthropic OAuth logout successful");
     Ok(())
@@ -645,12 +697,27 @@ pub struct CredentialStatus {
     cli_available: bool,
     credentials_found: bool,
     source: Option<String>,
-    is_expired: bool,
-    can_refresh: bool,
-    seconds_until_expiry: Option<i64>,
+    /// Flattened, so its keys stay top-level on the wire.
+    #[serde(flatten)]
+    expiry: TokenExpiry,
     subscription_type: Option<String>,
 }
 
+/// Where a CLI access token stands against its expiry.
+#[derive(serde::Serialize)]
+pub struct TokenExpiry {
+    is_expired: bool,
+    can_refresh: bool,
+    seconds_until_expiry: Option<i64>,
+}
+
+/// Report whether Claude CLI credentials are available, where they live, and
+/// how close they are to expiry.
+///
+/// # Errors
+///
+/// Never returns `Err`: missing or unreadable CLI credentials are reported as
+/// `credentials_found: false`.
 #[tauri::command]
 pub async fn get_credential_status() -> Result<CredentialStatus, String> {
     use nanna_config::{ClaudeCredentialManager, CredentialSource};
@@ -670,9 +737,11 @@ pub async fn get_credential_status() -> Result<CredentialStatus, String> {
                 cli_available,
                 credentials_found: true,
                 source: Some(source.to_string()),
-                is_expired: loaded.credential.is_expired(),
-                can_refresh: loaded.credential.can_refresh(),
-                seconds_until_expiry: loaded.credential.seconds_until_expiry(),
+                expiry: TokenExpiry {
+                    is_expired: loaded.credential.is_expired(),
+                    can_refresh: loaded.credential.can_refresh(),
+                    seconds_until_expiry: loaded.credential.seconds_until_expiry(),
+                },
                 subscription_type: loaded.credential.subscription_type,
             })
         }
@@ -681,9 +750,11 @@ pub async fn get_credential_status() -> Result<CredentialStatus, String> {
                 cli_available,
                 credentials_found: false,
                 source: None,
-                is_expired: false,
-                can_refresh: false,
-                seconds_until_expiry: None,
+                expiry: TokenExpiry {
+                    is_expired: false,
+                    can_refresh: false,
+                    seconds_until_expiry: None,
+                },
                 subscription_type: None,
             })
         }
@@ -697,12 +768,17 @@ pub async fn get_credential_status() -> Result<CredentialStatus, String> {
 /// daemon hasn't registered yet), and only the daemon actually routes chat.
 /// Errors when the daemon is unreachable or predates `llm_providers`, so the
 /// frontend can fall back to local gating instead of showing an empty picker.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `system.status` request is
+/// dropped or times out, and with `daemon did not report llm_providers` when
+/// the status has no such array.
 #[tauri::command]
 pub async fn get_daemon_providers(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<String>, String> {
-    let state_guard = state.read().await;
-    let status = state_guard.backend.system_status().await?;
+    let status = backend_handle(&state).await.system_status().await?;
     status
         .get("llm_providers")
         .and_then(|v| v.as_array())
@@ -714,7 +790,38 @@ pub async fn get_daemon_providers(
         .ok_or_else(|| "daemon did not report llm_providers".to_string())
 }
 
+/// Each configured MCP server's state, from the daemon's `system.status`.
+///
+/// Empty — not an error — when the daemon predates the field or has no MCP
+/// servers configured: the Tools page then simply shows no MCP section.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached or the `system.status` request is
+/// dropped or times out. A `mcp_servers` field that is missing or not an array
+/// lists nothing rather than failing.
+#[tauri::command]
+pub async fn get_mcp_servers(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let state_guard = state.read().await;
+    let status = state_guard.backend.system_status().await?;
+    drop(state_guard);
+    Ok(status
+        .get("mcp_servers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 /// Refresh the OAuth token if expired or expiring soon
+///
+/// # Errors
+///
+/// Fails with `No credentials found: …` when the CLI credential store has none,
+/// `Cannot refresh: no refresh token available`, or `Token refresh failed: …`.
+/// Failures to write the refreshed token back — to the CLI store, the secure
+/// store or `config.toml` — are only logged.
 #[tauri::command]
 pub async fn refresh_oauth_token(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -723,14 +830,14 @@ pub async fn refresh_oauth_token(
 
     let manager = ClaudeCredentialManager::new();
     let loaded = manager.load()
-        .map_err(|e| format!("No credentials found: {}", e))?;
+        .map_err(|e| format!("No credentials found: {e}"))?;
 
     if !loaded.credential.can_refresh() {
         return Err("Cannot refresh: no refresh token available".to_string());
     }
 
     let refreshed = manager.refresh_token(&loaded.credential).await
-        .map_err(|e| format!("Token refresh failed: {}", e))?;
+        .map_err(|e| format!("Token refresh failed: {e}"))?;
 
     // Save back to source
     if let Err(e) = manager.save(&refreshed, loaded.source) {
@@ -752,14 +859,25 @@ pub async fn refresh_oauth_token(
         error!("Failed to save config: {}", e);
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
 
-    let hours = refreshed.seconds_until_expiry().map(|s| s / 3600).unwrap_or(0);
+    let hours = refreshed.seconds_until_expiry().map_or(0, |s| s / 3600);
     info!("OAuth token refreshed, expires in {}h", hours);
 
-    Ok(format!("Token refreshed! Expires in {}h", hours))
+    Ok(format!("Token refreshed! Expires in {hours}h"))
 }
 
 /// Set the active LLM provider
+///
+/// # Errors
+///
+/// Returns `Unknown provider: …` for a provider other than `anthropic`,
+/// `openai`, `openrouter`, `github`, `claude-proxy` or `ollama`. For
+/// `anthropic` it returns `No OAuth token available…` when no OAuth token is
+/// loaded, and for `openai`, `openrouter` and `github` it returns `No API key
+/// set for <provider>` when neither the config nor the provider's environment
+/// variable has one. Nothing changes on error; a failed `config.toml` save is
+/// only logged.
 #[tauri::command]
 pub async fn set_provider(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -792,20 +910,28 @@ pub async fn set_provider(
             }
         }
         "claude-proxy" | "ollama" => {}
-        _ => return Err(format!("Unknown provider: {}", provider)),
+        _ => return Err(format!("Unknown provider: {provider}")),
     }
 
-    state_guard.config.llm.provider = provider.clone();
+    state_guard.config.llm.provider.clone_from(&provider);
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
 
     info!("Provider changed to: {}", provider);
     Ok(())
 }
 
 /// Set the embedding provider and model (requires restart to take effect)
+///
+/// # Errors
+///
+/// Returns `Unknown embedding provider: …` for anything but `openai`, `ollama`
+/// or `disabled`, and `Unknown OpenAI embedding model: …` for an `OpenAI` model
+/// other than `text-embedding-3-small` or `text-embedding-3-large`; nothing
+/// changes then. A failed `config.toml` save is only logged.
 #[tauri::command]
 pub async fn set_embedding_config(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -816,7 +942,7 @@ pub async fn set_embedding_config(
 
     // Validate provider
     if !["openai", "ollama", "disabled"].contains(&provider.as_str()) {
-        return Err(format!("Unknown embedding provider: {}", provider));
+        return Err(format!("Unknown embedding provider: {provider}"));
     }
 
     let model = if provider == "disabled" { "none".to_string() } else { model };
@@ -825,17 +951,18 @@ pub async fn set_embedding_config(
     if provider == "openai" {
         let valid_openai = ["text-embedding-3-small", "text-embedding-3-large"];
         if !valid_openai.contains(&model.as_str()) {
-            return Err(format!("Unknown OpenAI embedding model: {}", model));
+            return Err(format!("Unknown OpenAI embedding model: {model}"));
         }
     }
 
     // Save to config file (the daemon reads the same file at startup)
-    state_guard.config.memory.embedding_provider = provider.clone();
-    state_guard.config.memory.embedding_model = model.clone();
+    state_guard.config.memory.embedding_provider.clone_from(&provider);
+    state_guard.config.memory.embedding_model.clone_from(&model);
     state_guard.config.memory.enabled = provider != "disabled";
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save embedding config: {}", e);
     }
+    drop(state_guard);
 
     info!("Embedding config changed to: {} / {}", provider, model);
 
@@ -844,12 +971,23 @@ pub async fn set_embedding_config(
 }
 
 /// Get env var status (for checking if keys are set)
+///
+/// # Errors
+///
+/// Never returns `Err`.
 #[tauri::command]
 pub async fn check_env_var(name: String) -> Result<bool, String> {
     Ok(std::env::var(&name).is_ok())
 }
 
 /// Set Ollama host URL
+///
+/// # Errors
+///
+/// Returns `Ollama host must start with http:// or https://` for any other URL,
+/// before anything changes. Returns `Failed to save config: …` when
+/// `config.toml` cannot be written; the cached host has already changed then,
+/// but the daemon is not told.
 #[tauri::command]
 pub async fn set_ollama_host(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -866,26 +1004,37 @@ pub async fn set_ollama_host(
     let host = host.trim_end_matches('/').to_string();
 
     // Save to config file (the daemon reads the same file)
-    state_guard.config.memory.ollama_host = host.clone();
+    state_guard.config.memory.ollama_host.clone_from(&host);
     match state_guard.config.save() {
         Ok(()) => {
             info!("Ollama host saved to config: {}", host);
         }
         Err(e) => {
-            let err_msg = format!("Failed to save config: {}", e);
+            let err_msg = format!("Failed to save config: {e}");
             error!("{}", err_msg);
             return Err(err_msg);
         }
     }
     let _ = state_guard.backend.config_reload().await;
+    // Held from the validation through the save and the reload notice, so a
+    // concurrent config write cannot land between them.
+    drop(state_guard);
+    // No `OLLAMA_HOST` copy in this process's environment: nothing in the GUI
+    // reads it (the daemon is a separate process and reads the config file),
+    // and `set_var` here raced concurrent `getenv` on the multi-threaded runtime.
 
-    // Also set env var for current session
-    unsafe { std::env::set_var("OLLAMA_HOST", &host); }
-
-    Ok(format!("Ollama host saved: {}", host))
+    Ok(format!("Ollama host saved: {host}"))
 }
 
 /// Set Ollama API key (for remote/authenticated instances)
+///
+/// # Errors
+///
+/// Returns `Failed to store Ollama API key securely: …` when the OS keyring
+/// write fails, `Failed to remove stored Ollama API key: …` when clearing the
+/// key cannot delete its stored entry, and `Failed to save config: …` when
+/// `config.toml` cannot be written. The cached key has already changed in each
+/// case.
 #[tauri::command]
 pub async fn set_ollama_api_key(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -914,12 +1063,13 @@ pub async fn set_ollama_api_key(
             info!("Ollama API key saved to OS keychain");
         }
         Err(e) => {
-            let err_msg = format!("Failed to save config: {}", e);
+            let err_msg = format!("Failed to save config: {e}");
             error!("{}", err_msg);
             return Err(err_msg);
         }
     }
     let _ = state_guard.backend.config_reload().await;
+    drop(state_guard);
     Ok("Ollama API key saved".to_string())
 }
 
@@ -930,6 +1080,12 @@ pub async fn set_ollama_api_key(
 /// — rather than a private `GET /api/tags`. The GUI links no `nanna-llm`
 /// (P16), so the daemon is the only place the probe can run. A server that
 /// is down is an `Err` naming why; a server that is up lists what it has.
+///
+/// # Errors
+///
+/// `Failed to connect to Ollama at …: <reason>` when the daemon reports the
+/// server unreachable, or the daemon's own error text when the probe request
+/// itself failed.
 #[tauri::command]
 pub async fn get_ollama_models(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1189,19 +1345,48 @@ mod ollama_probe_tests {
 }
 
 /// Fetch available models from Anthropic
+///
+/// # Errors
+///
+/// Returns `OAuth enabled but no token available` or `No Anthropic API key
+/// configured` when the selected authentication has no credential. Fails with
+/// the HTTP client builder's error when the client cannot be built, `Failed to
+/// fetch Anthropic models: …` when the request fails, `Anthropic API error
+/// <status>: <body>` for a non-success status, and `Failed to parse Anthropic
+/// response: …` when the body is not the expected model list.
 #[tauri::command]
 pub async fn get_anthropic_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
-    let state_guard = state.read().await;
+    #[derive(Deserialize)]
+    struct AnthropicModelsResponse {
+        data: Vec<AnthropicModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicModel {
+        id: String,
+        display_name: Option<String>,
+    }
+
+    // A snapshot of the credentials: the fetch below is a network call, which
+    // must not hold the state lock.
+    let (use_oauth, oauth_token, config_api_key) = {
+        let state_guard = state.read().await;
+        (
+            state_guard.config.llm.anthropic_use_oauth,
+            state_guard.config.llm.anthropic_oauth_token.clone(),
+            state_guard.config.llm.api_key.clone(),
+        )
+    };
 
     // Check if OAuth is configured, otherwise use API key
-    let (auth_header, auth_value) = if state_guard.config.llm.anthropic_use_oauth {
-        let token = state_guard.config.llm.anthropic_oauth_token.clone()
+    let (auth_header, auth_value) = if use_oauth {
+        let token = oauth_token
             .ok_or("OAuth enabled but no token available")?;
-        ("Authorization".to_string(), format!("Bearer {}", token))
+        ("Authorization".to_string(), format!("Bearer {token}"))
     } else {
-        let api_key = state_guard.config.llm.api_key.clone()
+        let api_key = config_api_key
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .ok_or("No Anthropic API key configured")?;
         ("x-api-key".to_string(), api_key)
@@ -1218,7 +1403,7 @@ pub async fn get_anthropic_models(
         .header("anthropic-version", "2023-06-01");
 
     // Add OAuth-specific headers if using OAuth
-    if state_guard.config.llm.anthropic_use_oauth {
+    if use_oauth {
         request = request
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             .header("user-agent", "claude-code/2.1.2");
@@ -1227,27 +1412,16 @@ pub async fn get_anthropic_models(
     let response = request
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch Anthropic models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch Anthropic models: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {}: {}", status, body));
-    }
-
-    #[derive(Deserialize)]
-    struct AnthropicModelsResponse {
-        data: Vec<AnthropicModel>,
-    }
-
-    #[derive(Deserialize)]
-    struct AnthropicModel {
-        id: String,
-        display_name: Option<String>,
+        return Err(format!("Anthropic API error {status}: {body}"));
     }
 
     let models: AnthropicModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+        .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
 
     Ok(models.data.into_iter().map(|m| ModelInfo {
         id: m.id.clone(),
@@ -1255,30 +1429,20 @@ pub async fn get_anthropic_models(
     }).collect())
 }
 
-/// Fetch available models from OpenAI
+/// Fetch available models from `OpenAI`
+///
+/// # Errors
+///
+/// Returns `No OpenAI API key configured` when `OPENAI_API_KEY` is unset (the
+/// config cache is not consulted). Fails with the HTTP client builder's error
+/// when the client cannot be built, `Failed to fetch OpenAI models: …` when the
+/// request fails, `OpenAI API error <status>: <body>` for a non-success status,
+/// and `Failed to parse OpenAI response: …` when the body is not the expected
+/// model list.
 #[tauri::command]
-pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "No OpenAI API key configured")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch OpenAI models: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {}: {}", status, body));
-    }
-
+pub async fn get_openai_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
     #[derive(Deserialize)]
     struct OpenAIModelsResponse {
         data: Vec<OpenAIModel>,
@@ -1289,8 +1453,52 @@ pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
         id: String,
     }
 
+    // Config first: it holds the keyring copy, which survives a restart.
+    let api_key = state.read().await.config.llm.openai_api_key.clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .ok_or("No OpenAI API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenAI models: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {status}: {body}"));
+    }
+
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "No OpenAI API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenAI models: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI API error {status}: {body}"));
+    }
+
     let models: OpenAIModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenAI response: {e}"))?;
 
     // Filter to chat models (gpt-*, o1-*, chatgpt-*)
     let chat_prefixes = ["gpt-4", "gpt-3.5", "o1", "o3", "chatgpt"];
@@ -1313,35 +1521,20 @@ pub async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     Ok(result)
 }
 
-/// Fetch available models from OpenRouter
+/// Fetch available models from `OpenRouter`
+///
+/// # Errors
+///
+/// Returns `No OpenRouter API key configured` when neither the config nor
+/// `OPENROUTER_API_KEY` has a key. Fails with the HTTP client builder's error
+/// when the client cannot be built, `Failed to fetch OpenRouter models: …` when
+/// the request fails, `OpenRouter API error <status>: <body>` for a non-success
+/// status, and `Failed to parse OpenRouter response: …` when the body is not
+/// the expected model list.
 #[tauri::command]
 pub async fn get_openrouter_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
-    let state_guard = state.read().await;
-
-    let api_key = state_guard.config.llm.openrouter_api_key.clone()
-        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-        .ok_or("No OpenRouter API key configured")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .get("https://openrouter.ai/api/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch OpenRouter models: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenRouter API error {}: {}", status, body));
-    }
-
     #[derive(Deserialize)]
     struct OpenRouterModelsResponse {
         data: Vec<OpenRouterModel>,
@@ -1353,8 +1546,30 @@ pub async fn get_openrouter_models(
         name: Option<String>,
     }
 
+    let api_key = state.read().await.config.llm.openrouter_api_key.clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .ok_or("No OpenRouter API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://openrouter.ai/api/v1/models")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenRouter models: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter API error {status}: {body}"));
+    }
+
     let models: OpenRouterModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenRouter response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenRouter response: {e}"))?;
 
     // Priority prefixes for sorting (these appear first)
     let priority_prefixes = [
@@ -1390,35 +1605,20 @@ pub async fn get_openrouter_models(
     Ok(result)
 }
 
-/// Fetch available embedding models from OpenRouter's dedicated embeddings endpoint
+/// Fetch available embedding models from `OpenRouter`'s dedicated embeddings endpoint
+///
+/// # Errors
+///
+/// Returns `No OpenRouter API key configured` when neither the config nor
+/// `OPENROUTER_API_KEY` has a key. Fails with the HTTP client builder's error
+/// when the client cannot be built, `Failed to fetch OpenRouter embedding
+/// models: …` when the request fails, `OpenRouter embeddings API error
+/// <status>: <body>` for a non-success status, and `Failed to parse OpenRouter
+/// embeddings response: …` when the body is not the expected model list.
 #[tauri::command]
 pub async fn get_openrouter_embedding_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
-    let state_guard = state.read().await;
-
-    let api_key = state_guard.config.llm.openrouter_api_key.clone()
-        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-        .ok_or("No OpenRouter API key configured")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .get("https://openrouter.ai/api/v1/embeddings/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch OpenRouter embedding models: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("OpenRouter embeddings API error {}: {}", status, body));
-    }
-
     #[derive(Deserialize)]
     struct OpenRouterModelsResponse {
         data: Vec<OpenRouterEmbeddingModel>,
@@ -1430,8 +1630,30 @@ pub async fn get_openrouter_embedding_models(
         name: Option<String>,
     }
 
+    let api_key = state.read().await.config.llm.openrouter_api_key.clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .ok_or("No OpenRouter API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://openrouter.ai/api/v1/embeddings/models")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenRouter embedding models: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter embeddings API error {status}: {body}"));
+    }
+
     let models: OpenRouterModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse OpenRouter embeddings response: {}", e))?;
+        .map_err(|e| format!("Failed to parse OpenRouter embeddings response: {e}"))?;
 
     let result: Vec<ModelInfo> = models.data.into_iter()
         .map(|m| ModelInfo {
@@ -1444,34 +1666,20 @@ pub async fn get_openrouter_embedding_models(
 }
 
 /// Fetch available models from GitHub Models API
+///
+/// # Errors
+///
+/// Returns `No GitHub token configured` when neither the config nor
+/// `GITHUB_TOKEN` has a token. Fails with the HTTP client builder's error when
+/// the client cannot be built, `Failed to fetch GitHub models: …` when the
+/// request fails, `GitHub Models API error <status>: <body>` for a non-success
+/// status, `Failed to read GitHub response: …` when the body cannot be read,
+/// and `Failed to parse GitHub response: <body>` when it is neither a model
+/// array nor an object carrying one.
 #[tauri::command]
 pub async fn get_github_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
-    let state_guard = state.read().await;
-    let api_key = state_guard.config.llm.github_token.clone()
-        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-        .ok_or("No GitHub token configured")?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    // GitHub Models catalog endpoint
-    let response = client
-        .get("https://models.inference.ai.azure.com/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch GitHub models: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub Models API error {}: {}", status, body));
-    }
-
     #[derive(Deserialize)]
     struct GitHubModelsResponse {
         data: Option<Vec<GitHubModel>>,
@@ -1487,8 +1695,31 @@ pub async fn get_github_models(
         model_name: Option<String>,
     }
 
+    let api_key = state.read().await.config.llm.github_token.clone()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .ok_or("No GitHub token configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // GitHub Models catalog endpoint
+    let response = client
+        .get("https://models.inference.ai.azure.com/models")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub models: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("GitHub Models API error {status}: {body}"));
+    }
+
     let text = response.text().await
-        .map_err(|e| format!("Failed to read GitHub response: {}", e))?;
+        .map_err(|e| format!("Failed to read GitHub response: {e}"))?;
 
     // Try to parse as JSON array or object with data/models field
     let models: Vec<GitHubModel> = if let Ok(arr) = serde_json::from_str::<Vec<GitHubModel>>(&text) {
@@ -1496,7 +1727,7 @@ pub async fn get_github_models(
     } else if let Ok(resp) = serde_json::from_str::<GitHubModelsResponse>(&text) {
         resp.data.unwrap_or(resp.models)
     } else {
-        return Err(format!("Failed to parse GitHub response: {}", text));
+        return Err(format!("Failed to parse GitHub response: {text}"));
     };
 
     // Filter and map models
@@ -1513,11 +1744,38 @@ pub async fn get_github_models(
 
 /// Fetch available models from Anthropic API for use with Claude Proxy
 /// This queries Anthropic directly to get models available on your subscription
+///
+/// # Errors
+///
+/// Fails with the HTTP client builder's error when the client cannot be built,
+/// `Failed to fetch models: …` when the request fails, `Anthropic API error
+/// <status>: <body>` for a non-success status, and `Failed to parse Anthropic
+/// response: …` for an unexpected body. With no Anthropic credential at all it
+/// returns a fixed default list instead of an error.
 #[tauri::command]
 pub async fn get_claude_proxy_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
-    let state_guard = state.read().await;
+    #[derive(Deserialize)]
+    struct AnthropicModelsResponse {
+        data: Vec<AnthropicModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicModel {
+        id: String,
+        display_name: Option<String>,
+    }
+
+    // A snapshot of the credentials: the fetch below is a network call, which
+    // must not hold the state lock.
+    let (oauth_token, config_api_key) = {
+        let state_guard = state.read().await;
+        (
+            state_guard.config.llm.anthropic_oauth_token.clone(),
+            state_guard.config.llm.api_key.clone(),
+        )
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1525,25 +1783,24 @@ pub async fn get_claude_proxy_models(
         .map_err(|e| e.to_string())?;
 
     // Try OAuth first (for Pro/Max subscription), then API key
-    let response = if state_guard.config.llm.anthropic_oauth_token.is_some() {
-        let token = state_guard.config.llm.anthropic_oauth_token.clone().unwrap();
+    let response = if let Some(token) = oauth_token {
         client
             .get("https://api.anthropic.com/v1/models")
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             .header("user-agent", "claude-code/2.1.2")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
-    } else if let Some(ref api_key) = state_guard.config.llm.api_key {
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
+    } else if let Some(ref api_key) = config_api_key {
         client
             .get("https://api.anthropic.com/v1/models")
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
     } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         client
             .get("https://api.anthropic.com/v1/models")
@@ -1551,7 +1808,7 @@ pub async fn get_claude_proxy_models(
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch models: {}", e))?
+            .map_err(|e| format!("Failed to fetch models: {e}"))?
     } else {
         // No Anthropic credentials - return default Claude models that the proxy supports
         return Ok(vec![
@@ -1565,22 +1822,11 @@ pub async fn get_claude_proxy_models(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {}: {}", status, body));
-    }
-
-    #[derive(Deserialize)]
-    struct AnthropicModelsResponse {
-        data: Vec<AnthropicModel>,
-    }
-
-    #[derive(Deserialize)]
-    struct AnthropicModel {
-        id: String,
-        display_name: Option<String>,
+        return Err(format!("Anthropic API error {status}: {body}"));
     }
 
     let models: AnthropicModelsResponse = response.json().await
-        .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+        .map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
 
     // Filter to chat models only (exclude embedding models, etc.)
     let result: Vec<ModelInfo> = models.data.into_iter()
@@ -1595,6 +1841,10 @@ pub async fn get_claude_proxy_models(
 }
 
 /// Enable or disable Claude Proxy
+///
+/// # Errors
+///
+/// Never returns `Err`.
 #[tauri::command]
 pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), String> {
     unsafe {
@@ -1611,6 +1861,11 @@ pub async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), 
 }
 
 /// Check if Claude Proxy is running and reachable
+///
+/// # Errors
+///
+/// Returns the HTTP client builder's error when the client cannot be built. An
+/// unreachable or unhealthy proxy is `Ok(false)`.
 #[tauri::command]
 pub async fn check_claude_proxy_health() -> Result<bool, String> {
     let proxy_url = std::env::var("CLAUDE_PROXY_URL")
@@ -1621,10 +1876,11 @@ pub async fn check_claude_proxy_health() -> Result<bool, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get(format!("{}/health", proxy_url)).send().await {
-        Ok(resp) => Ok(resp.status().is_success()),
-        Err(_) => Ok(false),
-    }
+    Ok(client
+        .get(format!("{proxy_url}/health"))
+        .send()
+        .await
+        .is_ok_and(|resp| resp.status().is_success()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1638,6 +1894,11 @@ pub struct ModelInfo {
 // =============================================================================
 
 /// Get the custom system prompt (returns None if using default)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_system_prompt(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1647,46 +1908,64 @@ pub async fn get_system_prompt(
 }
 
 /// Set a custom system prompt (pass null to reset to default)
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_system_prompt(
     state: State<'_, Arc<RwLock<AppState>>>,
     prompt: Option<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.agent.system_prompt = prompt.clone();
+    state_guard.config.agent.system_prompt.clone_from(&prompt);
 
     // Save to disk
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("System prompt {}", if prompt.is_some() { "updated" } else { "reset to default" });
     Ok(())
 }
 
 /// Set agent name
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_agent_name(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.agent.name = name.clone();
+    state_guard.config.agent.name.clone_from(&name);
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
     info!("Agent name set to: {}", name);
     Ok(())
 }
 
 /// Set personality mode
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_personality_mode(
     state: State<'_, Arc<RwLock<AppState>>>,
     mode: String,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.agent.personality_mode = mode.clone();
+    state_guard.config.agent.personality_mode.clone_from(&mode);
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
     info!("Personality mode set to: {}", mode);
     Ok(())
 }
@@ -1698,6 +1977,11 @@ pub async fn set_personality_mode(
 // override.
 
 /// Set streaming enabled
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_streaming_enabled(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1706,12 +1990,18 @@ pub async fn set_streaming_enabled(
     let mut state_guard = state.write().await;
     state_guard.config.agent.streaming_enabled = enabled;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
     info!("Streaming: {}", if enabled { "enabled" } else { "disabled" });
     Ok(())
 }
 
 /// Set max tokens for responses
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_max_tokens(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1720,7 +2010,8 @@ pub async fn set_max_tokens(
     let mut state_guard = state.write().await;
     state_guard.config.llm.max_tokens = tokens;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
     info!("Max tokens set to: {}", tokens);
     Ok(())
 }
@@ -1731,6 +2022,11 @@ pub async fn set_max_tokens(
 /// backstop (`None`/0 = unlimited — only Stop/cancel or the model finishing ends
 /// it). Escalating soft nudges begin at `nudge_after` and repeat every
 /// `nudge_interval` iterations; they steer a possibly-stuck model but never stop it.
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_agent_iteration_policy(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1749,7 +2045,8 @@ pub async fn set_agent_iteration_policy(
     state_guard.config.agent.nudge_after_iterations = nudge_after;
     state_guard.config.agent.nudge_interval_iterations = nudge_interval;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
     info!(
         "Agent iteration policy set: max={:?}, nudge_after={}, nudge_interval={}",
         max_iterations, nudge_after, nudge_interval
@@ -1758,28 +2055,40 @@ pub async fn set_agent_iteration_policy(
 }
 
 /// Export config as TOML string
+///
+/// # Errors
+///
+/// Returns `Failed to serialize config: …` when the config cannot be rendered
+/// as TOML.
 #[tauri::command]
 pub async fn export_config(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
     let state_guard = state.read().await;
     toml::to_string_pretty(&state_guard.config)
-        .map_err(|e| format!("Failed to serialize config: {}", e))
+        .map_err(|e| format!("Failed to serialize config: {e}"))
 }
 
 /// Import config from TOML string
+///
+/// # Errors
+///
+/// Returns `Failed to parse config: …` when the text is not a valid config
+/// (nothing changes then), and `Failed to save config: …` when `config.toml`
+/// cannot be written (the cached config has already been replaced then).
 #[tauri::command]
 pub async fn import_config(
     state: State<'_, Arc<RwLock<AppState>>>,
     config: String,
 ) -> Result<(), String> {
     let new_config: nanna_config::Config = toml::from_str(&config)
-        .map_err(|e| format!("Failed to parse config: {}", e))?;
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
 
     let mut state_guard = state.write().await;
     state_guard.config = new_config;
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("Config imported from TOML");
     Ok(())
@@ -1790,6 +2099,11 @@ pub async fn import_config(
 // =============================================================================
 
 /// Get chat model priority list
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_chat_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1799,6 +2113,13 @@ pub async fn get_chat_model_priority(
 }
 
 /// Set chat model priority list
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached priority, primary model and badge have already changed then, but the
+/// daemon is not told and no `model-status` event is emitted. The push to the
+/// daemon after a successful save is best-effort.
 #[tauri::command]
 pub async fn set_chat_model_priority(
     app: AppHandle,
@@ -1806,28 +2127,26 @@ pub async fn set_chat_model_priority(
     priority: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.llm.model_priority = priority.clone();
+    state_guard.config.llm.model_priority.clone_from(&priority);
 
     // Also set the primary model to the first in the list for backwards compatibility
     let new_active = priority.first().cloned().unwrap_or_default();
     if !new_active.is_empty() {
-        state_guard.config.llm.model = new_active.clone();
+        state_guard.config.llm.model.clone_from(&new_active);
     }
 
     // Update active_model so the badge reflects the change immediately
-    {
-        let mut active = state_guard.active_model.write().await;
-        *active = new_active.clone();
-    }
+    state_guard.active_model.write().await.clone_from(&new_active);
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon so changes take effect without restart
     let _ = state_guard.backend.config_set(
         "llm.model_priority",
         serde_json::to_value(&priority).unwrap_or_default(),
     ).await;
+    drop(state_guard);
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -1841,6 +2160,11 @@ pub async fn set_chat_model_priority(
 }
 
 /// Get embedding model priority list
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_embedding_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1850,13 +2174,18 @@ pub async fn get_embedding_model_priority(
 }
 
 /// Set embedding model priority list
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_embedding_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
     priority: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.memory.embedding_priority = priority.clone();
+    state_guard.config.memory.embedding_priority.clone_from(&priority);
 
     // Update the primary embedding config for backwards compatibility
     if let Some(first) = priority.first() {
@@ -1869,13 +2198,19 @@ pub async fn set_embedding_model_priority(
     }
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("Embedding model priority set: {:?}", priority);
     Ok(())
 }
 
 /// Get summarization model priority list
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_summarization_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1885,16 +2220,22 @@ pub async fn get_summarization_model_priority(
 }
 
 /// Set summarization model priority list
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_summarization_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
     priority: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.llm.summarization_priority = priority.clone();
+    state_guard.config.llm.summarization_priority.clone_from(&priority);
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("Summarization model priority set: {:?}", priority);
     Ok(())
@@ -1905,6 +2246,11 @@ pub async fn set_summarization_model_priority(
 // =============================================================================
 
 /// Get OCR model priority list (vision-capable models used for text extraction)
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_ocr_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1914,22 +2260,33 @@ pub async fn get_ocr_model_priority(
 }
 
 /// Set OCR model priority list
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_ocr_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
     priority: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.memory.ocr_model_priority = priority.clone();
+    state_guard.config.memory.ocr_model_priority.clone_from(&priority);
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("OCR model priority set: {:?}", priority);
     Ok(())
 }
 
 /// Get whether embedded OCR (ocrs) is enabled
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_use_embedded_ocr(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1939,6 +2296,11 @@ pub async fn get_use_embedded_ocr(
 }
 
 /// Set whether embedded OCR (ocrs) is enabled
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then.
 #[tauri::command]
 pub async fn set_use_embedded_ocr(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1948,7 +2310,8 @@ pub async fn set_use_embedded_ocr(
     state_guard.config.memory.use_embedded_ocr = enabled;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+    drop(state_guard);
 
     info!("Embedded OCR (ocrs) set to: {}", enabled);
     Ok(())
@@ -1959,6 +2322,11 @@ pub async fn set_use_embedded_ocr(
 // =============================================================================
 
 /// Get model routing configuration
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_model_routing(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1969,28 +2337,41 @@ pub async fn get_model_routing(
 
 /// Set model routing configuration
 /// Each entry is "model:tier" where tier is simple|medium|complex
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then. The push to the daemon
+/// (`config.set` of `llm.model_routing`) happens only after a successful save
+/// and is best-effort: it never fails the command.
 #[tauri::command]
 pub async fn set_model_routing(
     state: State<'_, Arc<RwLock<AppState>>>,
     routes: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.llm.model_routing = routes.clone();
+    state_guard.config.llm.model_routing.clone_from(&routes);
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
         "llm.model_routing",
         serde_json::to_value(&routes).unwrap_or_default(),
     ).await;
+    drop(state_guard);
 
     info!("Model routing set: {:?}", routes);
     Ok(())
 }
 
-/// Get routing_first_turn_primary setting
+/// Get `routing_first_turn_primary` setting
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_routing_first_turn_primary(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1999,7 +2380,14 @@ pub async fn get_routing_first_turn_primary(
     Ok(state_guard.config.llm.routing_first_turn_primary)
 }
 
-/// Set routing_first_turn_primary setting
+/// Set `routing_first_turn_primary` setting
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached value has already changed by then. The push to the daemon
+/// (`config.set` of `llm.routing_first_turn_primary`) happens only after a
+/// successful save and is best-effort: it never fails the command.
 #[tauri::command]
 pub async fn set_routing_first_turn_primary(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -2009,13 +2397,14 @@ pub async fn set_routing_first_turn_primary(
     state_guard.config.llm.routing_first_turn_primary = enabled;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
         "llm.routing_first_turn_primary",
         serde_json::Value::Bool(enabled),
     ).await;
+    drop(state_guard);
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -2023,37 +2412,48 @@ pub async fn set_routing_first_turn_primary(
 
 /// Get the sub-agent model priority list (raw stored value; the legacy single
 /// `sub_agent_model` is folded in so pre-list configs show what they run).
+///
+/// # Errors
+///
+/// Never returns `Err`; the `Result` is what Tauri requires of an async command
+/// that borrows `State`.
 #[tauri::command]
 pub async fn get_sub_agent_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<String>, String> {
     let state_guard = state.read().await;
     let llm = &state_guard.config.llm;
-    if llm.sub_agent_models.is_empty() {
-        if let Some(ref legacy) = llm.sub_agent_model {
-            if !legacy.is_empty() {
-                return Ok(vec![legacy.clone()]);
-            }
+    let models = match &llm.sub_agent_model {
+        Some(legacy) if llm.sub_agent_models.is_empty() && !legacy.is_empty() => {
+            vec![legacy.clone()]
         }
-    }
-    Ok(llm.sub_agent_models.clone())
+        _ => llm.sub_agent_models.clone(),
+    };
+    drop(state_guard);
+    Ok(models)
 }
 
 /// Set the sub-agent model priority list. Empty = sub-agents use the main
 /// chat model list. Saving migrates away the legacy single-model field.
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written; the
+/// cached list has already changed and the legacy single model been cleared by
+/// then. The pushes to the daemon after a successful save are best-effort.
 #[tauri::command]
 pub async fn set_sub_agent_models(
     state: State<'_, Arc<RwLock<AppState>>>,
     models: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    state_guard.config.llm.sub_agent_models = models.clone();
+    state_guard.config.llm.sub_agent_models.clone_from(&models);
     // The list is now the source of truth — a lingering single would
     // resurrect itself whenever the list is cleared.
     state_guard.config.llm.sub_agent_model = None;
 
     state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
@@ -2066,6 +2466,7 @@ pub async fn set_sub_agent_models(
     ).await;
 
     info!("Sub-agent models set: {:?}", state_guard.config.llm.sub_agent_models);
+    drop(state_guard);
     Ok(())
 }
 
@@ -2162,14 +2563,129 @@ pub async fn set_data_dir(
 // =============================================================================
 
 /// Save config to disk
+///
+/// # Errors
+///
+/// Returns `Failed to save config: …` when `config.toml` cannot be written.
 #[tauri::command]
 pub async fn save_config(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
-    state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+    state.read().await.config.save()
+        .map_err(|e| format!("Failed to save config: {e}"))?;
 
     info!("Config saved to disk");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_settings() -> ExtendedSettings {
+        ExtendedSettings {
+            llm_api_keys: LlmApiKeys {
+                anthropic_key_set: true,
+                openai_key_set: false,
+                openrouter_key_set: true,
+            },
+            github_key_set: false,
+            claude_proxy: ClaudeProxyStatus {
+                claude_proxy_enabled: true,
+                claude_proxy_url: "http://localhost:3456".to_string(),
+            },
+            brave_key_set: true,
+            anthropic_oauth: AnthropicOauthStatus {
+                anthropic_oauth_logged_in: false,
+                anthropic_use_oauth: true,
+            },
+            provider: "ollama".to_string(),
+            available_providers: vec!["ollama".to_string()],
+            model: "qwen2.5".to_string(),
+            available_models: vec!["qwen2.5".to_string()],
+            embedding_provider: "ollama".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
+            available_embedding_providers: vec!["disabled".to_string()],
+            available_embedding_models: vec!["all-minilm".to_string()],
+            embedding_enabled: true,
+            extraction_model: String::new(),
+            available_extraction_models: vec![String::new()],
+            ollama_host: "http://127.0.0.1:11434".to_string(),
+            ollama_api_key: String::new(),
+            temperature: 1.0,
+            top_p: 0.95,
+            max_tokens: 8192,
+            tools: vec![ToolInfo {
+                name: "exec".to_string(),
+                description: "run".to_string(),
+                enabled: true,
+                is_user_tool: false,
+            }],
+            memory: MemorySettings {
+                dreaming_enabled: true,
+                auto_remember_messages: false,
+                max_compression_ratio: 0.5,
+                min_remaining_memories: 20,
+            },
+            scheduler: SchedulerSettings {
+                scheduler_enabled: false,
+                heartbeat_enabled: true,
+                heartbeat_interval_seconds: 1800,
+            },
+            agent_max_iterations: None,
+            agent_nudge_after_iterations: 40,
+            agent_nudge_interval_iterations: 10,
+        }
+    }
+
+    /// The flattened groups must serialize to exactly the bytes the flat
+    /// struct did — every key top-level, in the original order — and read
+    /// back to the same value.
+    #[test]
+    fn extended_settings_wire_shape_is_unchanged() {
+        let flat = concat!(
+            r#"{"anthropic_key_set":true,"openai_key_set":false,"openrouter_key_set":true,"#,
+            r#""github_key_set":false,"claude_proxy_enabled":true,"claude_proxy_url":"http://localhost:3456","#,
+            r#""brave_key_set":true,"anthropic_oauth_logged_in":false,"anthropic_use_oauth":true,"#,
+            r#""provider":"ollama","available_providers":["ollama"],"model":"qwen2.5","available_models":["qwen2.5"],"#,
+            r#""embedding_provider":"ollama","embedding_model":"nomic-embed-text","#,
+            r#""available_embedding_providers":["disabled"],"available_embedding_models":["all-minilm"],"#,
+            r#""embedding_enabled":true,"extraction_model":"","available_extraction_models":[""],"#,
+            r#""ollama_host":"http://127.0.0.1:11434","ollama_api_key":"","temperature":1.0,"top_p":0.95,"#,
+            r#""max_tokens":8192,"tools":[{"name":"exec","description":"run","enabled":true,"is_user_tool":false}],"#,
+            r#""dreaming_enabled":true,"auto_remember_messages":false,"max_compression_ratio":0.5,"#,
+            r#""min_remaining_memories":20,"scheduler_enabled":false,"heartbeat_enabled":true,"#,
+            r#""heartbeat_interval_seconds":1800,"agent_max_iterations":null,"#,
+            r#""agent_nudge_after_iterations":40,"agent_nudge_interval_iterations":10}"#,
+        );
+        let settings = sample_settings();
+        assert_eq!(serde_json::to_string(&settings).expect("serializes"), flat);
+
+        let read_back: ExtendedSettings = serde_json::from_str(flat).expect("deserializes");
+        assert_eq!(read_back.llm_api_keys, settings.llm_api_keys);
+        assert_eq!(read_back.claude_proxy, settings.claude_proxy);
+        assert_eq!(read_back.anthropic_oauth, settings.anthropic_oauth);
+        assert_eq!(read_back.memory, settings.memory);
+        assert_eq!(read_back.scheduler, settings.scheduler);
+        assert_eq!(serde_json::to_string(&read_back).expect("serializes"), flat);
+    }
+
+    #[test]
+    fn credential_status_wire_shape_is_unchanged() {
+        let status = CredentialStatus {
+            cli_available: true,
+            credentials_found: true,
+            source: Some("file".to_string()),
+            expiry: TokenExpiry {
+                is_expired: false,
+                can_refresh: true,
+                seconds_until_expiry: Some(3600),
+            },
+            subscription_type: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&status).expect("serializes"),
+            r#"{"cli_available":true,"credentials_found":true,"source":"file","is_expired":false,"can_refresh":true,"seconds_until_expiry":3600,"subscription_type":null}"#
+        );
+    }
 }

@@ -33,6 +33,7 @@ impl ExecTool {
         }
     }
 
+    #[must_use]
     pub fn with_workdir(mut self, workdir: impl Into<String>) -> Self {
         self.workdir = Some(workdir.into());
         self
@@ -144,7 +145,7 @@ impl Tool for ExecTool {
             } else {
                 format!("{stdout}\n\nStderr:\n{stderr}")
             };
-            ToolResult::success(content).with_data(data.clone())
+            ToolResult::success(content).with_data(data)
         } else {
             let error_msg = if stderr.is_empty() {
                 format!("Command failed with exit code: {:?}", output.status.code())

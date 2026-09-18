@@ -4,7 +4,7 @@
 //! can subscribe to the same session.
 //!
 //! All session and message data is persisted to Turso via nanna-storage.
-//! The in-memory HashMap serves as a hot cache for fast access.
+//! The in-memory `HashMap` serves as a hot cache for fast access.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,8 @@ pub enum MessageRole {
 
 impl MessageRole {
     /// Convert to the string format used in the database.
-    pub fn as_db_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_db_str(&self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
@@ -65,12 +66,13 @@ impl MessageRole {
     }
 
     /// Parse from the string format used in the database.
+    #[must_use]
     pub fn from_db_str(s: &str) -> Self {
         match s {
-            "user" => Self::User,
             "assistant" => Self::Assistant,
             "system" => Self::System,
             "tool" => Self::Tool,
+            // "user" itself, and any role string this build does not know.
             _ => Self::User,
         }
     }
@@ -216,7 +218,9 @@ fn char_floor_prefix(text: &str, bytes_max: usize) -> &str {
     text.get(..end).unwrap_or_default()
 }
 
-/// One entry in a run's chronological journal. A long-horizon run is not
+/// One entry in a run's chronological journal.
+///
+/// A long-horizon run is not
 /// "one thinking blob + one flat tool list + one text blob" — it is an
 /// interleaved sequence (think → call tools → think → speak → …), and for
 /// runs that heal through provider faults it can span many attempts. The
@@ -297,8 +301,19 @@ pub enum TimelineItem {
     },
 }
 
+/// Everything an assistant message can carry beyond its text: the tool calls
+/// it made, its reasoning, the run's chronological journal, and usage totals.
+#[derive(Debug, Clone, Default)]
+pub struct MessageDetails {
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub reasoning: Option<String>,
+    pub timeline: Vec<TimelineItem>,
+    pub usage: Option<RunUsage>,
+}
+
 /// Resource totals for one run, for benchmarking models against each other
 /// on identical tasks: total tokens spent and wall-clock time taken.
+///
 /// Token totals accumulate across EVERY healing attempt via the per-request
 /// usage callback — not just the attempt that finally succeeded. (Streams
 /// that die before the provider reports usage still under-count slightly;
@@ -338,6 +353,22 @@ const CHAT_MODEL_KEY: &str = "chat_model";
 /// before the feature existed.
 const CHAT_TOOLS_KEY: &str = "chat_tools";
 
+/// Metadata key holding the external channel a session's replies go back to:
+/// `{"provider": "telegram", "id": "<chat id>"}`.
+///
+/// Metadata rather than `Session::owner` because metadata is persisted and
+/// `owner` is not — a reply route that vanished on restart would strand every
+/// reminder a channel user set before it.
+const REPLY_CHANNEL_KEY: &str = "reply_channel";
+
+/// Where a channel conversation's replies are sent: provider plus that
+/// provider's chat/channel id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyChannel {
+    pub provider: String,
+    pub id: String,
+}
+
 /// A conversation session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -361,6 +392,7 @@ pub struct Session {
 
 impl Session {
     /// Create a new session
+    #[must_use]
     pub fn new(name: Option<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -393,6 +425,7 @@ impl Session {
     }
 
     /// Set the workspace ID for this session
+    #[must_use]
     pub fn with_workspace(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = Some(workspace_id.into());
         self
@@ -408,6 +441,19 @@ impl Session {
     /// `LlmRouter::client_for_model`.
     pub fn chat_model(&self) -> Option<&str> {
         self.metadata.get(CHAT_MODEL_KEY).and_then(serde_json::Value::as_str)
+    }
+
+    /// The external channel this session's replies go back to, if it is a
+    /// channel conversation. A malformed entry reads as none.
+    #[must_use]
+    pub fn reply_channel(&self) -> Option<ReplyChannel> {
+        let route = self.metadata.get(REPLY_CHANNEL_KEY)?;
+        let provider = route.get("provider")?.as_str()?;
+        let id = route.get("id")?.as_str()?;
+        (!provider.is_empty() && !id.is_empty()).then(|| ReplyChannel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        })
     }
 
     /// Tools the user manually added to this chat's context, if any.
@@ -429,7 +475,7 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Add a message to the session (in-memory only — use SessionManager for persistence)
+    /// Add a message to the session (in-memory only — use `SessionManager` for persistence)
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
@@ -453,11 +499,14 @@ impl Session {
         &mut self,
         role: MessageRole,
         content: impl Into<String>,
-        tool_calls: Vec<ToolCallRecord>,
-        reasoning: Option<String>,
-        timeline: Vec<TimelineItem>,
-        usage: Option<RunUsage>,
+        details: MessageDetails,
     ) -> String {
+        let MessageDetails {
+            tool_calls,
+            reasoning,
+            timeline,
+            usage,
+        } = details;
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
             id: id.clone(),
@@ -485,6 +534,7 @@ impl Session {
     }
     
     /// Check if a channel is subscribed
+    #[must_use]
     pub fn is_subscribed(&self, channel_id: &str) -> bool {
         self.subscribers.contains(channel_id)
     }
@@ -522,6 +572,7 @@ impl Session {
     }
 
     /// Get display name (name or truncated ID)
+    #[must_use]
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
             format!("Session {}", &self.id[..floor_boundary(&self.id, 8)])
@@ -529,7 +580,8 @@ impl Session {
     }
     
     /// Get message count
-    pub fn message_count(&self) -> usize {
+    #[must_use]
+    pub const fn message_count(&self) -> usize {
         self.messages.len()
     }
 }
@@ -621,7 +673,7 @@ pub struct MailboxMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Serialize a SessionMessage's extra fields (tool_calls, attachments, reasoning, timeline, usage) to JSON metadata.
+/// Serialize a `SessionMessage`'s extra fields (`tool_calls`, attachments, reasoning, timeline, usage) to JSON metadata.
 fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     let has_tool_calls = !msg.tool_calls.is_empty();
     let has_attachments = !msg.attachments.is_empty();
@@ -652,7 +704,7 @@ fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     Some(serde_json::Value::Object(meta).to_string())
 }
 
-/// Deserialize a DB message row back into a SessionMessage.
+/// Deserialize a DB message row back into a `SessionMessage`.
 fn db_message_to_session_message(
     message_id: &str,
     role: &str,
@@ -737,7 +789,7 @@ pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
     /// Default session ID (for new clients)
     default_session: Arc<RwLock<Option<SessionId>>>,
-    /// Sub-session registry (session_id -> info)
+    /// Sub-session registry (`session_id` -> info)
     sub_sessions: Arc<RwLock<HashMap<SessionId, SubSessionInfo>>>,
     /// Per-session mailbox for inter-session messaging
     mailboxes: Arc<RwLock<HashMap<SessionId, Vec<MailboxMessage>>>>,
@@ -747,6 +799,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Create a new session manager (no persistence)
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -758,6 +811,7 @@ impl SessionManager {
     }
 
     /// Create a new session manager backed by Turso storage
+    #[must_use]
     pub fn with_storage(storage: Arc<nanna_storage::Storage>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -852,6 +906,10 @@ impl SessionManager {
                 *default = Some(session_id);
             }
         }
+        // Both guards span the whole load, so no reader ever sees a
+        // half-loaded store or a default naming a session not yet inserted.
+        drop(default);
+        drop(sessions);
 
         info!("Loaded {} sessions from database", count);
         count
@@ -939,21 +997,91 @@ impl SessionManager {
         if default.is_none() {
             *default = Some(id.clone());
         }
+        // `sessions` stays held until the default is settled: a `delete` of
+        // this id cannot interleave between the insert and the default write
+        // and leave the default naming a session that no longer exists.
+        drop(default);
+        drop(sessions);
         
         info!("Created session: {} (workspace: {:?})", id, session.workspace_id);
         session
     }
     
+    /// Make sure the session a channel conversation maps to exists and routes
+    /// its replies to `route`, creating it under that exact id when missing.
+    ///
+    /// A channel conversation is addressed by a key derived from the channel,
+    /// not by an id a client obtained from `session.create`, so nothing else
+    /// creates it — and `chat.send` refuses a session that does not exist.
+    /// Returns whether the session was created.
+    ///
+    /// # Panics
+    ///
+    /// On an empty session id or a route missing its provider or chat — both
+    /// are built by the caller from a message that already has them.
+    pub async fn ensure_channel_session(
+        &self,
+        session_id: &str,
+        name: &str,
+        route: &ReplyChannel,
+    ) -> bool {
+        assert!(!session_id.is_empty(), "a channel session needs an id");
+        assert!(
+            !route.provider.is_empty(),
+            "a reply route names its provider"
+        );
+        assert!(!route.id.is_empty(), "a reply route names its chat");
+        let value = serde_json::json!({ "provider": route.provider, "id": route.id });
+        let (row, created) = {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_id) {
+                if session.reply_channel().as_ref() == Some(route) {
+                    return false;
+                }
+                session
+                    .metadata
+                    .insert(REPLY_CHANNEL_KEY.to_string(), value);
+                session.updated_at = Utc::now();
+                let row = SessionRow::from(&*session);
+                drop(sessions);
+                (row, false)
+            } else {
+                let mut session = Session::with_id(session_id, Some(name.to_string()));
+                session
+                    .metadata
+                    .insert(REPLY_CHANNEL_KEY.to_string(), value);
+                let row = SessionRow::from(&session);
+                sessions.insert(session_id.to_string(), session);
+                drop(sessions);
+                (row, true)
+            }
+        };
+        // Written with the map unlocked, as `set_chat_model` does.
+        self.persist_row(&row).await;
+        if created {
+            info!(
+                "Created channel session {session_id} ({}:{})",
+                route.provider, route.id
+            );
+        }
+        created
+    }
+
+    /// The reply route of a session, read without cloning its messages.
+    pub async fn reply_channel(&self, session_id: &str) -> Option<ReplyChannel> {
+        self.sessions.read().await.get(session_id)?.reply_channel()
+    }
+
     /// Set or clear the workspace for an existing session
     pub async fn set_workspace(&self, session_id: &str, workspace_id: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            session.workspace_id = workspace_id.clone();
+            session.workspace_id.clone_from(&workspace_id);
             // Persist to DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.set_daemon_session_workspace(session_id, workspace_id.as_deref()).await {
-                    warn!("Failed to persist workspace change for session {}: {}", session_id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.set_daemon_session_workspace(session_id, workspace_id.as_deref()).await
+            {
+                warn!("Failed to persist workspace change for session {}: {}", session_id, e);
             }
             true
         } else {
@@ -1006,7 +1134,9 @@ impl SessionManager {
         }
         session.updated_at = Utc::now();
         info!("Session {} chat model set to {:?}", session_id, session.chat_model());
-        Some(SessionRow::from(&*session))
+        let row = SessionRow::from(&*session);
+        drop(sessions);
+        Some(row)
     }
 
     /// Set or clear this session's user-selected extra tools (empty = no
@@ -1054,7 +1184,9 @@ impl SessionManager {
         }
         session.updated_at = Utc::now();
         info!("Session {} chat tools set to {:?}", session_id, session.chat_tools());
-        Some(SessionRow::from(&*session))
+        let row = SessionRow::from(&*session);
+        drop(sessions);
+        Some(row)
     }
 
     /// Get a session by ID
@@ -1071,10 +1203,10 @@ impl SessionManager {
             default.clone()
         };
         
-        if let Some(id) = default_id {
-            if let Some(session) = self.get(&id).await {
-                return session;
-            }
+        if let Some(id) = default_id
+            && let Some(session) = self.get(&id).await
+        {
+            return session;
         }
         
         // Create new default
@@ -1128,18 +1260,22 @@ impl SessionManager {
 
         if removed {
             // Delete from DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.delete_daemon_session(id).await {
-                    warn!("Failed to delete session {} from DB: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.delete_daemon_session(id).await
+            {
+                warn!("Failed to delete session {} from DB: {}", id, e);
             }
             // Clear default if it was this session
             let mut default = self.default_session.write().await;
             if default.as_deref() == Some(id) {
                 *default = sessions.keys().next().cloned();
             }
+            drop(default);
             info!("Deleted session: {}", id);
         }
+        // Held through the DB delete and the default reassignment, which reads
+        // the remaining keys: map, database and default change as one step.
+        drop(sessions);
 
         removed
     }
@@ -1163,6 +1299,11 @@ impl SessionManager {
         // Clear default session
         let mut default = self.default_session.write().await;
         *default = None;
+        // `sessions` stays held until the default is cleared, so a concurrent
+        // create cannot insert and become the default in between only to have
+        // that default wiped here.
+        drop(default);
+        drop(sessions);
 
         info!("Deleted all {} sessions", count);
         count
@@ -1175,10 +1316,10 @@ impl SessionManager {
             session.name = Some(name.clone());
             session.updated_at = Utc::now();
             // Persist to DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.rename_daemon_session(id, &name).await {
-                    warn!("Failed to persist rename for session {}: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.rename_daemon_session(id, &name).await
+            {
+                warn!("Failed to persist rename for session {}: {}", id, e);
             }
             true
         } else {
@@ -1192,10 +1333,10 @@ impl SessionManager {
         if let Some(session) = sessions.get_mut(id) {
             session.clear();
             // Clear from DB
-            if let Some(ref storage) = self.storage {
-                if let Err(e) = storage.clear_daemon_session_messages(id).await {
-                    warn!("Failed to clear messages for session {} in DB: {}", id, e);
-                }
+            if let Some(ref storage) = self.storage
+                && let Err(e) = storage.clear_daemon_session_messages(id).await
+            {
+                warn!("Failed to clear messages for session {} in DB: {}", id, e);
             }
             true
         } else {
@@ -1219,21 +1360,50 @@ impl SessionManager {
         }
     }
 
+    /// Append an assistant message outside any streamed turn and announce it
+    /// with `session_message_added`, so an open client shows it and the channel
+    /// reply forwarder delivers it to a channel-owned conversation.
+    ///
+    /// The one path for daemon-originated messages — a reminder coming due, a
+    /// clarifying question, a scheduled job's result — so none of them can be
+    /// persisted without being announced, or the reverse. `None` when the
+    /// session does not exist; nothing is sent then.
+    pub async fn post_assistant_message(
+        &self,
+        events: &tokio::sync::broadcast::Sender<crate::protocol::Event>,
+        session_id: &str,
+        content: String,
+    ) -> Option<String> {
+        debug_assert!(
+            !content.trim().is_empty(),
+            "a posted message says something"
+        );
+        let message_id = self
+            .add_message(session_id, MessageRole::Assistant, content.clone())
+            .await?;
+        // No receiver is not a failure: the message is persisted and read back
+        // from history by the next client that opens the session.
+        let _ = events.send(crate::protocol::Event::SessionMessageAdded {
+            session_id: session_id.to_string(),
+            message_id: message_id.clone(),
+            role: "assistant".to_string(),
+            content,
+        });
+        Some(message_id)
+    }
+
     /// Add a message with tool calls, reasoning, run timeline, and usage totals to a session (with write-through to DB)
     pub async fn add_full_message(
         &self,
         session_id: &str,
         role: MessageRole,
         content: impl Into<String>,
-        tool_calls: Vec<ToolCallRecord>,
-        reasoning: Option<String>,
-        timeline: Vec<TimelineItem>,
-        usage: Option<RunUsage>,
+        details: MessageDetails,
     ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_full_message(role, content, tool_calls, reasoning, timeline, usage);
+            let msg_id = session.add_full_message(role, content, details);
             // Persist the new message synchronously
             if let Some(msg) = session.messages.last() {
                 self.persist_message(session_id, msg).await;
@@ -1258,23 +1428,19 @@ impl SessionManager {
     /// Subscribe a channel to a session
     pub async fn subscribe(&self, session_id: &str, channel_id: ChannelId) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
+        sessions.get_mut(session_id).is_some_and(|session| {
             session.subscribe(channel_id);
             true
-        } else {
-            false
-        }
+        })
     }
     
     /// Unsubscribe a channel from a session
     pub async fn unsubscribe(&self, session_id: &str, channel_id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
+        sessions.get_mut(session_id).is_some_and(|session| {
             session.unsubscribe(channel_id);
             true
-        } else {
-            false
-        }
+        })
     }
     
     /// Get all sessions a channel is subscribed to
@@ -1325,6 +1491,10 @@ impl SessionManager {
         if default.is_none() {
             *default = Some(id);
         }
+        // Same ordering as `create_in_workspace`: the insert and the default
+        // settle together.
+        drop(default);
+        drop(sessions);
     }
     
     /// Set the default session ID
@@ -1337,11 +1507,13 @@ impl SessionManager {
     }
     
     /// Get the internal sessions map (for legacy code that needs it)
+    #[must_use]
     pub fn sessions_map(&self) -> Arc<RwLock<HashMap<SessionId, Session>>> {
         self.sessions.clone()
     }
     
     /// Get the default session ID holder
+    #[must_use]
     pub fn default_session_id(&self) -> Arc<RwLock<Option<SessionId>>> {
         self.default_session.clone()
     }
@@ -1404,7 +1576,7 @@ impl SessionManager {
             .cloned()
     }
 
-    /// Resolve a sub-session target (label or ID) to a SubSessionInfo
+    /// Resolve a sub-session target (label or ID) to a `SubSessionInfo`
     pub async fn resolve_sub_session(&self, target: &str) -> Option<SubSessionInfo> {
         let subs = self.sub_sessions.read().await;
         if let Some(info) = subs.get(target) {
@@ -1419,10 +1591,7 @@ impl SessionManager {
     pub async fn list_sub_sessions(&self, parent_id: Option<&str>) -> Vec<SubSessionInfo> {
         let subs = self.sub_sessions.read().await;
         subs.values()
-            .filter(|s| match parent_id {
-                Some(pid) => s.parent_id.as_deref() == Some(pid),
-                None => true,
-            })
+            .filter(|s| parent_id.is_none_or(|pid| s.parent_id.as_deref() == Some(pid)))
             .cloned()
             .collect()
     }
@@ -1447,16 +1616,14 @@ impl SessionManager {
     /// Send a message to a session's mailbox
     pub async fn send_to_mailbox(&self, session_id: &str, from: &str, content: String) -> bool {
         let mut mailboxes = self.mailboxes.write().await;
-        if let Some(mailbox) = mailboxes.get_mut(session_id) {
+        mailboxes.get_mut(session_id).is_some_and(|mailbox| {
             mailbox.push(MailboxMessage {
                 from: from.to_string(),
                 content,
                 timestamp: Utc::now(),
             });
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Drain all messages from a session's mailbox
@@ -1484,7 +1651,7 @@ impl SessionManager {
         let to_remove: Vec<String> = subs.iter()
             .filter(|(_, info)| {
                 matches!(info.state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed)
-                    && info.finished_at.map(|t| t < cutoff).unwrap_or(false)
+                    && info.finished_at.is_some_and(|t| t < cutoff)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1493,6 +1660,10 @@ impl SessionManager {
             subs.remove(id);
             mailboxes.remove(id);
         }
+        // Both maps are swept under one acquisition, so no reader sees a
+        // sub-session without its mailbox or the reverse.
+        drop(mailboxes);
+        drop(subs);
 
         if !to_remove.is_empty() {
             info!("Cleaned up {} completed sub-sessions", to_remove.len());
@@ -1507,7 +1678,7 @@ impl SessionManager {
 /// whatever text their source held. Slicing one at a fixed byte index panics
 /// when the id is shorter than the limit or when the index lands inside a
 /// multi-byte character, and a panic here would take the whole daemon down.
-fn floor_boundary(s: &str, max: usize) -> usize {
+const fn floor_boundary(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -1599,7 +1770,7 @@ mod tests {
     /// chat — they must survive not just navigation (see
     /// `tasks::tests::tool_calls_survive_navigation_via_run_buffers`) but a
     /// full daemon restart. The timeline journal persisted with the message
-    /// must round-trip through Turso intact: a fresh SessionManager over the
+    /// must round-trip through Turso intact: a fresh `SessionManager` over the
     /// same database restores the message with its tool call, input, output
     /// and verdict in place.
     #[tokio::test]
@@ -1653,10 +1824,10 @@ mod tests {
                 &session.id,
                 MessageRole::Assistant,
                 "there is one file: file.txt",
-                Vec::new(),
-                None,
-                timeline,
-                None,
+                MessageDetails {
+                    timeline,
+                    ..MessageDetails::default()
+                },
             )
             .await;
 
@@ -1831,10 +2002,10 @@ mod tests {
                 &session.id,
                 MessageRole::Assistant,
                 "done",
-                Vec::new(),
-                None,
-                timeline,
-                None,
+                MessageDetails {
+                    timeline,
+                    ..MessageDetails::default()
+                },
             )
             .await;
 

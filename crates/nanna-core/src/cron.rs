@@ -62,6 +62,15 @@ impl CronExpr {
     /// // Special strings
     /// let expr = CronExpr::parse("@hourly").unwrap();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CronError::Invalid`] when the expression (after expanding an
+    /// `@hourly`-style alias) does not have exactly five whitespace-separated
+    /// fields, [`CronError::InvalidField`] when a field's value, range or step is
+    /// not a number or is malformed (a `*/0` step included), and
+    /// [`CronError::OutOfRange`] when a value or range bound lies outside its
+    /// field (minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6).
     pub fn parse(expr: &str) -> Result<Self, CronError> {
         let expr = expr.trim();
 
@@ -115,7 +124,7 @@ impl CronExpr {
     where
         Tz::Offset: Copy,
     {
-        let mut dt = from.clone() + chrono::Duration::minutes(1);
+        let mut dt = *from + chrono::Duration::minutes(1);
         // Reset seconds
         dt = dt
             .timezone()
@@ -130,18 +139,20 @@ impl CronExpr {
             }
 
             // Advance by 1 minute
-            dt = dt + chrono::Duration::minutes(1);
+            dt += chrono::Duration::minutes(1);
         }
 
         None
     }
 
     /// Find the next datetime that matches, starting from now (UTC)
+    #[must_use]
     pub fn next_from_now(&self) -> Option<DateTime<Utc>> {
         self.next(&Utc::now())
     }
 
     /// Get human-readable description
+    #[must_use]
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
 
@@ -149,12 +160,11 @@ impl CronExpr {
         if self.minutes.len() == 60 {
             parts.push("every minute".to_string());
         } else if self.minutes.len() == 1 {
-            let m = *self.minutes.iter().next().unwrap();
-            if m == 0 {
-                // Don't mention "at minute 0"
-            } else {
-                parts.push(format!("at minute {m}"));
-            }
+            // Don't mention "at minute 0"
+            if let Some(&m) = self.minutes.iter().next()
+                && m != 0 {
+                    parts.push(format!("at minute {m}"));
+                }
         } else {
             // `minutes` is a HashSet (unordered) — sort before differencing so the
             // reported step is deterministic and actually the smallest interval.
@@ -170,18 +180,18 @@ impl CronExpr {
             if self.minutes.len() != 60 {
                 parts.push("every hour".to_string());
             }
-        } else if self.hours.len() == 1 {
-            let h = *self.hours.iter().next().unwrap();
-            let period = if h < 12 { "AM" } else { "PM" };
-            let h12 = if h == 0 {
-                12
-            } else if h > 12 {
-                h - 12
-            } else {
-                h
-            };
-            parts.push(format!("at {h12} {period}"));
-        }
+        } else if self.hours.len() == 1
+            && let Some(&h) = self.hours.iter().next() {
+                let period = if h < 12 { "AM" } else { "PM" };
+                let h12 = if h == 0 {
+                    12
+                } else if h > 12 {
+                    h - 12
+                } else {
+                    h
+                };
+                parts.push(format!("at {h12} {period}"));
+            }
 
         // Weekdays
         if self.weekdays.len() < 7 {
@@ -244,10 +254,12 @@ fn parse_field(field: &str, name: &str, min: u32, max: u32) -> Result<HashSet<u3
                 });
             }
 
-            let mut v = min;
-            while v <= max {
-                values.insert(v);
-                v += step;
+            // `checked_add`: a step near `u32::MAX` must end the walk, not
+            // wrap back into range and loop forever in a release build.
+            let mut v = Some(min);
+            while let Some(current) = v.filter(|&c| c <= max) {
+                values.insert(current);
+                v = current.checked_add(step);
             }
         } else if part.contains('/') {
             // Range with step: 0-30/10
@@ -265,12 +277,21 @@ fn parse_field(field: &str, name: &str, min: u32, max: u32) -> Result<HashSet<u3
                 message: format!("Invalid step: {}", parts[1]),
             })?;
 
+            // Same rule as `*/0`: a zero step never advances, so the walk
+            // below would never end.
+            if step == 0 {
+                return Err(CronError::InvalidField {
+                    field: name.to_string(),
+                    message: "Step cannot be 0".to_string(),
+                });
+            }
+
             let (start, end) = parse_range(range, name, min, max)?;
 
-            let mut v = start;
-            while v <= end {
-                values.insert(v);
-                v += step;
+            let mut v = Some(start);
+            while let Some(current) = v.filter(|&c| c <= end) {
+                values.insert(current);
+                v = current.checked_add(step);
             }
         } else if part.contains('-') {
             // Range: 1-5
@@ -395,6 +416,24 @@ mod tests {
         assert!(expr.minutes.contains(&30));
         assert!(expr.minutes.contains(&45));
         assert_eq!(expr.minutes.len(), 4);
+    }
+
+    #[test]
+    fn zero_step_is_rejected_in_a_range_too() {
+        // `0-30/0` used to loop forever: only `*/0` was checked.
+        assert!(CronExpr::parse("0-30/0 * * * *").is_err());
+        assert!(CronExpr::parse("*/0 * * * *").is_err());
+    }
+
+    #[test]
+    fn huge_step_ends_the_walk_instead_of_wrapping() {
+        // 1 + u32::MAX overflowed: a panic in debug, a wrap back to 0 and an
+        // endless loop in release.
+        let expr = CronExpr::parse("1-30/4294967295 * * * *").unwrap();
+        assert_eq!(expr.minutes.len(), 1);
+        assert!(expr.minutes.contains(&1));
+        let expr = CronExpr::parse("*/4294967295 * * * *").unwrap();
+        assert_eq!(expr.minutes.len(), 1);
     }
 
     #[test]

@@ -126,14 +126,23 @@ pub enum TaskAction {
         recurrence: Option<String>,
         #[serde(default)]
         depends_on: Option<Vec<i64>>,
+        /// Boxed because it is the whole reason this variant dwarfs the rest.
+        /// A `serde_json::Value` is 32 bytes with `serde_json`'s default
+        /// `BTreeMap`-backed map and ~72 with the `IndexMap` that
+        /// `preserve_order` swaps in — and something in the dependency graph
+        /// turns `preserve_order` on under `--all-features`. Inline, that made
+        /// `Create`, and through it `Action` (the type every IPC request is),
+        /// 368 bytes, so a `task.get {id}` cost as much to move as the largest
+        /// `task.create`. `Box` is transparent to serde: the wire JSON is
+        /// byte-for-byte what it was, including `null` for `None`.
         #[serde(default)]
-        acceptance: Option<serde_json::Value>,
+        acceptance: Option<Box<serde_json::Value>>,
         #[serde(default)]
         project: Option<String>,
         #[serde(default)]
         assignee: Option<String>,
     },
-    /// Partial update (status accepts pending|in_progress|cancelled)
+    /// Partial update (status accepts `pending|in_progress|cancelled`)
     Update {
         id: i64,
         #[serde(default)]
@@ -333,6 +342,18 @@ pub enum SessionAction {
         #[serde(default)]
         tools: Vec<String>,
     },
+    /// This session's file checkpoints — each file as it was just before a
+    /// tool write replaced it — newest first.
+    FileHistory {
+        id: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Put a file back the way checkpoint `checkpoint` found it. The current
+    /// content is checkpointed first, so this is undoable.
+    RestoreFile { id: String, checkpoint: u64 },
 
     // --- Sub-Agent Sessions (#72) ---
     /// Spawn a sub-agent session
@@ -465,7 +486,16 @@ pub enum ToolAction {
     /// Disable a tool
     Disable { name: String },
     /// Execute a tool directly
-    Execute { name: String, input: Value },
+    Execute {
+        name: String,
+        input: Value,
+        /// The conversation the call runs in, as `Nanna.sessionId()` sees it.
+        /// Without it a direct call reads whatever session the daemon was last
+        /// interactively bound to — an arbitrary one — so a session-scoped tool
+        /// (`todo`, `remind`) would file its work under someone else's chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     /// Create a user tool
     Create {
         name: String,
@@ -516,6 +546,11 @@ pub enum SchedulerAction {
         schedule: String,
         task: String,
         name: Option<String>,
+        /// A conversation the job's result is posted into after each run —
+        /// and so, for a channel conversation, sent to that chat. Absent: the
+        /// result goes to the job's run history only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// Update a job
     Update {
@@ -624,6 +659,15 @@ pub enum SystemAction {
     ToolStatsHourly {
         tool_name: Option<String>,
         hours: Option<u32>,
+    },
+    /// Estimated model spend per day or month, from the request log.
+    CostRollup {
+        /// Window in days (default 30, at most 366).
+        #[serde(default)]
+        days: Option<u32>,
+        /// `day` (default), `month`, or `session` (bucket label = session id).
+        #[serde(default)]
+        by: Option<String>,
     },
     /// Get daily tool stats time-series (for graphs)
     ToolStatsDaily {
@@ -737,12 +781,14 @@ impl Response {
     }
 
     /// Check if this response is an error
-    pub fn is_error(&self) -> bool {
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
 
     /// Get the data if successful
-    pub fn data(&self) -> Option<&Value> {
+    #[must_use]
+    pub const fn data(&self) -> Option<&Value> {
         match &self.result {
             ResponseResult::Success { data } => Some(data),
             ResponseResult::Error { .. } => None,
@@ -750,6 +796,7 @@ impl Response {
     }
 
     /// Get the error message if failed
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         match &self.result {
             ResponseResult::Error { message, .. } => Some(message),
@@ -779,6 +826,17 @@ pub enum Event {
     MessageEnd {
         session_id: String,
         message_id: String,
+        content: String,
+    },
+    /// A complete message was appended to a session outside any streamed
+    /// turn — today, a reminder coming due. Streamed turns announce themselves
+    /// with `message_start`/`message_end`; this one had no turn, so without its
+    /// own event a client viewing the session would show nothing until reload.
+    SessionMessageAdded {
+        session_id: String,
+        message_id: String,
+        /// `user` | `assistant` | `system` | `tool`, as stored.
+        role: String,
         content: String,
     },
 
@@ -834,7 +892,7 @@ pub enum Event {
         session_id: String,
         /// Seconds since this turn started.
         elapsed_s: u64,
-        /// Coarse phase: planning | step_pending | streaming | thinking | tool.
+        /// Coarse phase: planning | `step_pending` | streaming | thinking | tool.
         phase: String,
         /// What the turn is waiting on right now, human-readable
         /// (e.g. "model output (ollama/qwen3.5:9b): last token 41s ago").
@@ -856,6 +914,13 @@ pub enum Event {
         name: Option<String>,
     },
     SessionDeleted {
+        id: String,
+    },
+    /// Every message of a session was removed (`session.clear`, or `/new` from
+    /// a chat app); the session itself, its name and its model pin remain. An
+    /// open view of it must empty, or it keeps showing a conversation the
+    /// next turn no longer sees.
+    SessionCleared {
         id: String,
     },
     SessionRenamed {
@@ -1003,7 +1068,7 @@ pub enum Event {
         scope: String,
         scope_id: Option<String>,
         task_id: Option<i64>,
-        /// started | completed | abandoned | acceptance_checked | replanned | ...
+        /// started | completed | abandoned | `acceptance_checked` | replanned | ...
         kind: String,
         detail: serde_json::Value,
     },
@@ -1027,6 +1092,7 @@ impl Event {
             Self::MessageStart { session_id, .. }
             | Self::MessageDelta { session_id, .. }
             | Self::MessageEnd { session_id, .. }
+            | Self::SessionMessageAdded { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::StepStarted { session_id, .. }
             | Self::ToolStart { session_id, .. }
@@ -1040,6 +1106,7 @@ impl Event {
             | Self::ContextUsage { session_id, .. } => Some(session_id),
             Self::SessionCreated { id, .. }
             | Self::SessionDeleted { id }
+            | Self::SessionCleared { id }
             | Self::SessionRenamed { id, .. } => Some(id),
             Self::Error { session_id, .. } => session_id.as_deref(),
             Self::WorkspacesChanged
@@ -1096,27 +1163,29 @@ pub enum ControlAction {
 impl From<ControlAction> for Action {
     fn from(action: ControlAction) -> Self {
         match action {
-            ControlAction::ListSessions => Action::Session(SessionAction::List),
+            ControlAction::ListSessions => Self::Session(SessionAction::List),
             ControlAction::CreateSession { name } => {
-                Action::Session(SessionAction::Create { name })
+                Self::Session(SessionAction::Create { name })
             }
-            ControlAction::SwitchSession { id } => Action::Session(SessionAction::Switch { id }),
-            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search {
+            ControlAction::SwitchSession { id } => Self::Session(SessionAction::Switch { id }),
+            ControlAction::MemorySearch { query, limit } => Self::Memory(MemoryAction::Search {
                 query,
                 limit,
                 scope: None,
             }),
-            ControlAction::GetConfig => Action::Config(ConfigAction::Get { path: None }),
+            ControlAction::GetConfig => Self::Config(ConfigAction::Get { path: None }),
             ControlAction::SetConfig { path, value } => {
-                Action::Config(ConfigAction::Set { path, value })
+                Self::Config(ConfigAction::Set { path, value })
             }
-            ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => {
-                Action::Tool(ToolAction::Execute { name, input })
-            }
-            ControlAction::Status => Action::System(SystemAction::Status),
-            ControlAction::Restart => Action::System(SystemAction::Restart),
-            ControlAction::Shutdown => Action::System(SystemAction::Shutdown),
+            ControlAction::ListTools => Self::Tool(ToolAction::List),
+            ControlAction::RunTool { name, input } => Self::Tool(ToolAction::Execute {
+                name,
+                input,
+                session_id: None,
+            }),
+            ControlAction::Status => Self::System(SystemAction::Status),
+            ControlAction::Restart => Self::System(SystemAction::Restart),
+            ControlAction::Shutdown => Self::System(SystemAction::Shutdown),
         }
     }
 }
@@ -1170,6 +1239,75 @@ mod tests {
                     Action::Session(SessionAction::SetModel { model: None, .. })
                 ),
                 "no model on the wire is the clear, not a parse error"
+            );
+        }
+    }
+
+    /// `TaskAction::Create::acceptance` is a `Box` purely to keep `Action`
+    /// small, and that is only allowed because `Box` is transparent to serde.
+    /// Pinned in both directions: a client's `task.create` still parses, and
+    /// the acceptance goes back out as itself rather than wrapped in anything.
+    /// If the box ever leaked into the wire it would show up here and nowhere
+    /// else — every client hand-writes this envelope.
+    ///
+    /// The re-serialized envelope is not byte-identical to the request, but
+    /// that predates the box and has nothing to do with it: no field carries
+    /// `skip_serializing_if`, so all thirteen omitted `Option`s come back as
+    /// explicit `null`. Round-tripping that output is what the assertion
+    /// checks, because `null` and absent are the same thing on the way in.
+    #[test]
+    fn a_boxed_acceptance_is_the_same_json_in_both_directions() {
+        let check = serde_json::json!({ "kind": "command", "command": "cargo test", "cwd": "." });
+        let raw = serde_json::json!({
+            "type": "task",
+            "action": "create",
+            "title": "build minidb",
+            "acceptance": check,
+        });
+
+        let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+        match &action {
+            Action::Task(TaskAction::Create { title, acceptance, .. }) => {
+                assert_eq!(title, "build minidb");
+                assert_eq!(
+                    acceptance.as_deref(),
+                    Some(&check),
+                    "the acceptance arrives whole through the box"
+                );
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+
+        let out = serde_json::to_value(&action).expect("create must serialize");
+        assert_eq!(out["acceptance"], check, "the box must not show up on the wire");
+        let again = serde_json::from_value::<Action>(out).expect("our own output must parse");
+        match again {
+            Action::Task(TaskAction::Create { acceptance, .. }) => {
+                assert_eq!(acceptance.as_deref(), Some(&check));
+            }
+            other => panic!("expected a task create action, got {other:?}"),
+        }
+    }
+
+    /// The other half: no acceptance at all. `null` and an absent key both
+    /// mean "no check", and neither may round-trip into `Some(Value::Null)` —
+    /// which `task_create` would then hand to the harness parser as a shape to
+    /// reject, turning a plain task into a `bad_acceptance` error.
+    #[test]
+    fn a_null_or_absent_acceptance_is_no_acceptance() {
+        for raw in [
+            serde_json::json!({
+                "type": "task", "action": "create", "title": "t", "acceptance": null,
+            }),
+            serde_json::json!({ "type": "task", "action": "create", "title": "t" }),
+        ] {
+            let action = serde_json::from_value::<Action>(raw).expect("create must parse");
+            assert!(
+                matches!(
+                    action,
+                    Action::Task(TaskAction::Create { acceptance: None, .. })
+                ),
+                "no acceptance on the wire is no check, not an empty one"
             );
         }
     }

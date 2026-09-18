@@ -18,6 +18,12 @@ pub struct ExecutableTool {
 
 impl ExecutableTool {
     /// Create from a manifest file path
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Io`] if the manifest cannot be read, and
+    /// [`ToolError::InvalidParams`] if it is not a valid manifest or the path has
+    /// no parent directory to run the skill from.
     pub fn from_manifest(manifest_path: &Path) -> Result<Self, ToolError> {
         let manifest = SkillManifest::from_file(manifest_path)?;
         let skill_dir = manifest_path.parent()
@@ -103,11 +109,11 @@ impl ExecutableTool {
 impl Tool for ExecutableTool {
     fn definition(&self) -> ToolDefinition {
         // Convert JSON Schema parameters to ToolParameter format
-        let parameters = if let Some(schema) = &self.manifest.parameters {
-            parse_json_schema_params(schema)
-        } else {
-            vec![]
-        };
+        let parameters = self
+            .manifest
+            .parameters
+            .as_ref()
+            .map_or_else(Vec::new, parse_json_schema_params);
         
         ToolDefinition {
             name: self.manifest.name.clone(),
@@ -218,7 +224,7 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
-/// Parse JSON Schema parameters into ToolParameter format
+/// Parse JSON Schema parameters into `ToolParameter` format
 fn parse_json_schema_params(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
     
@@ -229,8 +235,8 @@ fn parse_json_schema_params(schema: &Value) -> Vec<ToolParameter> {
             .unwrap_or_default();
         
         for (name, prop) in properties {
+            // `string`, and anything absent or unrecognised, reads as a string.
             let param_type = match prop.get("type").and_then(|t| t.as_str()) {
-                Some("string") => ParameterType::String,
                 Some("integer") => ParameterType::Integer,
                 Some("number") => ParameterType::Number,
                 Some("boolean") => ParameterType::Boolean,

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -51,7 +52,8 @@ fn should_ignore(name: &str) -> bool {
 pub struct CodeOutlineTool;
 
 impl CodeOutlineTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -82,7 +84,7 @@ impl Tool for CodeOutlineTool {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| ToolError::Io(e))?;
+            .map_err(ToolError::Io)?;
 
         let ext = Path::new(path)
             .extension()
@@ -93,8 +95,7 @@ impl Tool for CodeOutlineTool {
 
         if outline.is_empty() {
             Ok(ToolResult::success(format!(
-                "No definitions found in {} (unsupported language or empty file)",
-                path
+                "No definitions found in {path} (unsupported language or empty file)"
             )))
         } else {
             let line_count = content.lines().count();
@@ -104,7 +105,8 @@ impl Tool for CodeOutlineTool {
                 path,
                 line_count,
                 outline_lines,
-                (1.0 - outline_lines as f64 / line_count.max(1) as f64) * 100.0,
+                (1.0 - crate::usize_to_f64(outline_lines) / crate::usize_to_f64(line_count.max(1)))
+                    * 100.0,
                 outline
             )))
         }
@@ -224,7 +226,8 @@ fn extract_by_patterns(content: &str, patterns: &[&str]) -> String {
 pub struct CodeSearchTool;
 
 impl CodeSearchTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -272,22 +275,26 @@ impl Tool for CodeSearchTool {
             .get("file_pattern")
             .and_then(Value::as_str);
 
-        let context_lines = params
-            .get("context_lines")
-            .and_then(Value::as_u64)
-            .unwrap_or(2) as usize;
+        let context_lines = crate::u64_to_usize(
+            params
+                .get("context_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(2),
+        );
 
-        let max_results = params
-            .get("max_results")
-            .and_then(Value::as_u64)
-            .unwrap_or(50) as usize;
+        let max_results = crate::u64_to_usize(
+            params
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .unwrap_or(50),
+        );
 
         let re = Regex::new(pattern_str)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid regex: {e}")))?;
 
-        let glob_pattern = file_pattern.map(|p| {
+        let glob_pattern = file_pattern.and_then(|p| {
             glob::Pattern::new(p).ok()
-        }).flatten();
+        });
 
         let mut results = Vec::new();
         let mut structured_matches: Vec<serde_json::Value> = Vec::new();
@@ -299,8 +306,7 @@ impl Tool for CodeSearchTool {
             .filter_entry(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|name| !should_ignore(name))
-                    .unwrap_or(true)
+                    .is_none_or(|name| !should_ignore(name))
             })
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
@@ -308,24 +314,20 @@ impl Tool for CodeSearchTool {
             let path = entry.path();
 
             // Apply file pattern filter
-            if let Some(ref glob) = glob_pattern {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !glob.matches(name) {
+            if let Some(ref glob) = glob_pattern
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && !glob.matches(name) {
                         continue;
                     }
-                }
-            }
 
             // Skip binary files (check first 512 bytes)
-            if let Ok(bytes) = std::fs::read(path) {
-                if bytes.len() > 512 && bytes[..512].contains(&0) {
+            if let Ok(bytes) = std::fs::read(path)
+                && bytes.len() > 512 && bytes[..512].contains(&0) {
                     continue;
                 }
-            }
 
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue, // Skip unreadable files
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue; // Skip unreadable files
             };
 
             // Skip likely minified/bundled files (any line > 500 chars)
@@ -347,9 +349,9 @@ impl Tool for CodeSearchTool {
                     let end = (i + context_lines + 1).min(lines.len());
 
                     let mut match_block = format!("{}:{}\n", path.display(), i + 1);
-                    for j in start..end {
+                    for (j, context_line) in lines.iter().enumerate().take(end).skip(start) {
                         let marker = if j == i { ">" } else { " " };
-                        match_block.push_str(&format!("{} {:>4} | {}\n", marker, j + 1, lines[j]));
+                        let _ = writeln!(match_block, "{} {:>4} | {}", marker, j + 1, context_line);
                     }
                     structured_matches.push(serde_json::json!({
                         "file": path.display().to_string(),
@@ -392,7 +394,8 @@ impl Tool for CodeSearchTool {
 pub struct ProjectStructureTool;
 
 impl ProjectStructureTool {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -428,14 +431,16 @@ impl Tool for ProjectStructureTool {
             .and_then(Value::as_str)
             .unwrap_or(".");
 
-        let max_depth = params
-            .get("max_depth")
-            .and_then(Value::as_u64)
-            .unwrap_or(3) as usize;
+        let max_depth = crate::u64_to_usize(
+            params
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(3),
+        );
 
         let root_path = Path::new(root);
         if !root_path.exists() {
-            return Ok(ToolResult::error(format!("Path does not exist: {}", root)));
+            return Ok(ToolResult::error(format!("Path does not exist: {root}")));
         }
 
         let mut output = Vec::new();
@@ -443,7 +448,7 @@ impl Tool for ProjectStructureTool {
         let mut total_size = 0u64;
         let mut total_lines = 0u64;
 
-        output.push(format!("{}/", root));
+        output.push(format!("{root}/"));
 
         for entry in WalkDir::new(root)
             .max_depth(max_depth)
@@ -451,8 +456,7 @@ impl Tool for ProjectStructureTool {
             .filter_entry(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|name| !should_ignore(name))
-                    .unwrap_or(true)
+                    .is_none_or(|name| !should_ignore(name))
             })
             .filter_map(Result::ok)
             .skip(1) // skip root
@@ -462,10 +466,10 @@ impl Tool for ProjectStructureTool {
             let name = entry.file_name().to_string_lossy();
 
             if entry.file_type().is_dir() {
-                output.push(format!("{}{}/", indent, name));
+                output.push(format!("{indent}{name}/"));
             } else if entry.file_type().is_file() {
                 let metadata = entry.metadata().ok();
-                let size = metadata.as_ref().map_or(0, |m| m.len());
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 total_files += 1;
                 total_size += size;
 
@@ -484,10 +488,10 @@ impl Tool for ProjectStructureTool {
 
                 let size_str = format_size(size);
                 let line_str = lines
-                    .map(|l| format!(", {} lines", l))
+                    .map(|l| format!(", {l} lines"))
                     .unwrap_or_default();
 
-                output.push(format!("{}{} ({}{})", indent, name, size_str, line_str));
+                output.push(format!("{indent}{name} ({size_str}{line_str})"));
             }
         }
 
@@ -519,10 +523,10 @@ fn format_size(bytes: u64) -> String {
     const MB: u64 = 1024 * 1024;
 
     if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
+        format!("{:.1}MB", crate::u64_to_f64(bytes) / crate::u64_to_f64(MB))
     } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
+        format!("{:.1}KB", crate::u64_to_f64(bytes) / crate::u64_to_f64(KB))
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }

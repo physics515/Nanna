@@ -76,6 +76,7 @@ impl ToolDefinition {
         self
     }
 
+    #[must_use]
     pub fn string_param(
         mut self,
         name: impl Into<String>,
@@ -93,6 +94,7 @@ impl ToolDefinition {
         self
     }
 
+    #[must_use]
     pub fn int_param(
         mut self,
         name: impl Into<String>,
@@ -110,6 +112,7 @@ impl ToolDefinition {
         self
     }
 
+    #[must_use]
     pub fn integer_param(
         self,
         name: impl Into<String>,
@@ -119,6 +122,7 @@ impl ToolDefinition {
         self.int_param(name, description, required)
     }
 
+    #[must_use]
     pub fn array_param(
         mut self,
         name: impl Into<String>,
@@ -136,6 +140,7 @@ impl ToolDefinition {
         self
     }
 
+    #[must_use]
     pub fn enum_param(
         mut self,
         name: impl Into<String>,
@@ -154,6 +159,7 @@ impl ToolDefinition {
         self
     }
 
+    #[must_use]
     pub fn bool_param(
         mut self,
         name: impl Into<String>,

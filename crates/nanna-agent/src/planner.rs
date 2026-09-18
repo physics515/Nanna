@@ -119,7 +119,7 @@ impl Plan {
 
     /// True when this is the degenerate single-step plan.
     #[must_use]
-    pub fn is_single_step(&self) -> bool {
+    pub const fn is_single_step(&self) -> bool {
         self.tasks.len() == 1
     }
 }
@@ -212,6 +212,15 @@ pub fn build_plan_prompt(goal: &str, context: Option<&str>) -> String {
 /// block, an object wrapping `tasks`/`plan`/`steps`, or a single bare task
 /// object. Returns `Err` only when nothing task-shaped is present; callers
 /// are expected to fall back rather than surface the error.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when:
+/// - the text contains no balanced JSON array or object;
+/// - the first such span does not parse as JSON;
+/// - it is an object with no `tasks`/`plan`/`steps` array and no `title`;
+/// - it is neither an array nor an object;
+/// - no element of the plan normalizes into a task with a non-empty title.
 pub fn parse_plan(text: &str) -> Result<Vec<PlannedTask>, String> {
     let candidate = extract_json(text).ok_or_else(|| "no JSON found in planner output".to_string())?;
     let value: serde_json::Value =
@@ -360,13 +369,13 @@ fn extract_json(text: &str) -> Option<String> {
 /// hiccup degrades a turn to ordinary one-step chat instead of breaking it.
 #[must_use]
 pub fn plan_or_fallback(goal: &str, planner_output: &str) -> Plan {
-    match parse_plan(planner_output) {
-        Ok(tasks) => Plan {
+    parse_plan(planner_output).map_or_else(
+        |_| Plan::single(goal),
+        |tasks| Plan {
             tasks,
             origin: PlanOrigin::Model,
         },
-        Err(_) => Plan::single(goal),
-    }
+    )
 }
 
 #[cfg(test)]

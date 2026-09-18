@@ -6,9 +6,10 @@ use super::vision::{AnalyzeImageTool, VisionFn};
 use nanna_llm::{AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient};
 use std::sync::Arc;
 
-/// Create an analyze_image tool wired to an LLM client with vision support.
+/// Create an `analyze_image` tool wired to an LLM client with vision support.
 ///
 /// The LLM client should support Anthropic's vision API (claude-3-* models).
+#[must_use]
 pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageTool {
     AnalyzeImageTool::new().with_vision_fn(create_vision_fn(llm, model))
 }
