@@ -1,17 +1,20 @@
 //! Daemon Client Integration
 //!
-//! Connects the Tauri GUI to the nanna-daemon via WebSocket.
-//! Falls back to embedded mode if daemon is not available.
+//! Connects the Tauri GUI to the nanna-daemon via WebSocket. A client that is
+//! not connected — never was, or lost the connection — keeps retrying (every
+//! [`RETRY_INTERVAL`] by default) until a daemon answers or
+//! [`DaemonClient::disconnect`] is called.
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 // use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
@@ -32,6 +35,29 @@ const MAX_MISSED_PINGS: u32 = 3;
 /// Needs to be long enough for post-processing (tool stats, DB writes,
 /// memory extraction/saving, session persistence) to complete.
 const IDLE_GRACE_PERIOD: Duration = Duration::from_secs(60);
+
+/// How often a client that is not connected tries the daemon again, unless
+/// [`DaemonClientConfig::retry_interval`] says otherwise.
+///
+/// The retry loop has no attempt cap. One attempt is a connect to a local
+/// port, which costs nothing, and a daemon can come up at any point: after a
+/// boot that takes minutes (a cold model load, a migration, a slow provider),
+/// when it is started by hand, or after a crash. The old cap of 30 attempts
+/// fell back to an embedded backend that no longer exists. After it, nothing
+/// retried until the app restarted.
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Set `state` to `next` unless a connection is live.
+///
+/// [`DaemonClient::connect`] and the retry loop run side by side, and either
+/// one can fail after the other has connected. A failed attempt must never
+/// mark a live connection as down.
+async fn set_unless_connected(state: &RwLock<ConnectionState>, next: ConnectionState) {
+    let mut state = state.write().await;
+    if *state != ConnectionState::Connected {
+        *state = next;
+    }
+}
 
 /// Connection mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -60,6 +86,8 @@ pub struct DaemonClientConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub auto_reconnect: bool,
+    /// How long the retry loop waits between attempts ([`RETRY_INTERVAL`]).
+    pub retry_interval: Duration,
 }
 
 impl Default for DaemonClientConfig {
@@ -69,6 +97,7 @@ impl Default for DaemonClientConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(300), // 5 minutes for large content summarization (many chunks)
             auto_reconnect: true,
+            retry_interval: RETRY_INTERVAL,
         }
     }
 }
@@ -195,7 +224,7 @@ struct PendingRequest {
 }
 
 /// The handles a connection's background tasks (the message pump and the
-/// reconnection loop) share with the [`DaemonClient`] that spawned them.
+/// retry loop) share with the [`DaemonClient`] that spawned them.
 #[derive(Clone)]
 struct ConnectionShared {
     config: DaemonClientConfig,
@@ -205,8 +234,15 @@ struct ConnectionShared {
     pending: Arc<RwLock<HashMap<String, PendingRequest>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     shutdown_tx: broadcast::Sender<()>,
-    /// Tracks whether a reconnection loop is running
-    reconnecting: Arc<RwLock<bool>>,
+    /// Whether a retry loop is running.
+    reconnecting: Arc<AtomicBool>,
+    /// Set by [`DaemonClient::disconnect`] and cleared by
+    /// [`DaemonClient::connect`]. A connection that closed on request is not
+    /// retried.
+    stopped: Arc<AtomicBool>,
+    /// How many connections have been installed so far. See
+    /// [`DaemonClient::subscribe_attached`].
+    attached: watch::Sender<u64>,
 }
 
 /// Daemon client for GUI
@@ -218,8 +254,13 @@ pub struct DaemonClient {
     pending: Arc<RwLock<HashMap<String, PendingRequest>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     shutdown_tx: broadcast::Sender<()>,
-    /// Tracks whether a reconnection loop is running
-    reconnecting: Arc<RwLock<bool>>,
+    /// Whether a retry loop is running.
+    reconnecting: Arc<AtomicBool>,
+    /// Whether the last word was [`Self::disconnect`], which retries must
+    /// respect.
+    stopped: Arc<AtomicBool>,
+    /// How many connections have been installed so far.
+    attached: watch::Sender<u64>,
 }
 
 impl DaemonClient {
@@ -237,48 +278,58 @@ impl DaemonClient {
             pending: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             shutdown_tx,
-            reconnecting: Arc::new(RwLock::new(false)),
+            reconnecting: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            attached: watch::Sender::new(0),
         }
     }
     
     /// Try to connect to the daemon
+    ///
+    /// Returns `Ok` at once when a connection is already live. Calling this
+    /// also cancels an earlier [`Self::disconnect`], so a failed attempt is
+    /// retried again.
     ///
     /// # Errors
     ///
     /// Returns `"Connection failed: …"` when the WebSocket handshake with the
     /// configured URL fails (typically nothing is listening), and
     /// `"Connection timeout"` when it does not complete within
-    /// `connect_timeout`. Either way the state is left `Disconnected`.
+    /// `connect_timeout`. With `auto_reconnect` set (the default), the retry
+    /// loop then keeps trying every `retry_interval`. It attaches the daemon
+    /// whenever it answers, and [`Self::subscribe_attached`] reports that.
     pub async fn connect(&self) -> Result<(), String> {
-        *self.state.write().await = ConnectionState::Connecting;
-        
+        self.stopped.store(false, Ordering::SeqCst);
+        if self.is_connected().await {
+            return Ok(());
+        }
+        set_unless_connected(&self.state, ConnectionState::Connecting).await;
+
         info!("Attempting to connect to daemon at {}", self.config.url);
         
         let connect_future = connect_async_with_config(&self.config.url, Some(ws_config()), false);
         
-        match tokio::time::timeout(self.config.connect_timeout, connect_future).await {
+        let error = match tokio::time::timeout(self.config.connect_timeout, connect_future).await {
             Ok(Ok((ws, _))) => {
-                *self.state.write().await = ConnectionState::Connected;
-                *self.mode.write().await = ConnectionMode::Daemon;
-                
-                info!("Connected to daemon");
-                
-                // Start message handler
-                self.spawn_handler(ws).await;
-                
-                Ok(())
+                // `false`: the retry loop connected first, which is just as
+                // good. The spare socket closes when `ws` drops.
+                if Self::install(ws, self.shared(), false).await {
+                    info!("Connected to daemon");
+                }
+                return Ok(());
             }
             Ok(Err(e)) => {
-                *self.state.write().await = ConnectionState::Disconnected;
                 warn!("Failed to connect to daemon: {}", e);
-                Err(format!("Connection failed: {e}"))
+                format!("Connection failed: {e}")
             }
             Err(_) => {
-                *self.state.write().await = ConnectionState::Disconnected;
                 warn!("Connection to daemon timed out");
-                Err("Connection timeout".to_string())
+                "Connection timeout".to_string()
             }
-        }
+        };
+        set_unless_connected(&self.state, ConnectionState::Disconnected).await;
+        Self::ensure_retry_loop(&self.shared());
+        Err(error)
     }
     
     /// Try to connect, fall back to embedded mode if daemon not available
@@ -308,18 +359,43 @@ impl DaemonClient {
             event_tx: self.event_tx.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
             reconnecting: self.reconnecting.clone(),
+            stopped: self.stopped.clone(),
+            attached: self.attached.clone(),
         }
     }
 
-    async fn spawn_handler(&self, ws: WebSocketStream<MaybeTlsStream<TcpStream>>) {
-        Self::attach_connection(ws, self.shared(), false).await;
+    /// Install `ws` as the live connection, unless one already is.
+    ///
+    /// [`Self::connect`] and the retry loop can both succeed at about the same
+    /// time. Two installed connections would mean two message pumps, and every
+    /// daemon event would reach the window twice. The check and the switch to
+    /// `Connected` happen under one state lock, so only the first caller
+    /// installs its socket. Returns whether `ws` was installed. A `ws` that
+    /// was not installed closes when it drops.
+    async fn install(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        shared: ConnectionShared,
+        reconnected: bool,
+    ) -> bool {
+        {
+            let mut state = shared.state.write().await;
+            if *state == ConnectionState::Connected {
+                return false;
+            }
+            *state = ConnectionState::Connected;
+        }
+        *shared.mode.write().await = ConnectionMode::Daemon;
+        let attached = shared.attached.clone();
+        Self::attach_connection(ws, shared, reconnected).await;
+        attached.send_modify(|count| *count += 1);
+        true
     }
 
-    /// Install `ws` as the live connection and spawn the task that pumps it
-    /// until it closes, then runs [`Self::handle_disconnect`].
+    /// Spawn the task that pumps `ws` until it closes, then runs
+    /// [`Self::handle_disconnect`]. Only [`Self::install`] calls this.
     ///
     /// `reconnected` only selects the disconnect log line, so a connection the
-    /// reconnect loop re-established stays distinguishable in the logs.
+    /// retry loop established stays distinguishable in the logs.
     async fn attach_connection(
         ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
         shared: ConnectionShared,
@@ -377,8 +453,9 @@ impl DaemonClient {
     }
 
     /// Settle a closed connection: mark the client disconnected, fail every
-    /// pending request, then either start the reconnection loop (unless one is
-    /// already running) or fall back to embedded mode.
+    /// pending request, then either start the retry loop (unless one is
+    /// already running, or the close was requested) or fall back to embedded
+    /// mode.
     async fn handle_disconnect(shared: ConnectionShared, reconnected: bool) {
         *shared.state.write().await = ConnectionState::Disconnected;
         if reconnected {
@@ -395,87 +472,94 @@ impl DaemonClient {
             }
         }
 
-        // Start reconnection loop if auto_reconnect is enabled
-        if shared.config.auto_reconnect {
-            // Check if reconnection loop is already running
-            let already_reconnecting = {
-                let mut flag = shared.reconnecting.write().await;
-                if *flag {
-                    true
-                } else {
-                    *flag = true;
-                    false
-                }
-            };
-
-            if !already_reconnecting {
-                Self::start_reconnect_loop(shared);
-            }
-        } else {
-            // Only a first connection can get here: the reconnect loop runs
-            // only when `auto_reconnect` is set, and the config never changes.
+        if !shared.config.auto_reconnect {
+            // Only a first connection can get here: the retry loop runs only
+            // when `auto_reconnect` is set, and the config never changes.
             *shared.mode.write().await = ConnectionMode::Embedded;
             info!("Auto-reconnect disabled, falling back to embedded mode");
+        } else if shared.stopped.load(Ordering::SeqCst) {
+            info!("Disconnected on request — not reconnecting");
+        } else {
+            Self::ensure_retry_loop(&shared);
         }
     }
 
-    /// Start a background task to periodically attempt reconnection
-    fn start_reconnect_loop(shared: ConnectionShared) {
-        tokio::spawn(async move {
-            let reconnect_interval = Duration::from_secs(10);
-            let max_attempts = 30; // Give up after ~5 minutes
-            let mut attempt = 0;
-            let mut shutdown_rx = shared.shutdown_tx.subscribe();
+    /// Start the retry loop, unless it is already running, retries are off
+    /// (`auto_reconnect` unset), or [`Self::disconnect`] was the last word.
+    fn ensure_retry_loop(shared: &ConnectionShared) {
+        if !shared.config.auto_reconnect || shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if shared
+            .reconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Self::start_retry_loop(shared.clone());
+        }
+    }
 
-            info!("Starting reconnection loop (interval: {:?})", reconnect_interval);
+    /// Try the daemon every `retry_interval` until a connection is live or
+    /// [`Self::disconnect`] is called. There is no attempt cap (see
+    /// [`RETRY_INTERVAL`]).
+    ///
+    /// The loop serves both cases: a client that never connected (the daemon
+    /// was slow to boot, crashed, or had not been started yet) and one whose
+    /// connection closed.
+    ///
+    /// The running flag is cleared *before* the loop installs a connection.
+    /// A connection that closes right after it was installed must be able to
+    /// start a new loop. It cannot do that while this one still looks like it
+    /// is running.
+    fn start_retry_loop(shared: ConnectionShared) {
+        tokio::spawn(async move {
+            let mut shutdown_rx = shared.shutdown_tx.subscribe();
+            let mut attempt: u64 = 0;
+
+            let interval = shared.config.retry_interval;
+            info!("Retrying the daemon at {} every {:?} until it answers", shared.config.url, interval);
 
             loop {
-                attempt += 1;
-
-                // Wait before attempting reconnection
                 tokio::select! {
-                    () = tokio::time::sleep(reconnect_interval) => {}
+                    () = tokio::time::sleep(interval) => {}
                     _ = shutdown_rx.recv() => {
-                        info!("Reconnection loop stopped by shutdown signal");
+                        info!("Retry loop stopped by shutdown signal");
                         break;
                     }
                 }
-
-                // Check if we should give up
-                if attempt > max_attempts {
-                    warn!("Max reconnection attempts ({}) reached, giving up", max_attempts);
-                    *shared.mode.write().await = ConnectionMode::Embedded;
+                // `disconnect` may have fired before this loop subscribed.
+                if shared.stopped.load(Ordering::SeqCst) {
+                    info!("Retry loop stopped: disconnected on request");
+                    break;
+                }
+                // An explicit `connect` got there first.
+                if *shared.state.read().await == ConnectionState::Connected {
                     break;
                 }
 
-                *shared.state.write().await = ConnectionState::Reconnecting;
-                info!("Reconnection attempt {}/{}", attempt, max_attempts);
+                attempt += 1;
+                set_unless_connected(&shared.state, ConnectionState::Reconnecting).await;
+                debug!("Daemon connection attempt {attempt}");
 
-                // Try to connect
                 let connect_future = connect_async_with_config(&shared.config.url, Some(ws_config()), false);
                 match tokio::time::timeout(shared.config.connect_timeout, connect_future).await {
                     Ok(Ok((ws, _))) => {
-                        info!("Reconnected to daemon successfully");
-                        *shared.state.write().await = ConnectionState::Connected;
-                        *shared.mode.write().await = ConnectionMode::Daemon;
-
-                        // Spawn new handler for this connection
-                        Self::attach_connection(ws, shared.clone(), true).await;
-
-                        // Exit the reconnection loop - handler will manage future disconnects
-                        break;
+                        shared.reconnecting.store(false, Ordering::SeqCst);
+                        if Self::install(ws, shared.clone(), true).await {
+                            info!("Connected to daemon after {attempt} attempt(s)");
+                        }
+                        return;
                     }
                     Ok(Err(e)) => {
-                        debug!("Reconnection attempt {} failed: {}", attempt, e);
+                        debug!("Daemon connection attempt {} failed: {}", attempt, e);
                     }
                     Err(_) => {
-                        debug!("Reconnection attempt {} timed out", attempt);
+                        debug!("Daemon connection attempt {} timed out", attempt);
                     }
                 }
             }
 
-            // Mark reconnection loop as done
-            *shared.reconnecting.write().await = false;
+            shared.reconnecting.store(false, Ordering::SeqCst);
         });
     }
     
@@ -518,6 +602,21 @@ impl DaemonClient {
     /// Check if connected to daemon
     pub async fn is_connected(&self) -> bool {
         *self.state.read().await == ConnectionState::Connected
+    }
+
+    /// Whether the retry loop is running, i.e. the client is not connected
+    /// and will try the daemon again within `retry_interval`.
+    #[must_use]
+    pub fn is_retrying(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
+    }
+
+    /// Watch the number of connections installed so far. It is `0` until the
+    /// first connection and goes up by one for each connection after that,
+    /// whether [`Self::connect`] or the retry loop made it.
+    #[must_use]
+    pub fn subscribe_attached(&self) -> watch::Receiver<u64> {
+        self.attached.subscribe()
     }
     
     /// Check if in embedded mode
@@ -729,8 +828,10 @@ impl DaemonClient {
         }
     }
     
-    /// Disconnect from daemon
+    /// Disconnect from daemon, and stop retrying until the next
+    /// [`Self::connect`].
     pub fn disconnect(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
     }
     
@@ -1007,8 +1108,9 @@ impl DaemonClient {
     ///
     /// # Errors
     ///
-    /// Fails as [`Self::request`] does: no daemon connection, or a dropped or
-    /// timed-out request.
+    /// Fails as [`Self::request`] does. An Ollama server that cannot be
+    /// reached is not an error: it comes back as `reachable: false` inside
+    /// the `Ok` reply.
     pub async fn system_probe_ollama(&self, base_url: Option<&str>, models: Vec<String>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "system",
@@ -1847,6 +1949,101 @@ mod tests {
         "awaiting": "model output (ollama/qwen3.5:9b): last token 41s ago",
         "beat": 3
     }"#;
+
+    /// A daemon stand-in on a free local port: accepts WebSocket connections
+    /// and holds them open. `accepted` counts the handshakes it completed.
+    fn serve_daemon(listener: tokio::net::TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+        accepted
+    }
+
+    /// A port nothing is listening on, freed for the test to bind later.
+    async fn free_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn quick_client(port: u16) -> DaemonClient {
+        DaemonClient::new(DaemonClientConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            connect_timeout: Duration::from_secs(2),
+            retry_interval: Duration::from_millis(50),
+            ..DaemonClientConfig::default()
+        })
+    }
+
+    /// 2026-09-18: a daemon that was not answering when the app started was
+    /// never attached. Only a connection that had been up and then closed
+    /// started the retry loop.
+    #[tokio::test]
+    async fn a_client_that_never_connected_attaches_a_daemon_that_comes_up_later() {
+        let port = free_port().await;
+        let client = quick_client(port);
+        let mut attached = client.subscribe_attached();
+
+        assert!(client.connect().await.is_err());
+        assert!(client.is_retrying(), "a failed first connect must leave the retry loop running");
+
+        let accepted = serve_daemon(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5), attached.wait_for(|n| *n == 1))
+            .await
+            .expect("the retry loop attaches the late daemon")
+            .unwrap();
+
+        assert!(client.is_connected().await);
+        assert_eq!(client.mode().await, ConnectionMode::Daemon);
+        assert!(!client.is_retrying());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// `disconnect` is what shutdown and the pre-update stop call. A retry
+    /// loop that outlived it would attach whatever daemon came up next,
+    /// behind the caller's back.
+    #[tokio::test]
+    async fn disconnect_stops_the_retry_loop() {
+        let port = free_port().await;
+        let client = quick_client(port);
+        assert!(client.connect().await.is_err());
+        client.disconnect();
+
+        let accepted = serve_daemon(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!client.is_retrying());
+        assert!(!client.is_connected().await);
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+        // An explicit connect works again, and it attaches.
+        client.connect().await.expect("the daemon is up");
+        assert!(client.is_connected().await);
+    }
+
+    /// `init` can run more than once. A second `connect` on a live client must
+    /// not open a second connection: two message pumps would forward every
+    /// daemon event twice.
+    #[tokio::test]
+    async fn connect_on_a_live_client_keeps_the_one_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = serve_daemon(listener);
+        let client = quick_client(port);
+
+        client.connect().await.unwrap();
+        client.connect().await.unwrap();
+
+        assert_eq!(*client.subscribe_attached().borrow(), 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
 
     /// Before this variant existed the whole message failed to parse and was
     /// logged as "Unknown message format", so the GUI never saw a single beat.

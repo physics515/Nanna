@@ -12,7 +12,7 @@
 //! event forwarding) are hand-written.
 
 use crate::daemon_client::{DaemonClient, DaemonClientConfig, DaemonEvent};
-use crate::daemon_manager::{DaemonManager, DaemonManagerConfig};
+use crate::daemon_manager::{DaemonManager, DaemonManagerConfig, DaemonState};
 use crate::state::AppState;
 use serde::Serialize;
 use serde_json::Value;
@@ -40,6 +40,12 @@ pub struct BackendStatus {
     pub daemon_url: Option<String>,
     pub daemon_state: String,
     pub version: String,
+    /// Whole seconds the sidecar has been starting. Present only while
+    /// `daemon_state` is `starting`, which lasts as long as the process is
+    /// alive and booting.
+    pub starting_for_s: Option<u64>,
+    /// Not connected, and the client will try the daemon again shortly.
+    pub retrying: bool,
 }
 
 /// The unified backend interface (daemon client + sidecar lifecycle).
@@ -51,6 +57,8 @@ pub struct Backend {
     initializing: Arc<RwLock<bool>>,
     /// Ensures the single DaemonEvent→Tauri forwarding task starts exactly once.
     forwarding_started: Arc<AtomicBool>,
+    /// Ensures the health monitor is armed exactly once.
+    health_monitor_armed: AtomicBool,
 }
 
 impl Backend {
@@ -78,6 +86,7 @@ impl Backend {
             app: Arc::new(RwLock::new(None)),
             initializing: Arc::new(RwLock::new(false)),
             forwarding_started: Arc::new(AtomicBool::new(false)),
+            health_monitor_armed: AtomicBool::new(false),
         }
     }
 
@@ -97,9 +106,13 @@ impl Backend {
     /// Initialize the backend: start the daemon sidecar, connect the client,
     /// and begin health monitoring + event forwarding.
     ///
-    /// On failure this returns [`BackendMode::Disconnected`] rather than falling
-    /// back to an embedded backend. The daemon client's auto-reconnect keeps
-    /// trying, so a daemon that starts late will still attach.
+    /// This waits for as long as the sidecar is alive and booting (see
+    /// [`DaemonManager::start`]). It returns [`BackendMode::Disconnected`]
+    /// when no connection can be made now; there is no embedded fallback. The
+    /// client then keeps retrying in the background, so a daemon that comes
+    /// up later still attaches. That covers a boot that outlived our
+    /// sidecar, a daemon started by hand, and a restart. Event forwarding and
+    /// the health monitor start on that late connection too.
     pub async fn init(&self, app: &AppHandle) -> BackendMode {
         // Already connected?
         if self.daemon_client.is_connected().await {
@@ -130,33 +143,65 @@ impl Backend {
         info!("Initializing backend (daemon-only)...");
         *self.app.write().await = Some(app.clone());
 
-        // Start the single event-forwarding task (idempotent).
+        // Both are idempotent, and both are armed before anything can
+        // connect: a connection the retry loop makes later must find them
+        // already in place.
         self.start_event_forwarding(app.clone());
+        self.arm_health_monitor(app.clone());
 
-        // Start the daemon sidecar, then connect the client.
-        let result = match self.daemon_manager.start(app).await {
-            Ok(()) => {
-                info!("Daemon sidecar started");
-                match self.daemon_client.connect().await {
-                    Ok(()) => {
-                        info!("Backend: connected to daemon");
-                        self.daemon_manager.clone().start_health_monitor(app.clone());
-                        BackendMode::Daemon
-                    }
-                    Err(e) => {
-                        error!("Daemon started but client connection failed: {e}");
-                        BackendMode::Disconnected
-                    }
+        // Start the daemon sidecar. A failed start still goes on to the
+        // connect below. A daemon may be answering anyway: our sidecar may
+        // have deferred to it (the AlreadyRunning exit), or someone started
+        // it by hand. And a failed connect is what arms the retry loop.
+        match self.daemon_manager.start(app).await {
+            Ok(()) => info!("Daemon sidecar started"),
+            Err(e) => error!("Failed to start daemon sidecar: {e}"),
+        }
+        let result = if matches!(
+            self.daemon_manager.state().await,
+            DaemonState::Stopping | DaemonState::Stopped
+        ) {
+            // A shutdown took over during the start. Connecting now would
+            // undo its disconnect and start retrying behind its back.
+            BackendMode::Disconnected
+        } else {
+            match self.daemon_client.connect().await {
+                Ok(()) => {
+                    info!("Backend: connected to daemon");
+                    BackendMode::Daemon
                 }
-            }
-            Err(e) => {
-                error!("Failed to start daemon sidecar: {e}");
-                BackendMode::Disconnected
+                Err(e) => {
+                    warn!("Daemon not reachable yet ({e}); retrying in the background until it answers");
+                    BackendMode::Disconnected
+                }
             }
         };
 
         *self.initializing.write().await = false;
         result
+    }
+
+    /// Start the health monitor on the client's first connection, whichever
+    /// path makes it: this `init`, or the retry loop minutes later.
+    ///
+    /// The monitor used to start only when `init` itself connected. A daemon
+    /// the retry loop attached was then never health-checked, and a sidecar
+    /// that died after that was never restarted. It is armed only once, since
+    /// every repeated `init` used to spawn another monitor.
+    fn arm_health_monitor(&self, app: AppHandle) {
+        if self.health_monitor_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let manager = Arc::clone(&self.daemon_manager);
+        let mut attached = self.daemon_client.subscribe_attached();
+        tokio::spawn(async move {
+            // Errs only once the client is gone, and then there is nothing
+            // left to monitor.
+            if attached.wait_for(|count| *count > 0).await.is_ok() {
+                info!("First daemon connection: starting the health monitor");
+                manager.start_health_monitor(app);
+            }
+        });
     }
 
     /// Shutdown the backend (stop the daemon sidecar).
@@ -172,6 +217,11 @@ impl Backend {
     pub async fn status(&self) -> BackendStatus {
         let daemon_state = self.daemon_manager.state().await;
         let connected = self.daemon_client.is_connected().await;
+        let starting_for_s = self
+            .daemon_manager
+            .starting_for()
+            .await
+            .map(|elapsed| elapsed.as_secs());
 
         BackendStatus {
             mode: if connected {
@@ -183,6 +233,8 @@ impl Backend {
             daemon_url: connected.then(|| self.daemon_manager.ws_url()),
             daemon_state: format!("{daemon_state:?}").to_lowercase(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            starting_for_s,
+            retrying: !connected && self.daemon_client.is_retrying(),
         }
     }
 

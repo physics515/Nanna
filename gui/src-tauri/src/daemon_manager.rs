@@ -37,8 +37,6 @@ pub struct DaemonManagerConfig {
     pub restart_delay: Duration,
     /// Health check interval
     pub health_check_interval: Duration,
-    /// Startup timeout
-    pub startup_timeout: Duration,
 }
 
 /// The daemon port `NANNA_DAEMON_PORT` asks for, if it names a usable one.
@@ -83,12 +81,58 @@ impl Default for DaemonManagerConfig {
             max_restarts: 3,
             restart_delay: Duration::from_secs(2),
             health_check_interval: Duration::from_secs(30),
-            // Generous: first boot can be slow (DB open + tool discovery). The
-            // slow embedding-model probe was moved off the daemon's startup
-            // critical path, so readiness is normally a few seconds — this is
-            // purely a worst-case ceiling.
-            startup_timeout: Duration::from_secs(90),
         }
+    }
+}
+
+/// When a boot counts as slow enough to log. Readiness normally takes a few
+/// seconds (claim the role, open storage, discover tools). Later notices come
+/// at double the previous elapsed time, so even a boot that takes hours logs
+/// only a handful of lines. The status footer switches to "Still starting"
+/// at the same point (`backendLabels.ts`). Nothing here stops the wait.
+const SLOW_START_NOTICE: Duration = Duration::from_secs(30);
+
+/// Where the wait for a starting sidecar stands after one poll of its port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootWait {
+    /// A daemon answered.
+    Ready,
+    /// Nobody answered yet and the sidecar is alive: it is still booting.
+    KeepWaiting,
+    /// Nobody answered and the sidecar is gone: the start failed.
+    Failed,
+    /// `stop()` took over while the wait was running.
+    Cancelled,
+}
+
+/// The ready-wait's verdict after one poll of the daemon port. `answered`
+/// says whether a daemon accepted the probe, and `sidecar_exited` whether the
+/// sidecar had already exited when the probe began.
+///
+/// A live sidecar is still booting, however long that takes. The daemon
+/// claims its PID file and reserves the port before it does anything slow,
+/// and it opens the port only when it is ready. So a live process with a
+/// closed port is a boot in progress. A cold model load, a big migration or a
+/// slow provider can take minutes. The old 90 s timeout killed such a boot,
+/// and every relaunch then did the same thing (2026-09-18).
+///
+/// A sidecar that has exited is a failure. That includes the `AlreadyRunning`
+/// exit, where another daemon already holds the role. The poll that sees the
+/// exit still probes the port, so a daemon that is already up gets attached.
+/// A daemon that is still booting is not ours to wait for: the client's retry
+/// loop attaches it when its port opens.
+///
+/// A stop wins over everything else. The wait must not leave behind a
+/// `Running` or `Crashed` state after `stop()` has already reported `Stopped`.
+const fn boot_wait_verdict(state: DaemonState, sidecar_exited: bool, answered: bool) -> BootWait {
+    if matches!(state, DaemonState::Stopping | DaemonState::Stopped) {
+        BootWait::Cancelled
+    } else if answered {
+        BootWait::Ready
+    } else if sidecar_exited {
+        BootWait::Failed
+    } else {
+        BootWait::KeepWaiting
     }
 }
 
@@ -205,6 +249,8 @@ pub struct DaemonManager {
     state: Arc<RwLock<DaemonState>>,
     restart_count: Arc<RwLock<u32>>,
     child: Arc<RwLock<Option<CommandChild>>>,
+    /// When the current start began. Read only while the state is `Starting`.
+    starting_since: RwLock<Option<tokio::time::Instant>>,
     /// Whether the spawned sidecar process has terminated. Distinguishes a
     /// live sidecar we own (stop = graceful shutdown, then tree-kill) from a
     /// dead one whose PID may have been recycled — e.g. the `AlreadyRunning`
@@ -222,6 +268,7 @@ impl DaemonManager {
             state: Arc::new(RwLock::new(DaemonState::Stopped)),
             restart_count: Arc::new(RwLock::new(0)),
             child: Arc::new(RwLock::new(None)),
+            starting_since: RwLock::new(None),
             sidecar_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -236,20 +283,36 @@ impl DaemonManager {
     pub async fn state(&self) -> DaemonState {
         *self.state.read().await
     }
+
+    /// How long the daemon has been starting, or `None` when it is not
+    /// `Starting`.
+    pub async fn starting_for(&self) -> Option<Duration> {
+        if *self.state.read().await != DaemonState::Starting {
+            return None;
+        }
+        self.starting_since.read().await.map(|since| since.elapsed())
+    }
     
     /// Start the daemon sidecar
     ///
     /// Returns `Ok` straight away when the daemon is already `Running` or
-    /// `Starting`.
+    /// `Starting`. Otherwise it waits until a daemon answers on the port, for
+    /// as long as the spawned sidecar stays alive. There is no deadline: a
+    /// live sidecar whose port is still closed is booting (see
+    /// [`boot_wait_verdict`]). [`Self::starting_for`] reports how long it has
+    /// been.
     ///
     /// # Errors
+    ///
+    /// Each failure leaves the manager `Crashed`, except a cancelled start.
     ///
     /// - `"Failed to create sidecar command: …"` when the bundled
     ///   `nanna-daemon` sidecar cannot be resolved;
     /// - `"Failed to spawn daemon: …"` when its process fails to start;
-    /// - `"Daemon startup timeout"` when nothing answers on the daemon port
-    ///   within `startup_timeout` (90 s by default). The spawned child is
-    ///   killed first so it cannot hold the port and the database lock.
+    /// - `"Daemon exited during startup"` when the sidecar exits and nothing
+    ///   answers on the daemon port;
+    /// - `"Daemon start cancelled by a stop request"` when [`Self::stop`] runs
+    ///   during the wait. The state is then the one `stop` set.
     pub async fn start(&self, app: &AppHandle) -> Result<(), String> {
         let current_state = *self.state.read().await;
         if current_state == DaemonState::Running || current_state == DaemonState::Starting {
@@ -257,27 +320,34 @@ impl DaemonManager {
         }
         
         *self.state.write().await = DaemonState::Starting;
+        *self.starting_since.write().await = Some(tokio::time::Instant::now());
         self.evict_stale_daemon(env!("CARGO_PKG_VERSION")).await;
         info!("Starting nanna-daemon sidecar...");
 
-        // Spawn the sidecar
+        // Spawn the sidecar. A failure must not leave the state `Starting`:
+        // `start` returns early on `Starting`, so every later call (the Retry
+        // button, the health monitor) would report success without spawning.
         let shell = app.shell();
         info!("Creating sidecar command for nanna-daemon...");
-        let sidecar = shell.sidecar("nanna-daemon")
-            .map_err(|e| {
+        let sidecar = match shell.sidecar("nanna-daemon") {
+            Ok(sidecar) => sidecar,
+            Err(e) => {
                 error!("Failed to create sidecar command: {}", e);
-                format!("Failed to create sidecar command: {e}")
-            })?;
+                *self.state.write().await = DaemonState::Crashed;
+                return Err(format!("Failed to create sidecar command: {e}"));
+            }
+        };
         
         let args = self.sidecar_args();
         info!("Spawning daemon with args: {:?}", args);
-        let (mut rx, child) = sidecar
-            .args(args)
-            .spawn()
-            .map_err(|e| {
+        let (mut rx, child) = match sidecar.args(args).spawn() {
+            Ok(spawned) => spawned,
+            Err(e) => {
                 error!("Failed to spawn daemon: {}", e);
-                format!("Failed to spawn daemon: {e}")
-            })?;
+                *self.state.write().await = DaemonState::Crashed;
+                return Err(format!("Failed to spawn daemon: {e}"));
+            }
+        };
         
         // Store the child handle
         *self.child.write().await = Some(child);
@@ -285,8 +355,8 @@ impl DaemonManager {
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Spawn a task to log daemon output (use info level so it's visible in production)
-        // It also flips the shared state to Crashed on termination so wait_for_ready
-        // can abort immediately instead of polling out the full startup timeout.
+        // It also records the termination, which is what ends the ready-wait
+        // for a sidecar that dies while booting.
         let state_for_events = self.state.clone();
         let sidecar_exited = self.sidecar_exited.clone();
         tokio::spawn(async move {
@@ -333,38 +403,29 @@ impl DaemonManager {
             }
         });
         
-        // Wait for daemon to be ready
-        let ready = self.wait_for_ready().await;
-
-        if ready {
-            *self.state.write().await = DaemonState::Running;
-            *self.restart_count.write().await = 0;
-            info!("Daemon started successfully on {}", self.ws_url());
-            Ok(())
-        } else {
-            *self.state.write().await = DaemonState::Crashed;
-            error!("Daemon failed to start within timeout");
-            // Kill the spawned child: an orphaned daemon would keep running,
-            // holding the nanna.db file lock (and port 5149) — which would make
-            // the embedded fallback unable to open storage at all.
-            // The child slot stays locked until the kill finishes, exactly as
-            // long as the guard used to live in the `if let`: a concurrent
-            // `stop()` waits for this kill instead of reporting `Stopped`
-            // while it is still in flight.
-            let mut child_slot = self.child.write().await;
-            if let Some(child) = child_slot.take() {
-                warn!("Killing unresponsive daemon child so it cannot orphan the DB lock");
-                // Tree-kill only a sidecar that is still alive: a dead one's
-                // PID may already belong to an unrelated process.
-                if !self.sidecar_exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    kill_sidecar_tree(child.pid()).await;
-                }
-                if let Err(e) = child.kill() {
-                    warn!("Failed to kill unresponsive daemon: {}", e);
-                }
+        // No deadline and no kill. The kill used to keep an embedded
+        // in-process backend's fallback able to open nanna.db, and that
+        // backend no longer exists. A live sidecar is still booting, and
+        // killing it is what turned a slow boot into one that never finished.
+        // The only way this wait fails is a sidecar that has exited. A dead
+        // process holds no port and no lock, so there is nothing to kill.
+        match self.wait_for_ready().await {
+            BootWait::Ready => {
+                *self.state.write().await = DaemonState::Running;
+                *self.restart_count.write().await = 0;
+                info!("Daemon started successfully on {}", self.ws_url());
+                Ok(())
             }
-            drop(child_slot);
-            Err("Daemon startup timeout".to_string())
+            BootWait::Cancelled => {
+                info!("Daemon start abandoned: a stop request took over");
+                Err("Daemon start cancelled by a stop request".to_string())
+            }
+            // `wait_for_ready` returns only a final verdict, never `KeepWaiting`.
+            BootWait::Failed | BootWait::KeepWaiting => {
+                *self.state.write().await = DaemonState::Crashed;
+                error!("Daemon exited during startup and nothing answers on {}", self.ws_url());
+                Err("Daemon exited during startup".to_string())
+            }
         }
     }
     
@@ -435,49 +496,57 @@ impl DaemonManager {
         );
     }
 
-    /// Wait for daemon to be ready (accepting connections)
-    async fn wait_for_ready(&self) -> bool {
+    /// Poll the daemon port until [`boot_wait_verdict`] is final: a daemon
+    /// answered, the sidecar exited with nobody answering, or a stop took
+    /// over. There is no deadline while the sidecar is alive. A slow boot is
+    /// logged at [`SLOW_START_NOTICE`], then at each doubling of the elapsed
+    /// time.
+    async fn wait_for_ready(&self) -> BootWait {
         let url = self.ws_url();
-        let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
-
-        let mut child_exited = false;
         let mut evicted = false;
-        while tokio::time::Instant::now() < deadline {
-            // A dead child can still mean a healthy daemon: the sidecar
-            // exits AlreadyRunning when a standalone daemon holds the
-            // PID-file lock (single-instance guard), and that daemon may
-            // still be mid-init (IPC binds late). Keep polling the port
-            // until the deadline; only fail when nobody ever answers.
-            if !child_exited && *self.state.read().await == DaemonState::Crashed {
-                child_exited = true;
+        let mut next_notice = SLOW_START_NOTICE;
+        loop {
+            // Read before the probe. An exit seen here means the probe below
+            // ran after the exit, so a daemon that was already up when our
+            // sidecar deferred to it (the AlreadyRunning exit) still gets
+            // attached.
+            let exited = self.sidecar_exited.load(std::sync::atomic::Ordering::SeqCst);
+            let occupant = probe_occupant(&url).await;
+            // A daemon from another release can win the port between the
+            // pre-spawn check and here. Evict it once; answering is not the
+            // same as being ours.
+            if stale_version(&occupant, env!("CARGO_PKG_VERSION")).is_some() && !evicted {
+                evicted = true;
+                self.evict_stale_daemon(env!("CARGO_PKG_VERSION")).await;
+                continue;
+            }
+            let answered = occupant != PortOccupant::Nobody;
+            let state = *self.state.read().await;
+            match boot_wait_verdict(state, exited, answered) {
+                BootWait::KeepWaiting => {}
+                BootWait::Ready if exited => {
+                    info!("Attached to an existing daemon instance on {}", url);
+                    return BootWait::Ready;
+                }
+                verdict => return verdict,
+            }
+            if let Some(elapsed) = self.starting_for().await
+                && elapsed >= next_notice
+            {
+                let pid = self
+                    .child
+                    .read()
+                    .await
+                    .as_ref()
+                    .map_or_else(|| "unknown".to_string(), |child| child.pid().to_string());
                 warn!(
-                    "Sidecar exited during startup — polling {} for an existing daemon instance",
-                    url
+                    "Daemon still starting after {}s (PID {pid}): the process is alive and {url} is not open yet — waiting",
+                    elapsed.as_secs()
                 );
+                next_notice = elapsed * 2;
             }
-            match probe_occupant(&url).await {
-                PortOccupant::Nobody => {
-                    // Not ready yet, wait and retry
-                    sleep(Duration::from_millis(200)).await;
-                }
-                occupant @ PortOccupant::Daemon { .. } => {
-                    // A daemon from another release can win the port between
-                    // the pre-spawn check and here. Evict it once; answering
-                    // is not the same as being ours.
-                    if stale_version(&occupant, env!("CARGO_PKG_VERSION")).is_some() && !evicted {
-                        evicted = true;
-                        self.evict_stale_daemon(env!("CARGO_PKG_VERSION")).await;
-                        continue;
-                    }
-                    if child_exited {
-                        info!("Attached to an existing daemon instance on {}", url);
-                    }
-                    return true;
-                }
-            }
+            sleep(Duration::from_millis(200)).await;
         }
-        
-        false
     }
     
     /// Stop the daemon
@@ -653,6 +722,43 @@ mod tests {
 
     fn daemon(version: Option<&str>) -> PortOccupant {
         PortOccupant::Daemon { version: version.map(str::to_string) }
+    }
+
+    /// The 2026-09-18 case: the sidecar is alive and its port is still closed
+    /// minutes into the boot. That means wait, not fail. Elapsed time is
+    /// deliberately not an input to this function.
+    #[test]
+    fn a_live_sidecar_with_a_closed_port_is_still_booting() {
+        assert_eq!(boot_wait_verdict(DaemonState::Starting, false, false), BootWait::KeepWaiting);
+    }
+
+    #[test]
+    fn an_answer_on_the_port_is_ready_whether_or_not_our_sidecar_lives() {
+        assert_eq!(boot_wait_verdict(DaemonState::Starting, false, true), BootWait::Ready);
+        // The AlreadyRunning exit: our sidecar deferred to a daemon that is up.
+        assert_eq!(boot_wait_verdict(DaemonState::Crashed, true, true), BootWait::Ready);
+    }
+
+    #[test]
+    fn only_an_exited_sidecar_with_nobody_answering_is_a_failure() {
+        // The Terminated handler flips `Starting` to `Crashed` as it records
+        // the exit, so both states are seen with the flag set.
+        assert_eq!(boot_wait_verdict(DaemonState::Crashed, true, false), BootWait::Failed);
+        assert_eq!(boot_wait_verdict(DaemonState::Starting, true, false), BootWait::Failed);
+    }
+
+    /// `stop()` during a boot owns the state it leaves behind. Neither a
+    /// late answer nor the sidecar's exit (which the stop itself caused) may
+    /// overwrite `Stopped` with `Running` or `Crashed`.
+    #[test]
+    fn a_stop_during_the_wait_cancels_it() {
+        for state in [DaemonState::Stopping, DaemonState::Stopped] {
+            for exited in [false, true] {
+                for answered in [false, true] {
+                    assert_eq!(boot_wait_verdict(state, exited, answered), BootWait::Cancelled);
+                }
+            }
+        }
     }
 
     #[test]
