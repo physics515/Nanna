@@ -234,6 +234,9 @@ mod tests {
     /// A one-connection server that answers `200` with one model only when the
     /// request carries `Authorization: Bearer <token>`, `401` otherwise — the
     /// shape of an Ollama-compatible server behind an authenticating proxy.
+    ///
+    /// Matched the way such a server matches: the header name and the
+    /// `Bearer` scheme case-insensitively (RFC 9110), the token byte for byte.
     async fn serve_once_requiring(token: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -242,8 +245,18 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let mut request = [0_u8; 4096];
             let n = socket.read(&mut request).await.unwrap_or(0);
-            let head = String::from_utf8_lossy(&request[..n]).to_lowercase();
-            let authorized = head.contains(&format!("authorization: bearer {}", token.to_lowercase()));
+            let head = String::from_utf8_lossy(&request[..n]);
+            let authorized = head.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("authorization")
+                        && value
+                            .trim()
+                            .split_once(' ')
+                            .is_some_and(|(scheme, credential)| {
+                                scheme.eq_ignore_ascii_case("bearer") && credential.trim() == token
+                            })
+                })
+            });
             let (status, body) = if authorized {
                 ("200 OK", r#"{"models":[{"name":"qwen2.5-1.5b-instruct","size":7}]}"#)
             } else {
@@ -283,6 +296,19 @@ mod tests {
         );
         let url = serve_once_requiring("s3cret").await;
         let probe = probe_ollama(&url, Some("wrong"), Duration::from_secs(5)).await;
+        assert!(
+            matches!(&probe, OllamaProbe::Unreachable { reason } if reason.contains("refused the bearer token")),
+            "{probe:?}"
+        );
+    }
+
+    /// A bearer token is an opaque secret, so a token that differs only in
+    /// case is a different token. The test server must refuse it, or every
+    /// token test here would pass for a probe that mangled the token's case.
+    #[tokio::test]
+    async fn a_token_that_differs_only_in_case_is_refused() {
+        let url = serve_once_requiring("s3cret").await;
+        let probe = probe_ollama(&url, Some("S3CRET"), Duration::from_secs(5)).await;
         assert!(
             matches!(&probe, OllamaProbe::Unreachable { reason } if reason.contains("refused the bearer token")),
             "{probe:?}"

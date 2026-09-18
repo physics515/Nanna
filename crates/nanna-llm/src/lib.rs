@@ -604,10 +604,29 @@ fn gguf_metadata_usize(
         .min()
 }
 
-/// File-based cache for model information
+/// File-based cache for model information.
+///
+/// Holds only what a provider answered about a model. A lookup that got no
+/// answer (a refusal, a transport error, a 404) is served the unknown-model
+/// floor for that lookup alone: the cache cannot see the event that would
+/// change the answer (a token saved, a model pulled, a server back up), so a
+/// persisted floor would outlive it by up to [`ModelInfo::CACHE_TTL_SECS`].
+///
+/// One entry per model name, stamped with the server that answered. A client
+/// reads only its own server's entry ([`Self::get_from`]); the name-only
+/// readers ([`Self::get`]), which size budgets with no client in hand, see the
+/// server asked last.
 #[derive(Clone)]
 pub struct ModelInfoCache {
     cache_dir: std::path::PathBuf,
+}
+
+/// The on-disk form of a cache entry: the answer and who gave it.
+#[derive(Serialize, Deserialize)]
+struct CachedModelInfo {
+    /// The answering server, as [`LlmClient::model_info_server`] names it.
+    server: String,
+    info: ModelInfo,
 }
 
 impl ModelInfoCache {
@@ -620,7 +639,17 @@ impl ModelInfoCache {
     /// v3: Ollama GGUF metadata was read at the fixed key `general.*`, which
     /// almost no model publishes — so every local model cached the invented
     /// 32k floor and every embedder cached a `None` dimension.
-    const SCHEMA_GENERATION: u32 = 3;
+    ///
+    /// v4: failed lookups were cached as if they were answers. Every 401 (the
+    /// previous build sent no bearer token on `/api/show`, so every proxied
+    /// server refused it), 404, transport error, `OpenRouter` error status and
+    /// proxy failure wrote the floor with a fresh timestamp. A v3 file carries
+    /// nothing that tells such an entry from a real answer, so a shorter TTL
+    /// would still serve the poisoned ones until they aged out while
+    /// discarding good ones early; only orphaning the generation reaches all
+    /// of them. v4 entries also record the answering server, a field no v3
+    /// file has.
+    const SCHEMA_GENERATION: u32 = 4;
 
     /// Create a new cache with the specified directory
     pub fn new(cache_dir: impl Into<std::path::PathBuf>) -> Self {
@@ -636,44 +665,87 @@ impl ModelInfoCache {
             .map(|dirs| Self::new(dirs.cache_dir().join("model_info")))
     }
 
-    /// Get cached model info if it exists and is not expired
+    /// Cached model info for `model` from whichever server answered last, if
+    /// it exists and is not expired.
+    ///
+    /// For callers with no client in hand; a client reads through
+    /// [`Self::get_from`], which never serves another server's answer.
+    #[must_use]
     pub fn get(&self, model: &str) -> Option<ModelInfo> {
+        self.read(model).map(|entry| entry.info)
+    }
+
+    /// Cached model info for `model` only if `server` gave it.
+    #[must_use]
+    pub fn get_from(&self, server: &str, model: &str) -> Option<ModelInfo> {
+        self.read(model)
+            .filter(|entry| entry.server == server)
+            .map(|entry| entry.info)
+    }
+
+    fn read(&self, model: &str) -> Option<CachedModelInfo> {
         let path = self.cache_path(model);
         if !path.exists() {
             return None;
         }
 
         let content = std::fs::read_to_string(&path).ok()?;
-        let info: ModelInfo = serde_json::from_str(&content).ok()?;
+        let entry: CachedModelInfo = serde_json::from_str(&content).ok()?;
 
-        if info.is_expired() {
+        if entry.info.is_expired() {
             // Remove expired cache
             let _ = std::fs::remove_file(&path);
             debug!(model = %model, "Model info cache expired, removed");
             return None;
         }
 
-        debug!(model = %model, context_window = info.context_window, "Loaded model info from cache");
-        Some(info)
+        debug!(
+            model = %model,
+            server = %entry.server,
+            context_window = entry.info.context_window,
+            "Loaded model info from cache"
+        );
+        Some(entry)
     }
 
-    /// Store model info in cache
+    /// Store `server`'s answer about a model.
+    ///
+    /// Only an answer belongs here, never a floor that stands in for a failed
+    /// lookup (see the type docs).
     ///
     /// # Errors
     ///
     /// Returns [`LlmError::Io`] when the cache directory cannot be created or the
     /// entry file cannot be written, and [`LlmError::Json`] when `info` cannot be
     /// serialized.
-    pub fn set(&self, info: &ModelInfo) -> Result<(), LlmError> {
+    pub fn set(&self, server: &str, info: &ModelInfo) -> Result<(), LlmError> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&self.cache_dir)?;
 
         let path = self.cache_path(&info.id);
-        let content = serde_json::to_string_pretty(info)?;
+        let entry = CachedModelInfo {
+            server: server.to_string(),
+            info: info.clone(),
+        };
+        let content = serde_json::to_string_pretty(&entry)?;
         std::fs::write(&path, content)?;
 
-        debug!(model = %info.id, path = %path.display(), "Cached model info");
+        debug!(model = %info.id, server = %server, path = %path.display(), "Cached model info");
         Ok(())
+    }
+
+    /// Drop the entry for `model` if a server other than `server` gave it.
+    ///
+    /// For a lookup through `server` that got no answer: the name-only readers
+    /// would otherwise go on sizing budgets from the other server's window
+    /// while the lookup itself fell back to the floor. That window can be
+    /// larger than this server's; the floor is the value built to stay under
+    /// a window nobody has reported.
+    fn forget_other_server(&self, server: &str, model: &str) {
+        if self.read(model).is_some_and(|entry| entry.server != server) {
+            let _ = std::fs::remove_file(self.cache_path(model));
+            debug!(model = %model, server = %server, "Dropped another server's cached model info");
+        }
     }
 
     /// Clear all cached model info
@@ -697,11 +769,11 @@ impl ModelInfoCache {
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
         // The suffix is a schema generation, not decoration. Entries written
-        // before the Anthropic field names were corrected hold the
-        // unknown-model floor (32k window / 4k output) for models that are
-        // nothing like it, with a fresh timestamp — so the week-long TTL would
-        // keep serving them. Bumping the generation orphans those files
-        // instead of trusting them; the next lookup refetches.
+        // before a fix (see `SCHEMA_GENERATION`) can hold the unknown-model
+        // floor (32k window / 4k output) for models that are nothing like
+        // it, with a fresh timestamp — so the week-long TTL would keep
+        // serving them. Bumping the generation orphans those files instead of
+        // trusting them; the next lookup refetches.
         self.cache_dir
             .join(format!("{safe_name}.v{}.json", Self::SCHEMA_GENERATION))
     }
@@ -2765,33 +2837,44 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Get model information with caching.
     ///
-    /// Checks the file cache first, then fetches from the API if needed.
-    /// Falls back to defaults if the API doesn't provide context window info.
-    ///
-    /// # Errors
-    ///
-    /// Returns `LlmError` if both cache and API fail (uses defaults as final fallback).
+    /// Checks the file cache first (this client's server only), then asks the
+    /// provider. When the provider gives no answer the unknown-model floor is
+    /// returned for this lookup and nothing is cached, so the next lookup asks
+    /// again (see [`ModelInfoCache`]).
     pub async fn get_model_info(&self, model: &str, cache: Option<&ModelInfoCache>) -> ModelInfo {
-        // Check cache first
+        let server = self.model_info_server();
         if let Some(cache) = cache
-            && let Some(info) = cache.get(model) {
+            && let Some(info) = cache.get_from(&server, model) {
                 return clamp_model_info_to_effective_window(model, info);
             }
 
-        // Fetch from API
         let info = match self.fetch_model_info(model).await {
             Ok(info) => info,
             Err(e) => {
-                warn!(model = %model, error = %e, "Failed to fetch model info, using defaults");
-                default_model_info(model, &format!("{:?}", self.provider))
+                warn!(
+                    model = %model,
+                    server = %server,
+                    error = %e,
+                    "no model info from the provider — budgets for this lookup use the \
+                     unknown-model floor, and it is not cached, so the next lookup asks again"
+                );
+                if let Some(cache) = cache {
+                    cache.forget_other_server(&server, model);
+                }
+                return clamp_model_info_to_effective_window(
+                    model,
+                    default_model_info(model, &format!("{:?}", self.provider)),
+                );
             }
         };
 
-        // Announce a model that ended up on the unknown floor instead of real
-        // provider limits. This is the failure mode that hid the Anthropic
-        // field-name bug: every Claude model silently resolved to 32k/4k, was
-        // cached with a fresh timestamp, and nothing anywhere said so. A model
-        // running on guessed limits is worth one line per cache TTL.
+        // Announce a model that the provider answered for but that ended up on
+        // the unknown floor instead of real limits. This is the failure mode
+        // that hid the Anthropic field-name bug: every Claude model silently
+        // resolved to 32k/4k, was cached with a fresh timestamp, and nothing
+        // anywhere said so. A model running on guessed limits is worth one line
+        // per cache TTL. (A lookup with no answer at all is announced above,
+        // every time, since it is never cached.)
         // Keyed on the window alone. Pairing it with the output floor made the
         // check unreachable for the two providers most likely to need it:
         // Ollama and OpenRouter derive the output cap as `context_window / 2`
@@ -2823,7 +2906,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // live per-process state (the Ollama num_ctx latch) and must never be
         // persisted as if the model itself shrank.
         if let Some(cache) = cache
-            && let Err(e) = cache.set(&info) {
+            && let Err(e) = cache.set(&server, &info) {
                 warn!(model = %model, error = %e, "Failed to cache model info");
             }
 
@@ -2834,18 +2917,46 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// # Errors
     ///
-    /// Returns `LlmError` if the API request fails.
+    /// Returns `LlmError` if the provider gives no answer for `model`, and
+    /// caches nothing then.
     pub async fn refresh_model_info(&self, model: &str, cache: Option<&ModelInfoCache>) -> Result<ModelInfo, LlmError> {
         let info = self.fetch_model_info(model).await?;
 
         if let Some(cache) = cache {
-            cache.set(&info)?;
+            cache.set(&self.model_info_server(), &info)?;
         }
 
         Ok(info)
     }
 
-    /// Fetch model info from the provider API
+    /// Which server answers this client's model-info lookups: the provider
+    /// and the base URL, stripped of any credentials in it (the name is
+    /// written to disk with the answer, and `https://user:pw@host` must not
+    /// put the password there).
+    ///
+    /// A model name alone names nothing across servers: `qwen3:8b` on a
+    /// remote server can be built with another window than the local one, and
+    /// a Claude proxy and Anthropic answer for the same Claude names.
+    fn model_info_server(&self) -> String {
+        let base = reqwest::Url::parse(&self.base_url).map_or_else(
+            |_| self.base_url.clone(),
+            |mut url| {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.as_str().trim_end_matches('/').to_string()
+            },
+        );
+        format!("{:?} {base}", self.provider)
+    }
+
+    /// Ask the provider about `model`.
+    ///
+    /// `Ok` only for the provider's answer, which [`Self::get_model_info`]
+    /// caches. Anything that is not an answer is an `Err` and is never
+    /// cached: a refusal or transport error obviously, and a 404 too — "not
+    /// on this server" or "not in this catalogue" is a fact about the server
+    /// right now (a pull or a corrected URL changes it), not about the
+    /// model's window.
     async fn fetch_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
         match self.provider {
             Provider::Anthropic => self.fetch_anthropic_model_info(model).await,
@@ -2855,23 +2966,20 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             // A Claude proxy serves Claude models, so ask the way Anthropic
             // answers. A proxy that does not implement the models endpoint
             // 404s or fails to deserialize, and `get_model_info` falls back to
-            // defaults exactly as before — trying costs a request that is made
-            // once per model per cache TTL.
-            Provider::ClaudeProxy => match self.fetch_anthropic_model_info(model).await {
-                Ok(info) => Ok(ModelInfo {
-                    provider: "claude_proxy".to_string(),
-                    ..info
-                }),
-                Err(e) => {
-                    debug!(
-                        model = %model,
-                        error = %e,
-                        "proxy did not answer the models endpoint; using defaults"
-                    );
-                    Ok(default_model_info(model, "claude_proxy"))
-                }
-            },
-            // GitHub Models publishes no per-model limit endpoint.
+            // defaults for that lookup. The failure is not cached, because a
+            // proxy that is merely not up yet fails the same way; the cost is
+            // one request per lookup to a proxy that never answers.
+            Provider::ClaudeProxy => {
+                self.fetch_anthropic_model_info(model)
+                    .await
+                    .map(|info| ModelInfo {
+                        provider: "claude_proxy".to_string(),
+                        ..info
+                    })
+            }
+            // GitHub Models publishes no per-model limit endpoint, so the
+            // floor is its standing answer — cached like any other, since no
+            // later request could say more.
             Provider::GitHubModels => {
                 Ok(default_model_info(model, &format!("{:?}", self.provider)))
             }
@@ -2890,13 +2998,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        // A 404 included: see `fetch_model_info` for why it is not an answer.
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            // If model not found or API doesn't support this, use defaults
-            if status == 404 {
-                info!(model = %model, "Model not found in API, using defaults");
-                return Ok(default_model_info(model, "anthropic"));
-            }
             let message = response.text().await.unwrap_or_default();
             return Err(LlmError::Api { status, message });
         }
@@ -2944,11 +3048,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        // A 404 included: see `fetch_model_info` for why it is not an answer.
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            if status == 404 {
-                return Ok(default_model_info(model, "openai"));
-            }
             let message = response.text().await.unwrap_or_default();
             return Err(LlmError::Api { status, message });
         }
@@ -2967,11 +3069,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        // A 404 included: Ollama says `model '…' not found` for a model that
+        // is not pulled (yet), and a path-routing proxy says it for a base URL
+        // missing its path. See `fetch_model_info`.
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            if status == 404 {
-                return Ok(default_model_info(model, "ollama"));
-            }
             let message = response.text().await.unwrap_or_default();
             return Err(LlmError::Api { status, message });
         }
@@ -3032,8 +3134,12 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        // An error status is no answer. It used to come back as `Ok` with the
+        // floor, which was then cached for a week like a real answer.
         if !response.status().is_success() {
-            return Ok(default_model_info(model, "openrouter"));
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
         }
 
         let api_response: OpenRouterModelsResponse = response.json().await?;
@@ -3056,7 +3162,12 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             });
         }
 
-        Ok(default_model_info(model, "openrouter"))
+        // Not listed is the catalogue's 404: true today, and changed by the
+        // catalogue tomorrow without anything the cache can see.
+        Err(LlmError::Api {
+            status: 404,
+            message: format!("{model} is not in OpenRouter's model list"),
+        })
     }
 
     /// Send a completion request (simple, no tools).
@@ -8428,6 +8539,375 @@ mod cache_creation_split_tests {
             usage.cache_creation_1h_tokens(),
             10,
             "a share never exceeds its total"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_info_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `POST /api/show` for a model that publishes its window, and for one
+    /// with a smaller window on a different server.
+    const SHOW_40K: &str = r#"{"model_info":{"llama.context_length":40960}}"#;
+    const SHOW_8K: &str = r#"{"model_info":{"llama.context_length":8192}}"#;
+    const UNAUTHORIZED: &str = r#"{"error":"unauthorized"}"#;
+
+    /// A cache in a directory of its own, removed when the test ends.
+    struct ScratchCache {
+        dir: std::path::PathBuf,
+        cache: ModelInfoCache,
+    }
+
+    impl ScratchCache {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "nanna-model-info-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            Self {
+                cache: ModelInfoCache::new(&dir),
+                dir,
+            }
+        }
+    }
+
+    impl Drop for ScratchCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Answer each connection with the next scripted `(status, body)`, then
+    /// repeat the last; `Connection: close` makes the hit count the request
+    /// count.
+    async fn serve(script: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = vec![0_u8; 65536];
+                let _ = stream.read(&mut request).await;
+                let (status, body) = script
+                    .get(n)
+                    .unwrap_or_else(|| script.last().expect("script is non-empty"));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// The upgrade story: the previous build never sent the bearer token on
+    /// `/api/show`, so a proxied server answered 401 and the floor was cached
+    /// for a week. The refusal is not an answer, so it must not outlive the
+    /// lookup: the next one (token saved, or the fixed build) asks again.
+    #[tokio::test]
+    async fn a_refused_lookup_is_not_cached_and_the_next_one_asks_again() {
+        let (url, hits) = serve(vec![(401, UNAUTHORIZED), (200, SHOW_40K)]).await;
+        let scratch = ScratchCache::new("refused");
+        let model = "model-info-cache-refused:7b";
+        let client = LlmClient::ollama(&url);
+
+        let refused = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(refused.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "a 401 fallback must not be written to the cache"
+        );
+
+        let answered = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(
+            answered.context_window, 40_960,
+            "the next lookup must ask the server"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A transport failure is the same case with no status at all.
+    #[tokio::test]
+    async fn an_unreachable_server_is_not_cached() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let scratch = ScratchCache::new("unreachable");
+        let model = "model-info-cache-unreachable:7b";
+        let client = LlmClient::ollama(format!("http://127.0.0.1:{port}"));
+
+        let info = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "a connect failure must not be cached"
+        );
+    }
+
+    /// Ollama's 404 says the model is not on that server NOW — `ollama pull`
+    /// changes that without anything the cache can see — or, for a proxied
+    /// server, that the base URL is missing its path. Neither is a fact about
+    /// the model's window.
+    #[tokio::test]
+    async fn a_model_the_server_does_not_have_yet_is_not_cached() {
+        let (url, hits) = serve(vec![
+            (
+                404,
+                r#"{"error":"model 'model-info-cache-unpulled:7b' not found"}"#,
+            ),
+            (200, SHOW_40K),
+        ])
+        .await;
+        let scratch = ScratchCache::new("unpulled");
+        let model = "model-info-cache-unpulled:7b";
+        let client = LlmClient::ollama(&url);
+
+        let missing = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(missing.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "a 404 fallback must not be cached"
+        );
+
+        let pulled = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(pulled.context_window, 40_960);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// The cache still does its job for a real answer: one request, then
+    /// served from disk — to the client and to the name-only readers.
+    #[tokio::test]
+    async fn an_answer_is_cached_and_served_without_asking_again() {
+        let (url, hits) = serve(vec![(200, SHOW_40K)]).await;
+        let scratch = ScratchCache::new("answered");
+        let model = "model-info-cache-answered:7b";
+        let client = LlmClient::ollama(&url);
+
+        let first = client.get_model_info(model, Some(&scratch.cache)).await;
+        let second = client.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(
+            (first.context_window, second.context_window),
+            (40_960, 40_960)
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the second lookup is a cache hit"
+        );
+        assert_eq!(
+            scratch.cache.get(model).map(|info| info.context_window),
+            Some(40_960),
+            "name-only readers see the answer"
+        );
+    }
+
+    /// Generation 3 is what every build before this fix wrote, poisoned
+    /// fallbacks included, each with a fresh timestamp and nothing to tell it
+    /// from a real answer. Such a file must never be served.
+    #[tokio::test]
+    async fn an_entry_from_the_poisoned_generation_is_not_served() {
+        let (url, hits) = serve(vec![(200, SHOW_40K)]).await;
+        let scratch = ScratchCache::new("generation");
+        let model = "model-info-cache-generation:7b";
+        std::fs::create_dir_all(&scratch.dir).expect("create the cache dir");
+        let poisoned = unknown_model_info(model, "Ollama");
+        std::fs::write(
+            scratch.dir.join("model-info-cache-generation_7b.v3.json"),
+            serde_json::to_string_pretty(&poisoned).expect("serializes"),
+        )
+        .expect("write the old entry");
+
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "a generation-3 file is not read"
+        );
+        let info = LlmClient::ollama(&url)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(info.context_window, 40_960);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the lookup asked the server"
+        );
+    }
+
+    /// A model name is not an identity across servers: `qwen3:8b` on a remote
+    /// server can be built with a different window than the local one. A
+    /// client must never be served another server's answer, and the
+    /// name-only readers follow the server that was asked last.
+    #[tokio::test]
+    async fn an_answer_from_one_server_is_not_served_for_another() {
+        let (local, local_hits) = serve(vec![(200, SHOW_40K)]).await;
+        let (remote, remote_hits) = serve(vec![(200, SHOW_8K)]).await;
+        let scratch = ScratchCache::new("two-servers");
+        let model = "model-info-cache-two-servers:8b";
+
+        let from_local = LlmClient::ollama(&local)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        let from_remote = LlmClient::ollama_with_key(&remote, "tok")
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(from_local.context_window, 40_960);
+        assert_eq!(
+            from_remote.context_window, 8_192,
+            "the remote server must be asked"
+        );
+        assert_eq!(local_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(remote_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scratch.cache.get(model).map(|info| info.context_window),
+            Some(8_192),
+            "name-only readers see the server asked last"
+        );
+    }
+
+    /// When the server now in use cannot answer, the other server's entry
+    /// must not stay behind for the name-only readers: they would size budgets
+    /// from a window the lookup itself just declined to trust.
+    #[tokio::test]
+    async fn a_failed_lookup_vacates_another_servers_entry() {
+        let (local, _) = serve(vec![(200, SHOW_40K)]).await;
+        let (remote, remote_hits) = serve(vec![(401, UNAUTHORIZED)]).await;
+        let scratch = ScratchCache::new("vacate");
+        let model = "model-info-cache-vacate:8b";
+
+        LlmClient::ollama(&local)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        let refused = LlmClient::ollama(&remote)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(
+            remote_hits.load(Ordering::SeqCst),
+            1,
+            "the remote server must be asked"
+        );
+        assert_eq!(refused.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "the local answer must not stand in"
+        );
+    }
+
+    /// The same rule on the other providers' error paths, which used to turn
+    /// a failure into an `Ok` floor and cache it.
+    #[tokio::test]
+    async fn openrouter_and_proxy_failures_are_not_cached() {
+        let (url, _) = serve(vec![(500, r#"{"error":"upstream"}"#)]).await;
+        let scratch = ScratchCache::new("openrouter");
+        let model = "model-info-cache/openrouter";
+        let mut openrouter = LlmClient::openrouter("key");
+        openrouter.base_url.clone_from(&url);
+        let info = openrouter.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "an OpenRouter 500 must not be cached"
+        );
+
+        let (url, _) = serve(vec![(503, r#"{"error":"starting"}"#)]).await;
+        let scratch = ScratchCache::new("proxy");
+        let model = "model-info-cache-proxy";
+        let info = LlmClient::claude_proxy(&url)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "a proxy failure must not be cached"
+        );
+    }
+
+    /// The other two "not found" answers that used to be cached as the floor:
+    /// Anthropic's 404, and a model missing from `OpenRouter`'s list.
+    #[tokio::test]
+    async fn not_found_is_not_cached_on_any_provider() {
+        let (url, _) = serve(vec![(404, r#"{"type":"error"}"#)]).await;
+        let scratch = ScratchCache::new("anthropic-404");
+        let model = "model-info-cache-anthropic-404";
+        let mut anthropic = LlmClient::anthropic("key");
+        anthropic.base_url.clone_from(&url);
+        let info = anthropic.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "an Anthropic 404 must not be cached"
+        );
+
+        let (url, _) = serve(vec![(200, r#"{"data":[{"id":"someone/else"}]}"#)]).await;
+        let scratch = ScratchCache::new("openrouter-unlisted");
+        let model = "model-info-cache/unlisted";
+        let mut openrouter = LlmClient::openrouter("key");
+        openrouter.base_url.clone_from(&url);
+        let info = openrouter.get_model_info(model, Some(&scratch.cache)).await;
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert!(
+            scratch.cache.get(model).is_none(),
+            "an unlisted model must not be cached"
+        );
+    }
+
+    /// One server spelled two ways (`localhost` and a trailing slash, as a
+    /// pasted URL has them) is one server: the second spelling is a hit.
+    #[tokio::test]
+    async fn one_server_spelled_two_ways_shares_its_entry() {
+        let (url, hits) = serve(vec![(200, SHOW_40K)]).await;
+        let port = url.rsplit(':').next().expect("the url has a port");
+        let scratch = ScratchCache::new("spellings");
+        let model = "model-info-cache-spellings:7b";
+
+        LlmClient::ollama(format!("http://localhost:{port}/"))
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        let again = LlmClient::ollama(&url)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(again.context_window, 40_960);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the second spelling is a cache hit"
+        );
+    }
+
+    /// The answering server is written to disk with the answer, so a
+    /// credential in the base URL must not go with it.
+    #[tokio::test]
+    async fn the_cached_server_name_carries_no_credentials() {
+        let (url, _) = serve(vec![(200, SHOW_40K)]).await;
+        let with_credentials = url.replacen("http://", "http://someone:pa55word@", 1);
+        let scratch = ScratchCache::new("credentials");
+        let model = "model-info-cache-credentials:7b";
+
+        let info = LlmClient::ollama(&with_credentials)
+            .get_model_info(model, Some(&scratch.cache))
+            .await;
+        assert_eq!(info.context_window, 40_960);
+        let written = std::fs::read_dir(&scratch.dir)
+            .expect("the entry was written")
+            .map(|entry| std::fs::read_to_string(entry.expect("dir entry").path()).expect("read"))
+            .collect::<String>();
+        assert!(written.contains(&url), "the server is recorded: {written}");
+        assert!(
+            !written.contains("pa55word") && !written.contains("someone"),
+            "credentials must not be written: {written}"
         );
     }
 }
