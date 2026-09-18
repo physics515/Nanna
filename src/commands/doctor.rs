@@ -1560,7 +1560,7 @@ mod tests {
     /// that serves it sends it there: chat models by the chat router's rule,
     /// embedding models by the embedding router's. The probe used one looser
     /// rule of its own for both, so it expected `gpt-oss:20b` there though
-    /// chat sends it to OpenAI, and skipped a namespaced tagged chat model and
+    /// chat sends it to `OpenAI`, and skipped a namespaced tagged chat model and
     /// a bare embedding name that both go to Ollama.
     #[test]
     fn each_model_is_probed_where_its_router_sends_it() {
