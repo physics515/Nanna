@@ -6918,6 +6918,19 @@ keep the phases readable; promote individual items into a phase when they become
 
 ### Linux host blockers (found 2026-09-09)
 
+- [x] *(2026-09-18)* **With no keyring backend, every secret operation failed instead of using the
+      encrypted file store it documents.** `SecureStore::{get,set,delete}` opened the keyring entry
+      with `Entry::new(..)?` *before* their fallback logic, and on a Linux session with no Secret
+      Service (a headless box, a service without a login session) `keyring` 4 fails right there
+      with `NoDefaultStore`. So `nanna mcp secret set` died with `Keyring error: No default store
+      has been set` and the daemon could read no stored credential at all — on exactly the machine
+      the `credentials.enc` fallback exists for. An entry that cannot be opened now means "no
+      keyring here" and falls to the file (keyring-only stores still fail). Verified on the real
+      CLI with `DBUS_SESSION_BUS_ADDRESS` pointed at a dead socket and a scratch `HOME`: before,
+      the error above; after, `Stored credential … in file fallback`. Same pass: the file store's
+      key file was created with the default mode and chmodded to `0600` afterwards — a window where
+      the key was readable; it is now created `0600`.
+
 - [x] *(2026-09-11 — fixed by the 2026-09-10 run, which reached master only through this
       stacked PR: `vendor/tauri-build` carries upstream tauri#15831; see the P11 Linux entry.
       Both sub-items below were settled by that run too.)*

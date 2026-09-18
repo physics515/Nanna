@@ -154,7 +154,9 @@ impl SecureStore {
         if self.file_only {
             return self.get_from_file(key);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.get_from_file(key);
+        };
         match entry.get_password() {
             Ok(value) => {
                 debug!("Retrieved credential '{}' from keyring", key);
@@ -199,7 +201,9 @@ impl SecureStore {
         if self.file_only {
             return self.set_to_file(key, value);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.set_to_file(key, value);
+        };
         match entry.set_password(value) {
             Ok(()) => {
                 info!("Stored credential '{}' in keyring", key);
@@ -237,7 +241,9 @@ impl SecureStore {
         if self.file_only {
             return self.delete_from_file(key);
         }
-        let entry = Entry::new(KEYRING_SERVICE, key)?;
+        let Some(entry) = self.open_entry(key)? else {
+            return self.delete_from_file(key);
+        };
         match entry.delete_credential() {
             Ok(()) => {
                 info!("Deleted credential '{}' from keyring", key);
@@ -364,6 +370,32 @@ impl SecureStore {
         Ok(())
     }
 
+    /// Open the keyring entry for `key`, or `None` when there is no keyring
+    /// to open it in and the file fallback may stand in.
+    ///
+    /// Opening fails *before* any read or write when no keyring backend
+    /// exists at all — measured 2026-09-18: with no Secret Service on the
+    /// session bus, `keyring` 4 answers `NoDefaultStore` from `Entry::new`.
+    /// That is exactly the machine the encrypted file fallback exists for
+    /// (a headless server, a service without a login session), so it must
+    /// not end the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Keyring`] when the entry cannot be opened
+    /// and the store is keyring-only.
+    fn open_entry(&self, key: &str) -> Result<Option<Entry>, CredentialError> {
+        debug_assert!(!self.file_only, "file-only stores never open the keyring");
+        match Entry::new(KEYRING_SERVICE, key) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(e) if self.allow_file_fallback => {
+                debug!("No keyring for '{}' ({}); using the encrypted file", key, e);
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // =========================================================================
     // File Fallback (for systems without keyring support)
     // =========================================================================
@@ -482,13 +514,23 @@ impl SecureStore {
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Created 0600 from the first byte: creating it with the default mode
+        // and narrowing afterwards leaves a window where the key is readable.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
         {
-            let mut f = std::fs::File::create(&key_path)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            let mut f = options.open(&key_path)?;
             f.write_all(&key)?;
             f.sync_all()?;
         }
         #[cfg(unix)]
         {
+            // A pre-existing file keeps its mode through `open`; narrow it too.
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&key_path)?.permissions();
             perms.set_mode(0o600);
