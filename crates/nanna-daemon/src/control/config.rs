@@ -117,6 +117,7 @@ impl ControlPlane {
                     // Reset specific path - would need more complex logic
                     json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
                 } else {
+                    let previous_ollama_host = config.memory.ollama_host.clone();
                     *config = Config::default().with_env_overrides();
 
                     // Save to disk
@@ -133,6 +134,12 @@ impl ControlPlane {
 
                     let snapshot = config.clone();
                     drop(config);
+                    // The reset moves the Ollama address like a `config.set`
+                    // of it: a token saved with no server recorded was the
+                    // old address's.
+                    let snapshot = self
+                        .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                        .await;
                     self.rebuild_llm_providers(&snapshot).await;
                     self.apply_scheduler_settings(&snapshot).await;
                     self.notify_config_changed();
@@ -140,15 +147,7 @@ impl ControlPlane {
                     json!({ "status": "reset" })
                 }
             }
-            ConfigAction::Reload => {
-                match Config::load() {
-                    Ok(new_config) => {
-                        self.apply_loaded_config(new_config.with_env_overrides()).await;
-                        json!({ "status": "reloaded" })
-                    }
-                    Err(e) => json!({ "error": "reload_failed", "message": e.to_string() })
-                }
-            }
+            ConfigAction::Reload => self.config_reload().await,
             ConfigAction::Export => {
                 let config = self.config.read().await;
                 // Export as JSON (TOML export would require additional dependencies)
@@ -165,6 +164,7 @@ impl ControlPlane {
                 match new_config {
                     Ok(cfg) => {
                         let mut config = self.config.write().await;
+                        let previous_ollama_host = config.memory.ollama_host.clone();
                         *config = cfg.with_env_overrides();
                         
                         // Save to disk
@@ -184,6 +184,10 @@ impl ControlPlane {
 
                         let snapshot = config.clone();
                         drop(config);
+                        // As for a reset: the address may have moved.
+                        let snapshot = self
+                            .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                            .await;
                         self.rebuild_llm_providers(&snapshot).await;
                         self.apply_scheduler_settings(&snapshot).await;
                         self.notify_config_changed();
@@ -193,6 +197,29 @@ impl ControlPlane {
                     Err(e) => json!({ "error": "import_failed", "message": e })
                 }
             }
+        }
+    }
+
+    /// `ConfigAction::Reload`: load `config.toml` again and apply it live.
+    ///
+    /// Loaded as the replacement for what is running, so a token saved with
+    /// no server recorded stays the running server's rather than following an
+    /// address edited in the file. Off the async runtime: keyring reads can
+    /// block on an unlock prompt.
+    async fn config_reload(&self) -> Value {
+        let running_host = self.config.read().await.memory.ollama_host.clone();
+        let store = self.credential_store.clone();
+        let loaded =
+            tokio::task::spawn_blocking(move || Config::load_replacing(&running_host, &store))
+                .await;
+        match loaded {
+            Ok(Ok(new_config)) => {
+                self.apply_loaded_config(new_config.with_env_overrides())
+                    .await;
+                json!({ "status": "reloaded" })
+            }
+            Ok(Err(e)) => json!({ "error": "reload_failed", "message": e.to_string() }),
+            Err(e) => json!({ "error": "reload_failed", "message": e.to_string() }),
         }
     }
 
@@ -219,8 +246,18 @@ impl ControlPlane {
             Ok(mut new_config) => {
                 // The Ollama token is bound to the server it was saved for;
                 // edited in place, the config would carry the old server's
-                // token to a new `memory.ollama_host` (a load never would).
-                new_config.rebind_ollama_token_if_moved(&config.memory.ollama_host);
+                // token to a new `memory.ollama_host`. Dropped here, under the
+                // lock, so nothing ever reads it paired with the new address;
+                // which token the new address gets is read from the secure
+                // store below, once the lock is released.
+                let previous_ollama_host = config.memory.ollama_host.clone();
+                let ollama_moved = nanna_config::ollama_server_changed(
+                    &previous_ollama_host,
+                    &new_config.memory.ollama_host,
+                );
+                if ollama_moved {
+                    new_config.llm.ollama_api_key = None;
+                }
                 *config = new_config;
 
                 // Save to disk if we have a path
@@ -248,6 +285,9 @@ impl ControlPlane {
                 // block on keyring/network.
                 let snapshot = config.clone();
                 drop(config);
+                let snapshot = self
+                    .adopt_moved_ollama_token(&previous_ollama_host, snapshot)
+                    .await;
                 self.rebuild_llm_providers(&snapshot).await;
                 self.apply_scheduler_settings(&snapshot).await;
                 self.notify_config_changed();
@@ -256,6 +296,57 @@ impl ControlPlane {
             }
             Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
         }
+    }
+
+    /// After a `config.set`, reset or import that may have moved
+    /// `[memory].ollama_host` away from `previous_host`, give the running
+    /// config the token the new address is owed, if any, and return
+    /// `changed` as the rest of the change should propagate it.
+    ///
+    /// Nothing to do when the address did not move, or when the new config
+    /// names a token of its own (an imported one — the operator's say-so, as
+    /// a token written into `config.toml` is). Read with no config lock held,
+    /// because keyring reads can block on an unlock prompt. A stored token
+    /// with no recorded server was `previous_host`'s, and is recorded as such
+    /// (see `Config::rebind_ollama_token_if_moved`). The token only lands if
+    /// the address is still the one it was resolved for: a change that moved
+    /// it again meanwhile resolves its own.
+    async fn adopt_moved_ollama_token(&self, previous_host: &str, changed: Config) -> Config {
+        let names_its_own = changed
+            .llm
+            .ollama_api_key
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        if names_its_own
+            || !nanna_config::ollama_server_changed(previous_host, &changed.memory.ollama_host)
+        {
+            return changed;
+        }
+        let store = self.credential_store.clone();
+        let previous_host = previous_host.to_string();
+        let mut resolved = changed.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            resolved.rebind_ollama_token_if_moved(&previous_host, &store);
+            resolved
+        })
+        .await;
+        let token = match resolved {
+            Ok(resolved) => resolved.llm.ollama_api_key,
+            Err(e) => {
+                warn!("Resolving the Ollama token for the new address failed: {e}");
+                None
+            }
+        };
+        let Some(token) = token else {
+            return changed;
+        };
+        let mut config = self.config.write().await;
+        if nanna_config::same_ollama_server(&config.memory.ollama_host, &changed.memory.ollama_host)
+            && config.llm.ollama_api_key.is_none()
+        {
+            config.llm.ollama_api_key = Some(token);
+        }
+        config.clone()
     }
 }
 

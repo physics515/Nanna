@@ -31,6 +31,20 @@ pub fn same_ollama_server(a: &str, b: &str) -> bool {
     }
 }
 
+/// Whether changing the Ollama address from `previous` to `current` points
+/// at a different server — what makes a token held for `previous` stop being
+/// sendable.
+///
+/// Not simply `!same_ollama_server`: that fails closed on an address that
+/// names no server, so every unrelated config write would count as a move
+/// while such an address is configured. The same address, however it is
+/// spelled, is never a move.
+#[must_use]
+pub fn ollama_server_changed(previous: &str, current: &str) -> bool {
+    normalize_ollama_host(previous) != normalize_ollama_host(current)
+        && !same_ollama_server(previous, current)
+}
+
 /// An address fit for a log line: user info (which can hold a password),
 /// query and fragment dropped.
 #[must_use]
@@ -107,7 +121,9 @@ impl ServerIdentity {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_ollama_host, redacted_ollama_host, same_ollama_server};
+    use super::{
+        normalize_ollama_host, ollama_server_changed, redacted_ollama_host, same_ollama_server,
+    };
 
     #[test]
     fn spellings_of_one_server_match() {
@@ -148,6 +164,26 @@ mod tests {
         assert!(!same_ollama_server("localhost:11434", "localhost:11434"));
         assert!(!same_ollama_server("", ""));
         assert!(!same_ollama_server("not a url", "http://localhost:11434"));
+    }
+
+    #[test]
+    fn only_another_server_is_a_move() {
+        assert!(ollama_server_changed(
+            "https://a.example",
+            "https://b.example"
+        ));
+        assert!(ollama_server_changed("", "http://localhost:11434"));
+        assert!(!ollama_server_changed(
+            "https://a.example",
+            "https://A.example:443/"
+        ));
+        // An address that names no server matches none, but leaving it as
+        // it is moves nothing.
+        assert!(!ollama_server_changed("", ""));
+        assert!(!ollama_server_changed(
+            "localhost:11434",
+            "localhost:11434/"
+        ));
     }
 
     #[test]

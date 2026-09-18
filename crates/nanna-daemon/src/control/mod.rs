@@ -134,6 +134,11 @@ pub struct ControlPlane {
     degradations: Option<Arc<nanna_agent::DegradationLedger>>,
     /// Per-server MCP state from the boot task; `None` outside a daemon.
     mcp_status: Option<crate::mcp_startup::McpStatus>,
+    /// Where config reloads and `config.set` read the saved secrets from: the
+    /// OS keyring with its encrypted-file fallback. A field, not a
+    /// `SecureStore::new()` at each use, so a test can hand the control plane
+    /// a store of its own instead of the machine's keyring.
+    pub(crate) credential_store: nanna_config::SecureStore,
 }
 
 impl ControlPlane {
@@ -175,6 +180,7 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -240,6 +246,7 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -307,6 +314,7 @@ impl ControlPlane {
             shutdown_tx: None,
             degradations: None,
             mcp_status: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 

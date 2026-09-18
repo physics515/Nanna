@@ -158,6 +158,116 @@ async fn config_set_rebuilds_llm_router_providers() {
     assert!(providers.contains(&"ollama"));
 }
 
+/// The Ollama bearer token is bound to the server it was saved for — and a
+/// token saved by an older build records no server. `config.set` of a new
+/// address (the agent can send one) used to re-read the store for the new
+/// address, find no record, and hand the old server's token to the new one:
+/// chat, embeddings and the probe would all have sent it there.
+#[tokio::test]
+async fn config_set_does_not_hand_a_legacy_ollama_token_to_a_new_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+    store
+        .set(
+            nanna_config::credentials::keys::OLLAMA_API_KEY,
+            "legacy-token",
+        )
+        .expect("set");
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.credential_store = store.clone();
+    {
+        // As the boot load left it: the legacy token, for the configured server.
+        let mut config = cp.config.write().await;
+        config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+        config.llm.ollama_api_key = Some("legacy-token".to_string());
+    }
+    let cp = Arc::new(cp);
+
+    let set_host = |host: &str| {
+        Action::Config(ConfigAction::Set {
+            path: "memory.ollama_host".into(),
+            value: json!(host),
+        })
+    };
+    let resp = cp
+        .handle("test", set_host("https://elsewhere.example"))
+        .await;
+    assert_eq!(resp["status"], "updated");
+    {
+        let config = cp.config.read().await;
+        assert_eq!(config.memory.ollama_host, "https://elsewhere.example");
+        assert_ne!(
+            config.llm.ollama_api_key.as_deref(),
+            Some("legacy-token"),
+            "the new address must not get the token that was going to the old one"
+        );
+    }
+    assert_eq!(
+        store
+            .ollama_token_host()
+            .expect("a file store answers")
+            .as_deref(),
+        Some("https://gpu.example/ollama"),
+        "the token is recorded as the old server's"
+    );
+
+    // Back to the server it was going to: it goes there again.
+    let resp = cp
+        .handle("test", set_host("https://gpu.example/ollama/"))
+        .await;
+    assert_eq!(resp["status"], "updated");
+    assert_eq!(
+        cp.config.read().await.llm.ollama_api_key.as_deref(),
+        Some("legacy-token")
+    );
+}
+
+/// `config.reset` and `config.import` replace the whole config, the address
+/// with it. A token saved with no server recorded was the replaced address's;
+/// unrecorded, the next reload would read it as the new address's.
+#[tokio::test]
+async fn reset_and_import_record_a_legacy_ollama_tokens_server_first() {
+    use nanna_config::credentials::keys;
+    for action in [
+        ConfigAction::Reset { path: None },
+        ConfigAction::Import {
+            config: serde_json::to_value(Config::default()).expect("json"),
+        },
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+        store
+            .set(keys::OLLAMA_API_KEY, "legacy-token")
+            .expect("set");
+        let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        cp.credential_store = store.clone();
+        {
+            let mut config = cp.config.write().await;
+            config.memory.ollama_host = "https://gpu.example/ollama".to_string();
+            config.llm.ollama_api_key = Some("legacy-token".to_string());
+        }
+        let cp = Arc::new(cp);
+        let label = format!("{action:?}");
+        cp.handle("test", Action::Config(action)).await;
+
+        let config = cp.config.read().await;
+        assert_eq!(
+            config.memory.ollama_host, "http://localhost:11434",
+            "{label}"
+        );
+        assert_ne!(
+            config.llm.ollama_api_key.as_deref(),
+            Some("legacy-token"),
+            "{label}: the default address must not get the old server's token"
+        );
+        assert_eq!(
+            store.get(keys::OLLAMA_API_KEY_HOST).ok().as_deref(),
+            Some("https://gpu.example/ollama"),
+            "{label}: recorded as the replaced server's"
+        );
+    }
+}
+
 /// Negative space: with no memory configured at all, consolidation reports the
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]

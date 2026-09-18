@@ -437,11 +437,16 @@ impl SecureStore {
     ///
     /// A blank record is still a record: it was written while the configured
     /// address was blank, names no server, and so matches none.
-    #[must_use]
-    pub fn ollama_token_host(&self) -> Option<String> {
-        self.get(keys::OLLAMA_API_KEY_HOST)
-            .ok()
-            .map(|host| crate::ollama::normalize_ollama_host(&host))
+    ///
+    /// # Errors
+    /// Returns the store's error when it cannot say whether a server is
+    /// recorded. That is not the same as none being recorded: a token with no
+    /// record goes to the configured server, so a record that exists but
+    /// could not be read must not pass for an absent one.
+    pub fn ollama_token_host(&self) -> Result<Option<String>, CredentialError> {
+        Ok(self
+            .lookup(keys::OLLAMA_API_KEY_HOST)?
+            .map(|host| crate::ollama::normalize_ollama_host(&host)))
     }
 
     /// Record `host` as the saved token's server when the token has none.
@@ -451,9 +456,11 @@ impl SecureStore {
     /// would count as the next address's too. Returns whether it recorded.
     ///
     /// # Errors
-    /// Returns the backing store's error when the record cannot be written.
+    /// Returns the backing store's error when the record cannot be written,
+    /// or when the store cannot say whether one is already there — nothing is
+    /// written then, so a record that exists is never overwritten.
     pub fn bind_unbound_ollama_token(&self, host: &str) -> Result<bool, CredentialError> {
-        if self.ollama_token().is_none() || self.ollama_token_host().is_some() {
+        if self.ollama_token().is_none() || self.ollama_token_host()?.is_some() {
             return Ok(false);
         }
         self.set(
@@ -461,6 +468,40 @@ impl SecureStore {
             &crate::ollama::normalize_ollama_host(host),
         )?;
         Ok(true)
+    }
+
+    /// Read `key`, telling "not stored" apart from "could not be read".
+    ///
+    /// [`Self::get`] answers `NotFound` for a keyring that fails (locked, its
+    /// service gone) whenever the file fallback lacks the key too. For a
+    /// credential that is harmless — it is missing either way — but not for
+    /// a record whose absence means something. `Ok(None)` here is only ever
+    /// the definite answer of the store that holds the key.
+    ///
+    /// # Errors
+    /// Returns the keyring's error when it could not answer and the file
+    /// store holds no copy, and the file store's own errors.
+    fn lookup(&self, key: &str) -> Result<Option<String>, CredentialError> {
+        let from_file = || match self.get_from_file(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(CredentialError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        };
+        if self.file_only {
+            return from_file();
+        }
+        let Some(entry) = self.open_entry(key)? else {
+            return from_file();
+        };
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) if self.allow_file_fallback => from_file(),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => match self.allow_file_fallback.then(from_file) {
+                Some(Ok(Some(value))) => Ok(Some(value)),
+                _ => Err(e.into()),
+            },
+        }
     }
 
     /// Open the keyring entry for `key`, or `None` when there is no keyring
@@ -1688,5 +1729,41 @@ mod tests {
         store_a.set("shared_key", "in_a").unwrap();
         assert_eq!(store_a.get("shared_key").unwrap(), "in_a");
         assert!(matches!(store_b.get("shared_key"), Err(CredentialError::NotFound)));
+    }
+
+    #[test]
+    fn an_unreadable_token_record_is_not_an_absent_one() {
+        // "No server recorded" sends a token to the configured server, so a
+        // store that cannot say must not answer "none" — and must not have a
+        // record written over one it could not read.
+        let dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only_at(dir.path().to_path_buf());
+        assert!(
+            matches!(store.ollama_token_host(), Ok(None)),
+            "nothing stored yet"
+        );
+        store
+            .save_ollama_token("token", "https://a.example")
+            .unwrap();
+        assert_eq!(
+            store.ollama_token_host().unwrap().as_deref(),
+            Some("https://a.example")
+        );
+
+        std::fs::write(dir.path().join("credentials.enc"), b"not an envelope").unwrap();
+        assert!(
+            store.ollama_token_host().is_err(),
+            "unreadable is not absent"
+        );
+        assert!(
+            !store
+                .bind_unbound_ollama_token("https://b.example")
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.enc")).unwrap(),
+            b"not an envelope",
+            "nothing was written over it"
+        );
     }
 }
