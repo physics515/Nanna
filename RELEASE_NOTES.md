@@ -72,6 +72,12 @@ asks, and tells apart "Ollama isn't running" from "it's running but this model i
 with the exact `ollama pull` to run. The model picker in Settings asks the same way. A server that
 lists a model as `qwen` rather than `qwen:latest` no longer has it reported missing.
 
+**A remote Ollama's context window is no longer sized from this computer's graphics card.** Nanna
+sizes a local model's context window to the video memory free on this machine, and it did the same
+for a server on another machine, whose card it cannot see. A busy card here could shrink a remote
+model's window to the minimum. A remote server now starts at 16,384 tokens, the size Nanna uses
+whenever the card cannot be read, and still steps down if that server runs out of memory.
+
 **Commands Nanna runs from the Linux app picked up the app's own libraries.** The AppImage's
 `LD_LIBRARY_PATH` leaked into every command, so tools like `git` loaded the bundled copies of
 `libssl` and `libpcre2`. Commands now run with your system's.

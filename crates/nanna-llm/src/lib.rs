@@ -117,6 +117,41 @@ impl RepeatWatch {
     }
 }
 
+/// Whether an Ollama base URL names a server on THIS machine.
+///
+/// Two things are only right for a server on this machine: sizing `num_ctx`
+/// from this machine's GPU, and the healing ladder's process-level cures
+/// (unloading a runner, killing and respawning the server). A server reached
+/// over the network has a GPU and processes of its own.
+///
+/// Parsed, not substring-matched: `https://localhost.example.com` and
+/// `https://host/127.0.0.1` are remote. Local is `localhost`, the IPv4
+/// loopback block, `::1`, or an unspecified address (`0.0.0.0`, `::`), which
+/// reaches this machine when dialled. Anything else, including anything that
+/// does not parse, reads as remote — the safe way to be wrong: a local server
+/// misread as remote loses a cure, while the reverse kills this machine's
+/// processes for a server they do not serve.
+#[must_use]
+pub fn ollama_server_is_local(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    unbracketed
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_canonical())
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
 /// The single generation slot a local Ollama server hands out, as a permit.
 ///
 /// llama.cpp serves one generation at a time per slot. A second concurrent
@@ -2153,8 +2188,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// Source order: what the caller explicitly asked for, then the live
     /// latch, then the env pin outright (falling back to the probed/nominal
-    /// size only when no pin is set) at latch initialization.
-    fn resolve_num_ctx(model: &str, explicit: Option<u32>) -> u32 {
+    /// size only when no pin is set) at latch initialization. Only a server on
+    /// this machine is probed — see [`Self::unpinned_start_num_ctx`].
+    fn resolve_num_ctx(base_url: &str, model: &str, explicit: Option<u32>) -> u32 {
         if let Some(explicit) = explicit {
             return explicit;
         }
@@ -2180,7 +2216,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // (the caller demotes on the second fault of a run): the safety net
         // for an over-pin is the fault ladder, not the snapshot.
         let start = Self::env_num_ctx().map_or_else(
-            || Self::fit_context_to_free_vram(model).unwrap_or(16_384),
+            || {
+                Self::unpinned_start_num_ctx(base_url, model, |model| {
+                    Self::fit_context_to_free_vram(base_url, model)
+                })
+            },
             |pinned| {
                 tracing::info!(
                     model = %model,
@@ -2194,6 +2234,37 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         );
         Self::latch_num_ctx(model, start);
         start
+    }
+
+    /// The starting `num_ctx` when neither the caller nor the operator chose
+    /// one: `fit_to_this_gpu`'s fit to this machine's free VRAM, or 16384 when
+    /// the card cannot be read.
+    ///
+    /// Only a server on THIS machine is sized from this machine's card. A
+    /// remote server loads the model onto its own GPU, whose free memory
+    /// nothing here can see, and this machine's figure is not an estimate of
+    /// it but an unrelated number: a desktop card busy with a game would pin
+    /// a remote server with room to spare at the floor. So a remote server
+    /// starts where an unreadable card starts, and a GPU-memory fault from it
+    /// still walks the latch down through [`Self::demote_context`].
+    fn unpinned_start_num_ctx(
+        base_url: &str,
+        model: &str,
+        fit_to_this_gpu: impl FnOnce(&str) -> Option<u32>,
+    ) -> u32 {
+        /// The start when the VRAM the model will load into is unknown.
+        const UNKNOWN_VRAM_START: u32 = 16_384;
+        if !ollama_server_is_local(base_url) {
+            tracing::info!(
+                model,
+                server = base_url,
+                num_ctx = UNKNOWN_VRAM_START,
+                "not sizing num_ctx to this machine's GPU: the Ollama server is not on this \
+                 machine, so the model starts at the size used when VRAM is unknown"
+            );
+            return UNKNOWN_VRAM_START;
+        }
+        fit_to_this_gpu(model).unwrap_or(UNKNOWN_VRAM_START)
     }
 
     /// The operator's explicit context size, if they set one.
@@ -2331,6 +2402,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// the GPU cannot be queried (no NVIDIA tooling, or a non-CUDA backend) —
     /// in which case the caller falls back to a fixed size.
     ///
+    /// `base_url` is the server the model runs on, and it must be on this
+    /// machine: the card measured is this machine's.
+    ///
     /// Deliberately empirical. The analytic route needs the model's
     /// sliding-window interleave and KV quantisation to be known, and getting
     /// those wrong is worse than measuring: for gemma4:12b the naive formula
@@ -2338,11 +2412,15 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// numbers we can actually read — free VRAM and the model's file size —
     /// plus a reserve for the prefill compute buffer, give a bound that adapts
     /// to whatever else is on the card.
-    fn fit_context_to_free_vram(model: &str) -> Option<u32> {
+    fn fit_context_to_free_vram(base_url: &str, model: &str) -> Option<u32> {
         const MIB: u64 = 1024 * 1024;
+        debug_assert!(
+            ollama_server_is_local(base_url),
+            "only a server on this machine is sized from this machine's GPU"
+        );
         let free_bytes = Self::nvidia_free_vram_bytes()?;
-        let weights_bytes = Self::ollama_model_size_bytes(model)?;
-        let (ours_resident, others_resident) = Self::ollama_resident_vram(model);
+        let weights_bytes = Self::ollama_model_size_bytes(base_url, model)?;
+        let (ours_resident, others_resident) = Self::ollama_resident_vram(base_url, model);
         let fitted = Self::fit_context_for_budget(
             lossy::u64_to_f64(free_bytes),
             lossy::u64_to_f64(weights_bytes),
@@ -2385,10 +2463,10 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// measured rather than assumed. Guessing the second one at 2.5 GB (a
     /// plausible embedder size) against an actual 0.32 GB was enough on its own
     /// to drive the budget negative and pin the context at the 4096 floor.
-    fn ollama_resident_vram(model: &str) -> (u64, u64) {
+    fn ollama_resident_vram(base_url: &str, model: &str) -> (u64, u64) {
         let name = model.strip_prefix("ollama/").unwrap_or(model);
         let Ok(out) = std::process::Command::new("curl")
-            .args(["-s", "http://127.0.0.1:11434/api/ps"])
+            .args(["-s", &format!("{base_url}/api/ps")])
             .output()
         else {
             return (0, 0);
@@ -2517,24 +2595,30 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// On-disk size of an Ollama model, a good proxy for its resident weights.
     ///
-    /// Cached per model name for the life of the process: free VRAM is the
-    /// term that has to be live, but a model's file size cannot change while
-    /// we are mid-run against it, and this runs on every single request.
-    fn ollama_model_size_bytes(model: &str) -> Option<u64> {
-        static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
-        > = std::sync::OnceLock::new();
+    /// Cached per server and model name for the life of the process: free
+    /// VRAM is the term that has to be live, but a model's file size cannot
+    /// change while we are mid-run against it, and this runs on every single
+    /// request.
+    ///
+    /// Asked without the server's token: a credential never goes on a command
+    /// line, where any local user's `ps` reads it. A local server that wants
+    /// one answers 401, which reads as an unknown size, and sizing falls back.
+    fn ollama_model_size_bytes(base_url: &str, model: &str) -> Option<u64> {
+        /// Size by (server base URL, model name); `None` is a cached miss.
+        type Sizes = std::collections::HashMap<(String, String), Option<u64>>;
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Sizes>> = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(Default::default);
         let name = model.strip_prefix("ollama/").unwrap_or(model).to_string();
+        let key = (base_url.to_string(), name.clone());
 
         if let Ok(guard) = cache.lock()
-            && let Some(hit) = guard.get(&name) {
+            && let Some(hit) = guard.get(&key) {
                 return *hit;
             }
 
         let looked_up = (|| {
             let out = std::process::Command::new("curl")
-                .args(["-s", "http://127.0.0.1:11434/api/tags"])
+                .args(["-s", &format!("{base_url}/api/tags")])
                 .output()
                 .ok()?;
             let body = String::from_utf8_lossy(&out.stdout);
@@ -2552,7 +2636,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // appear later either, and retrying a failed lookup on every request
         // would spawn a process per turn to learn the same thing.
         if let Ok(mut guard) = cache.lock() {
-            guard.insert(name, looked_up);
+            guard.insert(key, looked_up);
         }
         looked_up
     }
@@ -3285,7 +3369,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // `CUDA error: an illegal memory access was encountered` rather than a
         // clean allocation failure. So the budget reserves a fraction of free
         // VRAM for it instead of spending everything on cache.
-        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
+        let num_ctx = Self::resolve_num_ctx(&self.base_url, &request.model, request.context_limit);
         tracing::info!(
             model = %request.model,
             num_ctx,
@@ -3595,7 +3679,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // aggregation, and context compression. They were built and budgeted
         // against the model's real window and then quietly cut down to a
         // fraction of it.
-        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
+        let num_ctx = Self::resolve_num_ctx(&self.base_url, &request.model, request.context_limit);
         let options = Some(OllamaOptions {
             temperature: request.temperature,
             num_predict: request.max_tokens,
@@ -4970,7 +5054,7 @@ impl LlmClient {
             // Acquire before building the body: the wait is the point.
             let _slot = ollama_generation_slot(&base_url).acquire_owned().await;
 
-            let body = Self::ollama_stream_body(&request);
+            let body = Self::ollama_stream_body(&base_url, &request);
 
             let mut req = http
                 .post(format!("{base_url}/api/chat"))
@@ -5061,7 +5145,7 @@ impl LlmClient {
     /// The `/api/chat` body for a streaming Ollama request: messages and tools
     /// in Ollama's native shape, plus the sampling options and the `num_ctx`
     /// sized for this request.
-    fn ollama_stream_body(request: &AnthropicRequest) -> serde_json::Value {
+    fn ollama_stream_body(base_url: &str, request: &AnthropicRequest) -> serde_json::Value {
         let (messages_json, tools_json) = anthropic_to_ollama_request(request);
 
         let mut body = serde_json::json!({
@@ -5090,7 +5174,7 @@ impl LlmClient {
         // sharing with the desktop, and it failed as
         // `CUDA error: an illegal memory access was encountered` rather
         // than as a clean allocation failure.
-        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
+        let num_ctx = Self::resolve_num_ctx(base_url, &request.model, request.context_limit);
         tracing::info!(
             model = %request.model,
             num_ctx,
@@ -6683,7 +6767,7 @@ mod tests {
         request.context_limit = None;
 
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
             16_384,
             "an explicit override must win over whatever the card measures"
         );
@@ -6731,7 +6815,10 @@ mod tests {
         // env-touching tests, and nothing else reads this key.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
         request.model = "test-env-pin-shrinks:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
+        assert_eq!(
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
+            8_192
+        );
         assert_eq!(
             LlmClient::latched_num_ctx("test-env-pin-shrinks:1b"),
             Some(8_192),
@@ -6742,7 +6829,10 @@ mod tests {
         // durable measurement; only the GPU fault ladder can.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "32768") };
         request.model = "test-env-pin-wins-upward:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 32_768);
+        assert_eq!(
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
+            32_768
+        );
 
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
@@ -6760,21 +6850,24 @@ mod tests {
         let mut request = request_with_tool_history(serde_json::json!({}));
         request.model = "test-env-pin-demotes:1b".to_string();
         request.context_limit = None;
-        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
+        assert_eq!(
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
+            8_192
+        );
 
         assert_eq!(
             LlmClient::demote_context("test-env-pin-demotes:1b", None),
             Some(6_144)
         );
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
             6_144,
             "a demotion below the pin must stick — the pin must not re-inflate it"
         );
 
         request.context_limit = Some(2_048);
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
+            LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
             2_048,
             "an explicit request limit keeps its precedence over pin and latch"
         );
@@ -6796,7 +6889,10 @@ mod tests {
         request.context_limit = None;
 
         let out = capture_info_logs(|| {
-            assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
+            assert_eq!(
+                LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
+                8_192
+            );
         });
         assert!(
             out.contains("NANNA_OLLAMA_NUM_CTX pins"),
@@ -6832,13 +6928,94 @@ mod tests {
         request.context_limit = None;
 
         let out = capture_info_logs(|| {
-            assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 16_384);
+            assert_eq!(
+                LlmClient::resolve_num_ctx(LOCAL_OLLAMA, &request.model, request.context_limit),
+                16_384
+            );
         });
         assert!(
             !out.contains("NANNA_OLLAMA_NUM_CTX pins"),
             "no pin means no pin announcement, got: {out}"
         );
     }
+
+    /// A remote server's window is not this machine's GPU to size. The fit is
+    /// handed a card starved to the floor: a server on this machine gets that
+    /// fit, and a server elsewhere gets the start used when VRAM is unknown,
+    /// without this machine's card being measured at all.
+    #[test]
+    fn a_remote_servers_window_is_not_sized_from_this_machines_gpu() {
+        let starved = |_: &str| Some(4_096);
+        for local in [LOCAL_OLLAMA, "http://localhost:11500", "http://[::1]:11434"] {
+            assert_eq!(
+                LlmClient::unpinned_start_num_ctx(local, "qwen3:8b", starved),
+                4_096,
+                "{local} runs on this machine, so this machine's card sizes it"
+            );
+        }
+        for remote in ["https://gpubox.example/ollama", "http://192.168.1.20:11434"] {
+            let start = LlmClient::unpinned_start_num_ctx(remote, "qwen3:8b", |_: &str| {
+                panic!("measured this machine's GPU to size {remote}")
+            });
+            assert_eq!(start, 16_384, "{remote} must start at the unknown-VRAM size");
+        }
+    }
+
+    /// The same through the request path: with nothing pinned, a remote
+    /// server's model latches the unknown-VRAM start, and the log says why it
+    /// was not sized to the card.
+    #[test]
+    fn a_remote_server_latches_the_unsized_start_and_says_why() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let model = "test-remote-unsized:1b";
+        let out = capture_info_logs(|| {
+            assert_eq!(
+                LlmClient::resolve_num_ctx("https://gpubox.example/ollama", model, None),
+                16_384
+            );
+        });
+        assert_eq!(LlmClient::latched_num_ctx(model), Some(16_384));
+        assert!(
+            out.contains("not on this machine") && out.contains("gpubox.example"),
+            "the skipped sizing must name the server and the reason, got: {out}"
+        );
+    }
+
+    #[test]
+    fn only_a_server_on_this_machine_reads_as_local() {
+        for local in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434",
+            " http://LocalHost:11434/ ",
+            "http://127.0.0.2:8080",
+            "http://[::1]:11434",
+            "http://[::ffff:127.0.0.1]:11434",
+            // Unspecified: dialled, it reaches this machine.
+            "http://0.0.0.0:11434",
+            "http://[::]:11434",
+        ] {
+            assert!(ollama_server_is_local(local), "{local} is on this machine");
+        }
+        for remote in [
+            "https://gpubox.example/ollama",
+            "http://192.168.1.20:11434",
+            "https://localhost.example.com",
+            "https://host/127.0.0.1",
+            "http://[2001:db8::1]:11434",
+            // Unparseable fails safe to remote.
+            "",
+            "127.0.0.1:11434",
+            "not a url",
+        ] {
+            assert!(!ollama_server_is_local(remote), "{remote:?} must read as remote");
+        }
+    }
+
+    /// Ollama's default local address: the server the sizing tests size for.
+    const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
