@@ -11,8 +11,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tauri::AppHandle;
 use tauri::async_runtime::Receiver;
+use tauri::{AppHandle, Runtime};
 use tauri_plugin_shell::{ShellExt, process::{CommandChild, CommandEvent}};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
@@ -41,6 +41,9 @@ pub struct DaemonManagerConfig {
     pub restart_delay: Duration,
     /// Health check interval
     pub health_check_interval: Duration,
+    /// How long one health check may take to connect and complete the
+    /// handshake.
+    pub health_check_timeout: Duration,
 }
 
 /// The daemon port `NANNA_DAEMON_PORT` asks for, if it names a usable one.
@@ -85,6 +88,9 @@ impl Default for DaemonManagerConfig {
             max_restarts: 3,
             restart_delay: Duration::from_secs(2),
             health_check_interval: Duration::from_secs(30),
+            // The ceiling a version probe gets for a connect plus a request;
+            // a check only connects.
+            health_check_timeout: PROBE_TIMEOUT,
         }
     }
 }
@@ -107,6 +113,18 @@ enum BootWait {
     Failed,
     /// `stop()` took over while the wait was running.
     Cancelled,
+}
+
+/// What became of a ready-wait's answer (see [`DaemonManager::mark_ready`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marked {
+    /// The daemon is `Running`.
+    Running,
+    /// A stop, or a newer start, took over first.
+    Superseded,
+    /// The sidecar exited after the probe began. Probe again, now that the
+    /// exit is known.
+    ExitedSinceProbe,
 }
 
 /// The ready-wait's verdict after one poll of the daemon port. `answered`
@@ -247,23 +265,92 @@ async fn probe_occupant(url: &str) -> PortOccupant {
     PortOccupant::Daemon { version }
 }
 
+/// Why a health check failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckFailure {
+    /// The connection did not complete in time. Something holds the port (on
+    /// loopback a connection nobody listens for is refused at once) but does
+    /// not answer: a wedged or starved daemon, or another program.
+    NoAnswer(Duration),
+    /// The connection failed: nothing listens on the port, or what listens is
+    /// not a daemon.
+    Failed(String),
+}
+
+impl std::fmt::Display for CheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAnswer(timeout) => write!(f, "no answer within {timeout:?}"),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// One health check: complete a WebSocket handshake with the daemon, then
 /// close it again.
 ///
 /// Bounded by `timeout` end to end. An unbounded check hung for good on a
 /// port that accepts the TCP connection but never completes the handshake,
 /// and the monitor it runs in stopped acting with the last state frozen.
-async fn check_health(url: &str, timeout: Duration) -> Result<(), String> {
+async fn check_health(url: &str, timeout: Duration) -> Result<(), CheckFailure> {
     let check = async {
         let (mut ws, _) = tokio_tungstenite::connect_async(url)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CheckFailure::Failed(e.to_string()))?;
         let _ = futures_util::SinkExt::close(&mut ws).await;
         Ok(())
     };
     tokio::time::timeout(timeout, check)
         .await
-        .unwrap_or_else(|_| Err(format!("no answer within {timeout:?}")))
+        .unwrap_or(Err(CheckFailure::NoAnswer(timeout)))
+}
+
+/// What the health monitor does about a failed check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterFailedCheck {
+    /// Something holds the port but did not answer in time. It may only be
+    /// slow: nothing is recorded, and the next tick checks again.
+    CheckAgain,
+    /// The daemon we started, process `pid`, is alive but refuses
+    /// connections: `Crashed`, with the reason on record, and no restart.
+    Report { pid: u32 },
+    /// The daemon is gone: restart it.
+    Restart,
+}
+
+/// What the health monitor does about a failed check. `sidecar` is the PID of
+/// the sidecar we spawned while it is still running.
+///
+/// Only a daemon that is gone is restarted. A new daemon cannot start beside
+/// one that is still there: while our sidecar lives it holds the daemon's PID
+/// file, so a new one exits "Already running", and a port that took the
+/// connection without answering is held, so a new one cannot bind it.
+/// Replacing that daemon would mean killing it, and a daemon slow to answer
+/// (a busy disk can starve it for seconds) is not killed on a timeout, just
+/// as a slow boot is not (see [`boot_wait_verdict`]). A daemon that is alive
+/// but not serving is replaced when someone asks for a restart or a retry.
+///
+/// The bound on the check made this matter. With it, a daemon that took more
+/// than 3 s to answer was "restarted": the new sidecar took the old one's
+/// place in the child slot, and the old daemon ran on with nothing left to
+/// stop it.
+const fn after_failed_check(failure: &CheckFailure, sidecar: Option<u32>) -> AfterFailedCheck {
+    match (failure, sidecar) {
+        (CheckFailure::NoAnswer(_), _) => AfterFailedCheck::CheckAgain,
+        (CheckFailure::Failed(_), Some(pid)) => AfterFailedCheck::Report { pid },
+        (CheckFailure::Failed(_), None) => AfterFailedCheck::Restart,
+    }
+}
+
+/// What the health monitor makes of a check that found the daemon gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedCheck {
+    /// A stop, or someone else's start, took over while the check ran.
+    NotOurs,
+    /// Out of restarts: nothing more is tried.
+    GaveUp,
+    /// Restart; this is restart number `n` since a daemon was last ready.
+    Restart(u32),
 }
 
 // =============================================================================
@@ -364,19 +451,22 @@ impl StartFailure {
 // =============================================================================
 
 /// The output lines of the longest boot on record, from "Starting Nanna
-/// daemon…" to "Daemon ready": 457, on 2026-09-18 on the operator's machine
-/// (204 tool-registry lines, 184 skill lines, and embedding-congestion
-/// warnings from a busy provider). The 16 boots in that week's daemon logs
-/// that reached ready printed 204 to 457. A boot with an empty data dir and a
-/// scratch config prints 270 (measured the same day).
-const LONGEST_MEASURED_BOOT_LINES: usize = 457;
+/// daemon…" to "Daemon ready", both counted: 450, on 2026-09-18 on the
+/// operator's machine (tool-registry and skill lines, and
+/// embedding-congestion warnings from a busy provider). The 14 boots in that
+/// week's daemon logs (2026-09-14..18) that reached ready printed 197 to 450.
+/// A boot with an empty data dir and a scratch config prints 270 (measured
+/// the same day). The file log and stdout share one filter, so the file
+/// counts are what the sidecar prints.
+const LONGEST_MEASURED_BOOT_LINES: usize = 450;
 
 /// How many output lines of one sidecar the boot log keeps: twice the
 /// longest boot on record. Any boot that reaches ready is then held whole,
 /// from its first line, with room for a setup with twice the tools and
-/// skills. A boot that hangs keeps logging (the 2026-09-18 hang printed 5247
+/// skills. A boot that hangs keeps logging (the 2026-09-18 hang printed 5240
 /// lines before it was restarted); the log then keeps the newest lines, which
-/// hold the current phase and any fatal error.
+/// hold the current phase and any fatal error. The same happens to a boot
+/// logged below `info`: the sidecar inherits the app's `RUST_LOG`.
 const BOOT_LOG_LINES: usize = 2 * LONGEST_MEASURED_BOOT_LINES;
 
 /// The longest line the boot log keeps whole, in bytes. The longest of the
@@ -636,12 +726,13 @@ struct SidecarEvents {
 
 impl SidecarEvents {
     async fn run(self, mut events: Receiver<CommandEvent>) {
+        let mut status = (None, None);
         while let Some(event) = events.recv().await {
             match event {
                 CommandEvent::Stdout(line) => self.relay(BootStream::Stdout, &line).await,
                 CommandEvent::Stderr(line) => self.relay(BootStream::Stderr, &line).await,
                 CommandEvent::Terminated(payload) => {
-                    self.on_exit(payload.code, payload.signal).await;
+                    status = (payload.code, payload.signal);
                     break;
                 }
                 CommandEvent::Error(err) => {
@@ -650,6 +741,11 @@ impl SidecarEvents {
                 _ => {}
             }
         }
+        // The events also end without a `Terminated` when the plugin could
+        // not wait for the process. It can no longer be watched, so it counts
+        // as gone: a next boot waits for the previous sidecar's exit (see
+        // `DaemonManager::previous_sidecar_gone`), and would wait forever.
+        self.on_exit(status.0, status.1).await;
     }
 
     /// Log one output line (info level so it is visible in production) and
@@ -754,16 +850,24 @@ pub struct DaemonManager {
     /// while its own attempt is still the current one, so a sidecar that a
     /// restart killed cannot mark the next boot crashed.
     attempt: Arc<AtomicU64>,
-    /// How many stops have been requested. A start carries the count its
-    /// caller saw when it began, and is refused once a stop has come since
-    /// (see [`Self::start`]).
+    /// Counts each stop twice: when it is requested and when it is done. A
+    /// start carries the count its caller saw when it began, and is refused
+    /// once a stop has come since (see [`Self::start`]), including one that
+    /// was still running when the count was read.
     stops: AtomicU64,
+    /// Runs stops one at a time, so each caller returns with its stop done.
+    stop_turn: Mutex<()>,
     /// The record of the most recent spawn, kept after the sidecar exits and
     /// after a stop: its boot log is what `get_boot_log` returns.
     latest_spawn: RwLock<Option<Arc<SpawnWatch>>>,
     /// Why the daemon last failed to start or to stay up. Cleared when a
     /// daemon becomes ready.
     last_failure: Arc<RwLock<Option<StartFailure>>>,
+    /// The command that runs in the bundled sidecar's place, program first:
+    /// a `/bin/sh` script standing in for the daemon, or a program that
+    /// does not exist.
+    #[cfg(test)]
+    stand_in: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl DaemonManager {
@@ -778,8 +882,11 @@ impl DaemonManager {
             starting_since: RwLock::new(None),
             attempt: Arc::new(AtomicU64::new(0)),
             stops: AtomicU64::new(0),
+            stop_turn: Mutex::new(()),
             latest_spawn: RwLock::new(None),
             last_failure: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            stand_in: std::sync::Mutex::new(None),
         }
     }
     
@@ -803,8 +910,10 @@ impl DaemonManager {
         self.starting_since.read().await.map(|since| since.elapsed())
     }
 
-    /// How many stops have been requested so far. Read it when a start is
-    /// decided on, and pass it to [`Self::start`].
+    /// The stop count: each stop counts once when requested and once when
+    /// done. Read it when a start is decided on, and pass it to
+    /// [`Self::start`]. A count read after [`Self::stop`] returned is one no
+    /// stop was running at.
     #[must_use]
     pub fn stop_epoch(&self) -> u64 {
         self.stops.load(Ordering::SeqCst)
@@ -834,14 +943,24 @@ impl DaemonManager {
         *self.restart_count.write().await = 0;
     }
 
+    /// The app attached to a daemon, so one answers, whoever started it. A
+    /// crashed state reads running again, with nothing on record, at once:
+    /// the status used to say connected and crashed together until the
+    /// health monitor's next tick, up to 30 s later. Any other state has an
+    /// owner that decides it, a boot's ready-wait or a stop.
+    pub async fn attached(&self) {
+        self.recovered(self.stop_epoch()).await;
+    }
+
     /// Start the daemon sidecar
     ///
     /// Returns `Ok` straight away when the daemon is already `Running` or
     /// `Starting`. Otherwise it waits until a daemon answers on the port, for
     /// as long as the spawned sidecar stays alive. There is no deadline: a
     /// live sidecar whose port is still closed is booting (see
-    /// [`boot_wait_verdict`]). [`Self::starting_for`] reports how long it has
-    /// been.
+    /// [`boot_wait_verdict`]). Before the spawn it also waits for the
+    /// previous sidecar to exit (see [`Self::previous_sidecar_gone`]).
+    /// [`Self::starting_for`] reports how long it has been.
     ///
     /// `since_stop` is the [`Self::stop_epoch`] the caller read when it
     /// decided to start. A stop requested after that wins: the start is
@@ -862,7 +981,7 @@ impl DaemonManager {
     /// - `"Daemon start cancelled by a stop request"` when [`Self::stop`] was
     ///   requested after `since_stop`, or while the start was stopping. The
     ///   state is then the one `stop` set.
-    pub async fn start(&self, app: &AppHandle, since_stop: u64) -> Result<(), String> {
+    pub async fn start<R: Runtime>(&self, app: &AppHandle<R>, since_stop: u64) -> Result<(), String> {
         let Some(attempt) = self.claim_start(since_stop).await? else {
             return Ok(());
         };
@@ -878,13 +997,8 @@ impl DaemonManager {
         // process holds no port and no lock, so there is nothing to kill.
         match self.wait_for_ready(attempt, &watch).await {
             BootWait::Ready => {
-                if self.mark_ready(attempt).await {
-                    info!("Daemon started successfully on {}", self.ws_url());
-                    Ok(())
-                } else {
-                    info!("Daemon start abandoned: a stop request took over");
-                    Err(START_CANCELLED.to_string())
-                }
+                info!("Daemon started successfully on {}", self.ws_url());
+                Ok(())
             }
             BootWait::Cancelled => {
                 info!("Daemon start abandoned: a stop request took over");
@@ -937,6 +1051,14 @@ impl DaemonManager {
             .expect("nothing under way")
     }
 
+    /// Open a start attempt and fail it with `failure`, as a boot that
+    /// exited does: `Crashed`, with `failure` on record.
+    #[cfg(test)]
+    pub(crate) async fn crash_for_test(&self, failure: StartFailure) {
+        let attempt = self.begin_start_for_test().await;
+        self.fail_attempt(attempt, failure).await;
+    }
+
     /// Whether `attempt` still owns a start in progress: no stop, and no
     /// newer start, has come since it began.
     async fn is_starting(&self, attempt: u64) -> bool {
@@ -972,13 +1094,34 @@ impl DaemonManager {
     /// check and cancels the spawn, or waits for the new child and stops it.
     /// A stop during the eviction used to miss the child spawned after it,
     /// and that sidecar then ran with no one to stop it.
-    async fn spawn_sidecar(
+    ///
+    /// The previous sidecar goes first. A live one in the slot is killed:
+    /// `CommandChild` does not kill on drop, so replacing it in the slot
+    /// would leave it running with nothing left to stop it. The health
+    /// monitor never restarts a daemon whose sidecar lives (see
+    /// [`after_failed_check`]). A retry does, from the `Crashed` state the
+    /// monitor reports such a daemon in, and asks for exactly this. Then the
+    /// spawn waits until the previous sidecar has exited (see
+    /// [`Self::previous_sidecar_gone`]).
+    async fn spawn_sidecar<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         attempt: u64,
     ) -> Result<Arc<SpawnWatch>, String> {
         let mut slot = self.child.write().await;
         if !self.is_starting(attempt).await {
+            info!("Daemon start abandoned before the spawn: a stop request took over");
+            return Err(START_CANCELLED.to_string());
+        }
+        if let Some(live) = slot.take_if(|sidecar| !sidecar.watch.exited.load(Ordering::SeqCst)) {
+            let pid = live.child.pid();
+            warn!("The previous sidecar (PID {pid}) is still running: killing it before the next one starts");
+            kill_sidecar_tree(pid).await;
+            if let Err(e) = live.child.kill() {
+                warn!("Failed to kill daemon process: {}", e);
+            }
+        }
+        if !self.previous_sidecar_gone(attempt).await {
             info!("Daemon start abandoned before the spawn: a stop request took over");
             return Err(START_CANCELLED.to_string());
         }
@@ -987,12 +1130,18 @@ impl DaemonManager {
         // Spawn the sidecar. A failure must not leave the state `Starting`:
         // `start` returns early on `Starting`, so every later call (the Retry
         // button, the health monitor) would report success without spawning.
-        let shell = app.shell();
+        // Nor may it leave the spawn's record waiting for an exit that no
+        // process will make: the next spawn waits for that exit.
         info!("Creating sidecar command for nanna-daemon...");
-        let sidecar = match shell.sidecar("nanna-daemon") {
+        #[cfg(test)]
+        let command = self.stand_in_command(app).map_or_else(|| app.shell().sidecar("nanna-daemon"), Ok);
+        #[cfg(not(test))]
+        let command = app.shell().sidecar("nanna-daemon");
+        let sidecar = match command {
             Ok(sidecar) => sidecar,
             Err(e) => {
                 error!("Failed to create sidecar command: {}", e);
+                watch.exited.store(true, Ordering::SeqCst);
                 let failure = StartFailure::new(
                     StartFailureKind::SidecarUnresolved,
                     format!("Could not locate the bundled nanna-daemon program: {e}"),
@@ -1012,6 +1161,7 @@ impl DaemonManager {
             Ok(spawned) => spawned,
             Err(e) => {
                 error!("Failed to spawn daemon: {}", e);
+                watch.exited.store(true, Ordering::SeqCst);
                 let failure = StartFailure::new(
                     StartFailureKind::SpawnFailed,
                     format!("Could not start nanna-daemon: {e}"),
@@ -1032,6 +1182,64 @@ impl DaemonManager {
         Ok(watch)
     }
 
+    /// The command a test set to run in the sidecar's place, if any.
+    #[cfg(test)]
+    fn stand_in_command<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> Option<tauri_plugin_shell::process::Command> {
+        let stand_in = self.stand_in.lock().expect("the stand-in lock is never poisoned").clone()?;
+        let (program, args) = stand_in.split_first()?;
+        Some(app.shell().command(program).args(args))
+    }
+
+    /// Run `argv` (program first) in the sidecar's place from now on.
+    #[cfg(test)]
+    fn replace_sidecar_with(&self, argv: &[&str]) {
+        *self.stand_in.lock().expect("the stand-in lock is never poisoned") =
+            Some(argv.iter().map(ToString::to_string).collect());
+    }
+
+    /// Wait until the most recent sidecar has exited, for as long as
+    /// `attempt` still owns the start. `false` when a stop took over first.
+    ///
+    /// A sidecar that was killed (by a stop, a restart, or the backstop in
+    /// [`Self::spawn_sidecar`]) can take a while to go. A process blocked in
+    /// disk I/O dies only once that I/O completes, which on a busy disk takes
+    /// seconds. Until then it holds the daemon's PID file, and maybe the
+    /// port, so a new daemon beside it would exit "Already running" and the
+    /// restart would fail. There is no deadline, for the reason the
+    /// ready-wait has none: nothing can start before the process is gone, and
+    /// a stop ends the wait at once.
+    async fn previous_sidecar_gone(&self, attempt: u64) -> bool {
+        let Some(previous) = self.latest_spawn.read().await.clone() else {
+            return true;
+        };
+        if previous.exited.load(Ordering::SeqCst) {
+            return true;
+        }
+        info!("Waiting for the previous sidecar to exit before the next one starts");
+        loop {
+            if previous.exited.load(Ordering::SeqCst) {
+                return true;
+            }
+            if !self.is_starting(attempt).await {
+                return false;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The PID of the sidecar we spawned, while it is still running.
+    async fn live_sidecar_pid(&self) -> Option<u32> {
+        self.child
+            .read()
+            .await
+            .as_ref()
+            .filter(|sidecar| !sidecar.watch.exited.load(Ordering::SeqCst))
+            .map(|sidecar| sidecar.child.pid())
+    }
+
     /// The event task for the sidecar `attempt` spawned.
     fn sidecar_events(&self, attempt: u64, watch: Arc<SpawnWatch>) -> SidecarEvents {
         SidecarEvents {
@@ -1045,16 +1253,29 @@ impl DaemonManager {
     }
 
     /// `attempt` reached a daemon: `Running`, with a fresh restart budget and
-    /// no failure on record. `false` when a stop took over first.
-    async fn mark_ready(&self, attempt: u64) -> bool {
+    /// no failure on record.
+    ///
+    /// `exited_before_probe` says whether `watch`'s sidecar had exited before
+    /// the probe that got the answer began. If it exited after that, the
+    /// answer may have been its last: a daemon that answered and then died
+    /// at once. Its exit, seen while the state still read `Starting`, left
+    /// the verdict to the ready-wait, and marking `Running` now would leave a
+    /// dead daemon reading `running`, with nothing on record and, before any
+    /// attach, no health monitor to restart it. The exit is flagged before
+    /// the event task reads the state, so a flag this lock does not see is an
+    /// exit that finds `Running` and is handled as one (see [`exit_effect`]).
+    async fn mark_ready(&self, attempt: u64, watch: &SpawnWatch, exited_before_probe: bool) -> Marked {
         let mut state = self.state.write().await;
         if *state != DaemonState::Starting || self.attempt.load(Ordering::SeqCst) != attempt {
-            return false;
+            return Marked::Superseded;
+        }
+        if !exited_before_probe && watch.exited.load(Ordering::SeqCst) {
+            return Marked::ExitedSinceProbe;
         }
         *self.restart_count.write().await = 0;
         *self.last_failure.write().await = None;
         *state = DaemonState::Running;
-        true
+        Marked::Running
     }
 
     /// `attempt` failed: `Crashed`, with `failure` on record. Nothing changes
@@ -1144,10 +1365,10 @@ impl DaemonManager {
     }
 
     /// Poll the daemon port until [`boot_wait_verdict`] is final: a daemon
-    /// answered, the sidecar exited with nobody answering, or a stop took
-    /// over. There is no deadline while the sidecar is alive. A slow boot is
-    /// logged at [`SLOW_START_NOTICE`], then at each doubling of the elapsed
-    /// time.
+    /// answered (and the state is now `Running`, see [`Self::mark_ready`]),
+    /// the sidecar exited with nobody answering, or a stop took over. There
+    /// is no deadline while the sidecar is alive. A slow boot is logged at
+    /// [`SLOW_START_NOTICE`], then at each doubling of the elapsed time.
     async fn wait_for_ready(&self, attempt: u64, watch: &SpawnWatch) -> BootWait {
         let url = self.ws_url();
         let mut evicted = false;
@@ -1171,10 +1392,16 @@ impl DaemonManager {
             let state = self.state_of(attempt).await;
             match boot_wait_verdict(state, exited, answered) {
                 BootWait::KeepWaiting => {}
-                BootWait::Ready if exited => {
-                    info!("Attached to an existing daemon instance on {}", url);
-                    return BootWait::Ready;
-                }
+                BootWait::Ready => match self.mark_ready(attempt, watch, exited).await {
+                    Marked::Running => {
+                        if exited {
+                            info!("Attached to an existing daemon instance on {}", url);
+                        }
+                        return BootWait::Ready;
+                    }
+                    Marked::Superseded => return BootWait::Cancelled,
+                    Marked::ExitedSinceProbe => continue,
+                },
                 verdict => return verdict,
             }
             if let Some(elapsed) = self.starting_for().await
@@ -1201,6 +1428,10 @@ impl DaemonManager {
     
     /// Stop the daemon
     ///
+    /// Returns once the stop is done. A stop requested while another runs
+    /// waits for it. A sidecar killed here may take a while to exit; the
+    /// next spawn waits for that (see [`Self::previous_sidecar_gone`]).
+    ///
     /// # Errors
     ///
     /// Never returns `Err` today: an undeliverable or ignored shutdown request
@@ -1212,9 +1443,22 @@ impl DaemonManager {
         // (see [`Self::start`]), including one that has not reached the state
         // lock yet.
         self.stops.fetch_add(1, Ordering::SeqCst);
+        let turn = self.stop_turn.lock().await;
+        self.stop_sidecar().await;
+        // Counted again now that it is done, so a start decided on while it
+        // ran is refused too. A count read after this is one no stop was
+        // running at: that is how a restart tells an init that began after
+        // its stop from one it has to wait out (see `Backend::restart`).
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        drop(turn);
+        Ok(())
+    }
+
+    /// The body of [`Self::stop`], which runs one at a time.
+    async fn stop_sidecar(&self) {
         let current_state = *self.state.read().await;
         if current_state == DaemonState::Stopped || current_state == DaemonState::Stopping {
-            return Ok(());
+            return;
         }
 
         *self.state.write().await = DaemonState::Stopping;
@@ -1257,7 +1501,6 @@ impl DaemonManager {
 
         *self.state.write().await = DaemonState::Stopped;
         info!("Daemon stopped");
-        Ok(())
     }
 
     /// Ask the daemon to stop via its control plane. Returns whether the
@@ -1284,68 +1527,83 @@ impl DaemonManager {
     }
 
     /// Start health monitoring (call once after start)
-    pub fn start_health_monitor(self: Arc<Self>, app: AppHandle) {
-        let manager = self;
-        let config = manager.config.clone();
-
+    pub fn start_health_monitor<R: Runtime>(self: Arc<Self>, app: AppHandle<R>) {
         tokio::spawn(async move {
             loop {
-                sleep(config.health_check_interval).await;
-                // A stop from here on cancels this tick's restart.
-                let since_stop = manager.stop_epoch();
-
-                // `Crashed` is watched too: a daemon the app attached to may
-                // answer again (flip back to `Running`), or a first boot that
-                // failed stays down (restart it).
-                let state = *manager.state.read().await;
-                if !matches!(state, DaemonState::Running | DaemonState::Crashed) {
-                    continue;
-                }
-
-                // Health check: try to connect, within the same ceiling a
-                // version probe gets for a connect plus a request.
-                let url = manager.ws_url();
-                match check_health(&url, PROBE_TIMEOUT).await {
-                    Ok(()) => {
-                        if state == DaemonState::Crashed {
-                            // Our sidecar is gone, but a daemon is alive and
-                            // answering.
-                            manager.recovered(since_stop).await;
-                        }
-                        debug!("Daemon health check: OK");
-                    }
-                    Err(e) => {
-                        warn!("Daemon health check failed: {}", e);
-                        let failure = StartFailure::new(
-                            StartFailureKind::HealthCheckFailed,
-                            format!("The daemon stopped answering on {url} ({e})"),
-                        );
-                        let restart_count = *manager.restart_count.read().await;
-                        if restart_count >= config.max_restarts {
-                            error!("Max daemon restarts exceeded, giving up");
-                            manager
-                                .give_up_restarts(since_stop, config.max_restarts, failure)
-                                .await;
-                            continue;
-                        }
-                        if !manager.health_check_failed(since_stop, failure).await {
-                            // A stop or someone else's start took over while
-                            // the check ran: the restart is not ours to make.
-                            continue;
-                        }
-
-                        // Try to restart
-                        *manager.restart_count.write().await = restart_count + 1;
-                        warn!("Attempting daemon restart ({}/{})", restart_count + 1, config.max_restarts);
-
-                        sleep(config.restart_delay).await;
-                        if let Err(e) = manager.start(&app, since_stop).await {
-                            error!("Daemon restart failed: {}", e);
-                        }
-                    }
-                }
+                sleep(self.config.health_check_interval).await;
+                self.health_tick(&app).await;
             }
         });
+    }
+
+    /// One health check, and what follows from it.
+    ///
+    /// `Crashed` is checked too: a daemon the app attached to may answer
+    /// again (back to `Running`), or a first boot that failed stays down
+    /// (restart it).
+    async fn health_tick<R: Runtime>(&self, app: &AppHandle<R>) {
+        // A stop from here on cancels this tick's restart.
+        let since_stop = self.stop_epoch();
+        let state = self.state().await;
+        if !matches!(state, DaemonState::Running | DaemonState::Crashed) {
+            return;
+        }
+
+        let url = self.ws_url();
+        let failure = match check_health(&url, self.config.health_check_timeout).await {
+            Ok(()) => {
+                if state == DaemonState::Crashed {
+                    // Our sidecar is gone, but a daemon is alive and
+                    // answering.
+                    self.recovered(since_stop).await;
+                }
+                debug!("Daemon health check: OK");
+                return;
+            }
+            Err(failure) => failure,
+        };
+        match after_failed_check(&failure, self.live_sidecar_pid().await) {
+            AfterFailedCheck::CheckAgain => {
+                warn!(
+                    "Daemon health check failed ({failure}): something holds {url} but did not answer in time. Checking again in {}s",
+                    self.config.health_check_interval.as_secs()
+                );
+                return;
+            }
+            AfterFailedCheck::Report { pid } => {
+                warn!(
+                    "Daemon health check failed ({failure}), but the daemon we started (PID {pid}) is still running. A new one could not start beside it, so it is not restarted; restarting the daemon from the app replaces it"
+                );
+                let record = StartFailure::new(
+                    StartFailureKind::HealthCheckFailed,
+                    format!(
+                        "The daemon stopped answering on {url} ({failure}) · its process (PID {pid}) is still running"
+                    ),
+                );
+                self.not_serving(since_stop, record).await;
+                return;
+            }
+            AfterFailedCheck::Restart => {}
+        }
+
+        warn!("Daemon health check failed: {failure}");
+        let record = StartFailure::new(
+            StartFailureKind::HealthCheckFailed,
+            format!("The daemon stopped answering on {url} ({failure})"),
+        );
+        match self.on_failed_check(since_stop, record).await {
+            // A stop or someone else's start took over while the check ran:
+            // the restart is not ours to make.
+            FailedCheck::NotOurs => {}
+            FailedCheck::GaveUp => error!("Max daemon restarts exceeded, giving up"),
+            FailedCheck::Restart(n) => {
+                warn!("Attempting daemon restart ({n}/{})", self.config.max_restarts);
+                sleep(self.config.restart_delay).await;
+                if let Err(e) = self.start(app, since_stop).await {
+                    error!("Daemon restart failed: {}", e);
+                }
+            }
+        }
     }
 
     /// Whether the health monitor's tick that began at `since_stop` still
@@ -1365,48 +1623,70 @@ impl DaemonManager {
         }
     }
 
-    /// Record a failed health check as a crash. `false`, with nothing
-    /// changed, when the state moved on while the check ran.
+    /// Record a health check that found the daemon gone as a crash, and count
+    /// the restart it calls for, or give up once the restarts are used up.
+    /// [`FailedCheck::NotOurs`], with nothing changed, when the state moved
+    /// on while the check ran.
     ///
-    /// A daemon that was already down keeps the failure on record: it says
-    /// why (a boot that exited, say), and a check that cannot connect to a
-    /// daemon that is down adds nothing to it.
-    async fn health_check_failed(&self, since_stop: u64, failure: StartFailure) -> bool {
+    /// The count is checked and raised in one step, under its lock. When it
+    /// was read before the check and written after it, a restart's budget
+    /// reset (see [`Self::reset_restarts`]) that landed in between was
+    /// undone, and the next failure gave up at once.
+    ///
+    /// The check goes on record as [`record_check`] says. Giving up is
+    /// recorded once, around the failure before it (or this check's, when
+    /// there was none): the monitor logs every tick, and the record keeps the
+    /// first time and reason.
+    async fn on_failed_check(&self, since_stop: u64, failure: StartFailure) -> FailedCheck {
         let mut state = self.state.write().await;
         if !self.monitor_owns(since_stop, *state) {
-            return false;
+            return FailedCheck::NotOurs;
         }
+        let restart = {
+            let mut restarts = self.restart_count.write().await;
+            (*restarts < self.config.max_restarts).then(|| {
+                *restarts += 1;
+                *restarts
+            })
+        };
         {
             let mut last = self.last_failure.write().await;
-            if *state == DaemonState::Running || last.is_none() {
-                *last = Some(failure);
+            if restart.is_some() {
+                record_check(&mut last, *state, failure);
+            } else if last
+                .as_ref()
+                .is_none_or(|previous| previous.kind != StartFailureKind::RestartsExhausted)
+            {
+                let previous = last.take().unwrap_or(failure);
+                *last = Some(StartFailure::restarts_exhausted(self.config.max_restarts, &previous));
             }
         }
         *state = DaemonState::Crashed;
-        true
+        drop(state);
+        restart.map_or(FailedCheck::GaveUp, FailedCheck::Restart)
     }
 
-    /// The monitor is out of restarts: record that once, around the failure
-    /// before it (or `failure`, this tick's check, when there was none). The
-    /// monitor logs every tick; the record keeps the first time and reason.
-    async fn give_up_restarts(&self, since_stop: u64, max_restarts: u32, failure: StartFailure) {
+    /// Record a health check that found the daemon we started alive but not
+    /// serving: `Crashed`, with the check on record as [`record_check`] says,
+    /// and no restart counted, since none is made. Nothing changes when the
+    /// state moved on while the check ran.
+    async fn not_serving(&self, since_stop: u64, failure: StartFailure) {
         let mut state = self.state.write().await;
         if !self.monitor_owns(since_stop, *state) {
             return;
         }
-        {
-            let mut last = self.last_failure.write().await;
-            match last.take() {
-                Some(previous) if previous.kind == StartFailureKind::RestartsExhausted => {
-                    *last = Some(previous);
-                }
-                previous => {
-                    let previous = previous.unwrap_or(failure);
-                    *last = Some(StartFailure::restarts_exhausted(max_restarts, &previous));
-                }
-            }
-        }
+        record_check(&mut *self.last_failure.write().await, *state, failure);
         *state = DaemonState::Crashed;
+    }
+}
+
+/// Put a failed health check on `last`, the failure on record, given the
+/// `state` the daemon was in. A daemon that was already down keeps its
+/// failure: that says why (a boot that exited, say), and a check that cannot
+/// connect to a daemon that is down adds nothing to it.
+fn record_check(last: &mut Option<StartFailure>, state: DaemonState, failure: StartFailure) {
+    if state == DaemonState::Running || last.is_none() {
+        *last = Some(failure);
     }
 }
 
@@ -1655,10 +1935,60 @@ mod tests {
         // A retry keeps it on show while it boots, and a daemon that answers
         // clears it.
         let retry = claimed(&manager).await;
+        let retry_watch = manager.new_spawn_watch().await;
         assert_eq!(manager.last_failure().await, Some(failure));
-        assert!(manager.mark_ready(retry).await);
+        assert_eq!(manager.mark_ready(retry, &retry_watch, false).await, Marked::Running);
         assert_eq!(manager.state().await, DaemonState::Running);
         assert_eq!(manager.last_failure().await, None);
+    }
+
+    /// The answer came from a sidecar that exited while the probe ran: it
+    /// may have been its last. Marking it `Running` left a dead daemon
+    /// reading `running`, with nothing on record and nothing to restart it.
+    #[tokio::test]
+    async fn an_answer_from_a_sidecar_that_exited_meanwhile_is_not_ready_yet() {
+        let manager = manager_on(free_port().await);
+        let attempt = claimed(&manager).await;
+        let watch = manager.new_spawn_watch().await;
+        watch.exited.store(true, Ordering::SeqCst);
+
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::ExitedSinceProbe);
+        assert_eq!(manager.state().await, DaemonState::Starting, "left to the ready-wait");
+        // A probe that began after the exit is trustworthy: the daemon that
+        // answered is one our sidecar deferred to.
+        assert_eq!(manager.mark_ready(attempt, &watch, true).await, Marked::Running);
+    }
+
+    /// The whole ready-wait: a daemon answers, and its sidecar exits during
+    /// that very probe, taking the daemon with it. The wait looks again and
+    /// reports the failed boot.
+    #[tokio::test]
+    async fn a_daemon_that_answers_and_dies_at_once_is_a_failed_boot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = manager_on(listener.local_addr().unwrap().port());
+        let attempt = claimed(&manager).await;
+        let watch = manager.new_spawn_watch().await;
+        tokio::spawn({
+            let watch = Arc::clone(&watch);
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                // Nothing answers after this connection.
+                drop(listener);
+                watch.exited.store(true, Ordering::SeqCst);
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if let Some(Ok(Message::Text(request))) = ws.next().await {
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    let reply = serde_json::json!({
+                        "id": request["id"],
+                        "result": { "status": "success", "data": { "version": env!("CARGO_PKG_VERSION") } }
+                    });
+                    let _ = ws.send(Message::Text(reply.to_string().into())).await;
+                }
+            }
+        });
+
+        assert_eq!(manager.wait_for_ready(attempt, &watch).await, BootWait::Failed);
+        assert_eq!(manager.state().await, DaemonState::Starting, "start() records the failure next");
     }
 
     /// The contract the splash reads: `snake_case` kinds, nullable exit fields.
@@ -1729,7 +2059,7 @@ mod tests {
         let manager = manager_on(serve_daemon(env!("CARGO_PKG_VERSION")).await);
         let attempt = claimed(&manager).await;
         let watch = manager.new_spawn_watch().await;
-        assert!(manager.mark_ready(attempt).await);
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
 
         manager.sidecar_events(attempt, Arc::clone(&watch)).on_exit(Some(1), None).await;
 
@@ -1743,7 +2073,7 @@ mod tests {
         let manager = manager_on(free_port().await);
         let attempt = claimed(&manager).await;
         let watch = manager.new_spawn_watch().await;
-        assert!(manager.mark_ready(attempt).await);
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
         let events = manager.sidecar_events(attempt, Arc::clone(&watch));
         events
             .relay(BootStream::Stdout, b"2026-09-18T17:30:00.000000Z  INFO nanna_core::scheduler: tick\n")
@@ -1777,6 +2107,33 @@ mod tests {
         assert_eq!(manager.last_failure().await, None);
         assert!(!new_watch.exited.load(Ordering::SeqCst));
         assert_eq!(manager.boot_log().await, Vec::new());
+    }
+
+    /// A killed sidecar blocked in disk I/O exits only once the I/O is done,
+    /// and holds the PID file until then: a daemon spawned beside it exited
+    /// "Already running". The next spawn waits for the exit, and a stop ends
+    /// that wait.
+    #[tokio::test]
+    async fn the_next_spawn_waits_for_the_previous_sidecar_to_exit() {
+        let manager = manager_on(free_port().await);
+        let killed = manager.new_spawn_watch().await;
+        let attempt = claimed(&manager).await;
+        let began = tokio::time::Instant::now();
+        let (gone, ()) = tokio::join!(manager.previous_sidecar_gone(attempt), async {
+            sleep(Duration::from_millis(150)).await;
+            killed.exited.store(true, Ordering::SeqCst);
+        });
+        assert!(gone);
+        assert!(began.elapsed() >= Duration::from_millis(150), "it waited for the exit");
+
+        manager.stop().await.unwrap();
+        let _stuck = manager.new_spawn_watch().await;
+        let attempt = claimed(&manager).await;
+        let (gone, ()) = tokio::join!(manager.previous_sidecar_gone(attempt), async {
+            sleep(Duration::from_millis(50)).await;
+            manager.stop().await.unwrap();
+        });
+        assert!(!gone, "a stop ends the wait");
     }
 
     #[tokio::test]
@@ -1918,7 +2275,8 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = check_health(&url, Duration::from_millis(300)).await;
-        assert_eq!(result, Err("no answer within 300ms".to_string()));
+        assert_eq!(result, Err(CheckFailure::NoAnswer(Duration::from_millis(300))));
+        assert_eq!(result.unwrap_err().to_string(), "no answer within 300ms");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -1927,7 +2285,31 @@ mod tests {
         let serving = serve_daemon(env!("CARGO_PKG_VERSION")).await;
         assert_eq!(check_health(&format!("ws://127.0.0.1:{serving}"), PROBE_TIMEOUT).await, Ok(()));
         let closed = free_port().await;
-        assert!(check_health(&format!("ws://127.0.0.1:{closed}"), PROBE_TIMEOUT).await.is_err());
+        assert!(matches!(
+            check_health(&format!("ws://127.0.0.1:{closed}"), PROBE_TIMEOUT).await,
+            Err(CheckFailure::Failed(_))
+        ));
+    }
+
+    /// Only a daemon that is gone is restarted. One that is there, alive but
+    /// not answering, would only make a new one fail beside it.
+    #[test]
+    fn only_a_failed_check_with_our_sidecar_gone_restarts() {
+        let refused = CheckFailure::Failed("Connection refused (os error 111)".to_string());
+        let silent = CheckFailure::NoAnswer(PROBE_TIMEOUT);
+        assert_eq!(after_failed_check(&refused, None), AfterFailedCheck::Restart);
+        assert_eq!(
+            after_failed_check(&refused, Some(7)),
+            AfterFailedCheck::Report { pid: 7 },
+            "our live sidecar holds the PID file"
+        );
+        for sidecar in [None, Some(7)] {
+            assert_eq!(
+                after_failed_check(&silent, sidecar),
+                AfterFailedCheck::CheckAgain,
+                "something holds the port, and may only be slow"
+            );
+        }
     }
 
     /// A tick whose check outlived a stop must neither overwrite the stop's
@@ -1936,12 +2318,13 @@ mod tests {
     async fn a_health_check_that_outlived_a_stop_changes_nothing() {
         let manager = manager_on(free_port().await);
         let attempt = claimed(&manager).await;
-        assert!(manager.mark_ready(attempt).await);
+        let watch = manager.new_spawn_watch().await;
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
         let tick = manager.stop_epoch();
         manager.stop().await.unwrap();
 
         let failure = StartFailure::new(StartFailureKind::HealthCheckFailed, "x".to_string());
-        assert!(!manager.health_check_failed(tick, failure).await);
+        assert_eq!(manager.on_failed_check(tick, failure).await, FailedCheck::NotOurs);
         assert_eq!(manager.state().await, DaemonState::Stopped);
         assert_eq!(manager.last_failure().await, None);
         assert!(manager.claim_start(tick).await.is_err(), "its restart is refused");
@@ -1951,17 +2334,42 @@ mod tests {
     async fn a_failed_check_is_recorded_and_an_answer_clears_it() {
         let manager = manager_on(free_port().await);
         let attempt = claimed(&manager).await;
-        assert!(manager.mark_ready(attempt).await);
+        let watch = manager.new_spawn_watch().await;
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
         let tick = manager.stop_epoch();
 
         let failure = StartFailure::new(StartFailureKind::HealthCheckFailed, "x".to_string());
-        assert!(manager.health_check_failed(tick, failure.clone()).await);
+        assert_eq!(manager.on_failed_check(tick, failure.clone()).await, FailedCheck::Restart(1));
         assert_eq!(manager.state().await, DaemonState::Crashed);
         assert_eq!(manager.last_failure().await, Some(failure));
 
         manager.recovered(tick).await;
         assert_eq!(manager.state().await, DaemonState::Running);
         assert_eq!(manager.last_failure().await, None);
+    }
+
+    /// The retry loop attached to a daemon after a boot failed. The status
+    /// read connected and crashed, with the boot's error, until the next
+    /// health check up to 30 s later.
+    #[tokio::test]
+    async fn an_attach_clears_a_crash_at_once() {
+        let manager = manager_on(free_port().await);
+        let exit = SidecarExit { code: Some(1), signal: None, reason: None };
+        manager
+            .crash_for_test(StartFailure::from_exit(StartFailureKind::ExitedDuringBoot, &exit))
+            .await;
+
+        manager.attached().await;
+        assert_eq!(manager.state().await, DaemonState::Running);
+        assert_eq!(manager.last_failure().await, None);
+
+        // A stop's state is the stop's, and a boot's is its ready-wait's.
+        manager.stop().await.unwrap();
+        manager.attached().await;
+        assert_eq!(manager.state().await, DaemonState::Stopped);
+        let attempt = claimed(&manager).await;
+        manager.attached().await;
+        assert!(manager.is_starting(attempt).await);
     }
 
     /// A boot that failed stays explained while the monitor retries it.
@@ -1978,7 +2386,11 @@ mod tests {
         manager.fail_attempt(attempt, boot.clone()).await;
 
         let check = StartFailure::new(StartFailureKind::HealthCheckFailed, "x".to_string());
-        assert!(manager.health_check_failed(manager.stop_epoch(), check).await, "still a restart");
+        assert_eq!(
+            manager.on_failed_check(manager.stop_epoch(), check).await,
+            FailedCheck::Restart(1),
+            "still a restart"
+        );
         assert_eq!(manager.last_failure().await, Some(boot));
     }
 
@@ -1991,10 +2403,11 @@ mod tests {
             "Could not start nanna-daemon: No such file or directory (os error 2)".to_string(),
         );
         manager.fail_attempt(attempt, spawn_failed).await;
+        *manager.restart_count.write().await = manager.config.max_restarts;
         let tick = manager.stop_epoch();
         let check = || StartFailure::new(StartFailureKind::HealthCheckFailed, "check".to_string());
 
-        manager.give_up_restarts(tick, 3, check()).await;
+        assert_eq!(manager.on_failed_check(tick, check()).await, FailedCheck::GaveUp);
         let gave_up = manager.last_failure().await.expect("recorded");
         assert_eq!(gave_up.kind, StartFailureKind::RestartsExhausted);
         assert_eq!(
@@ -2002,7 +2415,284 @@ mod tests {
             "Stopped restarting the daemon after 3 failed restarts · Could not start nanna-daemon: No such file or directory (os error 2)"
         );
 
-        manager.give_up_restarts(tick, 3, check()).await;
+        assert_eq!(manager.on_failed_check(tick, check()).await, FailedCheck::GaveUp);
         assert_eq!(manager.last_failure().await, Some(gave_up), "the first record stays");
+    }
+
+    /// A restart resets the budget while a tick is between its check and
+    /// its count. The count used to be read before and written after, so
+    /// the stale count came back and the next failure gave up at once.
+    #[tokio::test]
+    async fn a_budget_reset_is_never_undone_by_a_tick() {
+        let manager = manager_on(free_port().await);
+        let attempt = claimed(&manager).await;
+        let watch = manager.new_spawn_watch().await;
+        assert_eq!(manager.mark_ready(attempt, &watch, false).await, Marked::Running);
+        *manager.restart_count.write().await = manager.config.max_restarts - 1;
+        let check = || StartFailure::new(StartFailureKind::HealthCheckFailed, "check".to_string());
+
+        manager.reset_restarts().await;
+        assert_eq!(
+            manager.on_failed_check(manager.stop_epoch(), check()).await,
+            FailedCheck::Restart(1),
+            "counted from the reset"
+        );
+    }
+}
+
+/// The sidecar lifecycle with a real process in the sidecar's place, spawned
+/// through the shell plugin of a mock app: what `start` and the health
+/// monitor do around a spawn, which the tests above drive in pieces.
+#[cfg(all(test, unix))]
+mod spawned {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicU8;
+    use tauri::test::{MockRuntime, mock_builder, mock_context, noop_assets};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// What a sidecar printed when another daemon held the PID file
+    /// (captured 2026-09-18 from a real second daemon on one data dir).
+    const ALREADY_RUNNING: &str = "\
+printf '%s\\n' '2026-09-18T17:21:44.208739Z ERROR nanna_daemon::server: Another daemon instance is already running (PID: 298915)'
+printf '%s\\n' '2026-09-18T17:21:44.209179Z ERROR nanna_daemon: Error: Already running'
+exit 1";
+
+    /// A daemon whose port stays closed: a boot, or a daemon, that never
+    /// answers. Bounded, so a failed test leaves nothing running for long.
+    const HANGS: &str = "exec sleep 60";
+
+    fn mock_app() -> tauri::App<MockRuntime> {
+        mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(mock_context(noop_assets()))
+            .expect("the mock app builds")
+    }
+
+    /// What the test's daemon port does with a connection.
+    const SERVE: u8 = 0;
+    const SILENT: u8 = 1;
+    const DROP: u8 = 2;
+
+    /// A daemon port whose behaviour a test switches: `SERVE` answers like a
+    /// daemon of this version, `SILENT` holds the connection and never
+    /// answers, `DROP` closes it at once, so every probe finds nobody.
+    struct Port {
+        number: u16,
+        mode: Arc<AtomicU8>,
+    }
+
+    impl Port {
+        async fn open(mode: u8) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let number = listener.local_addr().unwrap().port();
+            let mode = Arc::new(AtomicU8::new(mode));
+            let serving = Arc::clone(&mode);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    match serving.load(Ordering::SeqCst) {
+                        SERVE => {
+                            tokio::spawn(async move {
+                                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                                    return;
+                                };
+                                while let Some(Ok(Message::Text(request))) = ws.next().await {
+                                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                                    let reply = serde_json::json!({
+                                        "id": request["id"],
+                                        "result": {
+                                            "status": "success",
+                                            "data": { "version": env!("CARGO_PKG_VERSION") }
+                                        }
+                                    });
+                                    let _ = ws.send(Message::Text(reply.to_string().into())).await;
+                                }
+                            });
+                        }
+                        SILENT => {
+                            tokio::spawn(async move {
+                                let _stream = stream;
+                                std::future::pending::<()>().await;
+                            });
+                        }
+                        _ => drop(stream),
+                    }
+                }
+            });
+            Self { number, mode }
+        }
+
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, Ordering::SeqCst);
+        }
+    }
+
+    /// A manager on `port` that runs `script` with `/bin/sh` in the
+    /// sidecar's place. A script runs as `sh -c` rather than from a file:
+    /// executing a file a parallel test has just written can fail with
+    /// "Text file busy".
+    fn manager_running(script: &str, port: &Port) -> DaemonManager {
+        let manager = DaemonManager::new(DaemonManagerConfig {
+            port: port.number,
+            restart_delay: Duration::from_millis(10),
+            health_check_timeout: Duration::from_millis(300),
+            ..DaemonManagerConfig::default()
+        });
+        manager.replace_sidecar_with(&["/bin/sh", "-c", script, "nanna-daemon"]);
+        manager
+    }
+
+    /// The record of the most recent spawn.
+    async fn latest(manager: &DaemonManager) -> Arc<SpawnWatch> {
+        manager.latest_spawn.read().await.clone().expect("a spawn happened")
+    }
+
+    /// Stop the manager and wait for its sidecar's exit, so no test leaves
+    /// a process behind.
+    async fn stop_and_reap(manager: &DaemonManager) {
+        let watch = latest(manager).await;
+        manager.stop().await.unwrap();
+        assert!(wait_for_terminated(&watch, Duration::from_secs(5)).await, "the sidecar exited");
+    }
+
+    /// `start` records a boot's exit with the daemon's own reason, and the
+    /// sidecar ran with `NO_COLOR`. Then a spawn that fails is recorded, and
+    /// starts a log of its own.
+    #[tokio::test]
+    async fn start_records_why_a_boot_failed_and_each_spawn_starts_a_new_log() {
+        let app = mock_app();
+        let port = Port::open(DROP).await;
+        let script = format!("echo \"NO_COLOR=$NO_COLOR\"\n{ALREADY_RUNNING}");
+        let manager = manager_running(&script, &port);
+
+        let result = manager.start(app.handle(), manager.stop_epoch()).await;
+        assert_eq!(result, Err("Daemon exited during startup".to_string()));
+        assert_eq!(manager.state().await, DaemonState::Crashed);
+        let failure = manager.last_failure().await.expect("the exit is recorded");
+        assert_eq!(failure.kind, StartFailureKind::ExitedDuringBoot);
+        assert_eq!(failure.message, "Error: Already running");
+        assert_eq!((failure.exit_code, failure.signal), (Some(1), None));
+        let log = manager.boot_log().await;
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0], BootLine { stream: BootStream::Stdout, line: "NO_COLOR=1".to_string() });
+
+        manager.replace_sidecar_with(&["/nonexistent/nanna-daemon"]);
+        let result = manager.start(app.handle(), manager.stop_epoch()).await;
+        assert!(result.is_err_and(|e| e.starts_with("Failed to spawn daemon: ")));
+        assert_eq!(manager.state().await, DaemonState::Crashed);
+        let failure = manager.last_failure().await.expect("the spawn failure is recorded");
+        assert_eq!(failure.kind, StartFailureKind::SpawnFailed);
+        assert!(failure.message.starts_with("Could not start nanna-daemon: "));
+        assert_eq!(manager.boot_log().await, Vec::new(), "the failed spawn has a log of its own");
+
+        // Its record is not left waiting for an exit no process will make.
+        manager.replace_sidecar_with(&["/bin/sh", "-c", ALREADY_RUNNING, "nanna-daemon"]);
+        let next = tokio::time::timeout(PROBE_TIMEOUT * 2, manager.start(app.handle(), manager.stop_epoch()));
+        assert!(next.await.expect("the next spawn does not wait").is_err());
+    }
+
+    /// The blocking finding of the splash review: a daemon we started that
+    /// stops answering (wedged, or starved by a busy disk) is never
+    /// restarted by the monitor. It used to be: the new sidecar took its
+    /// slot, exited "Already running", and the old daemon ran on with nothing
+    /// left to stop it.
+    #[tokio::test]
+    async fn the_health_monitor_never_replaces_our_live_daemon() {
+        let app = mock_app();
+        let port = Port::open(SERVE).await;
+        let manager = manager_running(HANGS, &port);
+        manager.start(app.handle(), manager.stop_epoch()).await.unwrap();
+        let pid = manager.live_sidecar_pid().await.expect("the sidecar runs");
+
+        // No answer in time: it may only be slow. Nothing changes.
+        port.set(SILENT);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(manager.state().await, DaemonState::Running);
+        assert_eq!(manager.last_failure().await, None);
+
+        // Refused: it is not serving, and the status says so.
+        port.set(DROP);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(manager.state().await, DaemonState::Crashed);
+        let failure = manager.last_failure().await.expect("recorded");
+        assert_eq!(failure.kind, StartFailureKind::HealthCheckFailed);
+        assert!(
+            failure.message.ends_with(&format!(" · its process (PID {pid}) is still running")),
+            "{}",
+            failure.message
+        );
+        assert_eq!(manager.live_sidecar_pid().await, Some(pid), "the same daemon, still ours");
+        assert_eq!(*manager.restart_count.read().await, 0, "no restart was made");
+
+        // It answers again.
+        port.set(SERVE);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(manager.state().await, DaemonState::Running);
+        assert_eq!(manager.last_failure().await, None);
+
+        port.set(DROP);
+        stop_and_reap(&manager).await;
+    }
+
+    /// A retry of a daemon the monitor reported not serving: the live
+    /// sidecar in the slot is killed, and has exited, before the next one
+    /// starts.
+    #[tokio::test]
+    async fn a_new_spawn_never_leaves_a_live_sidecar_behind() {
+        let app = mock_app();
+        let port = Port::open(SERVE).await;
+        let manager = manager_running(HANGS, &port);
+        manager.start(app.handle(), manager.stop_epoch()).await.unwrap();
+        let first = latest(&manager).await;
+        let first_pid = manager.live_sidecar_pid().await.expect("the sidecar runs");
+
+        port.set(DROP);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(manager.state().await, DaemonState::Crashed, "reported, with our sidecar alive");
+        port.set(SERVE);
+        manager.start(app.handle(), manager.stop_epoch()).await.unwrap();
+
+        assert!(first.exited.load(Ordering::SeqCst), "the first sidecar exited before the spawn");
+        let exit = first.exit.lock().await.clone().expect("its exit is recorded");
+        assert_eq!(exit.signal, Some(9), "killed");
+        let second_pid = manager.live_sidecar_pid().await.expect("the new sidecar runs");
+        assert_ne!(second_pid, first_pid);
+
+        // Nothing to take a shutdown request, so the stop kills at once.
+        port.set(DROP);
+        stop_and_reap(&manager).await;
+    }
+
+    /// The monitor's call site: a daemon that is gone (nothing answers, and
+    /// our sidecar is not running) is restarted, and the restart's outcome
+    /// is what the status then reports.
+    #[tokio::test]
+    async fn the_health_monitor_restarts_a_daemon_that_is_gone() {
+        let app = mock_app();
+        let port = Port::open(SERVE).await;
+        let manager = manager_running(ALREADY_RUNNING, &port);
+        // Our sidecar deferred to the daemon already serving the port.
+        manager.start(app.handle(), manager.stop_epoch()).await.unwrap();
+        assert!(wait_for_terminated(&*latest(&manager).await, Duration::from_secs(5)).await);
+        // The exit handler probes the port once more after the exit is
+        // flagged. That probe is over within its timeout, and must meet the
+        // daemon still serving.
+        sleep(PROBE_TIMEOUT).await;
+        assert_eq!(manager.state().await, DaemonState::Running);
+
+        // A daemon that is there but silent is not restarted.
+        port.set(SILENT);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(manager.state().await, DaemonState::Running);
+        assert_eq!(*manager.restart_count.read().await, 0);
+
+        // That daemon is gone.
+        port.set(DROP);
+        manager.health_tick(app.handle()).await;
+        assert_eq!(*manager.restart_count.read().await, 1);
+        assert_eq!(manager.state().await, DaemonState::Crashed);
+        let failure = manager.last_failure().await.expect("recorded");
+        assert_eq!(failure.kind, StartFailureKind::ExitedDuringBoot, "the restart ran and failed");
+        assert_eq!(failure.message, "Error: Already running");
     }
 }

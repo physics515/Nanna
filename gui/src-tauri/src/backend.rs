@@ -56,28 +56,36 @@ pub struct BackendStatus {
     pub last_error: Option<StartFailure>,
 }
 
-/// Admits one `init` at a time. The flag lives in a watch channel so a
-/// waiter (a second init, a restart) wakes when the running init ends,
-/// instead of polling for it.
+/// Admits one `init` at a time. It holds the stop count the running init
+/// was decided on under (see [`DaemonManager::start`]), `None` while no init
+/// runs. That lives in a watch channel so a waiter (a second init, a
+/// restart) wakes when the running init ends, instead of polling for it.
 struct InitGate {
-    running: watch::Sender<bool>,
+    holder: watch::Sender<Option<u64>>,
 }
 
 impl InitGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            running: watch::Sender::new(false),
+            holder: watch::Sender::new(None),
         })
     }
 
     fn in_progress(&self) -> bool {
-        *self.running.borrow()
+        self.holder.borrow().is_some()
     }
 
-    /// Claim the gate, unless an init already holds it.
-    fn try_claim(self: &Arc<Self>) -> Option<InitClaim> {
-        self.running
-            .send_if_modified(|running| !std::mem::replace(running, true))
+    /// Claim the gate for an init decided on under stop count `since_stop`,
+    /// unless an init already holds it.
+    fn try_claim(self: &Arc<Self>, since_stop: u64) -> Option<InitClaim> {
+        self.holder
+            .send_if_modified(|holder| {
+                let open = holder.is_none();
+                if open {
+                    *holder = Some(since_stop);
+                }
+                open
+            })
             .then(|| InitClaim {
                 gate: Arc::clone(self),
             })
@@ -85,9 +93,20 @@ impl InitGate {
 
     /// Wait until no init holds the gate.
     async fn finished(&self) {
-        let mut running = self.running.subscribe();
+        let mut holder = self.holder.subscribe();
         // Errs only once the sender is gone, and the gate owns it.
-        let _ = running.wait_for(|running| !*running).await;
+        let _ = holder.wait_for(Option::is_none).await;
+    }
+
+    /// Wait until no init decided on before stop count `stop` holds the
+    /// gate: it is open, or the init holding it was decided on at `stop` or
+    /// later.
+    async fn settled_since(&self, stop: u64) {
+        let mut holder = self.holder.subscribe();
+        // Errs only once the sender is gone, and the gate owns it.
+        let _ = holder
+            .wait_for(|holder| holder.is_none_or(|since_stop| since_stop >= stop))
+            .await;
     }
 }
 
@@ -99,7 +118,7 @@ struct InitClaim {
 
 impl Drop for InitClaim {
     fn drop(&mut self) {
-        self.gate.running.send_replace(false);
+        self.gate.holder.send_replace(None);
     }
 }
 
@@ -135,8 +154,9 @@ pub struct Backend {
     restarts: RestartQueue,
     /// Ensures the single DaemonEvent→Tauri forwarding task starts exactly once.
     forwarding_started: Arc<AtomicBool>,
-    /// Ensures the health monitor is armed exactly once.
-    health_monitor_armed: AtomicBool,
+    /// Ensures the attach watch (and with it the health monitor) is armed
+    /// exactly once.
+    attach_watch_armed: AtomicBool,
 }
 
 impl Backend {
@@ -170,7 +190,7 @@ impl Backend {
             init_gate: InitGate::new(),
             restarts: RestartQueue::default(),
             forwarding_started: Arc::new(AtomicBool::new(false)),
-            health_monitor_armed: AtomicBool::new(false),
+            attach_watch_armed: AtomicBool::new(false),
         }
     }
 
@@ -209,7 +229,7 @@ impl Backend {
         let since_stop = self.daemon_manager.stop_epoch();
         // Serialize concurrent init attempts. A second caller waits for the
         // first and reports what it achieved; it starts nothing itself.
-        let Some(claim) = self.init_gate.try_claim() else {
+        let Some(claim) = self.init_gate.try_claim(since_stop) else {
             info!("Backend initialization already in progress, waiting...");
             self.init_gate.finished().await;
             return if self.daemon_client.is_connected().await {
@@ -222,9 +242,9 @@ impl Backend {
     }
 
     /// Restart the daemon: stop the client's retries and the sidecar (a live
-    /// but hung boot included), wait for any init in flight to unwind, then
-    /// begin a fresh init in the background and return. Progress shows in
-    /// [`Self::status`].
+    /// but hung boot included), wait for an init in flight from before the
+    /// stop to unwind, then begin a fresh init in the background and return.
+    /// Progress shows in [`Self::status`].
     ///
     /// `init` cannot do this. Behind a hung boot it queues for as long as the
     /// boot lasts, which has no deadline, and a start finds the daemon
@@ -248,7 +268,7 @@ impl Backend {
     /// Everything a restart does before its init. Returns the claim on that
     /// init and the stop count it starts under, or `None` when a fresh boot
     /// is already under way: this restart joined one that ran after it was
-    /// requested, or an init that began after its stop holds the gate.
+    /// requested, or an init decided on after its stop holds the gate.
     ///
     /// [`BackendStatus::init_in_progress`] stays true from the request until
     /// the new init ends, so the window never reads "stopped on request"
@@ -273,13 +293,20 @@ impl Backend {
             warn!("Error stopping daemon: {e}");
         }
         self.daemon_manager.reset_restarts().await;
-        // That init now unwinds in bounded time: its ready-wait sees the stop
-        // on its next poll (a probe is at most 3 s), and an eviction or a
-        // connect in progress has its own timeout. Waiting for it is what
-        // keeps it from absorbing this restart.
-        self.init_gate.finished().await;
+        // Read once the stop is done: no stop was running at this count.
         let since_stop = self.daemon_manager.stop_epoch();
-        let claim = self.init_gate.try_claim();
+        // An init decided on before that unwinds in bounded time: its start
+        // is refused, or each wait in its boot sees the stop on its next poll
+        // (a probe is at most 3 s), and an eviction or a connect in progress
+        // has its own timeout. Waiting for it keeps it from absorbing this
+        // restart. An init decided on since is the fresh boot a restart asks
+        // for. Its boot has no deadline, so waiting for it could hold up every
+        // later restart for as long as it runs; this one joins it instead.
+        self.init_gate.settled_since(since_stop).await;
+        // The count read above, not a fresh one: a stop that comes after it
+        // (a quit, an update) must cancel this restart's boot, not be undone
+        // by it.
+        let claim = self.init_gate.try_claim(since_stop);
         self.restarts.done.fetch_add(1, Ordering::SeqCst);
         if claim.is_none() {
             info!("An init that began after the restart's stop is already starting the daemon");
@@ -298,7 +325,7 @@ impl Backend {
         // connect: a connection the retry loop makes later must find them
         // already in place.
         self.start_event_forwarding(app.clone());
-        self.arm_health_monitor(app.clone());
+        self.arm_attach_watch(app.clone());
 
         // Start the daemon sidecar. A failed start still goes on to the
         // connect below. A daemon may be answering anyway: our sidecar may
@@ -332,25 +359,46 @@ impl Backend {
         result
     }
 
-    /// Start the health monitor on the client's first connection, whichever
-    /// path makes it: this `init`, or the retry loop minutes later.
+    /// Watch the client's connections, whichever path makes them: an
+    /// `init`, or the retry loop minutes later. Armed once, since every
+    /// repeated `init` used to spawn another health monitor.
     ///
-    /// The monitor used to start only when `init` itself connected. A daemon
-    /// the retry loop attached was then never health-checked, and a sidecar
-    /// that died after that was never restarted. It is armed only once, since
-    /// every repeated `init` used to spawn another monitor.
-    fn arm_health_monitor(&self, app: AppHandle) {
-        if self.health_monitor_armed.swap(true, Ordering::SeqCst) {
+    /// The first connection starts the health monitor. It used to start only
+    /// when `init` itself connected. A daemon the retry loop attached was then
+    /// never health-checked, and a sidecar that died after that was never
+    /// restarted.
+    fn arm_attach_watch(&self, app: AppHandle) {
+        if self.attach_watch_armed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.watch_attaches(move |manager| {
+            info!("First daemon connection: starting the health monitor");
+            Arc::clone(manager).start_health_monitor(app);
+        });
+    }
+
+    /// Tell the daemon manager of each connection the client makes (see
+    /// [`DaemonManager::attached`]), and run `on_first` at the first.
+    ///
+    /// A connection that is already gone again when this runs is not told:
+    /// its daemon may be the one whose exit was just recorded.
+    fn watch_attaches(&self, on_first: impl FnOnce(&Arc<DaemonManager>) + Send + 'static) {
         let manager = Arc::clone(&self.daemon_manager);
-        let mut attached = self.daemon_client.subscribe_attached();
+        let client = Arc::clone(&self.daemon_client);
+        let mut attached = client.subscribe_attached();
         tokio::spawn(async move {
+            let mut on_first = Some(on_first);
+            let mut seen = 0;
             // Errs only once the client is gone, and then there is nothing
-            // left to monitor.
-            if attached.wait_for(|count| *count > 0).await.is_ok() {
-                info!("First daemon connection: starting the health monitor");
-                manager.start_health_monitor(app);
+            // left to watch.
+            while let Ok(count) = attached.wait_for(|count| *count > seen).await.map(|count| *count) {
+                seen = count;
+                if client.is_connected().await {
+                    manager.attached().await;
+                }
+                if let Some(on_first) = on_first.take() {
+                    on_first(&manager);
+                }
             }
         });
     }
@@ -879,9 +927,9 @@ mod tests {
     #[tokio::test]
     async fn the_init_gate_admits_one_and_wakes_waiters_when_it_opens() {
         let gate = InitGate::new();
-        let claim = gate.try_claim().expect("the gate is open");
+        let claim = gate.try_claim(0).expect("the gate is open");
         assert!(gate.in_progress());
-        assert!(gate.try_claim().is_none(), "one init at a time");
+        assert!(gate.try_claim(0).is_none(), "one init at a time");
 
         let waiter = tokio::spawn({
             let gate = Arc::clone(&gate);
@@ -895,7 +943,7 @@ mod tests {
             .expect("the waiter wakes when the init ends")
             .unwrap();
         assert!(!gate.in_progress());
-        assert!(gate.try_claim().is_some());
+        assert!(gate.try_claim(0).is_some());
     }
 
     /// The race that absorbed a Retry: a stop, then an init that landed
@@ -910,7 +958,10 @@ mod tests {
 
         // An init in flight whose boot is under way (a hung one, say). Like
         // the real one, it unwinds once a stop cancels its boot.
-        let in_flight = backend.init_gate.try_claim().expect("the gate is open");
+        let in_flight = backend
+            .init_gate
+            .try_claim(backend.daemon_manager.stop_epoch())
+            .expect("the gate is open");
         backend.daemon_manager.begin_start_for_test().await;
         let unwound = Arc::new(AtomicBool::new(false));
         tokio::spawn({
@@ -963,7 +1014,10 @@ mod tests {
     async fn a_restart_requested_during_another_joins_it() {
         let backend = offline_backend().await;
         // An init in flight holds both restarts up, so they overlap.
-        let in_flight = backend.init_gate.try_claim().expect("the gate is open");
+        let in_flight = backend
+            .init_gate
+            .try_claim(backend.daemon_manager.stop_epoch())
+            .expect("the gate is open");
         let restart = || {
             let backend = Arc::clone(&backend);
             tokio::spawn(async move { backend.prepare_restart().await.map(|(claim, _)| claim) })
@@ -979,6 +1033,140 @@ mod tests {
         assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
     }
 
+    #[tokio::test]
+    async fn the_gate_settles_for_an_init_decided_on_since_a_stop() {
+        let gate = InitGate::new();
+        let claim = gate.try_claim(4).expect("the gate is open");
+        tokio::time::timeout(Duration::from_secs(1), gate.settled_since(4))
+            .await
+            .expect("an init decided on at that count is not waited for");
+
+        let waiter = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.settled_since(5).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "an init decided on before the count is");
+        drop(claim);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter wakes when that init ends")
+            .unwrap();
+    }
+
+    /// An init decided on after the restart's stop was done (`init_backend`
+    /// from the window, say) is the fresh boot the restart asks for. The
+    /// restart used to wait for any init, and that boot has no deadline: the
+    /// restart, and every one queued behind it, hung for as long as it ran.
+    #[tokio::test]
+    async fn a_restart_joins_an_init_decided_on_after_its_stop() {
+        let backend = offline_backend().await;
+        // A stop counts twice, when requested and when done.
+        let after_the_stop = backend.daemon_manager.stop_epoch() + 2;
+        let _fresh = backend.init_gate.try_claim(after_the_stop).expect("the gate is open");
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), backend.prepare_restart())
+            .await
+            .expect("the restart does not wait for that init");
+        assert!(joined.is_none(), "it joins that init");
+        assert!(backend.status().await.init_in_progress);
+    }
+
+    /// An init decided on while the restart's stop ran has its start
+    /// refused. Joining it would leave nothing running and nothing retrying,
+    /// so the restart waits it out and claims the next init itself.
+    #[tokio::test]
+    async fn a_restart_waits_out_an_init_decided_on_while_its_stop_ran() {
+        let backend = offline_backend().await;
+        let during_the_stop = backend.daemon_manager.stop_epoch() + 1;
+        let refused = backend.init_gate.try_claim(during_the_stop).expect("the gate is open");
+        let unwound = Arc::new(AtomicBool::new(false));
+        tokio::spawn({
+            let unwound = Arc::clone(&unwound);
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                unwound.store(true, Ordering::SeqCst);
+                drop(refused);
+            }
+        });
+
+        let (_claim, since_stop) = backend.prepare_restart().await.expect("the restart claims the next init");
+        assert!(unwound.load(Ordering::SeqCst));
+        assert_eq!(since_stop, during_the_stop + 1);
+    }
+
+    /// Serve a daemon's handshake on a free port and hold each connection
+    /// open until the client closes it. Returns the port.
+    async fn serve_handshakes() -> u16 {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+        port
+    }
+
+    /// Wait until the daemon manager reads `state`.
+    async fn until_state(backend: &Backend, state: DaemonState) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.daemon_manager.state().await != state {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the daemon manager never read {state:?}"));
+    }
+
+    /// A connection by any path clears a crash at once: the status used to
+    /// read connected and crashed together, with the boot's error, until the
+    /// health monitor's next tick. The first connection alone starts the
+    /// monitor.
+    #[tokio::test]
+    async fn every_attach_clears_a_crash_and_the_first_starts_the_monitor() {
+        use crate::daemon_manager::StartFailureKind;
+
+        let backend = Arc::new(Backend::with_manager_config(DaemonManagerConfig {
+            port: serve_handshakes().await,
+            ..DaemonManagerConfig::default()
+        }));
+        let crash = || StartFailure {
+            kind: StartFailureKind::ExitedDuringBoot,
+            message: "Error: Already running".to_string(),
+            exit_code: Some(1),
+            signal: None,
+            at_ms: 0,
+        };
+        let firsts = Arc::new(AtomicUsize::new(0));
+        backend.watch_attaches({
+            let firsts = Arc::clone(&firsts);
+            move |_| {
+                firsts.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        backend.daemon_manager.crash_for_test(crash()).await;
+        backend.daemon_client.connect().await.unwrap();
+        until_state(&backend, DaemonState::Running).await;
+        assert_eq!(backend.status().await.last_error, None);
+
+        backend.daemon_client.disconnect();
+        while backend.daemon_client.is_connected().await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        backend.daemon_manager.stop().await.unwrap();
+        backend.daemon_manager.crash_for_test(crash()).await;
+        backend.daemon_client.connect().await.unwrap();
+        until_state(&backend, DaemonState::Running).await;
+        assert_eq!(firsts.load(Ordering::SeqCst), 1);
+    }
+
     /// The status fields the splash reads, by the names it reads.
     #[tokio::test]
     async fn the_status_reports_an_init_in_progress_and_the_last_error() {
@@ -988,7 +1176,7 @@ mod tests {
         assert_eq!(status["init_in_progress"], false);
         assert_eq!(status["last_error"], Value::Null);
 
-        let _claim = backend.init_gate.try_claim().expect("the gate is open");
+        let _claim = backend.init_gate.try_claim(0).expect("the gate is open");
         let status = serde_json::to_value(backend.status().await).unwrap();
         assert_eq!(status["init_in_progress"], true);
     }

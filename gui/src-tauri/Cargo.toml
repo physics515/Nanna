@@ -91,3 +91,6 @@ e2e-webdriver = ["dep:tauri-plugin-webdriver"]
 
 [dev-dependencies]
 tempfile = "3"
+# `tauri::test`: a mock app, so unit tests can run the sidecar lifecycle
+# (daemon_manager.rs) against a stand-in process through the real shell plugin.
+tauri = { workspace = true, features = ["test"] }
