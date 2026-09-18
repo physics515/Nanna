@@ -231,6 +231,53 @@ pub(crate) mod test_ollama {
         (format!("http://{addr}"), seen)
     }
 
+    /// Serve `/api/chat` on an ephemeral port with no authentication, each
+    /// model answering the reply `answers` pairs with it — an empty reply
+    /// included, the shape of a runner that stops at once — and recording
+    /// every request. A model not listed, and every other path, gets `404`.
+    pub async fn spawn_answering(
+        answers: &'static [(&'static str, &'static str)],
+    ) -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_request(&mut stream).await;
+                let answer = answers
+                    .iter()
+                    .find(|(model, _)| request.model.as_deref() == Some(*model))
+                    .map(|(_, reply)| *reply)
+                    .filter(|_| request.path == "/api/chat");
+                let (status, body) = answer.map_or_else(
+                    || ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+                    |reply| {
+                        let body = serde_json::json!({
+                            "message": { "role": "assistant", "content": reply },
+                            "done": true,
+                            "done_reason": "stop",
+                        });
+                        ("200 OK", body.to_string())
+                    },
+                );
+                record.lock().expect("record lock").push(request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
     /// Read one whole request — head, then as much body as it declares.
     async fn read_request(stream: &mut tokio::net::TcpStream) -> SeenRequest {
         let mut bytes = Vec::new();

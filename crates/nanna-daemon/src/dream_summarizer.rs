@@ -121,10 +121,11 @@ pub async fn summarizer_context_window_tokens(router: &LlmRouter, models: &[Stri
 }
 
 /// Build the `summarize_fn` a dream cycle calls, walking `models` in order and
-/// returning the first success.
+/// returning the first answer that has text.
 ///
 /// Failure of one model is an *expected* operational condition (down,
-/// rate-limited, out of credit), so it is logged and the walk continues; only
+/// rate-limited, out of credit, or answering with no text), so it is logged
+/// and the walk continues; only
 /// exhausting every candidate is an error, and that error names the last real
 /// failure rather than a generic message.
 ///
@@ -178,6 +179,27 @@ pub fn summarize_with_failover(
                         .with_model(model)
                         .with_message(nanna_llm::Message::user(&prompt));
                     match router.complete(model, request).await {
+                        // No text is a failed call, not a summary: a runner
+                        // stuck on a stop token and a reasoning model that
+                        // spent its budget thinking both answer `""`, and a
+                        // consolidation that took it would store an empty
+                        // memory and delete the cluster it replaces. It is
+                        // final for this model, like any non-congestion
+                        // failure, so the next model on the list is asked.
+                        //
+                        // Emptiness is the only content test here. The
+                        // in-loop plausibility floor (`plausible_summary`:
+                        // 64 chars, 0.1% of the source) does not transfer —
+                        // an `Essence` fold asks for "one short line", which
+                        // is legitimately shorter, and each memory path
+                        // already guards its own result (enrichment must
+                        // contain the original).
+                        Ok(summary) if summary.trim().is_empty() => {
+                            tracing::warn!(
+                                "Dream summarization model {model} answered with no text"
+                            );
+                            last_error = format!("{model}: answered with no text");
+                        }
                         Ok(summary) => {
                             if round > 0 {
                                 tracing::info!(
@@ -317,6 +339,79 @@ mod tests {
         llm.summarization_priority = v(&["ollama/small:1b"]);
         assert_eq!(for_agent_service(&service), v(&["ollama/small:1b"]));
         assert_eq!(for_llm_config(&llm), v(&["ollama/small:1b"]));
+    }
+
+    /// The `/api/chat` models the fake server was asked for, in order.
+    fn asked(
+        seen: &std::sync::Mutex<Vec<crate::embedding_reload::test_ollama::SeenRequest>>,
+    ) -> Vec<String> {
+        seen.lock()
+            .expect("record lock")
+            .iter()
+            .filter(|request| request.path == "/api/chat")
+            .filter_map(|request| request.model.clone())
+            .collect()
+    }
+
+    /// An empty answer is not a summary. A runner that stops at once, or a
+    /// reasoning model that spends its whole budget thinking, answers with
+    /// no text — and a consolidation that took that as success would fold a
+    /// cluster into an empty memory and delete its sources, while the next
+    /// model on the Settings list was never asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_answer_hands_the_prompt_to_the_next_model() {
+        const SUMMARY: &str = "The user keeps the build green.";
+        let (host, seen) = crate::embedding_reload::test_ollama::spawn_answering(&[
+            ("silent:1b", ""),
+            ("blank:1b", " \n\t "),
+            ("answers:1b", SUMMARY),
+        ])
+        .await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let summarize = summarize_with_failover(
+            router,
+            v(&["ollama/silent:1b", "ollama/blank:1b", "ollama/answers:1b"]),
+        );
+
+        let summary = summarize("fold these memories".to_string())
+            .await
+            .expect("the third model answers");
+
+        assert_eq!(summary, SUMMARY);
+        assert_eq!(
+            asked(&seen),
+            v(&["silent:1b", "blank:1b", "answers:1b"]),
+            "each model is asked once, in the Settings order"
+        );
+    }
+
+    /// When every model answers with nothing, the walk fails — the
+    /// consolidation keeps its sources — and says which model answered
+    /// empty rather than reporting a success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_empty_answers_are_a_failure_that_says_so() {
+        let (host, seen) = crate::embedding_reload::test_ollama::spawn_answering(&[
+            ("silent:1b", ""),
+            ("blank:1b", "   "),
+        ])
+        .await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&host));
+        let summarize =
+            summarize_with_failover(router, v(&["ollama/silent:1b", "ollama/blank:1b"]));
+
+        let error = summarize("fold these memories".to_string())
+            .await
+            .expect_err("no model gave a summary");
+
+        assert!(
+            error.contains("ollama/blank:1b") && error.contains("no text"),
+            "names the last model and why: {error}"
+        );
+        assert_eq!(
+            asked(&seen),
+            v(&["silent:1b", "blank:1b"]),
+            "an empty answer is final for its model — no congestion retry"
+        );
     }
 
     #[test]
