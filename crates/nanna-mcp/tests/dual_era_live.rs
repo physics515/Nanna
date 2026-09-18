@@ -60,7 +60,7 @@ async fn a_modern_only_sdk_server_connects_and_runs_a_tool() {
     let tools = client.list_tools().await.expect("tools/list");
     assert_eq!(
         tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        ["shout"]
+        ["shout", "favorite"]
     );
     assert_eq!(shout(&client).await, "HELLO FROM NANNA");
     client.close().await.expect("close");
@@ -108,6 +108,62 @@ async fn the_legacy_everything_server_falls_back_to_initialize() {
     client.close().await.expect("close");
 }
 
+/// Answers every elicitation with a fixed reply and remembers the questions.
+struct ScriptedUser(std::sync::Mutex<Vec<String>>, &'static str);
+
+#[async_trait::async_trait]
+impl nanna_mcp::Elicitor for ScriptedUser {
+    async fn ask(&self, question: &str) -> Option<String> {
+        self.0.lock().expect("lock").push(question.to_string());
+        Some(self.1.to_string())
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs node + `npm install` in tests/fixtures/sdk-servers"]
+async fn a_real_servers_elicitation_is_put_to_the_user_and_answered() {
+    let modern = script("modern.mjs");
+    let user = std::sync::Arc::new(ScriptedUser(std::sync::Mutex::new(Vec::new()), "teal"));
+    let transport = nanna_mcp::StdioTransport::spawn("node", &[modern.as_str()]).expect("spawn");
+    let client = McpClient::new(transport).with_elicitor(user.clone());
+    client.initialize().await.expect("connect");
+    let result = client
+        .call_tool("favorite", Some(serde_json::json!({})))
+        .await
+        .expect("answered");
+    let text = serde_json::to_value(&result).expect("json")["content"][0]["text"].clone();
+    assert_eq!(text, "favorite=teal");
+    let asked = user.0.lock().expect("lock").clone();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].contains("What is your favorite color?"),
+        "{}",
+        asked[0]
+    );
+    assert!(
+        asked[0].contains("modern-fixture"),
+        "names the server: {}",
+        asked[0]
+    );
+
+    // Without an elicitor nothing is declared and the call fails clearly.
+    let bare = McpClient::spawn("node", &[modern.as_str()])
+        .await
+        .expect("connect");
+    let error = bare
+        .call_tool("favorite", Some(serde_json::json!({})))
+        .await
+        .expect_err("no elicitor");
+    // The real server honours the capability rule: with elicitation not
+    // declared it refuses (-32021) instead of asking.
+    match error {
+        nanna_mcp::McpError::JsonRpc { code, .. } => assert_eq!(code, -32021),
+        other => panic!("expected MissingRequiredClientCapability, got {other:?}"),
+    }
+    client.close().await.expect("close");
+    bare.close().await.expect("close");
+}
+
 // ---------------------------------------------------------------------------
 // Streamable HTTP
 // ---------------------------------------------------------------------------
@@ -133,7 +189,22 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Held from choosing a port until the fixture listens on it. Tests run in
+/// parallel, and a port released by `free_port` can be handed to a second
+/// test before the first fixture binds it.
+static PORT_ALLOCATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Start a fixture and wait for it to say it is listening (both fixtures log
+/// a line containing "listening" on stderr once bound).
+///
+/// Readiness is NOT probed with a TCP connect: a connect to a loopback port
+/// in the ephemeral range that nothing listens on yet can be given that same
+/// port as its source and connect to itself — the probe "succeeds", and the
+/// self-connected socket then holds the port the fixture needed (observed:
+/// 1 run in 20 failed with "error sending request").
 async fn start_http(args: &[&str], env: &[(&str, String)]) -> HttpServer {
+    use std::io::BufRead as _;
+    let _allocating = PORT_ALLOCATION.lock().await;
     let port = free_port();
     let mut command = std::process::Command::new("node");
     for arg in args {
@@ -144,21 +215,38 @@ async fn start_http(args: &[&str], env: &[(&str, String)]) -> HttpServer {
     }
     // Owned by the guard from the start, so every path (including the
     // panic below) kills and reaps it.
-    let server = HttpServer {
+    let mut server = HttpServer {
         child: command
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("node"),
         url: format!("http://127.0.0.1:{port}/mcp"),
     };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return server;
+    let stderr = server.child.stderr.take().expect("piped stderr");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("listening") {
+                let _ = ready_tx.send(());
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("fixture HTTP server did not listen on {port}");
+    });
+    let ready = tokio::task::spawn_blocking(move || {
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok()
+    })
+    .await
+    .expect("join");
+    assert!(
+        ready,
+        "fixture HTTP server did not report listening on {port}"
+    );
+    server
 }
 
 async fn call_text(

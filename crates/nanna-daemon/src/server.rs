@@ -4406,6 +4406,38 @@ impl DaemonServer {
         }
     }
 
+    /// Start the configured MCP servers in the background and keep the task
+    /// that owns them, for `finish_shutdown` to await.
+    async fn start_mcp_servers(
+        &self,
+        tools: &Arc<nanna_tools::ToolRegistry>,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    ) {
+        let mcp = crate::mcp_startup::spawn_mcp_servers(
+            &self.config.mcp,
+            Arc::clone(tools),
+            Arc::clone(&self.mcp_status),
+            self.shutdown_tx.subscribe(),
+            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
+            // A server's question (MCP elicitation) goes to the user through
+            // `ask_user`, in the conversation whose turn called the tool.
+            Some(Arc::new(crate::ask_user_service::McpAskUser {
+                deps: crate::ask_user_service::AskUserDeps {
+                    sessions: Arc::clone(&self.sessions),
+                    events: self.ipc.event_sender(),
+                    chat_runs: Arc::clone(chat_runs),
+                },
+            })),
+        )
+        .await;
+        if let Some(task) = mcp.task
+            && let Ok(mut slot) = self.mcp_task.lock()
+        {
+            debug_assert!(slot.is_none(), "services are initialized once");
+            *slot = Some(task);
+        }
+    }
+
     /// Drain and stop: shut the IPC server, let the stats task take its final
     /// save, release the PID file and record the clean exit.
     async fn finish_shutdown(
@@ -4525,20 +4557,7 @@ impl DaemonServer {
 
         // MCP servers register their tools as each handshake completes; the
         // count above is the tool surface before them.
-        let mcp = crate::mcp_startup::spawn_mcp_servers(
-            &self.config.mcp,
-            Arc::clone(&tools),
-            Arc::clone(&self.mcp_status),
-            self.shutdown_tx.subscribe(),
-            |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
-        )
-        .await;
-        if let Some(task) = mcp.task
-            && let Ok(mut slot) = self.mcp_task.lock()
-        {
-            debug_assert!(slot.is_none(), "services are initialized once");
-            *slot = Some(task);
-        }
+        self.start_mcp_servers(&tools, chat_runs).await;
 
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {

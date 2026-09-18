@@ -64,6 +64,9 @@ pub struct McpClient<T: Transport> {
     /// The server's protocol era, decided once by [`McpClient::initialize`]
     /// and cached for the server's lifetime. `Legacy` until then.
     era: RwLock<ProtocolEra>,
+    /// Puts a modern server's elicitation to the user. `None`: the
+    /// capability is not declared and an `input_required` answer is an error.
+    elicitor: Option<Arc<dyn crate::elicit::Elicitor>>,
 }
 
 impl<T: Transport> McpClient<T> {
@@ -79,6 +82,39 @@ impl<T: Transport> McpClient<T> {
             prompts: RwLock::new(Vec::new()),
             initialized: RwLock::new(false),
             era: RwLock::new(ProtocolEra::Legacy),
+            elicitor: None,
+        }
+    }
+
+    /// Serve the server's form elicitations through `elicitor` (modern era).
+    /// Set before [`Self::initialize`]: it decides what the client declares.
+    #[must_use]
+    pub fn with_elicitor(mut self, elicitor: Arc<dyn crate::elicit::Elicitor>) -> Self {
+        self.elicitor = Some(elicitor);
+        self
+    }
+
+    /// The client capabilities a modern request declares.
+    fn declared_capabilities(&self) -> serde_json::Value {
+        if self.elicitor.is_some() {
+            crate::elicit::elicitation_capability()
+        } else {
+            serde_json::json!({})
+        }
+    }
+
+    /// `params` with the modern `_meta` attached when the era is modern.
+    async fn with_era_meta(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>> {
+        match &*self.era.read().await {
+            ProtocolEra::Modern { version } => Ok(Some(crate::era::with_modern_meta_declaring(
+                params,
+                version,
+                &self.declared_capabilities(),
+            )?)),
+            ProtocolEra::Legacy => Ok(params),
         }
     }
 
@@ -93,16 +129,26 @@ impl<T: Transport> McpClient<T> {
     where
         R: serde::de::DeserializeOwned,
     {
-        let params = match &*self.era.read().await {
-            ProtocolEra::Modern { version } => Some(with_modern_meta(params, version)?),
-            ProtocolEra::Legacy => params,
-        };
+        let params = self.with_era_meta(params).await?;
         let result = self.request_value(method, params).await?;
         serde_json::from_value(result).map_err(Into::into)
     }
 
-    /// Send a request exactly as given and return its raw result.
+    /// Send a request exactly as given and return its result, which must be
+    /// `complete`.
     async fn request_value(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let result = self.request_value_raw(method, params).await?;
+        ensure_complete(&result)?;
+        Ok(result)
+    }
+
+    /// Send a request exactly as given and return its result whatever its
+    /// `resultType`.
+    async fn request_value_raw(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -118,11 +164,9 @@ impl<T: Transport> McpClient<T> {
             });
         }
 
-        let result = response
+        response
             .result
-            .ok_or_else(|| McpError::Protocol("Missing result in response".into()))?;
-        ensure_complete(&result)?;
-        Ok(result)
+            .ok_or_else(|| McpError::Protocol("Missing result in response".into()))
     }
 
     /// Connect to the server in whichever protocol era it speaks.
@@ -413,9 +457,68 @@ impl<T: Transport> McpClient<T> {
             name: name.to_string(),
             arguments,
         };
+        let result = self
+            .request_with_input("tools/call", serde_json::to_value(&params)?)
+            .await?;
+        serde_json::from_value(result).map_err(Into::into)
+    }
 
-        self.request("tools/call", Some(serde_json::to_value(&params)?))
-            .await
+    /// Send `method` and serve any multi-round-trip input it asks for: while
+    /// the server answers `input_required`, put its form questions to the
+    /// elicitor and retry with the answers (a new request id each time, the
+    /// server's `requestState` echoed verbatim), at most
+    /// [`crate::elicit::MRTR_ROUNDS_MAX`] times.
+    async fn request_with_input(
+        &self,
+        method: &str,
+        original: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::elicit::{
+            MRTR_ROUNDS_MAX, elicit_result, elicitation_question, form_requests, retry_params,
+        };
+        let mut params = original.clone();
+        // Whether the last round got no answer at all: the server was told
+        // `cancel`, so asking again cannot get a different reply.
+        let mut unanswered = false;
+        for round in 0..=MRTR_ROUNDS_MAX {
+            let wire = self.with_era_meta(Some(params)).await?;
+            let result = self.request_value_raw(method, wire).await?;
+            let asks = result.get("resultType").and_then(serde_json::Value::as_str)
+                == Some("input_required");
+            let Some(elicitor) = self.elicitor.as_ref().filter(|_| asks) else {
+                ensure_complete(&result)?;
+                return Ok(result);
+            };
+            if unanswered {
+                return Err(McpError::Protocol(
+                    "the MCP server needs an answer from the user, and none came \
+                     (no conversation to ask in, or no reply in time)"
+                        .into(),
+                ));
+            }
+            if round == MRTR_ROUNDS_MAX {
+                break;
+            }
+            let server = self
+                .server_info
+                .read()
+                .await
+                .as_ref()
+                .map_or_else(|| "unnamed".to_string(), |info| info.name.clone());
+            let mut responses = serde_json::Map::new();
+            let mut answered = false;
+            for form in form_requests(&result)? {
+                let question = elicitation_question(&server, &form.message, &form.schema);
+                let answer = elicitor.ask(&question).await;
+                answered |= answer.is_some();
+                responses.insert(form.key.clone(), elicit_result(&form, answer.as_deref()));
+            }
+            unanswered = !answered;
+            params = retry_params(&original, responses, result.get("requestState"));
+        }
+        Err(McpError::Protocol(format!(
+            "the MCP server was still asking for input after {MRTR_ROUNDS_MAX} rounds"
+        )))
     }
 
     /// Get a tool by name
@@ -1100,5 +1203,138 @@ mod tests {
             }
             other => panic!("expected a protocol error, got {other:?}"),
         }
+    }
+
+    /// A modern server whose `tools/call` asks for a color until it gets one
+    /// (or forever, with `always_ask`). Records every call's params and id.
+    struct AskingServer {
+        always_ask: bool,
+        calls: std::sync::Mutex<Vec<(RequestId, serde_json::Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for AskingServer {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let params = request.params.clone().unwrap_or_default();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.id.clone(), params.clone()));
+            let color = params["inputResponses"]["color"]["content"]["color"].as_str();
+            let result = match color {
+                Some(color) if !self.always_ask => serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{ "type": "text", "text": format!("favorite={color}") }]
+                }),
+                _ => serde_json::json!({
+                    "resultType": "input_required",
+                    "inputRequests": { "color": { "method": "elicitation/create", "params": {
+                        "mode": "form", "message": "Favorite color?",
+                        "requestedSchema": { "type": "object",
+                            "properties": { "color": { "type": "string" } }, "required": ["color"] }
+                    } } },
+                    "requestState": "state-1"
+                }),
+            };
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Replies(std::sync::Mutex<Vec<String>>, Option<&'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::elicit::Elicitor for Replies {
+        async fn ask(&self, question: &str) -> Option<String> {
+            self.0.lock().unwrap().push(question.to_string());
+            self.1.map(str::to_string)
+        }
+    }
+
+    async fn modern_client(
+        always_ask: bool,
+        reply: Option<&'static str>,
+    ) -> (McpClient<AskingServer>, Arc<Replies>) {
+        let replies = Arc::new(Replies(std::sync::Mutex::new(Vec::new()), reply));
+        let client = McpClient::new(AskingServer {
+            always_ask,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+        .with_elicitor(replies.clone());
+        *client.initialized.write().await = true;
+        *client.era.write().await = ProtocolEra::Modern {
+            version: "2026-07-28".into(),
+        };
+        (client, replies)
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_is_asked_and_the_call_retried_with_the_answer() {
+        let (client, replies) = modern_client(false, Some("teal")).await;
+        let result = client
+            .call_tool("favorite", None)
+            .await
+            .expect("answered on the retry");
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"].clone();
+        assert_eq!(text, "favorite=teal");
+
+        let asked = replies.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("Favorite color?"), "{}", asked[0]);
+
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].0, calls[1].0, "the retry is a new request id");
+        let retry = &calls[1].1;
+        assert_eq!(retry["requestState"], "state-1", "state echoed verbatim");
+        assert_eq!(retry["name"], "favorite", "the original params are kept");
+        assert_eq!(
+            retry["_meta"]["io.modelcontextprotocol/clientCapabilities"]["elicitation"],
+            serde_json::json!({ "form": {} }),
+            "elicitation is declared when an elicitor is installed"
+        );
+        assert!(calls[0].1.get("inputResponses").is_none());
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_sent_as_cancel_once_then_the_call_ends() {
+        let (client, _) = modern_client(false, None).await;
+        let error = client
+            .call_tool("favorite", None)
+            .await
+            .expect_err("unanswered");
+        assert!(error.to_string().contains("none came"), "{error}");
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "one cancel retry, not a cancel per round");
+        assert_eq!(
+            calls[1].1["inputResponses"]["color"],
+            serde_json::json!({ "action": "cancel" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_stops_asking_is_bounded() {
+        let (client, replies) = modern_client(true, Some("teal")).await;
+        let error = client
+            .call_tool("favorite", None)
+            .await
+            .expect_err("bounded");
+        assert!(error.to_string().contains("still asking"), "{error}");
+        let calls = client.transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), crate::elicit::MRTR_ROUNDS_MAX + 1);
+        assert_eq!(
+            replies.0.lock().unwrap().len(),
+            crate::elicit::MRTR_ROUNDS_MAX
+        );
     }
 }

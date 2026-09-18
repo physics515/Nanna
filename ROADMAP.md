@@ -4796,7 +4796,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             **negative control**: with the listen request disabled both tests fail. Real debug
             daemon: `mcp__grow__late` registered at +1.5 s and answered over IPC
             (`late tool answered`).
-      - [ ] *(found 2026-09-18)* **Serve MRTR elicitation through `ask_user` instead of refusing it.**
+      - [x] *(found 2026-09-18)* **Serve MRTR elicitation through `ask_user` instead of refusing it.**
             A modern server that needs input returns `resultType: "input_required"` with
             `inputRequests` (elicitation/sampling/roots), and the client retries the original
             request with `inputResponses`. Today nanna-mcp turns that into an error (no capability
@@ -4805,6 +4805,30 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             surface the server's message + schema as an `ask_user` question, retry with the answer,
             bounded rounds. Sampling stays undeclared. Source:
             [MRTR](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr).
+            *(2026-09-18, same night)* Done in that shape. `nanna_mcp::Elicitor` (one method: ask a
+            question, get the reply or nothing); a client given one declares
+            `{"elicitation":{"form":{}}}` and serves `input_required` on `tools/call`: each form
+            request becomes one question naming the server (multi-field forms list their fields),
+            the free-text reply is mapped onto the requested schema (one field takes the whole
+            reply; several take `name: value` lines or JSON; values coerced to the field's type,
+            enums matched case-insensitively, anything that does not fit left for the server to
+            re-ask), and the call is retried with `inputResponses`, a new request id and the
+            server's `requestState` echoed verbatim. Bounded at 3 rounds; a round with no answer at
+            all is sent as `cancel` once, and a repeat ask ends the call saying no answer came.
+            URL-mode elicitation, sampling and roots are refused (never declared). The daemon's
+            elicitor is `ask_user` itself (`McpAskUser`): the question lands in the conversation
+            whose turn made the tool call — found through the run's task-local session — and the
+            user's next message is the answer. Verified: against the real SDK server (a `favorite`
+            tool built with the SDK's own `inputRequired`/`acceptedContent`) the question reaches a
+            scripted user and the retry returns `favorite=teal`; the same server, with no elicitor
+            declared, refuses with `-32021` exactly as the spec requires; `McpAskUser` inside a live
+            turn posts the question and returns the queued reply, outside one returns nothing; the
+            real daemon, calling the tool with no conversation, ends with the clear no-answer error
+            instead of `-32021`. **Not verified: a full chat turn where a model calls the tool and a
+            person types the answer** — there is no model on this host. While hardening the live
+            suite: its HTTP fixtures raced (1 run in 20) because the readiness probe was a TCP
+            connect, which on loopback can self-connect to a not-yet-bound ephemeral port and then
+            squat it; the fixtures now announce readiness on stderr and the suite ran 25/25 clean.
       - [ ] *(research 2026-09-18)* **The official Rust SDK (`rmcp` 3.4.0, 2026-09-15) speaks
             2026-07-28** — stateless serving by default, a `ClientLifecycleMode::Discover` that
             skips `initialized`, and version negotiation on connect. Two uses: (a) a second,

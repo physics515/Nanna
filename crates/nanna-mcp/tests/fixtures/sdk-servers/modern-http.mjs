@@ -60,4 +60,4 @@ createServer(async (req, res) => {
     for await (const chunk of response.body) res.write(chunk);
   }
   res.end();
-}).listen(Number(port), '127.0.0.1', () => console.error(`modern-http on ${port} (${responseMode})`));
+}).listen(Number(port), '127.0.0.1', () => console.error(`modern-http listening on ${port} (${responseMode})`));

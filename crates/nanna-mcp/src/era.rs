@@ -192,16 +192,18 @@ fn classify_error(code: i32, data: Option<&Value>, message: &str) -> ProbeVerdic
 ///
 /// Panics if `version` is empty — a programmer error, never wire input.
 #[must_use]
-pub fn modern_meta(version: &str) -> Value {
+pub fn modern_meta(version: &str, capabilities: &Value) -> Value {
     assert!(
         !version.is_empty(),
         "a modern request must name its revision"
     );
+    debug_assert!(
+        capabilities.is_object(),
+        "client capabilities are an object"
+    );
     json!({
         META_PROTOCOL_VERSION: version,
-        // Nothing is declared: this client answers no server-to-client
-        // requests (sampling, elicitation, roots), so it must not invite them.
-        META_CLIENT_CAPABILITIES: {},
+        META_CLIENT_CAPABILITIES: capabilities,
         META_CLIENT_INFO: { "name": "nanna", "version": env!("CARGO_PKG_VERSION") },
     })
 }
@@ -215,6 +217,22 @@ pub fn modern_meta(version: &str) -> Value {
 /// Returns [`McpError::Protocol`] if `params` is present but not an object —
 /// JSON-RPC by-position params cannot carry `_meta`.
 pub fn with_modern_meta(params: Option<Value>, version: &str) -> Result<Value> {
+    // Nothing declared: a client without an elicitor answers no
+    // server-to-client requests, so it must not invite them.
+    with_modern_meta_declaring(params, version, &json!({}))
+}
+
+/// [`with_modern_meta`], declaring `capabilities` (e.g. elicitation, when the
+/// client can put a question to its user).
+///
+/// # Errors
+///
+/// As [`with_modern_meta`].
+pub fn with_modern_meta_declaring(
+    params: Option<Value>,
+    version: &str,
+    capabilities: &Value,
+) -> Result<Value> {
     let mut object = match params {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(object)) => object,
@@ -232,7 +250,7 @@ pub fn with_modern_meta(params: Option<Value>, version: &str) -> Result<Value> {
             "request `_meta` must be an object".into(),
         ));
     };
-    if let Value::Object(ours) = modern_meta(version) {
+    if let Value::Object(ours) = modern_meta(version, capabilities) {
         meta.extend(ours);
     }
     debug_assert!(meta.contains_key(META_PROTOCOL_VERSION));

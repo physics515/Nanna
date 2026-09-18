@@ -99,6 +99,7 @@ pub async fn spawn_mcp_servers(
     status: McpStatus,
     mut shutdown: broadcast::Receiver<()>,
     secret: impl Fn(&str) -> Option<String>,
+    elicitor: Option<Arc<dyn nanna_mcp::Elicitor>>,
 ) -> McpStartup {
     let (startable, skipped) = config.startable();
     let mut start = Vec::with_capacity(startable.len());
@@ -132,6 +133,9 @@ pub async fn spawn_mcp_servers(
     }
     let count = start.len();
     let mut integration = McpIntegration::new();
+    if let Some(elicitor) = elicitor {
+        integration.set_elicitor(elicitor);
+    }
     for (entry, env, bearer) in start {
         let url = entry.url.trim();
         integration.add_server(if url.is_empty() {
@@ -292,6 +296,7 @@ mod tests {
             status.clone(),
             rx,
             |_| panic!("no server lists a secret, so the store is not read"),
+            None,
         )
         .await;
         assert_eq!(started.count, 0);
@@ -328,6 +333,7 @@ mod tests {
             status.clone(),
             rx,
             |_| None,
+            None,
         )
         .await;
         assert_eq!(started.count, 0, "nothing is spawned without its token");

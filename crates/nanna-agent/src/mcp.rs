@@ -165,6 +165,8 @@ pub struct McpIntegration {
     manager: McpToolsManager<AnyTransport>,
     /// Server configurations
     configs: Vec<McpServerConfig>,
+    /// Serves servers' elicitation requests; `None` declares none.
+    elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -175,7 +177,14 @@ impl McpIntegration {
         Self {
             manager: McpToolsManager::new(),
             configs: Vec::new(),
+            elicitor: None,
         }
+    }
+
+    /// Put servers' questions (MCP elicitation) to the user through
+    /// `elicitor`. Set before [`Self::start_all`].
+    pub fn set_elicitor(&mut self, elicitor: std::sync::Arc<dyn nanna_mcp::Elicitor>) {
+        self.elicitor = Some(elicitor);
     }
 
     /// Add a server configuration
@@ -223,6 +232,7 @@ impl McpIntegration {
     /// dual-era handshake either way.
     async fn connect(
         config: &McpServerConfig,
+        elicitor: Option<std::sync::Arc<dyn nanna_mcp::Elicitor>>,
     ) -> Result<McpClient<AnyTransport>, nanna_mcp::McpError> {
         let transport = if let Some(url) = &config.url {
             AnyTransport::Http(Box::new(StreamableHttpTransport::new(
@@ -242,7 +252,10 @@ impl McpIntegration {
                 &env,
             )?)
         };
-        let client = McpClient::new(transport);
+        let mut client = McpClient::new(transport);
+        if let Some(elicitor) = elicitor {
+            client = client.with_elicitor(elicitor);
+        }
         client.initialize().await?;
         Ok(client)
     }
@@ -255,7 +268,7 @@ impl McpIntegration {
             info!(server = %config.name, command = %config.command, "Starting MCP server");
         }
 
-        let client = Self::connect(config)
+        let client = Self::connect(config, self.elicitor.clone())
             .await
             .map_err(|e| McpStartError::Spawn(config.name.clone(), e.to_string()))?;
 
@@ -409,7 +422,10 @@ mod tests {
         let printed = format!("{config:?} {stdio:?}");
         assert!(!printed.contains("sk-live-123"), "{printed}");
         assert!(!printed.contains("ghp_456"), "{printed}");
-        assert!(printed.contains("GITHUB_TOKEN"), "names stay visible: {printed}");
+        assert!(
+            printed.contains("GITHUB_TOKEN"),
+            "names stay visible: {printed}"
+        );
         assert!(printed.contains("<redacted>"), "{printed}");
     }
 

@@ -26,6 +26,7 @@
 
 mod adapter;
 mod client;
+pub mod elicit;
 pub mod era;
 mod protocol;
 mod schema_guard;
@@ -36,6 +37,7 @@ mod transport;
 
 pub use adapter::*;
 pub use client::{McpClient, McpClientBuilder};
+pub use elicit::Elicitor;
 pub use era::ProtocolEra;
 pub use protocol::*;
 pub use schema_guard::{

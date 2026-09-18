@@ -3,7 +3,7 @@
 // `node modern.mjs dual` also serves the legacy handshake; `node modern.mjs
 // grow` registers a second tool (`late`) 1.5 s after the first request, which
 // announces a tools/list_changed to any subscriptions/listen stream.
-import { McpServer } from '@modelcontextprotocol/server';
+import { McpServer, acceptedContent, inputRequired } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod';
 
@@ -18,6 +18,30 @@ serveStdio(() => {
     'shout',
     { description: 'Uppercase text', inputSchema: z.object({ text: z.string() }) },
     async ({ text }) => ({ content: [{ type: 'text', text: text.toUpperCase() }] }),
+  );
+  // Multi round-trip: asks the user (form elicitation) until it has a color.
+  server.registerTool(
+    'favorite',
+    { description: "Ask the user for their favorite color", inputSchema: z.object({}) },
+    async (_args, ctx) => {
+      const answer = acceptedContent(ctx.mcpReq.inputResponses, 'color');
+      if (answer && typeof answer.color === 'string' && answer.color.length > 0) {
+        return { content: [{ type: 'text', text: `favorite=${answer.color}` }] };
+      }
+      return inputRequired({
+        inputRequests: {
+          color: inputRequired.elicit({
+            message: 'What is your favorite color?',
+            requestedSchema: {
+              type: 'object',
+              properties: { color: { type: 'string', description: 'a color' } },
+              required: ['color'],
+            },
+          }),
+        },
+        requestState: 'favorite-round',
+      });
+    },
   );
   if (grow) {
     setTimeout(() => {
