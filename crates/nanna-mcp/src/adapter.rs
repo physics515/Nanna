@@ -7,6 +7,7 @@ use crate::transport::Transport;
 use crate::{McpClient, McpError, Tool as McpTool, ToolContent};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "tools-integration")]
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 

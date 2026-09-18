@@ -4756,9 +4756,13 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             (2025 session) and `mcp__local__shout` (stdio) all answered over IPC; the `ftp://` entry
             was skipped by name in the log, `system.status` and `doctor`; `MCP servers closed` then
             `Daemon stopped`.
-      - [ ] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
+      - [x] *(found 2026-09-18)* `cargo clippy -p nanna-mcp --no-default-features --features stdio`
             warns on two unused imports (`adapter.rs` `RwLock`, `server.rs` `ToolContent`) — the
             feature-gated build nobody gates. Trivial; gate the imports on their features.
+            *(same night)* Done, and the sweep over every subset found more: no-features also left
+            `McpError`/`Mutex` unused in `transport.rs`, `uuid` was a non-optional dependency used
+            only by `tools-integration`, and the live test did not build with `stdio` alone. All
+            five subsets (none, stdio, http, tools-integration, stdio+http) are now 0 warnings.
       - [x] **Per-server secrets without `config.toml`** — a keyring-backed `env` for servers that
             need a token, so a GitHub/Calendar server does not require exporting the token into the
             daemon's own environment (where every `exec` child also inherits it).

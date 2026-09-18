@@ -10,7 +10,7 @@ stdio = ["tokio/process"]
 # SSE over reqwest. `tokio-tungstenite` used to be here for a WebSocket
 # transport that was never written, and no file ever imported it.
 http = ["reqwest", "base64"]
-tools-integration = ["nanna-tools"]
+tools-integration = ["nanna-tools", "uuid"]
 
 [dependencies]
 tokio.workspace = true
@@ -29,7 +29,7 @@ base64 = { version = "0.23", optional = true }
 futures = "0.3"
 
 # JSON-RPC
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
 
 # Tools integration (optional)
 nanna-tools = { path = "../nanna-tools", optional = true }

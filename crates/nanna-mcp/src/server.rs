@@ -3,7 +3,9 @@
 //! Exposes Nanna tools as an MCP server that external clients can connect to.
 //! Supports stdio transport (for CLI tools) and HTTP/SSE (for web clients).
 
-use crate::protocol::{CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult, ToolContent};
+use crate::protocol::{CallToolResult, ReadResourceResult, Prompt, Tool, Resource, JsonRpcRequest, JsonRpcResponse, JsonRpcError, InitializeParams, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, ToolsCapability, ResourcesCapability, PromptsCapability, LoggingCapability, ServerInfo, ListToolsResult, CallToolParams, ListResourcesResult, ReadResourceParams, ListPromptsResult, GetPromptParams, GetPromptResult};
+#[cfg(any(test, feature = "tools-integration"))]
+use crate::protocol::ToolContent;
 use crate::{McpError, Result};
 use serde_json::Value;
 use std::collections::HashMap;

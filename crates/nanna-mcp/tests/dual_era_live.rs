@@ -7,7 +7,7 @@
 //! (cd crates/nanna-mcp/tests/fixtures/sdk-servers && npm install)
 //! cargo test -p nanna-mcp --test dual_era_live -- --ignored
 //! ```
-#![cfg(feature = "stdio")]
+#![cfg(all(feature = "stdio", feature = "http"))]
 
 use nanna_mcp::{McpClient, ProtocolEra};
 use std::path::PathBuf;

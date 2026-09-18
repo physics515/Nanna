@@ -4,10 +4,13 @@
 //! - stdio: Spawn a process and communicate via stdin/stdout
 //! - HTTP/SSE: Connect to an HTTP server with Server-Sent Events
 
-use crate::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, Result};
+#[cfg(any(feature = "stdio", feature = "http"))]
+use crate::McpError;
+use crate::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(feature = "stdio", feature = "http"))]
 use tokio::sync::Mutex;
 
 /// Which MCP list a `.../list_changed` notification refers to.
