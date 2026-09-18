@@ -5134,11 +5134,20 @@ asks permission or restricts her.)*:
             only before the first words, and the real message last. `TelegramChannel::with_api_base`
             (also usable for a self-hosted Bot API server) makes that possible. **Not verified with a
             real bot** — no bot token on this host.
-      - [ ] **Telegram: the stop button, and a live check of the drafts.** Bot API 10.3's `can_stop` /
+      - [~] **Telegram: the stop button, and a live check of the drafts.** Bot API 10.3's `can_stop` /
             `keep_on_stop` on `sendMessageDraft`, and the `stopped_message_generation` update routed
             to the same arm as `/stop` (add it to `allowed_updates`; read `MessageGenerationStopped`'s
             fields from the full API page first). Then one live round-trip with a real bot: a streamed
-            answer, a stop mid-answer. Follow-up the same day: a clear —
+            answer, a stop mid-answer.
+            *(2026-09-18, same night — the button is wired; the live check is still open.)*
+            `MessageGenerationStopped` is `{chat, message_thread_id?, draft_id}` (read from the
+            GramIO mirror of the API page). Drafts are sent with `can_stop: true, keep_on_stop:
+            true`; the listener asks for `stopped_message_generation` and turns a press into the
+            `/stop` its user would have typed — drafts exist only in private chats, where the chat
+            id is the user's id, so the synthesized sender lands on the running session and the
+            existing stop path does the rest. Allowed-chats and non-private stops are ignored. Also
+            learned: `sendMessageDraft` with empty text shows a "Thinking…" placeholder — a candidate
+            to replace "typing…" in private chats. Still open: the live round-trip. Follow-up the same day: a clear —
       `/new` or IPC `session.clear`, one `ControlPlane::clear_session` path — now broadcasts
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,

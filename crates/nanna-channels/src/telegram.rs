@@ -89,6 +89,12 @@ impl TelegramChannel {
             chat_id: i64,
             draft_id: i64,
             text: String,
+            /// Show a stop button; a press arrives as `stopped_message_generation`
+            /// (Bot API 10.3), which the listener turns into `/stop`.
+            can_stop: bool,
+            /// Keep what was written visible after a stop, until the final
+            /// message (the partial answer) replaces it.
+            keep_on_stop: bool,
         }
         assert!(draft_id != 0, "Telegram requires a non-zero draft_id");
         debug_assert!(chat_id > 0, "drafts exist only in private chats");
@@ -98,6 +104,8 @@ impl TelegramChannel {
                 chat_id,
                 draft_id,
                 text: draft_text(text),
+                can_stop: true,
+                keep_on_stop: true,
             },
         )
         .await
@@ -955,7 +963,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "chat_id": 4242, "draft_id": 7, "text": "Thinking about it" })
+            serde_json::json!({
+                "chat_id": 4242, "draft_id": 7, "text": "Thinking about it",
+                "can_stop": true, "keep_on_stop": true
+            })
         );
 
         // A group chat is not asked at all (no server is listening now).
