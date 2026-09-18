@@ -7341,6 +7341,26 @@ keep the phases readable; promote individual items into a phase when they become
             `clean_shutdown`, no process left — where the run before it had to stop the orphan by
             hand. Windows is unchanged (its Job Object already covers this; the flag is accepted
             and ignored).
+      - [ ] *(found 2026-09-18, on the operator's machine)* **In the AppImage, closing the GUI
+            crashes its daemon (SIGBUS) instead of stopping it.** Seen live, not reproduced:
+            the installed `Nanna_0.3.19_amd64.AppImage` daemon dumped core **twice**, each time in
+            the same second its GUI's launch scope ended. `nanna-daemon` 342632 died at 09:05:09
+            with its 10 h 50 min GUI; 4138924 died at 09:12:34 with the GUI started at 09:08:40.
+            Both were `SIGBUS / BUS_ADRERR` with `/tmp/.mount_Nanna_*/usr/bin/nanna-daemon` as the
+            command. /tmp was at 44 %, and the AppImage file was unchanged since 22:15 the night
+            before. The mechanism fits the AppImage runtime: the sidecar executes from the
+            runtime's FUSE mount, the mount goes when the GUI process exits, and the daemon's next
+            page fault is a SIGBUS. So whenever `ExitRequested` → `backend.shutdown()` does not run
+            (the window killed by the compositor, a crash, SIGTERM), the daemon is not orphaned. It
+            crashes: no drain, no exit-reason file, MCP children and turso writes cut mid-flight.
+            `--exit-with-parent` (above) cannot help, because its 1 s poll loses to the unmount.
+            Shape: (1) when the daemon runs from an AppImage (`$APPIMAGE` / `$APPDIR` set), the
+            GUI should copy the sidecar out of the mount (e.g. `$XDG_RUNTIME_DIR/nanna/`, keyed by
+            version) and spawn the copy, so it outlives the mount and `--exit-with-parent` drains
+            it; or (2) on Linux, stop the sidecar from a `SIGTERM` handler in the GUI as well as
+            from `ExitRequested`. First, reproduce it deliberately: launch the AppImage, `kill
+            -TERM` the GUI, and read `coredumpctl`. Note also that the operator's desktop entry
+            still launches **0.3.19**, while beta.30 is published.
       - [ ] `~/.claude/scheduled-tasks/_shared/tauri-webdriver.sh` prints the wrong package in its
             `ensure` failure text (it names `webkit2gtk-4.1`). Corrected in place on this host
             2026-09-14; the file lives outside this repo, so it is recorded here rather than in the PR.
