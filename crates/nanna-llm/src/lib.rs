@@ -2896,20 +2896,29 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         &self.base_url
     }
 
-    /// Whether this Ollama client's server answers the Ollama API right now:
-    /// one [`probe_ollama`] of its base URL, bounded by `timeout`, carrying the
-    /// client's own token — without it, a server behind an authenticating
-    /// proxy reads as down however healthy it is.
+    /// Whether this Ollama client's server answers HTTP right now, with any
+    /// status: one `GET /api/tags`, bounded by `timeout`.
     ///
-    /// `false` for any other provider: its key is not Ollama's to send.
+    /// This is a liveness check, for waiting out a server that refused or
+    /// dropped the connection, and any answer ends that condition. Whether
+    /// the answer is a good one is the next request's to find out: a gateway
+    /// that routes `/api/chat` alone answers this with 404 and serves chat
+    /// fine, and asking for an Ollama model list here kept such a server
+    /// "down" for as long as a caller would wait.
+    ///
+    /// Asked with the client's own token, as chat asks: a proxy that counts
+    /// unauthenticated requests would otherwise see one every few seconds for
+    /// the length of a wait. `false` for any other provider: its key is not
+    /// Ollama's to send.
     pub async fn ollama_answers(&self, timeout: std::time::Duration) -> bool {
         if self.provider != Provider::Ollama {
             return false;
         }
-        matches!(
-            probe_ollama(&self.base_url, Some(&self.api_key), timeout).await,
-            OllamaProbe::Reachable { .. }
-        )
+        self.apply_ollama_auth(self.http.get(format!("{}/api/tags", self.base_url)))
+            .timeout(timeout)
+            .send()
+            .await
+            .is_ok()
     }
 
     /// Check if this client uses OAuth authentication

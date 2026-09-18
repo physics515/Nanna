@@ -74,13 +74,14 @@ lists a model as `qwen` rather than `qwen:latest` no longer has it reported miss
 
 **Recovery acts on the Ollama server you set, and never kills a local one for a remote one.** When
 chat against Ollama kept failing, Nanna unloaded the model and, as a last resort, restarted Ollama.
-It did both to an Ollama on this computer (the one `OLLAMA_HOST` named, or the default address), no
-matter which server chat was using. With a server on another machine, a failing proxy there meant
-Nanna unloaded a model from the Ollama on your own computer and then killed it, and "waited for
-Ollama to come back" by checking that one. Recovery now uses the address in Settings → Models. It
-waits for that server wherever it is, sending its token, and it unloads or restarts only a server on
-this computer. `OLLAMA_HOST` no longer changes which server Nanna looks at: a local Ollama on another
-port is entered in Settings like any other address.
+Both went to the server `OLLAMA_HOST` named, or to the default address on this computer, no matter
+which server chat was using; only the restart refused a server elsewhere. So with chat on another
+machine and `OLLAMA_HOST` unset, a failing proxy there meant Nanna unloaded a model from the Ollama
+on your own computer and then killed it, and "waited for Ollama to come back" by checking that one.
+Recovery now uses the address in Settings → Models. It waits for that server wherever it is,
+sending its token, and stops waiting as soon as the server answers at all; it unloads or restarts
+only a server on this computer. `OLLAMA_HOST` no longer changes which server Nanna looks at: a local
+Ollama on another port is entered in Settings like any other address.
 
 **A remote Ollama's context window is no longer sized from this computer's graphics card.** Nanna
 sizes a local model's context window to the video memory free on this machine, and it did the same

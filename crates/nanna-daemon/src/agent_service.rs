@@ -27,11 +27,11 @@ const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
 /// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
 const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-/// Bounded waits for a DOWN local Ollama server before falling back to
-/// normal retry accounting. Derivation: a runner-surgery restart is back in
-/// under 60s (tasks.rs polls 20×3s), so one 120s wait covers a restart with
-/// 2× margin; three waits = six minutes of continuous downtime = genuinely
-/// dead, stop stalling the run.
+/// Bounded waits for a DOWN Ollama server (the configured one, wherever it
+/// runs) before falling back to normal retry accounting. Derivation: a
+/// runner-surgery restart is back in under 60s (tasks.rs polls 20×3s), so one
+/// 120s wait covers a restart with 2× margin; three waits = six minutes of
+/// continuous downtime = genuinely dead, stop stalling the run.
 const CHAT_SERVER_DOWN_WAITS_MAX: usize = 3;
 const CHAT_SERVER_DOWN_WAIT_SECS: u64 = 120;
 
@@ -1782,7 +1782,7 @@ impl AgentService {
     }
 
     /// A failed attempt: journal the fault, then decide between waiting out a
-    /// down local server, retrying the same model, or moving down the list —
+    /// down Ollama server, retrying the same model, or moving down the list —
     /// recording the decision in `walk`.
     async fn handle_attempt_failure(
         &self,
