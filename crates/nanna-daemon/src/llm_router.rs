@@ -404,6 +404,39 @@ impl LlmRouter {
         ProviderId::strip_prefix(model).to_string()
     }
 
+    /// The client and bare model id a summarization-model spec resolves to,
+    /// through the provider map chat uses right now.
+    ///
+    /// An `ollama/` entry therefore gets chat's server and the token bound to
+    /// it, an `anthropic/` entry chat's Anthropic credential, and so on — one
+    /// grammar ([`ProviderId::from_model`]) and one set of credentials for chat
+    /// and every summarizer. Snapshotted per call, so a caller that asks again
+    /// after a config reload gets the rebuilt provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sentence naming the provider and why it is absent (the
+    /// rebuild's recorded reason when it kept one) when no client is
+    /// registered for the spec's provider, and refuses a blank spec, which
+    /// names no model.
+    pub fn summarizer_client(&self, spec: &str) -> Result<(LlmClient, String), String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("a blank summarization entry names no model".to_string());
+        }
+        let provider = ProviderId::from_model(spec);
+        let client = self.client_for(provider).ok_or_else(|| {
+            let why = self.absent_reason(provider).unwrap_or_else(|| {
+                format!("no {} credential is configured", provider.name())
+            });
+            format!("`{spec}` needs the {} provider, which is not available: {why}", provider.name())
+        })?;
+        // `LlmClient` clones share their HTTP pool; the num_ctx latch is
+        // process-wide and keyed by (server, model), so a summarizer's clone
+        // and chat's own client learn from each other's demotions.
+        Ok(((*client).clone(), ProviderId::strip_prefix(spec).to_string()))
+    }
+
     /// Get the primary LLM client (first available, preferring Anthropic).
     /// Used for sub-agent spawning where we need a client but don't know the model yet.
     pub fn primary_client(&self) -> Option<Arc<LlmClient>> {
@@ -587,6 +620,20 @@ impl Default for LlmRouter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The resolver every agent this process builds summarizes through: each
+/// `summarization_priority` entry becomes a client by
+/// [`LlmRouter::summarizer_client`] on `router`, asked afresh on every use.
+///
+/// Holding the router rather than a client is the point. A config reload
+/// rebuilds the router's providers in place, so a new `[memory].ollama_host`,
+/// a newly saved token or key reaches the very next summarization — even in a
+/// turn that started before the change — with no restart.
+#[must_use]
+pub fn summarizer_clients(router: &Arc<LlmRouter>) -> nanna_agent::SummarizerClients {
+    let router = Arc::clone(router);
+    nanna_agent::SummarizerClients::new(move |spec| router.summarizer_client(spec))
 }
 
 /// The one resolved credential the Anthropic provider will use.
@@ -985,6 +1032,43 @@ mod tests {
             ProviderId::from_model("openrouter/openai/gpt-4o-mini"),
             ProviderId::OpenRouter
         );
+    }
+
+    /// A summarizer spec resolves through the provider map chat uses, to the
+    /// bare id that provider knows; an absent provider is explained with the
+    /// reason the rebuild recorded, not reported as a bad model name.
+    #[test]
+    fn a_summarizer_spec_resolves_like_chat_and_explains_an_absence() {
+        let router = LlmRouter::new();
+        router.rebuild(&ProviderCredentials {
+            anthropic: None,
+            anthropic_absent_reason: Some("the stored OAuth credential expired 4h ago".into()),
+            openai_api_key: Some("sk-test".into()),
+            openrouter_api_key: None,
+            github_token: None,
+            ollama_host: "http://gpu-box:11434".into(),
+            ollama_api_key: None,
+        });
+
+        let (client, model) = router
+            .summarizer_client("ollama/qwen3:4b")
+            .expect("Ollama always registers");
+        assert_eq!(model, "qwen3:4b");
+        assert_eq!(client.base_url(), "http://gpu-box:11434");
+        assert_eq!(
+            router.summarizer_client(" openai/gpt-4o-mini ").map(|(_, m)| m),
+            Ok("gpt-4o-mini".to_string())
+        );
+
+        let Err(err) = router.summarizer_client("anthropic/claude-haiku-4-5") else {
+            panic!("no Anthropic credential is registered");
+        };
+        assert!(err.contains("the stored OAuth credential expired 4h ago"), "{err}");
+        let Err(err) = router.summarizer_client("openrouter/meta-llama/llama-3") else {
+            panic!("no OpenRouter key is registered");
+        };
+        assert!(err.contains("openrouter"), "{err}");
+        assert!(router.summarizer_client("  ").is_err(), "a blank entry names no model");
     }
 
     /// `from_model` has always matched prefixes without regard to case, and

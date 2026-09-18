@@ -47,6 +47,20 @@ Be helpful. Be competent. Don't waste words.",
     base
 }
 
+/// How the CLI's agent reaches its summarization models: the daemon's chat
+/// router, built from the same credential chain the daemon resolves, so an
+/// entry in `[llm].summarization_priority` means here exactly what it means to
+/// the daemon — `ollama/` reaches `[memory].ollama_host` with its bound token,
+/// `anthropic/`, `openai/` and `openrouter/` their configured keys.
+async fn summarizer_clients(config: &Config) -> nanna_agent::SummarizerClients {
+    use nanna_daemon::llm_router::{LlmRouter, ProviderCredentials, summarizer_clients};
+    let credentials =
+        ProviderCredentials::resolve(&nanna_daemon::server::LlmConfig::from_nanna(config)).await;
+    let router = Arc::new(LlmRouter::new());
+    router.rebuild(&credentials);
+    summarizer_clients(&router)
+}
+
 /// Print tool call results.
 fn print_tool_calls(tool_calls: &[nanna_agent::ToolCallRecord]) {
     if tool_calls.is_empty() {
@@ -150,7 +164,9 @@ pub async fn run_cli(
             }
         }
 
-    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    let agent = Agent::new(agent_config, llm, tools)
+        .with_context(context)
+        .with_summarizer_clients(summarizer_clients(config).await);
     run_cli_loop(&agent, &storage, &session_id, stream).await
 }
 
@@ -286,7 +302,9 @@ Be concise and direct.",
         cwd.display()
     ));
 
-    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    let agent = Agent::new(agent_config, llm, tools)
+        .with_context(context)
+        .with_summarizer_clients(summarizer_clients(config).await);
 
     match agent.run(prompt, RunOptions::default()).await {
         Ok(response) => {

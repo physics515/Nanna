@@ -162,12 +162,32 @@ pub(crate) mod test_ollama {
         pub model: Option<String>,
     }
 
+    /// The chat router's view of one Ollama server: its address and the
+    /// token bound to it, and no other provider.
+    pub fn ollama_credentials(host: &str, token: &str) -> crate::llm_router::ProviderCredentials {
+        crate::llm_router::ProviderCredentials {
+            anthropic: None,
+            anthropic_absent_reason: None,
+            openai_api_key: None,
+            openrouter_api_key: None,
+            github_token: None,
+            ollama_host: host.to_string(),
+            ollama_api_key: Some(token.to_string()),
+        }
+    }
+
+    /// What `/api/chat` answers with the token: one memory, in the JSON shape
+    /// memory extraction asks for, so a summarizer's call can be followed
+    /// end to end through a real agent.
+    pub const CHAT_MEMORY: &str = "The user keeps the build green";
+
     /// Serve every request on an ephemeral port, recording each one: `401`
     /// unless it carries `Authorization: Bearer <token>`.
     ///
     /// With the token, one three-wide embedding in whichever shape the path
     /// asks for (Ollama's `/api/embed` and legacy `/api/embeddings`, or
-    /// `/v1/embeddings`). `Connection: close` makes each request its own
+    /// `/v1/embeddings`), and on `/api/chat` an assistant reply carrying
+    /// [`CHAT_MEMORY`]. `Connection: close` makes each request its own
     /// connection.
     pub async fn spawn_token_gated(token: &'static str) -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -176,6 +196,13 @@ pub(crate) mod test_ollama {
         let addr = listener.local_addr().expect("read back the bound addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
+        let memories = serde_json::json!([{ "content": CHAT_MEMORY, "category": "fact" }]);
+        let chat = serde_json::json!({
+            "message": { "role": "assistant", "content": memories.to_string() },
+            "done": true,
+            "done_reason": "stop",
+        })
+        .to_string();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -189,6 +216,7 @@ pub(crate) mod test_ollama {
                     "/api/embed" => ("200 OK", r#"{"embeddings":[[0.1,0.2,0.3]]}"#),
                     "/api/embeddings" => ("200 OK", r#"{"embedding":[0.1,0.2,0.3]}"#),
                     "/v1/embeddings" => ("200 OK", r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#),
+                    "/api/chat" => ("200 OK", chat.as_str()),
                     _ => ("404 Not Found", r#"{"error":"not found"}"#),
                 };
                 record.lock().expect("record lock").push(request);

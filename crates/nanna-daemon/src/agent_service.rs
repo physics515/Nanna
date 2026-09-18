@@ -1360,12 +1360,15 @@ impl AgentService {
             context.messages.push(anthropic_msg);
         }
 
+        // Summarizers resolve through the chat router, per call: the same
+        // grammar and credentials as chat, and a reload reaches a running turn.
         let mut agent = Agent::new(
             agent_config,
             llm_client,
             self.tools.clone(),
         )
-        .with_context(context);
+        .with_context(context)
+        .with_summarizer_clients(crate::llm_router::summarizer_clients(&self.router));
         // Record per-model request stats into the shared tracker so the
         // control plane persists them and the router can route on them.
         if let Some(ref tracker) = self.model_stats {
@@ -3216,5 +3219,84 @@ mod tests {
             (0, 0, 1),
             "the same model is tried again, with its retry budget untouched"
         );
+    }
+
+    /// The owner's case: chat on a remote Ollama that wants a token, and a
+    /// summarization list naming a model there. The in-loop summarizers read
+    /// `[llm].ollama_url` (localhost) and sent no token, so every one was
+    /// refused while chat worked. A turn's summarizer must reach the server
+    /// chat uses, with the bound bearer — and when the server moves, the SAME
+    /// agent's next summarization must follow it, with no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turns_summarizer_goes_where_chat_goes_and_follows_a_move() {
+        use crate::embedding_reload::test_ollama::{
+            CHAT_MEMORY, ollama_credentials, spawn_token_gated,
+        };
+        let (first_host, first_seen) = spawn_token_gated("bound-token").await;
+        let (moved_host, moved_seen) = spawn_token_gated("bound-token").await;
+        let router = Arc::new(LlmRouter::new());
+        router.rebuild(&ollama_credentials(&first_host, "bound-token"));
+
+        let chat_model = "ollama/nanna-test-chat:1b";
+        let (event_tx, _events) = broadcast::channel::<Event>(16);
+        let service = AgentService::new(
+            AgentServiceConfig {
+                model: chat_model.to_string(),
+                summarization_priority: vec!["ollama/nanna-test-summarizer:1b".to_string()],
+                ..AgentServiceConfig::default()
+            },
+            Arc::clone(&router),
+            Arc::new(ToolRegistry::new()),
+            None,
+            event_tx,
+        );
+        let history = [
+            test_message(
+                MessageRole::User,
+                "Please keep the build green on every commit; that is the one rule here.",
+            ),
+            test_message(MessageRole::Assistant, "Understood: every commit keeps the build green."),
+        ];
+        let chat_client = router.client_for_model(chat_model).expect("Ollama always registers");
+        let agent = service
+            .attempt_agent("s", chat_model, chat_client, None, &history)
+            .await;
+
+        let memories = agent.extract_memories().await.expect("the summarizer answers");
+        assert_eq!(
+            memories.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec![CHAT_MEMORY]
+        );
+        let reached = first_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")
+                && r.model.as_deref() == Some("nanna-test-summarizer:1b")),
+            "the summarizer reached chat's server with the bound token: {reached:?}"
+        );
+
+        // A config reload moves the server; the agent built before it follows.
+        router.rebuild(&ollama_credentials(&moved_host, "bound-token"));
+        agent.extract_memories().await.expect("the moved server answers");
+        let reached = moved_seen.lock().expect("record lock").clone();
+        assert!(
+            reached.iter().any(|r| r.path == "/api/chat"
+                && r.authorization.as_deref() == Some("Bearer bound-token")),
+            "the next summarization went to the new server: {reached:?}"
+        );
+    }
+
+    fn test_message(role: MessageRole, content: &str) -> SessionMessage {
+        SessionMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+            timeline: Vec::new(),
+            usage: None,
+        }
     }
 }
