@@ -592,17 +592,11 @@ fn misplaced_by_router(model: &str) -> Option<&'static str> {
     }
 }
 
-/// Does a model spec name an Ollama model? `ollama/<model>`, or a bare
-/// `name:tag` (how Ollama ids look, and how the router detects them).
-fn is_ollama_spec(model: &str) -> bool {
-    let model = model.trim();
-    model.starts_with("ollama/") || (!model.contains('/') && model.contains(':'))
-}
-
-/// Does a `summarization_priority` entry go to Ollama? Exactly when the chat
-/// router says so ([`ProviderId::from_model`]): the summarizers resolve through
-/// it, so there is no looser rule of their own any more.
-fn is_ollama_summary_spec(model: &str) -> bool {
+/// Does a chat or `summarization_priority` entry go to Ollama? Exactly when
+/// the chat router says so ([`ProviderId::from_model`]): chat and the
+/// summarizers both resolve through it, so neither has a looser rule of its
+/// own.
+fn routed_to_ollama(model: &str) -> bool {
     let model = model.trim();
     !model.is_empty() && ProviderId::from_model(model) == ProviderId::Ollama
 }
@@ -797,33 +791,36 @@ fn check_anthropic_credential(config: &Config) -> Check {
 /// expected there: chat's, the embedders', and the summarizers'. Summaries
 /// reach Ollama through the chat router, so they go to the same server chat
 /// does; `None` when no model is configured on Ollama at all.
+///
+/// Each model is expected there exactly when the code serving it sends it
+/// there, so a probe's "missing" is never about a model that goes elsewhere:
+/// - chat's models as the daemon walks them (`model_priority`, else `model`)
+///   and the summarization list, by the chat router's rule;
+/// - `[llm].model` when `[llm].provider` is `ollama` too — the CLI's chat;
+/// - the embedding specs the daemon tries ([`embedding_specs`]), by the
+///   embedding router's rule ([`split_embedding_spec`]).
 fn ollama_server_in_use(config: &Config) -> Option<OllamaServer> {
-    let mut models: Vec<&str> = config
-        .llm
-        .model_priority
+    let chat_models: &[String] = if config.llm.model_priority.is_empty() {
+        std::slice::from_ref(&config.llm.model)
+    } else {
+        &config.llm.model_priority
+    };
+    let mut models: Vec<String> = chat_models
         .iter()
-        .chain(&config.memory.embedding_priority)
-        .map(String::as_str)
-        .filter(|m| is_ollama_spec(m))
-        .chain(
-            config
-                .llm
-                .summarization_priority
-                .iter()
-                .map(String::as_str)
-                .filter(|m| is_ollama_summary_spec(m)),
-        )
+        .chain(&config.llm.summarization_priority)
+        .filter(|m| routed_to_ollama(m))
+        .cloned()
         .collect();
     if config.llm.provider.eq_ignore_ascii_case("ollama") {
-        models.push(&config.llm.model);
+        models.push(config.llm.model.clone());
     }
-    if config
-        .memory
-        .embedding_provider
-        .eq_ignore_ascii_case("ollama")
-    {
-        models.push(&config.memory.embedding_model);
-    }
+    models.extend(
+        embedding_specs(config)
+            .into_iter()
+            .filter_map(|spec| split_embedding_spec(&spec))
+            .filter(|(provider, _)| provider == "ollama")
+            .map(|(_, model)| model),
+    );
     if models.is_empty() {
         return None;
     }
@@ -1472,13 +1469,13 @@ mod tests {
     /// their own: a bare `qwen3` is not an Ollama model there.
     #[test]
     fn a_summary_model_is_ollamas_exactly_when_the_router_says_so() {
-        assert!(is_ollama_summary_spec("ollama/qwen3"));
-        assert!(is_ollama_summary_spec("Ollama/qwen3:4b"));
-        assert!(is_ollama_summary_spec("qwen3:4b"));
-        assert!(!is_ollama_summary_spec("qwen3"));
-        assert!(!is_ollama_summary_spec("anthropic/claude-haiku-4-5"));
-        assert!(!is_ollama_summary_spec("openrouter/meta-llama/llama-3:free"));
-        assert!(!is_ollama_summary_spec("  "));
+        assert!(routed_to_ollama("ollama/qwen3"));
+        assert!(routed_to_ollama("Ollama/qwen3:4b"));
+        assert!(routed_to_ollama("qwen3:4b"));
+        assert!(!routed_to_ollama("qwen3"));
+        assert!(!routed_to_ollama("anthropic/claude-haiku-4-5"));
+        assert!(!routed_to_ollama("openrouter/meta-llama/llama-3:free"));
+        assert!(!routed_to_ollama("  "));
     }
 
     #[test]
@@ -1549,18 +1546,54 @@ mod tests {
         assert!(server.models.contains(&"qwen3:4b".to_string()), "{server:?}");
 
         // Summarizing on Ollama while chat and embeddings are cloud still
-        // summarizes on that one server.
+        // summarizes on that one server. (Chat is routed by its model's
+        // name, so cloud chat is a cloud model, not only a provider.)
         config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
         config.memory.embedding_provider = "openai".to_string();
         let server = ollama_server_in_use(&config).expect("the summarizer is on Ollama");
         assert_eq!(server.url, "http://gpu-box:11434");
         assert_eq!(server.models, vec!["qwen3:4b"]);
     }
 
+    /// Every model is expected on the Ollama server exactly when the code
+    /// that serves it sends it there: chat models by the chat router's rule,
+    /// embedding models by the embedding router's. The probe used one looser
+    /// rule of its own for both, so it expected `gpt-oss:20b` there though
+    /// chat sends it to OpenAI, and skipped a namespaced tagged chat model and
+    /// a bare embedding name that both go to Ollama.
+    #[test]
+    fn each_model_is_probed_where_its_router_sends_it() {
+        let mut config = probe_config();
+        config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
+        config.llm.model_priority = vec![
+            "gpt-oss:20b".to_string(),
+            "hf.co/org/model:q4_k_m".to_string(),
+        ];
+        config.llm.summarization_priority = Vec::new();
+        config.memory.embedding_priority = vec!["mxbai-embed-large".to_string()];
+
+        let server = ollama_server_in_use(&config).expect("models are configured on Ollama");
+        assert_eq!(
+            server.models,
+            vec!["hf.co/org/model:q4_k_m", "mxbai-embed-large:latest"]
+        );
+
+        // The chat model itself goes where the router sends it too, whatever
+        // `[llm].provider` says.
+        config.llm.model_priority = Vec::new();
+        config.memory.embedding_priority = vec!["openai/text-embedding-3-small".to_string()];
+        config.llm.model = "qwen3:8b".to_string();
+        let server = ollama_server_in_use(&config).expect("the chat model is on Ollama");
+        assert_eq!(server.models, vec!["qwen3:8b"]);
+    }
+
     #[test]
     fn nothing_on_ollama_means_nothing_to_probe() {
         let mut config = probe_config();
         config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
         config.llm.summarization_priority = Vec::new();
         config.memory.embedding_provider = "openai".to_string();
         assert_eq!(ollama_server_in_use(&config), None);
@@ -1659,6 +1692,7 @@ mod tests {
         assert_eq!(ollama_tag("Ollama/qwen3:4b"), "qwen3:4b");
         let mut config = probe_config();
         config.llm.provider = "anthropic".to_string();
+        config.llm.model = "claude-sonnet-5".to_string();
         config.memory.embedding_provider = "openai".to_string();
         config.llm.summarization_priority = vec!["qwen3".to_string()];
         assert_eq!(ollama_server_in_use(&config), None);
