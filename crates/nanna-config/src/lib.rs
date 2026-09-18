@@ -736,6 +736,12 @@ fn retired_ollama_url_notice(content: &str, config: &Config) -> Option<String> {
     if retired.is_empty() || same_ollama_server(retired, host) {
         return None;
     }
+    // Redacted as every other Ollama address in the log is: a URL can carry a
+    // password in its user info or a token in its query.
+    let (retired, host) = (
+        ollama::redacted_ollama_host(retired),
+        ollama::redacted_ollama_host(host),
+    );
     Some(format!(
         "config.toml still sets [llm].ollama_url = \"{retired}\", which is no longer read: \
          summaries now reach Ollama through chat's server, [memory].ollama_host = \"{host}\". \
@@ -1675,6 +1681,25 @@ ollama_host = "http://localhost:11434"
             "names both servers: {notice}"
         );
         assert!(notice.contains("Settings"), "says where to set it: {notice}");
+    }
+
+    /// The notice goes to the log, so a password or token in either address
+    /// must not.
+    #[test]
+    fn a_leftover_ollama_url_notice_carries_no_credentials() {
+        let legacy = r#"
+[llm]
+ollama_url = "https://user:hunter2@gpu-box/ollama?token=abc"
+
+[memory]
+ollama_host = "https://me:pw@remote.example/ollama"
+"#;
+        let config: Config = toml::from_str(legacy).expect("parses");
+        let notice = retired_ollama_url_notice(legacy, &config).expect("announced");
+        for secret in ["hunter2", "user:", "token=abc", "me:pw"] {
+            assert!(!notice.contains(secret), "{secret} leaked: {notice}");
+        }
+        assert!(notice.contains("gpu-box") && notice.contains("remote.example"), "{notice}");
     }
 
     /// The same server, however it is spelled, moves nothing — the shipped

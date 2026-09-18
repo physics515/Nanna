@@ -796,7 +796,9 @@ fn check_anthropic_credential(config: &Config) -> Check {
 /// there, so a probe's "missing" is never about a model that goes elsewhere:
 /// - chat's models as the daemon walks them (`model_priority`, else `model`)
 ///   and the summarization list, by the chat router's rule;
-/// - `[llm].model` when `[llm].provider` is `ollama` too — the CLI's chat;
+/// - `[llm].model` when `[llm].provider` is `ollama` too: the config names
+///   Ollama for it, so that is where the operator expects it checked (the
+///   CLI cannot chat on Ollama, and the daemon routes chat by model name);
 /// - the embedding specs the daemon tries ([`embedding_specs`]), by the
 ///   embedding router's rule ([`split_embedding_spec`]).
 fn ollama_server_in_use(config: &Config) -> Option<OllamaServer> {

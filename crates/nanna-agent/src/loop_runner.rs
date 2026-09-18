@@ -5084,9 +5084,11 @@ impl Agent {
                 );
                 ctx.push_summarization_failure_notice(
                     dropped,
-                    "proactive compression found no tool results \
-                     to shrink, and measured growth says the next \
-                     step could overflow the context window",
+                    "proactive compression shrank no tool results \
+                     (there were none, or no summarization model \
+                     could shorten them in time), and measured growth \
+                     says the next step could overflow the context \
+                     window",
                 );
             }
         } else {
