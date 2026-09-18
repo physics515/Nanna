@@ -8,13 +8,35 @@
 
 use std::time::Duration;
 
+/// One model an Ollama server lists, as `/api/tags` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaModel {
+    /// The tag Ollama lists it under (`qwen3:8b`, `nomic-embed-text:latest`).
+    pub name: String,
+    /// On-disk size in bytes; `0` when the server did not say (an older
+    /// server, or a hand-written body). Never guessed.
+    pub size_bytes: u64,
+}
+
 /// Outcome of probing one Ollama server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OllamaProbe {
-    /// It answered `GET /api/tags`; these are the model names it has.
-    Reachable { models: Vec<String> },
+    /// It answered `GET /api/tags`; these are the models it has.
+    Reachable { models: Vec<OllamaModel> },
     /// Nothing usable answered; `reason` says what happened, in words.
     Unreachable { reason: String },
+}
+
+impl OllamaProbe {
+    /// The names of a reachable server's models, in the order listed; empty
+    /// when unreachable. The shape `doctor` and the daemon compare against.
+    #[must_use]
+    pub fn model_names(&self) -> Vec<&str> {
+        match self {
+            Self::Reachable { models } => models.iter().map(|m| m.name.as_str()).collect(),
+            Self::Unreachable { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Largest `/api/tags` answer the probe will read. A store of a few hundred
@@ -77,7 +99,7 @@ pub async fn probe_ollama(base_url: &str, timeout: Duration) -> OllamaProbe {
     debug_assert!(body.len() <= PROBE_BODY_BYTES_MAX, "the read is bounded");
     match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(tags) => OllamaProbe::Reachable {
-            models: model_names(&tags),
+            models: listed_models(&tags),
         },
         Err(e) => OllamaProbe::Unreachable {
             reason: format!("{url} did not answer like Ollama: {e}"),
@@ -85,22 +107,30 @@ pub async fn probe_ollama(base_url: &str, timeout: Duration) -> OllamaProbe {
     }
 }
 
-/// The `name` of every entry under `models` in an `/api/tags` body, bounded.
-fn model_names(tags: &serde_json::Value) -> Vec<String> {
-    let names: Vec<String> = tags
+/// Every named entry under `models` in an `/api/tags` body, bounded. An
+/// entry without a `name` is skipped (there is nothing to pull or pick);
+/// one without a `size` is kept at `size_bytes: 0`.
+fn listed_models(tags: &serde_json::Value) -> Vec<OllamaModel> {
+    let models: Vec<OllamaModel> = tags
         .get("models")
         .and_then(serde_json::Value::as_array)
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| m.get("name").and_then(serde_json::Value::as_str))
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(serde_json::Value::as_str)?;
+                    let size_bytes = m.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    Some(OllamaModel {
+                        name: name.to_string(),
+                        size_bytes,
+                    })
+                })
                 .take(PROBE_MODELS_MAX)
-                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default();
-    debug_assert!(names.len() <= PROBE_MODELS_MAX, "the list is bounded");
-    names
+    debug_assert!(models.len() <= PROBE_MODELS_MAX, "the list is bounded");
+    models
 }
 
 /// A transport failure in words a person can act on.
@@ -119,23 +149,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_names_come_from_the_models_array() {
+    fn models_come_from_the_models_array_with_their_sizes() {
         let tags = serde_json::json!({ "models": [
-            { "name": "qwen3:8b", "size": 1 },
+            { "name": "qwen3:8b", "size": 5_200_000_000_u64 },
             { "name": "nomic-embed-text:latest" },
             { "size": 3 }
         ]});
         assert_eq!(
-            model_names(&tags),
-            vec!["qwen3:8b", "nomic-embed-text:latest"]
+            listed_models(&tags),
+            vec![
+                OllamaModel { name: "qwen3:8b".to_string(), size_bytes: 5_200_000_000 },
+                // No size reported: kept, at zero — never invented.
+                OllamaModel { name: "nomic-embed-text:latest".to_string(), size_bytes: 0 },
+            ]
         );
+        let probe = OllamaProbe::Reachable { models: listed_models(&tags) };
+        assert_eq!(probe.model_names(), vec!["qwen3:8b", "nomic-embed-text:latest"]);
     }
 
     #[test]
     fn a_body_without_models_yields_none() {
-        let none: Vec<String> = Vec::new();
-        assert_eq!(model_names(&serde_json::json!({})), none);
-        assert_eq!(model_names(&serde_json::json!({ "models": "nope" })), none);
+        let none: Vec<OllamaModel> = Vec::new();
+        assert_eq!(listed_models(&serde_json::json!({})), none);
+        assert_eq!(listed_models(&serde_json::json!({ "models": "nope" })), none);
+        let down = OllamaProbe::Unreachable { reason: "x".to_string() };
+        assert!(down.model_names().is_empty());
     }
 
     /// A one-connection HTTP server on a free loopback port that answers its
@@ -164,14 +202,17 @@ mod tests {
     async fn a_reachable_server_reports_its_models() {
         let url = serve_once(
             "200 OK",
-            r#"{"models":[{"name":"qwen3:8b"},{"name":"bge-m3:latest"}]}"#,
+            r#"{"models":[{"name":"qwen3:8b","size":42},{"name":"bge-m3:latest"}]}"#,
         )
         .await;
         let probe = probe_ollama(&format!("{url}/"), Duration::from_secs(5)).await;
         assert_eq!(
             probe,
             OllamaProbe::Reachable {
-                models: vec!["qwen3:8b".to_string(), "bge-m3:latest".to_string()]
+                models: vec![
+                    OllamaModel { name: "qwen3:8b".to_string(), size_bytes: 42 },
+                    OllamaModel { name: "bge-m3:latest".to_string(), size_bytes: 0 },
+                ]
             }
         );
     }

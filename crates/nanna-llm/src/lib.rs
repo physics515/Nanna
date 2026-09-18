@@ -14,7 +14,7 @@ pub mod oauth;
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
 pub mod ollama_probe;
-pub use ollama_probe::{OllamaProbe, probe_ollama};
+pub use ollama_probe::{OllamaModel, OllamaProbe, probe_ollama};
 
 pub mod heal;
 pub use heal::{

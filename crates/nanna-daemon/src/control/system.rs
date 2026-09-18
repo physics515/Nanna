@@ -298,7 +298,9 @@ fn ollama_tag(model: &str) -> String {
 ///   models are not installed; each carries the `ollama pull` that fixes it.
 ///
 /// `wanted` is echoed back normalized (`name:tag`) so a client can show what
-/// was actually compared.
+/// was actually compared. `models` carries each installed model as
+/// `{ name, size_bytes }` — the GUI's model picker shows sizes, and this
+/// action is what it lists from.
 fn ollama_probe_report(
     base_url: &str,
     probe: &nanna_llm::OllamaProbe,
@@ -317,8 +319,12 @@ fn ollama_probe_report(
         nanna_llm::OllamaProbe::Reachable { models } => {
             let missing: Vec<Value> = wanted
                 .iter()
-                .filter(|want| !models.iter().any(|have| have.eq_ignore_ascii_case(want)))
+                .filter(|want| !models.iter().any(|have| have.name.eq_ignore_ascii_case(want)))
                 .map(|name| json!({ "name": name, "pull": format!("ollama pull {name}") }))
+                .collect();
+            let models: Vec<Value> = models
+                .iter()
+                .map(|m| json!({ "name": m.name, "size_bytes": m.size_bytes }))
                 .collect();
             json!({
                 "base_url": base_url,
@@ -340,6 +346,18 @@ mod ollama_probe_tests {
         models.iter().map(|m| (*m).to_string()).collect()
     }
 
+    fn installed(models: &[(&str, u64)]) -> OllamaProbe {
+        OllamaProbe::Reachable {
+            models: models
+                .iter()
+                .map(|(name, size_bytes)| nanna_llm::OllamaModel {
+                    name: (*name).to_string(),
+                    size_bytes: *size_bytes,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn a_dead_server_is_unreachable_and_claims_nothing_about_models() {
         let probe = OllamaProbe::Unreachable {
@@ -356,9 +374,7 @@ mod ollama_probe_tests {
 
     #[test]
     fn a_live_server_names_each_missing_model_with_its_pull_command() {
-        let probe = OllamaProbe::Reachable {
-            models: vec!["qwen3.5:9b".to_string(), "nomic-embed-text:latest".to_string()],
-        };
+        let probe = installed(&[("qwen3.5:9b", 6_000_000_000), ("nomic-embed-text:latest", 274_000_000)]);
         let report = ollama_probe_report(
             "http://localhost:11434",
             &probe,
@@ -366,7 +382,14 @@ mod ollama_probe_tests {
         );
         assert_eq!(report["reachable"], json!(true));
         assert!(report.get("reason").is_none(), "a reachable server has no failure reason");
-        assert_eq!(report["models"], json!(["qwen3.5:9b", "nomic-embed-text:latest"]));
+        // Sizes ride along: the GUI picker lists from this answer.
+        assert_eq!(
+            report["models"],
+            json!([
+                { "name": "qwen3.5:9b", "size_bytes": 6_000_000_000_u64 },
+                { "name": "nomic-embed-text:latest", "size_bytes": 274_000_000_u64 }
+            ])
+        );
         // `ollama/` stripped, `:latest` supplied — compared as Ollama lists them.
         assert_eq!(
             report["wanted"],
@@ -380,9 +403,7 @@ mod ollama_probe_tests {
 
     #[test]
     fn a_live_server_with_every_wanted_model_reports_nothing_missing() {
-        let probe = OllamaProbe::Reachable {
-            models: vec!["QWEN3.5:9b".to_string()],
-        };
+        let probe = installed(&[("QWEN3.5:9b", 0)]);
         let report = ollama_probe_report("http://gpu-box:11434", &probe, &wanted(&["qwen3.5:9b"]));
         assert_eq!(report["reachable"], json!(true));
         assert_eq!(report["missing"], json!([]), "tag comparison is case-insensitive");

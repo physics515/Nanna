@@ -762,7 +762,7 @@ fn judge_ollama_server(server: &OllamaServer, probe: &OllamaProbe) -> Vec<Check>
                 "start Ollama there (`ollama serve`), or point the config at the server that runs it",
             )];
         }
-        OllamaProbe::Reachable { models } => models,
+        OllamaProbe::Reachable { .. } => probe.model_names(),
     };
     let answered = Check::ok(
         "ollama.online",
@@ -1343,23 +1343,28 @@ mod tests {
         assert!(checks[0].remedy.is_some());
     }
 
+    fn installed(names: &[&str]) -> OllamaProbe {
+        OllamaProbe::Reachable {
+            models: names
+                .iter()
+                .map(|n| nanna_llm::OllamaModel {
+                    name: (*n).to_string(),
+                    size_bytes: 0,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn a_missing_model_fails_and_present_ones_pass() {
         let server = local_server(&["nomic-embed-text:latest", "qwen3:8b"]);
-        let all = OllamaProbe::Reachable {
-            models: vec![
-                "Qwen3:8b".to_string(),
-                "nomic-embed-text:latest".to_string(),
-            ],
-        };
+        let all = installed(&["Qwen3:8b", "nomic-embed-text:latest"]);
         let checks = judge_ollama_server(&server, &all);
         assert!(
             checks.iter().all(|c| c.severity == Severity::Ok),
             "{checks:?}"
         );
-        let one = OllamaProbe::Reachable {
-            models: vec!["qwen3:8b".to_string()],
-        };
+        let one = installed(&["qwen3:8b"]);
         let checks = judge_ollama_server(&server, &one);
         let models = checks
             .iter()

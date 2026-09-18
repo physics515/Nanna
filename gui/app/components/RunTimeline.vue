@@ -34,6 +34,17 @@
         <MarkdownContent :content="stripHarnessMarkers(item.content ?? '')" />
       </NuiMessage>
 
+      <!-- A message the user sent mid-run (P19 interjection), journaled where
+           it was sent so it sits after the assistant content that preceded it.
+           Rendered like the page's own user bubbles — raw content, no marker
+           stripping, since the user wrote it. -->
+      <NuiMessage
+        v-else-if="item.kind === 'user'"
+        role="user"
+      >
+        <MarkdownContent :content="item.content ?? ''" />
+      </NuiMessage>
+
       <!-- Healed provider fault: a seam in the run. Recorded so restarted
            thinking/text after it reads as "new attempt", not corruption. -->
       <div

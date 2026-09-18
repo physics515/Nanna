@@ -1051,12 +1051,26 @@ async function sendMessage() {
   // it into the live run at the next step boundary — holding it client-side
   // would make the user wait out a possibly hours-long run instead.
   if (hasActiveWork.value) {
-    messages.value.push({
-      id: Date.now().toString(),
-      role: 'user',
-      content: userMessage,
-      timestamp: new Date().toISOString(),
-    })
+    // Where it renders is the chronological question. The message list is
+    // drawn wholesale ABOVE the live journal, so pushing the interjection
+    // there placed it beside the previous reply while the run kept
+    // streaming underneath. With a journal in flight, journal it instead:
+    // it then lands after the assistant content streamed so far, and the
+    // next chunk opens a fresh segment below it. With no journal yet
+    // (nothing has streamed), the message list IS the chronological
+    // position — the loading indicator follows it.
+    const state = useSessionState(sessionId)
+    const journaled = liveTimeline.value.length > 0
+      ? state.timelineUserMessage(userMessage)
+      : null
+    if (!journaled) {
+      messages.value.push({
+        id: Date.now().toString(),
+        role: 'user',
+        content: userMessage,
+        timestamp: new Date().toISOString(),
+      })
+    }
     userScrolledUp.value = false
     await nextTick()
     scrollToBottom(true)
@@ -1069,7 +1083,10 @@ async function sendMessage() {
     } catch (error) {
       // The daemon queues it in PendingMessages either way; a transport
       // error here falls back to the old client-side queue so nothing is lost.
+      // A journal entry for a message the daemon never received is retracted —
+      // the queue re-renders it as a real message when it is actually sent.
       console.error('Interjection send failed, falling back to local queue:', error)
+      if (journaled) state.timelineRemove(journaled)
       queueMessage(userMessage)
     }
     return

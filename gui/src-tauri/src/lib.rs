@@ -247,6 +247,7 @@ pub fn run() {
             // Embedding configuration
             commands::settings::set_embedding_config,
             commands::settings::get_ollama_models,
+            commands::settings::probe_ollama,
             commands::settings::set_ollama_host,
             commands::settings::set_ollama_api_key,
             // Dynamic model fetching
