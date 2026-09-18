@@ -230,7 +230,7 @@ impl Backend {
     /// the health monitor start on that late connection too.
     ///
     /// The first init, the app's launch init, ends the status's report of an
-    /// init on its way (see [`Self::launch_init_pending`]). It never waits
+    /// init on its way (see `Self::launch_init_pending`). It never waits
     /// for that report: it is the init the report announces.
     pub async fn init<R: Runtime>(&self, app: &AppHandle<R>) -> BackendMode {
         // Already connected?

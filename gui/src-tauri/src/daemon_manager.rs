@@ -383,7 +383,7 @@ pub enum StartFailureKind {
 pub struct StartFailure {
     pub kind: StartFailureKind,
     /// What went wrong, for a person to read. For an exit it is the daemon's
-    /// own last error line when it printed one (see [`exit_reason`]), else
+    /// own last error line when it printed one (see `exit_reason`), else
     /// the exit code or signal.
     pub message: String,
     pub exit_code: Option<i32>,
@@ -1205,7 +1205,7 @@ impl DaemonManager {
     }
 
     /// The output lines of the current (or most recent) sidecar, oldest
-    /// first. At most [`BOOT_LOG_LINES`]; each spawn starts a new log.
+    /// first. At most `BOOT_LOG_LINES`; each spawn starts a new log.
     pub async fn boot_log(&self) -> Vec<BootLine> {
         let Some(watch) = self.latest_spawn.read().await.clone() else {
             return Vec::new();
@@ -1237,8 +1237,8 @@ impl DaemonManager {
     /// `Starting`. Otherwise it waits until a daemon answers on the port, for
     /// as long as the spawned sidecar stays alive. There is no deadline: a
     /// live sidecar whose port is still closed is booting (see
-    /// [`boot_wait_verdict`]). Before the spawn it also waits for the
-    /// previous sidecar to exit (see [`Self::previous_sidecar_gone`]).
+    /// `boot_wait_verdict`). Before the spawn it also waits for the
+    /// previous sidecar to exit (see `Self::previous_sidecar_gone`).
     /// [`Self::starting_for`] reports how long it has been.
     ///
     /// `since_stop` is the [`Self::stop_epoch`] the caller read when it
@@ -1721,9 +1721,9 @@ impl DaemonManager {
     ///
     /// Returns once the stop is done. A stop requested while another runs
     /// waits for it. A sidecar that had to be killed has been sent the kill
-    /// by then (see [`Sidecar::kill`]), so it cannot outlive an app that
+    /// by then (see `Sidecar::kill`), so it cannot outlive an app that
     /// exits right after. It may take a while to exit; the next spawn waits
-    /// for that (see [`Self::previous_sidecar_gone`]).
+    /// for that (see `Self::previous_sidecar_gone`).
     ///
     /// # Errors
     ///
