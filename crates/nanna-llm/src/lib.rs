@@ -7494,9 +7494,10 @@ mod tests {
         );
     }
 
-    /// Two servers in turn under one model name — the summarizer's client on
-    /// `[llm].ollama_url` (localhost by default) and chat's on the remote
-    /// `[memory].ollama_host`. Each keeps its own latch: the local server is
+    /// Two servers in turn under one model name — a client on this machine and
+    /// one on a remote server (as when `[memory].ollama_host` moves between
+    /// them, or, before 2026-09-18, when the summarizers had an Ollama address
+    /// of their own). Each keeps its own latch: the local server is
     /// not re-fitted on every return (a changed `num_ctx` makes Ollama evict
     /// and reload the model), and the remote server's demotion is not lost to
     /// a fresh start that faults the same way again.
@@ -7620,8 +7621,9 @@ mod tests {
         }
     }
 
-    /// One model, two servers: the summarizer's client on `[llm].ollama_url`
-    /// (this machine), chat's on a remote `[memory].ollama_host`. The local
+    /// One model, two servers: one client on this machine (where the
+    /// summarizers' own `[llm].ollama_url` pointed until 2026-09-18), another
+    /// on a remote `[memory].ollama_host`. The local
     /// server fitted 4096 while a game held the card; the remote one started
     /// at 16384, and chat's request was the latest. The summarizer's chunks
     /// are cut to the window its client reports, and its requests carry 4096:

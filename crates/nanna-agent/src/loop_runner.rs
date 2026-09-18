@@ -414,15 +414,13 @@ pub struct AgentConfig {
     pub nudge_interval_iterations: usize,
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
-    /// Model priority list for summarization (first working model is used)
-    /// Format: "provider/model" e.g. `["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku"]`
+    /// Model priority list for summarization, walked in this order: the next
+    /// model is tried whenever one cannot be reached or gives no usable answer.
+    /// Format: "provider/model" e.g. `["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku-4-5"]`.
+    /// Each entry becomes a client through the agent's resolver
+    /// ([`Agent::with_summarizer_clients`]), which owns the provider grammar
+    /// and the credentials; this config carries no address or key of its own.
     pub summarization_priority: Vec<String>,
-    /// Ollama URL for summarization (if using ollama)
-    pub summarization_ollama_url: Option<String>,
-    /// `OpenRouter` API key (for summarization/extraction via `OpenRouter` models)
-    pub openrouter_api_key: Option<String>,
-    /// `OpenAI` API key (for summarization/extraction via `OpenAI` models)
-    pub openai_api_key: Option<String>,
     /// Threshold (in chars) above which tool results are replaced with a
     /// memory-reference stub in context. 0 = auto (scales with model context window).
     /// Default: 0 (auto).
@@ -526,9 +524,6 @@ impl Default for AgentConfig {
             // budget and not another.
             thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
-            summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            openrouter_api_key: None,
-            openai_api_key: None,
             context_result_threshold: 0, // 0 = auto (scales with model context window)
             distillation_interval: 5,
             model_routing: vec![],

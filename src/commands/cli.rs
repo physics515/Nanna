@@ -134,7 +134,6 @@ pub async fn run_cli(
         temperature: config.llm.temperature,
         max_iterations: Some(10),
         summarization_priority: config.llm.summarization_priority.clone(),
-        summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()
     };
 
@@ -281,7 +280,6 @@ pub async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> a
         temperature: config.llm.temperature,
         max_iterations: Some(10),
         summarization_priority: config.llm.summarization_priority.clone(),
-        summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()
     };
 

@@ -188,12 +188,22 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
-    /// Model priority list for summarization (first working model is used)
-    /// Format: `["ollama/llama3.2", "ollama/mistral", "claude-haiku"]`
+    /// Model priority list for summarization, tried in order: the next model
+    /// answers when one cannot. Each entry is routed like a chat model, with
+    /// chat's credentials — `ollama/<model>` goes to `[memory].ollama_host`
+    /// with its bound token.
+    /// Format: `["ollama/llama3.2", "openrouter/<vendor>/<model>", "anthropic/claude-haiku-4-5"]`
     /// If empty, truncates instead of summarizing
     pub summarization_priority: Vec<String>,
-    /// Ollama server URL for summarization (if using ollama model)
-    pub ollama_url: Option<String>,
+    // NOTE: `ollama_url` was retired 2026-09-18 (owner decision: "summarization
+    // should follow the summarization model selection in settings, with
+    // fallbacks"). It was the summarizers' own Ollama address — localhost by
+    // default, with no token — so summaries went to a different server than
+    // chat whenever chat moved. Summaries now reach Ollama through chat's
+    // router. Existing config.toml files still carrying it load unchanged:
+    // nothing here uses `#[serde(deny_unknown_fields)]`, so serde ignores the
+    // stale key and the next save drops it. Covered by
+    // `legacy_llm_ollama_url_key_still_loads`.
     /// Ollama API key (optional — for remote/authenticated Ollama instances)
     pub ollama_api_key: Option<String>,
     /// Model routing priority for cost optimization.
@@ -292,7 +302,6 @@ impl Default for LlmConfig {
             anthropic_oauth_token: None,
             anthropic_use_oauth: false,
             summarization_priority: vec![], // Empty = truncate instead of summarize
-            ollama_url: Some("http://localhost:11434".to_string()),
             ollama_api_key: None,
             model_routing: vec![], // Empty = disabled (always use primary model)
             routing_first_turn_primary: true,
@@ -1591,6 +1600,30 @@ webhook_secret = "s3cret"
             .expect("the default config writes a [server] table");
         let server = server.split("\n[").next().unwrap_or_default();
         assert!(!server.contains("host"), "no host key is written: {server}");
+    }
+
+    #[test]
+    fn legacy_llm_ollama_url_key_still_loads() {
+        // `[llm].ollama_url` was retired 2026-09-18 (owner decision: summaries
+        // follow the Settings list through chat's providers). It was the
+        // summarizers' own Ollama address — localhost by default, no token —
+        // so every config ever saved carries it, and a config that refuses to
+        // parse is a dead app. The stale key must be ignored, and the keys
+        // beside it must still land.
+        let legacy = r#"
+[llm]
+summarization_priority = ["ollama/qwen3:4b"]
+ollama_url = "http://localhost:11434"
+model = "qwen3.5:9b"
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.llm.summarization_priority, vec!["ollama/qwen3:4b"]);
+        assert_eq!(config.llm.model, "qwen3.5:9b", "the keys beside it still land");
+
+        // And it is gone for good: a saved config no longer carries a key
+        // that looks like it points the summarizer somewhere.
+        let written = toml::to_string(&config).expect("config serializes");
+        assert!(!written.contains("ollama_url"), "no ollama_url is written: {written}");
     }
 
     // -----------------------------------------------------------------

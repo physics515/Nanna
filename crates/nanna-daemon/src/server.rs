@@ -5931,25 +5931,13 @@ impl DaemonBuilder {
             self.config.agent.model.clone_from(&config.llm.model);
         }
 
-        // Set summarization configuration
+        // Set summarization configuration. The list is all it takes: each
+        // entry resolves through the chat router, with chat's server, token
+        // and keys (`llm_router::summarizer_clients`).
         self.config
             .agent
             .summarization_priority
             .clone_from(&config.llm.summarization_priority);
-        self.config
-            .agent
-            .summarization_ollama_url
-            .clone_from(&config.llm.ollama_url);
-
-        // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
-        self.config
-            .agent
-            .openrouter_api_key
-            .clone_from(&config.llm.openrouter_api_key);
-        self.config
-            .agent
-            .openai_api_key
-            .clone_from(&config.llm.openai_api_key);
 
         // Thinking mode is NOT read from config: it is always on (owner
         // directive 2026-08-04). `AgentServiceConfig::default` already carries

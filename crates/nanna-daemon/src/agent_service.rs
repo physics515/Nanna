@@ -188,10 +188,10 @@ pub struct AgentServiceConfig {
     pub nudge_interval_iterations: usize,
     /// Default thinking mode
     pub thinking_mode: ThinkingMode,
-    /// Model priority list for summarization
+    /// Model priority list for summarization, in the order Settings lists it.
+    /// Resolved through the chat router (`llm_router::summarizer_clients`), so
+    /// it needs no address or key of its own.
     pub summarization_priority: Vec<String>,
-    /// Ollama URL for summarization
-    pub summarization_ollama_url: Option<String>,
     /// Model routing priority for cost optimization.
     /// Format: ["model:tier", ...] where tier is simple|medium|complex.
     pub model_routing: Vec<String>,
@@ -206,10 +206,6 @@ pub struct AgentServiceConfig {
     /// wins). Resolved at config load — empty here means the resolver already
     /// defaulted it to the main chat list, so consumers may use it verbatim.
     pub sub_agent_models: Vec<String>,
-    /// `OpenRouter` API key (passed to agents for summarization/extraction)
-    pub openrouter_api_key: Option<String>,
-    /// `OpenAI` API key (passed to agents for summarization/extraction)
-    pub openai_api_key: Option<String>,
     /// Anthropic prompt-cache lifetime for every breakpoint of a request.
     pub prompt_cache_ttl: CacheTtl,
 }
@@ -238,13 +234,10 @@ impl Default for AgentServiceConfig {
             // `agent.thinking_enabled` config flag is gone.
             thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
-            summarization_ollama_url: Some("http://localhost:11434".to_string()),
             model_routing: vec![],
             routing_first_turn_primary: true,
             sub_agent_model: None,
             sub_agent_models: vec![],
-            openrouter_api_key: None,
-            openai_api_key: None,
             prompt_cache_ttl: CacheTtl::FiveMinutes,
         }
     }
@@ -274,9 +267,6 @@ pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmC
         .cloned()
         .unwrap_or_else(|| llm.model.clone());
     cfg.summarization_priority.clone_from(&llm.summarization_priority);
-    cfg.summarization_ollama_url.clone_from(&llm.ollama_url);
-    cfg.openrouter_api_key.clone_from(&llm.openrouter_api_key);
-    cfg.openai_api_key.clone_from(&llm.openai_api_key);
     cfg.model_routing.clone_from(&llm.model_routing);
     cfg.routing_first_turn_primary = llm.routing_first_turn_primary;
     cfg.sub_agent_model.clone_from(&llm.sub_agent_model);
@@ -301,9 +291,6 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
         nudge_interval_iterations: config.nudge_interval_iterations,
         thinking_mode: config.thinking_mode,
         summarization_priority: config.summarization_priority.clone(),
-        summarization_ollama_url: config.summarization_ollama_url.clone(),
-        openrouter_api_key: config.openrouter_api_key.clone(),
-        openai_api_key: config.openai_api_key.clone(),
         model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
         routing_first_turn_primary: config.routing_first_turn_primary,
         prompt_cache_ttl: config.prompt_cache_ttl,
@@ -323,9 +310,9 @@ pub(crate) fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
 /// would run the user's pinned chat on globally-configured models from step 2
 /// onward, silently.
 ///
-/// Nothing else moves. `summarization_priority`, `summarization_ollama_url`,
-/// `sub_agent_model`, the provider keys and the whole iteration/nudge policy
-/// stay as `agent_config_from` produced them, because the pin names the CHAT
+/// Nothing else moves. `summarization_priority`, `sub_agent_model` and the
+/// whole iteration/nudge policy stay as `agent_config_from` produced them,
+/// because the pin names the CHAT
 /// model only. Embedding settings are not reachable from here at all — they
 /// live in `[embedding]` and nothing on the chat-turn path reads them.
 ///
@@ -2690,9 +2677,7 @@ mod tests {
         let llm = nanna_config::LlmConfig {
             model: "fallback-model".to_string(),
             model_priority: vec!["primary".to_string(), "secondary".to_string()],
-            ollama_url: Some("http://127.0.0.1:11434".to_string()),
-            openrouter_api_key: Some("or-key".to_string()),
-            openai_api_key: Some("oa-key".to_string()),
+            summarization_priority: vec!["ollama/summarizer".to_string()],
             model_routing: vec!["cheap:simple".to_string()],
             routing_first_turn_primary: false,
             sub_agent_models: vec!["sub".to_string()],
@@ -2703,9 +2688,9 @@ mod tests {
         // Head of the priority list wins, exactly as at boot.
         assert_eq!(cfg.model, "primary");
         assert_eq!(cfg.model_priority, vec!["primary".to_string(), "secondary".to_string()]);
-        assert_eq!(cfg.summarization_ollama_url.as_deref(), Some("http://127.0.0.1:11434"));
-        assert_eq!(cfg.openrouter_api_key.as_deref(), Some("or-key"));
-        assert_eq!(cfg.openai_api_key.as_deref(), Some("oa-key"));
+        // The summarization list is the whole of what summaries take from
+        // `[llm]`: its server, token and keys are chat's, through the router.
+        assert_eq!(cfg.summarization_priority, vec!["ollama/summarizer".to_string()]);
         assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
         assert!(!cfg.routing_first_turn_primary);
         assert_eq!(cfg.sub_agent_models, vec!["sub".to_string()]);
@@ -2754,7 +2739,6 @@ mod tests {
             model: "claude-sonnet-4".to_string(),
             model_priority: vec!["claude-sonnet-4".to_string()],
             summarization_priority: vec!["ollama/lfm2.5".to_string()],
-            summarization_ollama_url: Some("http://127.0.0.1:11434".to_string()),
             sub_agent_models: vec!["ollama/qwen3:4b".to_string()],
             model_routing: vec!["cheap:simple".to_string()],
             ..Default::default()
@@ -2767,10 +2751,6 @@ mod tests {
         assert_eq!(turn.model, "ollama/qwen3:14b");
         // Summarization stays global — the pin names the CHAT model only.
         assert_eq!(turn.summarization_priority, vec!["ollama/lfm2.5".to_string()]);
-        assert_eq!(
-            turn.summarization_ollama_url.as_deref(),
-            Some("http://127.0.0.1:11434")
-        );
         assert_eq!(turn.sub_agent_model, None, "sub-agents are not re-pointed by a chat pin");
 
         // The shared config every other consumer reads is untouched, so the
@@ -2802,8 +2782,6 @@ mod tests {
             nudge_after_iterations: 7,
             nudge_interval_iterations: 3,
             summarization_priority: vec!["ollama/lfm2.5".to_string()],
-            openrouter_api_key: Some("or-key".to_string()),
-            openai_api_key: Some("oa-key".to_string()),
             routing_first_turn_primary: false,
             ..Default::default()
         };
@@ -2819,9 +2797,6 @@ mod tests {
         assert_eq!(turn.nudge_interval_iterations, before.nudge_interval_iterations);
         assert_eq!(turn.thinking_mode, before.thinking_mode);
         assert_eq!(turn.summarization_priority, before.summarization_priority);
-        assert_eq!(turn.summarization_ollama_url, before.summarization_ollama_url);
-        assert_eq!(turn.openrouter_api_key, before.openrouter_api_key);
-        assert_eq!(turn.openai_api_key, before.openai_api_key);
         assert_eq!(turn.context_result_threshold, before.context_result_threshold);
         assert_eq!(turn.distillation_interval, before.distillation_interval);
         assert_eq!(turn.routing_first_turn_primary, before.routing_first_turn_primary);

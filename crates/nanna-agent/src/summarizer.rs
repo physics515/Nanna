@@ -81,8 +81,6 @@ pub fn resolve_summarizer(
 /// Configuration for the summarizer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummarizerConfig {
-    /// URL of Ollama instance for local summarization.
-    pub ollama_url: Option<String>,
     /// Minimum content length (bytes) before summarization is triggered.
     pub threshold: usize,
     /// Maximum summary length (tokens).
@@ -92,7 +90,6 @@ pub struct SummarizerConfig {
 impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
-            ollama_url: None,
             threshold: 50_000,
             max_summary_tokens: 1000,
         }
@@ -147,7 +144,7 @@ impl Summarizer {
     }
 
     /// Update configuration.
-    pub fn set_config(&mut self, config: SummarizerConfig) {
+    pub const fn set_config(&mut self, config: SummarizerConfig) {
         self.config = config;
     }
 

@@ -65,7 +65,6 @@ pub fn create_scheduler(
                 temperature: 0.7,
                 max_iterations: Some(5),
                 summarization_priority: vec![],
-                summarization_ollama_url: Some("http://localhost:11434".to_string()),
                 ..Default::default()
             };
 
