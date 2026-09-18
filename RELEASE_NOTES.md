@@ -79,9 +79,12 @@ which server chat was using; only the restart refused a server elsewhere. So wit
 machine and `OLLAMA_HOST` unset, a failing proxy there meant Nanna unloaded a model from the Ollama
 on your own computer and then killed it, and "waited for Ollama to come back" by checking that one.
 Recovery now uses the address in Settings → Models. It waits for that server wherever it is,
-sending its token, and stops waiting as soon as the server answers at all; it unloads or restarts
-only a server on this computer. `OLLAMA_HOST` no longer changes which server Nanna looks at: a local
-Ollama on another port is entered in Settings like any other address.
+sending its token, and stops waiting as soon as the server answers at all, or when you press Stop;
+it unloads or restarts only a server on this computer. `OLLAMA_HOST` no longer changes which server
+Nanna looks at: a local Ollama on another port is entered in Settings like any other address. Enter
+a server on this computer as `localhost` or `127.0.0.1`. Nanna treats any other address as another
+machine, this computer's own network name or LAN address included, so it will not restart that
+server or size its context window to this computer's card.
 
 **A remote Ollama's context window is no longer sized from this computer's graphics card.** Nanna
 sizes a local model's context window to the video memory free on this machine, and it did the same

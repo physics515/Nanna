@@ -2719,10 +2719,12 @@ impl AgentStepRunner {
         // retry, by which point the fault has repeated once, leaving
         // the first retry free for a genuinely transient drop.
         if let Some(reason) = wedge_reset_due(attempt, last_err, cur_wedge, prev_wedge) {
+            // The reset logs whether it went ahead: it declines a server that
+            // is not on this machine.
             tracing::warn!(
                 attempt,
                 ?reason,
-                "wedged runner — resetting it before the next attempt"
+                "wedged runner — asking for a runner reset before the next attempt"
             );
             self.reset_ollama_runner().await;
         }
@@ -4891,14 +4893,12 @@ mod tests {
             "the poll must carry chat's token"
         );
 
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr").port()
-        };
-        let router = LlmRouter::new().with_ollama(&format!("http://127.0.0.1:{port}"));
+        // Port 9: nothing listens there. A port freed by a dropped listener
+        // could be handed to a server another test binds at the same moment.
+        let router = LlmRouter::new().with_ollama("http://127.0.0.1:9");
         assert!(
             !wait_for_ollama_ready(&router, 0).await,
-            "nothing listens at the configured 127.0.0.1:{port}"
+            "nothing listens at the configured 127.0.0.1:9"
         );
     }
 
