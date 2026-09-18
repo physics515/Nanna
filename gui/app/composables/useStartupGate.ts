@@ -24,14 +24,22 @@ const pageEpoch = ref(0)
 export function useStartupGate() {
   const released = computed(() => everConnected.value || userContinued.value)
 
-  /** Record an attach. Only the first one matters, and it never re-arms the gate. */
-  function noteConnected() {
+  /**
+   * Record an attach. Only the first one matters, and it never re-arms the gate.
+   *
+   * `page.worksOffline` is the route's own `definePageMeta({ worksOffline: true })`:
+   * the page on screen works without a daemon and holds what the person
+   * typed into it (Settings' fields, the Logs filters).
+   */
+  function noteConnected(page: { worksOffline?: boolean } = {}) {
     if (everConnected.value) return
     everConnected.value = true
     // The pages that mounted offline fetched once, got nothing, and have no
     // reason to ask again. Remount the page so it does its load now. Only
     // this once: after a later reconnect the page already holds real data.
-    if (releasedOffline.value) pageEpoch.value += 1
+    // A page that works offline is kept: a remount would throw away its
+    // unsaved input, and a page opened after this mounts fresh anyway.
+    if (releasedOffline.value && !page.worksOffline) pageEpoch.value += 1
   }
 
   /** "Open Nanna anyway": the shell mounts without a daemon. */

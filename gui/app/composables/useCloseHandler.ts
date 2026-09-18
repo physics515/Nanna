@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { exit } from '@tauri-apps/plugin-process'
 import { readonly, ref } from 'vue'
 
 export type CloseMode = 'ask' | 'minimize_to_tray' | 'quit_completely'
@@ -36,42 +37,38 @@ export function useCloseHandler() {
   }
   
   /**
-   * Handle the window close request
-   * Returns true if close should proceed, false if handled (minimized or dialog shown)
+   * Act on a request to close the window, as the saved close mode says: open
+   * the close dialog ("ask"), hide to the tray, or quit. It does all of it
+   * itself, so a caller has nothing left to do afterwards.
+   *
+   * The window's own close is always prevented by its caller (the JS API
+   * would otherwise destroy the window, which the capabilities do not
+   * allow), so a close that did nothing here would leave no way out of the
+   * window. When the close mode cannot be read, this quits.
    */
-  async function handleClose(): Promise<boolean> {
-    console.log('[useCloseHandler] handleClose called')
+  async function handleClose(): Promise<void> {
+    let action: string
     try {
-      console.log('[useCloseHandler] Invoking handle_window_close...')
-      const action = await invoke<string>('handle_window_close')
-      console.log('[useCloseHandler] Backend returned action:', action)
-      
-      switch (action) {
-        case 'ask':
-          // Show the close dialog
-          console.log('[useCloseHandler] Showing close dialog')
-          showCloseDialog.value = true
-          console.log('[useCloseHandler] showCloseDialog is now:', showCloseDialog.value)
-          return false
-          
-        case 'minimized':
-          // Already minimized to tray
-          console.log('[useCloseHandler] Window minimized to tray')
-          return false
-          
-        case 'quit':
-          // Proceed with quit
-          console.log('[useCloseHandler] Proceeding with quit')
-          await performQuit()
-          return true
-          
-        default:
-          console.log('[useCloseHandler] Unknown action, returning true')
-          return true
-      }
+      action = await invoke<string>('handle_window_close')
     } catch (e) {
-      console.error('[useCloseHandler] Failed to handle close:', e)
-      return true
+      // Refused until Rust has managed the app's state, which waits on
+      // Config::load's keyring read (a locked Secret Service holds it for as
+      // long as its unlock prompt is up).
+      console.error('[useCloseHandler] Close mode unavailable, quitting:', e)
+      await performQuit()
+      return
+    }
+
+    switch (action) {
+      case 'ask':
+        showCloseDialog.value = true
+        return
+      case 'minimized':
+        // handle_window_close already hid the window.
+        return
+      default:
+        // 'quit', or an answer this build does not know: a close ends the app.
+        await performQuit()
     }
   }
   
@@ -104,16 +101,18 @@ export function useCloseHandler() {
   }
   
   /**
-   * Perform the actual quit
+   * Quit: perform_quit stops the daemon, then exits.
    */
   async function performQuit(): Promise<void> {
     try {
       await invoke('perform_quit')
     } catch (e) {
       console.error('Failed to perform quit:', e)
-      // Force exit if perform_quit fails
-      const window = getCurrentWindow()
-      await window.destroy()
+      // perform_quit is refused until the app's state is managed. exit()
+      // needs no state (process:default grants it), and the exit hook in
+      // lib.rs still stops a daemon that was started by then. The window's
+      // destroy() is not granted at all, so it did nothing here.
+      await exit(0)
     }
   }
   

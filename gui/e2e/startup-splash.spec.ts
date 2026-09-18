@@ -121,6 +121,89 @@ test.describe('startup splash', () => {
     await expect(page.locator('[data-e2e-mounted="online"]')).toHaveCount(1)
   })
 
+  test('keeps Settings as it is on the first attach, typed input and all', async ({ page, mock }) => {
+    await mock.gotoWithMock('/settings', { boot: { daemon_state: 'starting', starting_for_s: 3 } })
+    await splash(page).getByRole('button', { name: 'Open Nanna anyway' }).click()
+    const keyField = page
+      .locator('input[type="password"], input[placeholder*="sk-"], input[autocomplete="off"]')
+      .first()
+    await expect(keyField).toBeVisible()
+    await keyField.fill('sk-typed-while-offline')
+    await keyField.evaluate((el) => el.setAttribute('data-e2e-mounted', 'offline'))
+
+    await mock.attach()
+    await expect(page.locator('footer')).toContainText('Connected')
+    // Nothing to wait for when nothing happens: give a remount (which lands
+    // within a frame or two of the footer's change) ample time to show.
+    await page.waitForTimeout(1_000)
+    await expect(page.locator('[data-e2e-mounted="offline"]')).toHaveValue('sk-typed-while-offline')
+  })
+
+  test('keeps Logs as it is on the first attach, filter and all', async ({ page, mock }) => {
+    await mock.gotoWithMock('/logs', { boot: { daemon_state: 'starting', starting_for_s: 3 } })
+    await splash(page).getByRole('button', { name: 'Open Nanna anyway' }).click()
+    const search = page.getByRole('textbox', { name: 'Search logs' })
+    await expect(search).toBeVisible()
+    await search.fill('Attached')
+    await search.evaluate((el) => el.setAttribute('data-e2e-mounted', 'offline'))
+
+    await mock.attach()
+    await expect(page.locator('footer')).toContainText('Connected')
+    await page.waitForTimeout(1_000)
+    await expect(page.locator('[data-e2e-mounted="offline"]')).toHaveValue('Attached')
+  })
+
+  test('opening anyway mid-boot mounts the whole shell without waiting for the boot', async ({ page, mock }) => {
+    await mock.gotoWithMock('/', { boot: { daemon_state: 'starting', starting_for_s: 3 } })
+    await splash(page).getByRole('button', { name: 'Open Nanna anyway' }).click()
+    await expect(shell(page)).toBeVisible()
+    // The first load ran while the boot goes on: the chat list is filled.
+    await expect(page.getByRole('button', { name: /^Welcome/ })).toBeVisible()
+    await expect(page.locator('footer')).toContainText('Starting')
+    // And the window's own close reaches the shell's handler, which asks.
+    // Emitted until heard: the handler is registered a few awaits in.
+    await expect(async () => {
+      await mock.emit('tauri://close-requested', {})
+      await expect(page.getByText('Close Nanna?')).toBeVisible({ timeout: 500 })
+    }).toPass({ timeout: 12_000 })
+  })
+
+  test('stays readable in a window whose animations never advance', async ({ page, mock }) => {
+    await mock.gotoWithMock('/', { boot: { daemon_state: 'crashed', retrying: true, last_error: ipcPortTaken } })
+    await expect(splashStatus(page)).toHaveText('The daemon exited while starting')
+    // The tauri-webdriver window renders no frames, so each CSS animation sits
+    // at its first keyframe there. Hold every one of them at t=0.
+    const held = await page.evaluate(() => {
+      const animations = document.getAnimations()
+      for (const animation of animations) {
+        animation.pause()
+        animation.currentTime = 0
+      }
+      return animations.length
+    })
+    expect(held).toBeGreaterThan(0)
+
+    /** Opacity as painted: the element's own times every ancestor's. */
+    const paintedOpacity = (locator: ReturnType<Page['locator']>) =>
+      locator.evaluate((el) => {
+        let opacity = 1
+        for (let node: Element | null = el; node; node = node.parentElement) {
+          opacity *= Number(getComputedStyle(node).opacity)
+        }
+        return opacity
+      })
+    const targets = [
+      splash(page).getByRole('alert'),
+      splash(page).getByRole('button', { name: 'Restart the daemon' }),
+      splash(page).getByRole('button', { name: 'Open Nanna anyway' }),
+      splash(page).getByRole('button', { name: 'Show log' }),
+      splash(page).getByRole('button', { name: 'Quit' }),
+    ]
+    for (const target of targets) {
+      expect(await paintedOpacity(target)).toBeGreaterThan(0.9)
+    }
+  })
+
   test('opens anyway on Esc', async ({ page, mock }) => {
     await mock.gotoWithMock('/', { boot: { daemon_state: 'starting', starting_for_s: 3 } })
     await expect(splash(page)).toBeVisible()

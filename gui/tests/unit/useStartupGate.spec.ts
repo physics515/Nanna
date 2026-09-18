@@ -43,6 +43,18 @@ describe('useStartupGate', () => {
     expect(gate.pageEpoch.value).toBe(1)
   })
 
+  it('keeps a page that works offline across the first attach', async () => {
+    const gate = await freshGate()
+    gate.continueOffline()
+    // Settings or logs: it may hold unsaved input, and a remount would drop it.
+    gate.noteConnected({ worksOffline: true })
+    expect(gate.released.value).toBe(true)
+    expect(gate.pageEpoch.value).toBe(0)
+    // The one chance to remount has passed: a later attach is not the first.
+    gate.noteConnected()
+    expect(gate.pageEpoch.value).toBe(0)
+  })
+
   it('never re-arms: nothing takes the release back', async () => {
     const gate = await freshGate()
     gate.noteConnected()

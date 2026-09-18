@@ -686,8 +686,10 @@ function installInPage(options = {}) {
 
       case 'get_close_mode':
         return 'ask';
-      case 'set_close_mode':
       case 'handle_window_close':
+        // What the default close mode answers: the window opens CloseDialog.
+        return 'ask';
+      case 'set_close_mode':
       case 'hide_to_tray':
       case 'perform_quit':
         return true;

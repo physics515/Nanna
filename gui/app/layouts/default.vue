@@ -122,6 +122,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { statusBarLabel } from '~/lib/backendLabels'
 import { seedChatModel } from '~/composables/useSessionState'
 import { useAppUpdater } from '~/composables/useAppUpdater'
+import { useStartupGate } from '~/composables/useStartupGate'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
 import type { NuiRailItem } from '~/components/nui/NuiMainMenu.vue'
@@ -353,6 +354,7 @@ provide('showWorkspacePicker', showWorkspacePicker)
 
 const { checkPermission } = useNotifications()
 const { init: initBackend, status: backendStatus, daemonVersion } = useBackend()
+const { releasedOffline } = useStartupGate()
 const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
 
 const { bind: bindShortcut } = useShortcuts()
@@ -498,7 +500,14 @@ onMounted(async () => {
       document.documentElement.classList.add('density-compact')
     }
   } catch { /* ignore */ }
-  const mode = await initBackend()
+  // Opened with "Open Nanna anyway", init joins the boot in flight, or starts
+  // a daemon that is not running, and answers only when that boot ends, which
+  // has no deadline. Awaited, it held back everything below (the first load,
+  // the listeners, the close handler) for the whole boot. Start it and go on:
+  // the attach watcher below loads what needs a daemon once one answers.
+  let mode: 'daemon' | 'disconnected' = 'disconnected'
+  if (releasedOffline.value) void initBackend()
+  else mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   loadTabsFromStorage()
   // Without a daemon the workspace list comes back empty, and loading it would

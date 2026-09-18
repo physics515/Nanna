@@ -5,7 +5,8 @@
          leaves by v-if, never by a leave transition: those wait on
          requestAnimationFrame, which can stall in a hidden or automated window.
          The page key changes once, on the first attach after opening without
-         a daemon, so a page that loaded offline loads again. -->
+         a daemon, so a page that loaded offline loads again (not one that
+         works offline: see useStartupGate's noteConnected). -->
     <NuxtLayout v-if="released">
       <NuxtPage :key="pageEpoch" />
     </NuxtLayout>
@@ -22,11 +23,14 @@ import { useStartupGate } from '~/composables/useStartupGate'
 
 const { status } = useBackend()
 const { released, pageEpoch, noteConnected } = useStartupGate()
+const route = useRoute()
 
 watch(
   () => status.value?.connected === true,
   (connected) => {
-    if (connected) noteConnected()
+    // Settings and Logs declare worksOffline: they may hold unsaved input,
+    // so the first attach keeps them instead of remounting them.
+    if (connected) noteConnected({ worksOffline: route.meta.worksOffline === true })
   },
   { immediate: true },
 )
