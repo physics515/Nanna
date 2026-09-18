@@ -145,19 +145,22 @@
           <div class="space-y-3 pt-1 border-t border-white/[0.04]">
             <div>
               <label class="block text-xs text-nanna-text-dim mb-1">Server URL</label>
-              <div class="flex gap-2">
-                <UiInput v-model="ollamaHostInput" data-testid="ollama-host" placeholder="http://localhost:11434" class="flex-1" />
-                <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
-              </div>
+              <UiInput v-model="ollamaHostInput" data-testid="ollama-host" placeholder="http://localhost:11434" />
               <p class="text-[11px] text-nanna-text-muted mt-1">The address that answers <code>/api/tags</code> — Nanna adds <code>/api/…</code> itself. Include any path the server lives under, e.g. <code>https://host/ollama</code>.</p>
             </div>
             <div>
               <label class="block text-xs text-nanna-text-dim mb-1">Bearer token <span class="text-nanna-text-dim/60">(optional)</span></label>
               <div class="flex gap-2">
-                <UiInput v-model="ollamaApiKeyInput" data-testid="ollama-token" type="password" placeholder="Only if the server requires one" class="flex-1" />
-                <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
+                <UiInput v-model="ollamaTokenInput" data-testid="ollama-token" type="password" :placeholder="ollamaTokenPlaceholder" class="flex-1" />
+                <UiButton v-if="settings?.ollama_token_saved" data-testid="ollama-token-remove" @click="removeOllamaToken" :disabled="savingOllama" size="sm" variant="ghost">Remove token</UiButton>
               </div>
-              <p class="text-[11px] text-nanna-text-muted mt-1">Sent as <code>Authorization: Bearer …</code> to this server only. Stored in your OS keychain.</p>
+              <p v-if="ollamaTokenElsewhere" data-testid="ollama-token-elsewhere" class="text-[11px] text-nanna-text-muted mt-1">The saved token is for <code>{{ ollamaTokenElsewhere }}</code> and is not sent to this address. Enter one here if this server needs it.</p>
+              <p v-if="settings?.ollama_token_from_env" data-testid="ollama-token-env" class="text-[11px] text-nanna-text-muted mt-1"><code>OLLAMA_API_KEY</code> is set in Nanna's environment, so its token is sent to this address — to whatever address is set here — instead of a saved one.</p>
+              <p v-if="ollamaTokenInClear" data-testid="ollama-token-cleartext" class="text-[11px] text-nanna-warning mt-1">This address is plain http:// to another machine, so the token would cross the network unencrypted. Use https:// if the server offers it.</p>
+              <p class="text-[11px] text-nanna-text-muted mt-1">Sent as <code>Authorization: Bearer …</code> only to the server it was saved for. Stored in your OS keychain; leave empty to keep the saved one.</p>
+            </div>
+            <div class="flex justify-end">
+              <UiButton data-testid="ollama-save" @click="saveOllamaConnection" :disabled="savingOllama" size="sm">Save</UiButton>
             </div>
           </div>
         </div>
@@ -320,6 +323,7 @@ import {
   Brain, AlertTriangle, Layers, Link, ScanText, Bot
 } from '@lucide/vue'
 import { useSettingsPage } from '~/composables/useSettingsPage'
+import { sameOllamaServer, sendsTokenInClear } from '~/lib/ollamaServer'
 
 const store = useSettingsPage()
 const {
@@ -334,7 +338,34 @@ const {
 const selectedModel = ref('')
 const selectedEmbeddingModel = ref('')
 const ollamaHostInput = ref('')
-const ollamaApiKeyInput = ref('')
+/** The address the field last showed from the saved settings. While the field
+ *  differs from it, it holds an unsaved edit that a reload must not replace. */
+let ollamaHostShown = ''
+/** Only ever what the user types: the page is not sent the saved token. */
+const ollamaTokenInput = ref('')
+const savingOllama = ref(false)
+
+/** The saved token goes to the address in the field. */
+const ollamaTokenIsForHost = computed(() => {
+  const host = settings.value?.ollama_token_host
+  return !!settings.value?.ollama_token_saved && !!host && sameOllamaServer(host, ollamaHostInput.value)
+})
+/** The server the saved token belongs to, when it is not the one in the field. */
+const ollamaTokenElsewhere = computed(() =>
+  settings.value?.ollama_token_saved && settings.value.ollama_token_host && !ollamaTokenIsForHost.value
+    ? settings.value.ollama_token_host
+    : null,
+)
+const ollamaTokenPlaceholder = computed(() =>
+  ollamaTokenIsForHost.value ? 'A token is saved for this server — type to replace it' : 'Only if the server requires one',
+)
+/** A token that would go to this address over plain http to another machine:
+ *  one being typed, the one saved for it, or the environment's. */
+const ollamaTokenInClear = computed(
+  () =>
+    sendsTokenInClear(ollamaHostInput.value) &&
+    (ollamaTokenInput.value.trim() !== '' || ollamaTokenIsForHost.value || !!settings.value?.ollama_token_from_env),
+)
 
 // Model priority lists (fallback chains)
 const chatModelPriority = ref<string[]>([])
@@ -366,8 +397,10 @@ store.onSettingsLoaded(async () => {
   if (!settings.value) return
   selectedModel.value = settings.value.model
   selectedEmbeddingModel.value = settings.value.embedding_model
-  ollamaHostInput.value = settings.value.ollama_host
-  ollamaApiKeyInput.value = settings.value.ollama_api_key || ''
+  // Reloads come after every save and on each config-changed event; an
+  // address being edited stays as typed. The token field is never filled.
+  if (ollamaHostInput.value === ollamaHostShown) ollamaHostInput.value = settings.value.ollama_host
+  ollamaHostShown = settings.value.ollama_host
   claudeProxyUrl.value = settings.value.claude_proxy_url || 'http://localhost:3456'
 
   // Load model priority lists
@@ -605,27 +638,47 @@ async function updateModel() {
   }
 }
 
-async function saveOllamaHost() {
+/** One Save for the Ollama block: the address, then the token (saved for that
+ *  address — the only server it is sent to), then a re-check of the server.
+ *  An empty token field keeps the saved token; "Remove token" clears it. */
+async function saveOllamaConnection() {
+  const typedHost = ollamaHostInput.value
+  const host = typedHost.trim()
+  const token = ollamaTokenInput.value.trim()
+  savingOllama.value = true
   try {
-    await invoke('set_ollama_host', { host: ollamaHostInput.value })
-    showToast('Ollama host saved', 'success')
-    await refreshOllamaModels()
-    await loadSettings()
+    if (host !== settings.value?.ollama_host) {
+      await invoke('set_ollama_host', { host })
+      // Saved: the reload below may show it as stored (trimmed, no trailing
+      // slash) — unless it was edited again meanwhile.
+      if (ollamaHostInput.value === typedHost) ollamaHostShown = typedHost
+    }
+    if (token) {
+      await invoke('set_ollama_api_key', { key: token })
+      if (ollamaTokenInput.value.trim() === token) ollamaTokenInput.value = ''
+    }
+    showToast(token ? 'Ollama server and token saved' : 'Ollama server saved', 'success')
   } catch (e: any) {
     showToast(`Couldn't save: ${e.message || e}`, 'error')
+  } finally {
+    savingOllama.value = false
   }
+  // Re-check the server (the reload probes it): the address or a token is
+  // usually why a remote one was refusing.
+  await loadSettings()
 }
 
-async function saveOllamaApiKey() {
+async function removeOllamaToken() {
+  savingOllama.value = true
   try {
-    await invoke('set_ollama_api_key', { key: ollamaApiKeyInput.value })
-    showToast(ollamaApiKeyInput.value.trim() ? 'Ollama token saved' : 'Ollama token removed', 'success')
-    // Re-check the server: a token is usually why a remote one was refusing.
-    await refreshOllamaModels()
-    await loadSettings()
+    await invoke('set_ollama_api_key', { key: '' })
+    showToast('Ollama token removed', 'success')
   } catch (e: any) {
-    showToast(`Couldn't save: ${e.message || e}`, 'error')
+    showToast(`Couldn't remove: ${e.message || e}`, 'error')
+  } finally {
+    savingOllama.value = false
   }
+  await loadSettings()
 }
 
 async function setEmbeddingProvider(provider: string) {

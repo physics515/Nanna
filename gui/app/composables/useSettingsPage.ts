@@ -37,7 +37,13 @@ export interface ExtendedSettings {
   embedding_model: string
   embedding_enabled: boolean
   ollama_host: string
-  ollama_api_key: string
+  /** Whether an Ollama bearer token is saved, and the server it is sent to.
+   *  The token itself never reaches the page. */
+  ollama_token_saved: boolean
+  ollama_token_host: string | null
+  /** `OLLAMA_API_KEY` is set: its token goes to whatever address is
+   *  configured, ahead of any saved one. */
+  ollama_token_from_env: boolean
   tools: ToolInfo[]
   dreaming_enabled: boolean
   auto_remember_messages: boolean

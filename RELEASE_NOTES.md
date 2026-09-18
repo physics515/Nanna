@@ -51,9 +51,10 @@ an Ollama server address and an optional bearer token. The address can be a loca
 another machine, or any Ollama-compatible server behind a proxy. Give the path the server lives
 under, for example `https://host/ollama`; Nanna adds `/api/…` itself. The token is kept in your OS
 keychain and sent as `Authorization: Bearer …` to that server only: chat, embeddings, model details
-and the connection check all carry it. When the server won't talk, you're told why. It wants a
-token, or it refused the one you gave, or nothing Ollama-compatible answers at that address (which
-usually means the path is missing).
+and the connection check all carry it. (A token set in the `OLLAMA_API_KEY` environment variable
+instead goes to whatever address is configured, and Settings says so.) When the server won't talk,
+you're told why. It wants a token, or it refused the one you gave, or nothing Ollama-compatible
+answers at that address (which usually means the path is missing).
 
 ## What's Fixed
 

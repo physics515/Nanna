@@ -168,7 +168,10 @@ pub struct ExtendedSettings {
 
     // Ollama configuration
     pub ollama_host: String,
-    pub ollama_api_key: String,
+    /// Whether a bearer token is saved and which server it is for — never
+    /// the token itself, which the webview has no use for.
+    #[serde(flatten)]
+    pub ollama_token: OllamaTokenStatus,
 
     // Generation params
     pub temperature: f32,
@@ -213,6 +216,42 @@ pub struct ClaudeProxyStatus {
 pub struct AnthropicOauthStatus {
     pub anthropic_oauth_logged_in: bool,
     pub anthropic_use_oauth: bool,
+}
+
+/// The saved Ollama bearer token, described without revealing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OllamaTokenStatus {
+    pub ollama_token_saved: bool,
+    /// The server the token is sent to — and only it. `None` when no token
+    /// is saved, or the store cannot say which server it is for (it is sent
+    /// to none then).
+    pub ollama_token_host: Option<String>,
+    /// `OLLAMA_API_KEY` is set: that token goes to whatever address is
+    /// configured, ahead of any saved one — so what the page says about the
+    /// saved token is not the whole story.
+    pub ollama_token_from_env: bool,
+}
+
+/// What the store says about the saved Ollama token, and whether
+/// `OLLAMA_API_KEY` overrides it. A token saved by an older build recorded no
+/// server; it is the configured one's, as the daemon reads it.
+fn ollama_token_status(
+    store: &nanna_config::SecureStore,
+    configured_host: &str,
+    env_token: Option<&str>,
+) -> OllamaTokenStatus {
+    let saved = store.ollama_token().is_some();
+    OllamaTokenStatus {
+        ollama_token_saved: saved,
+        ollama_token_host: saved
+            .then(|| match store.ollama_token_host() {
+                Ok(Some(host)) => Some(host),
+                Ok(None) => Some(nanna_config::normalize_ollama_host(configured_host)),
+                Err(_) => None,
+            })
+            .flatten(),
+        ollama_token_from_env: env_token.is_some_and(|token| !token.trim().is_empty()),
+    }
 }
 
 /// Memory consolidation and capture settings.
@@ -263,34 +302,62 @@ pub async fn get_extended_settings(
         .and_then(|r| tool_infos(&r))
         .unwrap_or_default();
 
-    let state_guard = state.read().await;
+    let config = state.read().await.config.clone();
+    // Keyring reads, made after the state lock is released and off the async
+    // runtime: they can block on an unlock prompt.
+    let configured_host = config.memory.ollama_host.clone();
+    let ollama_token = tokio::task::spawn_blocking(move || {
+        let env_token = std::env::var("OLLAMA_API_KEY").ok();
+        ollama_token_status(
+            &nanna_config::SecureStore::new(),
+            &configured_host,
+            env_token.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or(OllamaTokenStatus {
+        ollama_token_saved: false,
+        ollama_token_host: None,
+        ollama_token_from_env: false,
+    });
+    Ok(build_extended_settings(&config, tools, ollama_token))
+}
 
-    Ok(ExtendedSettings {
+/// The settings page's view of `config`, with `tools` from the daemon.
+///
+/// Pure apart from environment reads, so what reaches the webview is
+/// testable without a running app.
+fn build_extended_settings(
+    config: &nanna_config::Config,
+    tools: Vec<ToolInfo>,
+    ollama_token: OllamaTokenStatus,
+) -> ExtendedSettings {
+    ExtendedSettings {
         llm_api_keys: LlmApiKeys {
-            anthropic_key_set: state_guard.config.llm.api_key.is_some()
+            anthropic_key_set: config.llm.api_key.is_some()
                 || std::env::var("ANTHROPIC_API_KEY").is_ok(),
-            openai_key_set: state_guard.config.llm.openai_api_key.is_some()
+            openai_key_set: config.llm.openai_api_key.is_some()
                 || std::env::var("OPENAI_API_KEY").is_ok(),
-            openrouter_key_set: state_guard.config.llm.openrouter_api_key.is_some()
+            openrouter_key_set: config.llm.openrouter_api_key.is_some()
                 || std::env::var("OPENROUTER_API_KEY").is_ok(),
         },
-        github_key_set: state_guard.config.llm.github_token.is_some()
+        github_key_set: config.llm.github_token.is_some()
             || std::env::var("GITHUB_TOKEN").is_ok(),
         claude_proxy: ClaudeProxyStatus {
             claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
             claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
                 .unwrap_or_else(|_| "http://localhost:3456".to_string()),
         },
-        brave_key_set: state_guard.config.tools.brave_api_key.is_some()
+        brave_key_set: config.tools.brave_api_key.is_some()
             || std::env::var("BRAVE_API_KEY").is_ok(),
 
         // Anthropic OAuth status
         anthropic_oauth: AnthropicOauthStatus {
-            anthropic_oauth_logged_in: state_guard.config.llm.anthropic_oauth_token.is_some(),
-            anthropic_use_oauth: state_guard.config.llm.anthropic_use_oauth,
+            anthropic_oauth_logged_in: config.llm.anthropic_oauth_token.is_some(),
+            anthropic_use_oauth: config.llm.anthropic_use_oauth,
         },
 
-        provider: state_guard.config.llm.provider.clone(),
+        provider: config.llm.provider.clone(),
         available_providers: vec![
             "anthropic".to_string(),
             "openai".to_string(),
@@ -300,14 +367,14 @@ pub async fn get_extended_settings(
             "ollama".to_string(),
         ],
 
-        model: state_guard.config.llm.model.clone(),
+        model: config.llm.model.clone(),
         available_models: known_chat_models(),
 
         // Embedding settings come from the config cache (the daemon reads the
         // same file), separate from chat.
-        embedding_provider: state_guard.config.memory.embedding_provider.clone(),
-        embedding_model: state_guard.config.memory.embedding_model.clone(),
-        embedding_enabled: state_guard.config.memory.enabled,
+        embedding_provider: config.memory.embedding_provider.clone(),
+        embedding_model: config.memory.embedding_model.clone(),
+        embedding_enabled: config.memory.enabled,
         available_embedding_providers: vec![
             "openai".to_string(),
             "ollama".to_string(),
@@ -323,11 +390,11 @@ pub async fn get_extended_settings(
             "all-minilm".to_string(),              // 384 dims
         ],
 
-        ollama_host: state_guard.config.memory.ollama_host.clone(),
-        ollama_api_key: state_guard.config.llm.ollama_api_key.clone().unwrap_or_default(),
+        ollama_host: config.memory.ollama_host.clone(),
+        ollama_token,
 
         // Memory extraction model
-        extraction_model: state_guard.config.memory.extraction_model.clone(),
+        extraction_model: config.memory.extraction_model.clone(),
         available_extraction_models: vec![
             String::new(), // Empty = use chat model
             "claude-3-5-haiku-20241022".to_string(),
@@ -346,24 +413,24 @@ pub async fn get_extended_settings(
             // Dreaming has no daemon control action yet; its setter is still a
             // no-op, so report the enabled default.
             dreaming_enabled: true,
-            auto_remember_messages: state_guard.config.memory.auto_remember_messages,
-            max_compression_ratio: state_guard.config.memory.max_compression_ratio,
-            min_remaining_memories: state_guard.config.memory.min_remaining_memories,
+            auto_remember_messages: config.memory.auto_remember_messages,
+            max_compression_ratio: config.memory.max_compression_ratio,
+            min_remaining_memories: config.memory.min_remaining_memories,
         },
         // Scheduler toggles are real settings now — read them back from the
         // config the daemon also reads, so the switches reflect what the daemon
         // is doing instead of hardcoded `true`s that never moved.
         scheduler: SchedulerSettings {
-            scheduler_enabled: state_guard.config.scheduler.enabled,
-            heartbeat_enabled: state_guard.config.scheduler.heartbeat_enabled,
-            heartbeat_interval_seconds: state_guard.config.scheduler.heartbeat_interval_secs,
+            scheduler_enabled: config.scheduler.enabled,
+            heartbeat_enabled: config.scheduler.heartbeat_enabled,
+            heartbeat_interval_seconds: config.scheduler.heartbeat_interval_secs,
         },
 
         // Agent-loop iteration policy
-        agent_max_iterations: state_guard.config.agent.max_iterations,
-        agent_nudge_after_iterations: state_guard.config.agent.nudge_after_iterations,
-        agent_nudge_interval_iterations: state_guard.config.agent.nudge_interval_iterations,
-    })
+        agent_max_iterations: config.agent.max_iterations,
+        agent_nudge_after_iterations: config.agent.nudge_after_iterations,
+        agent_nudge_interval_iterations: config.agent.nudge_interval_iterations,
+    }
 }
 
 /// Set memory extraction model (empty string = use chat model)
@@ -982,12 +1049,17 @@ pub async fn check_env_var(name: String) -> Result<bool, String> {
 
 /// Set Ollama host URL
 ///
+/// The saved bearer token does not follow the address: it is bound to the
+/// server it was saved for, and a token saved by an older build (no server
+/// recorded) is first bound to the address being replaced.
+///
 /// # Errors
 ///
 /// Returns `Ollama host must start with http:// or https://` for any other URL,
-/// before anything changes. Returns `Failed to save config: …` when
-/// `config.toml` cannot be written; the cached host has already changed then,
-/// but the daemon is not told.
+/// and `Failed to record which server the saved Ollama token belongs to: …`
+/// when an unbound token cannot be bound, before anything changes. Returns
+/// `Failed to save config: …` when `config.toml` cannot be written; the cached
+/// host has already changed then, but the daemon is not told.
 #[tauri::command]
 pub async fn set_ollama_host(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1004,10 +1076,25 @@ pub async fn set_ollama_host(
     }
 
     // Remove trailing slash — every call appends `/api/...` itself.
-    let host = host.trim_end_matches('/').to_string();
+    let host = nanna_config::normalize_ollama_host(host);
+
+    // A token with no server recorded counts as the configured server's;
+    // unrecorded, it would count as the new address's too the moment it is
+    // saved. Record the server it has been going to before the switch.
+    let previous = state_guard.config.memory.ollama_host.clone();
+    let store = nanna_config::SecureStore::new();
+    if let Err(e) = store.bind_unbound_ollama_token(&previous) {
+        let err_msg = format!("Failed to record which server the saved Ollama token belongs to: {e}");
+        error!("{err_msg}");
+        return Err(err_msg);
+    }
 
     // Save to config file (the daemon reads the same file)
     state_guard.config.memory.ollama_host.clone_from(&host);
+    // The cached token was the old server's; keep what the daemon will load.
+    state_guard
+        .config
+        .rebind_ollama_token_if_moved(&previous, &store);
     match state_guard.config.save() {
         Ok(()) => {
             info!("Ollama host saved to config: {}", host);
@@ -1029,37 +1116,50 @@ pub async fn set_ollama_host(
     Ok(format!("Ollama host saved: {host}"))
 }
 
+/// Save `key` as the Ollama token for the server at `host`, the only one it
+/// will be sent to; blank — whitespace included — removes the saved token
+/// and its server. Returns whether a token is saved now.
+fn store_ollama_token(
+    store: &nanna_config::SecureStore,
+    key: &str,
+    host: &str,
+) -> Result<bool, String> {
+    let saving = !key.trim().is_empty();
+    store.save_ollama_token(key, host).map_err(|e| {
+        if saving {
+            format!("Failed to store Ollama API key securely: {e}")
+        } else {
+            format!("Failed to remove stored Ollama API key: {e}")
+        }
+    })?;
+    Ok(saving)
+}
+
 /// Set Ollama API key (for remote/authenticated instances)
+///
+/// Saved for the configured `[memory].ollama_host` — the only server it is
+/// ever sent to. A blank key (whitespace included) removes the saved token.
 ///
 /// # Errors
 ///
 /// Returns `Failed to store Ollama API key securely: …` when the OS keyring
-/// write fails, `Failed to remove stored Ollama API key: …` when clearing the
-/// key cannot delete its stored entry, and `Failed to save config: …` when
-/// `config.toml` cannot be written. The cached key has already changed in each
-/// case.
+/// write fails (no token is saved then — not even the old one),
+/// `Failed to remove stored Ollama API key: …` when clearing the key cannot
+/// delete its stored entry, and `Failed to save config: …` when `config.toml`
+/// cannot be written.
 #[tauri::command]
 pub async fn set_ollama_api_key(
     state: State<'_, Arc<RwLock<AppState>>>,
     key: String,
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
-    state_guard.config.llm.ollama_api_key = if key.is_empty() { None } else { Some(key.clone()) };
-    if let Err(e) = state_guard.config.migrate_secrets_to_keyring() {
-        let err_msg = format!("Failed to store Ollama API key securely: {e}");
-        error!("{err_msg}");
-        return Err(err_msg);
-    }
-    if key.is_empty() {
-        // Clearing the key must also clear its durable home, or the hydration
-        // below (and at every launch) resurrects the old value.
-        match nanna_config::SecureStore::new().delete(nanna_config::credentials::keys::OLLAMA_API_KEY) {
-            Ok(()) | Err(nanna_config::CredentialError::NotFound) => {}
-            Err(e) => return Err(format!("Failed to remove stored Ollama API key: {e}")),
-        }
-    }
-    // migrate_secrets_to_keyring() blanks every secret it stores; refill so
-    // in-memory state (and the OAuth badge) keeps the session's credentials.
+    let host = state_guard.config.memory.ollama_host.clone();
+    let saved = store_ollama_token(&nanna_config::SecureStore::new(), &key, &host).inspect_err(|e| {
+        error!("{e}");
+    })?;
+    // Refill from the store (and environment), so the cache holds what the
+    // daemon will load: the new token, or none once removed.
+    state_guard.config.llm.ollama_api_key = None;
     state_guard.config.load_secrets_from_store();
     match state_guard.config.save() {
         Ok(()) => {
@@ -1073,7 +1173,7 @@ pub async fn set_ollama_api_key(
     }
     let _ = state_guard.backend.config_reload().await;
     drop(state_guard);
-    Ok("Ollama API key saved".to_string())
+    Ok(if saved { "Ollama token saved" } else { "Ollama token removed" }.to_string())
 }
 
 /// Fetch available models from Ollama.
@@ -1093,11 +1193,11 @@ pub async fn set_ollama_api_key(
 pub async fn get_ollama_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<OllamaModelInfo>, String> {
-    let report = {
-        let state_guard = state.read().await;
-        let host = state_guard.config.memory.ollama_host.clone();
-        state_guard.backend.system_probe_ollama(Some(&host), Vec::new()).await?
-    };
+    // No address: the daemon probes the server it is configured for. This
+    // process's copy was read at startup and goes stale after a hand edit of
+    // `config.toml`, which the daemon applies live.
+    let backend = backend_handle(&state).await;
+    let report = backend.system_probe_ollama(None, Vec::new()).await?;
     ollama_models_from_report(&report)
 }
 
@@ -2061,7 +2161,7 @@ pub async fn set_agent_iteration_policy(
     Ok(())
 }
 
-/// Export config as TOML string
+/// Export config as TOML string, without secrets
 ///
 /// # Errors
 ///
@@ -2072,8 +2172,39 @@ pub async fn export_config(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
     let state_guard = state.read().await;
-    toml::to_string_pretty(&state_guard.config)
-        .map_err(|e| format!("Failed to serialize config: {e}"))
+    exported_config_toml(&state_guard.config)
+}
+
+/// `config` as the TOML an export hands the webview and a downloaded file:
+/// without secrets, as `config.toml` itself is written. The cached copy holds
+/// the ones hydrated from the keychain; the keychain is where they live.
+fn exported_config_toml(config: &nanna_config::Config) -> Result<String, String> {
+    let mut exported = config.clone();
+    exported.strip_secrets_for_disk();
+    toml::to_string_pretty(&exported).map_err(|e| format!("Failed to serialize config: {e}"))
+}
+
+/// The config an import of `text` makes the cached copy, replacing `running`.
+///
+/// The Ollama token is the running one, kept only if the imported address is
+/// the same server, and otherwise re-derived for it as for any address change
+/// — never one carried in the text. The file is saved without secrets and the
+/// daemon loads it from there, so a carried token never reaches the daemon;
+/// left in this copy, the next key save would file it under the imported
+/// address, over the token saved for the server it belongs to.
+fn imported_config(
+    text: &str,
+    running: &nanna_config::Config,
+    store: &nanna_config::SecureStore,
+) -> Result<nanna_config::Config, String> {
+    let mut imported: nanna_config::Config =
+        toml::from_str(text).map_err(|e| format!("Failed to parse config: {e}"))?;
+    imported
+        .llm
+        .ollama_api_key
+        .clone_from(&running.llm.ollama_api_key);
+    imported.rebind_ollama_token_if_moved(&running.memory.ollama_host, store);
+    Ok(imported)
 }
 
 /// Import config from TOML string
@@ -2088,10 +2219,9 @@ pub async fn import_config(
     state: State<'_, Arc<RwLock<AppState>>>,
     config: String,
 ) -> Result<(), String> {
-    let new_config: nanna_config::Config = toml::from_str(&config)
-        .map_err(|e| format!("Failed to parse config: {e}"))?;
-
     let mut state_guard = state.write().await;
+    let store = nanna_config::SecureStore::new();
+    let new_config = imported_config(&config, &state_guard.config, &store)?;
     state_guard.config = new_config;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
@@ -2631,7 +2761,11 @@ mod tests {
             extraction_model: String::new(),
             available_extraction_models: vec![String::new()],
             ollama_host: "http://127.0.0.1:11434".to_string(),
-            ollama_api_key: String::new(),
+            ollama_token: OllamaTokenStatus {
+                ollama_token_saved: true,
+                ollama_token_host: Some("http://127.0.0.1:11434".to_string()),
+                ollama_token_from_env: false,
+            },
             temperature: 1.0,
             top_p: 0.95,
             max_tokens: 8192,
@@ -2671,7 +2805,9 @@ mod tests {
             r#""embedding_provider":"ollama","embedding_model":"nomic-embed-text","#,
             r#""available_embedding_providers":["disabled"],"available_embedding_models":["all-minilm"],"#,
             r#""embedding_enabled":true,"extraction_model":"","available_extraction_models":[""],"#,
-            r#""ollama_host":"http://127.0.0.1:11434","ollama_api_key":"","temperature":1.0,"top_p":0.95,"#,
+            r#""ollama_host":"http://127.0.0.1:11434","ollama_token_saved":true,"#,
+            r#""ollama_token_host":"http://127.0.0.1:11434","ollama_token_from_env":false,"#,
+            r#""temperature":1.0,"top_p":0.95,"#,
             r#""max_tokens":8192,"tools":[{"name":"exec","description":"run","enabled":true,"is_user_tool":false}],"#,
             r#""dreaming_enabled":true,"auto_remember_messages":false,"max_compression_ratio":0.5,"#,
             r#""min_remaining_memories":20,"scheduler_enabled":false,"heartbeat_enabled":true,"#,
@@ -2687,7 +2823,178 @@ mod tests {
         assert_eq!(read_back.anthropic_oauth, settings.anthropic_oauth);
         assert_eq!(read_back.memory, settings.memory);
         assert_eq!(read_back.scheduler, settings.scheduler);
+        assert_eq!(read_back.ollama_token, settings.ollama_token);
         assert_eq!(serde_json::to_string(&read_back).expect("serializes"), flat);
+    }
+
+    /// A hermetic credential store: its own directory, never the OS keyring.
+    fn file_store() -> (tempfile::TempDir, nanna_config::SecureStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = nanna_config::SecureStore::file_only_at(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    #[test]
+    fn the_settings_page_is_never_sent_the_ollama_token() {
+        let (_dir, store) = file_store();
+        store_ollama_token(&store, "s3cret-bearer-token", "https://host/ollama/").expect("save");
+        let mut config = nanna_config::Config::default();
+        config.memory.ollama_host = "https://host/ollama".to_string();
+        config.llm.ollama_api_key = Some("s3cret-bearer-token".to_string());
+
+        let status = ollama_token_status(&store, &config.memory.ollama_host, None);
+        let settings = build_extended_settings(&config, Vec::new(), status);
+        let wire = serde_json::to_string(&settings).expect("serializes");
+        assert!(
+            !wire.contains("s3cret-bearer-token"),
+            "the webview must never receive the token: {wire}"
+        );
+        // What it gets instead: that one is saved, and for which server.
+        assert!(wire.contains(r#""ollama_token_saved":true,"ollama_token_host":"https://host/ollama""#), "{wire}");
+    }
+
+    #[test]
+    fn the_token_status_names_its_server_or_the_configured_one_for_a_legacy_token() {
+        let (_dir, store) = file_store();
+        assert_eq!(
+            ollama_token_status(&store, "http://localhost:11434", None),
+            OllamaTokenStatus {
+                ollama_token_saved: false,
+                ollama_token_host: None,
+                ollama_token_from_env: false
+            }
+        );
+        store_ollama_token(&store, "token-for-a", "https://a.example/ollama").expect("save");
+        assert_eq!(
+            ollama_token_status(&store, "https://b.example/ollama", None)
+                .ollama_token_host
+                .as_deref(),
+            Some("https://a.example/ollama"),
+            "bound elsewhere: the page says where, so it can say it is not sent here"
+        );
+        store
+            .delete(nanna_config::credentials::keys::OLLAMA_API_KEY_HOST)
+            .expect("unbind");
+        assert_eq!(
+            ollama_token_status(&store, "https://b.example/ollama/", None)
+                .ollama_token_host
+                .as_deref(),
+            Some("https://b.example/ollama"),
+            "a legacy token is the configured server's"
+        );
+    }
+
+    #[test]
+    fn an_exported_config_carries_no_secrets() {
+        // Settings -> Data -> Export hands this text to the webview and to a
+        // downloaded file.
+        let mut config = nanna_config::Config::default();
+        config.memory.ollama_host = "https://host/ollama".to_string();
+        config.llm.ollama_api_key = Some("s3cret-bearer-token".to_string());
+        config.llm.api_key = Some("sk-ant-s3cret".to_string());
+        let text = exported_config_toml(&config).expect("serializes");
+        assert!(
+            !text.contains("s3cret-bearer-token") && !text.contains("sk-ant-s3cret"),
+            "an export must not carry secrets: {text}"
+        );
+        assert!(
+            text.contains("https://host/ollama"),
+            "the rest is exported: {text}"
+        );
+    }
+
+    #[test]
+    fn an_imported_config_brings_no_ollama_token_along() {
+        // The running config holds server A's token; the imported text names
+        // server B and carries a token of its own. The file is saved without
+        // it, so the daemon never sees it — but left in this copy, the next
+        // key save would file it under B over A's.
+        let (_dir, store) = file_store();
+        store_ollama_token(&store, "token-for-a", "https://a.example/ollama").expect("save");
+        let mut running = nanna_config::Config::default();
+        running.memory.ollama_host = "https://a.example/ollama".to_string();
+        running.llm.ollama_api_key = Some("token-for-a".to_string());
+
+        let mut text = nanna_config::Config::default();
+        text.memory.ollama_host = "https://b.example/ollama".to_string();
+        text.llm.ollama_api_key = Some("carried-token".to_string());
+        let imported = imported_config(
+            &toml::to_string_pretty(&text).expect("toml"),
+            &running,
+            &store,
+        )
+        .expect("parses");
+        assert_eq!(imported.memory.ollama_host, "https://b.example/ollama");
+        assert!(
+            !matches!(
+                imported.llm.ollama_api_key.as_deref(),
+                Some("carried-token" | "token-for-a")
+            ),
+            "B gets neither the carried token nor A's: {:?}",
+            imported.llm.ollama_api_key
+        );
+
+        // Importing the same server keeps the token it has.
+        text.memory.ollama_host = "https://A.example/ollama/".to_string();
+        let imported = imported_config(
+            &toml::to_string_pretty(&text).expect("toml"),
+            &running,
+            &store,
+        )
+        .expect("parses");
+        assert_eq!(imported.llm.ollama_api_key.as_deref(), Some("token-for-a"));
+    }
+
+    #[test]
+    fn the_token_status_says_when_the_environment_supplies_the_token() {
+        // `OLLAMA_API_KEY` goes to whatever address is configured, ahead of
+        // the saved token: a page that only described the saved one would say
+        // "not sent to this address" while the daemon sends a token there.
+        let (_dir, store) = file_store();
+        store_ollama_token(&store, "token-for-a", "https://a.example/ollama").expect("save");
+        let status = ollama_token_status(&store, "https://b.example", Some("env-token"));
+        assert!(status.ollama_token_from_env);
+        assert_eq!(
+            status.ollama_token_host.as_deref(),
+            Some("https://a.example/ollama")
+        );
+        let wire = serde_json::to_string(&status).expect("serializes");
+        assert!(
+            !wire.contains("env-token"),
+            "never the token itself: {wire}"
+        );
+        assert!(
+            !ollama_token_status(&store, "https://b.example", Some("  ")).ollama_token_from_env,
+            "a blank variable supplies nothing"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_token_removes_the_saved_one() {
+        let (_dir, store) = file_store();
+        store_ollama_token(&store, "old-token", "https://host/ollama").expect("save");
+        let saved = store_ollama_token(&store, "   ", "https://host/ollama").expect("clear");
+        assert!(!saved, "whitespace is no token");
+        assert_eq!(store.ollama_token(), None, "the old token must be gone");
+        assert_eq!(
+            store.ollama_token_host().expect("a file store answers"),
+            None,
+            "and the record of its server"
+        );
+    }
+
+    #[test]
+    fn a_saved_token_is_trimmed_and_bound_to_the_configured_server() {
+        let (_dir, store) = file_store();
+        assert!(store_ollama_token(&store, "  s3cret \n", " https://host/ollama/ ").expect("save"));
+        assert_eq!(store.ollama_token().as_deref(), Some("s3cret"));
+        assert_eq!(
+            store
+                .ollama_token_host()
+                .expect("a file store answers")
+                .as_deref(),
+            Some("https://host/ollama")
+        );
     }
 
     #[test]

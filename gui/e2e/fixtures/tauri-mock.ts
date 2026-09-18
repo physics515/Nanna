@@ -85,6 +85,9 @@ function installInPage(options = {}) {
       anthropic_api_key: apiKeySet ? 'sk-ant-e2e-mock' : '',
       openai_api_key: '',
       openrouter_api_key: '',
+      ollama_host: 'http://localhost:11434',
+      // The server a saved Ollama token is for; null = no token saved.
+      ollama_token_host: null,
     },
     sessions: sessions.slice(),
     messages: Object.assign(Object.create(null), options.messages || {}),
@@ -415,6 +418,12 @@ function installInPage(options = {}) {
           agent_name: state.config.agent_name,
           max_tokens: state.config.max_tokens,
           api_key_set: state.config.api_key_set,
+          ollama_host: state.config.ollama_host,
+          // Whether an Ollama token is saved and for which server — the
+          // real command never sends the token itself.
+          ollama_token_saved: state.config.ollama_token_host !== null,
+          ollama_token_host: state.config.ollama_token_host,
+          ollama_token_from_env: false,
         };
 
       case 'get_system_prompt':
@@ -560,10 +569,17 @@ function installInPage(options = {}) {
       case 'set_personality_mode':
       case 'set_agent_iteration_policy':
       case 'set_claude_proxy':
-      case 'set_ollama_host':
-      case 'set_ollama_api_key':
       case 'set_use_embedded_ocr':
         return true;
+      case 'set_ollama_host':
+        state.config.ollama_host = String(pick(args, 'host') || '').trim().replace(/\/+$/, '');
+        return 'Ollama host saved: ' + state.config.ollama_host;
+      case 'set_ollama_api_key': {
+        // Saved for the configured server; blank removes it.
+        const key = String(pick(args, 'key') || '').trim();
+        state.config.ollama_token_host = key ? state.config.ollama_host : null;
+        return key ? 'Ollama token saved' : 'Ollama token removed';
+      }
       case 'get_sub_agent_models':
         return [];
       case 'get_use_embedded_ocr':

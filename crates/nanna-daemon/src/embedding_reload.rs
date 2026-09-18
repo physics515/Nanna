@@ -70,7 +70,7 @@ impl LiveEmbeddingSettings {
         // address waits for a restart, a token saved beside it is for a
         // server these clients are not talking to, so it waits too.
         let same_server =
-            crate::control::same_ollama_server(&now.ollama_host, &self.boot.ollama_host);
+            nanna_config::same_ollama_server(&now.ollama_host, &self.boot.ollama_host);
         if same_server
             && self
                 .ollama_bearer
@@ -126,7 +126,7 @@ fn waiting_for_restart(boot: &EmbeddingConfig, now: &EmbeddingConfig) -> Vec<Str
 
     let mut waiting = Vec::new();
     if embeds_with_ollama
-        && !crate::control::same_ollama_server(&now.ollama_host, &boot.ollama_host)
+        && !nanna_config::same_ollama_server(&now.ollama_host, &boot.ollama_host)
     {
         waiting.push(format!(
             "the Ollama server {} (with its token) instead of {}",

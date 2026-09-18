@@ -1825,6 +1825,27 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
 }
 
+/// Record `configured_host` as the server of a saved Ollama token that
+/// records none — one saved by a build before tokens were bound.
+///
+/// Such a token has been going to the configured server, and every load reads
+/// it as the configured server's. Unrecorded, that stays true of whatever
+/// address is configured next, including one edited into `config.toml` while
+/// the daemon is stopped. Recorded once at the first start, it stays with the
+/// server it was going to. A failure is logged and changes nothing: the next
+/// start tries again, and reloads while running attribute it to the running
+/// server anyway.
+fn record_legacy_ollama_token_server(configured_host: &str) {
+    match SecureStore::new().bind_unbound_ollama_token(configured_host) {
+        Ok(true) => info!(
+            "Recorded {} as the server the saved Ollama token belongs to",
+            nanna_config::ollama::redacted_ollama_host(configured_host)
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("Could not record which server the saved Ollama token belongs to: {e}"),
+    }
+}
+
 /// A credential from the environment, falling back to the secure store.
 ///
 /// The store is where the GUI puts keys the user types in, so a key that is
@@ -5767,6 +5788,7 @@ impl DaemonBuilder {
         let config = match Config::load() {
             Ok(cfg) => {
                 info!("Loaded Nanna config successfully");
+                record_legacy_ollama_token_server(&cfg.memory.ollama_host);
                 cfg.with_env_overrides()
             }
             Err(e) => {

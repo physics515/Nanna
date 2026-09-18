@@ -43,7 +43,6 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use system::same_ollama_server;
 
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
@@ -140,6 +139,11 @@ pub struct ControlPlane {
     /// committed change is applied to it, so a token saved while the daemon
     /// runs reaches the embedder. `None` outside a daemon.
     live_embedding: Option<Arc<crate::embedding_reload::LiveEmbeddingSettings>>,
+    /// Where config reloads and `config.set` read the saved secrets from: the
+    /// OS keyring with its encrypted-file fallback. A field, not a
+    /// `SecureStore::new()` at each use, so a test can hand the control plane
+    /// a store of its own instead of the machine's keyring.
+    pub(crate) credential_store: nanna_config::SecureStore,
 }
 
 impl ControlPlane {
@@ -182,6 +186,7 @@ impl ControlPlane {
             degradations: None,
             mcp_status: None,
             live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -248,6 +253,7 @@ impl ControlPlane {
             degradations: None,
             mcp_status: None,
             live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
@@ -316,6 +322,7 @@ impl ControlPlane {
             degradations: None,
             mcp_status: None,
             live_embedding: None,
+            credential_store: nanna_config::SecureStore::new(),
         }
     }
 
