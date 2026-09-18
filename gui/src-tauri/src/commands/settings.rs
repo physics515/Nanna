@@ -2361,7 +2361,7 @@ pub async fn get_summarization_model_priority(
 /// # Errors
 ///
 /// Returns `Failed to save config: …` when `config.toml` cannot be written; the
-/// cached value has already changed by then.
+/// cached value has already changed by then. The daemon reload is best-effort.
 #[tauri::command]
 pub async fn set_summarization_model_priority(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -2372,6 +2372,10 @@ pub async fn set_summarization_model_priority(
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {e}"))?;
+    // Tell the daemon now, as the other settings saves do. It would find the
+    // change by itself — its file watcher polls every ~2 s — but a turn that
+    // starts inside that window would summarize on the old list.
+    let _ = state_guard.backend.config_reload().await;
     drop(state_guard);
 
     info!("Summarization model priority set: {:?}", priority);
