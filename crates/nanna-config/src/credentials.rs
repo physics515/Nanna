@@ -42,6 +42,13 @@ pub mod keys {
     pub const GITHUB_TOKEN: &str = "github_token";
     pub const BRAVE_API_KEY: &str = "brave_api_key";
     pub const OLLAMA_API_KEY: &str = "ollama_api_key";
+    /// The Ollama server [`OLLAMA_API_KEY`] was saved for (not a secret).
+    ///
+    /// The token is only ever loaded for that server: without the record it
+    /// followed whatever address was configured, so pointing Nanna at another
+    /// server sent it the previous server's token. A token with no record was
+    /// saved by an older build and counts as the current server's.
+    pub const OLLAMA_API_KEY_HOST: &str = "ollama_api_key_host";
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
     pub const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
     pub const SLACK_BOT_TOKEN: &str = "slack_bot_token";
@@ -368,6 +375,92 @@ impl SecureStore {
             }
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Ollama bearer token, bound to the server it was saved for
+    // =========================================================================
+
+    /// Save the Ollama bearer token for the server at `host`; a blank token
+    /// removes the saved one ([`Self::delete_ollama_token`]).
+    ///
+    /// The steps are ordered so that no failure part-way leaves a token
+    /// recorded for a server it was not saved for: the old token goes first,
+    /// then the server is recorded, then the new token is written. A failure
+    /// leaves no token at all — the error says so and saving again finishes
+    /// the job — never the previous server's token filed under this one.
+    ///
+    /// # Errors
+    /// Returns the backing store's error for the step that failed.
+    pub fn save_ollama_token(&self, token: &str, host: &str) -> Result<(), CredentialError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return self.delete_ollama_token();
+        }
+        let host = crate::ollama::normalize_ollama_host(host);
+        match self.delete(keys::OLLAMA_API_KEY) {
+            Ok(()) | Err(CredentialError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        self.set(keys::OLLAMA_API_KEY_HOST, &host)?;
+        self.set(keys::OLLAMA_API_KEY, token)
+    }
+
+    /// Remove the Ollama bearer token and the record of its server. Absent
+    /// keys are not an error. The token goes first: a record left behind
+    /// without one binds nothing.
+    ///
+    /// # Errors
+    /// Returns the backing store's error when a present key cannot be removed.
+    pub fn delete_ollama_token(&self) -> Result<(), CredentialError> {
+        for key in [keys::OLLAMA_API_KEY, keys::OLLAMA_API_KEY_HOST] {
+            match self.delete(key) {
+                Ok(()) | Err(CredentialError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// The saved Ollama bearer token, trimmed; `None` when there is none or
+    /// it is blank.
+    #[must_use]
+    pub fn ollama_token(&self) -> Option<String> {
+        self.get(keys::OLLAMA_API_KEY)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    /// The server the saved Ollama token was saved for; `None` when no server
+    /// is recorded (no token, or one saved by an older build).
+    ///
+    /// A blank record is still a record: it was written while the configured
+    /// address was blank, names no server, and so matches none.
+    #[must_use]
+    pub fn ollama_token_host(&self) -> Option<String> {
+        self.get(keys::OLLAMA_API_KEY_HOST)
+            .ok()
+            .map(|host| crate::ollama::normalize_ollama_host(&host))
+    }
+
+    /// Record `host` as the saved token's server when the token has none.
+    ///
+    /// Called with the address that is about to be replaced: a token saved by
+    /// an older build counts as the configured server's, and unrecorded it
+    /// would count as the next address's too. Returns whether it recorded.
+    ///
+    /// # Errors
+    /// Returns the backing store's error when the record cannot be written.
+    pub fn bind_unbound_ollama_token(&self, host: &str) -> Result<bool, CredentialError> {
+        if self.ollama_token().is_none() || self.ollama_token_host().is_some() {
+            return Ok(false);
+        }
+        self.set(
+            keys::OLLAMA_API_KEY_HOST,
+            &crate::ollama::normalize_ollama_host(host),
+        )?;
+        Ok(true)
     }
 
     /// Open the keyring entry for `key`, or `None` when there is no keyring

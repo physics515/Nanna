@@ -216,7 +216,11 @@ impl ControlPlane {
 
         // Deserialize back to config
         match serde_json::from_value::<Config>(config_value) {
-            Ok(new_config) => {
+            Ok(mut new_config) => {
+                // The Ollama token is bound to the server it was saved for;
+                // edited in place, the config would carry the old server's
+                // token to a new `memory.ollama_host` (a load never would).
+                new_config.rebind_ollama_token_if_moved(&config.memory.ollama_host);
                 *config = new_config;
 
                 // Save to disk if we have a path

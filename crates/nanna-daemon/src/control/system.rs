@@ -1,6 +1,7 @@
 //! System handlers for the [`ControlPlane`].
 
 use super::{json, info, ControlPlane, SystemAction, Value};
+use nanna_config::same_ollama_server;
 
 impl ControlPlane {
     /// Gather everything `GET /metrics` reports, in one pass.
@@ -106,29 +107,10 @@ impl ControlPlane {
                 }
             }
             SystemAction::ProbeOllama { base_url, models } => {
-                let (base_url, models, bearer) = {
-                    let config = self.config.read().await;
-                    let base_url = base_url
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|url| !url.is_empty())
-                        .map_or_else(|| config.memory.ollama_host.clone(), str::to_string);
-                    let models = if models.is_empty() {
-                        configured_ollama_models(&config)
-                    } else {
-                        models
-                    };
-                    // The configured server's token, sent as chat sends it —
-                    // a server behind an authenticating proxy otherwise reads
-                    // as down to the very check that is meant to find it. Only
-                    // to that server: a probe of some other URL gets no token.
-                    let bearer = same_ollama_server(&base_url, &config.memory.ollama_host)
-                        .then(|| config.llm.ollama_api_key.clone())
-                        .flatten();
-                    // Released before the probe's network round-trip.
-                    drop(config);
-                    (base_url, models, bearer)
-                };
+                // Resolved under the read lock, which is released before the
+                // probe's network round-trip.
+                let (base_url, models, bearer) =
+                    ollama_probe_target(&*self.config.read().await, base_url.as_deref(), models);
                 let probe =
                     nanna_llm::probe_ollama(&base_url, bearer.as_deref(), OLLAMA_PROBE_TIMEOUT).await;
                 ollama_probe_report(&base_url, &probe, &models)
@@ -325,17 +307,31 @@ impl ControlPlane {
 /// for longer than that. Same figure `nanna doctor --online` uses.
 const OLLAMA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Whether two Ollama base URLs name the same server: compared trimmed,
-/// without trailing slashes and case-insensitively, with `localhost` read as
-/// `127.0.0.1` (the clients pin it that way).
-fn same_ollama_server(a: &str, b: &str) -> bool {
-    let canonical = |url: &str| {
-        url.trim()
-            .trim_end_matches('/')
-            .to_lowercase()
-            .replacen("://localhost", "://127.0.0.1", 1)
+/// What one `probe_ollama` checks: the server (`base_url`, else the configured
+/// `[memory].ollama_host`), the models (as asked, else every Ollama model the
+/// config names), and the bearer token to send.
+///
+/// The token is the configured server's, sent as chat sends it — a server
+/// behind an authenticating proxy otherwise reads as down to the very check
+/// meant to find it. Only to that server: a probe of any other URL gets none.
+fn ollama_probe_target(
+    config: &nanna_config::Config,
+    base_url: Option<&str>,
+    models: Vec<String>,
+) -> (String, Vec<String>, Option<String>) {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map_or_else(|| config.memory.ollama_host.clone(), str::to_string);
+    let models = if models.is_empty() {
+        configured_ollama_models(config)
+    } else {
+        models
     };
-    canonical(a) == canonical(b)
+    let bearer = same_ollama_server(&base_url, &config.memory.ollama_host)
+        .then(|| config.llm.ollama_api_key.clone())
+        .flatten();
+    (base_url, models, bearer)
 }
 
 /// Every Ollama model the configuration names — the chat model when the
@@ -554,6 +550,44 @@ mod ollama_probe_tests {
         assert!(same_ollama_server("http://localhost:11434", " http://127.0.0.1:11434/ "));
         assert!(!same_ollama_server("https://host/ollama", "https://host/api"));
         assert!(!same_ollama_server("https://evil.example", "https://host/ollama"));
+        // A scheme's default port is the same server written or not, and
+        // `[::1]` is this machine as much as `localhost` is.
+        assert!(same_ollama_server("https://host:443/ollama", "https://host/ollama"));
+        assert!(same_ollama_server("http://[::1]:11434", "http://localhost:11434"));
+        assert!(!same_ollama_server("https://host:8443/ollama", "https://host/ollama"));
+    }
+
+    #[test]
+    fn a_probe_with_no_address_checks_the_configured_server_with_its_token() {
+        let mut config = nanna_config::Config::default();
+        config.memory.ollama_host = "https://host/ollama".to_string();
+        config.llm.ollama_api_key = Some("s3cret".to_string());
+
+        // The GUI's model picker sends none: the daemon's own address is
+        // current, the GUI's copy can be stale after a hand edit.
+        let (url, _, bearer) = ollama_probe_target(&config, None, Vec::new());
+        assert_eq!(url, "https://host/ollama");
+        assert_eq!(bearer.as_deref(), Some("s3cret"));
+
+        let (_, _, bearer) = ollama_probe_target(&config, Some(" https://HOST:443/ollama/ "), Vec::new());
+        assert_eq!(bearer.as_deref(), Some("s3cret"), "the same server, spelled differently");
+
+        let (url, _, bearer) = ollama_probe_target(&config, Some("https://elsewhere.example"), Vec::new());
+        assert_eq!(url, "https://elsewhere.example");
+        assert_eq!(bearer, None, "another server never gets the token");
+    }
+
+    #[test]
+    fn a_null_address_on_the_wire_means_the_configured_server() {
+        // What `get_ollama_models` sends: `"base_url": null`, not an absent key.
+        let action: Action = serde_json::from_value(json!({
+            "type": "system", "action": "probe_ollama", "base_url": null, "models": []
+        }))
+        .expect("parses");
+        assert!(
+            matches!(action, Action::System(SystemAction::ProbeOllama { base_url: None, .. })),
+            "{action:?}"
+        );
     }
 
     #[test]
