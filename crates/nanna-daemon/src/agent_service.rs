@@ -27,11 +27,11 @@ const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
 /// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
 const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-/// Bounded waits for a DOWN local Ollama server before falling back to
-/// normal retry accounting. Derivation: a runner-surgery restart is back in
-/// under 60s (tasks.rs polls 20×3s), so one 120s wait covers a restart with
-/// 2× margin; three waits = six minutes of continuous downtime = genuinely
-/// dead, stop stalling the run.
+/// Bounded waits for a DOWN Ollama server (the configured one, wherever it
+/// runs) before falling back to normal retry accounting. Derivation: a
+/// runner-surgery restart is back in under 60s (tasks.rs polls 20×3s), so one
+/// 120s wait covers a restart with 2× margin; three waits = six minutes of
+/// continuous downtime = genuinely dead, stop stalling the run.
 const CHAT_SERVER_DOWN_WAITS_MAX: usize = 3;
 const CHAT_SERVER_DOWN_WAIT_SECS: u64 = 120;
 
@@ -1782,7 +1782,7 @@ impl AgentService {
     }
 
     /// A failed attempt: journal the fault, then decide between waiting out a
-    /// down local server, retrying the same model, or moving down the list —
+    /// down Ollama server, retrying the same model, or moving down the list —
     /// recording the decision in `walk`.
     async fn handle_attempt_failure(
         &self,
@@ -1813,17 +1813,18 @@ impl AgentService {
             at: chrono::Utc::now().to_rfc3339(),
         });
 
-        // A DOWN local server (connection refused — e.g. our own
+        // A DOWN server (connection refused — e.g. our own
         // runner-surgery restart window, observed live killing a
         // 4h55m mission two minutes after the surgery cured its
         // fault storm) is a WAIT condition, not a fault to
         // retry-count: attempts against a down server complete
         // zero tool calls, so progress-based replenishment can
         // never refill the budget, and the 2/5/10s backoffs burn
-        // out inside a ~20-60s restart. Wait for readiness
-        // (bounded) and resume the same model with the budget
-        // untouched; if the server never comes back, fall
-        // through to normal retry accounting and exhaust.
+        // out inside a ~20-60s restart. Wait (bounded) for the
+        // configured server, wherever it runs, to answer, and
+        // resume the same model with the budget untouched; if
+        // the server never comes back, fall through to normal
+        // retry accounting and exhaust.
         if provider == crate::llm_router::ProviderId::Ollama
             && Self::is_server_down_error(error_str)
             && walk.server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
@@ -1834,7 +1835,18 @@ impl AgentService {
             warn!(
                 "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
             );
-            if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
+            // Stop ends the wait. Returning leaves the walk on this model, and
+            // the next attempt sees the cancel before its first request and
+            // ends the turn as stopped, as it does after a backoff.
+            let ready = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    info!("chat stopped while waiting for the Ollama server — no longer waiting");
+                    return;
+                }
+                ready = crate::tasks::wait_for_ollama_ready(&self.router, CHAT_SERVER_DOWN_WAIT_SECS) => ready,
+            };
+            if ready {
                 info!("Ollama is reachable again — resuming the run");
                 return;
             }
@@ -1848,7 +1860,8 @@ impl AgentService {
         // otherwise dies on the first hiccup and heartbeats fail
         // for hours. Mirrors the task harness's step-retry
         // ladder; Ollama-served models additionally get runner
-        // surgery (provider-gated — never fires for cloud models).
+        // surgery (provider-gated — never fires for cloud models,
+        // and declined for an Ollama server on another machine).
         // Rate-limit/overload errors (429/529) are excluded: the
         // branch below honors the provider's Retry-After and the
         // shared-bucket skip instead of hammering it. A cancelled
@@ -1905,12 +1918,12 @@ impl AgentService {
                 // server — the sticky degraded state survives
                 // unloads (verified live in the endurance runs).
                 if same_model_retries == 2 {
-                    crate::tasks::reset_ollama_runner_for(model).await;
+                    crate::tasks::reset_ollama_runner_for(&self.router, model).await;
                 }
                 if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
                     && crate::tasks::ollama_restart_allowed()
                 {
-                    crate::tasks::restart_ollama_server().await;
+                    crate::tasks::restart_ollama_server(&self.router).await;
                 }
             }
             return;
@@ -2066,10 +2079,14 @@ impl AgentService {
         })
     }
 
-    /// Connection-class failure against the local server: the server is DOWN
-    /// (or restarting), as opposed to a mid-stream fault from a live server.
-    /// Over-matching is safe — the caller's readiness wait returns instantly
-    /// when the server is actually up, and the wait count is bounded.
+    /// Connection-class failure against the configured server: the server is
+    /// DOWN (or restarting), as opposed to a mid-stream fault from a live
+    /// server. Over-matching costs time, not correctness: the caller's
+    /// readiness wait returns as soon as the server answers, the wait count
+    /// is bounded, and Stop ends a wait. It does match more than a refused
+    /// connection. reqwest reports a remote address that does not resolve,
+    /// or whose certificate is refused, as "error sending request" too, and
+    /// such a server waits out the bound like one that is down.
     fn is_server_down_error(error: &str) -> bool {
         let lower = error.to_lowercase();
         lower.contains("connection refused")
@@ -3151,5 +3168,53 @@ mod tests {
             }
             other => panic!("expected a tool item, got {other:?}"),
         }
+    }
+
+    /// Stop ends a server-down wait. One wait lasts up to
+    /// `CHAT_SERVER_DOWN_WAIT_SECS` and a message gets three, so a chat
+    /// stopped during one sat out the rest of it: six minutes for a remote
+    /// address with a typo, which fails the same way as a server that is down.
+    /// The walk stays on the same model with its budget untouched, and the
+    /// attempt that follows sees the cancel before its first request and ends
+    /// the turn as stopped.
+    #[tokio::test]
+    async fn stop_ends_a_server_down_wait() {
+        // Port 9 on this machine: refused, so the wait never ends by itself.
+        let router = Arc::new(LlmRouter::new().with_ollama("http://127.0.0.1:9"));
+        let (event_tx, _events) = broadcast::channel::<Event>(16);
+        let service = AgentService::new(
+            AgentServiceConfig::default(),
+            router,
+            Arc::new(ToolRegistry::new()),
+            None,
+            event_tx,
+        );
+        let model = "ollama/qwen3:8b";
+        let run = ChatRunBuffers::new();
+        let mut walk = ModelWalk::new(&[model.to_string()]);
+        let stop = run.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop.cancel();
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.handle_attempt_failure(
+                "s",
+                model,
+                crate::llm_router::ProviderId::Ollama,
+                "HTTP error: error sending request for url (http://127.0.0.1:9/api/chat)",
+                &run,
+                &mut walk,
+            ),
+        )
+        .await
+        .expect("Stop must end the wait, not the wait's own deadline");
+        assert_eq!(
+            (walk.index, walk.same_model_retries, walk.server_down_waits),
+            (0, 0, 1),
+            "the same model is tried again, with its retry budget untouched"
+        );
     }
 }
