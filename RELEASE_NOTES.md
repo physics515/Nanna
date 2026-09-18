@@ -54,7 +54,9 @@ keychain and sent as `Authorization: Bearer …` to that server only: chat, embe
 and the connection check all carry it. (A token set in the `OLLAMA_API_KEY` environment variable
 instead goes to whatever address is configured, and Settings says so.) When the server won't talk,
 you're told why. It wants a token, or it refused the one you gave, or nothing Ollama-compatible
-answers at that address (which usually means the path is missing).
+answers at that address (which usually means the path is missing). A token saved while Nanna runs
+reaches chat and embeddings at once. A new address reaches chat at once; embeddings keep the address
+and model they started with until Nanna restarts, and the log says so.
 
 ## What's Fixed
 
@@ -96,6 +98,13 @@ is kept per server, so changing the server in Settings while Nanna runs no longe
 server's size over, and a model used on two servers (summaries on this computer, chat on another)
 keeps one for each. Each prompt is sized for the window of the server it is sent to, and running
 out of memory on one server shrinks only that server's window.
+
+**A failed model lookup is no longer remembered for a week.** When Nanna could not get a model's
+details from its provider (a refused token, a server that was down, a network error), it cached the
+fallback as if it were the answer, for seven days, and sized every prompt for that model to a
+32,000-token guess. Only real answers are cached now, each under the server that gave it, and
+entries written by earlier versions are dropped. So an Ollama behind a proxy that refused the lookup
+before this release gets its real window on the first request.
 
 **Commands Nanna runs from the Linux app picked up the app's own libraries.** The AppImage's
 `LD_LIBRARY_PATH` leaked into every command, so tools like `git` loaded the bundled copies of
