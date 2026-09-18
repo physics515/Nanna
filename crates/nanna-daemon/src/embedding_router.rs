@@ -217,6 +217,38 @@ impl EmbeddingRouter {
         &self,
         text: &str,
     ) -> Result<(Vec<f32>, Option<EmbeddingProviderInfo>), String> {
+        self.embed_with_patience(text, &BACKOFF_SECS).await
+    }
+
+    /// [`Self::embed_one`] without waiting on congestion: one sweep over every
+    /// provider, and an error if they were all merely busy.
+    ///
+    /// For callers on a path something else is waiting for — daemon startup
+    /// above all. Nine minutes of patience is the right price for not losing
+    /// a memory in the background; spent on the boot-time dimension probe it
+    /// kept the IPC port closed until the app gave up on the daemon and killed
+    /// it (2026-09-18, a congested free-tier embedding model: the daemon never
+    /// started). A healthy provider still wins on this single sweep exactly as
+    /// it would on the first sweep of the patient path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::embed_one`], and also when every provider was congested on
+    /// the one sweep made.
+    pub async fn embed_one_now(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, Option<EmbeddingProviderInfo>), String> {
+        self.embed_with_patience(text, &[]).await
+    }
+
+    /// The sweep behind both entry points. `backoff` is the wait before each
+    /// retry sweep while everything is congested; empty means one sweep only.
+    async fn embed_with_patience(
+        &self,
+        text: &str,
+        backoff: &[u64],
+    ) -> Result<(Vec<f32>, Option<EmbeddingProviderInfo>), String> {
         let active_idx = *self.active_index.read().await;
         let total = self.providers.len();
 
@@ -258,7 +290,7 @@ impl EmbeddingRouter {
         // So: try everyone, and only wait if EVERYONE is merely congested.
         // Congestion is the one condition that clears on its own.
         for (round, wait) in std::iter::once(0)
-            .chain(BACKOFF_SECS.iter().copied())
+            .chain(backoff.iter().copied())
             .enumerate()
         {
             if wait > 0 {
@@ -375,20 +407,14 @@ impl EmbeddingRouter {
                 ));
             }
 
-            let next = soonest_retry.unwrap_or(wait);
-            warn!(
-                "All {} embedding provider(s) congested ({} of {}) — waiting {}s before sweep {}",
-                congested,
-                congested,
-                total,
-                next,
-                round + 2
-            );
+            announce_congestion_wait(backoff.get(round).copied(), round, congested, total, soonest_retry);
         }
 
-        Err(format!(
-            "All {total} embedding providers still congested after the full retry schedule"
-        ))
+        Err(if backoff.is_empty() {
+            format!("All {total} embedding provider(s) congested — not waiting for them here")
+        } else {
+            format!("All {total} embedding providers still congested after the full retry schedule")
+        })
     }
 
     // There is no separate `try_restore_primary` here any more. It probed with
@@ -402,6 +428,28 @@ impl EmbeddingRouter {
     pub const fn provider_count(&self) -> usize {
         self.providers.len()
     }
+}
+
+/// Log the wait before the next sweep while every provider is congested.
+///
+/// Only when another sweep will actually follow (`upcoming` is the schedule's
+/// next step), and naming the sleep the loop really takes. A provider's own
+/// Retry-After is reported beside it, not in its place: this line used to print
+/// that figure ("waiting 0s") ahead of a two-second sleep.
+fn announce_congestion_wait(
+    upcoming: Option<u64>,
+    round: usize,
+    congested: usize,
+    total: usize,
+    asked_for: Option<u64>,
+) {
+    let Some(upcoming) = upcoming else { return };
+    let asked = asked_for.map_or_else(String::new, |secs| format!(" (a provider asked for {secs}s)"));
+    warn!(
+        "All {congested} embedding provider(s) congested ({congested} of {total}) — \
+         waiting {upcoming}s before sweep {}{asked}",
+        round + 2
+    );
 }
 
 #[cfg(test)]
@@ -632,6 +680,40 @@ mod tests {
             2,
             "once on the way to the fallback, once as the restore attempt — then held"
         );
+    }
+
+    /// The startup probe's sweep: a congested provider is asked ONCE and the
+    /// call returns, instead of spending the nine-minute patience schedule.
+    /// That schedule, on the boot-time dimension probe, kept the daemon's IPC
+    /// port closed until the app killed it (2026-09-18) — each further sweep
+    /// would be another request here, so one hit proves nothing waited.
+    #[tokio::test]
+    async fn embed_one_now_does_not_wait_on_a_congested_provider() {
+        let (busy_url, busy_hits) =
+            spawn_counting_server(429, r#"{"error":{"message":"rate limited"}}"#).await;
+        let (busy_info, busy_client) = openai_provider("openrouter", &busy_url);
+        let router = EmbeddingRouter::new(busy_info, busy_client);
+
+        let err = router
+            .embed_one_now("dimension probe")
+            .await
+            .expect_err("a congested-only router has nothing to return");
+        assert!(err.contains("congested"), "the error says why: {err}");
+        assert_eq!(busy_hits.load(Ordering::SeqCst), 1, "one sweep, no retries");
+    }
+
+    /// A healthy provider wins on the single sweep exactly as on the patient
+    /// path, so the startup probe loses nothing when the provider is fine.
+    #[tokio::test]
+    async fn embed_one_now_returns_a_healthy_providers_vector() {
+        let (url, hits) = spawn_counting_server(200, HEALTHY_BODY).await;
+        let (info, client) = openai_provider("ollama", &url);
+        let router = EmbeddingRouter::new(info, client);
+
+        let (vector, switched) = router.embed_one_now("dimension probe").await.expect("healthy");
+        assert_eq!(vector.len(), 3);
+        assert!(switched.is_none(), "the active provider answered; nothing switched");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// The bench expires: after the cooldown the provider is eligible again,

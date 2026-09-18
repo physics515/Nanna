@@ -3024,7 +3024,11 @@ impl DaemonServer {
     ///
     /// A failure here is **not** fatal — see the call site.
     async fn probe_embedding_dimension(router: &EmbeddingRouter) -> Result<usize, String> {
-        let (embedding, _switched_to) = router.embed_one("dimension probe").await?;
+        // One sweep, no waiting on congestion: this runs before the IPC port
+        // listens, so the daemon cannot be reached while it waits. A busy
+        // provider leaves the store on the provisional width, and the
+        // background `probe_and_align_dimension` — which does wait — corrects it.
+        let (embedding, _switched_to) = router.embed_one_now("dimension probe").await?;
         if embedding.is_empty() {
             return Err("embedding provider returned an empty vector".to_string());
         }
