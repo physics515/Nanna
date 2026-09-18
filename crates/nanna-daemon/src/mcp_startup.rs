@@ -57,11 +57,32 @@ fn record_outcome(servers: &mut [McpServerState], name: &str, outcome: Result<us
     }
 }
 
+/// What [`spawn_mcp_servers`] started.
+#[derive(Debug)]
+pub struct McpStartup {
+    /// How many servers were handed to the background task.
+    pub count: usize,
+    /// The background task: it owns the clients, and finishes once it has
+    /// closed them after `shutdown` fires. `None` when nothing was started.
+    /// The daemon awaits it (bounded by [`MCP_SHUTDOWN_DEADLINE`]) so the
+    /// close actually runs before the process exits.
+    pub task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// How long the daemon's shutdown waits for the MCP task.
+///
+/// Every server's exit grace (they close concurrently) plus one second for
+/// the kill and the reap. Past it the task is aborted, which drops the transports and so
+/// kills any child still running (`kill_on_drop`).
+pub const MCP_SHUTDOWN_DEADLINE: std::time::Duration =
+    nanna_mcp::MCP_EXIT_GRACE.saturating_add(std::time::Duration::from_secs(1));
+
 /// Spawn every startable server from `config` and register its tools into
-/// `tools`. Returns how many servers were handed to the background task.
+/// `tools`.
 ///
 /// The servers are shut down when `shutdown` fires, so their child processes
-/// do not outlive a clean daemon exit.
+/// do not outlive a clean daemon exit — provided the caller awaits the
+/// returned task (see [`McpStartup::task`]).
 ///
 /// `secret` looks a `secret_env` value up by store key — the secure store in the
 /// daemon. It is called only for servers that list secrets, so a config without
@@ -78,7 +99,7 @@ pub async fn spawn_mcp_servers(
     status: McpStatus,
     mut shutdown: broadcast::Receiver<()>,
     secret: impl Fn(&str) -> Option<String>,
-) -> usize {
+) -> McpStartup {
     let (startable, skipped) = config.startable();
     let mut start = Vec::with_capacity(startable.len());
     // Unlike `skipped`, these have a well-formed, unique name to report under.
@@ -118,7 +139,10 @@ pub async fn spawn_mcp_servers(
         }));
     }
     if start.is_empty() {
-        return 0;
+        return McpStartup {
+            count: 0,
+            task: None,
+        };
     }
     let count = start.len();
     let mut integration = McpIntegration::new();
@@ -134,7 +158,7 @@ pub async fn spawn_mcp_servers(
         "startable() enforces the bound"
     );
     info!(servers = count, "Starting MCP servers in the background");
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         match integration.start_all(&tools).await {
             Ok(outcomes) => {
                 let mut servers = status.write().await;
@@ -168,8 +192,30 @@ pub async fn spawn_mcp_servers(
         if let Err(e) = integration.shutdown().await {
             warn!("MCP servers did not shut down cleanly: {e}");
         }
+        info!(servers = count, "MCP servers closed");
     });
-    count
+    McpStartup {
+        count,
+        task: Some(task),
+    }
+}
+
+/// Wait for the MCP task to close its servers, at most
+/// [`MCP_SHUTDOWN_DEADLINE`]; past it, abort the task so dropping the
+/// transports kills whatever is still running.
+pub async fn await_mcp_shutdown(task: tokio::task::JoinHandle<()>) {
+    let abort = task.abort_handle();
+    match tokio::time::timeout(MCP_SHUTDOWN_DEADLINE, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("MCP shutdown task failed: {e}"),
+        Err(_) => {
+            warn!(
+                deadline_ms = MCP_SHUTDOWN_DEADLINE.as_millis(),
+                "MCP servers did not close in time; aborting (children are killed on drop)"
+            );
+            abort.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +266,8 @@ mod tests {
             |_| panic!("no server lists a secret, so the store is not read"),
         )
         .await;
-        assert_eq!(started, 0);
+        assert_eq!(started.count, 0);
+        assert!(started.task.is_none());
         let servers = status.read().await.clone();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].state, "not_started");
@@ -253,7 +300,8 @@ mod tests {
             |_| None,
         )
         .await;
-        assert_eq!(started, 0, "nothing is spawned without its token");
+        assert_eq!(started.count, 0, "nothing is spawned without its token");
+        assert!(started.task.is_none());
         let servers = status.read().await.clone();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "github", "reported under its own name");

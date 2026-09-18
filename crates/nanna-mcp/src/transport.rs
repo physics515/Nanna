@@ -241,12 +241,40 @@ pub mod stdio {
         })
     }
 
+    /// How long a stdio server gets to exit after its stdin closes before it
+    /// is killed.
+    ///
+    /// The SDK servers exit in well under 100 ms (measured
+    /// 2026-09-18); the grace is 20x that so a server flushing state is not
+    /// cut off, and short enough that 16 servers closed concurrently keep the
+    /// daemon's shutdown inside its existing 5 s stats-save window.
+    pub const MCP_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Write one newline-delimited message. The lock is held across both
+    /// writes and the flush so concurrent messages cannot interleave inside
+    /// one line; a closed stdin is [`McpError::ConnectionClosed`].
+    async fn write_line(stdin: &Mutex<Option<ChildStdin>>, line: &str) -> Result<()> {
+        debug_assert!(
+            !line.contains('\n'),
+            "a stdio message must not embed a newline"
+        );
+        let mut guard = stdin.lock().await;
+        let pipe = guard.as_mut().ok_or(McpError::ConnectionClosed)?;
+        pipe.write_all(line.as_bytes()).await?;
+        pipe.write_all(b"\n").await?;
+        pipe.flush().await?;
+        drop(guard);
+        Ok(())
+    }
+
     /// Stdio transport - spawns a process and communicates via stdin/stdout
     pub struct StdioTransport {
         /// Child process
         child: Arc<Mutex<Child>>,
         /// Stdin writer
-        stdin: Arc<Mutex<ChildStdin>>,
+        /// Stdin writer. `None` once `close` has dropped it — the EOF that is a
+        /// stdio server's graceful-shutdown signal.
+        stdin: Arc<Mutex<Option<ChildStdin>>>,
         /// Pending requests waiting for responses
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
         /// Shutdown signal
@@ -309,7 +337,7 @@ pub mod stdio {
             // Spawn reader task
             let pending_clone = pending.clone();
             let list_changed_clone = list_changed.clone();
-            let stdin = Arc::new(Mutex::new(stdin));
+            let stdin = Arc::new(Mutex::new(Some(stdin)));
             tokio::spawn(Self::reader_task(
                 stdout,
                 stdin.clone(),
@@ -332,7 +360,7 @@ pub mod stdio {
         /// answered on stdin.
         async fn reader_task(
             stdout: ChildStdout,
-            stdin: Arc<Mutex<ChildStdin>>,
+            stdin: Arc<Mutex<Option<ChildStdin>>>,
             pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
             mut shutdown_rx: mpsc::Receiver<()>,
             list_changed: Arc<ListChangedFlags>,
@@ -368,7 +396,7 @@ pub mod stdio {
         /// Deliver one server line to where its shape says it belongs.
         async fn route_line(
             line: &str,
-            stdin: &Mutex<ChildStdin>,
+            stdin: &Mutex<Option<ChildStdin>>,
             pending: &Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>,
             list_changed: &ListChangedFlags,
         ) {
@@ -386,14 +414,7 @@ pub mod stdio {
                 Incoming::ServerRequest { id, method } => {
                     debug!(%id, method, "MCP server sent a request; answering");
                     let reply = reply_to_server_request(&id, &method).to_string();
-                    let mut stdin = stdin.lock().await;
-                    let written = async {
-                        stdin.write_all(reply.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        stdin.flush().await
-                    }
-                    .await;
-                    drop(stdin);
+                    let written = write_line(stdin, &reply).await;
                     if let Err(e) = written {
                         warn!(error = %e, method, "Could not answer an MCP server request");
                     }
@@ -421,14 +442,10 @@ pub mod stdio {
             let line = serde_json::to_string(&request)?;
             trace!(line, "Sending to MCP server");
             
-            {
-                let mut stdin = self.stdin.lock().await;
-                stdin.write_all(line.as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                stdin.flush().await?;
-                // Held across both writes and the flush so concurrent messages
-                // cannot interleave inside one line.
-                drop(stdin);
+            if let Err(error) = write_line(&self.stdin, &line).await {
+                // Nothing will ever answer an unsent request: do not leak its slot.
+                self.pending.lock().await.remove(&id);
+                return Err(error);
             }
 
             // Wait for response with timeout
@@ -446,23 +463,31 @@ pub mod stdio {
         async fn notify(&self, notification: JsonRpcNotification) -> Result<()> {
             let line = serde_json::to_string(&notification)?;
             trace!(line, "Sending notification to MCP server");
-            
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await?;
-            // Held across both writes and the flush so concurrent messages
-            // cannot interleave inside one line.
-            drop(stdin);
-            
-            Ok(())
+
+            write_line(&self.stdin, &line).await
         }
 
+        /// Shut the server down the way the stdio binding asks: close its
+        /// stdin (the primary, portable signal), give it [`MCP_EXIT_GRACE`] to
+        /// exit, and only then kill it.
         async fn close(&self) -> Result<()> {
             let _ = self.shutdown_tx.send(()).await;
+            let stdin = self.stdin.lock().await.take();
+            drop(stdin);
 
-            let _ = self.child.lock().await.kill().await;
-
+            let mut child = self.child.lock().await;
+            match tokio::time::timeout(MCP_EXIT_GRACE, child.wait()).await {
+                Ok(Ok(status)) => debug!(%status, "MCP server exited on stdin EOF"),
+                Ok(Err(e)) => warn!(error = %e, "Could not wait on the MCP server"),
+                Err(_) => {
+                    warn!(
+                        grace_ms = MCP_EXIT_GRACE.as_millis(),
+                        "MCP server ignored stdin EOF; killing it"
+                    );
+                    child.kill().await?;
+                }
+            }
+            drop(child);
             Ok(())
         }
 
@@ -475,9 +500,65 @@ pub mod stdio {
     mod tests {
         use super::{
             Incoming, JsonRpcNotification, JsonRpcResponse, ListChangedFlags, McpList,
-            ServerNotification, classify_incoming, classify_server_notification,
+            ServerNotification, Transport, classify_incoming, classify_server_notification,
             handle_server_notification, mcp_level_is_severe, reply_to_server_request,
         };
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn close_lets_a_server_that_honours_eof_exit_on_its_own() {
+            // `cat` exits the moment its stdin closes: no kill should be needed.
+            let transport = super::StdioTransport::spawn("sh", &["-c", "cat >/dev/null"]).unwrap();
+            let started = std::time::Instant::now();
+            transport.close().await.unwrap();
+            assert!(
+                started.elapsed() < super::MCP_EXIT_GRACE,
+                "{:?}",
+                started.elapsed()
+            );
+            let status = transport.child.lock().await.try_wait().unwrap();
+            assert!(
+                status.is_some_and(|s| s.success()),
+                "exited cleanly on EOF: {status:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn close_kills_a_server_that_ignores_eof_after_the_grace() {
+            // Never reads stdin, so EOF means nothing to it — the orphan case.
+            let transport = super::StdioTransport::spawn("sh", &["-c", "sleep 30"]).unwrap();
+            let started = std::time::Instant::now();
+            transport.close().await.unwrap();
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= super::MCP_EXIT_GRACE,
+                "waited the grace first: {elapsed:?}"
+            );
+            assert!(
+                elapsed < super::MCP_EXIT_GRACE * 2,
+                "then killed promptly: {elapsed:?}"
+            );
+            let status = transport.child.lock().await.try_wait().unwrap();
+            assert!(
+                status.is_some_and(|s| !s.success()),
+                "killed, not exited: {status:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_closed_transport_refuses_to_write() {
+            let transport = super::StdioTransport::spawn("sh", &["-c", "cat >/dev/null"]).unwrap();
+            transport.close().await.unwrap();
+            let refused = transport
+                .notify(JsonRpcNotification::new("notifications/initialized", None))
+                .await;
+            assert!(
+                matches!(refused, Err(super::McpError::ConnectionClosed)),
+                "{refused:?}"
+            );
+        }
 
         #[test]
         fn a_server_request_is_never_mistaken_for_a_response() {
@@ -627,7 +708,7 @@ pub mod stdio {
 }
 
 #[cfg(feature = "stdio")]
-pub use stdio::StdioTransport;
+pub use stdio::{MCP_EXIT_GRACE, StdioTransport};
 
 // ============================================================================
 // HTTP Transport

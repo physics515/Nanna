@@ -416,18 +416,20 @@ mod tools_impl {
             Ok(())
         }
 
-        /// Close all connections
+        /// Close all connections, concurrently: each close may spend a grace
+        /// period waiting for its server to exit, and one slow or failing
+        /// server must not keep the others running.
         ///
         /// # Errors
         ///
-        /// Returns error if any close fails
+        /// Returns the first close error, after every close has been attempted.
         pub async fn close_all(&self) -> Result<(), McpError> {
             let clients = self.clients.read().await;
-            for client in clients.values() {
-                client.close().await?;
-            }
+            let outcomes =
+                futures::future::join_all(clients.values().map(|client| client.close())).await;
+            debug_assert_eq!(outcomes.len(), clients.len());
             drop(clients);
-            Ok(())
+            outcomes.into_iter().collect()
         }
     }
 
@@ -709,16 +711,17 @@ impl<T: Transport + 'static> McpManager<T> {
         Ok(())
     }
 
-    /// Close all connections
+    /// Close all connections concurrently (see the tools manager's
+    /// `close_all` for why).
     ///
     /// # Errors
     ///
-    /// Returns error if any close fails
+    /// Returns the first close error, after every close has been attempted.
     pub async fn close_all(&self) -> Result<(), McpError> {
-        for client in self.clients.values() {
-            client.close().await?;
-        }
-        Ok(())
+        let outcomes =
+            futures::future::join_all(self.clients.values().map(|client| client.close())).await;
+        debug_assert_eq!(outcomes.len(), self.clients.len());
+        outcomes.into_iter().collect()
     }
 }
 

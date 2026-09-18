@@ -4657,7 +4657,7 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             daemon** (orphaned to the subreaper). Lines are now classified by shape; `ping` gets
             `{}`, every other request `-32601`; `roots` is no longer declared. Re-run: no survivor,
             `clean_shutdown`.
-      - [ ] **The daemon's MCP shutdown is never awaited.** `spawn_mcp_servers` closes the clients
+      - [x] **The daemon's MCP shutdown is never awaited.** `spawn_mcp_servers` closes the clients
             in a detached task on the shutdown broadcast, but the daemon returns (`Daemon stopped`)
             without waiting for it, so the `kill()` in `StdioTransport::close` does not run — the
             orphan above survived a SIGKILL-capable close path, which is the proof. Today every
@@ -4666,6 +4666,19 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             `JoinHandle` and await it under a bounded deadline in the shutdown sequence, and follow
             the spec's escalation (close stdin → wait → SIGTERM → SIGKILL) instead of an immediate
             kill.
+            *(2026-09-18, same night)* Done in that shape, minus SIGTERM (tokio's `Child` only
+            offers SIGKILL, and a new `nix`/`libc` dep for one signal is not worth it when EOF is
+            the spec's *primary* signal). `StdioTransport::close` now drops stdin, waits
+            `MCP_EXIT_GRACE` (2 s — the SDK servers exit in <100 ms) and only then kills;
+            `close_all` closes every server concurrently and no longer stops at the first error;
+            `spawn_mcp_servers` returns its task and `finish_shutdown` awaits it under
+            `MCP_SHUTDOWN_DEADLINE` (grace + 1 s), aborting past it so `kill_on_drop` still fires.
+            Also: a failed request write no longer leaks its pending slot. Proof on the real debug
+            daemon with an SDK server wrapped to ignore EOF: `MCP server exited on stdin EOF` for
+            the well-behaved one, `ignored stdin EOF; killing it grace_ms=2000` for the stubborn
+            one 2.0 s later, `MCP servers closed` **before** `Daemon stopped`, no node process left.
+            Unit tests pin both paths (`cat` exits inside the grace; `sleep 30` is killed after it,
+            within 2× grace) and that a closed transport refuses to write.
       - [ ] **HTTP/SSE servers from config** — `HttpTransport` exists but has no auth headers and
             speaks the 2024-11-05 SSE transport; add `url` entries with bearer tokens read from the
             keyring (not `config.toml`), then Streamable HTTP.

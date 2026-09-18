@@ -2910,6 +2910,8 @@ pub struct DaemonServer {
     scheduler_slot: crate::reminder_service::SchedulerSlot,
     /// Per-server MCP state: written by the boot task, read by `system.status`.
     mcp_status: crate::mcp_startup::McpStatus,
+    /// The MCP background task, awaited by `finish_shutdown`.
+    mcp_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The dreaming orchestrator, for `memory.get`'s use feedback. Filled once
     /// in `run()`, right after it is built.
     dreaming_slot: DreamingSlot,
@@ -3061,6 +3063,7 @@ impl DaemonServer {
             control_slot: Arc::new(tokio::sync::RwLock::new(None)),
             scheduler_slot: Arc::new(std::sync::OnceLock::new()),
             mcp_status: crate::mcp_startup::McpStatus::default(),
+            mcp_task: std::sync::Mutex::new(None),
             dreaming_slot: Arc::new(std::sync::OnceLock::new()),
             ipc,
             persistence,
@@ -4423,6 +4426,14 @@ impl DaemonServer {
         // Wait for stats auto-save task to complete final save
         let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
 
+        // The MCP task closes its servers on the same broadcast; wait for it,
+        // or the process exits before the close runs and a server that
+        // ignores stdin EOF outlives the daemon.
+        let mcp_task = self.mcp_task.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(task) = mcp_task {
+            crate::mcp_startup::await_mcp_shutdown(task).await;
+        }
+
         ipc_handle.abort();
 
         // Release PID file
@@ -4514,7 +4525,7 @@ impl DaemonServer {
 
         // MCP servers register their tools as each handshake completes; the
         // count above is the tool surface before them.
-        crate::mcp_startup::spawn_mcp_servers(
+        let mcp = crate::mcp_startup::spawn_mcp_servers(
             &self.config.mcp,
             Arc::clone(&tools),
             Arc::clone(&self.mcp_status),
@@ -4522,6 +4533,12 @@ impl DaemonServer {
             |key| nanna_config::credentials::SecureStore::new().get(key).ok(),
         )
         .await;
+        if let Some(task) = mcp.task
+            && let Ok(mut slot) = self.mcp_task.lock()
+        {
+            debug_assert!(slot.is_none(), "services are initialized once");
+            *slot = Some(task);
+        }
 
         // Register discover_tools (JS/TS skill with registry access)
         if let Some(ref dir) = tools_dir {
