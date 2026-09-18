@@ -33,10 +33,11 @@ jobs:
   live-sdk:
     name: nanna-mcp vs the reference SDKs
     runs-on: ubuntu-latest
-    # Not yet measured on a runner: the first run sets the real number.
-    # 30 matches the other Rust jobs here, whose shared dependency graph is
-    # larger than nanna-mcp's; re-measure rather than raise.
-    timeout-minutes: 30
+    # Measured: the first run (cold cache, PR #344) took 3m23s end to end,
+    # 2m44s of it building and running the suite (11 tests, 25 s). 15 is ~4x
+    # that — room for a cache miss on a slow runner. Re-measure rather than
+    # raise.
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
