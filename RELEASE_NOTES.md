@@ -86,7 +86,10 @@ port is entered in Settings like any other address.
 sizes a local model's context window to the video memory free on this machine, and it did the same
 for a server on another machine, whose card it cannot see. A busy card here could shrink a remote
 model's window to the minimum. A remote server now starts at 16,384 tokens, the size Nanna uses
-whenever the card cannot be read, and still steps down if that server runs out of memory.
+whenever the card cannot be read, and still steps down if that server runs out of memory. The size
+is kept per server, so changing the server in Settings while Nanna runs no longer carries the old
+server's size over, and a model used on two servers (summaries on this computer, chat on another)
+keeps one for each.
 
 **Commands Nanna runs from the Linux app picked up the app's own libraries.** The AppImage's
 `LD_LIBRARY_PATH` leaked into every command, so tools like `git` loaded the bundled copies of
