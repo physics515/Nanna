@@ -948,6 +948,21 @@ health checks). **Shipped**, except:
       MCP **server** logged every notification (`notifications/initialized`) as a failed parse, and
       silently dropped a request it could not read; notifications are now accepted quietly, and an
       unreadable line is answered `-32700` (`id: null`) or `-32600` (its id echoed).
+      *(2026-09-18, same night)* **The server side is dual-era too.** It answered only the 2024
+      handshake, so a modern-only client could not use it: the real `@modelcontextprotocol/client`
+      2.0 pinned to 2026-07-28 failed with *"the server did not offer pinned protocol version
+      2026-07-28 via server/discover"*, and in `auto` mode fell back to legacy. Now `server/discover`
+      is answered (supported `["2026-07-28", "2024-11-05"]`, capabilities, `serverInfo` in `_meta`),
+      a request naming an unknown revision in `_meta` gets `-32022` with the supported list, modern
+      results carry `resultType` and — for discover, the lists and `resources/read` — the required
+      caching hints (`ttlMs: 0`: the daemon's registry changes at runtime; `cacheScope: private`),
+      and errors use the spec's codes (`-32601` unknown method, `-32602` unknown tool/resource/bad
+      params, `-32603` otherwise) instead of the catch-all `-32000`. Legacy answers are byte-for-
+      byte as before. The caching-hint requirement was caught by the real client (it rejected
+      `tools/list` without `ttlMs`), not by reading. Verified with that client
+      (`tests/fixtures/sdk-servers/client-probe.mjs`) against `nanna mcp serve`: `legacy` →
+      2024-11-05, `auto` → **2026-07-28**, `pin` → 2026-07-28 (was a hard failure), 47 tools and a
+      call in each; an unknown tool → `Tool not found`.
 - [~] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
       *(2026-08-23)* **Half of this was already stale, and the half that was true hid a real bug.**
       `perform_health_check` does run a genuine agent loop — `Agent::run(probe_prompt)` under a
