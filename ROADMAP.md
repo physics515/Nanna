@@ -4948,6 +4948,8 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
             `McpServerList` shows each server with a state dot and its tool count or failure reason
             on the Tools landing panel (hidden when none are configured). 6 vitest incl. the exact
             payload captured from the live daemon. Not WebDriver-verified (Linux harness blocked).
+            *(2026-09-18 — verified in the real app over WebDriver:* the Tools landing panel rendered
+            `MCP SERVERS · modern — 2 tools · 2026-07-28 over stdio` for an isolated sidecar.)
 - [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.
@@ -5184,6 +5186,9 @@ asks permission or restricts her.)*:
       `session_cleared`; the GUI forwards it and an open chat on that session reloads from the
       daemon instead of showing a conversation the next turn no longer sees (daemon event test,
       Tauri parse test, 2 vitest; not WebDriver-verified).
+      *(2026-09-18 — verified in the real app over WebDriver:* with the chat open, an `ask_user`
+      question posted through the sidecar appeared live; `session.clear` sent over IPC from outside
+      the GUI made the open chat reload and the question disappear.)
 - [~] **Doctor probes** — health checks report availability, not root cause. Our own history (loopback
       stream faults misread as provider 502s → restart spirals) is exactly the failure class a
       self-diagnosing always-on daemon must catch.
