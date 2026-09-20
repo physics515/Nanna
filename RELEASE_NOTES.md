@@ -1,143 +1,73 @@
-# Nanna v0.3.21-beta.30 — Things That Talk Back
+# Nanna v0.3.23-beta.32 — Measuring Before Building
 
-If you wrote to Nanna from Telegram, Discord or Slack, every message was answered with
-**"I encountered an error processing your message."** Every one.
+This release is mostly about the memory system, and mostly about deciding things with numbers
+instead of with arguments. Three long-standing questions in the roadmap were each waiting on a
+measurement that nobody had taken. All three are now answered, and two of them turned out to have
+an answer nobody expected.
 
-Not because the model failed — the model was never asked. Two things were wrong at once. The
-conversation a chat message belongs to was never created, and the daemon refuses a message for a
-conversation that does not exist. And even past that, the channel code read its reply out of the
-daemon's response to "send this message" — which, since the daemon learned to acknowledge a message
-the moment it arrives (so a long task never times out the sender), is a receipt, not an answer.
+Recall got faster. Dreaming got faster. Neither is a rewrite — they are the cheap wins, taken
+deliberately so that the expensive one can be judged on evidence rather than intuition.
 
-This release makes the chat apps real conversations again, and then builds on that: reminders that
-arrive, questions Nanna can ask you, results that land where you asked for them, and an undo for the
-files she writes.
+## What's Faster
 
-## What's Fixed
+**Recall stopped ranking your whole memory store to return ten results.** Every time Nanna recalls
+something — and she recalls on every ingest, not just when you ask — she scored every memory and
+then **sorted all of them** before keeping the top handful. At fifty thousand memories that is
+sorting fifty thousand things to keep ten. It now selects rather than sorts, which is **5-18% off
+the entire recall path**, cosine included.
 
-**Chat apps get answers.** Each chat gets its own conversation, created on first contact with its
-reply route remembered — so it survives a restart. Telegram and Discord show "typing…" while Nanna
-works on your message. When a turn finishes, the answer is sent back to
-the chat it came from. If a message cannot be answered at all, the chat is told why ("no model
-provider is configured"), not "an error". Webhook conversations are covered by the same path.
+That change came with a quieter correctness fix. The ranking relied on sort stability to break
+ties, and ties are ordinary — every memory that cannot be compared scores identically. It now
+orders ties explicitly, so repeated recalls return the same memories in the same order. And a
+memory with a degenerate embedding used to produce a score that was *not a number*, which the old
+comparator treated as "equal to everything" and could seat anywhere in your results, including
+first. It now ranks last, where it belongs.
 
-**Reminders work — and survive a restart.** `remind`, `list_reminders` and `cancel_reminder` were
-the last three tools withheld at boot; **no bundled tool is missing its service any more**. A due
-reminder is posted into the conversation that set it — in the app, and in the chat app you wrote
-from. A reminder that came due while Nanna was not running is delivered at the next start and says
-how late it is. Driven for real: set, delivered 7 s later; set, daemon stopped, restarted 90 s
-later, delivered 6 s after boot with "is 2 min late".
+**Dreaming got about a third cheaper on a long-lived store.** Two passes, both of which leave the
+result bit-for-bit identical:
 
-**The scheduler no longer runs two copies of one job.** Anything still running when the next
-30-second check came round was started again — a slow one-shot fired **8 times** in the test that
-now pins it, a slow recurring job ran **11 copies at once**. And a fired one-shot was re-armed by
-every restart. Both are gone.
+- The similarity kernel was recomputing each memory's magnitude for every pair it looked at, inside
+  a loop that looks at every pair. Those are now computed once. Worth 11-18%.
+- Pairs that **cannot possibly** be close enough to merge are now rejected before Nanna reads
+  their embeddings at all. On a store spread over months this skips **21.9% of all comparisons**,
+  for another 16-22%.
 
-**MCP servers actually start — and their tools would have broken every request.** The MCP client
-was complete and nothing ever launched it. Configured servers now start at boot, in the background.
-On the way: MCP tools were named `server:tool`, and the colon is invalid for both Anthropic and
-OpenAI, which reject the *whole request* over it — the first MCP tool anyone added would have failed
-every turn. They are named `mcp__server__tool` now. A server that needs a token lists it in
-`secret_env` and you store it with `nanna mcp secret set <server> <VAR>` — it stays in the OS
-keyring and only that server receives it.
+The second one is exact rather than clever: it computes the best score a pair could achieve with a
+perfect match, and skips only when even that is not good enough. Nothing that would have merged is
+missed, and the test suite proves it by dreaming the same store twice, with and without the
+shortcut, and requiring identical results.
 
-**A failed tool call over IPC said nothing.** A direct tool call that failed answered `success:
-false` with an empty string; the reason was dropped. It is returned now.
+## What We Learned, Including Where We Were Wrong
 
-## What's New
+**Keeping memories in RAM beats querying them from the database, by 9-14x.** Nanna can search
+memories with an exact database query that uses almost no memory, and it was an open question
+whether that should become the normal path. It should not: the in-memory scan is between nine and
+fourteen times faster, and the cost of loading memories in the first place pays for itself after
+**two or three searches**. The database path stays for stores too large to hold in memory, and we
+now know the size where that starts to matter — around 350,000 memories, roughly seven times
+today's practical ceiling.
 
-**Ask when unsure.** `ask_user` posts a clarifying question into the conversation — app or chat app —
-and waits up to half an hour for your reply, which the running task picks up and continues with. No
-reply, and it carries on with its best judgement and says what it assumed.
+**Making the arithmetic cheaper does not fix a quadratic, and we measured how little it helps.**
+Removing two thirds of the similarity kernel's arithmetic was expected to be worth two to three
+times. It was worth thirteen percent, because the work is limited by memory bandwidth, not by
+arithmetic. Recorded plainly, because it closes off a whole direction: for a store of half a
+million memories, every cheap optimization available — a third of the arithmetic, a fifth of the
+comparisons — moves a dream cycle from about 73 minutes to about 47. The next step has to be
+comparing fundamentally fewer pairs, not comparing them faster.
 
-**Undo for file writes.** Before `write_file`, `edit_file` or `file_buffer` changes a file, its
-previous content is saved outside your project. Nanna can list and restore her own checkpoints
-(`file_history`), and the chat header has a **Files** button that does the same for you. A restore
-is itself undoable; restoring a file a tool created removes it. Bounded: 100 recent checkpoints per
-conversation plus each file's first version, 256 MiB per conversation, 1 GiB overall.
+**Thirteen of Nanna's twenty-one memory-decay parameters do not do anything.** They are public,
+they are saved to your config, several are non-zero, and they look exactly like tuning knobs.
+Eight of them are wired to a formula; the rest are a table inherited from a published algorithm
+whose update rules Nanna does not use. This is now proven by a test that perturbs each one and
+checks whether anything moves, so the documentation cannot quietly go stale — and the module no
+longer claims to be an implementation of an algorithm it only borrows one curve from.
 
-**Chat commands.** From any chat app: `/status` (up? busy here? able to answer at all?), `/stop`
-(cancel what Nanna is doing in that chat), `/new` (start the chat over), `/model <name>` to pin that conversation's model
-(`/model default` undoes it), `/help`.
+## Under the Hood
 
-**Rules you set can be lifted — by you.** When a file rule you declared ("don't touch tests/")
-really blocks the work, Nanna can ask, quoting your own words; only a clear yes lifts it.
-
-**Export a chat** to Markdown or JSON from the session menu.
-
-**Scheduled jobs can post their results into a conversation**, and so into a chat app. A quiet
-heartbeat posts nothing.
-
-**Hand edits of `config.toml` apply without a restart** (models, providers, scheduler switches). A
-half-saved file that does not parse is logged and the running configuration is kept; saving the same
-values changes nothing.
-
-**Spend by day, month and conversation.** The per-request log existed with nothing writing it; it is
-written now, and `system.cost_rollup` prices it. The Model Stats page shows spend by day for the last
-30 days. Models with no list price (local, unknown) are named and marked, never counted as $0.
-
-**Operations.** Prometheus `/metrics` on the health port (tools, models, MCP servers, channel
-messages in and out, reminders, live runs). `system.status` and the Tools page show each MCP server
-as started, failed (with the error) or not started (with the reason). `nanna doctor` checks MCP
-commands are on `PATH`.
-
-**Memory learns from use.** When Nanna recalls a result she stored earlier, the memories that
-served it are credited — the first producer of the "used successfully" signal the memory system has
-priced since July.
-
-## Crashes and Silences Found by Cleaning Up
-
-A pass that took the workspace to zero compiler, clippy and rustdoc warnings turned up ten real
-bugs on the way. The ones you could have hit:
-
-**An app update left the old server running.** Updating replaced the app but not the daemon behind
-it, so a new UI kept talking to the previous release — with every bug that update was meant to fix.
-The installer stops the daemon now, and on startup the app checks the version of whatever answers
-on its port and replaces a server from another release.
-
-**A second Nanna could not open a browser.** Every Chromium was launched on one shared profile
-directory, and Chromium refuses to start on a profile another Chromium holds. It also insisted on
-Playwright's own downloaded browser when that backend was compiled in, ignoring the Chromium already
-installed — which read as "Browser 'chromium' is not installed".
-
-**With no model configured, chats failed without saying why.** Four separate paths — a chat turn,
-the older chat route, sub-agents and the startup heartbeat — sent requests naming no model at all.
-Every one of them now stops and names the setting to fix (Settings → Models).
-
-**Crashes on ordinary text.** A re-embed log line, the Telegram token preview and a chat-wedge
-class of bug all cut strings at a fixed byte offset, which panics when a character straddles it.
-An empty search query divided by zero. Asking for a sub-agent without a system prompt panicked
-outright.
-
-**A cron expression could hang the scheduler forever:** `0-30/0` never advanced, and a step near
-four billion wrapped around instead of ending.
-
-## What This Release Does Not Do
-
-**None of this was driven through a live chat app.** There is no bot token on the build host. The
-channel path is tested with a recording channel against the real control plane and session store; a
-real Telegram round-trip is the remaining check.
-
-**MCP servers speaking only the newest protocol (2026-07-28) will not connect.** That revision drops
-the `initialize` handshake Nanna's client uses. Such a server is reported as failed, with its error,
-on the Tools page and in `system.status` — but it does not work yet. Stdio servers only;
-HTTP servers are not started from config.
-
-**`ask_user` waiting inside a running task, and a scheduled job's result being posted after a real
-model run, were not exercised end to end** — both need a live model turn. The mechanics under them
-are tested against the real run registry and session store.
-
-**GUI changes are not WebDriver-verified.** Linux still lacks a WebKitGTK driver matching the app's
-WebKitGTK generation. The GUI builds, and its logic is covered by unit tests.
-
-## Numbers
-
-- **2,106 Rust tests and 271 GUI tests pass, 0 fail**; clippy reports 0 errors and no new warnings.
-- **3 → 0** bundled tools withheld for want of a daemon service.
-- **8 → 1** fires of a slow one-shot job; **11 → 1** concurrent copies of a slow recurring job.
-- Dependencies: 19 compatible bumps, `deno_core` 0.411 → 0.412; `@vueuse/core` removed (nothing
-  imported it).
-- **3,331 → 0** clippy warnings (pedantic + nursery), **56 → 0** rustdoc warnings, and 0 build
-  warnings — with **no `#[allow]` left anywhere** in the workspace: the 36 that existed are gone and
-  what they hid is fixed. `--all-features` compiles for the first time, so the deno, playwright and
-  python paths are checked and tested too.
+- **Toolchain moved to nightly-2026-09-20**, with the full gate re-run under it.
+- **Clippy warnings halved** (21 → 11) by taking a newer lint's rewrites across 22 sites. Two of
+  its suggestions were rejected for being less readable than the code they replaced.
+- **Dependencies refreshed**: 8 Rust crates, 2 GUI packages. TypeScript 7 remains blocked upstream.
+- **2,178 tests pass**, up from 2,167.
+- The dreaming quality baseline — 0.90 compression at 1.000 recall — is **unchanged**, which is how
+  we know the speedups above cost nothing in what Nanna actually remembers.
