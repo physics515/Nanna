@@ -7376,6 +7376,25 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            remembered pin would have missed. Re-checked both retirement conditions: rustpython-
            {vm,stdlib,codegen} still 0.5.0 (2026-03-31) and pymath still 0.2.0, so both pins stay.
            GUI: `pnpm outdated` clean except the blocked TypeScript 7. 1722 tests green.
+     - [x] *(2026-09-20)* **Toolchain pin moved `nightly-2026-09-08` → `nightly-2026-09-20`**
+           (rustc `feaadeeac`, cargo `495c385d0`). Release-built `-p nanna-daemon` green from a
+           cold, isolated target dir in **9m06s** — no tokio ICE, no `turso_core` depth overflow —
+           and the full gate re-run under the new channel: **2173 tests, 0 failures, clippy 11
+           warnings / 0 errors**. The mirrored `toolchain:` inputs in `budget-gate.yml`,
+           `test-compile.yml` (4 sites) and `release-check.yml` moved with it.
+           **What the move actually cost, and what it was not:** the newer clippy first reported
+           **58** warnings against the old channel's 21. That looked like a regression and was not
+           — it is one newly-pedantic lint, `clippy::map_unwrap_or`, firing on
+           `map(f).unwrap_or_default()` at 22 sites across 19 files. Taking the machine-applicable
+           `map_or_default` rewrites cleared it and left **11 warnings on both channels**, i.e. the
+           cleanup also improved the old pin by 10. Two of clippy's auto-fixes were reverted by
+           hand: its suggestion for `assert!(x.is_empty())` is
+           `assert_eq!(x, [] as [std::string::String; 0])`, which reads worse than what it
+           replaces. Both rewrites were verified to compile on the **old** channel too, so the
+           style commit does not depend on the pin move landing.
+           The caveat from the previous pin still holds verbatim: the channel does not control
+           cargo's build-script output layout, so it neither caused nor fixes anything about the
+           Tauri GUI build on Linux.
      - [x] *(2026-09-09)* **Toolchain pin moved `nightly-2026-08-27` → `nightly-2026-09-08`**
            (rustc `cea272fa3`). Both candidates release-built `-p nanna-daemon` green from cold
            target dirs — `nightly-2026-08-29` in 8m37s, `nightly-2026-09-08` in 8m33s — with no
