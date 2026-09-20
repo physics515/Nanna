@@ -2878,6 +2878,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      **(2026-09-20) A constant-factor pass landed, and it is mostly useful for what it rules
+      out.** `cluster_memories` now hoists each memory's L2 norm out of the O(N^2) loop — the
+      cosine kernel re-derived both magnitudes on every pair (three FMAs per element) and now
+      does one dot product against two cached scalars. Bit-identical, asserted as exact `f32`
+      equality across seven widths, with the `pairs` column unchanged at every N. Worth
+      **11-18%** on the sparse arm (16k: 4,206.6 ms -> ~3,730 ms), two runs agreeing.
+      **But it was estimated at 2-3x and delivered 13%, and that gap is the finding**: the
+      kernel is **memory-bandwidth bound, not FMA bound** — each pair streams two 384-float
+      vectors and a wide core absorbs the extra multiply-adds nearly free. So no further
+      arithmetic tuning of this loop is worth scheduling; 35 ns/pair -> 29 ns/pair moves 500k
+      from ~73 min to ~60 min, which is not a fix. **Fewer pairs is the only lever**, which is
+      what this item already proposes — now supported by a measurement instead of an
+      assumption.
       **(2026-09-09) Baselined first — `bench/BASELINE.md` Suite 3b — and the two regimes are
       the finding.** Cost is governed by **match density**, not by N. *Dense* (clusters fill, so
       `max_cluster_memories` breaks the inner loop): **N^1.45**, 16k memories in 39 ms. *Sparse*

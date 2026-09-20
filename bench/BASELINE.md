@@ -128,6 +128,44 @@ win no matter how good the index is.
 The sparse regime is also the realistic one for a long-lived store: what survives
 consolidation is precisely the memories that did *not* merge into anything.
 
+### 2026-09-20 — norm hoisting: 11-18% off the pass, and a useful negative result
+
+`cluster_memories` now computes each memory's L2 norm **once** and gives the pair loop a
+single dot product against two cached scalars, instead of calling `cosine_similarity_f32`,
+which re-derives both magnitudes on every pair (it accumulates three FMAs per element:
+`a·b`, `a·a`, `b·b`). Bit-identical results — the two SIMD kernels walk the same chunks in
+the same order, so this is an identity, not a tolerance, and
+`norm_hoisting_is_bit_identical_to_the_cosine_kernel` asserts exact `f32` equality across
+seven widths. The `pairs` column is unchanged at every N, which is the other half of the
+proof that nothing about the clustering decision moved.
+
+Same host, same fixture, same seed; two independent runs after the change, both agreeing:
+
+| N (sparse) | wall_ms before | wall_ms after (2 runs) | delta |
+| --- | --- | --- | --- |
+| 1,000 | 14.2 | 12.2 / 11.2 | **-17.6%** |
+| 2,000 | 54.2 | 47.1 / 47.8 | **-12.5%** |
+| 4,000 | 224.2 | 194.3 / 193.9 | **-13.4%** |
+| 8,000 | 916.8 | 794.6 / 788.4 | **-13.7%** |
+| 16,000 | 4,206.6 | 3,756.4 / 3,703.3 | **-11.3%** |
+
+Dense arm moves too but less and noisily (226.9 → 203.2 / 206.1 at 16k, ~-10%); it has far
+fewer pairs, so read the sparse arm.
+
+**The negative result is the more useful half, and it contradicts the estimate that
+motivated the change.** Removing two thirds of the FMAs was expected to be worth roughly
+2-3x. It is worth 13%. The cosine kernel here is **memory-bandwidth bound, not
+FMA bound** — each pair streams two 384-float vectors (~3 KB) and a wide out-of-order core
+absorbs the extra multiply-adds nearly for free. So: **do not chase arithmetic in this
+loop.** Vectorising harder, fusing, or hand-tuning the kernel will buy single-digit
+percentages against a quadratic, and the ceiling is not moved by any of it.
+
+Concretely, the extrapolation barely improves — 35 ns/pair → 29 ns/pair means **500k goes
+from ~73 min to ~60 min**. A dream cycle still cannot take an hour. The only lever that
+changes the shape is **comparing fewer pairs**, which is exactly what the indexed-clustering
+item proposes and exactly what this measurement now supports with a number rather than an
+assumption.
+
 > **Two earlier readings of this table were wrong, and both for the same reason — the
 > configuration underneath moved.** The first (pre-fix `cluster_threshold` 0.45) showed
 > `pairs` growing *linearly*, because the non-semantic floor (0.50) sat above the threshold

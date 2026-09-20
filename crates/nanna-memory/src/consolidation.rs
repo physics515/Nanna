@@ -518,8 +518,41 @@ pub fn composite_cluster_score(
     b: &MemoryEntry,
     weights: &ClusteringWeights,
 ) -> f32 {
+    composite_cluster_score_with_norms(
+        a,
+        l2_norm(&a.embedding),
+        b,
+        l2_norm(&b.embedding),
+        weights,
+    )
+}
+
+/// [`composite_cluster_score`] when both embeddings' L2 norms are already known.
+///
+/// Exists for one caller — [`cluster_memories`]'s O(N²) inner loop — and for one
+/// reason: the norms are **loop-invariant** and the cosine kernel recomputes
+/// them on every pair. `nanna_simd::cosine_similarity_f32` accumulates three
+/// FMAs per element (`a·b`, `a·a`, `b·b`), so two thirds of its arithmetic is
+/// re-deriving magnitudes that do not change. Hoisting them out makes each pair
+/// a single dot product against two cached scalars.
+///
+/// **The result is bit-identical, not merely close**, and that is a property of
+/// how the two kernels are written rather than a tolerance: `dot_product_f32`
+/// and `cosine_similarity_f32` walk the same 16-wide chunks in the same order
+/// with the same `fmadd`, reduce the same way, and finish with the same scalar
+/// remainder — so `dot_product_f32(a, b)` reproduces the cosine kernel's own
+/// `dot_sum` exactly, and `dot_product_f32(a, a)` reproduces its `mag_a`.
+/// Dividing by `norm_a * norm_b` is then the same final expression.
+/// `norm_hoisting_is_bit_identical_to_the_cosine_kernel` pins that.
+fn composite_cluster_score_with_norms(
+    a: &MemoryEntry,
+    norm_a: f32,
+    b: &MemoryEntry,
+    norm_b: f32,
+    weights: &ClusteringWeights,
+) -> f32 {
     // 1. Semantic similarity (cosine)
-    let sim = cosine_similarity(&a.embedding, &b.embedding).max(0.0);
+    let sim = cosine_with_norms(&a.embedding, norm_a, &b.embedding, norm_b).max(0.0);
 
     // 2. Recall affinity: memories accessed a similar number of times are "peers"
     //    and memories both accessed recently are likely contextually related.
@@ -651,6 +684,14 @@ pub fn cluster_memories(
     let cap_count = config.max_cluster_memories.max(1);
     let cap_bytes = config.max_cluster_content_bytes;
 
+    // Each memory's L2 norm, computed once. The greedy pass below is O(N²) in
+    // pair comparisons and the cosine kernel re-derives both magnitudes on
+    // every one of them, so this is N vector passes bought to remove up to
+    // N(N-1)/2 of them. Scores are unchanged bit for bit — see
+    // `composite_cluster_score_with_norms`.
+    let norms: Vec<f32> = memories.iter().map(|m| l2_norm(&m.embedding)).collect();
+    debug_assert_eq!(norms.len(), memories.len(), "one norm per memory");
+
     let mut clusters: Vec<Vec<MemoryEntry>> = Vec::new();
     let mut assigned = vec![false; memories.len()];
 
@@ -678,9 +719,11 @@ pub fn cluster_memories(
                 continue;
             }
 
-            let score = composite_cluster_score(
+            let score = composite_cluster_score_with_norms(
                 &memories[i],
+                norms[i],
                 &memories[j],
+                norms[j],
                 &config.clustering_weights,
             );
             if score < config.cluster_threshold {
@@ -725,6 +768,42 @@ pub fn cluster_memories(
 }
 
 /// Cosine similarity between two vectors
+/// L2 norm of an embedding, in the exact form the cosine kernel derives it.
+///
+/// `sqrt` of `dot_product_f32(v, v)`, which reproduces
+/// `cosine_similarity_f32`'s internal `mag_a` bit for bit (same chunking, same
+/// FMA order, same reduction, same scalar remainder). An empty vector has no
+/// magnitude; 0.0 is the value that makes [`cosine_with_norms`] return this
+/// module's "0.0 on empty" contract rather than a NaN.
+fn l2_norm(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    nanna_simd::dot_product_f32(v, v).sqrt()
+}
+
+/// [`cosine_similarity`] with both magnitudes supplied by the caller.
+///
+/// Same contract as [`cosine_similarity`] — 0.0 on a width mismatch, on an
+/// empty vector, and on anything non-finite (a zero-magnitude embedding divides
+/// by zero and must not leak an infinity or a NaN into the score).
+fn cosine_with_norms(a: &[f32], norm_a: f32, b: &[f32], norm_b: f32) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let sim = nanna_simd::dot_product_f32(a, b) / (norm_a * norm_b);
+    if sim.is_finite() { sim } else { 0.0 }
+}
+
+/// The pre-hoist cosine: one `cosine_similarity_f32` call per pair, magnitudes
+/// and all.
+///
+/// **Test-only, and deliberately kept rather than deleted.** Production now
+/// goes through [`cosine_with_norms`], which claims to reproduce this function
+/// *bit for bit* — and a claim like that needs the thing it is compared
+/// against to still exist. `#[cfg(test)]` states that status instead of
+/// leaving a function that looks like a live code path and has no callers.
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     // Guards preserve this clusterer's "0.0 on mismatch/empty" contract:
     // `nanna_simd::cosine_similarity_f32` *panics* on unequal lengths (memories
@@ -1067,6 +1146,69 @@ mod tests {
         assert_eq!(CompressionLevel::from_weight(0.6, &thresholds), CompressionLevel::Standard);
         assert_eq!(CompressionLevel::from_weight(0.9, &thresholds), CompressionLevel::Detailed);
         assert_eq!(CompressionLevel::from_weight(1.5, &thresholds), CompressionLevel::Expand);
+    }
+
+    /// **The hoist must change the arithmetic, not the answer — and "close
+    /// enough" is not the claim being made.**
+    ///
+    /// `cluster_memories` no longer calls `cosine_similarity_f32`; it computes
+    /// each memory's magnitude once and divides a dot product by two cached
+    /// scalars. That is only safe to do silently if the result is *identical*,
+    /// because the score is compared against `cluster_threshold` and a pair
+    /// sitting exactly on it would otherwise flip between releases for reasons
+    /// nobody could see.
+    ///
+    /// It is identical because the two SIMD kernels are written the same way —
+    /// same 16-wide chunks, same order, same `fmadd`, same reduction, same
+    /// scalar remainder. So this asserts exact `f32` equality, on vectors
+    /// deliberately chosen to produce long, association-sensitive sums.
+    #[test]
+    fn norm_hoisting_is_bit_identical_to_the_cosine_kernel() {
+        // Widths that do and do not divide the 16-wide SIMD chunk, so the
+        // scalar-remainder tail is exercised too.
+        for dim in [1_usize, 15, 16, 17, 127, 384, 768] {
+            // `u16` bounded by the modulus, so the widening to f32 is exact
+            // and clippy's precision-loss lint has nothing to warn about.
+            let draw = |i: usize, mul: usize, add: usize, modulus: u16| -> f32 {
+                let raw = u16::try_from(i.wrapping_mul(mul).wrapping_add(add) % usize::from(modulus))
+                    .expect("bounded by the modulus");
+                f32::from(raw)
+            };
+            let a: Vec<f32> = (0..dim).map(|i| draw(i, 2_654_435_761, 0, 1000) / 500.0 - 1.0).collect();
+            let b: Vec<f32> = (0..dim).map(|i| draw(i, 40_503, 7, 997) / 498.5 - 1.0).collect();
+
+            let reference = cosine_similarity(&a, &b);
+            let hoisted = cosine_with_norms(&a, l2_norm(&a), &b, l2_norm(&b));
+            assert_eq!(
+                reference.to_bits(),
+                hoisted.to_bits(),
+                "dim {dim}: hoisted cosine {hoisted} != kernel cosine {reference}"
+            );
+        }
+    }
+
+    /// The hoist must also inherit the degenerate-input contract, not just the
+    /// arithmetic: 0.0 on a width mismatch, on empty, and on a zero-magnitude
+    /// vector (which divides by zero and would otherwise leak inf or NaN into
+    /// a score that is about to be compared against a threshold).
+    #[test]
+    fn norm_hoisting_keeps_the_zero_on_degenerate_input_contract() {
+        let v = vec![1.0_f32, 2.0, 3.0];
+        let zero = vec![0.0_f32; 3];
+
+        assert_eq!(cosine_with_norms(&v, l2_norm(&v), &zero, l2_norm(&zero)), 0.0);
+        assert_eq!(cosine_with_norms(&zero, l2_norm(&zero), &v, l2_norm(&v)), 0.0);
+        assert_eq!(cosine_with_norms(&zero, l2_norm(&zero), &zero, l2_norm(&zero)), 0.0);
+        // Width mismatch: memories from two embedding eras can co-occur.
+        let w = vec![1.0_f32, 2.0];
+        assert_eq!(cosine_with_norms(&v, l2_norm(&v), &w, l2_norm(&w)), 0.0);
+        // Empty on both sides.
+        assert_eq!(cosine_with_norms(&[], 0.0, &[], 0.0), 0.0);
+        assert_eq!(l2_norm(&[]), 0.0);
+
+        // And each matches what the kernel path returns for the same input.
+        assert_eq!(cosine_similarity(&v, &zero), 0.0);
+        assert_eq!(cosine_similarity(&v, &w), 0.0);
     }
 
     #[test]
