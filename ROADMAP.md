@@ -7142,6 +7142,31 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
            points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
            it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
+   - *(2026-09-20 sweep)* `cargo update` → 8 compatible bumps (`cc 1.4.7`, `find-msvc-tools 0.1.13`,
+     `generator 0.8.10`, `rand 0.10.3`, `tauri 2.11.6`, `tauri-plugin-updater 2.12.0`,
+     `unicode-id-start 1.5.0`). `cargo upgrade --incompatible` offered **nothing** — 79 non-local
+     packages already sit at their latest req, and for the first time in three sweeps neither
+     downgrade trap (`criterion 0.8 → "0.7"`, `lopdf 0.45 → "0.42"`) was reported at all, so those
+     rows are a registry artifact that comes and goes rather than a standing offer. Both pin-backs
+     were needed again and the `malachite` one arrived at a **third** version: `cargo update` pulled
+     in `malachite-bigint 0.12.0` beside the pinned 0.9.2 (0.10.0 on 2026-08-25, 0.11.0 on
+     2026-09-14), so the disambiguated spec is version-specific every run —
+     `cargo update -p malachite-bigint@<whatever-it-added> --precise 0.9.2`. Read the version out of
+     `cargo update`'s own "Adding" lines rather than assuming last run's number. `libc` walked to
+     0.2.189 as always and was pinned back to 0.2.186. Sweep order `update → upgrade → pin-backs →
+     verify` held.
+     GUI: only two real rows, both applied — `@tauri-apps/cli 2.11.4 → 2.11.5` and
+     `@tauri-apps/plugin-updater 2.11.0 → 2.12.0` (the latter in lockstep with the Rust
+     `tauri-plugin-updater 2.12.0` the same sweep produced). TypeScript 7 still blocked and the
+     cheap gate still answers it without a migration attempt: npm `typescript` latest is **still
+     7.0.2** and `vue-tsc` **still 3.3.11**, byte-identical to the state that failed on 2026-08-27.
+     Verified green: 2167 Rust tests (80 binaries, 0 failures), clippy 0 errors, 282 vitest,
+     `vue-tsc --noEmit` clean, `pnpm build` clean, and — the gate that matters for `malachite`, which
+     is release-only — `cargo build --release -p nanna-daemon` green in **8m14s**.
+   - *(2026-09-20)* **`rustpython` re-checked on crates.io: still nothing after 0.5.0 (2026-03-31)** —
+     just under six months, queried from `/api/v1/crates/rustpython-vm/versions` (next_page null,
+     0.5.0 is the newest of seven). Both holds it forces — `malachite-bigint =0.9.2` and the
+     `libc <= 0.2.186` ceiling — stay, and both are enforced by `dep_version_unification.rs`.
    - *(2026-09-13 sweep)* `cargo update` → 29 compatible bumps (`jiff 0.2.37`, `reqwest 0.13.5`,
      `tantivy 0.26.2`, `uuid 1.26.1`, `zerocopy 0.8.57`, `cc 1.4.6`, `bitflags 2.13.2`,
      `console 0.16.6`, `encoding_rs 0.8.41`, `multiversion 0.9`, `smallvec 1.16.1`, `toml 1.1.6`, …)
