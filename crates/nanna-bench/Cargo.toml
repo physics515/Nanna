@@ -15,12 +15,22 @@ toml.workspace = true
 [dev-dependencies]
 # Criterion is the harness; suites pull in the crates they measure as needed.
 # Bench targets are the only users, so these stay out of the library's graph.
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 nanna-simd = { path = "../nanna-simd" }
+# Suite 2c measures the real recall path, so it needs the real store: Turso
+# through `nanna-storage`, a tokio runtime to drive it, and a scratch dir for
+# the file-backed databases the SQL arm must read from disk.
+nanna-storage = { path = "../nanna-storage" }
+tokio = { workspace = true }
+tempfile = "3"
 
 [lib]
 bench = false
 
 [[bench]]
 name = "vector_search"
+harness = false
+
+[[bench]]
+name = "recall_path"
 harness = false

@@ -3018,10 +3018,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the same generator the recall harness uses), persists it to Turso, and asserts for every centroid
             probe that SQL k-NN's nearest neighbour is the **same memory** an independent in-RAM cosine scan
             picks **and** is in the probe's own topic cluster. So exact SQL k-NN is a faithful drop-in for the
-            in-RAM scan on realistic embeddings, not just a hand-built spread. **Still the remaining work:** the
+            in-RAM scan on realistic embeddings, not just a hand-built spread. ~~**Still the remaining work:** the
             *latency/RAM comparison* (wall-clock trade; needs the not-yet-built `nanna-bench` harness, release
             profile), and the **decision to wire it into the live recall path** vs the current `bulk_load`+SIMD
-            scan — only after that measurement does the ANN-crate question reopen.
+            scan — only after that measurement does the ANN-crate question reopen.~~
+            *(2026-09-20)* **MEASURED, and the decision is: keep the in-RAM scan; do NOT wire SQL k-NN into
+            the live recall path.** `nanna-bench` exists now, so the blocker is gone. New criterion body
+            `crates/nanna-bench/benches/recall_path.rs` runs three arms against a **file-backed** Turso
+            database (not `Storage::in_memory()`, which would hand the SQL arm the very residency the
+            comparison is about) at 768-dim, `LIMIT = 10`, fixed seed, quiet host — full table in
+            `bench/BASELINE.md` Suite 2c. Per-query, SQL k-NN is **12.0x / 10.7x / 7.7x slower** at
+            1k / 10k / 50k (541.5 µs vs 44.94 µs · 16.21 ms vs 1.521 ms · 89.54 ms vs 11.64 ms), and the
+            residency that buys the in-RAM arm its speed is cheap: `bulk_load` amortizes after **3 queries
+            at 1k and 2 at 10k and 50k**. There is no N in the practical range where SQL k-NN wins on
+            latency, so its value is only ever the O(1) RAM — it stays a tested, documented escape hatch
+            for a store too large to hold, off the turn's critical path.
+            **The ANN question reopens, and now at a measured N.** Embeddings cost `N x dim x 4` bytes —
+            146 MiB @ 50k, **1.43 GiB @ 500k** at 768-dim — so residency binds around **~350k** under a
+            1 GB embedding budget. SQL k-NN is asymptotically linear at ~1.8 µs/element there, i.e.
+            **~630 ms per query**, which is not a recall path. So at the scale where the in-RAM ceiling
+            actually bites, the answer is an index and not SQL, and the `hnswlib-rs` shortlist above
+            becomes live at roughly **7x** today's ceiling — not before. That is the trigger to schedule
+            it on, alongside the O(N^2) dreaming clustering the shortlist was already keyed to.
+      - [x] *(2026-09-20, found by the bench above)* **Suite 2's `simd_batch` row is not the recall
+            path's latency, and the gap is a real cost the shipped code pays.** `simd_batch/50000`
+            measures 4.08 ms; `ram_scan/50000` — same N, dim, seed and host — measures **11.64 ms**,
+            2.8x more. The difference is the work `VectorStore::search_with_coverage` does around the
+            cosine map: the comparable-width count, and **a full `sort_by` of all N similarities before
+            `truncate(top_k)`**, O(N log N) on top of the O(N) cosine, for a `top_k` that is 10.
+            `remember_scoped` runs a search on **every ingest**, so this is on the write path too.
+            Fixed by selection instead of sorting — see the item below.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the

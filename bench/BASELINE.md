@@ -680,6 +680,69 @@ measurement — the test asserts it at 1, 8 and 64 chunks. The ordinary-fact row
 ceiling: it must not drop to 0, or the deferral has silently swallowed the paths that should still
 dedup inline.
 
+### Suite 2c — the recall path: SQL exact k-NN vs the in-RAM SIMD scan
+
+Instrument: `nanna-bench` criterion body `benches/recall_path.rs`. Run with
+`cargo bench -p nanna-bench --bench recall_path`.
+
+**Why this row exists.** P13's "indexed clustering" item sequenced the ANN-crate question behind
+one measurement: exact SQL k-NN (`MemoryRepository::search_by_embedding_sql`, O(1) RAM, reads
+rows from Turso per query) against the shipped in-RAM scan (`VectorStore::search_with_coverage`,
+O(N x dim) resident, pure compute per query). Correctness was already proven — `vector_knn.rs`
+pins the ranking against an independent cosine scan, `sql_knn_retention.rs` repeats it on the
+retention corpus — so the only open question was the trade. Three arms, because comparing the two
+query paths alone would credit the in-RAM arm with a load it never paid for: `bulk_load` is what
+buys its residency.
+
+Measurement *(2026-09-20, release/bench profile, AMD Ryzen 9 7950X3D / AVX-512, Arch Linux,
+nightly-2026-09-08, 768-dim, fixed seed `0x0A_11A_B01`, `LIMIT = 10`, **file-backed** Turso
+database in a scratch dir — not `Storage::in_memory()`, which would hand the SQL arm the very
+residency the comparison is about; quiet host, 20 samples, criterion mean with its 95% CI)*:
+
+| N | `sql_knn` mean [95% CI] | `ram_scan` mean [95% CI] | SQL / RAM | `bulk_load` (one-time) [95% CI] |
+| --- | --- | --- | --- | --- |
+| 1,000 | **541.5 µs** [537.5, 545.1] | **44.94 µs** [44.70, 45.18] | **12.05x** | **1.171 ms** [1.160, 1.188] |
+| 10,000 | **16.21 ms** [16.10, 16.33] | **1.521 ms** [1.505, 1.539] | **10.66x** | **25.30 ms** [25.11, 25.47] |
+| 50,000 | **89.54 ms** [88.75, 90.76] | **11.64 ms** [11.57, 11.72] | **7.70x** | **130.3 ms** [129.4, 131.2] |
+
+**Decision: keep the in-RAM scan as the live recall path. Do not wire SQL k-NN into it.**
+The per-query gap is 7.7-12x in the in-RAM arm's favour at every size measured, and the residency
+that buys it is not expensive enough to change the answer — `bulk_load` amortizes after
+**3 queries at 1k and 2 queries at 10k and 50k** (load / per-query saving: 1.171/0.497 = 2.4,
+25.30/14.69 = 1.7, 130.3/77.9 = 1.7). A daemon serving more than a handful of recalls per boot is
+strictly better off resident. This closes the item's "decision to wire it into the live recall
+path" with a measurement rather than a preference.
+
+**What SQL k-NN is still for, stated precisely.** Its value was never latency — it is the O(1) RAM
+property, and the number that decides when that matters is residency, not milliseconds. Embeddings
+alone cost `N x dim x 4` bytes: **2.9 MiB @ 1k, 29.3 MiB @ 10k, 146 MiB @ 50k, 1.43 GiB @ 500k,
+2.86 GiB @ 1M** (768-dim; `MemoryEntry` content and metadata sit on top). So the escape hatch is
+for a store too large to hold, and it stays exactly that — documented, tested, not on the turn's
+critical path.
+
+**And that is what re-opens the ANN question, at a measured N rather than a feeling.** Per-element
+SQL cost is 541 ns @ 1k, 1.62 µs @ 10k, 1.79 µs @ 50k — rising then flattening, i.e. asymptotically
+linear at ~1.8 µs/element once the fixed and cache-locality terms wash out. Extrapolating to the N
+where residency actually becomes the binding constraint (~350k at 768-dim under a 1 GB embedding
+budget), SQL k-NN would cost **~630 ms per query**, which is not a recall path. So at the scale
+where the in-RAM ceiling bites, the answer is an index, not SQL — the shortlist in the roadmap
+(`hnswlib-rs` et al.) is the right next question, and it becomes live at a corpus roughly **7x**
+today's ~50k ceiling, not before.
+
+**A second finding, unlooked for: Suite 2's `simd_batch` row understates the shipped recall path by
+~2.8x at 50k.** `simd_batch/50000` measures 4.08 ms; `ram_scan/50000` measures 11.64 ms for the
+same N, same dim, same seed, on the same host. The difference is not noise — it is the work
+`search_with_coverage` does around the cosine map and `simd_batch` omits: the comparable-width
+count that fills `SearchCoverage`, and **a full `sort_by` of all N similarities before
+`truncate(top_k)`**, which is O(N log N) on top of the O(N) cosine. Suite 2's row is still a valid
+SIMD-kernel gate; it is just not the recall path's latency, and the two should not be read as the
+same number. See the follow-on row below.
+
+Budget: none added. This suite answers a design question rather than gating a regression — the
+`ram_scan` arm is budgeted through Suite 2's `simd_batch` ceilings, and a budget on `sql_knn` would
+gate a path deliberately kept off the critical path.
+
+
 ---
 
 ## Suite 5 — Resource guardrails (not yet baselined)
